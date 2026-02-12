@@ -288,10 +288,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let placement = place_market_order(&client, market_order).await.unwrap();
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
@@ -357,10 +355,8 @@ mod tests {
             direction: Direction::Sell,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let placement = place_market_order(&client, market_order).await.unwrap();
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
@@ -388,10 +384,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let error = place_market_order(&client, market_order).await.unwrap_err();
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
@@ -416,10 +410,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let error = place_market_order(&client, market_order).await.unwrap_err();
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
@@ -443,10 +435,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let error = place_market_order(&client, market_order).await.unwrap_err();
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
@@ -490,10 +480,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
         assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
@@ -542,10 +531,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
         assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
@@ -594,10 +582,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "MSFT");
         assert_eq!(order_update.shares.inner().inner(), Decimal::from(25));
@@ -646,10 +633,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "GOOGL");
         assert_eq!(order_update.shares.inner().inner(), Decimal::from(200));
@@ -664,9 +650,8 @@ mod tests {
             quantity: 100.into(),
         };
 
-        let result = extract_shares_from_amount(&quantity_amount);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().inner().inner(), Decimal::from(100));
+        let shares = extract_shares_from_amount(&quantity_amount).unwrap();
+        assert_eq!(shares.inner().inner(), Decimal::from(100));
     }
 
     #[tokio::test]
@@ -739,10 +724,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = poll_pending_orders(&client).await;
+        let order_updates = poll_pending_orders(&client).await.unwrap();
 
         mock.assert();
-        let order_updates = result.unwrap();
 
         assert_eq!(order_updates.len(), 2);
 
@@ -780,10 +764,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = poll_pending_orders(&client).await;
+        let order_updates = poll_pending_orders(&client).await.unwrap();
 
         mock.assert();
-        let order_updates = result.unwrap();
         assert_eq!(order_updates.len(), 0);
     }
 
@@ -830,10 +813,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = poll_pending_orders(&client).await;
+        let order_updates = poll_pending_orders(&client).await.unwrap();
 
         mock.assert();
-        let order_updates = result.unwrap();
 
         assert_eq!(order_updates.len(), 1);
 
@@ -866,10 +848,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = poll_pending_orders(&client).await;
+        let error = poll_pending_orders(&client).await.unwrap_err();
 
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderList(_)));
     }
 
@@ -891,10 +872,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = poll_pending_orders(&client).await;
+        let error = poll_pending_orders(&client).await.unwrap_err();
 
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderList(_)));
     }
 

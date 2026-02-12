@@ -1,7 +1,8 @@
 //! MintManager orchestrates the TokenizedEquityMint workflow.
 //!
-//! Coordinates between `AlpacaTokenizationService` and the `TokenizedEquityMint` aggregate
-//! to execute the full mint lifecycle: request -> poll -> receive tokens -> finalize.
+//! Coordinates between `AlpacaTokenizationService` and the
+//! `TokenizedEquityMint` aggregate to execute the full mint
+//! lifecycle: request -> poll -> receive tokens -> finalize.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -290,27 +291,25 @@ mod tests {
     #[test]
     fn decimal_to_u256_converts_fractional() {
         let value = FractionalShares::new(dec!(100.5));
-        let result = decimal_to_u256_18_decimals(value).unwrap();
-
-        let expected = U256::from(100_500_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
+        assert_eq!(
+            decimal_to_u256_18_decimals(value).unwrap(),
+            U256::from(100_500_000_000_000_000_000_u128)
+        );
     }
 
     #[test]
     fn decimal_to_u256_converts_whole_number() {
         let value = FractionalShares::new(dec!(42));
-        let result = decimal_to_u256_18_decimals(value).unwrap();
-
-        let expected = U256::from(42_000_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
+        assert_eq!(
+            decimal_to_u256_18_decimals(value).unwrap(),
+            U256::from(42_000_000_000_000_000_000_u128)
+        );
     }
 
     #[test]
     fn decimal_to_u256_converts_zero() {
         let value = FractionalShares::new(dec!(0));
-        let result = decimal_to_u256_18_decimals(value).unwrap();
-
-        assert_eq!(result, U256::ZERO);
+        assert_eq!(decimal_to_u256_18_decimals(value).unwrap(), U256::ZERO);
     }
 
     #[tokio::test]
@@ -341,11 +340,10 @@ mod tests {
         let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let result = manager
+        manager
             .execute_mint_impl(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
-            .await;
-
-        assert!(result.is_ok(), "execute_mint failed: {result:?}");
+            .await
+            .unwrap();
 
         mint_mock.assert();
         poll_mock.assert();
@@ -391,11 +389,12 @@ mod tests {
         let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let result = manager
-            .execute_mint_impl(&IssuerRequestId::new("mint-002"), symbol, quantity, wallet)
-            .await;
-
-        assert!(matches!(result, Err(MintError::Rejected)));
+        assert!(matches!(
+            manager
+                .execute_mint_impl(&IssuerRequestId::new("mint-002"), symbol, quantity, wallet)
+                .await,
+            Err(MintError::Rejected)
+        ));
 
         mint_mock.assert();
         poll_mock.assert();
@@ -420,11 +419,12 @@ mod tests {
         let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let result = manager
-            .execute_mint_impl(&IssuerRequestId::new("mint-003"), symbol, quantity, wallet)
-            .await;
-
-        assert!(matches!(result, Err(MintError::Alpaca(_))));
+        assert!(matches!(
+            manager
+                .execute_mint_impl(&IssuerRequestId::new("mint-003"), symbol, quantity, wallet)
+                .await,
+            Err(MintError::Alpaca(_))
+        ));
 
         mint_mock.assert();
     }
@@ -455,16 +455,15 @@ mod tests {
 
         let mint_trait: &dyn Mint = &manager;
 
-        let result = mint_trait
+        mint_trait
             .execute_mint(
                 &IssuerRequestId::new("trait-001"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares::new(dec!(50.0)),
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
             )
-            .await;
-
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         mint_mock.assert();
         poll_mock.assert();

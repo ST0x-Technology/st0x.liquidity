@@ -1,3 +1,6 @@
+//! Dual-writes onchain trade aggregate commands to both
+//! CQRS/ES and legacy SQLite tables.
+
 use rust_decimal::Decimal;
 
 use crate::onchain::OnchainTrade;
@@ -45,6 +48,7 @@ pub(crate) async fn witness_trade(
 mod tests {
     use alloy::primitives::{Address, fixed_bytes};
     use chrono::Utc;
+
     use st0x_execution::Direction;
 
     use super::*;
@@ -77,8 +81,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = witness_trade(&context, &trade, 12345).await;
-        assert!(result.is_ok());
+        witness_trade(&context, &trade, 12345).await.unwrap();
 
         let event_count = sqlx::query_scalar!(
             "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OnChainTrade'"
@@ -181,11 +184,10 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = witness_trade(&context, &trade, 12345).await;
+        let error = witness_trade(&context, &trade, 12345).await.unwrap_err();
 
-        assert!(result.is_err());
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             DualWriteError::MissingBlockTimestamp { .. }
         ));
     }

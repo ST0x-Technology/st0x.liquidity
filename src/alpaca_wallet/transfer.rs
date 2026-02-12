@@ -1,3 +1,9 @@
+//! Alpaca Broker API crypto transfer types and operations.
+//!
+//! Provides `request_withdrawal` and `get_transfer_status`
+//! for initiating and tracking crypto transfers. Transfers
+//! progress through Queued -> Pending -> Complete/Failed.
+
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -37,13 +43,8 @@ impl std::fmt::Display for TokenSymbol {
 pub(crate) struct AlpacaAccountId(Uuid);
 
 impl AlpacaAccountId {
-    #[cfg(test)]
     pub(crate) const fn new(uuid: Uuid) -> Self {
         Self(uuid)
-    }
-
-    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
-        Ok(Self(Uuid::parse_str(s)?))
     }
 }
 
@@ -334,15 +335,14 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
+        let err = initiate_withdrawal(
             &client,
             Decimal::ZERO,
             "USDC",
             "0x1234567890abcdef1234567890abcdef12345678",
         )
-        .await;
-
-        let err = result.unwrap_err();
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::ZERO
@@ -359,15 +359,14 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
+        let err = initiate_withdrawal(
             &client,
             Decimal::new(-100, 0),
             "USDC",
             "0x1234567890abcdef1234567890abcdef12345678",
         )
-        .await;
-
-        let err = result.unwrap_err();
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::new(-100, 0)
@@ -394,16 +393,17 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
+        let error = initiate_withdrawal(
             &client,
             Decimal::new(100, 0),
             "INVALID",
             "0x1234567890abcdef1234567890abcdef12345678",
         )
-        .await;
+        .await
+        .unwrap_err();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaWalletError::ApiError { status, .. } if status == 400
         ));
 
@@ -430,11 +430,12 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result =
-            initiate_withdrawal(&client, Decimal::new(100, 0), "USDC", "invalid_address").await;
+        let error = initiate_withdrawal(&client, Decimal::new(100, 0), "USDC", "invalid_address")
+            .await
+            .unwrap_err();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaWalletError::ApiError { status, .. } if status == 400
         ));
 
@@ -457,16 +458,17 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
+        let error = initiate_withdrawal(
             &client,
             Decimal::new(100, 0),
             "USDC",
             "0x1234567890abcdef1234567890abcdef12345678",
         )
-        .await;
+        .await
+        .unwrap_err();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaWalletError::ApiError { status, .. } if status == 500
         ));
 
@@ -695,12 +697,11 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
+        let error = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
+            .await
+            .unwrap_err();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::TransferNotFound { .. }
-        ));
+        assert!(matches!(error, AlpacaWalletError::TransferNotFound { .. }));
 
         status_mock.assert();
     }
@@ -722,10 +723,12 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
+        let error = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
+            .await
+            .unwrap_err();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaWalletError::ApiError { status, .. } if status == 500
         ));
 
@@ -751,9 +754,11 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
+        let error = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
+            .await
+            .unwrap_err();
 
-        assert!(matches!(result.unwrap_err(), AlpacaWalletError::Reqwest(_)));
+        assert!(matches!(error, AlpacaWalletError::Reqwest(_)));
 
         status_mock.assert();
     }
@@ -844,10 +849,9 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result =
-            get_transfer_status(&client, &AlpacaTransferId::from(target_transfer_id)).await;
-
-        let transfer = result.unwrap();
+        let transfer = get_transfer_status(&client, &AlpacaTransferId::from(target_transfer_id))
+            .await
+            .unwrap();
 
         assert_eq!(
             transfer.id,
@@ -1033,10 +1037,12 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = find_transfer_by_tx_hash(&client, &tx_hash).await;
+        let error = find_transfer_by_tx_hash(&client, &tx_hash)
+            .await
+            .unwrap_err();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaWalletError::ApiError { status, .. } if status == 500
         ));
 

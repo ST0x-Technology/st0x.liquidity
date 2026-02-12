@@ -1,0 +1,22 @@
+database_url = ":memory:"
+log_level = "debug"
+server_port = 8080
+
+[evm]
+orderbook = "0x1111111111111111111111111111111111111111"
+deployment_block = 1
+
+[hyperdx]
+service_name = "st0x-hedge"
+
+[rebalancing]
+redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+[rebalancing.equity_threshold]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc_threshold]
+target = "0.5"
+deviation = "0.3"

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/execution"]
+members = [".", "crates/dto", "crates/execution"]
 resolver = "2"
 
 [workspace.package]
@@ -87,10 +87,10 @@ anyhow = "1.0.98"
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
+st0x-dto = { path = "crates/dto" }
 st0x-execution = { path = "crates/execution" }
 backon.workspace = true
 clap.workspace = true
-dotenvy = "0.15.7"
 futures-util = "0.3.31"
 lazy_static = "1.5.0"
 rain-math-float.workspace = true
@@ -126,6 +126,7 @@ ts-rs = { version = "11.1.0", features = [
   "serde-compat",
 ] }
 rocket_ws = "0.1.1"
+toml = "0.9.11"
 rust_decimal_macros = "1.38.0"
 
 [dev-dependencies]
@@ -135,15 +136,8 @@ proptest.workspace = true
 temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"
 st0x-execution = { path = "crates/execution", features = ["mock"] }
+tempfile = "3.24.0"
 tracing-test = "0.2.5"
-
-[[bin]]
-name = "migrate_to_events"
-path = "src/bin/migrate_to_events.rs"
-
-[[bin]]
-name = "validate_config"
-path = "src/bin/validate_config.rs"
 
 [lints]
 workspace = true

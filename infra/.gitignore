@@ -1,0 +1,6 @@
+*.tfstate
+*.tfstate.backup
+terraform.tfvars
+tfplan
+.terraform/
+!*.age

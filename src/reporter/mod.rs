@@ -1,42 +1,61 @@
+//! Standalone reporting binary for trade history and PnL analysis.
+
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info};
 
-use crate::symbol::Symbol;
 use st0x_execution::Direction;
 
+use crate::config::{CtxError, LogLevel, configure_sqlite_pool};
+use crate::symbol::Symbol;
+
 mod pnl;
+use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
 pub struct ReporterEnv {
-    #[clap(long, env, default_value = "sqlite:./data/schwab.db")]
-    database_url: String,
-    #[clap(long, env, default_value = "30")]
-    reporter_processing_interval_secs: u64,
-    #[clap(long, env, default_value = "info")]
-    log_level: crate::env::LogLevel,
+    /// Path to plaintext TOML configuration file
+    #[clap(long)]
+    pub config: PathBuf,
 }
 
-impl crate::env::HasSqlite for ReporterEnv {
+#[derive(Debug, Deserialize)]
+pub struct ReporterConfig {
+    database_url: String,
+    processing_interval_secs: Option<u64>,
+    log_level: Option<LogLevel>,
+}
+
+trait HasSqlite {
+    async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error>;
+}
+
+impl HasSqlite for ReporterConfig {
     async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
-        crate::env::configure_sqlite_pool(&self.database_url).await
+        configure_sqlite_pool(&self.database_url).await
     }
 }
 
-impl ReporterEnv {
-    pub fn log_level(&self) -> &crate::env::LogLevel {
-        &self.log_level
+impl ReporterConfig {
+    pub fn load_file(path: &std::path::Path) -> Result<Self, CtxError> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&contents)?;
+        Ok(config)
+    }
+
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level.clone().unwrap_or(LogLevel::Info)
     }
 
     fn processing_interval(&self) -> Duration {
-        Duration::from_secs(self.reporter_processing_interval_secs)
+        Duration::from_secs(self.processing_interval_secs.unwrap_or(30))
     }
 }
 
@@ -386,11 +405,9 @@ pub(crate) async fn process_iteration(pool: &SqlitePool) -> anyhow::Result<usize
     Ok(new_trades.len())
 }
 
-pub async fn run(env: ReporterEnv) -> anyhow::Result<()> {
-    use crate::env::HasSqlite;
-
-    let pool = env.get_sqlite_pool().await?;
-    let interval = env.processing_interval();
+pub async fn run(config: ReporterConfig) -> anyhow::Result<()> {
+    let pool = config.get_sqlite_pool().await?;
+    let interval = config.processing_interval();
 
     initialize_reporter(&pool, interval).await?;
     run_processing_loop(&pool, interval).await;
@@ -441,13 +458,79 @@ fn log_processing_result(result: anyhow::Result<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+    use std::io::Write;
+
+    use super::*;
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    #[test]
+    fn load_file_parses_minimal_config() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let () = write!(file, "database_url = \":memory:\"").unwrap();
+
+        let config = ReporterConfig::load_file(file.path()).unwrap();
+
+        assert_eq!(config.database_url, ":memory:");
+        assert!(config.processing_interval_secs.is_none());
+        assert!(config.log_level.is_none());
+    }
+
+    #[test]
+    fn load_file_parses_all_fields() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let () = writeln!(file, "database_url = \"test.db\"").unwrap();
+        let () = writeln!(file, "processing_interval_secs = 30").unwrap();
+        let () = writeln!(file, "log_level = \"info\"").unwrap();
+
+        let config = ReporterConfig::load_file(file.path()).unwrap();
+
+        assert_eq!(config.database_url, "test.db");
+        assert_eq!(config.processing_interval_secs, Some(30));
+        assert!(matches!(config.log_level, Some(LogLevel::Info)));
+    }
+
+    #[test]
+    fn load_file_returns_io_error_for_missing_file() {
+        let path = std::path::Path::new("/nonexistent/path/config.toml");
+
+        let err = ReporterConfig::load_file(path).unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::Io(_)),
+            "expected CtxError::Io, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_file_returns_toml_error_for_invalid_content() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let () = write!(file, "this is not valid toml {{{{").unwrap();
+
+        let err = ReporterConfig::load_file(file.path()).unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::Toml(_)),
+            "expected CtxError::Toml, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_file_returns_toml_error_when_required_field_missing() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let () = write!(file, "processing_interval_secs = 30").unwrap();
+
+        let err = ReporterConfig::load_file(file.path()).unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::Toml(_)),
+            "expected CtxError::Toml for missing database_url, got: {err:?}"
+        );
     }
 
     #[tokio::test]

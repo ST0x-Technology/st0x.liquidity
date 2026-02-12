@@ -1,12 +1,14 @@
+//! Reporting service for P&L and trade statistics generation.
+
 use clap::Parser;
-use st0x_hedge::env::setup_tracing;
-use st0x_hedge::reporter::{self, ReporterEnv};
+use st0x_hedge::reporter::{self, ReporterConfig, ReporterEnv};
+use st0x_hedge::setup_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv_override().ok();
-    let env = ReporterEnv::parse();
-    setup_tracing(env.log_level());
+    let ReporterEnv { config } = ReporterEnv::parse();
+    let config = ReporterConfig::load_file(&config)?;
+    setup_tracing(&config.log_level());
 
-    reporter::run(env).await
+    reporter::run(config).await
 }

@@ -1,3 +1,6 @@
+//! Classifies onchain trades into long/short exposure buckets
+//! for position accumulation.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccumulationBucket {
     LongExposure,

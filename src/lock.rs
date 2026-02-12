@@ -1,4 +1,11 @@
-use crate::error::OnChainError;
+//! Per-symbol execution locks backed by SQLite with automatic
+//! cleanup for stale leases.
+//!
+//! Provides [`try_acquire_execution_lease`] and
+//! [`release_execution_lease`] to ensure only one worker
+//! processes a given symbol at a time.
+
+use crate::onchain::OnChainError;
 use st0x_execution::Symbol;
 use tracing::{debug, info, warn};
 
@@ -141,6 +148,7 @@ pub(crate) async fn clear_pending_execution_id(
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
+
     use st0x_execution::OrderState;
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
 

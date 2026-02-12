@@ -1,3 +1,6 @@
+//! PnL calculation engine for matched trade pairs using
+//! FIFO inventory matching.
+
 use rust_decimal::Decimal;
 use st0x_execution::Direction;
 use std::cmp::Ordering;
@@ -444,7 +447,8 @@ mod tests {
             "OFFCHAIN".parse::<TradeType>().unwrap(),
             TradeType::Offchain
         );
-        assert!("invalid".parse::<TradeType>().is_err());
+        let error = "invalid".parse::<TradeType>().unwrap_err();
+        assert_eq!(error, "Invalid trade type: 'invalid'");
     }
 
     #[test]

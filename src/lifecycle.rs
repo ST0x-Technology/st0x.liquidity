@@ -2,26 +2,30 @@
 //!
 //! # The Problem
 //!
-//! Event-sourced entities (aggregates, views) naturally model as state machines:
-//! genesis events create them, subsequent events transition between valid states.
-//! The type `T` represents this clean business model - a perfect world where every
-//! event is valid.
+//! Event-sourced entities (aggregates, views) naturally model as state
+//! machines: genesis events create them, subsequent events transition
+//! between valid states. The type `T` represents this clean business
+//! model - a perfect world where every event is valid.
 //!
 //! Reality is messier:
-//! - `Aggregate::apply` and `View::update` are **infallible** (no `Result` return)
+//! - `Aggregate::apply` and `View::update` are **infallible** (no
+//!   `Result` return)
 //! - Financial applications **cannot panic** on arithmetic overflow
 //! - Events might arrive before genesis (replay ordering, bugs)
 //! - Transitions might fail (overflow, invalid state combinations)
 //!
 //! # The Solution
 //!
-//! `Lifecycle<T, E>` wraps your clean domain model `T` and handles infrastructure
-//! concerns:
+//! `Lifecycle<T, E>` wraps your clean domain model `T` and handles
+//! infrastructure concerns:
 //!
-//! - **`T`** - Your business model. Clean state machine with valid states only.
-//! - **`Lifecycle<T, E>`** - Adapter that adds lifecycle tracking and error capture.
+//! - **`T`** - Your business model. Clean state machine with valid
+//!   states only.
+//! - **`Lifecycle<T, E>`** - Adapter that adds lifecycle tracking and
+//!   error capture.
 //!
-//! This separation keeps `T` focused on domain logic while `Lifecycle` handles:
+//! This separation keeps `T` focused on domain logic while
+//! `Lifecycle` handles:
 //! - Tracking whether the entity exists yet (`Uninitialized`)
 //! - Capturing failures without panicking (`Failed`)
 //! - Preserving the last valid state for debugging/recovery

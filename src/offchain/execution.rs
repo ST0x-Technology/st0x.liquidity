@@ -1,6 +1,11 @@
+//! Offchain execution persistence and retrieval.
+//!
+//! Provides `OffchainExecution` and query functions for reading and writing
+//! broker order records in SQLite.
+
 use sqlx::SqlitePool;
 
-use crate::error::OnChainError;
+use crate::onchain::OnChainError;
 use st0x_execution::{
     Direction, FractionalShares, OrderState, OrderStatus, PersistenceError, Positive,
     SupportedExecutor, Symbol,
@@ -254,12 +259,13 @@ impl OffchainExecution {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use rust_decimal::Decimal;
+
+    use st0x_execution::OrderState;
 
     use super::*;
     use crate::test_utils::{OffchainExecutionBuilder, setup_test_db};
-    use chrono::Utc;
-    use st0x_execution::OrderState;
 
     #[tokio::test]
     async fn test_offchain_execution_save_and_find() {

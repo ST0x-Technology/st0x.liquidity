@@ -1,7 +1,9 @@
+//! Polls broker APIs for order status updates and reconciles fills.
+
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
-use st0x_execution::{Executor, OrderState, OrderStatus, PersistenceError, Symbol};
+use st0x_execution::{ExecutionError, Executor, OrderState, OrderStatus, PersistenceError, Symbol};
 use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
@@ -10,8 +12,27 @@ use super::execution::{
     OffchainExecution, find_execution_by_id, find_executions_by_symbol_status_and_broker,
 };
 use crate::dual_write::DualWriteContext;
-use crate::error::{OnChainError, OrderPollingError};
 use crate::lock::{clear_execution_lease, clear_pending_execution_id, renew_execution_lease};
+use crate::onchain::OnChainError;
+
+/// Order polling errors for order status monitoring.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OrderPollingError {
+    #[error("Executor error: {0}")]
+    Executor(Box<dyn std::error::Error + Send + Sync>),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] PersistenceError),
+    #[error("Onchain error: {0}")]
+    OnChain(#[from] OnChainError),
+}
+
+impl From<ExecutionError> for OrderPollingError {
+    fn from(err: ExecutionError) -> Self {
+        Self::Executor(Box::new(err))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OrderPollerConfig {
@@ -238,7 +259,10 @@ impl<E: Executor> OrderStatusPoller<E> {
     ) -> Result<(), OrderPollingError> {
         let execution = self.finalize_order(execution_id, order_state).await?;
         let symbol = &execution.symbol;
-        info!("Updated execution {execution_id} to FAILED and cleared locks for symbol: {symbol}");
+        info!(
+            "Updated execution {execution_id} to FAILED \
+             and cleared locks for symbol: {symbol}"
+        );
 
         let error_message = extract_error_message(order_state);
         self.execute_failed_order_dual_write(execution_id, symbol, error_message)
@@ -459,10 +483,10 @@ mod tests {
         };
 
         let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-        let result = poller
+        poller
             .handle_filled_order(execution_id, &filled_state)
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
@@ -540,10 +564,10 @@ mod tests {
         };
 
         let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-        let result = poller
+        poller
             .handle_failed_order(execution_id, &failed_state)
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(

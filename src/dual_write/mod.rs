@@ -1,3 +1,8 @@
+//! Dual-write layer for CQRS/ES and legacy persistence during migration.
+//!
+//! Writes to both the new event-sourced aggregates and legacy SQLite tables,
+//! ensuring consistency while the codebase transitions to full CQRS/ES.
+
 use std::sync::Arc;
 
 use alloy::primitives::TxHash;

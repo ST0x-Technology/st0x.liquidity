@@ -1,3 +1,8 @@
+//! Historical onchain event backfill with retry logic.
+//!
+//! Scans past blocks for `ClearV3` and `TakeOrderV3` events and enqueues them
+//! for processing, ensuring no trades are missed after downtime.
+
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
@@ -8,9 +13,9 @@ use sqlx::SqlitePool;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
-use super::EvmEnv;
+use super::EvmCtx;
+use super::OnChainError;
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
-use crate::error::OnChainError;
 use crate::queue::enqueue;
 
 fn get_backfill_retry_strat() -> ExponentialBuilder {
@@ -34,18 +39,22 @@ enum EventData {
 pub(crate) async fn backfill_events<P: Provider + Clone>(
     pool: &SqlitePool,
     provider: &P,
-    evm_env: &EvmEnv,
+    evm_ctx: &EvmCtx,
     end_block: u64,
 ) -> Result<(), OnChainError> {
     let retry_strat = get_backfill_retry_strat();
-    backfill_events_with_retry_strat(pool, provider, evm_env, end_block, retry_strat).await
+    backfill_events_with_retry_strat(pool, provider, evm_ctx, end_block, retry_strat).await
 }
 
-#[tracing::instrument(skip(pool, provider, evm_env, retry_strategy), fields(end_block), level = tracing::Level::INFO)]
+#[tracing::instrument(
+    skip(pool, provider, evm_ctx, retry_strategy),
+    fields(end_block),
+    level = tracing::Level::INFO,
+)]
 async fn backfill_events_with_retry_strat<P: Provider + Clone, B: BackoffBuilder + Clone>(
     pool: &SqlitePool,
     provider: &P,
-    evm_env: &EvmEnv,
+    evm_ctx: &EvmCtx,
     end_block: u64,
     retry_strategy: B,
 ) -> Result<(), OnChainError> {
@@ -56,9 +65,9 @@ async fn backfill_events_with_retry_strat<P: Provider + Clone, B: BackoffBuilder
             || {
                 info!(
                     "Starting initial backfill from deployment block {}",
-                    evm_env.deployment_block
+                    evm_ctx.deployment_block
                 );
-                evm_env.deployment_block
+                evm_ctx.deployment_block
             },
             |max_block| {
                 let resume_block = max_block + 1;
@@ -94,7 +103,7 @@ async fn backfill_events_with_retry_strat<P: Provider + Clone, B: BackoffBuilder
             enqueue_batch_events(
                 pool,
                 provider,
-                evm_env,
+                evm_ctx,
                 batch_start,
                 batch_end,
                 retry_strategy.clone(),
@@ -115,23 +124,27 @@ async fn backfill_events_with_retry_strat<P: Provider + Clone, B: BackoffBuilder
     Ok(())
 }
 
-#[tracing::instrument(skip(pool, provider, evm_env, retry_strategy), fields(batch_start, batch_end), level = tracing::Level::DEBUG)]
+#[tracing::instrument(
+    skip(pool, provider, evm_ctx, retry_strategy),
+    fields(batch_start, batch_end),
+    level = tracing::Level::DEBUG,
+)]
 async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     pool: &SqlitePool,
     provider: &P,
-    evm_env: &EvmEnv,
+    evm_ctx: &EvmCtx,
     batch_start: u64,
     batch_end: u64,
     retry_strategy: B,
 ) -> Result<usize, OnChainError> {
     let clear_filter = Filter::new()
-        .address(evm_env.orderbook)
+        .address(evm_ctx.orderbook)
         .from_block(batch_start)
         .to_block(batch_end)
         .event_signature(ClearV3::SIGNATURE_HASH);
 
     let take_filter = Filter::new()
-        .address(evm_env.orderbook)
+        .address(evm_ctx.orderbook)
         .from_block(batch_start)
         .to_block(batch_end)
         .event_signature(TakeOrderV3::SIGNATURE_HASH);
@@ -247,11 +260,12 @@ mod tests {
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
+    use url::Url;
 
     use super::*;
     use crate::bindings::IERC20::symbolCall;
     use crate::bindings::IOrderBookV5;
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmCtx;
     use crate::onchain::trade::TradeEvent;
     use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
     use crate::test_utils::{get_test_order, setup_test_db};
@@ -272,14 +286,14 @@ mod tests {
         asserter.push_success(&serde_json::json!([])); // take events
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -350,8 +364,8 @@ mod tests {
     async fn test_backfill_events_with_clear_v2_events() {
         let pool = setup_test_db().await;
         let order = get_test_order();
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -378,7 +392,7 @@ mod tests {
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
+                address: evm_ctx.orderbook,
                 data: clear_event.to_log_data(),
             },
             block_hash: None,
@@ -397,7 +411,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -415,8 +429,8 @@ mod tests {
     async fn test_backfill_events_with_take_order_v2_events() {
         let pool = setup_test_db().await;
         let order = get_test_order();
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -442,7 +456,7 @@ mod tests {
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         let take_log = Log {
             inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
+                address: evm_ctx.orderbook,
                 data: take_event.to_log_data(),
             },
             block_hash: None,
@@ -467,7 +481,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -485,8 +499,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_enqueues_all_events() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -509,7 +523,7 @@ mod tests {
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
+                address: evm_ctx.orderbook,
                 data: clear_event.to_log_data(),
             },
             block_hash: None,
@@ -530,7 +544,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -542,8 +556,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_handles_rpc_errors() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -560,21 +574,20 @@ mod tests {
         let result = backfill_events_with_retry_strat(
             &pool,
             &provider,
-            &evm_env,
+            &evm_ctx,
             100,
             test_retry_strategy(),
         )
         .await;
 
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OnChainError::Alloy(_)));
     }
 
     #[tokio::test]
     async fn test_backfill_events_block_range() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50,
@@ -587,7 +600,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -644,8 +657,8 @@ mod tests {
     async fn test_backfill_events_preserves_chronological_order() {
         let pool = setup_test_db().await;
         let order = get_test_order();
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -667,8 +680,8 @@ mod tests {
             uint!(2_000_000_000_000_000_000_U256),
         );
 
-        let take_log1 = create_test_log(evm_env.orderbook, &take_event1, 50, tx_hash1);
-        let take_log2 = create_test_log(evm_env.orderbook, &take_event2, 100, tx_hash2);
+        let take_log1 = create_test_log(evm_ctx.orderbook, &take_event1, 50, tx_hash1);
+        let take_log2 = create_test_log(evm_ctx.orderbook, &take_event2, 100, tx_hash2);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(200u64));
@@ -691,7 +704,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -719,8 +732,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_batch_count_verification() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1000,
@@ -738,7 +751,7 @@ mod tests {
         asserter.push_success(&serde_json::json!([]));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        backfill_events(&pool, &provider, &evm_env, 2500)
+        backfill_events(&pool, &provider, &evm_ctx, 2500)
             .await
             .unwrap();
 
@@ -750,8 +763,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_batch_boundary_verification() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 500,
@@ -773,7 +786,7 @@ mod tests {
         backfill_events_with_retry_strat(
             &pool,
             &provider,
-            &evm_env,
+            &evm_ctx,
             1900,
             get_backfill_retry_strat(),
         )
@@ -789,8 +802,8 @@ mod tests {
     async fn test_process_batch_with_realistic_data() {
         let pool = setup_test_db().await;
         let order = get_test_order();
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -803,7 +816,7 @@ mod tests {
             uint!(500_000_000_U256),
             uint!(5_000_000_000_000_000_000_U256),
         );
-        let take_log = create_test_log(evm_env.orderbook, &take_event, 150, tx_hash);
+        let take_log = create_test_log(evm_ctx.orderbook, &take_event, 150, tx_hash);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
@@ -812,7 +825,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let enqueued_count =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy())
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy())
                 .await
                 .unwrap();
 
@@ -827,8 +840,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_deployment_equals_current_block() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 100,
@@ -841,7 +854,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -852,8 +865,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_large_block_range_batching() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -872,7 +885,7 @@ mod tests {
         backfill_events_with_retry_strat(
             &pool,
             &provider,
-            &evm_env,
+            &evm_ctx,
             3000,
             get_backfill_retry_strat(),
         )
@@ -886,8 +899,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_deployment_after_current_block() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 200,
@@ -898,7 +911,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events_with_retry_strat(&pool, &provider, &evm_env, 100, test_retry_strategy())
+        backfill_events_with_retry_strat(&pool, &provider, &evm_ctx, 100, test_retry_strategy())
             .await
             .unwrap();
 
@@ -910,8 +923,8 @@ mod tests {
     async fn test_backfill_events_mixed_valid_and_invalid_events() {
         let pool = setup_test_db().await;
         let order = get_test_order();
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -937,9 +950,9 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let invalid_tx_hash =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
-        let valid_log = create_test_log(evm_env.orderbook, &valid_take_event, 50, valid_tx_hash);
+        let valid_log = create_test_log(evm_ctx.orderbook, &valid_take_event, 50, valid_tx_hash);
         let invalid_log =
-            create_test_log(evm_env.orderbook, &invalid_take_event, 51, invalid_tx_hash);
+            create_test_log(evm_ctx.orderbook, &invalid_take_event, 51, invalid_tx_hash);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64));
@@ -948,7 +961,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -1036,8 +1049,8 @@ mod tests {
     async fn test_backfill_events_mixed_clear_and_take_events() {
         let pool = setup_test_db().await;
         let order = get_test_order();
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1053,9 +1066,9 @@ mod tests {
             uint!(100_000_000_U256),
             uint!(9_000_000_000_000_000_000_U256),
         );
-        let take_log = create_test_log(evm_env.orderbook, &take_event, 50, tx_hash1);
-        let clear_log = create_clear_log(evm_env.orderbook, &order, tx_hash2);
-        let after_clear_log = create_after_clear_log(evm_env.orderbook, tx_hash2);
+        let take_log = create_test_log(evm_ctx.orderbook, &take_event, 50, tx_hash1);
+        let clear_log = create_clear_log(evm_ctx.orderbook, &order, tx_hash2);
+        let after_clear_log = create_after_clear_log(evm_ctx.orderbook, tx_hash2);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(150u64));
@@ -1077,7 +1090,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -1102,8 +1115,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_batch_retry_mechanism() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1119,9 +1132,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy()).await;
 
-        assert!(result.is_ok());
         let enqueued_count = result.unwrap();
         assert_eq!(enqueued_count, 0);
     }
@@ -1129,8 +1141,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_batch_exhausted_retries() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1149,17 +1161,16 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy()).await;
 
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OnChainError::Alloy(_)));
     }
 
     #[tokio::test]
     async fn test_backfill_events_partial_batch_failure() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1187,21 +1198,20 @@ mod tests {
         let result = backfill_events_with_retry_strat(
             &pool,
             &provider,
-            &evm_env,
+            &evm_ctx,
             25000,
             test_retry_strategy(),
         )
         .await;
 
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OnChainError::Alloy(_)));
     }
 
     #[tokio::test]
     async fn test_backfill_events_corrupted_log_data() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1210,7 +1220,7 @@ mod tests {
         // Create malformed log with invalid event signature
         let corrupted_log = Log {
             inner: alloy::primitives::Log::new(
-                evm_env.orderbook,
+                evm_ctx.orderbook,
                 Vec::new(),
                 Vec::from([0x00u8; 32]).into(),
             )
@@ -1233,7 +1243,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -1245,8 +1255,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_single_block_range() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 42,
@@ -1259,7 +1269,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
 
@@ -1270,8 +1280,8 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_database_failure() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1284,7 +1294,7 @@ mod tests {
             uint!(9_000_000_000_000_000_000_U256),
         );
         let take_log = create_test_log(
-            evm_env.orderbook,
+            evm_ctx.orderbook,
             &take_event,
             50,
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"),
@@ -1300,19 +1310,19 @@ mod tests {
         pool.close().await;
 
         let result =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy()).await;
 
         // Should succeed at RPC level but fail at database level
         // The function handles enqueue failures gracefully by continuing
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0); // No events successfully enqueued
+        let enqueued = result.unwrap();
+        assert_eq!(enqueued, 0); // No events successfully enqueued
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_filter_creation() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1326,15 +1336,15 @@ mod tests {
 
         // Test with specific block range
         let result =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 150, test_retry_strategy()).await;
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 150, test_retry_strategy()).await;
         assert_eq!(result.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_partial_enqueue_failure() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1355,13 +1365,13 @@ mod tests {
         );
 
         let take_log1 = create_test_log(
-            evm_env.orderbook,
+            evm_ctx.orderbook,
             &take_event1,
             50,
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"),
         );
         let take_log2 = create_test_log(
-            evm_env.orderbook,
+            evm_ctx.orderbook,
             &take_event2,
             51,
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222"),
@@ -1374,18 +1384,17 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy()).await;
 
-        // Should succeed with 2 events enqueued
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 2);
+        let enqueued = result.unwrap();
+        assert_eq!(enqueued, 2);
     }
 
     #[tokio::test]
     async fn test_backfill_events_concurrent_batch_processing() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1398,7 +1407,7 @@ mod tests {
             uint!(9_000_000_000_000_000_000_U256),
         );
         let take_log = create_test_log(
-            evm_env.orderbook,
+            evm_ctx.orderbook,
             &take_event,
             50,
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"),
@@ -1422,7 +1431,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 3000)
+        backfill_events(&pool, &provider, &evm_ctx, 3000)
             .await
             .unwrap();
 
@@ -1433,8 +1442,8 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_retry_exponential_backoff() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1452,12 +1461,11 @@ mod tests {
 
         let start_time = std::time::Instant::now();
         let result =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy()).await;
         let elapsed = start_time.elapsed();
 
-        // Should succeed after retries
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
+        let enqueued = result.unwrap();
+        assert_eq!(enqueued, 0);
 
         // Should have taken at least the test initial delay time due to retries
         assert!(elapsed >= Duration::from_millis(1));
@@ -1466,8 +1474,8 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_zero_blocks() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 100,
@@ -1477,8 +1485,9 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result = backfill_events(&pool, &provider, &evm_env, 50).await;
-        assert!(result.is_ok());
+        backfill_events(&pool, &provider, &evm_ctx, 50)
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 0);
@@ -1487,8 +1496,8 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_mixed_log_types() {
         let pool = setup_test_db().await;
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1513,7 +1522,7 @@ mod tests {
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
+                address: evm_ctx.orderbook,
                 data: clear_event.to_log_data(),
             },
             block_hash: None,
@@ -1534,7 +1543,7 @@ mod tests {
             uint!(9_000_000_000_000_000_000_U256),
         );
         let take_log = create_test_log(
-            evm_env.orderbook,
+            evm_ctx.orderbook,
             &take_event,
             51,
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222"),
@@ -1547,11 +1556,10 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result =
-            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
+            enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy()).await;
 
-        // Should process both event types
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 2);
+        let enqueued = result.unwrap();
+        assert_eq!(enqueued, 2);
 
         // Verify both events were enqueued
         let count = count_unprocessed(&pool).await.unwrap();
@@ -1573,8 +1581,8 @@ mod tests {
         .await
         .unwrap();
 
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50, // Earlier than processed block
@@ -1588,7 +1596,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         // Should start from block 101 (last processed + 1), not deployment_block
-        backfill_events(&pool, &provider, &evm_env, 200)
+        backfill_events(&pool, &provider, &evm_ctx, 200)
             .await
             .unwrap();
     }
@@ -1597,8 +1605,8 @@ mod tests {
     async fn test_backfill_initial_run_starts_from_deployment() {
         let pool = setup_test_db().await;
 
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50,
@@ -1611,7 +1619,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100)
+        backfill_events(&pool, &provider, &evm_ctx, 100)
             .await
             .unwrap();
     }
@@ -1631,8 +1639,8 @@ mod tests {
         .await
         .unwrap();
 
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50,
@@ -1643,7 +1651,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         // Last processed: 150, end_block: 150, so start would be 151 > 150
-        backfill_events(&pool, &provider, &evm_env, 150)
+        backfill_events(&pool, &provider, &evm_ctx, 150)
             .await
             .unwrap();
     }
@@ -1667,8 +1675,8 @@ mod tests {
         .await
         .unwrap();
 
-        let evm_env = EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
@@ -1681,7 +1689,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 200)
+        backfill_events(&pool, &provider, &evm_ctx, 200)
             .await
             .unwrap();
     }

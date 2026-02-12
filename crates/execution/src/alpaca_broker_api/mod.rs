@@ -12,7 +12,7 @@ mod market_hours;
 mod order;
 mod positions;
 
-pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+pub use auth::{AccountStatus, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use order::{ConversionDirection, CryptoOrderResponse};
 

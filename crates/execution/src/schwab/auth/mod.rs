@@ -13,7 +13,7 @@ pub(crate) mod view;
 
 pub use cmd::{AccessToken, RefreshToken, SchwabAuthCommand};
 pub use event::SchwabAuthEvent;
-pub use oauth::SchwabAuthEnv;
+pub(crate) use oauth::SchwabAuthCtx;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchwabAuth {
@@ -266,11 +266,11 @@ mod tests {
             new_access_token: cmd::AccessToken::new("new_access".to_string()),
         };
 
-        let result = aggregate.handle(command, &encryption_key).await;
-        assert!(matches!(
-            result.unwrap_err(),
-            SchwabAuthError::NotAuthenticated
-        ));
+        let error = aggregate
+            .handle(command, &encryption_key)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SchwabAuthError::NotAuthenticated));
     }
 
     #[test]

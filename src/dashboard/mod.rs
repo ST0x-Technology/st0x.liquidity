@@ -1,74 +1,16 @@
+//! WebSocket-based dashboard for real-time server state streaming.
+
 use futures_util::SinkExt;
 use rocket::{Route, State, get, routes};
 use rocket_ws::{Channel, Message, WebSocket};
-use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::warn;
-use ts_rs::TS;
 
-mod auth;
-mod circuit_breaker;
+use st0x_dto::{InitialState, ServerMessage};
+
 mod event;
-mod inventory;
-mod performance;
-mod position;
-mod rebalance;
-mod spread;
-mod trade;
-mod ts;
 
 pub(crate) use event::EventBroadcaster;
-pub use ts::export_bindings;
-
-use auth::AuthStatus;
-use circuit_breaker::CircuitBreakerStatus;
-use event::EventStoreEntry;
-use inventory::Inventory;
-use performance::PerformanceMetrics;
-use rebalance::RebalanceOperation;
-use spread::SpreadSummary;
-use trade::Trade;
-
-/// Messages sent from the server to WebSocket clients.
-///
-/// Note: Variants for future message types (trades, positions, metrics, etc.)
-/// will be added as their respective dashboard panels are implemented.
-#[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub(crate) enum ServerMessage {
-    Initial(Box<InitialState>),
-    Event(EventStoreEntry),
-}
-
-#[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct InitialState {
-    recent_trades: Vec<Trade>,
-    inventory: Inventory,
-    metrics: PerformanceMetrics,
-    spreads: Vec<SpreadSummary>,
-    active_rebalances: Vec<RebalanceOperation>,
-    recent_rebalances: Vec<RebalanceOperation>,
-    auth_status: AuthStatus,
-    circuit_breaker: CircuitBreakerStatus,
-}
-
-impl InitialState {
-    pub(crate) fn stub() -> Self {
-        Self {
-            recent_trades: Vec::new(),
-            inventory: Inventory::empty(),
-            metrics: PerformanceMetrics::zero(),
-            spreads: Vec::new(),
-            active_rebalances: Vec::new(),
-            recent_rebalances: Vec::new(),
-            auth_status: AuthStatus::NotConfigured,
-            circuit_breaker: CircuitBreakerStatus::Active,
-        }
-    }
-}
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
@@ -138,6 +80,7 @@ mod tests {
     use futures_util::future::join_all;
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
+    use st0x_dto::EventStoreEntry;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
 

@@ -1,3 +1,8 @@
+//! Thread-safe cache for ERC20 token symbol lookups.
+//!
+//! Prevents repeated RPC calls by caching the mapping from token addresses
+//! to their symbol strings.
+
 use alloy::{primitives::Address, providers::Provider};
 use backon::{ExponentialBuilder, Retryable};
 use std::{
@@ -6,7 +11,7 @@ use std::{
 };
 
 use crate::bindings::{IERC20::IERC20Instance, IOrderBookV5::IOV2};
-use crate::error::OnChainError;
+use crate::onchain::OnChainError;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SymbolCache {
@@ -50,7 +55,7 @@ impl SymbolCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
+    use alloy::primitives::{B256, address};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
 
     #[tokio::test]
@@ -66,13 +71,12 @@ mod tests {
 
         let io = IOV2 {
             token: address,
-            vaultId: alloy::primitives::B256::ZERO,
+            vaultId: B256::ZERO,
         };
 
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let result = cache.get_io_symbol(provider, &io).await.unwrap();
-        assert_eq!(result, "TEST");
+        assert_eq!(cache.get_io_symbol(provider, &io).await.unwrap(), "TEST");
     }
 
     #[tokio::test]
@@ -82,16 +86,15 @@ mod tests {
 
         let io = IOV2 {
             token: address,
-            vaultId: alloy::primitives::B256::ZERO,
+            vaultId: B256::ZERO,
         };
 
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let result = cache.get_io_symbol(provider, &io).await;
         assert!(matches!(
-            result.unwrap_err(),
-            OnChainError::Alloy(crate::error::AlloyError::GetSymbol(_))
+            cache.get_io_symbol(provider, &io).await.unwrap_err(),
+            OnChainError::Alloy(crate::onchain::AlloyError::GetSymbol(_))
         ));
     }
 }

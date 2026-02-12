@@ -4,16 +4,16 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use tracing::{error, info};
 
-use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens, extract_code_from_url};
+use st0x_execution::{SchwabError, extract_code_from_url};
 
-use crate::env::BrokerConfig;
+use crate::config::{BrokerCtx, SchwabAuth};
 
 pub(super) async fn auth_command<W: Write>(
     stdout: &mut W,
-    broker: &BrokerConfig,
+    broker: &BrokerCtx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::Schwab(schwab_auth) = broker else {
+    let BrokerCtx::Schwab(schwab_auth) = broker else {
         anyhow::bail!("Auth command is only supported for Schwab broker")
     };
 
@@ -52,16 +52,17 @@ pub(super) async fn auth_command<W: Write>(
 
 pub(super) async fn ensure_schwab_authentication<W: Write>(
     pool: &SqlitePool,
-    broker: &BrokerConfig,
+    broker: &BrokerCtx,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::Schwab(schwab_auth) = broker else {
+    let BrokerCtx::Schwab(schwab_auth) = broker else {
         anyhow::bail!("Authentication is only required for Schwab broker")
     };
 
     writeln!(stdout, "Refreshing authentication tokens if needed")?;
 
-    match SchwabTokens::get_valid_access_token(pool, schwab_auth).await {
+    let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
+    match schwab_ctx.get_valid_access_token().await {
         Ok(_access_token) => {
             info!("Authentication tokens are valid, access token obtained");
             Ok(())
@@ -73,10 +74,12 @@ pub(super) async fn ensure_schwab_authentication<W: Write>(
     }
 }
 
-async fn run_oauth_flow(pool: &SqlitePool, schwab_auth: &SchwabAuthEnv) -> Result<(), SchwabError> {
+async fn run_oauth_flow(pool: &SqlitePool, schwab_auth: &SchwabAuth) -> Result<(), SchwabError> {
+    let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
+
     println!(
         "Authenticate portfolio brokerage account (not dev account) and paste URL: {}",
-        schwab_auth.get_auth_url()
+        schwab_ctx.get_auth_url()?
     );
     print!("Paste the full redirect URL you were sent to: ");
     std::io::stdout().flush()?;
@@ -88,7 +91,7 @@ async fn run_oauth_flow(pool: &SqlitePool, schwab_auth: &SchwabAuthEnv) -> Resul
     let code = extract_code_from_url(redirect_url)?;
     println!("Extracted code: {code}");
 
-    let tokens = schwab_auth.get_tokens_from_code(&code).await?;
+    let tokens = schwab_ctx.get_tokens_from_code(&code).await?;
     tokens.store(pool, &schwab_auth.encryption_key).await?;
 
     Ok(())
@@ -99,57 +102,60 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
+    use url::Url;
+
+    use st0x_execution::SchwabTokens;
 
     use super::*;
-    use crate::env::{Config, LogLevel};
-    use crate::onchain::EvmEnv;
+    use crate::config::{Ctx, LogLevel};
+    use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuthEnv) {
-        let schwab_auth = SchwabAuthEnv {
-            schwab_app_key: "test_app_key".to_string(),
-            schwab_app_secret: "test_app_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: mock_server.base_url(),
-            schwab_account_index: 0,
+    fn create_schwab_ctx(mock_server: &MockServer) -> (Ctx, SchwabAuth) {
+        let schwab_auth = SchwabAuth {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
+            base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+            account_index: Some(0),
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
-        let config = Config {
+        let ctx = Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+            evm: EvmCtx {
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(schwab_auth.clone()),
-            hyperdx: None,
+            broker: BrokerCtx::Schwab(schwab_auth.clone()),
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         };
 
-        (config, schwab_auth)
+        (ctx, schwab_auth)
     }
 
     #[tokio::test]
     async fn test_ensure_auth_with_valid_tokens() {
         let server = MockServer::start();
-        let (config, schwab_auth) = create_schwab_config(&server);
+        let (ctx, schwab_auth) = create_schwab_ctx(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, &schwab_auth).await;
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &config.broker, &mut stdout).await;
-
-        assert!(result.is_ok());
+        let () = ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+            .await
+            .unwrap();
         let output = String::from_utf8(stdout).unwrap();
         assert!(output.contains("Refreshing authentication tokens"));
     }
@@ -157,7 +163,7 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_auth_with_expired_access_token_refreshes() {
         let server = MockServer::start();
-        let (config, schwab_auth) = create_schwab_config(&server);
+        let (ctx, schwab_auth) = create_schwab_ctx(&server);
         let pool = setup_test_db().await;
 
         let expired_access_tokens = SchwabTokens {
@@ -187,16 +193,16 @@ mod tests {
         });
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &config.broker, &mut stdout).await;
-
-        assert!(result.is_ok());
+        let () = ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+            .await
+            .unwrap();
         refresh_mock.assert();
     }
 
     #[tokio::test]
     async fn test_ensure_auth_with_expired_refresh_token_returns_error() {
         let server = MockServer::start();
-        let (config, schwab_auth) = create_schwab_config(&server);
+        let (ctx, schwab_auth) = create_schwab_ctx(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -211,10 +217,11 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &config.broker, &mut stdout).await;
-
         assert!(matches!(
-            result.unwrap_err().downcast_ref::<SchwabError>(),
+            ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+                .await
+                .unwrap_err()
+                .downcast_ref::<SchwabError>(),
             Some(SchwabError::RefreshTokenExpired)
         ));
     }
@@ -222,12 +229,14 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_auth_rejects_non_schwab_broker() {
         let pool = setup_test_db().await;
-        let broker = BrokerConfig::DryRun;
+        let broker = BrokerCtx::DryRun;
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &broker, &mut stdout).await;
 
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = ensure_schwab_authentication(&pool, &broker, &mut stdout)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("only required for Schwab"),
             "Expected Schwab-only error, got: {err_msg}"
@@ -237,15 +246,17 @@ mod tests {
     #[tokio::test]
     async fn test_auth_command_rejects_non_schwab_broker() {
         let pool = setup_test_db().await;
-        let broker = BrokerConfig::DryRun;
+        let broker = BrokerCtx::DryRun;
 
         let mut stdout = Vec::new();
-        let result = auth_command(&mut stdout, &broker, &pool).await;
+        let err_msg = auth_command(&mut stdout, &broker, &pool)
+            .await
+            .unwrap_err()
+            .to_string();
 
-        let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("only supported for Schwab"),
-            "Expected Schwab-only error, got: {err_msg}"
+            "Expected Schwab-only error"
         );
     }
 }

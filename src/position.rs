@@ -1,4 +1,9 @@
-//! Position aggregate for tracking onchain/offchain exposure.
+//! Position CQRS/ES aggregate for tracking per-symbol
+//! onchain/offchain exposure.
+//!
+//! Accumulates long and short fills, tracks the net
+//! position, and decides when the imbalance exceeds the
+//! threshold to trigger an offsetting broker order.
 
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
@@ -6,8 +11,9 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
 use tracing::warn;
+
+use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
@@ -721,9 +727,10 @@ pub(crate) enum TriggerReason {
 mod tests {
     use cqrs_es::test::TestFramework;
     use rust_decimal_macros::dec;
-    use st0x_execution::Positive;
     use std::collections::HashMap;
     use std::str::FromStr;
+
+    use st0x_execution::Positive;
 
     use super::*;
     use crate::threshold::Usdc;
@@ -1765,10 +1772,8 @@ mod tests {
             last_price_usdc: None,
         };
 
-        let result = position.handle(command, &()).await;
-
         assert!(matches!(
-            result,
+            position.handle(command, &()).await,
             Err(PositionError::State(LifecycleError::AlreadyInitialized))
         ));
     }
@@ -1786,11 +1791,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::Schwab)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
             shares.inner(),
@@ -1813,11 +1818,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::Schwab)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Buy);
         assert_eq!(
             shares.inner(),
@@ -1840,11 +1845,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
             shares.inner(),
@@ -1867,11 +1872,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Buy);
         assert_eq!(
             shares.inner(),

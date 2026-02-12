@@ -1,0 +1,55 @@
+name: Deploy
+
+on:
+  # Temporarily disabled during live testing - manual deploys only
+  # push:
+  #   branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+# Setting any permission drops all others to "none" by default,
+# so we explicitly list every permission we need.
+permissions:
+  # Required by magic-nix-cache-action to authenticate
+  # with the GitHub Actions cache API.
+  id-token: write
+
+  # check out the repository
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Trust host key
+        run: |
+          host_key=$(nix eval --raw --file keys.nix keys.host)
+          echo "* $host_key" > ~/.ssh/known_hosts
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
+
+      - name: Mask host IP
+        run: echo "::add-mask::$(nix run .#resolveIp)"
+
+      - name: Build and deploy
+        run: nix run .#deployAll

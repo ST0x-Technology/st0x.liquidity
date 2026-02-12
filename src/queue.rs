@@ -1,18 +1,23 @@
+//! Idempotent event queue for buffering and sequencing blockchain
+//! events before processing. Provides [`Enqueueable`] for converting
+//! raw DEX events into [`QueuedEvent`]s, and functions to enqueue,
+//! retrieve, and mark events as processed.
+
 use alloy::primitives::B256;
 use alloy::rpc::types::Log;
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::num::TryFromIntError;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
-use crate::error::EventQueueError;
 use crate::onchain::trade::TradeEvent;
 
 /// Trait for events that can be enqueued
-pub trait Enqueueable {
+pub(crate) trait Enqueueable {
     fn to_trade_event(&self) -> TradeEvent;
 }
 
@@ -39,67 +44,6 @@ pub(crate) struct QueuedEvent {
     pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) processed_at: Option<DateTime<Utc>>,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
-}
-
-async fn enqueue_event(
-    pool: &SqlitePool,
-    log: &Log,
-    event: TradeEvent,
-) -> Result<(), EventQueueError> {
-    let tx_hash = log
-        .transaction_hash
-        .ok_or(EventQueueError::MissingLogField("transaction_hash"))?;
-
-    let log_index = log
-        .log_index
-        .ok_or(EventQueueError::MissingLogField("log_index"))?;
-
-    let log_index_i64 = i64::try_from(log_index)?;
-
-    let block_number = log
-        .block_number
-        .ok_or(EventQueueError::MissingLogField("block_number"))?;
-
-    let block_number_i64 = i64::try_from(block_number)?;
-
-    let tx_hash_str = format!("{tx_hash:#x}");
-    let event_json = serde_json::to_string(&event)?;
-
-    let block_timestamp_naive = log.block_timestamp.and_then(|ts| {
-        let Ok(ts_i64) = i64::try_from(ts) else {
-            warn!(
-                "Block timestamp {ts} exceeds i64::MAX, storing NULL for tx {tx_hash:#x} log_index {log_index}"
-            );
-            return None;
-        };
-
-        DateTime::from_timestamp(ts_i64, 0).map_or_else(
-            || {
-                warn!(
-                    "Invalid block timestamp {ts_i64}, storing NULL for tx {tx_hash:#x} log_index {log_index}"
-                );
-                None
-            },
-            |dt| Some(dt.naive_utc()),
-        )
-    });
-
-    sqlx::query!(
-        r#"
-        INSERT OR IGNORE INTO event_queue
-        (tx_hash, log_index, block_number, event_data, processed, block_timestamp)
-        VALUES (?, ?, ?, ?, 0, ?)
-        "#,
-        tx_hash_str,
-        log_index_i64,
-        block_number_i64,
-        event_json,
-        block_timestamp_naive
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
 }
 
 /// Gets the next unprocessed event from the queue, ordered by block number then log index
@@ -182,7 +126,11 @@ pub(crate) async fn enqueue<E: Enqueueable>(
 }
 
 /// Enqueues buffered events that were collected during coordination phase
-#[tracing::instrument(skip(pool, event_buffer), fields(buffer_size = event_buffer.len()), level = tracing::Level::INFO)]
+#[tracing::instrument(
+    skip(pool, event_buffer),
+    fields(buffer_size = event_buffer.len()),
+    level = tracing::Level::INFO,
+)]
 pub(crate) async fn enqueue_buffer(
     pool: &sqlx::SqlitePool,
     event_buffer: Vec<(TradeEvent, alloy::rpc::types::Log)>,
@@ -241,6 +189,85 @@ pub(crate) async fn get_max_processed_block(
     let block_u64 = u64::try_from(block)?;
 
     Ok(Some(block_u64))
+}
+
+/// Event queue persistence and processing errors.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EventQueueError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Log missing required field: {0}")]
+    MissingLogField(&'static str),
+    #[error("Queued event missing ID")]
+    MissingEventId,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] TryFromIntError),
+    #[error("Event serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Invalid tx_hash format: {0}")]
+    InvalidTxHash(#[from] alloy::hex::FromHexError),
+}
+
+async fn enqueue_event(
+    pool: &SqlitePool,
+    log: &Log,
+    event: TradeEvent,
+) -> Result<(), EventQueueError> {
+    let tx_hash = log
+        .transaction_hash
+        .ok_or(EventQueueError::MissingLogField("transaction_hash"))?;
+
+    let log_index = log
+        .log_index
+        .ok_or(EventQueueError::MissingLogField("log_index"))?;
+
+    let log_index_i64 = i64::try_from(log_index)?;
+
+    let block_number = log
+        .block_number
+        .ok_or(EventQueueError::MissingLogField("block_number"))?;
+
+    let block_number_i64 = i64::try_from(block_number)?;
+    let tx_hash_str = format!("{tx_hash:#x}");
+    let event_json = serde_json::to_string(&event)?;
+
+    let block_timestamp_naive = log.block_timestamp.and_then(|ts| {
+        let Ok(ts_i64) = i64::try_from(ts) else {
+            warn!(
+                "Block timestamp {ts} exceeds i64::MAX, storing NULL for \
+                 tx {tx_hash:#x} log_index {log_index}"
+            );
+            return None;
+        };
+
+        DateTime::from_timestamp(ts_i64, 0).map_or_else(
+            || {
+                warn!(
+                    "Invalid block timestamp {ts_i64}, storing NULL for \
+                     tx {tx_hash:#x} log_index {log_index}"
+                );
+                None
+            },
+            |dt| Some(dt.naive_utc()),
+        )
+    });
+
+    sqlx::query!(
+        r#"
+        INSERT OR IGNORE INTO event_queue
+        (tx_hash, log_index, block_number, event_data, processed, block_timestamp)
+        VALUES (?, ?, ?, ?, 0, ?)
+        "#,
+        tx_hash_str,
+        log_index_i64,
+        block_number_i64,
+        event_json,
+        block_timestamp_naive
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -341,8 +368,8 @@ mod tests {
         let test_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log.inner.address,
             config: TakeOrderConfigV4::default(),
-            input: alloy::primitives::B256::ZERO,
-            output: alloy::primitives::B256::ZERO,
+            input: B256::ZERO,
+            output: B256::ZERO,
         }));
 
         // Enqueue same event twice
@@ -454,8 +481,8 @@ mod tests {
         let take_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log2.inner.address,
             config: TakeOrderConfigV4::default(),
-            input: alloy::primitives::B256::ZERO,
-            output: alloy::primitives::B256::ZERO,
+            input: B256::ZERO,
+            output: B256::ZERO,
         }));
 
         let event_buffer = vec![(clear_event, log1), (take_event, log2)];

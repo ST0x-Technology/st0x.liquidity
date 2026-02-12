@@ -1,4 +1,8 @@
-//! OnChainTrade aggregate for tracking blockchain trades.
+//! OnChainTrade CQRS/ES aggregate for recording DEX fills
+//! from the Raindex orderbook.
+//!
+//! Keyed by `(tx_hash, log_index)`. Can be enriched after
+//! the fact with gas costs and Pyth oracle price data.
 
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
@@ -433,9 +437,10 @@ mod tests {
             pyth_price,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyEnriched)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyEnriched)
+        ));
     }
 
     #[tokio::test]
@@ -455,9 +460,10 @@ mod tests {
             pyth_price,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::NotFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::NotFilled)
+        ));
     }
 
     #[tokio::test]
@@ -545,9 +551,10 @@ mod tests {
             block_timestamp: now,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyFilled)
+        ));
     }
 
     #[tokio::test]
@@ -590,9 +597,10 @@ mod tests {
             block_timestamp: now,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyFilled)
+        ));
     }
 
     #[test]
@@ -863,8 +871,9 @@ mod tests {
             pyth_price: None,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyFilled)
+        ));
     }
 }

@@ -1,3 +1,6 @@
+//! Dual-writes offchain order aggregate commands to both
+//! CQRS/ES and legacy SQLite tables.
+
 use st0x_execution::{FractionalShares, OrderState, PersistenceError};
 use tracing::info;
 
@@ -145,8 +148,7 @@ mod tests {
             state: OrderState::Pending,
         };
 
-        let result = place_order(&context, &execution).await;
-        assert!(result.is_ok());
+        place_order(&context, &execution).await.unwrap();
 
         let event_count = sqlx::query_scalar!(
             "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '1'"
@@ -182,13 +184,8 @@ mod tests {
             state: OrderState::Pending,
         };
 
-        let result = place_order(&context, &execution).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DualWriteError::MissingExecutionId
-        ));
+        let error = place_order(&context, &execution).await.unwrap_err();
+        assert!(matches!(error, DualWriteError::MissingExecutionId));
     }
 
     #[tokio::test]
@@ -223,8 +220,9 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        let result = confirm_submission(&context, execution_id, BrokerOrderId::new("ORD123")).await;
-        assert!(result.is_ok());
+        confirm_submission(&context, execution_id, BrokerOrderId::new("ORD123"))
+            .await
+            .unwrap();
 
         let event_count = sqlx::query_scalar!(
             "SELECT COUNT(*) FROM events \
@@ -290,8 +288,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = record_fill(&context, &execution).await;
-        assert!(result.is_ok());
+        record_fill(&context, &execution).await.unwrap();
 
         let event_type = sqlx::query_scalar!(
             "SELECT event_type FROM events \
@@ -321,13 +318,8 @@ mod tests {
             state: OrderState::Pending,
         };
 
-        let result = record_fill(&context, &execution).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DualWriteError::InvalidOrderState { .. }
-        ));
+        let error = record_fill(&context, &execution).await.unwrap_err();
+        assert!(matches!(error, DualWriteError::InvalidOrderState { .. }));
     }
 
     #[tokio::test]
@@ -347,8 +339,9 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        let result = mark_failed(&context, 5, "Broker API timeout".to_string()).await;
-        assert!(result.is_ok());
+        mark_failed(&context, 5, "Broker API timeout".to_string())
+            .await
+            .unwrap();
 
         let event_type = sqlx::query_scalar!(
             "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '5' ORDER BY sequence DESC LIMIT 1"
@@ -557,14 +550,11 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let result =
-            confirm_submission(&context, execution_id, BrokerOrderId::new("ORD-FAIL")).await;
-
+        let error = confirm_submission(&context, execution_id, BrokerOrderId::new("ORD-FAIL"))
+            .await
+            .unwrap_err();
         assert!(
-            matches!(
-                result.unwrap_err(),
-                DualWriteError::OffchainOrderAggregate(_)
-            ),
+            matches!(error, DualWriteError::OffchainOrderAggregate(_)),
             "ES should fail because place_order was never called"
         );
 
@@ -608,15 +598,15 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        let result = confirm_submission(
+        let error = confirm_submission(
             &context,
             nonexistent_execution_id,
             BrokerOrderId::new("ORD-ORPHAN"),
         )
-        .await;
-
+        .await
+        .unwrap_err();
         assert!(
-            matches!(result.unwrap_err(), DualWriteError::Persistence(_)),
+            matches!(error, DualWriteError::Persistence(_)),
             "Should fail with RowNotFound when legacy row doesn't exist"
         );
 
@@ -683,11 +673,10 @@ mod tests {
         assert_eq!(legacy_row.status, "SUBMITTED");
         assert_eq!(legacy_row.order_id.unwrap(), "ORD-SUCCESS");
 
-        let result =
-            confirm_submission(&context, execution_id, BrokerOrderId::new("ORD-DUPLICATE")).await;
-
         assert!(
-            result.is_err(),
+            confirm_submission(&context, execution_id, BrokerOrderId::new("ORD-DUPLICATE"))
+                .await
+                .is_err(),
             "Second confirm_submission should fail at ES level (invalid state transition)"
         );
 

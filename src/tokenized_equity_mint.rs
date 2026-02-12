@@ -1,8 +1,8 @@
-//! Tokenized Equity Mint aggregate for converting offchain Alpaca shares to onchain tokens.
+//! Aggregate modeling the lifecycle of minting tokenized
+//! equities from underlying Alpaca shares.
 //!
-//! This module implements the CQRS-ES aggregate pattern for managing the asynchronous workflow
-//! of minting tokenized equity shares. It tracks the complete lifecycle from requesting a mint
-//! through Alpaca's tokenization API to receiving the onchain tokens.
+//! Tracks the workflow from requesting a mint through
+//! Alpaca's tokenization API to receiving onchain tokens.
 //!
 //! # State Flow
 //!
@@ -28,9 +28,12 @@
 //!
 //! The mint process integrates with Alpaca's tokenization API:
 //!
-//! 1. **Request**: System initiates mint request with symbol, quantity, and destination wallet
-//! 2. **Acceptance**: Alpaca responds with `issuer_request_id` and `tokenization_request_id`
-//! 3. **Transfer**: Alpaca executes onchain transfer, system detects transaction
+//! 1. **Request**: System initiates mint request with symbol,
+//!    quantity, and destination wallet
+//! 2. **Acceptance**: Alpaca responds with `issuer_request_id` and
+//!    `tokenization_request_id`
+//! 3. **Transfer**: Alpaca executes onchain transfer, system detects
+//!    transaction
 //! 4. **Completion**: System verifies receipt and finalizes mint
 //!
 //! # Error Handling

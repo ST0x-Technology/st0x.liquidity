@@ -1,9 +1,11 @@
+use alloy::primitives::FixedBytes;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
+use url::Url;
 
-use crate::schwab::SchwabAuthEnv;
+use crate::schwab::SchwabAuthCtx;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
@@ -11,35 +13,77 @@ use crate::{
     OrderStatus, OrderUpdate, Positive, Symbol, TryIntoExecutor,
 };
 
-/// Configuration for SchwabExecutor containing auth environment and database pool
+/// Everything the Schwab executor needs to initialize: auth credentials,
+/// endpoint configuration, and database pool for token storage.
 #[derive(Debug, Clone)]
-pub struct SchwabConfig {
-    pub auth: SchwabAuthEnv,
+pub struct SchwabCtx {
+    pub app_key: String,
+    pub app_secret: String,
+    pub redirect_uri: Option<Url>,
+    pub base_url: Option<Url>,
+    pub account_index: Option<usize>,
+    pub encryption_key: FixedBytes<32>,
     pub pool: SqlitePool,
+}
+
+impl SchwabCtx {
+    fn to_auth_ctx(&self) -> SchwabAuthCtx {
+        SchwabAuthCtx {
+            app_key: self.app_key.clone(),
+            app_secret: self.app_secret.clone(),
+            redirect_uri: self.redirect_uri.clone(),
+            base_url: self.base_url.clone(),
+            account_index: self.account_index,
+            encryption_key: self.encryption_key,
+        }
+    }
+
+    pub fn get_auth_url(&self) -> Result<String, super::SchwabError> {
+        self.to_auth_ctx().get_auth_url()
+    }
+
+    pub async fn get_tokens_from_code(
+        &self,
+        code: &str,
+    ) -> Result<SchwabTokens, super::SchwabError> {
+        self.to_auth_ctx().get_tokens_from_code(code).await
+    }
+
+    pub async fn get_valid_access_token(&self) -> Result<String, super::SchwabError> {
+        SchwabTokens::get_valid_access_token(&self.pool, &self.to_auth_ctx()).await
+    }
 }
 
 /// Schwab executor implementation
 #[derive(Debug, Clone)]
-pub struct SchwabExecutor {
-    auth: SchwabAuthEnv,
+pub struct Schwab {
+    auth: SchwabAuthCtx,
     pool: SqlitePool,
 }
 
 #[async_trait]
-impl Executor for SchwabExecutor {
+impl Executor for Schwab {
     type Error = ExecutionError;
     type OrderId = String;
-    type Config = SchwabConfig;
+    type Ctx = SchwabCtx;
 
-    async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
-        // Validate and refresh tokens during initialization
-        SchwabTokens::refresh_if_needed(&config.pool, &config.auth).await?;
+    async fn try_from_ctx(ctx: Self::Ctx) -> Result<Self, Self::Error> {
+        let auth = SchwabAuthCtx {
+            app_key: ctx.app_key,
+            app_secret: ctx.app_secret,
+            redirect_uri: ctx.redirect_uri,
+            base_url: ctx.base_url,
+            account_index: ctx.account_index,
+            encryption_key: ctx.encryption_key,
+        };
+
+        SchwabTokens::refresh_if_needed(&ctx.pool, &auth).await?;
 
         info!("Schwab executor initialized with valid tokens");
 
         Ok(Self {
-            auth: config.auth,
-            pool: config.pool,
+            auth,
+            pool: ctx.pool,
         })
     }
 
@@ -236,7 +280,7 @@ impl Executor for SchwabExecutor {
     }
 
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
-        // For SchwabExecutor, OrderId is String, so just clone the input
+        // For Schwab, OrderId is String, so just clone the input
         Ok(order_id_str.to_string())
     }
 
@@ -263,13 +307,13 @@ impl Executor for SchwabExecutor {
 }
 
 #[async_trait]
-impl TryIntoExecutor for SchwabConfig {
-    type Executor = SchwabExecutor;
+impl TryIntoExecutor for SchwabCtx {
+    type Executor = Schwab;
 
     async fn try_into_executor(
         self,
     ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        SchwabExecutor::try_from_config(self).await
+        Schwab::try_from_ctx(self).await
     }
 }
 
@@ -277,49 +321,61 @@ impl TryIntoExecutor for SchwabConfig {
 mod tests {
     use super::*;
     use crate::schwab::tokens::SchwabTokens;
-    use crate::schwab::{SchwabAuthEnv, SchwabError};
+    use crate::schwab::{SchwabAuthCtx, SchwabError};
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
     use sqlx::SqlitePool;
 
-    fn create_test_auth_env() -> SchwabAuthEnv {
-        SchwabAuthEnv {
-            schwab_app_key: "test_key".to_string(),
-            schwab_app_secret: "test_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: "https://test.com".to_string(),
-            schwab_account_index: 0,
+    fn create_test_auth_env() -> SchwabAuthCtx {
+        SchwabAuthCtx {
+            app_key: "test_key".to_string(),
+            app_secret: "test_secret".to_string(),
+            redirect_uri: None,
+            base_url: Some(url::Url::parse("https://test.com").expect("test url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         }
     }
 
-    fn create_test_auth_env_with_server(server: &MockServer) -> SchwabAuthEnv {
-        SchwabAuthEnv {
-            schwab_app_key: "test_key".to_string(),
-            schwab_app_secret: "test_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: server.base_url(),
-            schwab_account_index: 0,
+    fn create_test_auth_env_with_server(server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
+            app_key: "test_key".to_string(),
+            app_secret: "test_secret".to_string(),
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
+        }
+    }
+
+    fn create_test_ctx(auth: SchwabAuthCtx, pool: SqlitePool) -> SchwabCtx {
+        SchwabCtx {
+            app_key: auth.app_key,
+            app_secret: auth.app_secret,
+            redirect_uri: auth.redirect_uri,
+            base_url: auth.base_url,
+            account_index: auth.account_index,
+            encryption_key: auth.encryption_key,
+            pool,
         }
     }
 
     #[tokio::test]
-    async fn test_try_from_config_with_no_tokens() {
+    async fn test_try_from_ctx_with_no_tokens() {
         let pool = setup_test_db().await;
         let auth = create_test_auth_env();
-        let config = SchwabConfig { auth, pool };
+        let ctx = create_test_ctx(auth, pool);
 
-        let result = SchwabExecutor::try_from_config(config).await;
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
+        assert!(matches!(
+            Schwab::try_from_ctx(ctx).await.unwrap_err(),
+            ExecutionError::Schwab(_)
+        ));
     }
 
     #[tokio::test]
-    async fn test_try_from_config_with_valid_tokens() {
+    async fn test_try_from_ctx_with_valid_tokens() {
         let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
@@ -336,16 +392,14 @@ mod tests {
             .await
             .unwrap();
 
-        let config = SchwabConfig { auth, pool };
-        let result = SchwabExecutor::try_from_config(config).await;
+        let ctx = create_test_ctx(auth, pool);
 
-        assert!(result.is_ok());
-        let broker = result.unwrap();
-        assert_eq!(broker.auth.schwab_app_key, "test_key");
+        let broker = Schwab::try_from_ctx(ctx).await.unwrap();
+        assert_eq!(broker.auth.app_key, "test_key");
     }
 
     #[tokio::test]
-    async fn test_try_from_config_with_expired_access_token_valid_refresh() {
+    async fn test_try_from_ctx_with_expired_access_token_valid_refresh() {
         let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
@@ -379,13 +433,9 @@ mod tests {
                 }));
         });
 
-        let config = SchwabConfig {
-            auth,
-            pool: pool.clone(),
-        };
-        let result = SchwabExecutor::try_from_config(config).await;
+        let ctx = create_test_ctx(auth, pool.clone());
 
-        assert!(result.is_ok());
+        Schwab::try_from_ctx(ctx).await.unwrap();
         refresh_mock.assert();
 
         // Verify tokens were updated
@@ -397,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_config_with_expired_refresh_token() {
+    async fn test_try_from_ctx_with_expired_refresh_token() {
         let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
@@ -414,12 +464,10 @@ mod tests {
             .await
             .unwrap();
 
-        let config = SchwabConfig { auth, pool };
-        let result = SchwabExecutor::try_from_config(config).await;
+        let ctx = create_test_ctx(auth, pool);
 
-        assert!(result.is_err());
         assert!(matches!(
-            result.unwrap_err(),
+            Schwab::try_from_ctx(ctx).await.unwrap_err(),
             ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
         ));
     }
@@ -486,11 +534,9 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabExecutor { auth, pool };
-        let result = broker.wait_until_market_open().await;
+        let broker = Schwab { auth, pool };
 
-        assert!(result.is_ok());
-        let duration = result.unwrap();
+        let duration = broker.wait_until_market_open().await.unwrap();
         // Market is open, returns time until close (should be ~2 hours)
         assert!(duration.as_secs() > 0);
         assert!(duration.as_secs() < 7300); // Less than ~2 hours + buffer
@@ -541,7 +587,7 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabExecutor { auth, pool };
+        let broker = Schwab { auth, pool };
         // This test should not complete because the method loops when market is closed
         // We'll just verify it starts correctly by not panicking immediately
         tokio::time::timeout(
@@ -584,11 +630,12 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabExecutor { auth, pool };
-        let result = broker.wait_until_market_open().await;
+        let broker = Schwab { auth, pool };
 
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
+        assert!(matches!(
+            broker.wait_until_market_open().await.unwrap_err(),
+            ExecutionError::Schwab(_)
+        ));
         market_hours_mock.assert();
     }
 
@@ -596,7 +643,7 @@ mod tests {
     async fn test_parse_order_id() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         let auth = create_test_auth_env();
-        let broker = SchwabExecutor { auth, pool };
+        let broker = Schwab { auth, pool };
 
         let test_id = "12345";
         let parsed = broker.parse_order_id(test_id).unwrap();
@@ -607,7 +654,7 @@ mod tests {
     async fn test_to_supported_executor() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         let auth = create_test_auth_env();
-        let executor = SchwabExecutor { auth, pool };
+        let executor = Schwab { auth, pool };
 
         assert_eq!(
             executor.to_supported_executor(),

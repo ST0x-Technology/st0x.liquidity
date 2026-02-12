@@ -1,3 +1,6 @@
+//! Solidity contract ABI bindings for raindex orderbook, ERC20,
+//! and Pyth oracle contracts.
+
 use alloy::sol;
 
 sol!(
@@ -37,7 +40,7 @@ sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IPyth, "node_modules/@pythnetwork/pyth-sdk-solidity/abis/IPyth.json"
+    IPyth, "lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/abis/IPyth.json"
 );
 
 sol!(

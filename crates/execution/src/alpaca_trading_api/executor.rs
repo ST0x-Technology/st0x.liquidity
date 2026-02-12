@@ -5,7 +5,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
-use super::auth::{AlpacaTradingApiAuthEnv, AlpacaTradingApiClient};
+use super::auth::{AlpacaTradingApiClient, AlpacaTradingApiCtx};
 use crate::{
     Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
     TryIntoExecutor,
@@ -21,10 +21,10 @@ pub struct AlpacaTradingApi {
 impl Executor for AlpacaTradingApi {
     type Error = AlpacaTradingApiError;
     type OrderId = String;
-    type Config = AlpacaTradingApiAuthEnv;
+    type Ctx = AlpacaTradingApiCtx;
 
-    async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
-        let client = AlpacaTradingApiClient::new(&config)?;
+    async fn try_from_ctx(ctx: Self::Ctx) -> Result<Self, Self::Error> {
+        let client = AlpacaTradingApiClient::new(&ctx)?;
 
         client.verify_account().await?;
 
@@ -105,13 +105,13 @@ impl Executor for AlpacaTradingApi {
 }
 
 #[async_trait]
-impl TryIntoExecutor for AlpacaTradingApiAuthEnv {
+impl TryIntoExecutor for AlpacaTradingApiCtx {
     type Executor = AlpacaTradingApi;
 
     async fn try_into_executor(
         self,
     ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        AlpacaTradingApi::try_from_config(self).await
+        AlpacaTradingApi::try_from_ctx(self).await
     }
 }
 
@@ -123,11 +123,11 @@ mod tests {
     use super::*;
     use crate::alpaca_trading_api::AlpacaTradingApiMode;
 
-    fn create_test_auth_env(base_url: &str) -> AlpacaTradingApiAuthEnv {
-        AlpacaTradingApiAuthEnv {
-            alpaca_api_key: "test_key_id".to_string(),
-            alpaca_api_secret: "test_secret_key".to_string(),
-            alpaca_trading_mode: AlpacaTradingApiMode::Mock(base_url.to_string()),
+    fn create_test_auth_env(base_url: &str) -> AlpacaTradingApiCtx {
+        AlpacaTradingApiCtx {
+            api_key: "test_key_id".to_string(),
+            api_secret: "test_secret_key".to_string(),
+            trading_mode: Some(AlpacaTradingApiMode::Mock(base_url.to_string())),
         }
     }
 
@@ -172,20 +172,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_config_with_valid_credentials() {
+    async fn test_try_from_ctx_with_valid_credentials() {
         let server = MockServer::start();
         let auth = create_test_auth_env(&server.base_url());
 
         let account_mock = create_account_mock(&server);
 
-        let result = AlpacaTradingApi::try_from_config(auth).await;
+        AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
-        assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_try_from_config_with_invalid_credentials() {
+    async fn test_try_from_ctx_with_invalid_credentials() {
         let server = MockServer::start();
         let auth = create_test_auth_env(&server.base_url());
 
@@ -200,11 +199,11 @@ mod tests {
                 }));
         });
 
-        let result = AlpacaTradingApi::try_from_config(auth).await;
+        let error = AlpacaTradingApi::try_from_ctx(auth).await.unwrap_err();
 
         account_mock.assert();
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaTradingApiError::AccountVerification(_)
         ));
     }
@@ -228,13 +227,13 @@ mod tests {
                 }));
         });
 
-        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
-        let result = executor.wait_until_market_open().await;
+        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
+
+        let duration = executor.wait_until_market_open().await.unwrap();
+
         clock_mock.assert();
-        assert!(result.is_ok());
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 
@@ -257,12 +256,13 @@ mod tests {
                 }));
         });
 
-        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
-        let result = executor.wait_until_market_open().await;
+        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
+
+        let duration = executor.wait_until_market_open().await.unwrap();
+
         mock.assert();
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 
@@ -273,15 +273,14 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
 
         let valid_uuid = "904837e3-3b76-47ec-b432-046db621571b";
-        let result = executor.parse_order_id(valid_uuid);
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), valid_uuid);
+        let order_id = executor.parse_order_id(valid_uuid).unwrap();
+        assert_eq!(order_id, valid_uuid);
     }
 
     #[tokio::test]
@@ -291,15 +290,14 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
 
         let invalid_uuid = "not-a-valid-uuid";
-        let result = executor.parse_order_id(invalid_uuid);
 
         assert!(matches!(
-            result.unwrap_err(),
+            executor.parse_order_id(invalid_uuid).unwrap_err(),
             AlpacaTradingApiError::InvalidOrderId(_)
         ));
     }
@@ -311,7 +309,7 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
 
@@ -328,12 +326,10 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
 
-        let result = executor.run_executor_maintenance().await;
-
-        assert!(result.is_none());
+        assert!(executor.run_executor_maintenance().await.is_none());
     }
 }

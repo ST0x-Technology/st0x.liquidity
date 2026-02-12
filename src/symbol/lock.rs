@@ -1,3 +1,5 @@
+//! Per-symbol mutex locks for serializing concurrent trade processing.
+
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, RwLock};

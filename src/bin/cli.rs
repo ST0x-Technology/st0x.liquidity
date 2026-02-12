@@ -1,12 +1,13 @@
+//! Command-line interface for manual trading and authentication operations.
+
 use st0x_hedge::cli;
-use st0x_hedge::env::setup_tracing;
+use st0x_hedge::setup_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv_override().ok();
-    let (env, command) = cli::CliEnv::parse_and_convert()?;
-    setup_tracing(&env.log_level);
+    let (ctx, command) = cli::CliEnv::parse_and_convert()?;
+    setup_tracing(&ctx.log_level);
 
-    cli::run_command(env, command).await?;
+    cli::run_command(ctx, command).await?;
     Ok(())
 }

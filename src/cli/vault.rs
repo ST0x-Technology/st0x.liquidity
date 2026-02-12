@@ -9,7 +9,7 @@ use std::io::Write;
 use thiserror::Error;
 
 use crate::bindings::IERC20;
-use crate::env::Config;
+use crate::config::Ctx;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -48,7 +48,7 @@ pub(super) async fn vault_deposit_command<
     token: Address,
     vault_id: B256,
     decimals: u8,
-    config: &Config,
+    ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Depositing tokens to Raindex vault")?;
@@ -56,18 +56,17 @@ pub(super) async fn vault_deposit_command<
     writeln!(stdout, "   Token: {token}")?;
     writeln!(stdout, "   Decimals: {decimals}")?;
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "vault-deposit requires rebalancing configuration (set REBALANCING_ENABLED=true)"
-        )
-    })?;
+    let rebalancing_config = ctx
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("vault-deposit requires rebalancing configuration"))?;
 
     let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
-    writeln!(stdout, "   Orderbook: {}", config.evm.orderbook)?;
+    writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let base_provider_with_wallet = ProviderBuilder::new()
@@ -88,7 +87,7 @@ pub(super) async fn vault_deposit_command<
 
     writeln!(stdout, "   Approving orderbook to spend tokens...")?;
     let approve_receipt = token_contract
-        .approve(config.evm.orderbook, amount_u256)
+        .approve(ctx.evm.orderbook, amount_u256)
         .send()
         .await?
         .with_required_confirmations(REQUIRED_CONFIRMATIONS)
@@ -100,7 +99,7 @@ pub(super) async fn vault_deposit_command<
         approve_receipt.transaction_hash
     )?;
 
-    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
+    let vault_service = VaultService::new(base_provider_with_wallet, ctx.evm.orderbook);
 
     writeln!(stdout, "   Depositing to vault...")?;
     let deposit_tx = vault_service
@@ -119,31 +118,30 @@ pub(super) async fn vault_withdraw_command<
 >(
     stdout: &mut W,
     amount: Usdc,
-    config: &Config,
+    ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "vault-withdraw requires rebalancing configuration (set REBALANCING_ENABLED=true)"
-        )
-    })?;
+    let rebalancing_config = ctx
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("vault-withdraw requires rebalancing configuration"))?;
 
     let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
-    writeln!(stdout, "   Orderbook: {}", config.evm.orderbook)?;
+    writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
 
     let base_provider_with_wallet = ProviderBuilder::new()
         .wallet(base_wallet)
         .connect_provider(base_provider);
 
-    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
+    let vault_service = VaultService::new(base_provider_with_wallet, ctx.evm.orderbook);
     let vault_id = VaultId(rebalancing_config.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
@@ -163,27 +161,28 @@ mod tests {
     use alloy::primitives::{address, b256};
     use alloy::providers::mock::Asserter;
     use std::str::FromStr;
+    use url::Url;
 
     use super::*;
-    use crate::env::{BrokerConfig, LogLevel};
-    use crate::onchain::EvmEnv;
+    use crate::config::{BrokerCtx, LogLevel};
+    use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
-    fn create_config_without_rebalancing() -> Config {
-        Config {
+    fn create_ctx_without_rebalancing() -> Ctx {
+        Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+            evm: EvmCtx {
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::DryRun,
-            hyperdx: None,
+            broker: BrokerCtx::DryRun,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }
@@ -200,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_deposit_requires_rebalancing_config() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Decimal::from_str("100").unwrap();
 
@@ -211,7 +210,7 @@ mod tests {
             TEST_TOKEN,
             TEST_VAULT_ID,
             6,
-            &config,
+            &ctx,
             provider,
         )
         .await;
@@ -225,14 +224,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_config() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
-        let result = vault_withdraw_command(&mut stdout, amount, &config, provider).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = vault_withdraw_command(&mut stdout, amount, &ctx, provider)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
@@ -241,21 +241,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_deposit_writes_amount_to_stdout() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Decimal::from_str("500.50").unwrap();
 
         let mut stdout = Vec::new();
-        let _ = vault_deposit_command(
+        vault_deposit_command(
             &mut stdout,
             amount,
             TEST_TOKEN,
             TEST_VAULT_ID,
             6,
-            &config,
+            &ctx,
             provider,
         )
-        .await;
+        .await
+        .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
@@ -266,12 +267,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
-        let _ = vault_withdraw_command(&mut stdout, amount, &config, provider).await;
+        vault_withdraw_command(&mut stdout, amount, &ctx, provider)
+            .await
+            .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

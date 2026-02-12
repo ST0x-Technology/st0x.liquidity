@@ -1,3 +1,5 @@
+//! Token symbol newtype with validation, caching, and distributed locking.
+
 pub(crate) mod cache;
 pub(crate) mod lock;
 

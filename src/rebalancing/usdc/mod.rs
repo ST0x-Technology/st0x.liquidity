@@ -20,7 +20,7 @@ use crate::cctp::CctpError;
 use crate::onchain::vault::VaultError;
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{UsdcRebalanceError, UsdcRebalanceId};
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use st0x_execution::AlpacaBrokerApiError;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcRebalanceManagerError {

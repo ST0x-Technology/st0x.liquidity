@@ -1,0 +1,4 @@
+# Copy to terraform.tfvars and fill in values.
+# NEVER commit terraform.tfvars — it contains secrets.
+
+do_token = ""

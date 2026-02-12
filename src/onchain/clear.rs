@@ -1,13 +1,17 @@
+//! Processes ClearV3 events from the Raindex orderbook with
+//! fallback to transaction receipts.
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::{debug, info};
 
+use super::OnChainError;
 use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-use crate::error::{OnChainError, TradeValidationError};
+use crate::onchain::trade::TradeValidationError;
 use crate::onchain::{
-    EvmEnv,
+    EvmCtx,
     pyth::FeedIdCache,
     trade::{OnchainTrade, OrderFill},
 };
@@ -17,7 +21,7 @@ impl OnchainTrade {
     /// Creates OnchainTrade directly from ClearV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
     pub async fn try_from_clear_v3<P: Provider>(
-        env: &EvmEnv,
+        evm_ctx: &EvmCtx,
         cache: &SymbolCache,
         provider: P,
         event: ClearV3,
@@ -60,7 +64,7 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        let after_clear = fetch_after_clear_event(&provider, env, &log).await?;
+        let after_clear = fetch_after_clear_event(&provider, evm_ctx, &log).await?;
 
         let ClearStateChangeV2 {
             aliceOutput,
@@ -126,7 +130,7 @@ impl OnchainTrade {
 /// returned 0 AfterClearV2 logs, but `get_transaction_receipt` showed both logs present.
 async fn fetch_after_clear_event<P: Provider>(
     provider: &P,
-    env: &EvmEnv,
+    evm_ctx: &EvmCtx,
     log: &Log,
 ) -> Result<AfterClearV2, OnChainError> {
     let block_number = log
@@ -137,7 +141,7 @@ async fn fetch_after_clear_event<P: Provider>(
 
     let filter = Filter::new()
         .select(block_number)
-        .address(env.orderbook)
+        .address(evm_ctx.orderbook)
         .event_signature(AfterClearV2::SIGNATURE_HASH);
 
     let after_clear_logs = provider.get_logs(&filter).await?;
@@ -164,7 +168,7 @@ async fn fetch_after_clear_event<P: Provider>(
 
     // Find the AfterClearV2 log in the receipt with log_index > clear_log_index
     for receipt_log in r.inner.logs() {
-        if receipt_log.address() != env.orderbook {
+        if receipt_log.address() != evm_ctx.orderbook {
             continue;
         }
 
@@ -194,10 +198,11 @@ async fn fetch_after_clear_event<P: Provider>(
 
     // Check what's actually in the receipt for error reporting
     let clear_in_receipt = r.inner.logs().iter().any(|l| {
-        l.address() == env.orderbook && l.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
+        l.address() == evm_ctx.orderbook && l.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
     });
     let after_clear_in_receipt = r.inner.logs().iter().any(|l| {
-        l.address() == env.orderbook && l.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
+        l.address() == evm_ctx.orderbook
+            && l.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
     });
 
     if clear_in_receipt && !after_clear_in_receipt {
@@ -229,6 +234,7 @@ mod tests {
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
     use serde_json::json;
+    use url::Url;
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -239,9 +245,9 @@ mod tests {
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
 
-    fn create_test_env() -> EvmEnv {
-        EvmEnv {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+    fn create_test_ctx() -> EvmCtx {
+        EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(get_test_order().owner),
             deployment_block: 1,
@@ -307,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_alice_order_match() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -369,13 +375,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -389,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_bob_order_match() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -450,13 +456,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -470,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_no_order_match() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let different_order1 = {
@@ -492,13 +498,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -508,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_missing_block_number() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -528,25 +534,25 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoBlockNumber)
+            OnChainError::Validation(TradeValidationError::NoBlockNumber)
         ));
     }
 
     #[tokio::test]
     async fn test_try_from_clear_v3_missing_after_clear_log() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -583,13 +589,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -601,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_after_clear_wrong_transaction() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -655,13 +661,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -673,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_after_clear_wrong_log_index() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -725,13 +731,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -743,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_alice_and_bob_both_match() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -800,13 +806,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -908,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_after_clear_multiple_logs_picks_first_match() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -952,13 +958,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -970,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_after_clear_equal_log_index_rejected() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1022,13 +1028,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1041,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_after_clear_mixed_transactions_finds_correct() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1097,13 +1103,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -1125,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_to_receipt_when_get_logs_returns_empty() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1166,13 +1172,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -1186,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_receipt_with_multiple_logs_picks_correct_after_clear() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1241,13 +1247,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -1259,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_receipt_rejects_wrong_contract_address() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1295,13 +1301,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1313,7 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_receipt_rejects_log_index_less_than_or_equal_to_clear() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1348,13 +1354,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1366,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_after_clear_missing_from_receipt_error() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1397,13 +1403,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1415,7 +1421,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_receipt_ignores_wrong_event_signature() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1453,13 +1459,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1471,7 +1477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_get_logs_has_wrong_tx_but_receipt_has_correct() {
-        let env = create_test_env();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1525,13 +1531,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &env,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            env.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
