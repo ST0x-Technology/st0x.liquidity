@@ -2,8 +2,8 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use st0x_execution::{OrderStatus, SupportedExecutor, Symbol};
 
+use crate::error::OnChainError;
 use crate::offchain_order::{OffchainOrderAggregate, OffchainOrderId};
-use crate::onchain::OnChainError;
 
 pub(crate) async fn find_executions_by_symbol_status_and_broker(
     pool: &SqlitePool,

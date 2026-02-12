@@ -4,11 +4,11 @@ use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::num::TryFromIntError;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
-use crate::error::EventQueueError;
 use crate::onchain::trade::TradeEvent;
 
 /// Trait for events that can be enqueued
@@ -39,6 +39,23 @@ pub(crate) struct QueuedEvent {
     pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) processed_at: Option<DateTime<Utc>>,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
+}
+
+/// Event queue persistence and processing errors.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EventQueueError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Log missing required field: {0}")]
+    MissingLogField(&'static str),
+    #[error("Queued event missing ID")]
+    MissingEventId,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] TryFromIntError),
+    #[error("Event serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Invalid tx_hash format: {0}")]
+    InvalidTxHash(#[from] alloy::hex::FromHexError),
 }
 
 async fn enqueue_event(

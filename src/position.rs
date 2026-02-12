@@ -8,16 +8,15 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, SupportedExecutor, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
-use crate::shares::ArithmeticError;
 use crate::threshold::{ExecutionThreshold, Usdc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -534,14 +533,6 @@ impl Aggregate for Lifecycle<Position, ArithmeticError<FractionalShares>> {
     }
 }
 
-impl View<Self> for Lifecycle<Position, ArithmeticError<FractionalShares>> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, Position::apply_transition)
-            .or_initialize(&event.payload, Position::from_event);
-    }
-}
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub(crate) enum PositionError {
@@ -726,6 +717,7 @@ pub(crate) enum TriggerReason {
 #[cfg(test)]
 mod tests {
     use cqrs_es::test::TestFramework;
+    use cqrs_es::EventEnvelope;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
     use std::str::FromStr;

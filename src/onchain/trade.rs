@@ -1,20 +1,23 @@
 use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::ruint::FromUintError;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use std::num::ParseFloatError;
 use tracing::{error, warn};
+
+use st0x_execution::{Direction, FractionalShares, Positive};
 
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
-use crate::error::{OnChainError, TradeValidationError};
-use crate::onchain::EvmConfig;
+use crate::onchain::EvmCtx;
+use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
-use st0x_execution::Direction;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
@@ -255,7 +258,7 @@ impl OnchainTrade {
         tx_hash: B256,
         provider: P,
         cache: &SymbolCache,
-        config: &EvmConfig,
+        ctx: &EvmCtx,
         feed_id_cache: &FeedIdCache,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
@@ -263,7 +266,7 @@ impl OnchainTrade {
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| {
-                OnChainError::Validation(crate::error::TradeValidationError::TransactionNotFound(
+                OnChainError::Validation(TradeValidationError::TransactionNotFound(
                     tx_hash,
                 ))
             })?;
@@ -275,7 +278,7 @@ impl OnchainTrade {
             .filter(|log| {
                 (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
                     || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
-                    && log.address() == config.orderbook
+                    && log.address() == ctx.orderbook
             })
             .collect();
 
@@ -291,7 +294,7 @@ impl OnchainTrade {
                 log,
                 &provider,
                 cache,
-                config,
+                ctx,
                 feed_id_cache,
                 order_owner,
             )
@@ -317,7 +320,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     log: &Log,
     provider: P,
     cache: &SymbolCache,
-    config: &EvmConfig,
+    ctx: &EvmCtx,
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -334,7 +337,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 
     if let Ok(clear_event) = log.log_decode::<ClearV3>() {
         return OnchainTrade::try_from_clear_v3(
-            config,
+            ctx,
             cache,
             &provider,
             clear_event.data().clone(),
@@ -370,6 +373,70 @@ fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
     Ok(formatted.parse::<f64>()?)
 }
 
+/// Business logic validation errors for trade processing rules.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TradeValidationError {
+    #[error("No transaction hash found in log")]
+    NoTxHash,
+    #[error("No log index found in log")]
+    NoLogIndex,
+    #[error("No block number found in log")]
+    NoBlockNumber,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
+    #[error("Invalid IO index: {0}")]
+    InvalidIndex(#[from] FromUintError<usize>),
+    #[error("No input found at index: {0}")]
+    NoInputAtIndex(usize),
+    #[error("No output found at index: {0}")]
+    NoOutputAtIndex(usize),
+    #[error(
+        "Expected IO to contain USDC and one tokenized equity \
+         (t prefix, 0x or s1 suffix) but got {0} and {1}"
+    )]
+    InvalidSymbolConfiguration(String, String),
+    #[error(
+        "Could not fully allocate execution shares for \
+         symbol {symbol}. Remaining: {remaining_shares}"
+    )]
+    InsufficientTradeAllocation {
+        symbol: String,
+        remaining_shares: f64,
+    },
+    #[error("Failed to convert U256 to f64: {0}")]
+    U256ToF64(#[from] ParseFloatError),
+    #[error("Transaction not found: {0}")]
+    TransactionNotFound(B256),
+    #[error(
+        "Node provider issue: tx receipt missing or has no logs. \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    NodeReceiptMissing {
+        block_number: u64,
+        tx_hash: B256,
+        clear_log_index: u64,
+    },
+    #[error(
+        "Unexpected: tx receipt has ClearV3 but no AfterClearV2 (should be impossible). \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    AfterClearMissingFromReceipt {
+        block_number: u64,
+        tx_hash: B256,
+        clear_log_index: u64,
+    },
+    #[error("Negative shares amount: {0}")]
+    NegativeShares(f64),
+    #[error("Share quantity {0} cannot be converted to f64")]
+    ShareConversionFailed(Positive<FractionalShares>),
+    #[error("Negative USDC amount: {0}")]
+    NegativeUsdc(f64),
+    #[error(
+        "Symbol '{0}' is not a tokenized equity (must start with 't' or end with '0x' or 's1')"
+    )]
+    NotTokenizedEquity(String),
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
@@ -378,7 +445,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5;
-    use crate::onchain::EvmConfig;
+    use crate::onchain::EvmCtx;
     use crate::symbol::cache::SymbolCache;
 
     #[test]
@@ -536,7 +603,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
-        let config = EvmConfig {
+        let ctx = EvmCtx {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             order_owner: Some(Address::ZERO),
@@ -551,7 +618,7 @@ mod tests {
             tx_hash,
             provider,
             &cache,
-            &config,
+            &ctx,
             &feed_id_cache,
             Address::ZERO,
         )

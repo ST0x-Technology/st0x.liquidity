@@ -7,15 +7,16 @@ mod builder;
 
 use std::sync::Arc;
 use std::time::Duration;
-
-use alloy::primitives::Address;
+use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::{AggregateError, Query};
+use cqrs_es::Query;
+use cqrs_es::persist::GenericQuery;
 use futures_util::{Stream, StreamExt};
-use sqlite_es::{SqliteCqrs, sqlite_cqrs};
+use rust_decimal::Decimal;
+use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
@@ -27,44 +28,75 @@ use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::{
-    AlpacaBrokerApiError, AlpacaTradingApiError, EmptySymbolError, ExecutionError, Executor,
-    MarketOrder, SchwabError, SupportedExecutor, Symbol,
+    EmptySymbolError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor,
+    Symbol,
 };
 
+pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
-use crate::config::{Ctx, CtxError};
-use crate::dual_write::DualWriteContext;
+use crate::config::Ctx;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
-use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
-use crate::offchain_order::BrokerOrderId;
+use crate::offchain_order::{
+    OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs,
+    OffchainOrderId,
+};
 use crate::onchain::accumulator::{
-    CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
+    ExecutionParams, check_all_positions, check_execution_readiness,
 };
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
-use crate::onchain::{EvmCtx, OnChainError, OnchainTrade, accumulator};
-use crate::queue::{
-    EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
+use crate::onchain::{EvmCtx, OnchainTrade};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
+use crate::position::{
+    Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
 };
+use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::{
     RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
     build_rebalancing_queries, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
+use crate::threshold::ExecutionThreshold;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::{
-    VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryError,
-};
-pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
+use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
+
+/// Bundles CQRS frameworks used throughout the trade processing pipeline.
+struct TradeProcessingCqrs {
+    onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
+    position_cqrs: Arc<PositionCqrs>,
+    position_query: Arc<PositionQuery>,
+    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    execution_threshold: ExecutionThreshold,
+}
+
+/// Adapter that bridges the generic Executor trait to the OrderPlacer
+/// trait used by the OffchainOrder aggregate's Services.
+pub(crate) struct ExecutorOrderPlacer<E>(pub E);
+
+#[async_trait::async_trait]
+impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
+    async fn place_market_order(
+        &self,
+        order: MarketOrder,
+    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+        let mapped_order = MarketOrder {
+            symbol: to_executor_ticker(&order.symbol)?,
+            ..order
+        };
+
+        let placement = self.0.place_market_order(mapped_order).await?;
+        Ok(ExecutorOrderId::new(&placement.order_id.to_string()))
+    }
+}
 
 pub(crate) struct Conductor {
     pub(crate) executor_maintenance: Option<JoinHandle<()>>,
@@ -75,37 +107,6 @@ pub(crate) struct Conductor {
     pub(crate) queue_processor: JoinHandle<()>,
     pub(crate) rebalancer: Option<JoinHandle<()>>,
     pub(crate) inventory_poller: Option<JoinHandle<()>>,
-}
-
-/// Event processing errors for live event handling.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum EventProcessingError {
-    #[error("Event queue error: {0}")]
-    Queue(#[from] EventQueueError),
-    #[error("Failed to enqueue ClearV3 event: {0}")]
-    EnqueueClearV3(#[source] EventQueueError),
-    #[error("Failed to enqueue TakeOrderV3 event: {0}")]
-    EnqueueTakeOrderV3(#[source] EventQueueError),
-    #[error("Database transaction error: {0}")]
-    Transaction(#[from] sqlx::Error),
-    #[error("Execution with ID {0} not found")]
-    ExecutionNotFound(i64),
-    #[error("Onchain trade processing error: {0}")]
-    OnChain(#[from] OnChainError),
-    #[error("Schwab execution error: {0}")]
-    Schwab(#[from] SchwabError),
-    #[error("Alpaca Broker API error: {0}")]
-    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
-    #[error("Alpaca Trading API error: {0}")]
-    AlpacaTradingApi(#[from] AlpacaTradingApiError),
-    #[error("Execution error: {0}")]
-    Execution(#[from] ExecutionError),
-    #[error(transparent)]
-    EmptySymbol(#[from] EmptySymbolError),
-    #[error("Config error: {0}")]
-    Config(#[from] CtxError),
-    #[error("Vault registry command failed: {0}")]
-    VaultRegistry(#[from] AggregateError<VaultRegistryError>),
 }
 
 pub(crate) async fn run_market_hours_loop<E>(
@@ -294,19 +295,45 @@ impl Conductor {
         }
 
         let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-
-        let dual_write_context = DualWriteContext::with_threshold(
-            pool.clone(),
-            onchain_trade_cqrs,
-            position_cqrs,
-            offchain_order_cqrs,
-            ctx.execution_threshold,
-        );
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+        let (trigger, rebalancer) = match ctx.rebalancing_config() {
+            Some(rebalancing_config) => {
+                let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+                let market_maker_wallet = signer.address();
+
+                let (trigger, rebalancer_handle) = spawn_rebalancing_infrastructure(
+                    rebalancing_config,
+                    pool,
+                    ctx,
+                    &inventory,
+                    event_sender,
+                    &provider,
+                    market_maker_wallet,
+                )
+                .await?;
+
+                (Some(trigger), Some(rebalancer_handle))
+            }
+            None => (None, None),
+        };
+
+        let (position_cqrs, position_query) = build_position_cqrs(pool, trigger.as_ref());
+
+        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+            OffchainOrderAggregate,
+            OffchainOrderAggregate,
+        >::new(
+            pool.clone(), "offchain_order_view".to_string()
+        ));
+        let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+            order_placer,
+        ));
+        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         let snapshot_query = InventorySnapshotQuery::new(inventory.clone());
         let snapshot_cqrs = sqlite_cqrs(
@@ -315,23 +342,12 @@ impl Conductor {
             (),
         );
 
-        let rebalancer = match ctx.rebalancing_ctx() {
-            Some(rebalancing_config) => Some(
-                spawn_rebalancing_infrastructure(
-                    rebalancing_config,
-                    pool,
-                    ctx,
-                    &inventory,
-                    event_sender,
-                    &provider,
-                )
-                .await?,
-            ),
-            None => None,
-        };
-
         let frameworks = CqrsFrameworks {
-            dual_write_context,
+            pool: pool.clone(),
+            onchain_trade_cqrs,
+            position_cqrs,
+            position_query,
+            offchain_order_cqrs,
             vault_registry_cqrs,
             snapshot_cqrs,
         };
@@ -342,6 +358,7 @@ impl Conductor {
             cache,
             provider,
             executor,
+            ctx.execution_threshold,
             frameworks,
         )
         .with_executor_maintenance(executor_maintenance)
@@ -382,10 +399,7 @@ impl Conductor {
     }
 
     pub(crate) fn abort_trading_tasks(&self) {
-        info!(
-            "Aborting trading tasks \
-             (keeping broker maintenance and DEX event receiver alive)"
-        );
+        info!("Aborting trading tasks (keeping broker maintenance and DEX event receiver alive)");
 
         self.order_poller.abort();
         self.event_processor.abort();
@@ -410,19 +424,17 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     inventory: &Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
-) -> anyhow::Result<JoinHandle<()>> {
+    market_maker_wallet: Address,
+) -> anyhow::Result<(Arc<RebalancingTrigger>, JoinHandle<()>)> {
     info!("Initializing rebalancing infrastructure");
-
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let market_maker_wallet = signer.address();
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
     let trigger = Arc::new(RebalancingTrigger::new(
         RebalancingTriggerConfig {
-            equity_threshold: rebalancing_ctx.equity_threshold,
-            usdc_threshold: rebalancing_ctx.usdc_threshold,
+            equity_threshold: rebalancing_config.equity_threshold,
+            usdc_threshold: rebalancing_config.usdc_threshold,
         },
         pool.clone(),
         ctx.evm.orderbook,
@@ -449,20 +461,22 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         )),
         usdc: Arc::new(sqlite_cqrs(
             pool.clone(),
-            build_rebalancing_queries::<UsdcRebalance>(trigger, event_broadcast),
+            build_rebalancing_queries::<UsdcRebalance>(trigger.clone(), event_broadcast),
             (),
         )),
     };
 
-    Ok(spawn_rebalancer(
-        rebalancing_ctx,
+    let handle = spawn_rebalancer(
+        rebalancing_config,
         provider.clone(),
         ctx.evm.orderbook,
         market_maker_wallet,
         operation_receiver,
         frameworks,
     )
-    .await?)
+    .await?;
+
+    Ok((trigger, handle))
 }
 
 async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: &str) {
@@ -483,11 +497,41 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
     }
 }
 
+/// Constructs the position CQRS framework with its view query and optional
+/// rebalancing trigger. Used by `Conductor::start` and integration tests to
+/// ensure the same wiring is tested as runs in production.
+fn build_position_cqrs(
+    pool: &SqlitePool,
+    trigger: Option<&Arc<RebalancingTrigger>>,
+) -> (Arc<PositionCqrs>, Arc<PositionQuery>) {
+    let position_view_repo = Arc::new(SqliteViewRepository::new(
+        pool.clone(),
+        "position_view".to_string(),
+    ));
+    let position_query = GenericQuery::new(position_view_repo.clone());
+
+    let position_queries: Vec<Box<dyn Query<PositionAggregate>>> = std::iter::once(Box::new(
+        GenericQuery::new(position_view_repo),
+    )
+        as Box<dyn Query<PositionAggregate>>)
+    .chain(
+        trigger
+            .iter()
+            .map(|t| Box::new(Arc::clone(t)) as Box<dyn Query<PositionAggregate>>),
+    )
+    .collect();
+
+    let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), position_queries, ()));
+
+    (position_cqrs, Arc::new(position_query))
+}
+
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     ctx: &Ctx,
     pool: &SqlitePool,
     executor: E,
-    dual_write_context: DualWriteContext,
+    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    position_cqrs: Arc<PositionCqrs>,
 ) -> JoinHandle<()> {
     let poller_config = ctx.get_order_poller_config();
     info!(
@@ -495,7 +539,13 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
         poller_config.polling_interval, poller_config.max_jitter
     );
 
-    let poller = OrderStatusPoller::new(poller_config, pool.clone(), executor, dual_write_context);
+    let poller = OrderStatusPoller::new(
+        poller_config,
+        pool.clone(),
+        executor,
+        offchain_order_cqrs,
+        position_cqrs,
+    );
     tokio::spawn(async move {
         if let Err(e) = poller.run().await {
             error!("Order poller failed: {e}");
@@ -546,7 +596,7 @@ fn spawn_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-    dual_write_context: DualWriteContext,
+    cqrs: TradeProcessingCqrs,
     vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
 ) -> JoinHandle<()>
 where
@@ -566,7 +616,7 @@ where
             &pool_clone,
             &cache_clone,
             provider,
-            &dual_write_context,
+            &cqrs,
             &vault_registry_cqrs,
         )
         .await;
@@ -576,7 +626,10 @@ where
 fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
     pool: SqlitePool,
-    dual_write_context: DualWriteContext,
+    position_cqrs: Arc<PositionCqrs>,
+    position_query: Arc<PositionQuery>,
+    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -593,8 +646,15 @@ where
         loop {
             interval.tick().await;
             debug!("Running periodic accumulated position check");
-            if let Err(e) =
-                check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context).await
+            if let Err(e) = check_and_execute_accumulated_positions(
+                &executor,
+                &pool,
+                &position_cqrs,
+                &position_query,
+                &offchain_order_cqrs,
+                &execution_threshold,
+            )
+            .await
             {
                 error!("Periodic accumulated position check failed: {e}");
             }
@@ -763,7 +823,7 @@ async fn run_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-    dual_write_context: &DualWriteContext,
+    cqrs: &TradeProcessingCqrs,
     vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
 ) where
     P: Provider + Clone,
@@ -778,24 +838,18 @@ async fn run_queue_processor<P, E>(
 
     let executor_type = executor.to_supported_executor();
 
-    let queue_context = QueueProcessingCtx {
+    let queue_context = QueueProcessingContext {
         cache,
         feed_id_cache: &feed_id_cache,
         vault_registry_cqrs,
     };
 
     loop {
-        let result = process_next_queued_event(
-            executor_type,
-            ctx,
-            pool,
-            &provider,
-            dual_write_context,
-            &queue_context,
-        )
-        .await;
+        let result =
+            process_next_queued_event(executor_type, ctx, pool, &provider, cqrs, &queue_context)
+                .await;
 
-        handle_queue_processing_result(executor, pool, dual_write_context, result).await;
+        handle_queue_processing_result(result).await;
     }
 }
 

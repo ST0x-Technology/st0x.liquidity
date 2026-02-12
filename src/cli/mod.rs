@@ -16,10 +16,9 @@ use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
-use st0x_execution::{Direction, Symbol};
+use st0x_execution::{Direction, FractionalShares, Symbol};
 
 use crate::config::{Ctx, Env};
-use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 

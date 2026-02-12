@@ -1,10 +1,10 @@
 //! Generic venue balance tracking for inventory management.
 
-use std::ops::{Add, Sub};
-
 use serde::{Deserialize, Serialize};
-use st0x_execution::{ArithmeticError, HasZero};
+use std::ops::{Add, Sub};
 use tracing::debug;
+
+use st0x_execution::{ArithmeticError, HasZero};
 
 impl<T: HasZero> Default for VenueBalance<T> {
     fn default() -> Self {

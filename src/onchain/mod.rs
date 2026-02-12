@@ -9,18 +9,17 @@ use alloy::transports::layers::RetryBackoffLayer;
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
 use serde::Deserialize;
-use st0x_execution::order::status::ParseOrderStatusError;
-use st0x_execution::{
-    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
-    InvalidSharesError, PersistenceError,
-};
 use std::num::{ParseFloatError, TryFromIntError};
 use url::Url;
 
-use crate::dual_write::DualWriteError;
+use st0x_execution::order::status::ParseOrderStatusError;
+use st0x_execution::{
+    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
+    InvalidSharesError, PersistenceError, SharesConversionError,
+};
+
 use crate::position::PositionError;
 use crate::queue::EventQueueError;
-use crate::shares::SharesConversionError;
 
 pub(crate) mod accumulator;
 pub(crate) mod backfill;
@@ -116,12 +115,14 @@ pub(crate) enum OnChainError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
-    #[error("Dual write error: {0}")]
-    DualWrite(#[from] DualWriteError),
     #[error("Position error: {0}")]
     Position(#[from] PositionError),
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] SharesConversionError),
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("UUID parse error: {0}")]
+    Uuid(#[from] uuid::Error),
 }
 
 impl From<sqlx::Error> for OnChainError {

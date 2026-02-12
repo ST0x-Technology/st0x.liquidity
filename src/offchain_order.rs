@@ -5,11 +5,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, SupportedExecutor, Symbol};
+use sqlite_es::SqliteCqrs;
 use tracing::error;
+use uuid::Uuid;
+
+use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::shares::FractionalShares;
+
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExecutionId(pub(crate) i64);

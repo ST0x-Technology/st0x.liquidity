@@ -7,7 +7,7 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::{Direction, Symbol};
@@ -221,15 +221,6 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
     }
 }
 
-impl View<Self> for Lifecycle<OnChainTrade, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, OnChainTrade::apply_transition)
-            .or_initialize(&event.payload, OnChainTrade::from_event);
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OnChainTradeError {
     #[error("Cannot enrich trade that hasn't been filled yet")]
@@ -328,9 +319,11 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use cqrs_es::EventEnvelope;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+
+    use super::*;
 
     fn make_envelope(
         aggregate_id: &str,

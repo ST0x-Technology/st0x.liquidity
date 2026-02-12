@@ -11,6 +11,31 @@ the limit:
 - **Remove redundancy** - if a guideline duplicates another, keep one reference
 - **Shorten explanations** - preserve the rule, reduce the elaboration
 
+## Documentation
+
+**Before doing any work**, read these documents:
+
+1. **[SPEC.md](SPEC.md)** — the north star. Describes what this service should
+   be. All new features must be spec'ed here first. If your change contradicts
+   the spec, either update the spec first (with user approval) or change your
+   approach. Implementation is downstream from the spec.
+2. **[docs/domain.md](docs/domain.md)** — naming conventions and domain
+   terminology. All code must use the names defined here. If a name isn't in
+   this doc, check existing code for precedent before inventing one.
+
+**Read when relevant** to your task:
+
+- [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
+  `::random()`, mocks, encoding, compile-time macros
+- [docs/cqrs.md](docs/cqrs.md) - CQRS/ES patterns (upcasters, views, replay,
+  services)
+
+**Update at the end:**
+
+- **README.md** — if project structure, features, commands, or architecture
+  changed
+- **ROADMAP.md** — mark completed issues, link PRs
+
 ## Ownership Principles
 
 **CRITICAL: Take full ownership. Never deflect responsibility.**

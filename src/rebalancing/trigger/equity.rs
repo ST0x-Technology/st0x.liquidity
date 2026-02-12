@@ -111,10 +111,11 @@ mod tests {
     use rust_decimal_macros::dec;
     use st0x_execution::Direction;
 
+    use st0x_execution::FractionalShares;
+
     use super::*;
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
-    use crate::shares::FractionalShares;
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
