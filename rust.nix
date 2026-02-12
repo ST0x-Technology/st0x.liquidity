@@ -55,7 +55,6 @@ let
   commonArgs = {
     pname = "st0x-liquidity";
     version = "0.1.0";
-
     src = ./.;
 
     inherit cargoVendorDir;
@@ -92,6 +91,7 @@ in {
     pname = "st0x-dto";
     cargoExtraArgs = "-p st0x-dto";
     doCheck = false;
+
     meta = {
       description = "st0x DTO types for TypeScript codegen";
       homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
@@ -101,11 +101,8 @@ in {
   # Main package with all binaries
   package = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
-
     preBuild = sqlxSetup;
-
     nativeCheckInputs = sol-build-inputs;
-
     doCheck = true;
 
     meta = {
@@ -117,9 +114,7 @@ in {
   # Clippy check (reuses cached deps)
   clippy = craneLib.cargoClippy (commonArgs // {
     inherit cargoArtifacts;
-
     preBuild = sqlxSetup;
-
     cargoClippyExtraArgs = "--all-targets --all-features -- -D clippy::all";
   });
 }

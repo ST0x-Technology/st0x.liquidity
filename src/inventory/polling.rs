@@ -838,8 +838,6 @@ mod tests {
         );
     }
 
-    // ==================== Helper Functions ====================
-
     /// Loads all InventorySnapshotEvents for the given orderbook/owner from the event store.
     async fn load_snapshot_events(
         pool: &SqlitePool,

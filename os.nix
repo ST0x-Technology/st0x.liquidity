@@ -1,11 +1,9 @@
-{ pkgs, lib, modulesPath, # dashboard,
-... }:
+{ pkgs, lib, modulesPath, dashboard, ... }:
 
 let
   inherit (import ./keys.nix) roles;
 
   services = import ./services.nix;
-
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
 
   mkService = name: cfg: {
@@ -98,41 +96,40 @@ in {
       };
     };
 
-    # nginx = {
-    #   enable = true;
-    #   virtualHosts.default = {
-    #     default = true;
-    #     root = "${dashboard}";
-    #
-    #     locations = let
-    #       wsProxy = port: {
-    #         proxyPass = "http://127.0.0.1:${toString port}/api/ws";
-    #         proxyWebsockets = true;
-    #         extraConfig = ''
-    #           proxy_connect_timeout 60;
-    #           proxy_send_timeout 60;
-    #           proxy_read_timeout 86400;
-    #         '';
-    #       };
-    #     in {
-    #       "/".tryFiles = "$uri $uri/ /index.html";
-    #       "/api/schwab/ws" = wsProxy 8080;
-    #       "/api/alpaca/ws" = wsProxy 8081;
-    #     };
-    #   };
-    # };
+    nginx = {
+      enable = true;
+      virtualHosts.default = {
+        default = true;
+        root = "${dashboard}";
 
-    # grafana = {
-    #   enable = true;
-    #   settings.server = {
-    #     http_addr = "0.0.0.0";
-    #     http_port = 3000;
-    #   };
-    #   settings.database = {
-    #     type = "sqlite3";
-    #     path = "/mnt/data/grafana/grafana.db";
-    #   };
-    # };
+        locations = let
+          wsProxy = port: {
+            proxyPass = "http://127.0.0.1:${toString port}/api/ws";
+            proxyWebsockets = true;
+            extraConfig = ''
+              proxy_connect_timeout 60;
+              proxy_send_timeout 60;
+              proxy_read_timeout 86400;
+            '';
+          };
+        in {
+          "/".tryFiles = "$uri $uri/ /index.html";
+          "/api/alpaca/ws" = wsProxy 8081;
+        };
+      };
+    };
+
+    grafana = {
+      enable = true;
+      settings.server = {
+        http_addr = "0.0.0.0";
+        http_port = 3000;
+      };
+      settings.database = {
+        type = "sqlite3";
+        path = "/mnt/data/grafana/grafana.db";
+      };
+    };
   };
 
   users.users.root.openssh.authorizedKeys.keys = roles.ssh;
@@ -141,8 +138,8 @@ in {
     enable = true;
     allowedTCPPorts = [
       22 # SSH
-      # 80 # Dashboard
-      # 3000 # Grafana
+      80 # Dashboard
+      3000 # Grafana
     ];
   };
 
@@ -165,17 +162,13 @@ in {
     };
   };
 
-  system.activationScripts.per-service-profiles.text =
-    "mkdir -p /nix/var/nix/profiles/per-service";
-
-  # systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
-
   users.groups.st0x = { };
 
   age.secrets = lib.mapAttrs mkSecret enabledServices;
-
+  systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
+  programs.bash.interactiveShellInit = "set -o vi";
   environment.systemPackages = with pkgs; [
     bat
     curl
@@ -185,7 +178,8 @@ in {
     zellij
   ];
 
-  programs.bash.interactiveShellInit = "set -o vi";
+  system.activationScripts.per-service-profiles.text =
+    "mkdir -p /nix/var/nix/profiles/per-service";
 
   system.stateVersion = "24.11";
 }

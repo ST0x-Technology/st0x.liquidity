@@ -6,6 +6,7 @@ let
 
   tfState = "infra/terraform.tfstate";
   tfVars = "infra/terraform.tfvars";
+  tfPlanFile = "infra/tfplan";
 
   parseIdentity = ''
     set -eo pipefail
@@ -31,8 +32,6 @@ let
         | rage -e -R /dev/stdin -o ${tfState}.age ${tfState}
     fi
   '';
-
-  tfPlanFile = "infra/tfplan";
 
   cleanup = "rm -f ${tfState} ${tfState}.backup ${tfVars}";
   cleanupWithPlan = "${cleanup} ${tfPlanFile}";

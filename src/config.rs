@@ -91,8 +91,6 @@ enum BrokerSecrets {
     DryRun,
 }
 
-// ===== Runtime types (assembled from Config + Secrets) =====
-
 /// Combined runtime context for the server. Assembled from plaintext config,
 /// encrypted secrets, and derived runtime state.
 #[derive(Clone)]
