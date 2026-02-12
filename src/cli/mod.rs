@@ -359,7 +359,7 @@ async fn execute_order<W: Write>(
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    if quantity <= 0.0 {
+    if !quantity.is_finite() || quantity <= 0.0 {
         return Err(CliError::InvalidQuantity { value: quantity }.into());
     }
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
@@ -1183,6 +1183,75 @@ mod tests {
         let error_msg = quantity_error.to_string();
         assert!(error_msg.contains("Invalid quantity: 0"));
         assert!(error_msg.contains("greater than zero"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_order_rejects_nan() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx_for_cli(&server);
+        let pool = setup_test_db().await;
+
+        let result = execute_order(
+            Symbol::new("AAPL").unwrap(),
+            f64::NAN,
+            Direction::Buy,
+            None,
+            &ctx,
+            &pool,
+            &mut std::io::sink(),
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<CliError>(),
+            Some(CliError::InvalidQuantity { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_order_rejects_infinity() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx_for_cli(&server);
+        let pool = setup_test_db().await;
+
+        let result = execute_order(
+            Symbol::new("AAPL").unwrap(),
+            f64::INFINITY,
+            Direction::Buy,
+            None,
+            &ctx,
+            &pool,
+            &mut std::io::sink(),
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<CliError>(),
+            Some(CliError::InvalidQuantity { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_order_rejects_negative_infinity() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx_for_cli(&server);
+        let pool = setup_test_db().await;
+
+        let result = execute_order(
+            Symbol::new("AAPL").unwrap(),
+            f64::NEG_INFINITY,
+            Direction::Buy,
+            None,
+            &ctx,
+            &pool,
+            &mut std::io::sink(),
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<CliError>(),
+            Some(CliError::InvalidQuantity { .. })
+        ));
     }
 
     fn create_test_ctx_for_cli(mock_server: &MockServer) -> Ctx {
