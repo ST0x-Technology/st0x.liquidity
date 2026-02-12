@@ -196,61 +196,39 @@ job handler never touches `Services` directly - it operates through the CQRS
 command interface.
 
 ```mermaid
-graph TD
-    subgraph "Orchestration Layer - apalis Data T"
-        direction LR
-        JH[Job Handler]
-        CQRS_I["Cqrs&lt;A&gt; instance"]
-        JQ["SqliteStorage&lt;Job&gt;"]
-        VIEW["View&lt;A&gt;"]
-        JH -->|receives| CQRS_I
-        JH -->|receives| JQ
-        JH -->|receives| VIEW
-    end
+sequenceDiagram
+    participant JH as Job Handler
+    participant CQ as Cqrs&lt;A&gt;
+    participant AGG as Aggregate::handle()
+    participant EXT as External APIs
 
-    CQRS_I -->|"execute(command)"| HANDLE
-
-    subgraph "Domain Layer - CQRS Aggregate::Services"
-        direction LR
-        HANDLE["Aggregate::handle()"]
-        BROKER[Broker API]
-        RPC[Ethereum RPC]
-        TOKEN[Tokenization API]
-        HANDLE -->|uses| BROKER
-        HANDLE -->|uses| RPC
-        HANDLE -->|uses| TOKEN
-    end
+    Note over JH: apalis Data&lt;T&gt; layer
+    JH->>CQ: execute(command)
+    Note over CQ,EXT: CQRS Services layer
+    CQ->>AGG: handle(command, &services)
+    AGG->>EXT: services.place_order() etc.
 ```
+
+A job handler also receives `Data<SqliteStorage<Job>>` to push downstream jobs
+and `Data<View<A>>` to read projections - but these stay within the
+orchestration layer and never cross into the CQRS domain layer.
 
 ##### System Overview
 
 ```mermaid
-graph TD
-    WS[DEX WebSocket - tokio::spawn]
+sequenceDiagram
+    participant WS as DEX WebSocket
+    participant Q as Persistent Job Queue
+    participant W as Workers (Monitor)
+    participant CQRS as CQRS Aggregates
 
-    subgraph QUEUE["Persistent Job Queue (SQLite)"]
-        direction LR
-        POE[ProcessOnchainEvent]
-        PFO[PlaceOffchainOrder]
-        EOT[EnrichOnchainTrade]
-        ER[ExecuteRebalancing]
+    WS->>Q: push ProcessOnchainEvent
+
+    loop Workers consume and produce
+        Q->>W: dequeue job
+        W->>CQRS: execute commands
+        W->>Q: push downstream jobs
     end
-
-    subgraph MON[Monitor]
-        direction LR
-        W1[Trade Worker]
-        W2[Order Worker]
-        W3[Enrichment Worker]
-        W4[Rebalancing Worker]
-        W5[Cron Workers]
-    end
-
-    CQRS[CQRS Aggregates]
-
-    WS -->|push| QUEUE
-    QUEUE --> MON
-    MON -->|push| QUEUE
-    MON -->|execute| CQRS
 ```
 
 ### Trade Execution
