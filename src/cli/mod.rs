@@ -52,7 +52,7 @@ pub enum CctpChain {
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("Invalid quantity: {value}. Quantity must be greater than zero")]
-    InvalidQuantity { value: u64 },
+    InvalidQuantity { value: f64 },
 }
 
 #[derive(Debug, Parser)]
@@ -71,9 +71,9 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to buy (whole shares only)
+        /// Number of shares to buy
         #[arg(short = 'q', long = "quantity")]
-        quantity: u64,
+        quantity: f64,
         /// Time-in-force for the order (Alpaca Broker API only)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
@@ -83,9 +83,9 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to sell (whole shares only)
+        /// Number of shares to sell
         #[arg(short = 'q', long = "quantity")]
-        quantity: u64,
+        quantity: f64,
         /// Time-in-force for the order (Alpaca Broker API only)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
@@ -165,6 +165,21 @@ pub enum Commands {
         /// Address to whitelist (defaults to SENDER_WALLET from env)
         #[arg(short = 'a', long = "address")]
         address: Option<Address>,
+    },
+
+    /// List all whitelisted addresses for Alpaca withdrawals
+    ///
+    /// Shows all whitelist entries with their status, asset, and creation date.
+    AlpacaWhitelistList,
+
+    /// Remove an address from Alpaca withdrawal whitelist
+    ///
+    /// Deletes all whitelist entries matching the given address.
+    /// Use this to revoke withdrawal access from older wallets.
+    AlpacaUnwhitelist {
+        /// Address to remove from whitelist
+        #[arg(short = 'a', long = "address")]
+        address: Address,
     },
 
     /// List all Alpaca crypto wallet transfers
@@ -337,14 +352,14 @@ pub async fn run_command(ctx: Ctx, command: Commands) -> anyhow::Result<()> {
 
 async fn execute_order<W: Write>(
     symbol: Symbol,
-    quantity: u64,
+    quantity: f64,
     direction: Direction,
     time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    if quantity == 0 {
+    if quantity <= 0.0 {
         return Err(CliError::InvalidQuantity { value: quantity }.into());
     }
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
@@ -364,12 +379,12 @@ async fn execute_order<W: Write>(
 enum SimpleCommand {
     Buy {
         symbol: Symbol,
-        quantity: u64,
+        quantity: f64,
         time_in_force: Option<TimeInForce>,
     },
     Sell {
         symbol: Symbol,
-        quantity: u64,
+        quantity: f64,
         time_in_force: Option<TimeInForce>,
     },
     Auth,
@@ -388,6 +403,10 @@ enum SimpleCommand {
     },
     AlpacaWhitelist {
         address: Option<Address>,
+    },
+    AlpacaWhitelistList,
+    AlpacaUnwhitelist {
+        address: Address,
     },
     AlpacaTransfers,
     AlpacaConvert {
@@ -494,6 +513,8 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
         }
         Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
+        Commands::AlpacaWhitelistList => Ok(SimpleCommand::AlpacaWhitelistList),
+        Commands::AlpacaUnwhitelist { address } => Ok(SimpleCommand::AlpacaUnwhitelist { address }),
         Commands::AlpacaTransfers => Ok(SimpleCommand::AlpacaTransfers),
         Commands::AlpacaConvert { direction, amount } => {
             Ok(SimpleCommand::AlpacaConvert { direction, amount })
@@ -610,6 +631,12 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::AlpacaWhitelist { address } => {
             alpaca_wallet::alpaca_whitelist_command(stdout, address, ctx).await
+        }
+        SimpleCommand::AlpacaWhitelistList => {
+            alpaca_wallet::alpaca_whitelist_list_command(stdout, ctx).await
+        }
+        SimpleCommand::AlpacaUnwhitelist { address } => {
+            alpaca_wallet::alpaca_unwhitelist_command(stdout, address, ctx).await
         }
         SimpleCommand::AlpacaWithdraw { amount, to_address } => {
             alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, ctx).await
@@ -753,7 +780,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -797,7 +824,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("TSLA").unwrap(),
-            50,
+            50.0,
             Direction::Sell,
             None,
             &ctx,
@@ -842,7 +869,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -874,7 +901,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -944,7 +971,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -998,7 +1025,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1039,7 +1066,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1087,7 +1114,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1152,7 +1179,7 @@ mod tests {
 
     #[test]
     fn test_cli_error_display_messages() {
-        let quantity_error = CliError::InvalidQuantity { value: 0 };
+        let quantity_error = CliError::InvalidQuantity { value: 0.0 };
         let error_msg = quantity_error.to_string();
         assert!(error_msg.contains("Invalid quantity: 0"));
         assert!(error_msg.contains("greater than zero"));
@@ -1462,7 +1489,7 @@ mod tests {
 
         let buy_command = Commands::Buy {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: 100,
+            quantity: 100.0,
             time_in_force: None,
         };
 
@@ -1511,7 +1538,7 @@ mod tests {
 
         let sell_command = Commands::Sell {
             symbol: Symbol::new("TSLA").unwrap(),
-            quantity: 50,
+            quantity: 50.0,
             time_in_force: None,
         };
 
@@ -1561,7 +1588,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1636,7 +1663,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1671,7 +1698,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1708,7 +1735,7 @@ mod tests {
 
         let result2 = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1744,7 +1771,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -1827,7 +1854,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("INVALID").unwrap(),
-            999_999,
+            999_999.0,
             Direction::Buy,
             None,
             &ctx,

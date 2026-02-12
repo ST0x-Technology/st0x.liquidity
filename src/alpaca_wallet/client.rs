@@ -4,6 +4,7 @@
 //!
 //! - Fetch whitelisted withdrawal addresses
 //! - Whitelist new withdrawal addresses
+//! - Remove whitelisted withdrawal addresses
 //! - Fetch deposit addresses
 
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
@@ -49,6 +50,8 @@ pub enum AlpacaWalletError {
         asset: TokenSymbol,
         network: Network,
     },
+    #[error("No whitelist entries found for address {address}")]
+    NoWhitelistEntries { address: Address },
     #[error("Deposit with tx hash {tx_hash} not detected after {elapsed:?}")]
     DepositTimeout {
         tx_hash: TxHash,
@@ -143,6 +146,32 @@ impl AlpacaWalletClient {
         Ok(response)
     }
 
+    pub(super) async fn delete(&self, path: &str) -> Result<Response, AlpacaWalletError> {
+        let url = format!("{}{}", self.base_url, path);
+        debug!("DELETE {url}");
+
+        let response = self
+            .client
+            .delete(&url)
+            .basic_auth(&self.api_key, Some(&self.api_secret))
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+
+            return Err(AlpacaWalletError::ApiError { status, message });
+        }
+
+        Ok(response)
+    }
+
     pub(super) fn account_id(&self) -> &AlpacaAccountId {
         &self.account_id
     }
@@ -205,6 +234,20 @@ impl AlpacaWalletClient {
         debug!("Whitelist creation response: {text}");
 
         Ok(serde_json::from_str::<WhitelistEntry>(&text)?)
+    }
+
+    /// Deletes a whitelist entry by its ID.
+    pub(super) async fn delete_whitelist_entry(
+        &self,
+        whitelist_id: &str,
+    ) -> Result<(), AlpacaWalletError> {
+        let path = format!(
+            "/v1/accounts/{}/wallets/whitelists/{}",
+            self.account_id, whitelist_id
+        );
+
+        self.delete(&path).await?;
+        Ok(())
     }
 
     /// Gets or creates a wallet deposit address for a specific asset and network.
@@ -498,6 +541,111 @@ mod tests {
                 .await
                 .unwrap_err(),
             AlpacaWalletError::ParseError(_)
+        ));
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_auth_headers() {
+        let server = MockServer::start();
+
+        let test_mock = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/v1/test")
+                .header(
+                    "authorization",
+                    "Basic dGVzdF9rZXlfaWQ6dGVzdF9zZWNyZXRfa2V5",
+                )
+                .header("APCA-API-KEY-ID", "test_key_id")
+                .header("APCA-API-SECRET-KEY", "test_secret_key");
+            then.status(204);
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        let response = client.delete("/v1/test").await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        test_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_delete_api_error() {
+        let server = MockServer::start();
+
+        let error_mock = server.mock(|when, then| {
+            when.method(DELETE).path("/v1/error");
+            then.status(404).json_body(json!({
+                "message": "Not found"
+            }));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        assert!(matches!(
+            client.delete("/v1/error").await.unwrap_err(),
+            AlpacaWalletError::ApiError { status, .. }
+                if status == StatusCode::NOT_FOUND
+        ));
+        error_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_delete_whitelist_entry_success() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists/wl-123"
+            ));
+            then.status(204);
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        client.delete_whitelist_entry("wl-123").await.unwrap();
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_delete_whitelist_entry_not_found() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists/nonexistent"
+            ));
+            then.status(404).json_body(json!({"message": "Not found"}));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        assert!(matches!(
+            client
+                .delete_whitelist_entry("nonexistent")
+                .await
+                .unwrap_err(),
+            AlpacaWalletError::ApiError { status, .. }
+                if status == StatusCode::NOT_FOUND
         ));
         mock.assert();
     }

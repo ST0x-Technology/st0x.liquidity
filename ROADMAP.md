@@ -15,6 +15,7 @@
 - [ ] [#284 Equity mint completion trusts Alpaca API without onchain verification](https://github.com/ST0x-Technology/st0x.liquidity/issues/284)
 - [ ] [#276 EquityPosition market_value_cents truncates sub-cent precision](https://github.com/ST0x-Technology/st0x.liquidity/issues/276)
 - [ ] [#277 No automatic retry after offchain order failure](https://github.com/ST0x-Technology/st0x.liquidity/issues/277)
+- [ ] [#290 CLI: add alpaca-unwhitelist command to remove wallet whitelist entries](https://github.com/ST0x-Technology/st0x.liquidity/issues/290)
 
 **CQRS/ES Phase 3 - Complete Migration:**
 
