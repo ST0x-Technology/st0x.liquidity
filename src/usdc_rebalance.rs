@@ -68,7 +68,7 @@ use sqlite_es::SqliteEventRepository;
 use uuid::Uuid;
 
 use crate::alpaca_wallet::AlpacaTransferId;
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
 use crate::threshold::Usdc;
 
 /// SQLite-backed event store for UsdcRebalance aggregates.
@@ -152,7 +152,7 @@ pub(crate) enum UsdcRebalanceError {
     InvalidCommand { command: String, state: String },
     /// Lifecycle state error
     #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
+    State(#[from] LifecycleError<UsdcRebalance>),
 }
 
 /// Commands for the USDC rebalance aggregate.
@@ -232,7 +232,7 @@ pub(crate) enum UsdcRebalanceCommand {
 ///
 /// Events represent immutable facts that have occurred and are persisted to the event store.
 /// Each event carries only the data relevant to that state transition.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum UsdcRebalanceEvent {
     /// Conversion operation started (USD<->USDC). Records direction, amount, and order ID.
     ConversionInitiated {
@@ -475,6 +475,10 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+}
+
+impl EventSourced for UsdcRebalance {
+    type Event = UsdcRebalanceEvent;
 }
 
 #[async_trait]
@@ -1022,67 +1026,81 @@ impl UsdcRebalance {
     pub(crate) fn apply_transition(
         event: &UsdcRebalanceEvent,
         current: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         match event {
             UsdcRebalanceEvent::ConversionConfirmed {
                 filled_amount,
                 converted_at,
                 ..
-            } => current.apply_conversion_confirmed(*filled_amount, *converted_at),
+            } => current.apply_conversion_confirmed(*filled_amount, *converted_at, event),
             UsdcRebalanceEvent::ConversionFailed { reason, failed_at } => {
-                current.apply_conversion_failed(reason, *failed_at)
+                current.apply_conversion_failed(reason, *failed_at, event)
             }
             UsdcRebalanceEvent::Initiated {
                 withdrawal_ref,
                 initiated_at,
                 ..
-            } => current.apply_initiated(withdrawal_ref, *initiated_at),
+            } => current.apply_initiated(withdrawal_ref, *initiated_at, event),
             UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at } => {
-                current.apply_withdrawal_confirmed(*confirmed_at)
+                current.apply_withdrawal_confirmed(*confirmed_at, event)
             }
             UsdcRebalanceEvent::WithdrawalFailed { reason, failed_at } => {
-                current.apply_withdrawal_failed(reason, *failed_at)
+                current.apply_withdrawal_failed(reason, *failed_at, event)
             }
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash,
                 burned_at,
-            } => current.apply_bridging_initiated(*burn_tx_hash, *burned_at),
+            } => current.apply_bridging_initiated(*burn_tx_hash, *burned_at, event),
             UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation,
                 cctp_nonce,
                 attested_at,
-            } => current.apply_attestation_received(attestation, *cctp_nonce, *attested_at),
+            } => current.apply_attestation_received(attestation, *cctp_nonce, *attested_at, event),
             UsdcRebalanceEvent::Bridged {
                 mint_tx_hash,
                 amount_received,
                 fee_collected,
                 minted_at,
-            } => current.apply_bridged(*mint_tx_hash, *amount_received, *fee_collected, *minted_at),
+            } => current.apply_bridged(
+                *mint_tx_hash,
+                *amount_received,
+                *fee_collected,
+                *minted_at,
+                event,
+            ),
             UsdcRebalanceEvent::BridgingFailed {
                 burn_tx_hash,
                 cctp_nonce,
                 reason,
                 failed_at,
-            } => current.apply_bridging_failed(*burn_tx_hash, *cctp_nonce, reason, *failed_at),
+            } => {
+                current.apply_bridging_failed(*burn_tx_hash, *cctp_nonce, reason, *failed_at, event)
+            }
             UsdcRebalanceEvent::DepositInitiated {
                 deposit_ref,
                 deposit_initiated_at,
-            } => current.apply_deposit_initiated(deposit_ref, *deposit_initiated_at),
+            } => current.apply_deposit_initiated(deposit_ref, *deposit_initiated_at, event),
             UsdcRebalanceEvent::DepositConfirmed {
                 direction,
                 deposit_confirmed_at,
-            } => current.apply_deposit_confirmed(direction, *deposit_confirmed_at),
+            } => current.apply_deposit_confirmed(direction, *deposit_confirmed_at, event),
             UsdcRebalanceEvent::DepositFailed {
                 deposit_ref,
                 reason,
                 failed_at,
-            } => current.apply_deposit_failed(deposit_ref.as_ref(), reason, *failed_at),
+            } => current.apply_deposit_failed(deposit_ref.as_ref(), reason, *failed_at, event),
             UsdcRebalanceEvent::ConversionInitiated {
                 direction,
                 amount,
                 order_id,
                 initiated_at,
-            } => current.apply_conversion_initiated(direction, *amount, *order_id, *initiated_at),
+            } => current.apply_conversion_initiated(
+                direction,
+                *amount,
+                *order_id,
+                *initiated_at,
+                event,
+            ),
         }
     }
 
@@ -1092,11 +1110,12 @@ impl UsdcRebalance {
         amount: Usdc,
         order_id: Uuid,
         initiated_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::DepositConfirmed { .. } = self else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "ConversionInitiated".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1112,7 +1131,8 @@ impl UsdcRebalance {
         &self,
         filled_amount: Usdc,
         converted_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::Converting {
             direction,
             amount,
@@ -1121,8 +1141,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "ConversionConfirmed".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1139,7 +1159,8 @@ impl UsdcRebalance {
         &self,
         reason: &str,
         failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::Converting {
             direction,
             amount,
@@ -1148,8 +1169,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "ConversionFailed".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1167,7 +1188,8 @@ impl UsdcRebalance {
         &self,
         withdrawal_ref: &TransferRef,
         initiated_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::ConversionComplete {
             direction,
             filled_amount,
@@ -1175,8 +1197,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "Initiated".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1192,7 +1214,8 @@ impl UsdcRebalance {
     fn apply_withdrawal_confirmed(
         &self,
         confirmed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::Withdrawing {
             direction,
             amount,
@@ -1201,8 +1224,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "WithdrawalConfirmed".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1218,7 +1241,8 @@ impl UsdcRebalance {
         &self,
         reason: &str,
         failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::Withdrawing {
             direction,
             amount,
@@ -1227,8 +1251,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "WithdrawalFailed".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1246,7 +1270,8 @@ impl UsdcRebalance {
         &self,
         burn_tx_hash: TxHash,
         burned_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::WithdrawalComplete {
             direction,
             amount,
@@ -1255,8 +1280,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "BridgingInitiated".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1274,7 +1299,8 @@ impl UsdcRebalance {
         attestation: &[u8],
         cctp_nonce: u64,
         attested_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::Bridging {
             direction,
             amount,
@@ -1284,8 +1310,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "BridgeAttestationReceived".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1306,7 +1332,8 @@ impl UsdcRebalance {
         amount_received: Usdc,
         fee_collected: Usdc,
         minted_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::Attested {
             direction,
             amount,
@@ -1316,8 +1343,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "Bridged".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1339,7 +1366,8 @@ impl UsdcRebalance {
         cctp_nonce: Option<u64>,
         reason: &str,
         failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let (Self::Bridging {
             direction,
             amount,
@@ -1354,8 +1382,8 @@ impl UsdcRebalance {
         }) = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "BridgingFailed".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1374,7 +1402,8 @@ impl UsdcRebalance {
         &self,
         deposit_ref: &TransferRef,
         deposit_initiated_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::Bridged {
             direction,
             amount,
@@ -1385,8 +1414,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "DepositInitiated".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1405,7 +1434,8 @@ impl UsdcRebalance {
         &self,
         event_direction: &RebalanceDirection,
         deposit_confirmed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::DepositInitiated {
             direction,
             amount,
@@ -1416,8 +1446,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "DepositConfirmed".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1441,7 +1471,8 @@ impl UsdcRebalance {
         deposit_ref: Option<&TransferRef>,
         reason: &str,
         failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         let Self::DepositInitiated {
             direction,
             amount,
@@ -1452,8 +1483,8 @@ impl UsdcRebalance {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "DepositFailed".to_string(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -1470,7 +1501,9 @@ impl UsdcRebalance {
     }
 
     /// Create initial state from an initialization event.
-    pub(crate) fn from_event(event: &UsdcRebalanceEvent) -> Result<Self, LifecycleError<Never>> {
+    pub(crate) fn from_event(
+        event: &UsdcRebalanceEvent,
+    ) -> Result<Self, LifecycleError<UsdcRebalance>> {
         match event {
             UsdcRebalanceEvent::ConversionInitiated {
                 direction,
@@ -1497,8 +1530,8 @@ impl UsdcRebalance {
             }),
 
             _ => Err(LifecycleError::Mismatch {
-                state: "Uninitialized".into(),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Uninitialized),
+                event: event.clone(),
             }),
         }
     }
@@ -1516,7 +1549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         let events = aggregate
@@ -1551,7 +1584,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_base_to_alpaca() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
         let tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
@@ -1587,7 +1620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         let event = UsdcRebalanceEvent::Initiated {
@@ -1617,7 +1650,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_initiation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -1691,7 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_withdrawal() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -1732,7 +1765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_withdrawal_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
 
         let result = aggregate
             .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
@@ -1746,7 +1779,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_withdrawal_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -1772,7 +1805,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_withdrawal_after_initiation() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -1822,7 +1855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_withdrawal_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
 
         let result = aggregate
             .handle(
@@ -1841,7 +1874,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_already_confirmed_withdrawal() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -1872,7 +1905,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_already_failed_withdrawal() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -1904,7 +1937,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_withdrawal_confirmation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
@@ -1946,7 +1979,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_withdrawal_failure() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
         let failed_at = Utc::now();
@@ -1995,7 +2028,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_bridging_after_withdrawal_confirmed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
@@ -2054,7 +2087,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_before_withdrawal() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
@@ -2075,7 +2108,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_while_withdrawing() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2104,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_after_withdrawal_failed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2138,7 +2171,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2176,7 +2209,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_bridging_initiation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
@@ -2233,7 +2266,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_receive_attestation_after_bridging_initiated() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -2306,7 +2339,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_before_bridging() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
 
         let result = aggregate
             .handle(
@@ -2326,7 +2359,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_while_withdrawing() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2354,7 +2387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_after_withdrawal_complete() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2386,7 +2419,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_after_withdrawal_failed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2419,7 +2452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2464,7 +2497,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_attestation_receipt() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
@@ -2539,7 +2572,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_bridging() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -2619,7 +2652,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_bridging_before_attestation() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2661,7 +2694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_bridging_after_initiated() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -2736,7 +2769,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_bridging_after_attestation_received() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -2816,7 +2849,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bridging_failed_preserves_burn_data_when_available() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2871,7 +2904,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_bridging_after_already_completed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2928,7 +2961,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_bridging_after_already_completed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -2981,7 +3014,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_bridging_after_already_failed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -3026,7 +3059,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_bridging_completion() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
@@ -3114,7 +3147,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_bridging_failure() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
@@ -3189,7 +3222,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_deposit_with_alpaca_transfer() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -3276,7 +3309,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_deposit_with_onchain_tx() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -3358,7 +3391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_deposit_before_bridging_complete() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -3403,7 +3436,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_deposit() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -3483,7 +3516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_deposit_before_initiating() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -3532,7 +3565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_deposit_after_initiated() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -3622,7 +3655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deposit_failed_preserves_deposit_ref_when_available() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
@@ -3704,7 +3737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_alpaca_to_base_full_flow() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let initiated_at = Utc::now();
 
@@ -3815,7 +3848,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_base_to_alpaca_full_flow() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let withdrawal_tx =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
         let initiated_at = Utc::now();
@@ -3929,7 +3962,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut agg = Lifecycle::<UsdcRebalance>::default();
         agg.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc(dec!(100.00)),
@@ -3960,7 +3993,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut agg = Lifecycle::<UsdcRebalance>::default();
         agg.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc(dec!(100.00)),
@@ -4013,7 +4046,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut agg = Lifecycle::<UsdcRebalance>::default();
         agg.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc(dec!(100.00)),
@@ -4062,7 +4095,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut agg = Lifecycle::<UsdcRebalance>::default();
         agg.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc(dec!(100.00)),
@@ -4117,7 +4150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_conversion_from_uninitialized() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
 
         let events = aggregate
@@ -4150,7 +4183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_conversion_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
 
         aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
@@ -4179,7 +4212,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_conversion_from_converting_state() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
         let initiated_at = Utc::now();
 
@@ -4226,7 +4259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_conversion_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
 
         let result = aggregate
             .handle(
@@ -4245,7 +4278,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_conversion_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
 
         aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
@@ -4278,7 +4311,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_conversion_from_converting_state() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
         let initiated_at = Utc::now();
 
@@ -4328,7 +4361,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_conversion_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
 
         let result = aggregate
             .handle(
@@ -4347,7 +4380,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_already_completed_conversion() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
 
         aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
@@ -4380,7 +4413,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_withdrawal_after_conversion_complete() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let filled_amount = Usdc(dec!(998)); // ~0.2% slippage
@@ -4433,7 +4466,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_with_mismatched_amount_from_conversion_complete_fails() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let filled_amount = Usdc(dec!(998));
@@ -4474,7 +4507,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_conversion_initiation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
         let initiated_at = Utc::now();
 
@@ -4514,7 +4547,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_conversion_confirmation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
         let initiated_at = Utc::now();
         let converted_at = Utc::now();
@@ -4563,7 +4596,7 @@ mod tests {
 
     #[test]
     fn test_view_tracks_conversion_failure() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut view = Lifecycle::<UsdcRebalance>::default();
         let order_id = Uuid::new_v4();
         let initiated_at = Utc::now();
         let failed_at = Utc::now();
@@ -4618,7 +4651,7 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let order_id = Uuid::new_v4();
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::BaseToAlpaca,
@@ -4687,7 +4720,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::AlpacaToBase,
@@ -4740,7 +4773,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_post_deposit_conversion_before_deposit_confirmed() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let aggregate = Lifecycle::<UsdcRebalance>::default();
 
         let result = aggregate
             .handle(
@@ -4765,7 +4798,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::BaseToAlpaca,
@@ -4829,7 +4862,7 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let order_id = Uuid::new_v4();
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let mut aggregate = Lifecycle::<UsdcRebalance>::default();
 
         aggregate.apply(UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::BaseToAlpaca,

@@ -110,6 +110,7 @@ mod tests {
     use super::*;
     use crate::position::{Position, PositionCommand, PositionCqrs, PositionQuery};
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_test_position_infra(pool: &SqlitePool) -> (PositionCqrs, PositionQuery) {
         let view_repo = Arc::new(SqliteViewRepository::new(
@@ -134,6 +135,8 @@ mod tests {
         cqrs.execute(
             &Position::aggregate_id(symbol),
             PositionCommand::AcknowledgeOnChainFill {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
                 trade_id: crate::position::TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 1,

@@ -7,28 +7,21 @@ use alloy::providers::fillers::{
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::Query;
 use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use st0x_dto::ServerMessage;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
 
 use super::usdc::UsdcRebalanceManager;
-use super::{
-    MintManager, Rebalancer, RebalancingCtx, RebalancingTrigger, RedemptionManager,
-    TriggeredOperation,
-};
+use super::{MintManager, Rebalancer, RebalancingCtx, RedemptionManager, TriggeredOperation};
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
-use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::lifecycle::Lifecycle;
 use crate::onchain::http_client_with_retry;
@@ -229,24 +222,6 @@ where
             ctx.redemption_wallet,
         )
     }
-}
-
-pub(crate) fn build_rebalancing_queries<A>(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<A>>>>
-where
-    Lifecycle<A>: cqrs_es::Aggregate,
-    RebalancingTrigger: Query<Lifecycle<A>>,
-    EventBroadcaster: Query<Lifecycle<A>>,
-{
-    let mut queries: Vec<Box<dyn Query<Lifecycle<A>>>> = vec![Box::new(trigger)];
-
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
-
-    queries
 }
 
 #[cfg(test)]

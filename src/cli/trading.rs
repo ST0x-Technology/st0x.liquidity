@@ -420,29 +420,16 @@ async fn acknowledge_fill(
         return;
     };
 
-    // Ensure the position aggregate exists before acknowledging
-    // the fill. AlreadyInitialized is expected on subsequent
-    // trades for the same symbol.
-    let _ = position_cqrs
-        .execute(
-            aggregate_id,
-            PositionCommand::Initialize {
-                symbol: base_symbol.clone(),
-                threshold: execution_threshold,
-            },
-        )
-        .await;
-
-    let trade_id = TradeId {
-        tx_hash: onchain_trade.tx_hash,
-        log_index: onchain_trade.log_index,
-    };
-
     if let Err(error) = position_cqrs
         .execute(
             aggregate_id,
             PositionCommand::AcknowledgeOnChainFill {
-                trade_id,
+                symbol: base_symbol.clone(),
+                threshold: execution_threshold,
+                trade_id: TradeId {
+                    tx_hash: onchain_trade.tx_hash,
+                    log_index: onchain_trade.log_index,
+                },
                 amount,
                 direction: onchain_trade.direction,
                 price_usdc,

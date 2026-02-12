@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
 
 /// SQLite-backed event store for TokenizedEquityMint aggregates.
 pub(crate) type MintEventStore =
@@ -109,7 +109,7 @@ pub(crate) enum TokenizedEquityMintError {
     AlreadyFailed,
     /// Lifecycle state error
     #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
+    State(#[from] LifecycleError<TokenizedEquityMint>),
 }
 
 #[derive(Debug, Clone)]
@@ -142,7 +142,7 @@ pub(crate) enum TokenizedEquityMintCommand {
     Finalize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum TokenizedEquityMintEvent {
     MintRequested {
         symbol: Symbol,
@@ -262,6 +262,10 @@ pub(crate) enum TokenizedEquityMint {
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+}
+
+impl EventSourced for TokenizedEquityMint {
+    type Event = TokenizedEquityMintEvent;
 }
 
 #[async_trait]
@@ -445,11 +449,11 @@ impl TokenizedEquityMint {
     pub(crate) fn apply_transition(
         event: &TokenizedEquityMintEvent,
         current: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<TokenizedEquityMint>> {
         match event {
             TokenizedEquityMintEvent::MintRequested { .. } => Err(LifecycleError::Mismatch {
-                state: format!("{current:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(current.clone())),
+                event: event.clone(),
             }),
             TokenizedEquityMintEvent::MintRejected {
                 reason,
@@ -491,7 +495,7 @@ impl TokenizedEquityMint {
     /// Create initial state from an initialization event.
     pub(crate) fn from_event(
         event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<TokenizedEquityMint>> {
         match event {
             TokenizedEquityMintEvent::MintRequested {
                 symbol,
@@ -506,8 +510,8 @@ impl TokenizedEquityMint {
             }),
 
             _ => Err(LifecycleError::Mismatch {
-                state: "Uninitialized".into(),
-                event: format!("{event:?}"),
+                state: Box::new(Lifecycle::Uninitialized),
+                event: event.clone(),
             }),
         }
     }
@@ -518,7 +522,7 @@ impl TokenizedEquityMint {
         tokenization_request_id: &TokenizationRequestId,
         accepted_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<TokenizedEquityMint>> {
         let Self::MintRequested {
             symbol,
             quantity,
@@ -527,8 +531,8 @@ impl TokenizedEquityMint {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -550,7 +554,7 @@ impl TokenizedEquityMint {
         shares_minted: U256,
         received_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<TokenizedEquityMint>> {
         let Self::MintAccepted {
             symbol,
             quantity,
@@ -562,8 +566,8 @@ impl TokenizedEquityMint {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -586,7 +590,7 @@ impl TokenizedEquityMint {
         &self,
         completed_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<TokenizedEquityMint>> {
         let Self::TokensReceived {
             symbol,
             quantity,
@@ -601,8 +605,8 @@ impl TokenizedEquityMint {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -625,7 +629,7 @@ impl TokenizedEquityMint {
         reason: &str,
         rejected_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<TokenizedEquityMint>> {
         let Self::MintRequested {
             symbol,
             quantity,
@@ -634,8 +638,8 @@ impl TokenizedEquityMint {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -653,7 +657,7 @@ impl TokenizedEquityMint {
         reason: &str,
         failed_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<TokenizedEquityMint>> {
         let Self::MintAccepted {
             symbol,
             quantity,
@@ -662,8 +666,8 @@ impl TokenizedEquityMint {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -684,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_mint_from_uninitialized() {
-        let aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -709,7 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_acknowledge_acceptance_after_request() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -741,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_receive_tokens_after_acceptance() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -782,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_after_tokens_received() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -828,7 +832,7 @@ mod tests {
         let wallet = Address::random();
         let tx_hash = TxHash::random();
 
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
 
         let events = aggregate
             .handle(
@@ -894,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_acknowledge_before_request() {
-        let aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let aggregate = Lifecycle::<TokenizedEquityMint>::default();
 
         let result = aggregate
             .handle(
@@ -914,7 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_receive_tokens_before_acceptance() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -942,7 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_finalize_before_tokens_received() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -973,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_mint_from_requested_state() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -1004,7 +1008,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_acceptance_from_accepted_state() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -1042,7 +1046,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_reject_mint_when_completed() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -1092,7 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_reject_mint_when_already_failed() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -1127,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_reject_mint_before_request() {
-        let aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let aggregate = Lifecycle::<TokenizedEquityMint>::default();
 
         let result = aggregate
             .handle(
@@ -1146,7 +1150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_acceptance_before_acceptance() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
@@ -1196,8 +1200,11 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("Completed"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintAccepted");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(TokenizedEquityMint::Completed { .. })
+        ));
+        assert!(matches!(evt, TokenizedEquityMintEvent::MintAccepted { .. }));
     }
 
     #[test]
@@ -1221,8 +1228,14 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("MintRequested"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::TokensReceived");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(TokenizedEquityMint::MintRequested { .. })
+        ));
+        assert!(matches!(
+            evt,
+            TokenizedEquityMintEvent::TokensReceived { .. }
+        ));
     }
 
     #[test]
@@ -1246,8 +1259,14 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintCompleted");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(TokenizedEquityMint::MintAccepted { .. })
+        ));
+        assert!(matches!(
+            evt,
+            TokenizedEquityMintEvent::MintCompleted { .. }
+        ));
     }
 
     #[test]
@@ -1272,8 +1291,11 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintRejected");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(TokenizedEquityMint::MintAccepted { .. })
+        ));
+        assert!(matches!(evt, TokenizedEquityMintEvent::MintRejected { .. }));
     }
 
     #[test]
@@ -1295,8 +1317,14 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("MintRequested"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintAcceptanceFailed");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(TokenizedEquityMint::MintRequested { .. })
+        ));
+        assert!(matches!(
+            evt,
+            TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+        ));
     }
 
     #[test]
@@ -1320,7 +1348,13 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("MintRequested"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintRequested");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(TokenizedEquityMint::MintRequested { .. })
+        ));
+        assert!(matches!(
+            evt,
+            TokenizedEquityMintEvent::MintRequested { .. }
+        ));
     }
 }

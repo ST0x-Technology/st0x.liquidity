@@ -412,8 +412,8 @@ is the source of truth for terminology and naming conventions.
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and
   authentication tokens
-- **Symbol Prefix Convention**: Tokenized equities use "t" prefix to
-  distinguish from base assets (e.g., tAAPL, tTSLA, tSPYM)
+- **Symbol Prefix Convention**: Tokenized equities use "t" prefix to distinguish
+  from base assets (e.g., tAAPL, tTSLA, tSPYM)
 - **Price Direction Logic**: Onchain buy = offchain sell (and vice versa) to
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
@@ -520,8 +520,8 @@ is the source of truth for terminology and naming conventions.
     in error variants (e.g., `format!("{side:?}")`) - store the actual typed
     value instead
   - **FORBIDDEN**: Unpacking newtypes into their inner type to store in error
-    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`,
-    not `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
+    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`, not
+    `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
     representation. Never discard type safety by extracting inner values.
   - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
     preserve all type information
@@ -649,6 +649,11 @@ assignments is useless; test actual behavior like
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
+- **CRITICAL: Do NOT run clippy until ALL substantive work is done.** Clippy is
+  a polish step. Running it while tasks remain open is wasted effort -
+  subsequent code changes will introduce new lint issues. Complete every task on
+  the list first (`cargo check` + `cargo test` passing), then run clippy as a
+  final pass before handing over.
 
 #### CRITICAL: Lint Policy
 
@@ -708,10 +713,10 @@ that cannot be expressed through code structure alone.
 
 #### Examples
 
-Good: explaining non-obvious business logic ("USDC input + t-prefix output
-means the order sold tokenized equity, so hedge by buying on Schwab"), test
-data context ("9 shares with 18 decimal places"), or external system
-constraints ("ClearV2 doesn't contain amounts, so query AfterClear").
+Good: explaining non-obvious business logic ("USDC input + t-prefix output means
+the order sold tokenized equity, so hedge by buying on Schwab"), test data
+context ("9 shares with 18 decimal places"), or external system constraints
+("ClearV2 doesn't contain amounts, so query AfterClear").
 
 Bad: restating what code does (`// Store test tokens`), redundant with function
 name, test section markers (`// 1. Test token refresh`).

@@ -13,7 +13,7 @@ use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
 use crate::threshold::Usdc;
 
 /// State tracking the latest inventory snapshots.
@@ -81,6 +81,10 @@ impl InventorySnapshot {
     }
 }
 
+impl EventSourced for InventorySnapshot {
+    type Event = InventorySnapshotEvent;
+}
+
 #[async_trait]
 impl Aggregate for Lifecycle<InventorySnapshot> {
     type Command = InventorySnapshotCommand;
@@ -142,7 +146,7 @@ impl Aggregate for Lifecycle<InventorySnapshot> {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InventorySnapshotError {
     #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
+    State(#[from] LifecycleError<InventorySnapshot>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

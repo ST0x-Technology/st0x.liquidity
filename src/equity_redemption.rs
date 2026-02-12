@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 /// SQLite-backed event store for EquityRedemption aggregates.
@@ -89,7 +89,7 @@ pub(crate) enum EquityRedemptionError {
     AlreadyFailed,
     /// Lifecycle state error
     #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
+    State(#[from] LifecycleError<EquityRedemption>),
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +112,7 @@ pub(crate) enum EquityRedemptionCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum EquityRedemptionEvent {
     TokensSent {
         symbol: Symbol,
@@ -211,6 +211,10 @@ pub(crate) enum EquityRedemption {
         sent_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+}
+
+impl EventSourced for EquityRedemption {
+    type Event = EquityRedemptionEvent;
 }
 
 #[async_trait]
@@ -357,11 +361,11 @@ impl EquityRedemption {
     pub(crate) fn apply_transition(
         event: &EquityRedemptionEvent,
         current: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<EquityRedemption>> {
         match event {
             EquityRedemptionEvent::TokensSent { .. } => Err(LifecycleError::Mismatch {
-                state: format!("{current:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(current.clone())),
+                event: event.clone(),
             }),
 
             EquityRedemptionEvent::Detected {
@@ -385,7 +389,9 @@ impl EquityRedemption {
     }
 
     /// Create initial state from an initialization event.
-    pub(crate) fn from_event(event: &EquityRedemptionEvent) -> Result<Self, LifecycleError<Never>> {
+    pub(crate) fn from_event(
+        event: &EquityRedemptionEvent,
+    ) -> Result<Self, LifecycleError<EquityRedemption>> {
         match event {
             EquityRedemptionEvent::TokensSent {
                 symbol,
@@ -402,8 +408,8 @@ impl EquityRedemption {
             }),
 
             _ => Err(LifecycleError::Mismatch {
-                state: "Uninitialized".into(),
-                event: format!("{event:?}"),
+                state: Box::new(Lifecycle::Uninitialized),
+                event: event.clone(),
             }),
         }
     }
@@ -413,7 +419,7 @@ impl EquityRedemption {
         tokenization_request_id: &TokenizationRequestId,
         detected_at: DateTime<Utc>,
         event: &EquityRedemptionEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<EquityRedemption>> {
         let Self::TokensSent {
             symbol,
             quantity,
@@ -423,8 +429,8 @@ impl EquityRedemption {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -442,7 +448,7 @@ impl EquityRedemption {
         &self,
         completed_at: DateTime<Utc>,
         event: &EquityRedemptionEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<EquityRedemption>> {
         let Self::Pending {
             symbol,
             quantity,
@@ -452,8 +458,8 @@ impl EquityRedemption {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -471,7 +477,7 @@ impl EquityRedemption {
         reason: &str,
         failed_at: DateTime<Utc>,
         event: &EquityRedemptionEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<EquityRedemption>> {
         let Self::TokensSent {
             symbol,
             quantity,
@@ -481,8 +487,8 @@ impl EquityRedemption {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -502,7 +508,7 @@ impl EquityRedemption {
         reason: &str,
         rejected_at: DateTime<Utc>,
         event: &EquityRedemptionEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<EquityRedemption>> {
         let Self::Pending {
             symbol,
             quantity,
@@ -513,8 +519,8 @@ impl EquityRedemption {
         } = self
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(self.clone())),
+                event: event.clone(),
             });
         };
 
@@ -537,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_tokens_from_uninitialized() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -564,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_detect_after_tokens_sent() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let mut aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -594,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_from_pending() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let mut aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -625,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_redemption_flow_end_to_end() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let mut aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -672,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_detect_before_sending_tokens() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let aggregate = Lifecycle::<EquityRedemption>::default();
 
         let result = aggregate
             .handle(
@@ -688,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_complete_before_pending() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let aggregate = Lifecycle::<EquityRedemption>::default();
 
         let result = aggregate
             .handle(EquityRedemptionCommand::Complete, &())
@@ -699,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_detection_from_tokens_sent_state() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let mut aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -732,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_redemption_from_pending_state() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let mut aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -771,7 +777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_reject_redemption_before_pending() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let mut aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -802,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_redemption_rejected_preserves_context_with_tokenization_id() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let mut aggregate = Lifecycle::<EquityRedemption>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
@@ -854,7 +860,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_detection_before_sending() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let aggregate = Lifecycle::<EquityRedemption>::default();
 
         let result = aggregate
             .handle(
@@ -870,7 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_reject_redemption_before_sending() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let aggregate = Lifecycle::<EquityRedemption>::default();
 
         let result = aggregate
             .handle(
@@ -907,8 +913,11 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("Completed"));
-        assert_eq!(evt, "EquityRedemptionEvent::Detected");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(EquityRedemption::Completed { .. })
+        ));
+        assert!(matches!(evt, EquityRedemptionEvent::Detected { .. }));
     }
 
     #[test]
@@ -930,8 +939,11 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("TokensSent"));
-        assert_eq!(evt, "EquityRedemptionEvent::Completed");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(EquityRedemption::TokensSent { .. })
+        ));
+        assert!(matches!(evt, EquityRedemptionEvent::Completed { .. }));
     }
 
     #[test]
@@ -955,8 +967,11 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("Pending"));
-        assert_eq!(evt, "EquityRedemptionEvent::DetectionFailed");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(EquityRedemption::Pending { .. })
+        ));
+        assert!(matches!(evt, EquityRedemptionEvent::DetectionFailed { .. }));
     }
 
     #[test]
@@ -979,8 +994,14 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("TokensSent"));
-        assert_eq!(evt, "EquityRedemptionEvent::RedemptionRejected");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(EquityRedemption::TokensSent { .. })
+        ));
+        assert!(matches!(
+            evt,
+            EquityRedemptionEvent::RedemptionRejected { .. }
+        ));
     }
 
     #[test]
@@ -1006,8 +1027,11 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert!(state.contains("TokensSent"));
-        assert_eq!(evt, "EquityRedemptionEvent::TokensSent");
+        assert!(matches!(
+            *state,
+            Lifecycle::Live(EquityRedemption::TokensSent { .. })
+        ));
+        assert!(matches!(evt, EquityRedemptionEvent::TokensSent { .. }));
     }
 
     #[test]
@@ -1022,7 +1046,7 @@ mod tests {
         let LifecycleError::Mismatch { state, event: evt } = err else {
             panic!("Expected Mismatch error, got {err:?}");
         };
-        assert_eq!(state, "Uninitialized");
-        assert!(evt.contains("Detected"));
+        assert!(matches!(*state, Lifecycle::Uninitialized));
+        assert!(matches!(evt, EquityRedemptionEvent::Detected { .. }));
     }
 }

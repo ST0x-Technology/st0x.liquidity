@@ -13,6 +13,7 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
+expect_used = "deny"
 enum_glob_use = "allow"
 
 # `priority = -1` allow for allowing lints enabled by a group to be re-disabled

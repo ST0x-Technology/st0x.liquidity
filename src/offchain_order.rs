@@ -16,7 +16,7 @@ use st0x_execution::{
     SupportedExecutor, Symbol,
 };
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
 
 pub(crate) type OffchainOrderCqrs = SqliteCqrs<Lifecycle<OffchainOrder>>;
 pub(crate) type OffchainOrderQuery = crate::lifecycle::SqliteQuery<OffchainOrder>;
@@ -212,6 +212,10 @@ pub(crate) enum OffchainOrder {
     },
 }
 
+impl EventSourced for OffchainOrder {
+    type Event = OffchainOrderEvent;
+}
+
 impl OffchainOrder {
     pub(crate) fn aggregate_id(id: OffchainOrderId) -> String {
         id.to_string()
@@ -281,7 +285,7 @@ impl OffchainOrder {
     pub(crate) fn apply_transition(
         event: &OffchainOrderEvent,
         order: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<OffchainOrder>> {
         match event {
             OffchainOrderEvent::Submitted {
                 executor_order_id,
@@ -310,8 +314,8 @@ impl OffchainOrder {
             }
 
             OffchainOrderEvent::Placed { .. } => Err(LifecycleError::Mismatch {
-                state: format!("{order:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(order.clone())),
+                event: event.clone(),
             }),
         }
     }
@@ -321,7 +325,7 @@ impl OffchainOrder {
         executor_order_id: &ExecutorOrderId,
         submitted_at: DateTime<Utc>,
         event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<OffchainOrder>> {
         let Self::Pending {
             symbol,
             shares,
@@ -331,8 +335,8 @@ impl OffchainOrder {
         } = order
         else {
             return Err(LifecycleError::Mismatch {
-                state: format!("{order:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(order.clone())),
+                event: event.clone(),
             });
         };
 
@@ -353,7 +357,7 @@ impl OffchainOrder {
         avg_price_cents: PriceCents,
         partially_filled_at: DateTime<Utc>,
         event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<OffchainOrder>> {
         match order {
             Self::Submitted {
                 symbol,
@@ -388,8 +392,8 @@ impl OffchainOrder {
 
             Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
                 Err(LifecycleError::Mismatch {
-                    state: format!("{order:?}"),
-                    event: event.event_type(),
+                    state: Box::new(Lifecycle::Live(order.clone())),
+                    event: event.clone(),
                 })
             }
         }
@@ -400,7 +404,7 @@ impl OffchainOrder {
         price_cents: PriceCents,
         filled_at: DateTime<Utc>,
         event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<OffchainOrder>> {
         match order {
             Self::Submitted {
                 symbol,
@@ -434,8 +438,8 @@ impl OffchainOrder {
 
             Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
                 Err(LifecycleError::Mismatch {
-                    state: format!("{order:?}"),
-                    event: event.event_type(),
+                    state: Box::new(Lifecycle::Live(order.clone())),
+                    event: event.clone(),
                 })
             }
         }
@@ -446,7 +450,7 @@ impl OffchainOrder {
         error: &str,
         failed_at: DateTime<Utc>,
         event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    ) -> Result<Self, LifecycleError<OffchainOrder>> {
         match order {
             Self::Pending {
                 symbol,
@@ -481,13 +485,15 @@ impl OffchainOrder {
             }),
 
             Self::Filled { .. } | Self::Failed { .. } => Err(LifecycleError::Mismatch {
-                state: format!("{order:?}"),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Live(order.clone())),
+                event: event.clone(),
             }),
         }
     }
 
-    pub(crate) fn from_event(event: &OffchainOrderEvent) -> Result<Self, LifecycleError<Never>> {
+    pub(crate) fn from_event(
+        event: &OffchainOrderEvent,
+    ) -> Result<Self, LifecycleError<OffchainOrder>> {
         match event {
             OffchainOrderEvent::Placed {
                 symbol,
@@ -504,8 +510,8 @@ impl OffchainOrder {
             }),
 
             _ => Err(LifecycleError::Mismatch {
-                state: "Uninitialized".into(),
-                event: event.event_type(),
+                state: Box::new(Lifecycle::Uninitialized),
+                event: event.clone(),
             }),
         }
     }
@@ -660,7 +666,7 @@ pub(crate) enum OffchainOrderError {
     #[error("Cannot update order: order has already been completed (filled or failed)")]
     AlreadyCompleted,
     #[error(transparent)]
-    Lifecycle(#[from] LifecycleError<Never>),
+    Lifecycle(#[from] LifecycleError<OffchainOrder>),
 }
 
 impl TryFrom<i64> for PriceCents {
@@ -1040,7 +1046,7 @@ mod tests {
     // aggregate transitions to Failed state (corruption detection)
     #[test]
     fn transition_on_uninitialized_corrupts_state() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
+        let mut order = Lifecycle::<OffchainOrder>::default();
 
         let event = OffchainOrderEvent::Submitted {
             executor_order_id: ExecutorOrderId::new("ORD123"),

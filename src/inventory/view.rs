@@ -437,7 +437,6 @@ impl InventoryView {
             }
 
             PositionEvent::Initialized { .. }
-            | PositionEvent::Migrated { .. }
             | PositionEvent::OffChainOrderPlaced { .. }
             | PositionEvent::OffChainOrderFailed { .. }
             | PositionEvent::ThresholdUpdated { .. } => Ok(Self {

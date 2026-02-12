@@ -398,6 +398,8 @@ mod tests {
             .execute(
                 &aggregate_id,
                 PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
                     trade_id,
                     amount: decimal_amount,
                     direction: onchain_trade.direction,

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use st0x_execution::Symbol;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
 
 pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry>;
 
@@ -117,6 +117,10 @@ impl VaultRegistry {
     }
 }
 
+impl EventSourced for VaultRegistry {
+    type Event = VaultRegistryEvent;
+}
+
 #[async_trait]
 impl Aggregate for Lifecycle<VaultRegistry> {
     type Command = VaultRegistryCommand;
@@ -175,7 +179,7 @@ impl Aggregate for Lifecycle<VaultRegistry> {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VaultRegistryError {
     #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
+    State(#[from] LifecycleError<VaultRegistry>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -47,52 +47,63 @@
 
 use async_trait::async_trait;
 use cqrs_es::persist::GenericQuery;
-use cqrs_es::{Aggregate, EventEnvelope, Query, View};
+use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, Query, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteViewRepository;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use tracing::error;
 
-/// A query that materializes a `Lifecycle<T, E>` aggregate as
-/// its own view in SQLite.
-pub(crate) type SqliteQuery<T, E = Never> = GenericQuery<
-    SqliteViewRepository<Lifecycle<T, E>, Lifecycle<T, E>>,
-    Lifecycle<T, E>,
-    Lifecycle<T, E>,
+/// Associates a domain entity with its event type.
+///
+/// Required by [`Lifecycle`] to carry typed event information in
+/// error states instead of opaque strings.
+pub(crate) trait EventSourced {
+    type Event: DomainEvent + Eq;
+}
+
+/// A query that materializes a `Lifecycle` aggregate as its own
+/// view in SQLite.
+pub(crate) type SqliteQuery<State, CustomError = Never> = GenericQuery<
+    SqliteViewRepository<Lifecycle<State, CustomError>, Lifecycle<State, CustomError>>,
+    Lifecycle<State, CustomError>,
+    Lifecycle<State, CustomError>,
 >;
 
 /// A lifecycle wrapper for event-sourced entities.
 ///
-/// Wraps entity data `T` and tracks whether the entity is uninitialized,
-/// live, or failed due to an error during event application.
+/// Wraps entity data `State` and tracks whether the entity is
+/// uninitialized, live, or failed due to an error during event
+/// application.
 ///
 /// # Type Parameters
 ///
-/// - `T`: The entity data type (e.g., `Position`, `OnChainTrade`)
-/// - `E`: The custom error type for domain-specific failures
-///   (e.g., `ArithmeticError`).
+/// - `State`: The entity data type (e.g., `Position`,
+///   `OnChainTrade`). Must implement [`EventSourced`] to associate
+///   with its event type.
+/// - `CustomError`: The domain-specific error type for fallible
+///   transitions (e.g., `ArithmeticError`).
 ///   Use [`Never`] for entities with no fallible operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum Lifecycle<T, E = Never> {
+pub(crate) enum Lifecycle<State: EventSourced, CustomError = Never> {
     /// No events have been applied yet. This is the default state.
     Uninitialized,
 
     /// Normal operational state containing valid entity data.
-    Live(T),
+    Live(State),
 
     /// Error state entered when event application fails.
     ///
-    /// The entity becomes unusable, preventing further damage from cascading
-    /// errors. The `last_valid_state` preserves the state before failure for
-    /// debugging and potential recovery.
+    /// The entity becomes unusable, preventing further damage from
+    /// cascading errors. The `last_valid_state` preserves the state
+    /// before failure for debugging and potential recovery.
     Failed {
-        error: LifecycleError<E>,
-        last_valid_state: Option<Box<T>>,
+        error: LifecycleError<State, CustomError>,
+        last_valid_state: Option<Box<State>>,
     },
 }
 
-impl<T, E> Default for Lifecycle<T, E> {
+impl<State: EventSourced, CustomError> Default for Lifecycle<State, CustomError> {
     fn default() -> Self {
         Self::Uninitialized
     }
@@ -113,28 +124,39 @@ pub(crate) enum Never {}
 
 /// Errors that can occur during lifecycle transitions.
 ///
-/// Wraps both infrastructure-level errors (uninitialized state, event mismatch)
-/// and domain-specific errors via the `Custom` variant.
+/// Type-safe: carries the actual aggregate state and event that
+/// caused the error rather than opaque debug strings.
+///
+/// # Type Parameters
+///
+/// - `State`: The entity type ([`EventSourced`] implementor)
+/// - `CustomError`: The domain-specific error
+///   (e.g., `ArithmeticError`)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum LifecycleError<E> {
+pub(crate) enum LifecycleError<State: EventSourced, CustomError = Never> {
     /// A transition event was applied to an uninitialized entity.
     #[error("operation on uninitialized state")]
     Uninitialized,
-    /// An initialization event was applied to an already-live entity.
+    /// An initialization event was applied to an already-live
+    /// entity.
     #[error("initialization on already-live state")]
     AlreadyInitialized,
     /// An event was applied that doesn't match the current state.
-    #[error("event '{event}' not applicable to state '{state}'")]
-    Mismatch { state: String, event: String },
+    #[error("event '{event:?}' not applicable to state '{state:?}'")]
+    Mismatch {
+        state: Box<Lifecycle<State, CustomError>>,
+        event: State::Event,
+    },
     /// A domain-specific error (e.g., arithmetic overflow).
     #[error(transparent)]
-    Custom(#[from] E),
+    Custom(#[from] CustomError),
 }
 
-impl<T, E: Display> Lifecycle<T, E> {
-    pub(crate) fn live(&self) -> Result<&T, LifecycleError<E>>
+impl<State: EventSourced + Debug, CustomError: Display + Debug> Lifecycle<State, CustomError> {
+    pub(crate) fn live(&self) -> Result<&State, LifecycleError<State, CustomError>>
     where
-        E: Clone,
+        State: Clone,
+        CustomError: Clone,
     {
         match self {
             Self::Live(inner) => Ok(inner),
@@ -146,14 +168,15 @@ impl<T, E: Display> Lifecycle<T, E> {
     /// Apply a transition to a live entity.
     ///
     /// - If Live: applies the transition
-    /// - If Uninitialized: returns Failed with last_valid_state = None
+    /// - If Uninitialized: returns Failed with
+    ///   last_valid_state = None
     /// - If Failed: returns self unchanged
-    pub(crate) fn transition<Ev, F>(self, event: &Ev, f: F) -> Self
+    pub(crate) fn transition<Apply>(self, event: &State::Event, apply: Apply) -> Self
     where
-        F: FnOnce(&Ev, &T) -> Result<T, LifecycleError<E>>,
+        Apply: FnOnce(&State::Event, &State) -> Result<State, LifecycleError<State, CustomError>>,
     {
         match self {
-            Self::Live(current) => match f(event, &current) {
+            Self::Live(current) => match apply(event, &current) {
                 Ok(new_state) => Self::Live(new_state),
                 Err(err) => {
                     error!("Lifecycle failed during transition: {err}");
@@ -174,21 +197,26 @@ impl<T, E: Display> Lifecycle<T, E> {
     /// Initialize from an uninitialized state.
     ///
     /// - If Uninitialized: applies the initialization
-    /// - If Failed with last_valid_state = None: was never live, try to init
-    /// - If Live or Failed with last_valid_state: returns Failed (already initialized)
-    pub(crate) fn initialize<Ev, F>(self, event: &Ev, f: F) -> Self
+    /// - If Failed with last_valid_state = None: was never live,
+    ///   try to init
+    /// - If Live or Failed with last_valid_state: returns Failed
+    ///   (already initialized)
+    pub(crate) fn initialize<Init>(self, event: &State::Event, init: Init) -> Self
     where
-        F: FnOnce(&Ev) -> Result<T, LifecycleError<E>>,
+        Init: FnOnce(&State::Event) -> Result<State, LifecycleError<State, CustomError>>,
     {
         match self {
             Self::Uninitialized
             | Self::Failed {
                 last_valid_state: None,
                 ..
-            } => match f(event) {
+            } => match init(event) {
                 Ok(new_state) => Self::Live(new_state),
                 Err(err) => {
-                    error!("Lifecycle failed during initialization: {err}");
+                    error!(
+                        "Lifecycle failed during initialization: \
+                         {err}"
+                    );
                     Self::Failed {
                         error: err,
                         last_valid_state: None,
@@ -207,22 +235,25 @@ impl<T, E: Display> Lifecycle<T, E> {
         }
     }
 
-    /// Try to initialize if transition failed on uninitialized state.
+    /// Try to initialize if transition failed on uninitialized
+    /// state.
     ///
     /// - If Live: returns self (transition succeeded)
-    /// - If Failed with last_valid_state = Some: returns self (real error)
-    /// - If Failed with last_valid_state = None: was uninitialized, try to init
+    /// - If Failed with last_valid_state = Some: returns self
+    ///   (real error)
+    /// - If Failed with last_valid_state = None: was
+    ///   uninitialized, try to init
     /// - If Uninitialized: try to init
-    pub(crate) fn or_initialize<Ev, F>(self, event: &Ev, f: F) -> Self
+    pub(crate) fn or_initialize<Init>(self, event: &State::Event, init: Init) -> Self
     where
-        F: FnOnce(&Ev) -> Result<T, LifecycleError<E>>,
+        Init: FnOnce(&State::Event) -> Result<State, LifecycleError<State, CustomError>>,
     {
         match &self {
             Self::Uninitialized
             | Self::Failed {
                 last_valid_state: None,
                 ..
-            } => self.initialize(event, f),
+            } => self.initialize(event, init),
 
             Self::Live(_)
             | Self::Failed {
@@ -233,14 +264,14 @@ impl<T, E: Display> Lifecycle<T, E> {
     }
 }
 
-/// Blanket View impl: any `Lifecycle<T, E>` that is an
-/// `Aggregate` can serve as its own materialized view by
+/// Blanket View impl: any `Lifecycle<State, CustomError>` that
+/// is an `Aggregate` can serve as its own materialized view by
 /// replaying events through `apply`.
-impl<T, E> View<Self> for Lifecycle<T, E>
+impl<State, CustomError> View<Self> for Lifecycle<State, CustomError>
 where
     Self: Aggregate,
-    T: Debug,
-    E: Debug,
+    State: EventSourced + Debug,
+    CustomError: Debug,
 {
     fn update(&mut self, event: &EventEnvelope<Self>) {
         self.apply(event.payload.clone());
@@ -254,13 +285,18 @@ where
 /// CQRS frameworks (e.g., mint, redemption, USDC) without
 /// needing adapter wrappers.
 #[async_trait]
-impl<Q, T, E> Query<Lifecycle<T, E>> for Arc<Q>
+impl<QueryImpl, State, CustomError> Query<Lifecycle<State, CustomError>> for Arc<QueryImpl>
 where
-    Q: Query<Lifecycle<T, E>> + Send + Sync,
-    Lifecycle<T, E>: Aggregate,
+    QueryImpl: Query<Lifecycle<State, CustomError>> + Send + Sync,
+    State: EventSourced,
+    Lifecycle<State, CustomError>: Aggregate,
 {
-    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<T, E>>]) {
-        Q::dispatch(self, aggregate_id, events).await;
+    async fn dispatch(
+        &self,
+        aggregate_id: &str,
+        events: &[EventEnvelope<Lifecycle<State, CustomError>>],
+    ) {
+        QueryImpl::dispatch(self, aggregate_id, events).await;
     }
 }
 
@@ -282,14 +318,17 @@ mod tests {
         value: i32,
     }
 
+    impl EventSourced for TestState {
+        type Event = TestEvent;
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
     #[error("test error: {0}")]
     struct TestError(String);
 
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     enum TestEvent {
         Initialize { value: i32 },
-        Migrate { value: i32 },
         Increment { amount: i32 },
     }
 
@@ -297,7 +336,6 @@ mod tests {
         fn event_type(&self) -> String {
             match self {
                 Self::Initialize { .. } => "TestEvent::Initialize".to_string(),
-                Self::Migrate { .. } => "TestEvent::Migrate".to_string(),
                 Self::Increment { .. } => "TestEvent::Increment".to_string(),
             }
         }
@@ -323,14 +361,21 @@ mod tests {
         }
 
         fn apply(&mut self, event: Self::Event) {
-            *self = self.clone().transition(&event, |ev, cur| match ev {
-                TestEvent::Initialize { .. } | TestEvent::Migrate { .. } => {
-                    Err(LifecycleError::AlreadyInitialized)
-                }
-                TestEvent::Increment { amount } => Ok(TestState {
-                    value: cur.value + amount,
-                }),
-            });
+            *self = self
+                .clone()
+                .transition(&event, |event, current| match event {
+                    TestEvent::Initialize { .. } => Err(LifecycleError::AlreadyInitialized),
+                    TestEvent::Increment { amount } => Ok(TestState {
+                        value: current.value + amount,
+                    }),
+                })
+                .or_initialize(&event, |event| match event {
+                    TestEvent::Initialize { value } => Ok(TestState { value: *value }),
+                    _ => Err(LifecycleError::Mismatch {
+                        state: Box::new(Lifecycle::Uninitialized),
+                        event: event.clone(),
+                    }),
+                });
         }
 
         async fn handle(
@@ -346,13 +391,14 @@ mod tests {
     fn transition_on_active_succeeds() {
         let state: Lifecycle<TestState, TestError> = Lifecycle::Live(TestState { value: 42 });
 
-        let state = state.transition(&TestEvent::Increment { amount: 10 }, |ev, cur| match ev {
+        let event = TestEvent::Increment { amount: 10 };
+        let state = state.transition(&event, |event, current| match event {
             TestEvent::Increment { amount } => Ok(TestState {
-                value: cur.value + amount,
+                value: current.value + amount,
             }),
             _ => Err(LifecycleError::Mismatch {
-                state: format!("{cur:?}"),
-                event: format!("{ev:?}"),
+                state: Box::new(Lifecycle::Live(current.clone())),
+                event: event.clone(),
             }),
         });
 
@@ -388,11 +434,11 @@ mod tests {
 
         let state = state
             .transition(&event, |_, _| Ok(TestState { value: 999 }))
-            .or_initialize(&event, |ev| match ev {
+            .or_initialize(&event, |event| match event {
                 TestEvent::Initialize { value } => Ok(TestState { value: *value }),
                 _ => Err(LifecycleError::Mismatch {
-                    state: "Uninitialized".into(),
-                    event: format!("{ev:?}"),
+                    state: Box::new(Lifecycle::Uninitialized),
+                    event: event.clone(),
                 }),
             });
 
@@ -408,13 +454,13 @@ mod tests {
         let event = TestEvent::Increment { amount: 5 };
 
         let state = state
-            .transition(&event, |ev, cur| match ev {
+            .transition(&event, |event, current| match event {
                 TestEvent::Increment { amount } => Ok(TestState {
-                    value: cur.value + amount,
+                    value: current.value + amount,
                 }),
                 _ => Err(LifecycleError::Mismatch {
-                    state: format!("{cur:?}"),
-                    event: format!("{ev:?}"),
+                    state: Box::new(Lifecycle::Live(current.clone())),
+                    event: event.clone(),
                 }),
             })
             .or_initialize(&event, |_| Ok(TestState { value: 999 }));
@@ -454,11 +500,11 @@ mod tests {
 
         let state = state
             .transition(&event, |_, _| Ok(TestState { value: 999 }))
-            .or_initialize(&event, |ev| match ev {
+            .or_initialize(&event, |event| match event {
                 TestEvent::Initialize { value } => Ok(TestState { value: *value }),
                 _ => Err(LifecycleError::Mismatch {
-                    state: "Uninitialized".into(),
-                    event: format!("{ev:?}"),
+                    state: Box::new(Lifecycle::Uninitialized),
+                    event: event.clone(),
                 }),
             });
 
@@ -477,22 +523,22 @@ mod tests {
     fn multiple_transitions_accumulate() {
         let mut state: Lifecycle<TestState, TestError> = Lifecycle::Live(TestState { value: 0 });
 
-        for i in 1..=3 {
-            let event = TestEvent::Increment { amount: i };
+        for idx in 1..=3 {
+            let event = TestEvent::Increment { amount: idx };
             state = state
-                .transition(&event, |ev, cur| match ev {
+                .transition(&event, |event, current| match event {
                     TestEvent::Increment { amount } => Ok(TestState {
-                        value: cur.value + amount,
+                        value: current.value + amount,
                     }),
                     _ => Err(LifecycleError::Mismatch {
-                        state: format!("{cur:?}"),
-                        event: format!("{ev:?}"),
+                        state: Box::new(Lifecycle::Live(current.clone())),
+                        event: event.clone(),
                     }),
                 })
-                .or_initialize(&event, |ev| {
+                .or_initialize(&event, |event| {
                     Err(LifecycleError::Mismatch {
-                        state: "Uninitialized".into(),
-                        event: format!("{ev:?}"),
+                        state: Box::new(Lifecycle::Uninitialized),
+                        event: event.clone(),
                     })
                 });
         }
@@ -509,19 +555,17 @@ mod tests {
 
         let init_event = TestEvent::Initialize { value: 10 };
         state = state
-            .transition(&init_event, |ev, cur| {
+            .transition(&init_event, |event, current| {
                 Err(LifecycleError::Mismatch {
-                    state: format!("{cur:?}"),
-                    event: format!("{ev:?}"),
+                    state: Box::new(Lifecycle::Live(current.clone())),
+                    event: event.clone(),
                 })
             })
-            .or_initialize(&init_event, |ev| match ev {
-                TestEvent::Initialize { value } | TestEvent::Migrate { value } => {
-                    Ok(TestState { value: *value })
-                }
-                TestEvent::Increment { .. } => Err(LifecycleError::Mismatch {
-                    state: "Uninitialized".into(),
-                    event: format!("{ev:?}"),
+            .or_initialize(&init_event, |event| match event {
+                TestEvent::Initialize { value } => Ok(TestState { value: *value }),
+                _ => Err(LifecycleError::Mismatch {
+                    state: Box::new(Lifecycle::Uninitialized),
+                    event: event.clone(),
                 }),
             });
 
@@ -532,19 +576,19 @@ mod tests {
 
         let transition_event = TestEvent::Increment { amount: 5 };
         state = state
-            .transition(&transition_event, |ev, cur| match ev {
+            .transition(&transition_event, |event, current| match event {
                 TestEvent::Increment { amount } => Ok(TestState {
-                    value: cur.value + amount,
+                    value: current.value + amount,
                 }),
                 _ => Err(LifecycleError::Mismatch {
-                    state: format!("{cur:?}"),
-                    event: format!("{ev:?}"),
+                    state: Box::new(Lifecycle::Live(current.clone())),
+                    event: event.clone(),
                 }),
             })
-            .or_initialize(&transition_event, |ev| {
+            .or_initialize(&transition_event, |event| {
                 Err(LifecycleError::Mismatch {
-                    state: "Uninitialized".into(),
-                    event: format!("{ev:?}"),
+                    state: Box::new(Lifecycle::Uninitialized),
+                    event: event.clone(),
                 })
             });
 
