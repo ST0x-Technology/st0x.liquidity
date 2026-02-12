@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::error;
 
-use super::{SchwabAuthConfig, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
+use super::{SchwabAuthCtx, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
 
 /// Response from Schwab order placement API.
 /// According to Schwab OpenAPI spec, successful order placement (201) returns
@@ -49,7 +49,7 @@ impl Order {
 
     pub async fn place(
         &self,
-        config: &SchwabAuthConfig,
+        config: &SchwabAuthCtx,
         pool: &SqlitePool,
     ) -> Result<OrderPlacementResponse, SchwabError> {
         let access_token = SchwabTokens::get_valid_access_token(pool, config).await?;
@@ -106,7 +106,7 @@ impl Order {
     /// Returns the order status response containing fill information and execution details.
     pub async fn get_order_status(
         order_id: &str,
-        config: &SchwabAuthConfig,
+        config: &SchwabAuthCtx,
         pool: &SqlitePool,
     ) -> Result<OrderStatusResponse, SchwabError> {
         let access_token = SchwabTokens::get_valid_access_token(pool, config).await?;
@@ -512,8 +512,8 @@ mod tests {
         );
     }
 
-    fn create_test_config_with_mock_server(mock_server: &httpmock::MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_config_with_mock_server(mock_server: &httpmock::MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,

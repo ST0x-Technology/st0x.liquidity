@@ -6,7 +6,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::debug;
 
-use super::{SchwabAuthConfig, SchwabError, SchwabTokens};
+use super::{SchwabAuthCtx, SchwabError, SchwabTokens};
 
 /// Market session types for trading hours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +128,7 @@ struct TimeRange {
 /// Uses the `/marketdata/v1/markets/{marketId}` endpoint with "equity" as the market ID.
 /// Returns market hours in Eastern timezone per the API specification.
 pub(crate) async fn fetch_market_hours(
-    config: &SchwabAuthConfig,
+    config: &SchwabAuthCtx,
     pool: &SqlitePool,
     date: Option<&str>,
 ) -> Result<MarketHours, SchwabError> {
@@ -293,8 +293,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,

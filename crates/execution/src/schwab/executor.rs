@@ -5,7 +5,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 use url::Url;
 
-use crate::schwab::SchwabAuthConfig;
+use crate::schwab::SchwabAuthCtx;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
@@ -27,8 +27,8 @@ pub struct SchwabCtx {
 }
 
 impl SchwabCtx {
-    fn to_auth_config(&self) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn to_auth_ctx(&self) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: self.app_key.clone(),
             app_secret: self.app_secret.clone(),
             redirect_uri: self.redirect_uri.clone(),
@@ -39,25 +39,25 @@ impl SchwabCtx {
     }
 
     pub fn get_auth_url(&self) -> Result<String, super::SchwabError> {
-        self.to_auth_config().get_auth_url()
+        self.to_auth_ctx().get_auth_url()
     }
 
     pub async fn get_tokens_from_code(
         &self,
         code: &str,
     ) -> Result<SchwabTokens, super::SchwabError> {
-        self.to_auth_config().get_tokens_from_code(code).await
+        self.to_auth_ctx().get_tokens_from_code(code).await
     }
 
     pub async fn get_valid_access_token(&self) -> Result<String, super::SchwabError> {
-        SchwabTokens::get_valid_access_token(&self.pool, &self.to_auth_config()).await
+        SchwabTokens::get_valid_access_token(&self.pool, &self.to_auth_ctx()).await
     }
 }
 
 /// Schwab executor implementation
 #[derive(Debug, Clone)]
 pub struct Schwab {
-    auth: SchwabAuthConfig,
+    auth: SchwabAuthCtx,
     pool: SqlitePool,
 }
 
@@ -68,7 +68,7 @@ impl Executor for Schwab {
     type Ctx = SchwabCtx;
 
     async fn try_from_ctx(ctx: Self::Ctx) -> Result<Self, Self::Error> {
-        let auth = SchwabAuthConfig {
+        let auth = SchwabAuthCtx {
             app_key: ctx.app_key,
             app_secret: ctx.app_secret,
             redirect_uri: ctx.redirect_uri,
@@ -321,15 +321,15 @@ impl TryIntoExecutor for SchwabCtx {
 mod tests {
     use super::*;
     use crate::schwab::tokens::SchwabTokens;
-    use crate::schwab::{SchwabAuthConfig, SchwabError};
+    use crate::schwab::{SchwabAuthCtx, SchwabError};
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
     use sqlx::SqlitePool;
 
-    fn create_test_auth_env() -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_auth_env() -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
@@ -339,8 +339,8 @@ mod tests {
         }
     }
 
-    fn create_test_auth_env_with_server(server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_auth_env_with_server(server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
@@ -350,7 +350,7 @@ mod tests {
         }
     }
 
-    fn create_test_ctx(auth: SchwabAuthConfig, pool: SqlitePool) -> SchwabCtx {
+    fn create_test_ctx(auth: SchwabAuthCtx, pool: SqlitePool) -> SchwabCtx {
         SchwabCtx {
             app_key: auth.app_key,
             app_secret: auth.app_secret,

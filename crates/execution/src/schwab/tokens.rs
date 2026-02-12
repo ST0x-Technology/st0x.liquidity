@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use alloy::primitives::FixedBytes;
 
 use super::SchwabError;
-use super::auth::SchwabAuthConfig;
+use super::auth::SchwabAuthCtx;
 use super::encryption::{EncryptedToken, EncryptionError, decrypt_token, encrypt_token};
 
 const ACCESS_TOKEN_DURATION_MINUTES: i64 = 30;
@@ -157,7 +157,7 @@ impl SchwabTokens {
 
     pub async fn get_valid_access_token(
         pool: &SqlitePool,
-        config: &SchwabAuthConfig,
+        config: &SchwabAuthCtx,
     ) -> Result<String, SchwabError> {
         let tokens = Self::load(pool, &config.encryption_key).await?;
 
@@ -184,7 +184,7 @@ impl SchwabTokens {
 
     pub async fn refresh_if_needed(
         pool: &SqlitePool,
-        config: &SchwabAuthConfig,
+        config: &SchwabAuthCtx,
     ) -> Result<bool, SchwabError> {
         let tokens = Self::load(pool, &config.encryption_key).await?;
 
@@ -207,7 +207,7 @@ impl SchwabTokens {
 // Moved out of impl block to avoid clippy false positive with unsafe_derive_deserialize
 pub(crate) fn spawn_automatic_token_refresh(
     pool: SqlitePool,
-    config: SchwabAuthConfig,
+    config: SchwabAuthCtx,
 ) -> JoinHandle<()> {
     info!("Starting token refresh service");
     tokio::spawn(async move {
@@ -219,7 +219,7 @@ pub(crate) fn spawn_automatic_token_refresh(
 
 async fn start_automatic_token_refresh_loop(
     pool: SqlitePool,
-    config: SchwabAuthConfig,
+    config: SchwabAuthCtx,
 ) -> Result<(), SchwabError> {
     let refresh_interval_secs = (ACCESS_TOKEN_DURATION_MINUTES - 1) * 60;
     let refresh_interval_u64 = refresh_interval_secs.try_into().map_err(|_| {
@@ -235,7 +235,7 @@ async fn start_automatic_token_refresh_loop(
 
 async fn handle_token_refresh(
     pool: &SqlitePool,
-    config: &SchwabAuthConfig,
+    config: &SchwabAuthCtx,
 ) -> Result<(), SchwabError> {
     match SchwabTokens::refresh_if_needed(pool, config).await {
         Ok(refreshed) if refreshed => {
@@ -264,8 +264,8 @@ mod tests {
     use std::thread;
     use tokio::time::{Duration as TokioDuration, sleep};
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
@@ -275,8 +275,8 @@ mod tests {
         }
     }
 
-    fn create_test_config() -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_config() -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,

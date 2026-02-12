@@ -19,7 +19,7 @@ static DEFAULT_BASE_URL: LazyLock<Result<Url, url::ParseError>> =
     LazyLock::new(|| Url::parse("https://api.schwabapi.com"));
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SchwabAuthConfig {
+pub struct SchwabAuthCtx {
     pub app_key: String,
     pub app_secret: String,
     pub redirect_uri: Option<Url>,
@@ -28,7 +28,7 @@ pub struct SchwabAuthConfig {
     pub encryption_key: FixedBytes<32>,
 }
 
-impl SchwabAuthConfig {
+impl SchwabAuthCtx {
     pub fn redirect_uri(&self) -> Result<&Url, url::ParseError> {
         self.redirect_uri.as_ref().map_or_else(
             || DEFAULT_REDIRECT_URI.as_ref().map_err(ToOwned::to_owned),
@@ -64,7 +64,7 @@ pub(crate) struct AccountNumbers {
     pub hash_value: String,
 }
 
-impl SchwabAuthConfig {
+impl SchwabAuthCtx {
     pub async fn get_account_hash(&self, pool: &SqlitePool) -> Result<String, SchwabError> {
         let access_token = SchwabTokens::get_valid_access_token(pool, self).await?;
 
@@ -267,8 +267,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_config() -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_config() -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
@@ -278,8 +278,8 @@ mod tests {
         }
     }
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_schwab_auth_env_get_auth_url_custom_base_url() {
-        let config = SchwabAuthConfig {
+        let config = SchwabAuthCtx {
             app_key: "custom_key".to_string(),
             app_secret: "custom_secret".to_string(),
             redirect_uri: Some(Url::parse("https://custom.redirect.com").expect("test url")),
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_schwab_auth_env_get_auth_url_with_special_characters() {
-        let config = SchwabAuthConfig {
+        let config = SchwabAuthCtx {
             app_key: "test key with spaces & symbols!".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: Some(
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_schwab_auth_config_defaults() {
-        let config = SchwabAuthConfig {
+        let config = SchwabAuthCtx {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,

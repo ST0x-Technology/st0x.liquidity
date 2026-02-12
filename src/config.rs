@@ -243,6 +243,8 @@ impl std::fmt::Debug for Ctx {
             .field("log_level", &self.log_level)
             .field("server_port", &self.server_port)
             .field("evm", &self.evm)
+            .field("order_polling_interval", &self.order_polling_interval)
+            .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("rebalancing", &self.rebalancing.is_some())

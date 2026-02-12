@@ -13,7 +13,7 @@ pub(crate) mod view;
 
 pub use cmd::{AccessToken, RefreshToken, SchwabAuthCommand};
 pub use event::SchwabAuthEvent;
-pub(crate) use oauth::SchwabAuthConfig;
+pub(crate) use oauth::SchwabAuthCtx;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchwabAuth {

@@ -12,7 +12,7 @@ mod order_status;
 mod tokens;
 
 // Re-export only what's needed for executor construction
-pub(crate) use auth::SchwabAuthConfig;
+pub(crate) use auth::SchwabAuthCtx;
 pub use auth::{
     AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthError, SchwabAuthEvent,
 };
@@ -129,8 +129,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
