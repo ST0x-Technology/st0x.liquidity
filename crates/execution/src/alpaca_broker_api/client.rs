@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Serialize;
 use tracing::debug;
@@ -32,7 +32,7 @@ impl std::fmt::Debug for AlpacaBrokerApiClient {
 impl AlpacaBrokerApiClient {
     pub(crate) fn new(ctx: &AlpacaBrokerApiCtx) -> Result<Self, AlpacaBrokerApiError> {
         let credentials = format!("{}:{}", ctx.api_key, ctx.api_secret);
-        let encoded_credentials = BASE64_STANDARD.encode(credentials.as_bytes());
+        let encoded_credentials = general_purpose::STANDARD.encode(credentials.as_bytes());
         let auth_value = format!("Basic {encoded_credentials}");
 
         let headers = HeaderMap::from_iter([

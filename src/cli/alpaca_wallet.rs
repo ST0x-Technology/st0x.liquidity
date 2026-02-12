@@ -393,8 +393,8 @@ pub(super) async fn alpaca_convert_command<W: Write>(
                 let usd_amount = price_decimal * qty;
                 writeln!(stdout, "   USD Amount: ${usd_amount}")?;
             }
-            Err(e) => {
-                writeln!(stdout, "   USD Amount: (conversion error: {e})")?;
+            Err(error) => {
+                writeln!(stdout, "   USD Amount: (conversion error: {error})")?;
             }
         }
     }

@@ -5,12 +5,12 @@
 //! - **Equity Vaults**: Hold tokenized equities (token != USDC)
 //! - **USDC Vaults**: Hold USDC for trading
 
-use std::collections::BTreeMap;
 use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use st0x_execution::Symbol;
 
@@ -55,8 +55,8 @@ impl VaultRegistry {
     pub(crate) fn token_by_symbol(&self, symbol: &Symbol) -> Option<Address> {
         self.equity_vaults
             .values()
-            .find(|v| v.symbol == *symbol)
-            .map(|v| v.token)
+            .find(|vault| vault.symbol == *symbol)
+            .map(|vault| vault.token)
     }
 
     fn empty(timestamp: DateTime<Utc>) -> Self {

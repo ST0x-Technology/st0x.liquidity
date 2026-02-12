@@ -229,7 +229,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|s| s.parse().map_err(serde::de::Error::custom))
+    opt.map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -521,7 +521,7 @@ where
 
         requests
             .into_iter()
-            .find(|r| r.id == *id)
+            .find(|request| request.id == *id)
             .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
     }
 
@@ -545,7 +545,7 @@ where
 
         let pending = match erc20.transfer(self.redemption_wallet, amount).send().await {
             Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
+            Err(error) => return Err(handle_contract_error(error).await),
         };
 
         let receipt = pending.get_receipt().await?;
@@ -576,7 +576,7 @@ where
 
         Ok(requests
             .into_iter()
-            .find(|r| r.tx_hash.as_ref() == Some(tx_hash)))
+            .find(|request| request.tx_hash.as_ref() == Some(tx_hash)))
     }
 
     /// Poll until a tokenization request reaches a terminal state (Completed or Rejected).

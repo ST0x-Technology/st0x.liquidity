@@ -15,7 +15,7 @@ use crate::{
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum OrderSide {
+pub enum OrderSide {
     Buy,
     Sell,
 }
@@ -231,6 +231,13 @@ pub(super) async fn place_market_order(
     };
 
     let response = client.place_order(&request).await?;
+
+    if response.side != side {
+        return Err(AlpacaBrokerApiError::SideMismatch {
+            requested_side: side,
+            response_side: response.side,
+        });
+    }
 
     Ok(OrderPlacement {
         order_id: response.id.to_string(),

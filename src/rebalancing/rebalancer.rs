@@ -107,8 +107,8 @@ where
             Ok(()) => {
                 info!(%symbol, "Mint operation completed successfully");
             }
-            Err(e) => {
-                error!(%symbol, error = %e, "Mint operation failed");
+            Err(error) => {
+                error!(%symbol, error = %error, "Mint operation failed");
             }
         }
     }
@@ -116,11 +116,11 @@ where
     async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
         let amount = match quantity.to_u256_18_decimals() {
             Ok(amount) => amount,
-            Err(e) => {
+            Err(error) => {
                 error!(
                     %symbol,
                     ?quantity,
-                    error = %e,
+                    error = %error,
                     "Redemption operation failed: share conversion error"
                 );
                 return;
@@ -148,8 +148,8 @@ where
             Ok(()) => {
                 info!("USDC Alpaca to Base rebalance completed successfully");
             }
-            Err(e) => {
-                error!(error = %e, "USDC Alpaca to Base rebalance failed");
+            Err(error) => {
+                error!(error = %error, "USDC Alpaca to Base rebalance failed");
             }
         }
     }
@@ -163,8 +163,8 @@ where
             Ok(()) => {
                 info!("USDC Base to Alpaca rebalance completed successfully");
             }
-            Err(e) => {
-                error!(error = %e, "USDC Base to Alpaca rebalance failed");
+            Err(error) => {
+                error!(error = %error, "USDC Base to Alpaca rebalance failed");
             }
         }
     }
@@ -190,7 +190,7 @@ fn log_redemption_start(
 fn log_redemption_result<E: std::fmt::Display>(symbol: &Symbol, result: Result<(), E>) {
     match result {
         Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
-        Err(e) => error!(%symbol, error = %e, "Redemption operation failed"),
+        Err(error) => error!(%symbol, error = %error, "Redemption operation failed"),
     }
 }
 

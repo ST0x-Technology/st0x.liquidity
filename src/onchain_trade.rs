@@ -220,7 +220,7 @@ impl Aggregate for Lifecycle<OnChainTrade> {
                 Err(OnChainTradeError::NotFilled)
             }
 
-            (Err(e), _) => Err(e.into()),
+            (Err(error), _) => Err(error.into()),
         }
     }
 }

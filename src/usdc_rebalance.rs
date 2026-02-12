@@ -572,7 +572,7 @@ impl Lifecycle<UsdcRebalance> {
                 }])
             }
             Ok(_) => Err(UsdcRebalanceError::AlreadyInitiated),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -591,7 +591,7 @@ impl Lifecycle<UsdcRebalance> {
             Ok(
                 UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
             ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            Err(error) if !matches!(error, LifecycleError::Uninitialized) => Err(error.into()),
             _ => Err(UsdcRebalanceError::ConversionNotInitiated),
         }
     }
@@ -610,7 +610,7 @@ impl Lifecycle<UsdcRebalance> {
             Ok(
                 UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
             ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            Err(error) if !matches!(error, LifecycleError::Uninitialized) => Err(error.into()),
             _ => Err(UsdcRebalanceError::ConversionNotInitiated),
         }
     }
@@ -642,7 +642,7 @@ impl Lifecycle<UsdcRebalance> {
                     initiated_at: Utc::now(),
                 }])
             }
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            Err(error) if !matches!(error, LifecycleError::Uninitialized) => Err(error.into()),
             _ => Err(UsdcRebalanceError::DepositNotConfirmed),
         }
     }
@@ -691,7 +691,7 @@ impl Lifecycle<UsdcRebalance> {
                 }])
             }
             Ok(_) => Err(UsdcRebalanceError::AlreadyInitiated),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -713,7 +713,7 @@ impl Lifecycle<UsdcRebalance> {
                 | UsdcRebalance::DepositConfirmed { .. }
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            Err(error) if !matches!(error, LifecycleError::Uninitialized) => Err(error.into()),
             _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
         }
     }
@@ -740,7 +740,7 @@ impl Lifecycle<UsdcRebalance> {
                 | UsdcRebalance::DepositConfirmed { .. }
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            Err(error) if !matches!(error, LifecycleError::Uninitialized) => Err(error.into()),
             _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
         }
     }
@@ -779,7 +779,7 @@ impl Lifecycle<UsdcRebalance> {
                 state: "Bridging".to_string(),
             }),
 
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -820,7 +820,7 @@ impl Lifecycle<UsdcRebalance> {
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
 
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -857,7 +857,7 @@ impl Lifecycle<UsdcRebalance> {
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
 
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -904,7 +904,7 @@ impl Lifecycle<UsdcRebalance> {
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
 
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -940,7 +940,7 @@ impl Lifecycle<UsdcRebalance> {
                 state: format!("{:?}", self.live()),
             }),
 
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -974,7 +974,7 @@ impl Lifecycle<UsdcRebalance> {
                 })
             }
 
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1012,7 +1012,7 @@ impl Lifecycle<UsdcRebalance> {
                 })
             }
 
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 }

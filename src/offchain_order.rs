@@ -1,17 +1,18 @@
 //! OffchainOrder CQRS/ES aggregate for tracking broker
 //! order lifecycle: Pending -> Submitted -> Filled/Failed.
 
-use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
+use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
 
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor, Symbol,
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Positive,
+    SupportedExecutor, Symbol,
 };
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
@@ -25,7 +26,8 @@ pub(crate) type OffchainOrderCqrs = SqliteCqrs<Lifecycle<OffchainOrder>>;
 /// (`Error`, `OrderId`, `Ctx`) which make it non-object-safe - you cannot
 /// write `Arc<dyn Executor>`. This trait provides the minimal surface needed
 /// by the aggregate (just `place_market_order`) with erased error/ID types,
-/// allowing different executor implementations to be used via `Arc<dyn OrderPlacer>`.
+/// allowing different executor implementations to be used
+/// via `Arc<dyn OrderPlacer>`.
 #[async_trait]
 pub(crate) trait OrderPlacer: Send + Sync {
     async fn place_market_order(
@@ -91,14 +93,14 @@ pub(crate) struct PriceCents(pub(crate) u64);
 pub(crate) enum OffchainOrder {
     Pending {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
     },
     Submitted {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         broker_order_id: BrokerOrderId,
@@ -107,7 +109,7 @@ pub(crate) enum OffchainOrder {
     },
     PartiallyFilled {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         shares_filled: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
@@ -119,7 +121,7 @@ pub(crate) enum OffchainOrder {
     },
     Filled {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         broker_order_id: BrokerOrderId,
@@ -130,7 +132,7 @@ pub(crate) enum OffchainOrder {
     },
     Failed {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         error: String,
@@ -155,7 +157,7 @@ impl OffchainOrder {
         }
     }
 
-    pub(crate) fn shares(&self) -> FractionalShares {
+    pub(crate) fn shares(&self) -> Positive<FractionalShares> {
         use OffchainOrder::*;
         match self {
             Pending { shares, .. }
@@ -180,11 +182,17 @@ impl OffchainOrder {
     pub(crate) fn executor_order_id(&self) -> Option<&BrokerOrderId> {
         use OffchainOrder::*;
         match self {
-            Pending { .. } | Failed { .. } => None,
+            Submitted {
+                broker_order_id, ..
+            }
+            | PartiallyFilled {
+                broker_order_id, ..
+            }
+            | Filled {
+                broker_order_id, ..
+            } => Some(broker_order_id),
 
-            Submitted { broker_order_id, .. }
-            | PartiallyFilled { broker_order_id, .. }
-            | Filled { broker_order_id, .. } => Some(broker_order_id),
+            Pending { .. } | Failed { .. } => None,
         }
     }
 
@@ -640,7 +648,7 @@ pub(crate) enum OffchainOrderView {
     Execution {
         execution_id: ExecutionId,
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         status: ExecutionStatus,
@@ -743,7 +751,7 @@ impl OffchainOrderView {
         &mut self,
         execution_id: ExecutionId,
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
@@ -871,7 +879,7 @@ pub(crate) enum OffchainOrderError {
 pub(crate) enum OffchainOrderCommand {
     Migrate {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         status: MigratedOrderStatus,
@@ -881,7 +889,7 @@ pub(crate) enum OffchainOrderCommand {
     },
     Place {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
     },
@@ -946,7 +954,7 @@ impl TryFrom<i64> for PriceCents {
 pub(crate) enum OffchainOrderEvent {
     Migrated {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         status: MigratedOrderStatus,
@@ -957,7 +965,7 @@ pub(crate) enum OffchainOrderEvent {
     },
     Placed {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
@@ -1013,7 +1021,7 @@ mod tests {
 
         let command = OffchainOrderCommand::Place {
             symbol: symbol.clone(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
         };
@@ -1035,7 +1043,7 @@ mod tests {
     async fn test_cannot_place_when_already_pending() {
         let order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
@@ -1043,7 +1051,7 @@ mod tests {
 
         let command = OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
         };
@@ -1058,7 +1066,7 @@ mod tests {
     async fn test_cannot_place_when_filled() {
         let order = Lifecycle::Live(OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -1070,7 +1078,7 @@ mod tests {
 
         let command = OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
         };
@@ -1085,7 +1093,7 @@ mod tests {
     async fn test_cannot_place_when_failed() {
         let order = Lifecycle::Live(OffchainOrder::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             error: "Market closed".to_string(),
@@ -1095,7 +1103,7 @@ mod tests {
 
         let command = OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
         };
@@ -1110,7 +1118,7 @@ mod tests {
     async fn test_confirm_submission_after_place() {
         let mut order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
@@ -1151,7 +1159,7 @@ mod tests {
     async fn test_submit_with_different_order_id_fails() {
         let order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -1173,7 +1181,7 @@ mod tests {
     async fn test_partial_fill_from_submitted() {
         let mut order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -1206,7 +1214,7 @@ mod tests {
     async fn test_partial_fill_updates_from_partially_filled() {
         let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             shares_filled: FractionalShares::new(dec!(50)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
@@ -1239,7 +1247,7 @@ mod tests {
     async fn test_complete_fill_from_submitted() {
         let mut order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -1268,7 +1276,7 @@ mod tests {
     async fn test_complete_fill_from_partially_filled() {
         let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             shares_filled: FractionalShares::new(dec!(75)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
@@ -1299,7 +1307,7 @@ mod tests {
     async fn test_cannot_fill_if_not_submitted() {
         let order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
@@ -1319,7 +1327,7 @@ mod tests {
     async fn test_cannot_fill_already_filled() {
         let order = Lifecycle::Live(OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -1343,7 +1351,7 @@ mod tests {
     async fn test_mark_failed_from_pending() {
         let mut order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
@@ -1370,7 +1378,7 @@ mod tests {
     async fn test_mark_failed_from_submitted() {
         let mut order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -1398,7 +1406,7 @@ mod tests {
     async fn test_mark_failed_from_partially_filled() {
         let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             shares_filled: FractionalShares::new(dec!(50)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
@@ -1429,7 +1437,7 @@ mod tests {
     async fn test_cannot_fail_already_filled() {
         let order = Lifecycle::Live(OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -1455,7 +1463,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
@@ -1479,7 +1487,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Submitted,
@@ -1503,7 +1511,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
@@ -1527,7 +1535,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Failed {
@@ -1555,7 +1563,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol: symbol.clone(),
-            shares: FractionalShares::new(dec!(100.5)),
+            shares: Positive::new(FractionalShares::new(dec!(100.5))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
@@ -1596,7 +1604,10 @@ mod tests {
 
         assert_eq!(view_execution_id, execution_id);
         assert_eq!(view_symbol, symbol);
-        assert_eq!(shares, FractionalShares::new(dec!(100.5)));
+        assert_eq!(
+            shares,
+            Positive::new(FractionalShares::new(dec!(100.5))).unwrap()
+        );
         assert_eq!(direction, Direction::Buy);
         assert_eq!(executor, SupportedExecutor::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
@@ -1614,7 +1625,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol,
-            shares: FractionalShares::new(dec!(50.0)),
+            shares: Positive::new(FractionalShares::new(dec!(50.0))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             status: MigratedOrderStatus::Submitted,
@@ -1664,7 +1675,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol,
-            shares: FractionalShares::new(dec!(25.75)),
+            shares: Positive::new(FractionalShares::new(dec!(25.75))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
@@ -1714,7 +1725,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol,
-            shares: FractionalShares::new(dec!(10.0)),
+            shares: Positive::new(FractionalShares::new(dec!(10.0))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             status: MigratedOrderStatus::Failed {
@@ -1765,7 +1776,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Placed {
             symbol: symbol.clone(),
-            shares: FractionalShares::new(dec!(75.25)),
+            shares: Positive::new(FractionalShares::new(dec!(75.25))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             placed_at,
@@ -1799,7 +1810,10 @@ mod tests {
 
         assert_eq!(view_execution_id, execution_id);
         assert_eq!(view_symbol, symbol);
-        assert_eq!(shares, FractionalShares::new(dec!(75.25)));
+        assert_eq!(
+            shares,
+            Positive::new(FractionalShares::new(dec!(75.25))).unwrap()
+        );
         assert_eq!(direction, Direction::Buy);
         assert_eq!(executor, SupportedExecutor::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
@@ -1819,7 +1833,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: FractionalShares::new(dec!(50.0)),
+            shares: Positive::new(FractionalShares::new(dec!(50.0))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             status: ExecutionStatus::Pending,
@@ -1866,7 +1880,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: FractionalShares::new(dec!(100.0)),
+            shares: Positive::new(FractionalShares::new(dec!(100.0))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: ExecutionStatus::Submitted,
@@ -1908,7 +1922,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: FractionalShares::new(dec!(30.0)),
+            shares: Positive::new(FractionalShares::new(dec!(30.0))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             status: ExecutionStatus::Submitted,
@@ -1957,7 +1971,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: FractionalShares::new(dec!(200.0)),
+            shares: Positive::new(FractionalShares::new(dec!(200.0))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: ExecutionStatus::Submitted,
@@ -2086,7 +2100,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Migrated {
             symbol,
-            shares: FractionalShares::new(dec!(100.0)),
+            shares: Positive::new(FractionalShares::new(dec!(100.0))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
@@ -2115,7 +2129,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Placed {
             symbol,
-            shares: FractionalShares::new(dec!(50.0)),
+            shares: Positive::new(FractionalShares::new(dec!(50.0))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             placed_at: chrono::Utc::now(),
@@ -2154,7 +2168,7 @@ mod tests {
 
         let command = OffchainOrderCommand::Migrate {
             symbol: symbol.clone(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
@@ -2199,7 +2213,7 @@ mod tests {
         let order = Lifecycle::<OffchainOrder, Never>::default();
         let command = OffchainOrderCommand::Migrate {
             symbol: symbol.clone(),
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
@@ -2220,7 +2234,7 @@ mod tests {
         let order = Lifecycle::<OffchainOrder, Never>::default();
         let command = OffchainOrderCommand::Migrate {
             symbol: symbol.clone(),
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Submitted,
@@ -2241,7 +2255,7 @@ mod tests {
         let order = Lifecycle::<OffchainOrder, Never>::default();
         let command = OffchainOrderCommand::Migrate {
             symbol: symbol.clone(),
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
@@ -2262,7 +2276,7 @@ mod tests {
         let order = Lifecycle::<OffchainOrder, Never>::default();
         let command = OffchainOrderCommand::Migrate {
             symbol,
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Failed {
@@ -2286,7 +2300,7 @@ mod tests {
     async fn test_cannot_migrate_when_already_placed() {
         let order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
@@ -2294,7 +2308,7 @@ mod tests {
 
         let command = OffchainOrderCommand::Migrate {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(50)),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
@@ -2319,7 +2333,7 @@ mod tests {
     async fn test_confirm_submission_not_idempotent_blocks_retry_recovery() {
         let mut order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),

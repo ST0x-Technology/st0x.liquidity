@@ -49,8 +49,8 @@ impl EventBroadcaster {
             let entry = event_store_entry_from_envelope(envelope);
             let msg = ServerMessage::Event(entry);
 
-            if let Err(e) = self.sender.send(msg) {
-                warn!("Failed to broadcast event (no receivers): {e}");
+            if let Err(error) = self.sender.send(msg) {
+                warn!("Failed to broadcast event (no receivers): {error}");
             }
         }
     }
@@ -91,14 +91,15 @@ impl Query<Lifecycle<UsdcRebalance>> for EventBroadcaster {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::equity_redemption::EquityRedemptionEvent;
-    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
-    use crate::usdc_rebalance::UsdcRebalanceEvent;
     use alloy::primitives::Address;
     use cqrs_es::Query;
     use st0x_execution::Symbol;
     use std::collections::HashMap;
+
+    use super::*;
+    use crate::equity_redemption::EquityRedemptionEvent;
+    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
+    use crate::usdc_rebalance::UsdcRebalanceEvent;
 
     fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
@@ -202,12 +203,8 @@ mod tests {
             },
         ];
 
-        Query::<Lifecycle<TokenizedEquityMint>>::dispatch(
-            &broadcaster,
-            "mint-multi",
-            &events,
-        )
-        .await;
+        Query::<Lifecycle<TokenizedEquityMint>>::dispatch(&broadcaster, "mint-multi", &events)
+            .await;
 
         let msg1 = receiver.recv().await.expect("should receive first message");
         let msg2 = receiver
@@ -244,12 +241,8 @@ mod tests {
             metadata: HashMap::new(),
         }];
 
-        Query::<Lifecycle<EquityRedemption>>::dispatch(
-            &broadcaster,
-            "redemption-123",
-            &events,
-        )
-        .await;
+        Query::<Lifecycle<EquityRedemption>>::dispatch(&broadcaster, "redemption-123", &events)
+            .await;
 
         let msg = receiver.recv().await.expect("should receive message");
 

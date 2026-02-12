@@ -3,15 +3,12 @@ use apca::api::v2::order;
 use chrono::Utc;
 use num_decimal::Num;
 use num_traits::ToPrimitive;
-use rust_decimal::Decimal;
 use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
 use crate::order::OrderUpdate;
-use crate::{
-    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, Positive, Symbol,
-};
+use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus};
 
 pub(super) async fn place_market_order(
     client: &Client,
@@ -116,7 +113,6 @@ fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
         // so new statuses may be added. We conservatively treat unknown statuses
         // as Failed to avoid incorrect handling. This will log a warning when
         // we encounter an unknown status, prompting us to update this mapping.
-        #[allow(unreachable_patterns)]
         unknown => {
             debug!("Unknown Alpaca order status encountered: {unknown:?}, treating as Failed");
             OrderStatus::Failed
@@ -142,28 +138,15 @@ fn extract_price_cents_from_order(
     }
 }
 
-/// Extracts shares from Alpaca Amount enum
-fn extract_shares_from_amount(
-    amount: &order::Amount,
-) -> Result<Positive<FractionalShares>, AlpacaTradingApiError> {
-    match amount {
-        order::Amount::Quantity { quantity } => {
-            let qty_decimal: Decimal = quantity.to_string().parse()?;
-            Ok(Positive::new(FractionalShares::new(qty_decimal))?)
-        }
-        order::Amount::Notional { .. } => Err(AlpacaTradingApiError::NotionalOrdersNotSupported),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use apca::api::v2::order::Amount;
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use serde_json::json;
 
     use super::*;
+    use crate::{FractionalShares, Positive, Symbol};
 
     fn create_test_client(mock_server: &MockServer) -> Client {
         let api_info =
@@ -568,16 +551,6 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
-    }
-
-    #[test]
-    fn test_extract_shares_from_notional_amount_returns_error() {
-        let quantity_amount = Amount::Quantity {
-            quantity: 100.into(),
-        };
-
-        let shares = extract_shares_from_amount(&quantity_amount).unwrap();
-        assert_eq!(shares.inner().inner(), Decimal::from(100));
     }
 
     proptest! {

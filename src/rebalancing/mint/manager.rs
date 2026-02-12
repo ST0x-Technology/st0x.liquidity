@@ -244,10 +244,8 @@ mod tests {
         tokenization_requests_path,
     };
 
-    type TestCqrs = CqrsFramework<
-        Lifecycle<TokenizedEquityMint>,
-        MemStore<Lifecycle<TokenizedEquityMint>>,
-    >;
+    type TestCqrs =
+        CqrsFramework<Lifecycle<TokenizedEquityMint>, MemStore<Lifecycle<TokenizedEquityMint>>>;
 
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();

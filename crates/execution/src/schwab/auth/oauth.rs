@@ -58,9 +58,6 @@ pub(crate) struct SchwabAuthResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountNumbers {
-    // Field exists in API response but isn't currently used
-    #[allow(dead_code)]
-    pub account_number: String,
     pub hash_value: String,
 }
 
@@ -240,7 +237,7 @@ async fn extract_error_body(response: reqwest::Response) -> String {
     let is_gzipped = response
         .headers()
         .get("content-encoding")
-        .map(reqwest::header::HeaderValue::as_bytes)
+        .map(HeaderValue::as_bytes)
         == Some(b"gzip");
 
     if is_gzipped {

@@ -67,9 +67,9 @@ pub(super) async fn ensure_schwab_authentication<W: Write>(
             info!("Authentication tokens are valid, access token obtained");
             Ok(())
         }
-        Err(e) => {
-            error!("Failed to obtain valid access token: {e:?}");
-            Err(e.into())
+        Err(error) => {
+            error!("Failed to obtain valid access token: {error:?}");
+            Err(error.into())
         }
     }
 }

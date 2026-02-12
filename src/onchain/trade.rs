@@ -3,8 +3,8 @@
 //! price calculation, and Pyth oracle pricing. Also provides vault extraction
 //! utilities for the vault registry.
 
-use alloy::primitives::{Address, B256, U256};
 use alloy::primitives::ruint::FromUintError;
+use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -40,7 +40,8 @@ pub(crate) struct VaultInfo {
 /// Extracts vault information from an OrderV4 for both input and output at the
 /// specified indices.
 ///
-/// Returns `(input_vault, output_vault)` if both indices are valid, or None if either is out of bounds.
+/// Returns `(input_vault, output_vault)` if both indices
+/// are valid, or `None` if either is out of bounds.
 pub(crate) fn extract_vault_info(
     order: &OrderV4,
     input_index: usize,
@@ -70,8 +71,9 @@ pub(crate) struct OwnedVaultInfo {
 
 /// Extracts all vault information from a ClearV3 event.
 ///
-/// Returns vaults from both alice and bob orders. Each order contributes two vaults
-/// (input and output) as determined by the clear config indices.
+/// Returns vaults from both alice and bob orders. Each
+/// order contributes two vaults (input and output) as
+/// determined by the clear config indices.
 pub(crate) fn extract_vaults_from_clear(event: &ClearV3) -> Vec<OwnedVaultInfo> {
     let participants = [
         (
@@ -134,7 +136,7 @@ pub(crate) fn extract_owned_vaults(
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnchainTrade {
     pub(crate) id: Option<i64>,
-    pub(crate) tx_hash: B256,
+    pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedEquitySymbol,
     pub(crate) equity_token: Address,
@@ -224,8 +226,8 @@ impl OnchainTrade {
         .await
         {
             Ok(pricing) => Some(pricing),
-            Err(e) => {
-                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {e}");
+            Err(error) => {
+                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {error}");
                 None
             }
         };
@@ -241,17 +243,17 @@ impl OnchainTrade {
             amount: trade_details.equity_amount().value(),
             direction: trade_details.direction(),
             price,
-            #[allow(clippy::cast_possible_wrap)]
-            block_timestamp: log
-                .block_timestamp
-                .and_then(|ts| DateTime::from_timestamp(ts as i64, 0)),
+            block_timestamp: log.block_timestamp.and_then(|timestamp_secs| {
+                let secs: i64 = timestamp_secs.try_into().ok()?;
+                DateTime::from_timestamp(secs, 0)
+            }),
             created_at: None,
             gas_used,
             effective_gas_price,
-            pyth_price: pyth_pricing.as_ref().map(|p| p.price),
-            pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
-            pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
-            pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
+            pyth_price: pyth_pricing.as_ref().map(|pricing| pricing.price),
+            pyth_confidence: pyth_pricing.as_ref().map(|pricing| pricing.confidence),
+            pyth_exponent: pyth_pricing.as_ref().map(|pricing| pricing.exponent),
+            pyth_publish_time: pyth_pricing.as_ref().map(|pricing| pricing.publish_time),
         };
 
         Ok(Some(trade))
@@ -260,7 +262,7 @@ impl OnchainTrade {
     /// Attempts to create an OnchainTrade from a transaction hash by looking up
     /// the transaction receipt and parsing relevant orderbook events.
     pub async fn try_from_tx_hash<P: Provider>(
-        tx_hash: B256,
+        tx_hash: TxHash,
         provider: P,
         cache: &SymbolCache,
         ctx: &EvmCtx,
@@ -271,9 +273,7 @@ impl OnchainTrade {
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| {
-                OnChainError::Validation(TradeValidationError::TransactionNotFound(
-                    tx_hash,
-                ))
+                OnChainError::Validation(TradeValidationError::TransactionNotFound(tx_hash))
             })?;
 
         let trades: Vec<_> = receipt
@@ -370,8 +370,9 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 
 /// Converts a Float (bytes32) amount to f64.
 ///
-/// Uses the rain-math-float library's format() method to convert the Float to a string,
-/// then parses it to f64. Float.format() handles the proper formatting internally.
+/// Uses the rain-math-float library's format() method to convert the Float to
+/// a string, then parses it to f64. Float.format() handles the proper
+/// formatting internally.
 fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
     let float = Float::from_raw(float);
     let formatted = float.format()?;
@@ -396,8 +397,8 @@ pub(crate) enum TradeValidationError {
     #[error("No output found at index: {0}")]
     NoOutputAtIndex(usize),
     #[error(
-        "Expected IO to contain USDC and one tokenized equity \
-         (t prefix, 0x or s1 suffix) but got {0} and {1}"
+        "Expected IO to contain USDC and one tokenized \
+         equity (t prefix) but got {0} and {1}"
     )]
     InvalidSymbolConfiguration(String, String),
     #[error(
@@ -411,14 +412,14 @@ pub(crate) enum TradeValidationError {
     #[error("Failed to convert U256 to f64: {0}")]
     U256ToF64(#[from] ParseFloatError),
     #[error("Transaction not found: {0}")]
-    TransactionNotFound(B256),
+    TransactionNotFound(TxHash),
     #[error(
         "Node provider issue: tx receipt missing or has no logs. \
         block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
     )]
     NodeReceiptMissing {
         block_number: u64,
-        tx_hash: B256,
+        tx_hash: TxHash,
         clear_log_index: u64,
     },
     #[error(
@@ -427,7 +428,7 @@ pub(crate) enum TradeValidationError {
     )]
     AfterClearMissingFromReceipt {
         block_number: u64,
-        tx_hash: B256,
+        tx_hash: TxHash,
         clear_log_index: u64,
     },
     #[error("Negative shares amount: {0}")]
@@ -437,7 +438,8 @@ pub(crate) enum TradeValidationError {
     #[error("Negative USDC amount: {0}")]
     NegativeUsdc(f64),
     #[error(
-        "Symbol '{0}' is not a tokenized equity (must start with 't' or end with '0x' or 's1')"
+        "Symbol '{0}' is not a tokenized equity \
+         (must have 't' prefix, e.g. tAAPL, tSPYM)"
     )]
     NotTokenizedEquity(String),
 }
@@ -485,8 +487,8 @@ mod tests {
         assert!((float_to_f64(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
     }
 
-    /// Test with real production event data from tx 0xf05d240c99c7c3f8d4562130f655d2b571b1b82643b621987bed3d8aabab304d
-    /// The trade was for 2 shares of tSPLG at ~$80/share.
+    /// Test with real production event data from tx
+    /// 0xf05d...304d (2 shares of tSPLG at ~$80/share).
     ///
     /// TakeOrderV3 event field semantics (counterintuitive naming):
     /// - event.input = amount the order GAVE = 2 tSPLG shares

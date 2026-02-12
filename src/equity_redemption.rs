@@ -277,7 +277,7 @@ impl Lifecycle<EquityRedemption> {
             }]),
             Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
             Ok(_) => Err(EquityRedemptionError::AlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -293,7 +293,7 @@ impl Lifecycle<EquityRedemption> {
             }]),
             Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
             Ok(_) => Err(EquityRedemptionError::AlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -307,7 +307,7 @@ impl Lifecycle<EquityRedemption> {
             }]),
             Ok(EquityRedemption::Completed { .. }) => Err(EquityRedemptionError::AlreadyCompleted),
             Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -327,7 +327,7 @@ impl Lifecycle<EquityRedemption> {
             Ok(EquityRedemption::Pending { .. } | EquityRedemption::Completed { .. }) => {
                 Err(EquityRedemptionError::AlreadyCompleted)
             }
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -347,7 +347,7 @@ impl Lifecycle<EquityRedemption> {
             }
             Ok(EquityRedemption::Completed { .. }) => Err(EquityRedemptionError::AlreadyCompleted),
             Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 }

@@ -1,16 +1,15 @@
 //! Polls broker APIs for order status updates and reconciles fills.
 
-use std::sync::Arc;
-use std::time::Duration;
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
 use st0x_execution::{
-    ExecutionError, Executor, ExecutorOrderId, FractionalShares, OrderState,
-    OrderStatus, PersistenceError, Symbol,
+    ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
 
 use super::execution::find_executions_by_symbol_status_and_broker;
@@ -41,12 +40,12 @@ impl From<ExecutionError> for OrderPollingError {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrderPollerConfig {
+pub struct OrderPollerCtx {
     pub polling_interval: Duration,
     pub max_jitter: Duration,
 }
 
-impl Default for OrderPollerConfig {
+impl Default for OrderPollerCtx {
     fn default() -> Self {
         Self {
             polling_interval: Duration::from_secs(15),
@@ -56,7 +55,7 @@ impl Default for OrderPollerConfig {
 }
 
 pub struct OrderStatusPoller<E: Executor> {
-    config: OrderPollerConfig,
+    ctx: OrderPollerCtx,
     pool: SqlitePool,
     interval: Interval,
     executor: E,
@@ -66,16 +65,16 @@ pub struct OrderStatusPoller<E: Executor> {
 
 impl<E: Executor> OrderStatusPoller<E> {
     pub fn new(
-        config: OrderPollerConfig,
+        ctx: OrderPollerCtx,
         pool: SqlitePool,
         executor: E,
         offchain_order_cqrs: Arc<OffchainOrderCqrs>,
         position_cqrs: Arc<PositionCqrs>,
     ) -> Self {
-        let interval = interval(config.polling_interval);
+        let interval = interval(ctx.polling_interval);
 
         Self {
-            config,
+            ctx,
             pool,
             interval,
             executor,
@@ -87,7 +86,7 @@ impl<E: Executor> OrderStatusPoller<E> {
     pub async fn run(mut self) -> Result<(), OrderPollingError> {
         info!(
             "Starting order status poller with interval: {:?}",
-            self.config.polling_interval
+            self.ctx.polling_interval
         );
 
         loop {
@@ -349,8 +348,8 @@ impl<E: Executor> OrderStatusPoller<E> {
     }
 
     async fn add_jittered_delay(&self) {
-        if self.config.max_jitter > Duration::ZERO {
-            let max_jitter_u128 = self.config.max_jitter.as_millis().min(u128::from(u64::MAX));
+        if self.ctx.max_jitter > Duration::ZERO {
+            let max_jitter_u128 = self.ctx.max_jitter.as_millis().min(u128::from(u64::MAX));
             let max_jitter_millis = max_jitter_u128.to_u64().unwrap_or(u64::MAX);
             let jitter_millis = rand::thread_rng().gen_range(0..max_jitter_millis);
             let jitter = Duration::from_millis(jitter_millis);
@@ -483,7 +482,7 @@ mod tests {
         let pool = setup_test_db().await;
         let (offchain_order_cqrs, position_cqrs) = create_test_frameworks(&pool);
         let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let ctx = OrderPollerCtx::default();
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
@@ -506,7 +505,7 @@ mod tests {
         .await;
 
         let poller = OrderStatusPoller::new(
-            config,
+            ctx,
             pool.clone(),
             broker,
             offchain_order_cqrs,
@@ -568,7 +567,7 @@ mod tests {
         let pool = setup_test_db().await;
         let (offchain_order_cqrs, position_cqrs) = create_test_frameworks(&pool);
         let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let ctx = OrderPollerCtx::default();
 
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
@@ -591,7 +590,7 @@ mod tests {
         .await;
 
         let poller = OrderStatusPoller::new(
-            config,
+            ctx,
             pool.clone(),
             broker,
             offchain_order_cqrs,

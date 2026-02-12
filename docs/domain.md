@@ -63,9 +63,9 @@ rebalancing), and respects market hours by pausing trading outside open hours.
 ### Symbol
 
 A type-safe stock ticker represented as a newtype (`Symbol(String)`). Tokenized
-equities use an "0x" suffix to distinguish them from base assets:
+equities use a "t" prefix to distinguish them from base assets:
 
-- `AAPL0x` - tokenized Apple stock (onchain)
+- `tAAPL` - tokenized Apple stock (onchain)
 - `AAPL` - Apple stock (offchain, at the brokerage)
 - `USDC` - stablecoin used as the quote currency onchain
 
@@ -123,9 +123,9 @@ The process of creating or destroying onchain representations of offchain
 equities:
 
 - **Mint**: Convert broker-held shares into onchain tokenized equity tokens
-  (e.g., 100 AAPL shares at Alpaca -> 100 AAPL0x tokens on Base).
+  (e.g., 100 AAPL shares at Alpaca -> 100 tAAPL tokens on Base).
 - **Redemption**: The reverse - burn onchain tokens to recover broker-held
-  shares (e.g., 100 AAPL0x tokens -> 100 AAPL shares at Alpaca).
+  shares (e.g., 100 tAAPL tokens -> 100 AAPL shares at Alpaca).
 
 Both operations are tracked as CQRS event-sourced aggregates
 (`TokenizedEquityMint`, `EquityRedemption`) providing an immutable audit trail.

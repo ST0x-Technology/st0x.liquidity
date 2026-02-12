@@ -1,19 +1,20 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
-use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
-use crate::offchain::execution::OffchainExecution;
-use crate::onchain::OnchainTrade;
-use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
-use alloy::primitives::{B256, LogData, address, bytes, fixed_bytes};
+use alloy::primitives::{Address, B256, LogData, TxHash, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_execution::{OrderState, SchwabTokens};
+use st0x_execution::{
+    Direction, FractionalShares, OrderState, Positive, SchwabTokens, SupportedExecutor, Symbol,
+};
 
+use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+use crate::offchain::execution::OffchainExecution;
+use crate::onchain::OnchainTrade;
+use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important -- only that the
@@ -85,8 +86,9 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
     pool
 }
 
-/// Centralized test token setup to eliminate duplication across test files.
-/// Creates and stores test tokens in the database for Schwab API authentication.
+/// Centralized test token setup to eliminate duplication
+/// across test files. Creates and stores test tokens in
+/// the database for Schwab API authentication.
 pub(crate) async fn setup_test_tokens(pool: &SqlitePool, auth: &SchwabAuth) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
@@ -118,7 +120,7 @@ impl OnchainTradeBuilder {
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
                 log_index: 1,
-                symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+                symbol: "tAAPL".parse::<TokenizedEquitySymbol>().unwrap(),
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 amount: 1.0,
                 direction: Direction::Buy,
@@ -142,7 +144,7 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_equity_token(mut self, token: alloy::primitives::Address) -> Self {
+    pub(crate) fn with_equity_token(mut self, token: Address) -> Self {
         self.trade.equity_token = token;
         self
     }
@@ -160,7 +162,7 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_tx_hash(mut self, hash: B256) -> Self {
+    pub(crate) fn with_tx_hash(mut self, hash: TxHash) -> Self {
         self.trade.tx_hash = hash;
         self
     }

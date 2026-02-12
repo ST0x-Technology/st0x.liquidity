@@ -1,5 +1,6 @@
 use alloy::primitives::FixedBytes;
 use async_trait::async_trait;
+use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -94,8 +95,8 @@ impl Executor for Schwab {
                 MarketStatus::Open => {
                     // Market is open, return time until close
                     if let Some(end_time) = market_hours.end {
-                        let market_close = end_time.with_timezone(&chrono::Utc);
-                        let now = chrono::Utc::now();
+                        let market_close = end_time.with_timezone(&Utc);
+                        let now = Utc::now();
                         if market_close > now {
                             let duration = (market_close - now)
                                 .to_std()
@@ -109,8 +110,8 @@ impl Executor for Schwab {
                 MarketStatus::Closed => {
                     // Market is closed, wait until next open
                     if let Some(start_time) = market_hours.start {
-                        let next_open = start_time.with_timezone(&chrono::Utc);
-                        let now = chrono::Utc::now();
+                        let next_open = start_time.with_timezone(&Utc);
+                        let now = Utc::now();
                         if next_open > now {
                             let wait_duration = (next_open - now)
                                 .to_std()

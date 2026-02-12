@@ -45,16 +45,17 @@
 //! - `or_initialize()` handles genesis events if the entity doesn't exist yet
 //! - Failures transition to `Failed` instead of panicking
 
-use std::fmt::{Debug, Display};
-use std::sync::Arc;
 use async_trait::async_trait;
 use cqrs_es::persist::GenericQuery;
 use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteViewRepository;
+use std::fmt::{Debug, Display};
+use std::sync::Arc;
 use tracing::error;
 
-/// A query that materializes a `Lifecycle<T, E>` aggregate as its own view in SQLite.
+/// A query that materializes a `Lifecycle<T, E>` aggregate as
+/// its own view in SQLite.
 pub(crate) type SqliteQuery<T, E = Never> = GenericQuery<
     SqliteViewRepository<Lifecycle<T, E>, Lifecycle<T, E>>,
     Lifecycle<T, E>,
@@ -69,7 +70,8 @@ pub(crate) type SqliteQuery<T, E = Never> = GenericQuery<
 /// # Type Parameters
 ///
 /// - `T`: The entity data type (e.g., `Position`, `OnChainTrade`)
-/// - `E`: The custom error type for domain-specific failures (e.g., `ArithmeticError`).
+/// - `E`: The custom error type for domain-specific failures
+///   (e.g., `ArithmeticError`).
 ///   Use [`Never`] for entities with no fallible operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum Lifecycle<T, E = Never> {
@@ -98,15 +100,16 @@ impl<T, E> Default for Lifecycle<T, E> {
 
 /// An uninhabited type for entities with no fallible operations.
 ///
-/// Similar to `std::convert::Infallible` but implements `Serialize`/`Deserialize`
-/// for compatibility with `cqrs_es` bounds.
+/// Similar to `std::convert::Infallible` but implements
+/// `Serialize`/`Deserialize` for compatibility with `cqrs_es`
+/// bounds.
 ///
-/// Since this enum has no variants, values of type `Never` cannot be constructed,
-/// making `LifecycleError::Custom(Never)` unreachable at runtime.
+/// Since this enum has no variants, values of type `Never`
+/// cannot be constructed, making
+/// `LifecycleError::Custom(Never)` unreachable at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("never")]
 pub(crate) enum Never {}
-
 
 /// Errors that can occur during lifecycle transitions.
 ///
@@ -230,8 +233,9 @@ impl<T, E: Display> Lifecycle<T, E> {
     }
 }
 
-/// Blanket View impl: any `Lifecycle<T, E>` that is an `Aggregate` can serve as
-/// its own materialized view by replaying events through `apply`.
+/// Blanket View impl: any `Lifecycle<T, E>` that is an
+/// `Aggregate` can serve as its own materialized view by
+/// replaying events through `apply`.
 impl<T, E> View<Self> for Lifecycle<T, E>
 where
     Self: Aggregate,
@@ -243,15 +247,17 @@ where
     }
 }
 
-/// Blanket impl allowing `Arc<Q>` to be used as a `Query` when `Q: Query`.
+/// Blanket impl allowing `Arc<Q>` to be used as a `Query`
+/// when `Q: Query`.
 ///
-/// This enables sharing a single query instance across multiple CQRS frameworks
-/// (e.g., mint, redemption, USDC) without needing adapter wrappers.
+/// This enables sharing a single query instance across multiple
+/// CQRS frameworks (e.g., mint, redemption, USDC) without
+/// needing adapter wrappers.
 #[async_trait]
 impl<Q, T, E> Query<Lifecycle<T, E>> for Arc<Q>
 where
     Q: Query<Lifecycle<T, E>> + Send + Sync,
-    Lifecycle<T, E>: cqrs_es::Aggregate,
+    Lifecycle<T, E>: Aggregate,
 {
     async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<T, E>>]) {
         Q::dispatch(self, aggregate_id, events).await;
@@ -260,13 +266,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use cqrs_es::DomainEvent;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use chrono::Utc;
-    use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
-    use rust_decimal_macros::dec;
 
-    use st0x_execution::FractionalShares;
+    use st0x_execution::{ArithmeticError, FractionalShares, Symbol};
 
     use super::*;
     use crate::position::{Position, PositionEvent};
@@ -580,14 +585,14 @@ mod tests {
         );
     }
 
-    type PositionLifecycle = Lifecycle<Position, st0x_execution::ArithmeticError<FractionalShares>>;
+    type PositionLifecycle = Lifecycle<Position, ArithmeticError<FractionalShares>>;
 
     #[test]
     fn view_update_transitions_uninitialized_to_live() {
         let mut lifecycle = PositionLifecycle::default();
         assert!(matches!(lifecycle, Lifecycle::Uninitialized));
 
-        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
         let initialized_at = Utc::now();
 
         let event = PositionEvent::Initialized {
@@ -621,7 +626,7 @@ mod tests {
     fn view_update_clones_payload_leaving_envelope_usable() {
         let mut lifecycle = PositionLifecycle::default();
 
-        let symbol = st0x_execution::Symbol::new("TSLA").unwrap();
+        let symbol = Symbol::new("TSLA").unwrap();
         let initialized_at = Utc::now();
 
         let event = PositionEvent::Initialized {

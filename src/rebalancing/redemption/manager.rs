@@ -192,10 +192,8 @@ mod tests {
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
     };
 
-    type TestCqrs = CqrsFramework<
-        Lifecycle<EquityRedemption>,
-        MemStore<Lifecycle<EquityRedemption>>,
-    >;
+    type TestCqrs =
+        CqrsFramework<Lifecycle<EquityRedemption>, MemStore<Lifecycle<EquityRedemption>>>;
 
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();

@@ -1,8 +1,6 @@
 //! Trading order execution and transaction processing CLI commands.
 
-use std::io::Write;
-use std::sync::Arc;
-use alloy::primitives::B256;
+use alloy::primitives::TxHash;
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,23 +8,21 @@ use cqrs_es::persist::GenericQuery;
 use rust_decimal::Decimal;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
-use tracing::{error, info};
-
-use st0x_execution::schwab::SchwabCtx;
 use st0x_execution::{
     ArithmeticError, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
     MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
+use std::io::Write;
+use std::sync::Arc;
+use tracing::{error, info};
 
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::lifecycle::Lifecycle;
-use crate::offchain_order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
-};
-use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
+use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer};
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
@@ -185,7 +181,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 }
 
 pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
-    tx_hash: B256,
+    tx_hash: TxHash,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -213,9 +209,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
                 "   This transaction may not contain orderbook events matching the configured order hash."
             )?;
         }
-        Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(
-            hash,
-        ))) => {
+        Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(hash))) => {
             writeln!(stdout, "❌ Transaction not found: {hash}")?;
             writeln!(
                 stdout,
@@ -315,12 +309,11 @@ pub(super) async fn process_found_trade<W: Write>(
     >::new(
         pool.clone(), "offchain_order_view".to_string()
     ));
-    let offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder>>> =
-        Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            order_placer,
-        ));
+    let offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder>>> = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+        order_placer,
+    ));
 
     update_position_aggregate(&position_cqrs, &onchain_trade, ctx.execution_threshold).await;
 
@@ -331,7 +324,6 @@ pub(super) async fn process_found_trade<W: Write>(
         &position_query,
         base_symbol,
         executor_type,
-        &ctx.execution_threshold,
     )
     .await?
     else {

@@ -52,9 +52,9 @@ async fn auth_refresh(
 
     let code = match extract_code_from_url(&request.redirect_url) {
         Ok(code) => code,
-        Err(e) => {
+        Err(error) => {
             return Json(AuthRefreshResponse::Error {
-                error: format!("Failed to extract authorization code: {e}"),
+                error: format!("Failed to extract authorization code: {error}"),
             });
         }
     };
@@ -62,19 +62,19 @@ async fn auth_refresh(
     let schwab_ctx = schwab_auth.to_schwab_ctx(pool.inner().clone());
     let tokens = match schwab_ctx.get_tokens_from_code(&code).await {
         Ok(tokens) => tokens,
-        Err(e) => {
+        Err(error) => {
             return Json(AuthRefreshResponse::Error {
-                error: format!("Authentication failed: {e}"),
+                error: format!("Authentication failed: {error}"),
             });
         }
     };
 
-    if let Err(e) = tokens
+    if let Err(error) = tokens
         .store(pool.inner(), &schwab_auth.encryption_key)
         .await
     {
         return Json(AuthRefreshResponse::Error {
-            error: format!("Failed to store tokens: {e}"),
+            error: format!("Failed to store tokens: {error}"),
         });
     }
 

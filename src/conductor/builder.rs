@@ -1,12 +1,12 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
-use std::sync::Arc;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
+use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -15,8 +15,8 @@ use st0x_execution::Executor;
 
 use super::{
     Conductor, EventProcessingError, spawn_event_processor, spawn_inventory_poller,
-    spawn_onchain_event_receiver, spawn_order_poller,
-    spawn_periodic_accumulated_position_check, spawn_queue_processor,
+    spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
+    spawn_queue_processor,
 };
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;

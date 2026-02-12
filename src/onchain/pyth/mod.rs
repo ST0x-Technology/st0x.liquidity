@@ -1,7 +1,7 @@
 //! Pyth oracle price feed integration for onchain price lookups via
 //! transaction traces.
 
-use alloy::primitives::{Address, B256, Bytes, U256, address};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::providers::ext::DebugApi;
 use alloy::rpc::types::trace::geth::{
@@ -66,7 +66,7 @@ pub(super) struct PythPricing {
 
 impl PythPricing {
     pub(super) async fn try_from_tx_hash<P: Provider>(
-        tx_hash: B256,
+        tx_hash: TxHash,
         provider: P,
         symbol: &str,
         feed_id_cache: &FeedIdCache,
@@ -214,7 +214,7 @@ impl Price {
 }
 
 pub async fn extract_pyth_price<P>(
-    tx_hash: B256,
+    tx_hash: TxHash,
     provider: &P,
     symbol: &str,
     cache: &FeedIdCache,
@@ -237,7 +237,7 @@ where
 
 fn parse_non_empty_pyth_calls(
     pyth_calls: &[PythCall],
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<(&PythCall, &[PythCall]), PythError> {
     let Some((first, rest)) = pyth_calls.split_first() else {
         warn!("No Pyth call found in transaction {tx_hash}");
@@ -253,7 +253,7 @@ async fn find_matching_pyth_call<'a>(
     rest: &'a [PythCall],
     symbol: &str,
     cache: &FeedIdCache,
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<&'a PythCall, PythError> {
     let cached_feed_id = cache.get(symbol).await;
 
@@ -270,7 +270,7 @@ fn find_call_by_cached_feed_id<'a>(
     rest: &'a [PythCall],
     feed_id: B256,
     symbol: &str,
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<&'a PythCall, PythError> {
     debug!("Found cached feed ID for {symbol}: {feed_id}");
 
@@ -298,16 +298,16 @@ async fn cache_new_feed_id(cache: &FeedIdCache, symbol: &str, call: &PythCall) {
 fn extract_and_log_price(
     matching_call: &PythCall,
     symbol: &str,
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<Price, PythError> {
     debug!(
         "Using Pyth call at depth {} with feed ID {} for price extraction",
         matching_call.depth, matching_call.price_feed_id
     );
 
-    let price = decode_pyth_price(&matching_call.output).map_err(|e| {
-        error!("Failed to extract Pyth price from {tx_hash}: {e}");
-        e
+    let price = decode_pyth_price(&matching_call.output).map_err(|error| {
+        error!("Failed to extract Pyth price from {tx_hash}: {error}");
+        error
     })?;
 
     info!(
@@ -318,7 +318,7 @@ fn extract_and_log_price(
     Ok(price)
 }
 
-async fn fetch_transaction_trace<P>(tx_hash: B256, provider: &P) -> Result<GethTrace, PythError>
+async fn fetch_transaction_trace<P>(tx_hash: TxHash, provider: &P) -> Result<GethTrace, PythError>
 where
     P: Provider,
 {
@@ -332,7 +332,7 @@ where
     let trace = provider
         .debug_trace_transaction(tx_hash, options)
         .await
-        .map_err(|e| PythError::Rpc(Box::new(e)))?;
+        .map_err(|error| PythError::Rpc(Box::new(error)))?;
 
     Ok(trace)
 }
@@ -594,7 +594,7 @@ mod tests {
             price: 100_000,
             conf: 500,
             expo: -5,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let encoded = Price::abi_encode(&price);
@@ -625,7 +625,7 @@ mod tests {
             price: 123_456_789,
             conf: 1000,
             expo: -8,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -639,7 +639,7 @@ mod tests {
             price: 42,
             conf: 1,
             expo: 0,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -653,7 +653,7 @@ mod tests {
             price: 123,
             conf: 10,
             expo: 3,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -677,7 +677,7 @@ mod tests {
                 price: price_value,
                 conf: 100,
                 expo,
-                publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+                publishTime: U256::from(1_700_000_000u64),
             };
 
             let decimal = price.to_decimal().unwrap();
@@ -696,7 +696,7 @@ mod tests {
             price: -50_000_000,
             conf: 1000,
             expo: -6,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -710,7 +710,7 @@ mod tests {
             price: 18_250,
             conf: 10,
             expo: -2,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -724,7 +724,7 @@ mod tests {
             price: 999_999_999,
             conf: 5000,
             expo: -8,
-            publishTime: alloy::primitives::U256::from(1_700_123_456u64),
+            publishTime: U256::from(1_700_123_456u64),
         };
 
         let encoded = Price::abi_encode(&original_price);

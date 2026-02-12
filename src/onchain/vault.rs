@@ -124,7 +124,7 @@ where
             .await
         {
             Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
+            Err(error) => return Err(handle_contract_error(error).await),
         };
 
         let receipt = pending.get_receipt().await?;
@@ -168,7 +168,7 @@ where
             .await
         {
             Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
+            Err(error) => return Err(handle_contract_error(error).await),
         };
 
         // Wait for confirmations to ensure state propagates across load-balanced

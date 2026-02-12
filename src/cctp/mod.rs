@@ -384,7 +384,7 @@ where
         // Find the fast transfer fee (threshold 1000)
         let fast_fee = fee_entries
             .iter()
-            .find(|e| e.finality_threshold == FAST_TRANSFER_THRESHOLD)
+            .find(|entry| entry.finality_threshold == FAST_TRANSFER_THRESHOLD)
             .ok_or(CctpError::FastTransferFeeNotAvailable { direction })?
             .minimum_fee;
 

@@ -23,16 +23,16 @@ fn deserialize_date<'de, D>(deserializer: D) -> Result<NaiveDate, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(serde::de::Error::custom)
+    let date_str = String::deserialize(deserializer)?;
+    NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(serde::de::Error::custom)
 }
 
 fn deserialize_time<'de, D>(deserializer: D) -> Result<NaiveTime, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom)
+    let time_str = String::deserialize(deserializer)?;
+    NaiveTime::parse_from_str(&time_str, "%H:%M").map_err(serde::de::Error::custom)
 }
 
 enum MarketStatus {

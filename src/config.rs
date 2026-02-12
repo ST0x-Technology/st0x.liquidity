@@ -20,7 +20,7 @@ use st0x_execution::{
     FractionalShares, Positive, SchwabCtx, SupportedExecutor,
 };
 
-use crate::offchain::order_poller::OrderPollerConfig;
+use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
@@ -352,8 +352,8 @@ impl Ctx {
         self.rebalancing.as_ref()
     }
 
-    pub const fn get_order_poller_config(&self) -> OrderPollerConfig {
-        OrderPollerConfig {
+    pub const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
+        OrderPollerCtx {
             polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
             max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
         }
@@ -438,8 +438,7 @@ pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use tracing_test::traced_test;
 
-    use st0x_execution::TryIntoExecutor;
-    use st0x_execution::{MockExecutor, MockExecutorCtx};
+    use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
     use crate::onchain::EvmCtx;

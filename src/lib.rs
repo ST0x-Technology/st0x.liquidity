@@ -95,8 +95,8 @@ fn spawn_bot_task(
         let bot_span = info_span!("bot_task");
         let _enter = bot_span.enter();
 
-        if let Err(e) = Box::pin(run(ctx, pool, event_sender)).await {
-            error!("Bot failed: {e}");
+        if let Err(error) = Box::pin(run(ctx, pool, event_sender)).await {
+            error!("Bot failed: {error}");
         }
     })
 }
@@ -137,15 +137,15 @@ fn abort_task(name: &str, handle: &AbortHandle) {
 fn log_server_result(result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>) {
     match result {
         Ok(Ok(_)) => info!("Server completed successfully"),
-        Ok(Err(e)) => error!("Server failed: {e}"),
-        Err(e) => error!("Server task panicked: {e}"),
+        Ok(Err(error)) => error!("Server failed: {error}"),
+        Err(error) => error!("Server task panicked: {error}"),
     }
 }
 
 fn log_bot_result(result: Result<(), JoinError>) {
     match result {
         Ok(()) => info!("Bot task completed"),
-        Err(e) => error!("Bot task panicked: {e}"),
+        Err(error) => error!("Bot task panicked: {error}"),
     }
 }
 
@@ -165,8 +165,8 @@ async fn run(
                 info!("Bot session completed successfully");
                 break Ok(());
             }
-            Err(e) => {
-                if let Some(execution_error) = e.downcast_ref::<ExecutionError>()
+            Err(error) => {
+                if let Some(execution_error) = error.downcast_ref::<ExecutionError>()
                     && matches!(
                         execution_error,
                         ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
@@ -177,8 +177,8 @@ async fn run(
                     continue;
                 }
 
-                error!("Bot session failed: {e}");
-                return Err(e);
+                error!("Bot session failed: {error}");
+                return Err(error);
             }
         }
     }

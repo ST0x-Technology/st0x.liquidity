@@ -5,6 +5,7 @@ mod usdc;
 
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
+use chrono::Utc;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
 use serde::Deserialize;
@@ -16,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
-use chrono::Utc;
 
 use st0x_execution::{AlpacaBrokerApiCtx, ArithmeticError, FractionalShares, Symbol};
 
@@ -336,10 +336,10 @@ impl RebalancingTrigger {
         symbol: &Symbol,
     ) -> Result<Option<Address>, TokenAddressError> {
         let repo = SqliteEventRepository::new(self.pool.clone());
-        let store = PersistedEventStore::<
-            SqliteEventRepository,
-            Lifecycle<VaultRegistry>,
-        >::new_event_store(repo);
+        let store =
+            PersistedEventStore::<SqliteEventRepository, Lifecycle<VaultRegistry>>::new_event_store(
+                repo,
+            );
 
         let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
         let aggregate_context = store.load_aggregate(&aggregate_id).await?;
@@ -428,9 +428,7 @@ impl RebalancingTrigger {
         None
     }
 
-    fn has_terminal_mint_event(
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>],
-    ) -> bool {
+    fn has_terminal_mint_event(events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>]) -> bool {
         events.iter().any(|envelope| {
             matches!(
                 envelope.payload,

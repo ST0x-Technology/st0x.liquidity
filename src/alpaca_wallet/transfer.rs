@@ -214,7 +214,7 @@ pub(super) async fn get_transfer_status(
 
     transfers
         .into_iter()
-        .find(|t| t.id == *transfer_id)
+        .find(|transfer| transfer.id == *transfer_id)
         .ok_or_else(|| AlpacaWalletError::TransferNotFound {
             transfer_id: *transfer_id,
         })
@@ -247,7 +247,7 @@ pub(super) async fn find_transfer_by_tx_hash(
 
     Ok(transfers
         .into_iter()
-        .find(|t| t.tx.as_ref() == Some(tx_hash)))
+        .find(|transfer| transfer.tx.as_ref() == Some(tx_hash)))
 }
 
 #[cfg(test)]

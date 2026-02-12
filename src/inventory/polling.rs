@@ -6,8 +6,6 @@
 //! the fetched values. The InventoryView reacts to these events to reconcile
 //! tracked inventory.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use cqrs_es::persist::PersistedEventStore;
@@ -15,6 +13,8 @@ use cqrs_es::{AggregateContext, AggregateError, EventStore};
 use futures_util::future::try_join_all;
 use sqlite_es::{SqliteCqrs, SqliteEventRepository};
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use tracing::debug;
 
 use st0x_execution::{Executor, InventoryResult};
@@ -126,10 +126,10 @@ where
         &self,
     ) -> Result<Option<VaultRegistry>, InventoryPollingError<E::Error>> {
         let repo = SqliteEventRepository::new(self.pool.clone());
-        let store = PersistedEventStore::<
-            SqliteEventRepository,
-            Lifecycle<VaultRegistry>,
-        >::new_event_store(repo);
+        let store =
+            PersistedEventStore::<SqliteEventRepository, Lifecycle<VaultRegistry>>::new_event_store(
+                repo,
+            );
 
         let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
         let aggregate_context = store.load_aggregate(&aggregate_id).await?;

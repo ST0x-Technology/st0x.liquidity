@@ -942,8 +942,7 @@ mod tests {
         Ethereum,
     >;
 
-    type TestCqrs =
-        CqrsFramework<Lifecycle<UsdcRebalance>, MemStore<Lifecycle<UsdcRebalance>>>;
+    type TestCqrs = CqrsFramework<Lifecycle<UsdcRebalance>, MemStore<Lifecycle<UsdcRebalance>>>;
 
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();

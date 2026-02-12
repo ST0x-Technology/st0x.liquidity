@@ -7,18 +7,20 @@ mod rebalancing;
 mod trading;
 mod vault;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
 use st0x_execution::{Direction, FractionalShares, Symbol};
 
 use crate::config::{Ctx, Env};
+use crate::offchain_order::OrderPlacer;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 
@@ -88,7 +90,7 @@ pub enum Commands {
     ProcessTx {
         /// Transaction hash (0x prefixed, 64 hex characters)
         #[arg(long = "tx-hash")]
-        tx_hash: B256,
+        tx_hash: TxHash,
     },
     /// Perform Charles Schwab OAuth authentication flow
     Auth,
@@ -128,7 +130,8 @@ pub enum Commands {
     /// Deposit USDC directly to Alpaca from Ethereum (bypasses vault/CCTP)
     ///
     /// This is a simplified command for testing Alpaca integration.
-    /// It sends USDC from your Ethereum wallet directly to Alpaca's deposit address.
+    /// It sends USDC from your Ethereum wallet directly
+    /// to Alpaca's deposit address.
     AlpacaDeposit {
         /// Amount of USDC to deposit
         #[arg(short = 'a', long = "amount")]
@@ -384,7 +387,7 @@ enum SimpleCommand {
 /// Commands that require a WebSocket provider.
 enum ProviderCommand {
     ProcessTx {
-        tx_hash: B256,
+        tx_hash: TxHash,
     },
     TransferUsdc {
         direction: TransferDirection,
@@ -432,7 +435,10 @@ async fn run_command_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     match classify_command(command) {
         Ok(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
-        Err(provider_cmd) => run_provider_command(provider_cmd, &ctx, pool, stdout).await?,
+        Err(provider_cmd) => {
+            let order_placer = trading::create_order_placer(&ctx, pool);
+            run_provider_command(provider_cmd, &ctx, pool, stdout, order_placer).await?
+        }
     }
 
     info!("CLI operation completed successfully");
@@ -571,6 +577,7 @@ async fn run_provider_command<W: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
+    order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     let provider = ProviderBuilder::new()
         .connect_ws(WsConnect::new(ctx.evm.ws_rpc_url.as_str()))
@@ -580,7 +587,16 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::ProcessTx { tx_hash } => {
             info!("Processing transaction: tx_hash={tx_hash}");
             let cache = SymbolCache::default();
-            trading::process_tx_with_provider(tx_hash, ctx, pool, stdout, &provider, &cache).await
+            trading::process_tx_with_provider(
+                tx_hash,
+                ctx,
+                pool,
+                stdout,
+                &provider,
+                &cache,
+                order_placer,
+            )
+            .await
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool, provider).await
@@ -1125,7 +1141,7 @@ mod tests {
 
     fn create_mock_blockchain_data(
         orderbook: Address,
-        tx_hash: B256,
+        tx_hash: TxHash,
         alice_output_shares: &str,
         bob_output_usdc: u64,
     ) -> MockBlockchainData {
@@ -1173,7 +1189,7 @@ mod tests {
             }]
         });
 
-        fn create_float_from_u256(value: U256, decimals: u8) -> alloy::primitives::B256 {
+        fn create_float_from_u256(value: U256, decimals: u8) -> B256 {
             use rain_math_float::Float;
             let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
             float.get_inner()
@@ -1640,10 +1656,18 @@ mod tests {
         asserter.push_success(&json!(null));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
+        let order_placer = trading::create_order_placer(&ctx, &pool);
 
-        let result =
-            trading::process_tx_with_provider(tx_hash, &ctx, &pool, &mut stdout, &provider, &cache)
-                .await;
+        let result = trading::process_tx_with_provider(
+            tx_hash,
+            &ctx,
+            &pool,
+            &mut stdout,
+            &provider,
+            &cache,
+            order_placer,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -1735,14 +1759,22 @@ mod tests {
 
         let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
 
-        let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "AAPL0x");
+        let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "tAAPL");
         let cache = SymbolCache::default();
+        let order_placer = trading::create_order_placer(&ctx, &pool);
 
         let mut stdout = Vec::new();
 
-        let result =
-            trading::process_tx_with_provider(tx_hash, &ctx, &pool, &mut stdout, &provider, &cache)
-                .await;
+        let result = trading::process_tx_with_provider(
+            tx_hash,
+            &ctx,
+            &pool,
+            &mut stdout,
+            &provider,
+            &cache,
+            order_placer,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -1753,7 +1785,7 @@ mod tests {
         let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
             .await
             .unwrap();
-        assert_eq!(trade.symbol.to_string(), "AAPL0x");
+        assert_eq!(trade.symbol.to_string(), "tAAPL");
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
 
         let executions = find_executions_by_symbol_status_and_broker(
@@ -1844,11 +1876,12 @@ mod tests {
         ));
         asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"TSLA0x".to_string(),
+            &"tTSLA".to_string(),
         ));
 
         let provider1 = ProviderBuilder::new().connect_mocked_client(asserter1);
         let cache1 = SymbolCache::default();
+        let order_placer = trading::create_order_placer(&ctx, &pool);
 
         let mut stdout1 = Vec::new();
 
@@ -1859,6 +1892,7 @@ mod tests {
             &mut stdout1,
             &provider1,
             &cache1,
+            order_placer.clone(),
         )
         .await;
         assert!(
@@ -1870,7 +1904,7 @@ mod tests {
         let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
             .await
             .unwrap();
-        assert_eq!(trade.symbol.to_string(), "TSLA0x");
+        assert_eq!(trade.symbol.to_string(), "tTSLA");
         assert!((trade.amount - 5.0).abs() < f64::EPSILON);
 
         let stdout_str1 = String::from_utf8(stdout1).unwrap();
@@ -1886,7 +1920,7 @@ mod tests {
         ));
         asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"TSLA0x".to_string(),
+            &"tTSLA".to_string(),
         ));
 
         let provider2 = ProviderBuilder::new().connect_mocked_client(asserter2);
@@ -1901,6 +1935,7 @@ mod tests {
             &mut stdout2,
             &provider2,
             &cache2,
+            order_placer,
         )
         .await;
         assert!(

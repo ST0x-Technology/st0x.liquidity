@@ -5,19 +5,19 @@
 
 mod builder;
 
-use std::sync::Arc;
-use std::time::Duration;
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::{AggregateError, Query};
 use cqrs_es::persist::GenericQuery;
+use cqrs_es::{AggregateError, Query};
 use futures_util::{Stream, StreamExt};
 use rust_decimal::Decimal;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -29,20 +29,16 @@ use tracing::{debug, error, info, trace, warn};
 use st0x_dto::ServerMessage;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
-use st0x_execution::{
-    ExecutionError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor,
-    Symbol,
-};
+use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecutor};
 
-pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::{Ctx, CtxError};
-use crate::lifecycle::Lifecycle;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
+use crate::lifecycle::Lifecycle;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
@@ -60,7 +56,9 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
 use crate::position::{
     Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
 };
-use crate::queue::{EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::queue::{
+    EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
+};
 use crate::rebalancing::{
     RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
     build_rebalancing_queries, spawn_rebalancer,
@@ -70,7 +68,10 @@ use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryError};
+use crate::vault_registry::{
+    VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryError,
+};
+pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
 struct TradeProcessingCqrs {
@@ -658,7 +659,6 @@ where
                 &position_cqrs,
                 &position_query,
                 &offchain_order_cqrs,
-                &execution_threshold,
             )
             .await
             {
@@ -941,9 +941,9 @@ async fn process_next_queued_event<P: Provider + Clone>(
 }
 
 fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
-    queued_event
-        .id
-        .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))
+    queued_event.id.ok_or(EventProcessingError::Queue(
+        EventQueueError::MissingQueuedEventId,
+    ))
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
@@ -1321,14 +1321,13 @@ async fn process_queued_trade(
         &cqrs.position_query,
         base_symbol,
         executor_type,
-        &cqrs.execution_threshold,
     )
     .await?
     else {
         return Ok(None);
     };
 
-    let offchain_order_id = OffchainOrder::aggregate_id();
+    let offchain_order_id = OffchainOrderId::new();
     execute_new_execution_cqrs(
         &cqrs.position_cqrs,
         &cqrs.offchain_order_cqrs,
@@ -1376,7 +1375,6 @@ async fn check_and_execute_accumulated_positions<E>(
     position_cqrs: &PositionCqrs,
     position_query: &PositionQuery,
     offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
-    threshold: &ExecutionThreshold,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
@@ -1384,7 +1382,7 @@ where
 {
     let executor_type = executor.to_supported_executor();
     let ready_positions =
-        check_all_positions(pool, position_query, executor_type, threshold).await?;
+        check_all_positions(pool, position_query, executor_type).await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1397,7 +1395,7 @@ where
     );
 
     for params in ready_positions {
-        let offchain_order_id = OffchainOrder::aggregate_id();
+        let offchain_order_id = OffchainOrderId::new();
 
         info!(
             symbol = %params.symbol,
@@ -1524,7 +1522,6 @@ async fn buffer_live_events<S1, S2>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use alloy::primitives::{B256, IntoLogData, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
@@ -1533,15 +1530,16 @@ mod tests {
     use futures_util::stream;
     use rust_decimal_macros::dec;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+    use std::sync::Arc;
 
-    use st0x_execution::{Direction, MockExecutorConfig, Symbol, TryIntoExecutor};
+    use st0x_execution::{Direction, MockExecutorConfig, Positive, Symbol, TryIntoExecutor};
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx;
     use crate::inventory::ImbalanceThreshold;
-    use crate::offchain_order::PriceCents;
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::TriggeredOperation;
@@ -2408,10 +2406,6 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    use crate::bindings::IOrderBookV5::TakeOrderConfigV4;
-    use crate::cctp::USDC_BASE;
-    use crate::queue::QueuedEvent;
-
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
     const ORDER_OWNER: Address = address!("0xdddddddddddddddddddddddddddddddddddddddd");
     const OTHER_OWNER: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
@@ -2517,10 +2511,19 @@ mod tests {
     }
 
     fn create_test_trade(symbol: &str) -> OnchainTrade {
-        let tokenized_symbol = format!("{symbol}0x");
+        let tokenized_symbol = format!("t{symbol}");
         OnchainTradeBuilder::default()
             .with_symbol(&tokenized_symbol)
             .with_equity_token(TEST_EQUITY_TOKEN)
+            .build()
+    }
+
+    fn test_trade_with_amount(amount: f64, log_index: u64) -> OnchainTrade {
+        OnchainTradeBuilder::default()
+            .with_symbol("tAAPL")
+            .with_equity_token(TEST_EQUITY_TOKEN)
+            .with_amount(amount)
+            .with_log_index(log_index)
             .build()
     }
 
@@ -2813,7 +2816,6 @@ mod tests {
         let event_id = queued.id.expect("queued event should have id");
         (queued, event_id)
     }
-
 
     #[tokio::test]
     async fn trade_below_threshold_does_not_place_order() {
@@ -3115,7 +3117,6 @@ mod tests {
             &cqrs.position_cqrs,
             &cqrs.position_query,
             &cqrs.offchain_order_cqrs,
-            &cqrs.execution_threshold,
         )
         .await
         .unwrap();
@@ -3259,7 +3260,7 @@ mod tests {
             .apply_position_event(
                 symbol,
                 &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    offchain_order_id: OffchainOrderId::new(),
                     shares_filled: FractionalShares::new(dec!(80)),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
@@ -3366,7 +3367,7 @@ mod tests {
             .apply_position_event(
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    offchain_order_id: OffchainOrderId::new(),
                     shares_filled: FractionalShares::new(dec!(50)),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("SEED"),
@@ -3454,7 +3455,7 @@ mod tests {
             .apply_position_event(
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    offchain_order_id: OffchainOrderId::new(),
                     shares_filled: FractionalShares::new(dec!(50)),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
@@ -3569,7 +3570,7 @@ mod tests {
             .apply_position_event(
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    offchain_order_id: OffchainOrderId::new(),
                     shares_filled: FractionalShares::new(dec!(35)),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),

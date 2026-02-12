@@ -9,10 +9,10 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
-use std::ops::{Add, Mul, Sub};
-use std::str::FromStr;
 
 use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Positive};
+use std::ops::{Add, Mul, Sub};
+use std::str::FromStr;
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -71,8 +71,7 @@ impl Usdc {
             .checked_mul(USDC_DECIMAL_SCALE)
             .ok_or(UsdcConversionError::Overflow)?;
 
-        U256::from_str_radix(&scaled.trunc().to_string(), 10)
-            .map_err(UsdcConversionError::ParseError)
+        Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
     }
 }
 

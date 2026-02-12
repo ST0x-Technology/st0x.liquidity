@@ -331,7 +331,7 @@ impl Lifecycle<TokenizedEquityMint> {
                 }])
             }
             Ok(_) => Err(TokenizedEquityMintError::AlreadyInProgress),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -349,7 +349,7 @@ impl Lifecycle<TokenizedEquityMint> {
             }
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Ok(_) => Err(TokenizedEquityMintError::AlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -369,7 +369,7 @@ impl Lifecycle<TokenizedEquityMint> {
             }
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Ok(_) => Err(TokenizedEquityMintError::AlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -389,7 +389,7 @@ impl Lifecycle<TokenizedEquityMint> {
             }
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Ok(_) => Err(TokenizedEquityMintError::AlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -415,7 +415,7 @@ impl Lifecycle<TokenizedEquityMint> {
                 TokenizedEquityMint::Completed { .. } | TokenizedEquityMint::TokensReceived { .. },
             ) => Err(TokenizedEquityMintError::AlreadyCompleted),
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -435,7 +435,7 @@ impl Lifecycle<TokenizedEquityMint> {
                 Err(TokenizedEquityMintError::AlreadyCompleted)
             }
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 }

@@ -1,16 +1,18 @@
 //! Order I/O parsing: extracts symbol pairs, amounts, prices,
 //! and trade direction from raw Raindex order inputs/outputs.
 //!
-//! Determines which side of a Raindex fill is USDC vs tokenized
-//! equity, computes the trade direction (buy/sell), and
-//! validates amounts before further processing.
+//! Determines which side of a Raindex fill is USDC vs
+//! tokenized equity (tTICKER format, e.g. tAAPL, tSPYM),
+//! computes the trade direction (buy/sell), and validates
+//! amounts before further processing.
 
 use std::fmt;
 use std::str::FromStr;
 
+use st0x_execution::{Direction, Symbol};
+
 use super::OnChainError;
 use crate::onchain::trade::TradeValidationError;
-use st0x_execution::{Direction, Symbol};
 
 /// Test-only macro to create a TokenizedEquitySymbol.
 #[cfg(test)]
@@ -65,33 +67,6 @@ impl Usdc {
     }
 }
 
-/// The marker for tokenized equity symbols (can be prefix or suffix)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenizedEquityMarker {
-    T,     // "t" (prefix)
-    ZeroX, // "0x" (suffix)
-    S1,    // "s1" (suffix)
-}
-
-impl TokenizedEquityMarker {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::T => "t",
-            Self::ZeroX => "0x",
-            Self::S1 => "s1",
-        }
-    }
-
-    pub(crate) const fn is_prefix(self) -> bool {
-        matches!(self, Self::T)
-    }
-}
-
-impl fmt::Display for TokenizedEquityMarker {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
 
 /// Represents a validated tokenized equity symbol with guaranteed format
 /// Composed of a base equity symbol and a tokenized marker (prefix or suffix)
@@ -107,7 +82,7 @@ impl TokenizedEquitySymbol {
         Self { base, marker }
     }
 
-    /// Creates a new TokenizedEquitySymbol from a string (e.g., "AAPL0x", "tAAPL")
+    /// Parses a tTICKER string (e.g. "tAAPL", "tSPYM").
     pub(crate) fn parse(symbol: &str) -> Result<Self, OnChainError> {
         // Try to extract prefix first
         if let Some(stripped) = symbol.strip_prefix('t') {

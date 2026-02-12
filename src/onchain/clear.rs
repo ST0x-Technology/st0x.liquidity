@@ -157,7 +157,7 @@ async fn fetch_after_clear_event<P: Provider>(
     // Some RPC nodes fail to return logs via eth_getLogs for historical blocks,
     // but the logs are present in the transaction receipt.
     let receipt = provider.get_transaction_receipt(tx_hash).await?;
-    let Some(r) = receipt else {
+    let Some(tx_receipt) = receipt else {
         return Err(TradeValidationError::NodeReceiptMissing {
             block_number,
             tx_hash,
@@ -167,7 +167,7 @@ async fn fetch_after_clear_event<P: Provider>(
     };
 
     // Find the AfterClearV2 log in the receipt with log_index > clear_log_index
-    for receipt_log in r.inner.logs() {
+    for receipt_log in tx_receipt.inner.logs() {
         if receipt_log.address() != evm_ctx.orderbook {
             continue;
         }
@@ -197,10 +197,10 @@ async fn fetch_after_clear_event<P: Provider>(
     }
 
     // Check what's actually in the receipt for error reporting
-    let clear_in_receipt = r.inner.logs().iter().any(|l| {
+    let clear_in_receipt = tx_receipt.inner.logs().iter().any(|l| {
         l.address() == evm_ctx.orderbook && l.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
     });
-    let after_clear_in_receipt = r.inner.logs().iter().any(|l| {
+    let after_clear_in_receipt = tx_receipt.inner.logs().iter().any(|l| {
         l.address() == evm_ctx.orderbook
             && l.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
     });
@@ -227,7 +227,7 @@ async fn fetch_after_clear_event<P: Provider>(
 mod tests {
     use alloy::hex;
     use alloy::primitives::{
-        Address, B256, Bytes, IntoLogData, LogData, U256, address, fixed_bytes, uint,
+        Address, B256, Bytes, IntoLogData, LogData, TxHash, U256, address, fixed_bytes, uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
@@ -366,10 +366,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
@@ -387,7 +387,7 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -442,10 +442,10 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (AAPL0x)
+        // Mock decimals() then symbol() calls for input token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
@@ -468,7 +468,7 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -797,10 +797,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
@@ -819,7 +819,7 @@ mod tests {
 
         // Should process Alice first (alice_hash_matches is checked first)
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -851,7 +851,7 @@ mod tests {
 
     fn create_test_log(
         orderbook: Address,
-        tx_hash: B256,
+        tx_hash: TxHash,
         log_data: LogData,
         log_index: u64,
     ) -> Log {
@@ -871,7 +871,7 @@ mod tests {
     }
 
     fn create_receipt_json_with_logs(
-        tx_hash: B256,
+        tx_hash: TxHash,
         logs: &[serde_json::Value],
     ) -> serde_json::Value {
         json!({
@@ -893,7 +893,7 @@ mod tests {
 
     fn create_receipt_log_json(
         address: Address,
-        tx_hash: B256,
+        tx_hash: TxHash,
         log_index: u64,
         topics: &[B256],
         data: Bytes,
@@ -949,10 +949,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
@@ -970,7 +970,7 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
     }
 
@@ -1094,10 +1094,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        // Mock decimals() then symbol() calls for output token (tAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
@@ -1115,7 +1115,7 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
     }
 
@@ -1163,10 +1163,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
@@ -1184,7 +1184,7 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -1238,10 +1238,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
@@ -1259,7 +1259,7 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
     }
 
@@ -1522,10 +1522,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
@@ -1543,7 +1543,7 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
     }
 }
