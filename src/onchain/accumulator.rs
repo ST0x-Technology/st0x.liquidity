@@ -2,7 +2,7 @@ use sqlx::SqlitePool;
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 use tracing::{debug, info};
 
-use crate::error::OnChainError;
+use crate::onchain::OnChainError;
 use crate::position::{PositionQuery, load_position};
 use crate::threshold::ExecutionThreshold;
 
