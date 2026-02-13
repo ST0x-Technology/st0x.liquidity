@@ -9,13 +9,12 @@ pub(crate) mod mock;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
 use thiserror::Error;
 
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::lifecycle::LifecycleError;
+use crate::event_sourced::SendError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 #[derive(Debug, Error)]
@@ -24,7 +23,7 @@ pub(crate) enum MintError {
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<LifecycleError<TokenizedEquityMint>>),
+    Aggregate(#[from] SendError<TokenizedEquityMint>),
 
     #[error("Mint request was rejected by Alpaca")]
     Rejected,

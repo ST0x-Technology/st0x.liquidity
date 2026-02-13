@@ -43,12 +43,11 @@
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::DomainEvent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 
-use crate::event_sourced::EventSourced;
+use crate::event_sourced::{DomainEvent, EventSourced};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 /// Unique identifier for a redemption aggregate instance.
@@ -222,8 +221,9 @@ impl EventSourced for EquityRedemption {
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
+        use EquityRedemptionEvent::*;
         match event {
-            EquityRedemptionEvent::TokensSent {
+            TokensSent {
                 symbol,
                 quantity,
                 redemption_wallet,
@@ -241,23 +241,22 @@ impl EventSourced for EquityRedemption {
     }
 
     fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        use EquityRedemptionEvent::*;
         Ok(match event {
-            EquityRedemptionEvent::TokensSent { .. } => None,
+            TokensSent { .. } => None,
 
-            EquityRedemptionEvent::Detected {
+            Detected {
                 tokenization_request_id,
                 detected_at,
             } => state.try_apply_detected(tokenization_request_id, *detected_at),
 
-            EquityRedemptionEvent::DetectionFailed { reason, failed_at } => {
+            DetectionFailed { reason, failed_at } => {
                 state.try_apply_detection_failed(reason, *failed_at)
             }
 
-            EquityRedemptionEvent::Completed { completed_at } => {
-                state.try_apply_completed(*completed_at)
-            }
+            Completed { completed_at } => state.try_apply_completed(*completed_at),
 
-            EquityRedemptionEvent::RedemptionRejected {
+            RedemptionRejected {
                 reason,
                 rejected_at,
             } => state.try_apply_redemption_rejected(reason, *rejected_at),
@@ -268,27 +267,25 @@ impl EventSourced for EquityRedemption {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use EquityRedemptionCommand::*;
+        use EquityRedemptionEvent::*;
         match command {
-            EquityRedemptionCommand::SendTokens {
+            SendTokens {
                 symbol,
                 quantity,
                 redemption_wallet,
                 tx_hash,
-            } => Ok(vec![EquityRedemptionEvent::TokensSent {
+            } => Ok(vec![TokensSent {
                 symbol,
                 quantity,
                 redemption_wallet,
                 tx_hash,
                 sent_at: Utc::now(),
             }]),
-            EquityRedemptionCommand::Detect { .. } => Err(EquityRedemptionError::TokensNotSent),
-            EquityRedemptionCommand::FailDetection { .. } => {
-                Err(EquityRedemptionError::TokensNotSent)
-            }
-            EquityRedemptionCommand::Complete => Err(EquityRedemptionError::NotPending),
-            EquityRedemptionCommand::RejectRedemption { .. } => {
-                Err(EquityRedemptionError::NotPendingForRejection)
-            }
+            Detect { .. } => Err(EquityRedemptionError::TokensNotSent),
+            FailDetection { .. } => Err(EquityRedemptionError::TokensNotSent),
+            Complete => Err(EquityRedemptionError::NotPending),
+            RejectRedemption { .. } => Err(EquityRedemptionError::NotPendingForRejection),
         }
     }
 
@@ -297,16 +294,18 @@ impl EventSourced for EquityRedemption {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use EquityRedemptionCommand::*;
+        use EquityRedemptionEvent::*;
         match command {
-            EquityRedemptionCommand::SendTokens { .. } => match self {
+            SendTokens { .. } => match self {
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
                 _ => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
-            EquityRedemptionCommand::Detect {
+            Detect {
                 tokenization_request_id,
             } => match self {
-                Self::TokensSent { .. } => Ok(vec![EquityRedemptionEvent::Detected {
+                Self::TokensSent { .. } => Ok(vec![Detected {
                     tokenization_request_id,
                     detected_at: Utc::now(),
                 }]),
@@ -314,8 +313,8 @@ impl EventSourced for EquityRedemption {
                 _ => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
-            EquityRedemptionCommand::FailDetection { reason } => match self {
-                Self::TokensSent { .. } => Ok(vec![EquityRedemptionEvent::DetectionFailed {
+            FailDetection { reason } => match self {
+                Self::TokensSent { .. } => Ok(vec![DetectionFailed {
                     reason,
                     failed_at: Utc::now(),
                 }]),
@@ -325,18 +324,18 @@ impl EventSourced for EquityRedemption {
                 }
             },
 
-            EquityRedemptionCommand::Complete => match self {
+            Complete => match self {
                 Self::TokensSent { .. } => Err(EquityRedemptionError::NotPending),
-                Self::Pending { .. } => Ok(vec![EquityRedemptionEvent::Completed {
+                Self::Pending { .. } => Ok(vec![Completed {
                     completed_at: Utc::now(),
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             },
 
-            EquityRedemptionCommand::RejectRedemption { reason } => match self {
+            RejectRedemption { reason } => match self {
                 Self::TokensSent { .. } => Err(EquityRedemptionError::NotPendingForRejection),
-                Self::Pending { .. } => Ok(vec![EquityRedemptionEvent::RedemptionRejected {
+                Self::Pending { .. } => Ok(vec![RedemptionRejected {
                     reason,
                     rejected_at: Utc::now(),
                 }]),

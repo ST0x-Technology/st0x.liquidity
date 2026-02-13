@@ -8,7 +8,6 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::DomainEvent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -18,7 +17,7 @@ use st0x_execution::{
     Symbol,
 };
 
-use crate::event_sourced::{EventSourced, SqliteQuery};
+use crate::event_sourced::{DomainEvent, EventSourced, SqliteQuery};
 use crate::lifecycle::LifecycleError;
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
@@ -1649,7 +1648,7 @@ mod tests {
         let position_query =
             std::sync::Arc::new(cqrs_es::persist::GenericQuery::new(view_repo.clone()));
 
-        let cqrs = sqlite_es::sqlite_cqrs(
+        let store = crate::conductor::wire::test_cqrs(
             pool.clone(),
             vec![Box::new(cqrs_es::persist::GenericQuery::new(view_repo))],
             (),
@@ -1657,23 +1656,24 @@ mod tests {
 
         let symbol = Symbol::new("AAPL").unwrap();
 
-        cqrs.execute(
-            &symbol.to_string(),
-            PositionCommand::AcknowledgeOnChainFill {
-                symbol: symbol.clone(),
-                threshold: one_share_threshold(),
-                trade_id: TradeId {
-                    tx_hash: TxHash::random(),
-                    log_index: 1,
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: one_share_threshold(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(dec!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150),
+                    block_timestamp: Utc::now(),
                 },
-                amount: FractionalShares::new(dec!(1)),
-                direction: Direction::Buy,
-                price_usdc: dec!(150),
-                block_timestamp: Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
 
         let result = load_position(&position_query, &symbol).await.unwrap();
 

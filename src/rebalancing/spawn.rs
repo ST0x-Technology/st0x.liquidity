@@ -229,14 +229,13 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use uuid::Uuid;
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
-    use crate::event_sourced::Store;
+    use crate::conductor::wire::test_cqrs;
     use crate::inventory::ImbalanceThreshold;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
@@ -413,9 +412,9 @@ mod tests {
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
 
         let (_tx, rx) = mpsc::channel(100);
-        let mint_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
-        let redemption_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
-        let usdc_store = Arc::new(Store::new(sqlite_cqrs(pool, vec![], ())));
+        let mint_store = Arc::new(test_cqrs(pool.clone(), vec![], ()));
+        let redemption_store = Arc::new(test_cqrs(pool.clone(), vec![], ()));
+        let usdc_store = Arc::new(test_cqrs(pool, vec![], ()));
 
         let _rebalancer = services.into_rebalancer(
             &rebalancing_ctx,

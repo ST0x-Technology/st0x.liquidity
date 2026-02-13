@@ -16,13 +16,12 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use tracing::info;
 
-use crate::event_sourced::EventSourced;
+use crate::event_sourced::{DomainEvent, EventSourced};
 use crate::lifecycle::{Lifecycle, Never};
 
 /// Singleton aggregate ID for the schema registry.

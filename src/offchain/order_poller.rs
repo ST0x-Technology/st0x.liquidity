@@ -342,13 +342,13 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use sqlite_es::sqlite_cqrs;
 
     use st0x_execution::{
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -357,12 +357,12 @@ mod tests {
         pool: &SqlitePool,
     ) -> (Arc<Store<OffchainOrder>>, Arc<Store<Position>>) {
         (
-            Arc::new(Store::new(sqlite_cqrs(
+            Arc::new(test_cqrs(
                 pool.clone(),
                 vec![],
                 crate::offchain_order::noop_order_placer(),
-            ))),
-            Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ()))),
+            )),
+            Arc::new(test_cqrs(pool.clone(), vec![], ())),
         )
     }
 

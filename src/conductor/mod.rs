@@ -124,7 +124,7 @@ where
     let timeout = executor
         .wait_until_market_open()
         .await
-        .map_err(|e| anyhow::anyhow!("Market hours check failed: {e}"))?;
+        .map_err(|error| anyhow::anyhow!("Market hours check failed: {error}"))?;
 
     let timeout_minutes = timeout.as_secs() / 60;
     if timeout_minutes < 60 * 24 {
@@ -1106,10 +1106,12 @@ async fn process_queued_trade(
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
-    mark_event_processed(pool, event_id).await.map_err(|e| {
-        error!("Failed to mark event {event_id} as processed: {e}");
-        EventProcessingError::Queue(e)
-    })?;
+    mark_event_processed(pool, event_id)
+        .await
+        .map_err(|error| {
+            error!("Failed to mark event {event_id} as processed: {error}");
+            EventProcessingError::Queue(error)
+        })?;
 
     info!(
         "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",
@@ -2388,7 +2390,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::UsdcVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::UsdcVaultDiscovered"),
             "Expected UsdcVaultDiscovered event, got: {events:?}"
         );
     }
@@ -2413,7 +2415,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::EquityVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::EquityVaultDiscovered"),
             "Expected EquityVaultDiscovered event, got: {events:?}"
         );
     }
@@ -2437,13 +2439,13 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::UsdcVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::UsdcVaultDiscovered"),
             "Expected UsdcVaultDiscovered event from take order"
         );
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::EquityVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::EquityVaultDiscovered"),
             "Expected EquityVaultDiscovered event from take order"
         );
     }

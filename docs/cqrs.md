@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 ```
 
-- **aggregate_type**: From `Aggregate::aggregate_type()` (e.g., `"Position"`)
+- **aggregate_type**: From `EventSourced::AGGREGATE_TYPE` (e.g., `"Position"`)
 - **aggregate_id**: Caller-provided ID string
 - **sequence**: Auto-incremented per aggregate instance (1, 2, 3, ...)
 - **event_type**: From `DomainEvent::event_type()` (e.g.,
@@ -93,9 +93,9 @@ with `serde_json::from_value()`.
 
 ### Lifecycle Serialization in View Payloads
 
-All our aggregates use `Lifecycle<T, E>` as both the aggregate and its own view
-(via the blanket `View` impl). Serde's default externally-tagged enum
-representation means:
+All our aggregates use `Lifecycle<Entity>` (where `Entity: EventSourced`) as
+both the aggregate and its own view (via the blanket `View` impl). Serde's
+default externally-tagged enum representation means:
 
 - `Lifecycle::Uninitialized` -> `"Uninitialized"`
 - `Lifecycle::Live(data)` -> `{"Live": <data>}`
@@ -168,31 +168,35 @@ new events.
 ## Views and GenericQuery
 
 Views are read-optimized projections built from events. **Never query view
-tables directly with raw SQL** - use `GenericQuery`:
+tables directly with raw SQL** -- use `GenericQuery`.
+
+For `EventSourced` entities, `Lifecycle<Entity>` has a blanket `View` impl that
+delegates to `originate` and `evolve`, so the entity itself serves as its own
+view. Use the `SqliteQuery<Entity>` type alias (defined in `event_sourced.rs`)
+for the query type:
 
 ```rust
-use cqrs_es::persist::GenericQuery;
-use sqlite_es::SqliteViewRepository;
+use crate::event_sourced::SqliteQuery;
 
-// Create view repository and query
-let view_repo = Arc::new(SqliteViewRepository::<MyView, MyAggregate>::new(
-    pool.clone(),
-    "my_view".to_string(),
-));
-let query = GenericQuery::new(view_repo.clone());
+// SqliteQuery<Position> wraps
+// GenericQuery<SqliteViewRepository<Lifecycle<Position>,
+//     Lifecycle<Position>>>
+let query: Arc<SqliteQuery<Position>> = /* built by CqrsBuilder */;
 
-// Load a view by aggregate ID
-let view: Option<MyView> = query.load(&aggregate_id).await;
+// Load view by aggregate ID
+let view: Option<Lifecycle<Position>> =
+    query.load(&symbol.to_string()).await;
 ```
 
-Views implement the `View` trait:
+For custom views (not the entity itself), implement the `View` trait on the
+cqrs-es `Aggregate` type (`Lifecycle<Entity>`):
 
 ```rust
-impl View<MyAggregate> for MyView {
-    fn update(&mut self, event: &EventEnvelope<MyAggregate>) {
+impl View<Lifecycle<MyEntity>> for MyCustomView {
+    fn update(&mut self, event: &EventEnvelope<Lifecycle<MyEntity>>) {
         match &event.payload {
-            MyEvent::Created { ... } => { /* update view state */ }
-            MyEvent::Updated { ... } => { /* update view state */ }
+            MyEvent::Created { .. } => { /* update view */ }
+            MyEvent::Updated { .. } => { /* update view */ }
         }
     }
 }
@@ -230,37 +234,36 @@ changes.
 
 ## Services Pattern
 
-Aggregates can depend on external services (APIs, blockchain, etc.) via the
-`Services` associated type:
+Domain types can depend on external services (APIs, blockchain, etc.) via the
+`Services` associated type on `EventSourced`:
 
 ```rust
 #[async_trait]
-impl Aggregate for MyAggregate {
-    type Command = MyCommand;
-    type Event = MyEvent;
-    type Error = MyError;
-    type Services = Arc<dyn MyService>;  // or () if no services needed
+impl EventSourced for MyEntity {
+    type Services = Arc<dyn MyService>;  // or () if none needed
 
-    async fn handle(
+    async fn transition(
         &self,
         command: Self::Command,
-        services: &Self::Services,  // injected by framework
+        services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        // Use services in command handlers
         let result = services.do_something().await?;
         Ok(vec![MyEvent::SomethingDone { result }])
     }
+    // ...
 }
 ```
 
-Pass services when creating the CQRS framework:
+Pass services when building the `Store`:
 
 ```rust
 let services: Arc<dyn MyService> = Arc::new(MyServiceImpl::new());
-let cqrs = CqrsFramework::new(event_store, queries, services);
+let store: Store<MyEntity> = CqrsBuilder::<MyEntity>::new(pool)
+    .build(services)
+    .await?;
 ```
 
-For aggregates that don't need services, use `type Services = ()`.
+For entities that don't need services, use `type Services = ()`.
 
 ## Forbidden Patterns
 
@@ -269,10 +272,9 @@ For aggregates that don't need services, use `type Services = ()`.
 1. **NEVER write directly to the `events` table** - this is STRICTLY FORBIDDEN:
    - **FORBIDDEN**: Direct INSERT statements into the `events` table
    - **FORBIDDEN**: Manual sequence number management for events
-   - **FORBIDDEN**: Bypassing the CqrsFramework to write events
-   - **REQUIRED**: Always use `CqrsFramework::execute()` or
-     `CqrsFramework::execute_with_metadata()` to emit events through aggregate
-     commands
+   - **FORBIDDEN**: Bypassing the framework to write events
+   - **REQUIRED**: Always use `Store::send()` (or `CqrsFramework::execute()` in
+     test code) to emit events through commands
    - **WHY**: Direct writes break aggregate consistency, event ordering, and
      violate the CQRS pattern. Events must be emitted through aggregate commands
      that generate domain events. The framework handles event persistence,
@@ -292,74 +294,83 @@ For aggregates that don't need services, use `type Services = ()`.
 
 ## Single Framework Instance Per Aggregate
 
-**CRITICAL**: Each aggregate type must have exactly ONE `SqliteCqrs<A>`
-instance, constructed once in `Conductor::start`, then shared via `Arc` clones.
+**CRITICAL**: Each entity type must have exactly ONE `Store<Entity>` instance,
+constructed once in `Conductor::start` via `CqrsBuilder`, then shared. The
+`CqrsBuilder` enforces compile-time query wiring via type-level linked lists
+(`Cons`/`Nil`), making it impossible to silently forget wiring a query
+processor.
 
 ### Why This Matters
 
-Multiple `SqliteCqrs<A>` instances for the same aggregate cause **silent
-production bugs**: events persist to the database, but query processors
-registered on OTHER instances never see them. Views and projections go stale
-without any warnings while the application continues operating as if everything
-worked.
+Multiple framework instances for the same entity cause **silent production
+bugs**: events persist to the database, but query processors registered on OTHER
+instances never see them. Views and projections go stale without any warnings
+while the application continues operating as if everything worked.
 
 ### Rules
 
-- **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` in the server
-  binary outside `Conductor::start`
-- **FORBIDDEN**: Creating multiple `SqliteCqrs<A>` instances for the same
-  aggregate type in the bot flow
-- **REQUIRED**: Add all query processors to the single instance at construction
-- **ALLOWED**: Direct construction in tests, CLI, and migration code (different
-  execution contexts with intentionally different processor needs)
+- **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` directly in
+  the server binary -- use `CqrsBuilder` instead
+- **FORBIDDEN**: Creating multiple `Store<Entity>` instances for the same entity
+  type in the bot flow
+- **REQUIRED**: Wire all query processors via `CqrsBuilder::wire()` before
+  calling `build()`
+- **ALLOWED**: Direct construction in test code (via `wire::test_cqrs()`), CLI
+  code, and migration code (different execution contexts)
 
 ### Adding a New Query Processor
 
-1. Add it to the query processor vector in `Conductor::start`
+1. Wire it via `CqrsBuilder::wire()` in `Conductor::start`
 2. Never create a new framework instance just to add a processor
-3. The framework registers processors at construction time -- the only way to
-   ensure all events trigger all required side effects is to have every
-   processor on the single instance from the start
+3. The builder tracks wired queries at the type level -- if a query is required
+   by the manifest but not wired, it's a compile-time error
 
 ## Testing Aggregates
 
-Use the Given-When-Then pattern with in-memory stores:
+Use `Lifecycle::default()` with `Aggregate::handle()` for command tests. Set up
+prior state with `Aggregate::apply()`:
 
 ```rust
-use cqrs_es::mem_store::MemStore;
+use cqrs_es::{Aggregate, View};
 
 #[tokio::test]
 async fn test_my_command() {
-    let store = MemStore::<MyAggregate>::default();
-    let cqrs = CqrsFramework::new(store, vec![], services);
+    let mut aggregate = Lifecycle::<MyEntity>::default();
 
-    // Given: apply prior events
-    cqrs.execute(&id, SetupCommand { ... }).await.unwrap();
+    // Given: apply prior events to set up state
+    aggregate.apply(MyEvent::Created { /* ... */ });
 
     // When: execute command under test
-    let result = cqrs.execute(&id, CommandUnderTest { ... }).await;
+    let events = aggregate
+        .handle(MyCommand::Update { /* ... */ }, &())
+        .await
+        .unwrap();
 
-    // Then: verify result
-    assert!(result.is_ok());
+    // Then: verify emitted events
+    assert!(matches!(events[0], MyEvent::Updated { .. }));
 }
 ```
 
-To verify aggregate state after executing commands, clone the store before
-passing it to the framework and use `load_aggregate`:
+For view tests, use `View::update()` with `EventEnvelope`:
 
 ```rust
-let store = MemStore::<MyAggregate>::default();
-let cqrs = CqrsFramework::new(store.clone(), vec![], services);
+#[test]
+fn test_view_updates() {
+    let mut view = Lifecycle::<MyEntity>::default();
+    view.update(&make_envelope("id", 1, MyEvent::Created { /* ... */ }));
 
-cqrs.execute(&id, MyCommand { ... }).await.unwrap();
-
-let ctx = store.load_aggregate(&id).await.unwrap();
-let aggregate = ctx.aggregate();
-// assert on aggregate state
+    let Lifecycle::Live(entity) = view else {
+        panic!("Expected Live state");
+    };
+    assert_eq!(entity.field, expected_value);
+}
 ```
 
-**FORBIDDEN**: Calling `Aggregate::handle()` + `Aggregate::apply()` manually in
-tests. This bypasses the framework and doesn't test the real execution path. Use
-`CqrsFramework::execute()` instead. The only exception is testing the `apply()`
-method itself (e.g., verifying corruption detection when applying events to
-invalid states).
+For error cases, verify the exact `LifecycleError` variant:
+
+```rust
+assert!(matches!(
+    aggregate.handle(command, &()).await,
+    Err(LifecycleError::Apply(MyError::SpecificVariant))
+));
+```

@@ -270,7 +270,7 @@ mod tests {
                 .next()
                 .await
                 .unwrap_or_else(|| panic!("client{} stream closed", i + 1))
-                .unwrap_or_else(|e| panic!("client{} message error: {}", i + 1, e));
+                .unwrap_or_else(|error| panic!("client{} message error: {}", i + 1, error));
 
             let text = msg.into_text().expect("expected text message");
             let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
@@ -322,7 +322,7 @@ mod tests {
         for (i, result) in results.into_iter().enumerate() {
             let msg = result
                 .unwrap_or_else(|| panic!("client{} stream closed", i + 1))
-                .unwrap_or_else(|e| panic!("client{} error: {}", i + 1, e));
+                .unwrap_or_else(|error| panic!("client{} error: {}", i + 1, error));
 
             let text = msg.into_text().expect("expected text");
             let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");

@@ -258,12 +258,11 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use sqlite_es::sqlite_cqrs;
     use sqlx::Row;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
-    use crate::event_sourced::Store;
+    use crate::conductor::wire::test_cqrs;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::VaultRegistryCommand;
@@ -323,7 +322,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -332,7 +331,7 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let offchain_equity_event = events
             .iter()
-            .find(|e| matches!(e, InventorySnapshotEvent::OffchainEquity { .. }))
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }))
             .expect("Expected OffchainEquity event to be emitted");
 
         let InventorySnapshotEvent::OffchainEquity { positions, .. } = offchain_equity_event else {
@@ -370,7 +369,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -379,7 +378,7 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let offchain_cash_event = events
             .iter()
-            .find(|e| matches!(e, InventorySnapshotEvent::OffchainCash { .. }))
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainCash { .. }))
             .expect("Expected OffchainCash event to be emitted");
 
         let InventorySnapshotEvent::OffchainCash {
@@ -413,7 +412,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -421,7 +420,7 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let offchain_equity_event = events
             .iter()
-            .find(|e| matches!(e, InventorySnapshotEvent::OffchainEquity { .. }))
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }))
             .expect("Expected OffchainEquity event even with empty positions");
 
         let InventorySnapshotEvent::OffchainEquity { positions, .. } = offchain_equity_event else {
@@ -445,7 +444,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         // Should succeed without error
@@ -455,10 +454,10 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let has_offchain_equity = events
             .iter()
-            .any(|e| matches!(e, InventorySnapshotEvent::OffchainEquity { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }));
         let has_offchain_cash = events
             .iter()
-            .any(|e| matches!(e, InventorySnapshotEvent::OffchainCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OffchainCash { .. }));
 
         assert!(
             !has_offchain_equity,
@@ -494,7 +493,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -502,7 +501,7 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let offchain_cash_event = events
             .iter()
-            .find(|e| matches!(e, InventorySnapshotEvent::OffchainCash { .. }))
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainCash { .. }))
             .expect("Expected OffchainCash event");
 
         let InventorySnapshotEvent::OffchainCash {
@@ -541,7 +540,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -549,7 +548,7 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let offchain_equity_event = events
             .iter()
-            .find(|e| matches!(e, InventorySnapshotEvent::OffchainEquity { .. }))
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }))
             .expect("Expected OffchainEquity event");
 
         let InventorySnapshotEvent::OffchainEquity { positions, .. } = offchain_equity_event else {
@@ -582,7 +581,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -615,24 +614,24 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
-        let aggregate_id = VaultRegistryId {
+        let store = test_cqrs::<VaultRegistry>(pool.clone(), vec![], ());
+        let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
-        }
-        .to_string();
+        };
 
-        cqrs.execute(
-            &aggregate_id,
-            VaultRegistryCommand::DiscoverEquityVault {
-                token,
-                vault_id,
-                discovered_in: TEST_TX_HASH,
-                symbol,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &vault_registry_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token,
+                    vault_id,
+                    discovered_in: TEST_TX_HASH,
+                    symbol,
+                },
+            )
+            .await
+            .unwrap();
     }
 
     async fn discover_usdc_vault(
@@ -641,22 +640,22 @@ mod tests {
         order_owner: Address,
         vault_id: B256,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
-        let aggregate_id = VaultRegistryId {
+        let store = test_cqrs::<VaultRegistry>(pool.clone(), vec![], ());
+        let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
-        }
-        .to_string();
+        };
 
-        cqrs.execute(
-            &aggregate_id,
-            VaultRegistryCommand::DiscoverUsdcVault {
-                vault_id,
-                discovered_in: TEST_TX_HASH,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &vault_registry_id,
+                VaultRegistryCommand::DiscoverUsdcVault {
+                    vault_id,
+                    discovered_in: TEST_TX_HASH,
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -674,7 +673,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -682,10 +681,10 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let has_onchain_equity = events
             .iter()
-            .any(|e| matches!(e, InventorySnapshotEvent::OnchainEquity { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }));
         let has_onchain_cash = events
             .iter()
-            .any(|e| matches!(e, InventorySnapshotEvent::OnchainCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainCash { .. }));
 
         assert!(
             !has_onchain_equity,
@@ -718,7 +717,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -726,7 +725,7 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let has_onchain_equity = events
             .iter()
-            .any(|e| matches!(e, InventorySnapshotEvent::OnchainEquity { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }));
 
         assert!(
             !has_onchain_equity,
@@ -763,7 +762,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -771,7 +770,7 @@ mod tests {
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let has_onchain_cash = events
             .iter()
-            .any(|e| matches!(e, InventorySnapshotEvent::OnchainCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainCash { .. }));
 
         assert!(
             !has_onchain_cash,
@@ -807,7 +806,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -838,7 +837,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();

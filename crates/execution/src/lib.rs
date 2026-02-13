@@ -126,11 +126,11 @@ impl std::str::FromStr for Symbol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("Value must be positive, got {0}")]
 pub struct NonPositiveError(pub Decimal);
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WholeSharesError {
     #[error("Cannot convert fractional shares {0} to whole shares")]
     Fractional(Decimal),
@@ -173,7 +173,7 @@ where
         D: serde::Deserializer<'de>,
     {
         let value = T::deserialize(deserializer)?;
-        Positive::new(value).map_err(serde::de::Error::custom)
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 

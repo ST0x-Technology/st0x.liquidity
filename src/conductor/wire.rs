@@ -147,21 +147,22 @@ impl<Processor> UnwiredQuery<Processor, Nil> {
 /// wiring.
 ///
 /// Parameterized on an [`EventSourced`] entity type. Internally
-/// constructs `SqliteCqrs<Lifecycle<E>>` but returns
-/// [`Store<E>`], keeping Lifecycle as an implementation detail.
+/// constructs `SqliteCqrs<Lifecycle<Entity>>` but returns
+/// [`Store<Entity>`], keeping Lifecycle as an implementation
+/// detail.
 ///
 /// Accumulates query processors via [`wire`](Self::wire) calls,
 /// tracking them at the type level in the `Wired` parameter.
 /// Call [`build`](Self::build) to construct the framework and
 /// get back wired queries for continued wiring.
-pub(crate) struct CqrsBuilder<E: EventSourced, Wired = ()> {
+pub(crate) struct CqrsBuilder<Entity: EventSourced, Wired = ()> {
     pool: SqlitePool,
-    queries: Vec<Box<dyn Query<Lifecycle<E>>>>,
+    queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
     wired: Wired,
 }
 
-impl<E: EventSourced> CqrsBuilder<E, ()> {
-    /// Creates a new builder for entity type `E`.
+impl<Entity: EventSourced> CqrsBuilder<Entity, ()> {
+    /// Creates a new builder for the given entity type.
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
@@ -177,8 +178,13 @@ impl<E: EventSourced> CqrsBuilder<E, ()> {
     /// changed.
     ///
     /// Returns a [`Store`] for type-safe command dispatch.
-    pub(crate) async fn build(self, services: E::Services) -> Result<Store<E>, anyhow::Error> {
-        Reconciler::new(self.pool.clone()).reconcile::<E>().await?;
+    pub(crate) async fn build(
+        self,
+        services: Entity::Services,
+    ) -> Result<Store<Entity>, anyhow::Error> {
+        Reconciler::new(self.pool.clone())
+            .reconcile::<Entity>()
+            .await?;
 
         #[allow(clippy::disallowed_methods)]
         let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
@@ -186,28 +192,29 @@ impl<E: EventSourced> CqrsBuilder<E, ()> {
     }
 }
 
-impl<E: EventSourced, W> CqrsBuilder<E, W> {
+impl<Entity: EventSourced, Wired> CqrsBuilder<Entity, Wired> {
     /// Wires a query processor to this CQRS framework.
     ///
     /// Consumes the [`UnwiredQuery`] and returns a new builder
     /// with:
     /// - The query added to the internal processors list
-    /// - An updated `UnwiredQuery` (with `E` removed from
-    ///   dependencies) added to the `Wired` tuple for return at
+    /// - An updated `UnwiredQuery` (with `Entity` removed from
+    ///   dependencies) added to the wired tuple for return at
     ///   build time
     ///
     /// # Type Evolution
     ///
-    /// The input query must have `E` as its next dependency:
-    /// `UnwiredQuery<Q, Cons<E, Tail>>`. The returned query in
-    /// the tuple will be `UnwiredQuery<Q, Tail>`.
-    pub(crate) fn wire<Q, Tail>(
+    /// The input query must have `Entity` as its next dependency:
+    /// `UnwiredQuery<Processor, Cons<Entity, Tail>>`. The
+    /// returned query will be
+    /// `UnwiredQuery<Processor, Tail>`.
+    pub(crate) fn wire<Processor, Tail>(
         mut self,
-        query: UnwiredQuery<Q, Cons<E, Tail>>,
-    ) -> CqrsBuilder<E, (UnwiredQuery<Q, Tail>, W)>
+        query: UnwiredQuery<Processor, Cons<Entity, Tail>>,
+    ) -> CqrsBuilder<Entity, (UnwiredQuery<Processor, Tail>, Wired)>
     where
-        Q: Send + Sync + 'static,
-        Arc<Q>: Query<Lifecycle<E>>,
+        Processor: Send + Sync + 'static,
+        Arc<Processor>: Query<Lifecycle<Entity>>,
     {
         self.queries.push(Box::new(query.query.clone()));
 
@@ -225,7 +232,7 @@ impl<E: EventSourced, W> CqrsBuilder<E, W> {
     }
 }
 
-impl<E: EventSourced, H, T> CqrsBuilder<E, (H, T)> {
+impl<Entity: EventSourced, Head, Tail> CqrsBuilder<Entity, (Head, Tail)> {
     /// Builds the CQRS framework, returning a [`Store`] with all
     /// wired queries.
     ///
@@ -235,9 +242,11 @@ impl<E: EventSourced, H, T> CqrsBuilder<E, (H, T)> {
     /// [`UnwiredQuery::into_inner`].
     pub(crate) async fn build(
         self,
-        services: E::Services,
-    ) -> Result<(Store<E>, (H, T)), anyhow::Error> {
-        Reconciler::new(self.pool.clone()).reconcile::<E>().await?;
+        services: Entity::Services,
+    ) -> Result<(Store<Entity>, (Head, Tail)), anyhow::Error> {
+        Reconciler::new(self.pool.clone())
+            .reconcile::<Entity>()
+            .await?;
 
         #[allow(clippy::disallowed_methods)]
         let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
@@ -251,11 +260,11 @@ impl<E: EventSourced, H, T> CqrsBuilder<E, (H, T)> {
 /// fit the production wiring pattern. Use this instead of
 /// `sqlite_es::sqlite_cqrs`.
 #[cfg(test)]
-pub(crate) fn test_cqrs<E: EventSourced>(
+pub(crate) fn test_cqrs<Entity: EventSourced>(
     pool: SqlitePool,
-    queries: Vec<Box<dyn Query<Lifecycle<E>>>>,
-    services: E::Services,
-) -> Store<E> {
+    queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
+    services: Entity::Services,
+) -> Store<Entity> {
     #[allow(clippy::disallowed_methods)]
     let cqrs = sqlite_es::sqlite_cqrs(pool, queries, services);
     Store::new(cqrs)

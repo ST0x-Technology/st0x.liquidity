@@ -54,7 +54,7 @@ pub(super) async fn poll_transfer_status(
 
         let transfer = (|| async { get_transfer_status(client, transfer_id).await })
             .retry(retry_strategy)
-            .when(|e| matches!(e, AlpacaWalletError::ApiError { status, .. } if status.is_server_error()))
+            .when(|error| matches!(error, AlpacaWalletError::ApiError { status, .. } if status.is_server_error()))
             .await?;
 
         validate_and_log_status_change(*transfer_id, last_status, &transfer)?;
@@ -179,8 +179,8 @@ pub(super) async fn poll_deposit_by_tx_hash(
         let maybe_transfer =
             (|| async { find_transfer_by_tx_hash(client, tx_hash).await })
                 .retry(retry_strategy)
-                .when(|e| {
-                    matches!(e, AlpacaWalletError::ApiError { status, .. } if status.is_server_error())
+                .when(|error| {
+                    matches!(error, AlpacaWalletError::ApiError { status, .. } if status.is_server_error())
                 })
                 .await?;
 

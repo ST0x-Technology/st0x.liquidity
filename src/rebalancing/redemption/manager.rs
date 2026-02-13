@@ -179,18 +179,18 @@ where
 mod tests {
     use alloy::primitives::address;
     use rust_decimal_macros::dec;
-    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
 
     use super::*;
     use crate::alpaca_tokenization::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
     };
+    use crate::conductor::wire::test_cqrs;
 
     async fn create_test_cqrs() -> Arc<Store<EquityRedemption>> {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        Arc::new(Store::new(sqlite_cqrs(pool, vec![], ())))
+        Arc::new(test_cqrs(pool, vec![], ()))
     }
 
     #[tokio::test]

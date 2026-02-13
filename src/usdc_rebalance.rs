@@ -61,12 +61,11 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::alpaca_wallet::AlpacaTransferId;
-use crate::event_sourced::EventSourced;
+use crate::event_sourced::{DomainEvent, EventSourced};
 use crate::threshold::Usdc;
 
 /// Unique identifier for a USDC rebalance operation.
@@ -486,8 +485,9 @@ impl EventSourced for UsdcRebalance {
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
+        use UsdcRebalanceEvent::*;
         match event {
-            UsdcRebalanceEvent::ConversionInitiated {
+            ConversionInitiated {
                 direction,
                 amount,
                 order_id,
@@ -499,7 +499,7 @@ impl EventSourced for UsdcRebalance {
                 initiated_at: *initiated_at,
             }),
 
-            UsdcRebalanceEvent::Initiated {
+            Initiated {
                 direction,
                 amount,
                 withdrawal_ref,
@@ -516,10 +516,11 @@ impl EventSourced for UsdcRebalance {
     }
 
     fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        use UsdcRebalanceEvent::*;
         let mismatch = || Ok(None);
 
         match event {
-            UsdcRebalanceEvent::ConversionInitiated {
+            ConversionInitiated {
                 direction,
                 amount,
                 order_id,
@@ -536,7 +537,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::ConversionConfirmed {
+            ConversionConfirmed {
                 filled_amount,
                 converted_at,
                 ..
@@ -559,7 +560,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::ConversionFailed { reason, failed_at } => {
+            ConversionFailed { reason, failed_at } => {
                 let Self::Converting {
                     direction,
                     amount,
@@ -579,7 +580,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::Initiated {
+            Initiated {
                 withdrawal_ref,
                 initiated_at,
                 ..
@@ -600,7 +601,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at } => {
+            WithdrawalConfirmed { confirmed_at } => {
                 let Self::Withdrawing {
                     direction,
                     amount,
@@ -618,7 +619,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::WithdrawalFailed { reason, failed_at } => {
+            WithdrawalFailed { reason, failed_at } => {
                 let Self::Withdrawing {
                     direction,
                     amount,
@@ -638,7 +639,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::BridgingInitiated {
+            BridgingInitiated {
                 burn_tx_hash,
                 burned_at,
             } => {
@@ -660,7 +661,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::BridgeAttestationReceived {
+            BridgeAttestationReceived {
                 attestation,
                 cctp_nonce,
                 attested_at,
@@ -686,7 +687,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::Bridged {
+            Bridged {
                 mint_tx_hash,
                 amount_received,
                 fee_collected,
@@ -714,7 +715,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::BridgingFailed {
+            BridgingFailed {
                 burn_tx_hash,
                 cctp_nonce,
                 reason,
@@ -746,7 +747,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::DepositInitiated {
+            DepositInitiated {
                 deposit_ref,
                 deposit_initiated_at,
             } => {
@@ -772,7 +773,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::DepositConfirmed {
+            DepositConfirmed {
                 deposit_confirmed_at,
                 ..
             } => {
@@ -797,7 +798,7 @@ impl EventSourced for UsdcRebalance {
                 }))
             }
 
-            UsdcRebalanceEvent::DepositFailed {
+            DepositFailed {
                 deposit_ref,
                 reason,
                 failed_at,
@@ -831,63 +832,53 @@ impl EventSourced for UsdcRebalance {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use UsdcRebalanceCommand::*;
+        use UsdcRebalanceEvent::*;
+
         match command {
-            UsdcRebalanceCommand::InitiateConversion {
+            InitiateConversion {
                 direction,
                 amount,
                 order_id,
-            } => Ok(vec![UsdcRebalanceEvent::ConversionInitiated {
+            } => Ok(vec![ConversionInitiated {
                 direction,
                 amount,
                 order_id,
                 initiated_at: Utc::now(),
             }]),
 
-            UsdcRebalanceCommand::Initiate {
+            Initiate {
                 direction,
                 amount,
                 withdrawal,
-            } => Ok(vec![UsdcRebalanceEvent::Initiated {
+            } => Ok(vec![Initiated {
                 direction,
                 amount,
                 withdrawal_ref: withdrawal,
                 initiated_at: Utc::now(),
             }]),
 
-            UsdcRebalanceCommand::ConfirmConversion { .. }
-            | UsdcRebalanceCommand::FailConversion { .. } => {
+            ConfirmConversion { .. } | FailConversion { .. } => {
                 Err(UsdcRebalanceError::ConversionNotInitiated)
             }
 
-            UsdcRebalanceCommand::InitiatePostDepositConversion { .. } => {
-                Err(UsdcRebalanceError::DepositNotConfirmed)
-            }
+            InitiatePostDepositConversion { .. } => Err(UsdcRebalanceError::DepositNotConfirmed),
 
-            UsdcRebalanceCommand::ConfirmWithdrawal
-            | UsdcRebalanceCommand::FailWithdrawal { .. } => {
+            ConfirmWithdrawal | FailWithdrawal { .. } => {
                 Err(UsdcRebalanceError::WithdrawalNotInitiated)
             }
 
-            UsdcRebalanceCommand::InitiateBridging { .. } => {
-                Err(UsdcRebalanceError::WithdrawalNotConfirmed)
-            }
+            InitiateBridging { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
 
-            UsdcRebalanceCommand::ReceiveAttestation { .. }
-            | UsdcRebalanceCommand::FailBridging { .. } => {
+            ReceiveAttestation { .. } | FailBridging { .. } => {
                 Err(UsdcRebalanceError::BridgingNotInitiated)
             }
 
-            UsdcRebalanceCommand::ConfirmBridging { .. } => {
-                Err(UsdcRebalanceError::AttestationNotReceived)
-            }
+            ConfirmBridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
 
-            UsdcRebalanceCommand::InitiateDeposit { .. } => {
-                Err(UsdcRebalanceError::BridgingNotCompleted)
-            }
+            InitiateDeposit { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
-            UsdcRebalanceCommand::ConfirmDeposit | UsdcRebalanceCommand::FailDeposit { .. } => {
-                Err(UsdcRebalanceError::DepositNotInitiated)
-            }
+            ConfirmDeposit | FailDeposit { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
         }
     }
 
@@ -896,27 +887,26 @@ impl EventSourced for UsdcRebalance {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            UsdcRebalanceCommand::InitiateConversion { .. } => {
-                Err(UsdcRebalanceError::AlreadyInitiated)
-            }
+        use UsdcRebalanceCommand::*;
+        use UsdcRebalanceEvent::*;
 
-            UsdcRebalanceCommand::ConfirmConversion { filled_amount } => match self {
-                Self::Converting { direction, .. } => {
-                    Ok(vec![UsdcRebalanceEvent::ConversionConfirmed {
-                        direction: direction.clone(),
-                        filled_amount,
-                        converted_at: Utc::now(),
-                    }])
-                }
+        match command {
+            InitiateConversion { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
+
+            ConfirmConversion { filled_amount } => match self {
+                Self::Converting { direction, .. } => Ok(vec![ConversionConfirmed {
+                    direction: direction.clone(),
+                    filled_amount,
+                    converted_at: Utc::now(),
+                }]),
                 Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
                     Err(UsdcRebalanceError::ConversionAlreadyCompleted)
                 }
                 _ => Err(UsdcRebalanceError::ConversionNotInitiated),
             },
 
-            UsdcRebalanceCommand::FailConversion { reason } => match self {
-                Self::Converting { .. } => Ok(vec![UsdcRebalanceEvent::ConversionFailed {
+            FailConversion { reason } => match self {
+                Self::Converting { .. } => Ok(vec![ConversionFailed {
                     reason,
                     failed_at: Utc::now(),
                 }]),
@@ -926,7 +916,7 @@ impl EventSourced for UsdcRebalance {
                 _ => Err(UsdcRebalanceError::ConversionNotInitiated),
             },
 
-            UsdcRebalanceCommand::InitiatePostDepositConversion {
+            InitiatePostDepositConversion {
                 order_id,
                 amount: command_amount,
             } => match self {
@@ -942,7 +932,7 @@ impl EventSourced for UsdcRebalance {
                             provided: command_amount,
                         });
                     }
-                    Ok(vec![UsdcRebalanceEvent::ConversionInitiated {
+                    Ok(vec![ConversionInitiated {
                         direction: direction.clone(),
                         amount: *amount,
                         order_id,
@@ -952,7 +942,7 @@ impl EventSourced for UsdcRebalance {
                 _ => Err(UsdcRebalanceError::DepositNotConfirmed),
             },
 
-            UsdcRebalanceCommand::Initiate {
+            Initiate {
                 direction,
                 amount,
                 withdrawal,
@@ -980,7 +970,7 @@ impl EventSourced for UsdcRebalance {
                             ),
                         });
                     }
-                    Ok(vec![UsdcRebalanceEvent::Initiated {
+                    Ok(vec![Initiated {
                         direction,
                         amount: *conv_filled_amount,
                         withdrawal_ref: withdrawal,
@@ -990,8 +980,8 @@ impl EventSourced for UsdcRebalance {
                 _ => Err(UsdcRebalanceError::AlreadyInitiated),
             },
 
-            UsdcRebalanceCommand::ConfirmWithdrawal => match self {
-                Self::Withdrawing { .. } => Ok(vec![UsdcRebalanceEvent::WithdrawalConfirmed {
+            ConfirmWithdrawal => match self {
+                Self::Withdrawing { .. } => Ok(vec![WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
                 }]),
                 Self::WithdrawalComplete { .. }
@@ -1006,8 +996,8 @@ impl EventSourced for UsdcRebalance {
                 _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             },
 
-            UsdcRebalanceCommand::FailWithdrawal { reason } => match self {
-                Self::Withdrawing { .. } => Ok(vec![UsdcRebalanceEvent::WithdrawalFailed {
+            FailWithdrawal { reason } => match self {
+                Self::Withdrawing { .. } => Ok(vec![WithdrawalFailed {
                     reason,
                     failed_at: Utc::now(),
                 }]),
@@ -1023,18 +1013,16 @@ impl EventSourced for UsdcRebalance {
                 _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             },
 
-            UsdcRebalanceCommand::InitiateBridging { burn_tx } => match self {
+            InitiateBridging { burn_tx } => match self {
                 Self::Converting { .. }
                 | Self::ConversionComplete { .. }
                 | Self::ConversionFailed { .. }
                 | Self::Withdrawing { .. }
                 | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
-                Self::WithdrawalComplete { .. } => {
-                    Ok(vec![UsdcRebalanceEvent::BridgingInitiated {
-                        burn_tx_hash: burn_tx,
-                        burned_at: Utc::now(),
-                    }])
-                }
+                Self::WithdrawalComplete { .. } => Ok(vec![BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                }]),
                 Self::Bridging { .. }
                 | Self::Attested { .. }
                 | Self::Bridged { .. }
@@ -1047,7 +1035,7 @@ impl EventSourced for UsdcRebalance {
                 }),
             },
 
-            UsdcRebalanceCommand::ReceiveAttestation {
+            ReceiveAttestation {
                 attestation,
                 cctp_nonce,
             } => match self {
@@ -1057,7 +1045,7 @@ impl EventSourced for UsdcRebalance {
                 | Self::Withdrawing { .. }
                 | Self::WithdrawalComplete { .. }
                 | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
-                Self::Bridging { .. } => Ok(vec![UsdcRebalanceEvent::BridgeAttestationReceived {
+                Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
                     attestation,
                     cctp_nonce,
                     attested_at: Utc::now(),
@@ -1073,7 +1061,7 @@ impl EventSourced for UsdcRebalance {
                 | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
             },
 
-            UsdcRebalanceCommand::ConfirmBridging {
+            ConfirmBridging {
                 mint_tx,
                 amount_received,
                 fee_collected,
@@ -1085,7 +1073,7 @@ impl EventSourced for UsdcRebalance {
                 | Self::WithdrawalComplete { .. }
                 | Self::WithdrawalFailed { .. }
                 | Self::Bridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
-                Self::Attested { .. } => Ok(vec![UsdcRebalanceEvent::Bridged {
+                Self::Attested { .. } => Ok(vec![Bridged {
                     mint_tx_hash: mint_tx,
                     amount_received,
                     fee_collected,
@@ -1098,26 +1086,24 @@ impl EventSourced for UsdcRebalance {
                 | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
             },
 
-            UsdcRebalanceCommand::FailBridging { reason } => match self {
+            FailBridging { reason } => match self {
                 Self::Converting { .. }
                 | Self::ConversionComplete { .. }
                 | Self::ConversionFailed { .. }
                 | Self::Withdrawing { .. }
                 | Self::WithdrawalComplete { .. }
                 | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
-                Self::Bridging { burn_tx_hash, .. } => {
-                    Ok(vec![UsdcRebalanceEvent::BridgingFailed {
-                        burn_tx_hash: Some(*burn_tx_hash),
-                        cctp_nonce: None,
-                        reason,
-                        failed_at: Utc::now(),
-                    }])
-                }
+                Self::Bridging { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
+                    burn_tx_hash: Some(*burn_tx_hash),
+                    cctp_nonce: None,
+                    reason,
+                    failed_at: Utc::now(),
+                }]),
                 Self::Attested {
                     burn_tx_hash,
                     cctp_nonce,
                     ..
-                } => Ok(vec![UsdcRebalanceEvent::BridgingFailed {
+                } => Ok(vec![BridgingFailed {
                     burn_tx_hash: Some(*burn_tx_hash),
                     cctp_nonce: Some(*cctp_nonce),
                     reason,
@@ -1130,7 +1116,7 @@ impl EventSourced for UsdcRebalance {
                 | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
             },
 
-            UsdcRebalanceCommand::InitiateDeposit { deposit } => match self {
+            InitiateDeposit { deposit } => match self {
                 Self::Converting { .. }
                 | Self::ConversionComplete { .. }
                 | Self::ConversionFailed { .. }
@@ -1140,7 +1126,7 @@ impl EventSourced for UsdcRebalance {
                 | Self::Bridging { .. }
                 | Self::Attested { .. }
                 | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
-                Self::Bridged { .. } => Ok(vec![UsdcRebalanceEvent::DepositInitiated {
+                Self::Bridged { .. } => Ok(vec![DepositInitiated {
                     deposit_ref: deposit,
                     deposit_initiated_at: Utc::now(),
                 }]),
@@ -1152,7 +1138,7 @@ impl EventSourced for UsdcRebalance {
                 }),
             },
 
-            UsdcRebalanceCommand::ConfirmDeposit => match self {
+            ConfirmDeposit => match self {
                 Self::Converting { .. }
                 | Self::ConversionComplete { .. }
                 | Self::ConversionFailed { .. }
@@ -1163,12 +1149,10 @@ impl EventSourced for UsdcRebalance {
                 | Self::Attested { .. }
                 | Self::BridgingFailed { .. }
                 | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
-                Self::DepositInitiated { direction, .. } => {
-                    Ok(vec![UsdcRebalanceEvent::DepositConfirmed {
-                        direction: direction.clone(),
-                        deposit_confirmed_at: Utc::now(),
-                    }])
-                }
+                Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
+                    direction: direction.clone(),
+                    deposit_confirmed_at: Utc::now(),
+                }]),
                 Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
                     Err(UsdcRebalanceError::InvalidCommand {
                         command: "ConfirmDeposit".to_string(),
@@ -1177,7 +1161,7 @@ impl EventSourced for UsdcRebalance {
                 }
             },
 
-            UsdcRebalanceCommand::FailDeposit { reason } => match self {
+            FailDeposit { reason } => match self {
                 Self::Converting { .. }
                 | Self::ConversionComplete { .. }
                 | Self::ConversionFailed { .. }
@@ -1188,13 +1172,11 @@ impl EventSourced for UsdcRebalance {
                 | Self::Attested { .. }
                 | Self::BridgingFailed { .. }
                 | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
-                Self::DepositInitiated { deposit_ref, .. } => {
-                    Ok(vec![UsdcRebalanceEvent::DepositFailed {
-                        deposit_ref: Some(deposit_ref.clone()),
-                        reason,
-                        failed_at: Utc::now(),
-                    }])
-                }
+                Self::DepositInitiated { deposit_ref, .. } => Ok(vec![DepositFailed {
+                    deposit_ref: Some(deposit_ref.clone()),
+                    reason,
+                    failed_at: Utc::now(),
+                }]),
                 Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
                     Err(UsdcRebalanceError::InvalidCommand {
                         command: "FailDeposit".to_string(),

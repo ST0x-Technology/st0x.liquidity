@@ -1880,8 +1880,8 @@ mod tests {
 
     #[test]
     fn extract_nonce_from_minimum_length_message_succeeds() {
-        let expected_nonce: [u8; 32] = core::array::from_fn(|i| {
-            u8::try_from(i + 1).expect("index 0..31 + 1 always fits in u8")
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
         });
         let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &[]);
 

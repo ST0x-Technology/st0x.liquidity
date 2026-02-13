@@ -7,11 +7,12 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::DomainEvent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use st0x_execution::{Direction, Symbol};
+
+use crate::event_sourced::DomainEvent;
 
 use crate::event_sourced::EventSourced;
 
@@ -51,8 +52,9 @@ impl EventSourced for OnChainTrade {
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
+        use OnChainTradeEvent::*;
         match event {
-            OnChainTradeEvent::Filled {
+            Filled {
                 symbol,
                 amount,
                 direction,
@@ -71,13 +73,14 @@ impl EventSourced for OnChainTrade {
                 enrichment: None,
             }),
 
-            OnChainTradeEvent::Enriched { .. } => None,
+            Enriched { .. } => None,
         }
     }
 
     fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        use OnChainTradeEvent::*;
         match event {
-            OnChainTradeEvent::Enriched {
+            Enriched {
                 gas_used,
                 pyth_price,
                 enriched_at,
@@ -90,7 +93,7 @@ impl EventSourced for OnChainTrade {
                 ..state.clone()
             })),
 
-            OnChainTradeEvent::Filled { .. } => Ok(None),
+            Filled { .. } => Ok(None),
         }
     }
 
@@ -98,15 +101,17 @@ impl EventSourced for OnChainTrade {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use OnChainTradeCommand::*;
+        use OnChainTradeEvent::*;
         match command {
-            OnChainTradeCommand::Witness {
+            Witness {
                 symbol,
                 amount,
                 direction,
                 price_usdc,
                 block_number,
                 block_timestamp,
-            } => Ok(vec![OnChainTradeEvent::Filled {
+            } => Ok(vec![Filled {
                 symbol,
                 amount,
                 direction,
@@ -116,7 +121,7 @@ impl EventSourced for OnChainTrade {
                 filled_at: Utc::now(),
             }]),
 
-            OnChainTradeCommand::Enrich { .. } => Err(OnChainTradeError::NotFilled),
+            Enrich { .. } => Err(OnChainTradeError::NotFilled),
         }
     }
 
@@ -125,10 +130,12 @@ impl EventSourced for OnChainTrade {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use OnChainTradeCommand::*;
+        use OnChainTradeEvent::*;
         match command {
-            OnChainTradeCommand::Witness { .. } => Err(OnChainTradeError::AlreadyFilled),
+            Witness { .. } => Err(OnChainTradeError::AlreadyFilled),
 
-            OnChainTradeCommand::Enrich {
+            Enrich {
                 gas_used,
                 pyth_price,
             } => {
@@ -136,7 +143,7 @@ impl EventSourced for OnChainTrade {
                     return Err(OnChainTradeError::AlreadyEnriched);
                 }
 
-                Ok(vec![OnChainTradeEvent::Enriched {
+                Ok(vec![Enriched {
                     gas_used,
                     pyth_price,
                     enriched_at: Utc::now(),

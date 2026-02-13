@@ -47,12 +47,11 @@
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::DomainEvent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 
-use crate::event_sourced::EventSourced;
+use crate::event_sourced::{DomainEvent, EventSourced};
 
 /// Tokenized equity mint aggregate state machine.
 ///
@@ -131,8 +130,9 @@ impl EventSourced for TokenizedEquityMint {
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
+        use TokenizedEquityMintEvent::*;
         match event {
-            TokenizedEquityMintEvent::MintRequested {
+            MintRequested {
                 symbol,
                 quantity,
                 wallet,
@@ -148,21 +148,22 @@ impl EventSourced for TokenizedEquityMint {
     }
 
     fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        use TokenizedEquityMintEvent::*;
         Ok(match event {
-            TokenizedEquityMintEvent::MintRequested { .. } => None,
-            TokenizedEquityMintEvent::MintRejected {
+            MintRequested { .. } => None,
+            MintRejected {
                 reason,
                 rejected_at,
             } => state.try_apply_rejected(reason, *rejected_at),
-            TokenizedEquityMintEvent::MintAccepted {
+            MintAccepted {
                 issuer_request_id,
                 tokenization_request_id,
                 accepted_at,
             } => state.try_apply_accepted(issuer_request_id, tokenization_request_id, *accepted_at),
-            TokenizedEquityMintEvent::MintAcceptanceFailed { reason, failed_at } => {
+            MintAcceptanceFailed { reason, failed_at } => {
                 state.try_apply_acceptance_failed(reason, *failed_at)
             }
-            TokenizedEquityMintEvent::TokensReceived {
+            TokensReceived {
                 tx_hash,
                 receipt_id,
                 shares_minted,
@@ -170,9 +171,7 @@ impl EventSourced for TokenizedEquityMint {
             } => {
                 state.try_apply_tokens_received(*tx_hash, receipt_id, *shares_minted, *received_at)
             }
-            TokenizedEquityMintEvent::MintCompleted { completed_at } => {
-                state.try_apply_completed(*completed_at)
-            }
+            MintCompleted { completed_at } => state.try_apply_completed(*completed_at),
         })
     }
 
@@ -180,32 +179,24 @@ impl EventSourced for TokenizedEquityMint {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use TokenizedEquityMintCommand::*;
+        use TokenizedEquityMintEvent::*;
         match command {
-            TokenizedEquityMintCommand::RequestMint {
+            RequestMint {
                 symbol,
                 quantity,
                 wallet,
-            } => Ok(vec![TokenizedEquityMintEvent::MintRequested {
+            } => Ok(vec![MintRequested {
                 symbol,
                 quantity,
                 wallet,
                 requested_at: Utc::now(),
             }]),
-            TokenizedEquityMintCommand::RejectMint { .. } => {
-                Err(TokenizedEquityMintError::NotRequested)
-            }
-            TokenizedEquityMintCommand::AcknowledgeAcceptance { .. } => {
-                Err(TokenizedEquityMintError::NotRequested)
-            }
-            TokenizedEquityMintCommand::FailAcceptance { .. } => {
-                Err(TokenizedEquityMintError::NotAccepted)
-            }
-            TokenizedEquityMintCommand::ReceiveTokens { .. } => {
-                Err(TokenizedEquityMintError::NotAccepted)
-            }
-            TokenizedEquityMintCommand::Finalize => {
-                Err(TokenizedEquityMintError::TokensNotReceived)
-            }
+            RejectMint { .. } => Err(TokenizedEquityMintError::NotRequested),
+            AcknowledgeAcceptance { .. } => Err(TokenizedEquityMintError::NotRequested),
+            FailAcceptance { .. } => Err(TokenizedEquityMintError::NotAccepted),
+            ReceiveTokens { .. } => Err(TokenizedEquityMintError::NotAccepted),
+            Finalize => Err(TokenizedEquityMintError::TokensNotReceived),
         }
     }
 
@@ -214,13 +205,13 @@ impl EventSourced for TokenizedEquityMint {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use TokenizedEquityMintCommand::*;
+        use TokenizedEquityMintEvent::*;
         match command {
-            TokenizedEquityMintCommand::RequestMint { .. } => {
-                Err(TokenizedEquityMintError::AlreadyInProgress)
-            }
+            RequestMint { .. } => Err(TokenizedEquityMintError::AlreadyInProgress),
 
-            TokenizedEquityMintCommand::RejectMint { reason } => match self {
-                Self::MintRequested { .. } => Ok(vec![TokenizedEquityMintEvent::MintRejected {
+            RejectMint { reason } => match self {
+                Self::MintRequested { .. } => Ok(vec![MintRejected {
                     reason,
                     rejected_at: Utc::now(),
                 }]),
@@ -228,11 +219,11 @@ impl EventSourced for TokenizedEquityMint {
                 _ => Err(TokenizedEquityMintError::AlreadyCompleted),
             },
 
-            TokenizedEquityMintCommand::AcknowledgeAcceptance {
+            AcknowledgeAcceptance {
                 issuer_request_id,
                 tokenization_request_id,
             } => match self {
-                Self::MintRequested { .. } => Ok(vec![TokenizedEquityMintEvent::MintAccepted {
+                Self::MintRequested { .. } => Ok(vec![MintAccepted {
                     issuer_request_id,
                     tokenization_request_id,
                     accepted_at: Utc::now(),
@@ -241,25 +232,23 @@ impl EventSourced for TokenizedEquityMint {
                 _ => Err(TokenizedEquityMintError::AlreadyCompleted),
             },
 
-            TokenizedEquityMintCommand::FailAcceptance { reason } => match self {
+            FailAcceptance { reason } => match self {
                 Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
-                Self::MintAccepted { .. } => {
-                    Ok(vec![TokenizedEquityMintEvent::MintAcceptanceFailed {
-                        reason,
-                        failed_at: Utc::now(),
-                    }])
-                }
+                Self::MintAccepted { .. } => Ok(vec![MintAcceptanceFailed {
+                    reason,
+                    failed_at: Utc::now(),
+                }]),
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
                 _ => Err(TokenizedEquityMintError::AlreadyCompleted),
             },
 
-            TokenizedEquityMintCommand::ReceiveTokens {
+            ReceiveTokens {
                 tx_hash,
                 receipt_id,
                 shares_minted,
             } => match self {
                 Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
-                Self::MintAccepted { .. } => Ok(vec![TokenizedEquityMintEvent::TokensReceived {
+                Self::MintAccepted { .. } => Ok(vec![TokensReceived {
                     tx_hash,
                     receipt_id,
                     shares_minted,
@@ -271,11 +260,11 @@ impl EventSourced for TokenizedEquityMint {
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
 
-            TokenizedEquityMintCommand::Finalize => match self {
+            Finalize => match self {
                 Self::MintRequested { .. } | Self::MintAccepted { .. } => {
                     Err(TokenizedEquityMintError::TokensNotReceived)
                 }
-                Self::TokensReceived { .. } => Ok(vec![TokenizedEquityMintEvent::MintCompleted {
+                Self::TokensReceived { .. } => Ok(vec![MintCompleted {
                     completed_at: Utc::now(),
                 }]),
                 Self::Completed { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),

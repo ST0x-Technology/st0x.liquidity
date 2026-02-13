@@ -898,12 +898,10 @@ mod tests {
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::AggregateError;
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
 
     use uuid::{Uuid, uuid};
@@ -915,9 +913,11 @@ mod tests {
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
+    use crate::conductor::wire::test_cqrs;
     use crate::lifecycle::LifecycleError;
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
+    use cqrs_es::AggregateError;
 
     const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
     const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
@@ -943,8 +943,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        #[allow(clippy::disallowed_methods)]
-        Arc::new(Store::new(sqlite_cqrs(pool, vec![], ())))
+        Arc::new(test_cqrs(pool, vec![], ()))
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal -> InitiateBridging ->

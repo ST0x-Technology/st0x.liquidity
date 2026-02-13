@@ -189,8 +189,11 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |s| {
-        s.parse::<f64>().map(Some).map_err(serde::de::Error::custom)
+    opt.map_or(Ok(None), |value| {
+        value
+            .parse::<f64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom)
     })
 }
 
@@ -199,8 +202,9 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |s| {
-        s.parse::<Decimal>()
+    opt.map_or(Ok(None), |value| {
+        value
+            .parse::<Decimal>()
             .map(Some)
             .map_err(serde::de::Error::custom)
     })
@@ -307,11 +311,11 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
 }
 
 fn convert_price_to_cents(price: Option<f64>) -> Result<Option<u64>, AlpacaBrokerApiError> {
-    price.map_or(Ok(None), |p| {
-        let cents_float = (p * 100.0).round();
+    price.map_or(Ok(None), |price_value| {
+        let cents_float = (price_value * 100.0).round();
         let cents = cents_float
             .to_u64()
-            .ok_or(AlpacaBrokerApiError::PriceConversion(p))?;
+            .ok_or(AlpacaBrokerApiError::PriceConversion(price_value))?;
         Ok(Some(cents))
     })
 }

@@ -190,7 +190,7 @@ mod tests {
         let aapl = state
             .positions
             .iter()
-            .find(|p| p.symbol.to_string() == "AAPL")
+            .find(|position| position.symbol.to_string() == "AAPL")
             .unwrap();
         assert_eq!(aapl.quantity, FractionalShares::new(Decimal::new(105, 1)));
         assert_eq!(aapl.market_value_cents, Some(157_500));

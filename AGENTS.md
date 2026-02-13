@@ -844,3 +844,11 @@ Use struct literal syntax directly (`SchwabTokens { access_token: "...", ... }`)
 and access fields directly (`tokens.access_token`). Don't create `fn new()`
 constructors or `fn field(&self)` getters unless they add meaningful logic
 beyond setting/getting field values.
+
+#### No one-liner helpers
+
+If a helper function's body is a single expression, it's useless indirection --
+just inline the call. A function that only wraps another function call adds a
+name to learn and a place to jump to without reducing complexity. Helpers earn
+their existence by encapsulating multi-step logic, not by renaming a single
+operation.

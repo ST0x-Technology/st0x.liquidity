@@ -77,7 +77,11 @@
 
 use async_trait::async_trait;
 use cqrs_es::persist::GenericQuery;
-use cqrs_es::{Aggregate, AggregateError, DomainEvent};
+use cqrs_es::{Aggregate, AggregateError};
+
+/// Re-exported from cqrs-es so domain modules import from here,
+/// not from cqrs-es directly.
+pub(crate) use cqrs_es::DomainEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository};

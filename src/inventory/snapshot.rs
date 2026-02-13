@@ -9,11 +9,10 @@ use std::collections::BTreeMap;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::event_sourced::EventSourced;
+use crate::event_sourced::{DomainEvent, EventSourced};
 use crate::lifecycle::Never;
 use crate::threshold::Usdc;
 
@@ -79,32 +78,25 @@ impl EventSourced for InventorySnapshot {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use InventorySnapshotCommand::*;
         let now = Utc::now();
         Ok(vec![match command {
-            InventorySnapshotCommand::OnchainEquity { balances } => {
-                InventorySnapshotEvent::OnchainEquity {
-                    balances,
-                    fetched_at: now,
-                }
-            }
-            InventorySnapshotCommand::OnchainCash { usdc_balance } => {
-                InventorySnapshotEvent::OnchainCash {
-                    usdc_balance,
-                    fetched_at: now,
-                }
-            }
-            InventorySnapshotCommand::OffchainEquity { positions } => {
-                InventorySnapshotEvent::OffchainEquity {
-                    positions,
-                    fetched_at: now,
-                }
-            }
-            InventorySnapshotCommand::OffchainCash { cash_balance_cents } => {
-                InventorySnapshotEvent::OffchainCash {
-                    cash_balance_cents,
-                    fetched_at: now,
-                }
-            }
+            OnchainEquity { balances } => InventorySnapshotEvent::OnchainEquity {
+                balances,
+                fetched_at: now,
+            },
+            OnchainCash { usdc_balance } => InventorySnapshotEvent::OnchainCash {
+                usdc_balance,
+                fetched_at: now,
+            },
+            OffchainEquity { positions } => InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at: now,
+            },
+            OffchainCash { cash_balance_cents } => InventorySnapshotEvent::OffchainCash {
+                cash_balance_cents,
+                fetched_at: now,
+            },
         }])
     }
 
@@ -113,32 +105,25 @@ impl EventSourced for InventorySnapshot {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        use InventorySnapshotCommand::*;
         let now = Utc::now();
         Ok(vec![match command {
-            InventorySnapshotCommand::OnchainEquity { balances } => {
-                InventorySnapshotEvent::OnchainEquity {
-                    balances,
-                    fetched_at: now,
-                }
-            }
-            InventorySnapshotCommand::OnchainCash { usdc_balance } => {
-                InventorySnapshotEvent::OnchainCash {
-                    usdc_balance,
-                    fetched_at: now,
-                }
-            }
-            InventorySnapshotCommand::OffchainEquity { positions } => {
-                InventorySnapshotEvent::OffchainEquity {
-                    positions,
-                    fetched_at: now,
-                }
-            }
-            InventorySnapshotCommand::OffchainCash { cash_balance_cents } => {
-                InventorySnapshotEvent::OffchainCash {
-                    cash_balance_cents,
-                    fetched_at: now,
-                }
-            }
+            OnchainEquity { balances } => InventorySnapshotEvent::OnchainEquity {
+                balances,
+                fetched_at: now,
+            },
+            OnchainCash { usdc_balance } => InventorySnapshotEvent::OnchainCash {
+                usdc_balance,
+                fetched_at: now,
+            },
+            OffchainEquity { positions } => InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at: now,
+            },
+            OffchainCash { cash_balance_cents } => InventorySnapshotEvent::OffchainCash {
+                cash_balance_cents,
+                fetched_at: now,
+            },
         }])
     }
 }

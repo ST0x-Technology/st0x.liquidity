@@ -148,10 +148,10 @@ pub(crate) async fn fetch_market_hours(
 
     if let Some(date_param) = date {
         use std::fmt::Write;
-        write!(url, "?date={date_param}").map_err(|e| SchwabError::RequestFailed {
+        write!(url, "?date={date_param}").map_err(|error| SchwabError::RequestFailed {
             action: SchwabAction::FormatUrl,
             status: reqwest::StatusCode::OK,
-            body: format!("Failed to format date parameter: {e}"),
+            body: format!("Failed to format date parameter: {error}"),
         })?;
     }
 
@@ -200,10 +200,10 @@ fn parse_market_hours_response(
         });
     };
 
-    let date = parse_date(&eq.date).map_err(|e| SchwabError::RequestFailed {
+    let date = parse_date(&eq.date).map_err(|error| SchwabError::RequestFailed {
         action: SchwabAction::ParseMarketHoursDate,
         status: reqwest::StatusCode::OK,
-        body: format!("Invalid date format '{}': {e}", eq.date),
+        body: format!("Invalid date format '{}': {error}", eq.date),
     })?;
 
     // If market is closed (weekends/holidays), return closed market hours

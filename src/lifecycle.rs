@@ -43,6 +43,11 @@ use crate::event_sourced::EventSourced;
 /// Failed { .. } ---- any event ----> Failed { .. } (unchanged)
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Override serde's inferred bounds. Without this, serde derives
+// `Entity: Serialize + Deserialize` bounds, but Entity's serde
+// impls are already guaranteed by the EventSourced supertrait.
+// The empty bound avoids redundant constraints that confuse the
+// compiler when Entity has complex associated types.
 #[serde(bound = "")]
 pub(crate) enum Lifecycle<Entity: EventSourced> {
     Uninitialized,
@@ -85,6 +90,9 @@ impl<Entity: EventSourced> Default for Lifecycle<Entity> {
 ///
 /// [`Apply`]: LifecycleError::Apply
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+// Same override as Lifecycle above -- serde would infer
+// `Entity::Error: Serialize + Deserialize` bounds that are
+// already guaranteed by EventSourced's DomainError supertrait.
 #[serde(bound = "")]
 pub(crate) enum LifecycleError<Entity: EventSourced> {
     #[error("operation on uninitialized state")]

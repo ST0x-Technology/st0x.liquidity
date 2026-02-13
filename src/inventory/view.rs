@@ -357,9 +357,10 @@ impl InventoryView {
     fn update_equity(
         self,
         symbol: &Symbol,
-        f: impl FnOnce(
+        update: impl FnOnce(
             Inventory<FractionalShares>,
-        ) -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
+        )
+            -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         let inventory = self
@@ -367,7 +368,7 @@ impl InventoryView {
             .get(symbol)
             .ok_or_else(|| InventoryViewError::UnknownSymbol(symbol.clone()))?;
 
-        let updated = f(inventory.clone())?;
+        let updated = update(inventory.clone())?;
 
         let mut equities = self.equities;
         equities.insert(symbol.clone(), updated);
@@ -381,10 +382,10 @@ impl InventoryView {
 
     fn update_usdc(
         self,
-        f: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
+        update: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let updated = f(self.usdc)?;
+        let updated = update(self.usdc)?;
 
         Ok(Self {
             usdc: updated,

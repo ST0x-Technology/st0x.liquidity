@@ -197,12 +197,12 @@ async fn fetch_after_clear_event<P: Provider>(
     }
 
     // Check what's actually in the receipt for error reporting
-    let clear_in_receipt = tx_receipt.inner.logs().iter().any(|l| {
-        l.address() == evm_ctx.orderbook && l.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
+    let clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
+        log.address() == evm_ctx.orderbook && log.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
     });
-    let after_clear_in_receipt = tx_receipt.inner.logs().iter().any(|l| {
-        l.address() == evm_ctx.orderbook
-            && l.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
+    let after_clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
+        log.address() == evm_ctx.orderbook
+            && log.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
     });
 
     if clear_in_receipt && !after_clear_in_receipt {

@@ -478,9 +478,10 @@ fn format_tokenization_request<W: Write>(
     stdout: &mut W,
     request: &TokenizationRequest,
 ) -> io::Result<()> {
-    let type_str = request
-        .r#type
-        .map_or_else(|| "unknown".to_string(), |t| t.to_string());
+    let type_str = request.r#type.map_or_else(
+        || "unknown".to_string(),
+        |transfer_type| transfer_type.to_string(),
+    );
 
     let status_str = match request.status {
         TokenizationRequestStatus::Pending => "⏳ pending",

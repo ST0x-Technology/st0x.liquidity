@@ -120,11 +120,11 @@ mod tests {
             "position_view".to_string(),
         ));
         let position_query = GenericQuery::new(view_repo.clone());
-        let position_store = Store::new(sqlite_es::sqlite_cqrs(
+        let position_store = crate::conductor::wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),
-        ));
+        );
         (position_store, position_query)
     }
 

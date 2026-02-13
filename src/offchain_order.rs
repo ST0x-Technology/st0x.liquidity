@@ -3,7 +3,6 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::DomainEvent;
 use cqrs_es::persist::GenericQuery;
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
@@ -16,7 +15,7 @@ use st0x_execution::{
     SupportedExecutor, Symbol,
 };
 
-use crate::event_sourced::{EventSourced, SqliteQuery};
+use crate::event_sourced::{DomainEvent, EventSourced, SqliteQuery};
 use crate::lifecycle::Lifecycle;
 
 /// Constructs the offchain order CQRS framework with its view
