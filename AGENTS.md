@@ -663,14 +663,24 @@ you MUST fix the underlying code problems, not suppress the warnings.
 
 **Required approach for clippy issues:**
 
-1. **Refactor the code** to address the root cause of the lint violation
-2. **Break down large functions** into smaller, more focused functions
-3. **Improve code structure** to meet clippy's standards
-4. **Use proper error handling** instead of suppressing warnings
+Clippy lint errors are not about the exact specific cosmetic thing -- they are
+often indications of poor design or broader things worth reconsidering. Upon
+encountering a lint violation:
 
-When encountering a clippy issue: understand why it's flagged, refactor to
-address the root cause, and ask permission before suppressing if you believe
-it's incorrect.
+1. **Re-evaluate the design** in the context of what was flagged. If the lint
+   reveals a flaw in the broader design or architecture, fix that
+2. **Refactor the code** to address the root cause of the lint violation
+3. **Break down large functions** into smaller, more focused functions
+4. **Improve code structure** to meet clippy's standards
+5. **Use proper error handling** instead of suppressing warnings
+6. If the violation is intentional and makes perfect sense in context, **stop
+   and request explicit permission** from the user before suppressing
+
+**FORBIDDEN: Obscure workarounds that silence the linter without fixing the
+problem.** Do not restructure code in weird ways, add unnecessary indirection,
+wrap things in newtypes, or use any other trick whose sole purpose is making the
+lint go away. Either fix the underlying design issue the lint is pointing at, or
+request permission to suppress. There is no third option.
 
 **Exception**: Lint suppression inside `sol!` macros is acceptable for issues
 from contract ABI signatures we cannot control.
