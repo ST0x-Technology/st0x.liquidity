@@ -5,6 +5,7 @@
 //! to reconcile tracked inventory with actual balances.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
@@ -12,8 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::event_sourced::{DomainEvent, EventSourced};
-use crate::lifecycle::Never;
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
+
 use crate::threshold::Usdc;
 
 /// Typed identifier for InventorySnapshot aggregates, keyed
@@ -27,6 +28,23 @@ pub(crate) struct InventorySnapshotId {
 impl std::fmt::Display for InventorySnapshotId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.orderbook, self.owner)
+    }
+}
+
+impl FromStr for InventorySnapshotId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (orderbook_str, owner_str) = value
+            .split_once(':')
+            .ok_or_else(|| format!("expected 'orderbook:owner', got '{value}'"))?;
+        let orderbook = orderbook_str
+            .parse()
+            .map_err(|err| format!("invalid orderbook address: {err}"))?;
+        let owner = owner_str
+            .parse()
+            .map_err(|err| format!("invalid owner address: {err}"))?;
+        Ok(Self { orderbook, owner })
     }
 }
 
@@ -215,12 +233,12 @@ impl DomainEvent for InventorySnapshotEvent {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::Aggregate;
     use rust_decimal::Decimal;
+    use st0x_event_sorcery::Aggregate;
     use std::str::FromStr;
 
     use super::*;
-    use crate::lifecycle::Lifecycle;
+    use st0x_event_sorcery::Lifecycle;
 
     type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 

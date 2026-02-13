@@ -6671,7 +6671,6 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
- "cqrs-es",
  "flate2",
  "futures-util",
  "httpmock",

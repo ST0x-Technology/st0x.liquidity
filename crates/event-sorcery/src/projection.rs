@@ -8,9 +8,15 @@
 use std::sync::Arc;
 
 use cqrs_es::persist::{GenericQuery, ViewRepository};
+use sqlite_es::SqliteViewRepository;
 
 use crate::EventSourced;
 use crate::lifecycle::{Lifecycle, LifecycleError};
+
+/// SQLite-backed projection — the concrete type used in
+/// production wiring.
+pub type SqliteProjection<Entity> =
+    Projection<Entity, SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>>;
 
 /// Materialized view of an event-sourced entity.
 ///

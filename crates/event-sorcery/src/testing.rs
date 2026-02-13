@@ -85,12 +85,16 @@ pub struct TestResult<Entity: EventSourced> {
     result: Result<Vec<Entity::Event>, LifecycleError<Entity>>,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertion helpers are meant to panic on failure"
+)]
 impl<Entity: EventSourced> TestResult<Entity>
 where
     Entity::Event: PartialEq + std::fmt::Debug,
 {
     /// Assert that the command produced exactly these events.
-    pub fn then_expect_events(self, expected: Vec<Entity::Event>) {
+    pub fn then_expect_events(self, expected: &[Entity::Event]) {
         let events = self
             .result
             .expect("expected events but command returned error");

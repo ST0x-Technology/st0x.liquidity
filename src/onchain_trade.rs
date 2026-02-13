@@ -4,6 +4,8 @@
 //! Keyed by `(tx_hash, log_index)`. Can be enriched after
 //! the fact with gas costs and Pyth oracle price data.
 
+use std::str::FromStr;
+
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -12,9 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use st0x_execution::{Direction, Symbol};
 
-use crate::event_sourced::DomainEvent;
-
-use crate::event_sourced::EventSourced;
+use st0x_event_sorcery::{DomainEvent, EventSourced};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OnChainTradeId {
@@ -25,6 +25,23 @@ pub(crate) struct OnChainTradeId {
 impl std::fmt::Display for OnChainTradeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.tx_hash, self.log_index)
+    }
+}
+
+impl FromStr for OnChainTradeId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (tx_hash_str, log_index_str) = value
+            .split_once(':')
+            .ok_or_else(|| format!("expected 'tx_hash:log_index', got '{value}'"))?;
+        let tx_hash = tx_hash_str
+            .parse()
+            .map_err(|err| format!("invalid tx_hash: {err}"))?;
+        let log_index = log_index_str
+            .parse()
+            .map_err(|err| format!("invalid log_index: {err}"))?;
+        Ok(Self { tx_hash, log_index })
     }
 }
 
@@ -233,12 +250,12 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::{Aggregate, EventEnvelope, View};
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::{Aggregate, EventEnvelope, View};
     use std::collections::HashMap;
 
     use super::*;
-    use crate::lifecycle::{Lifecycle, LifecycleError};
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     fn make_envelope(
         aggregate_id: &str,

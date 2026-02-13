@@ -147,6 +147,11 @@ impl<Processor> Unwired<Processor, Nil> {
     }
 }
 
+/// The wired-output accumulator: a cons-cell pairing a
+/// partially-wired processor with the previously accumulated
+/// wired results.
+type WiredOutput<Processor, Tail, Rest> = (Unwired<Processor, Tail>, Rest);
+
 /// Builder for a single CQRS framework with type-tracked query
 /// wiring.
 ///
@@ -248,7 +253,7 @@ impl<Entity: EventSourced, Wired> StoreBuilder<Entity, Wired> {
     pub fn wire<Processor, Tail>(
         mut self,
         query: Unwired<Processor, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, (Unwired<Processor, Tail>, Wired)>
+    ) -> StoreBuilder<Entity, WiredOutput<Processor, Tail, Wired>>
     where
         Processor: Send + Sync + 'static,
         Arc<Processor>: Query<Lifecycle<Entity>>,
@@ -276,7 +281,7 @@ impl<Entity: EventSourced, Wired> StoreBuilder<Entity, Wired> {
     pub fn wire_reactor<Processor, Tail>(
         mut self,
         query: Unwired<Processor, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, (Unwired<Processor, Tail>, Wired)>
+    ) -> StoreBuilder<Entity, WiredOutput<Processor, Tail, Wired>>
     where
         Processor: Send + Sync + 'static,
         Arc<Processor>: Reactor<Entity>,
@@ -303,7 +308,7 @@ impl<Entity: EventSourced, Wired> StoreBuilder<Entity, Wired> {
     pub fn wire_projection<Repo, Tail>(
         mut self,
         projection: &Unwired<Projection<Entity, Repo>, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, (Unwired<Projection<Entity, Repo>, Tail>, Wired)>
+    ) -> StoreBuilder<Entity, WiredOutput<Projection<Entity, Repo>, Tail, Wired>>
     where
         Entity: 'static,
         Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync + 'static,
@@ -416,6 +421,10 @@ where
     ///
     /// Prefer [`load`](Self::load) with typed IDs. This exists
     /// for tests that haven't been migrated to typed IDs yet.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test-only helper, panicking on error is fine"
+    )]
     pub async fn load_by_id(&self, aggregate_id: &str) -> Lifecycle<Entity> {
         use cqrs_es::EventStore;
 

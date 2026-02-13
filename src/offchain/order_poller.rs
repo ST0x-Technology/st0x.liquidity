@@ -12,9 +12,9 @@ use st0x_execution::{
     ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
 
+use st0x_event_sorcery::{Lifecycle, SendError, Store};
+
 use super::execution::find_orders_by_status;
-use crate::event_sourced::{SendError, Store};
-use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, PriceCents};
 use crate::onchain::OnChainError;
 use crate::position::{Position, PositionCommand};
@@ -347,8 +347,9 @@ mod tests {
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
 
+    use st0x_event_sorcery::test_store;
+
     use super::*;
-    use crate::conductor::wire::test_cqrs;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -357,12 +358,12 @@ mod tests {
         pool: &SqlitePool,
     ) -> (Arc<Store<OffchainOrder>>, Arc<Store<Position>>) {
         (
-            Arc::new(test_cqrs(
+            Arc::new(test_store(
                 pool.clone(),
                 vec![],
                 crate::offchain_order::noop_order_placer(),
             )),
-            Arc::new(test_cqrs(pool.clone(), vec![], ())),
+            Arc::new(test_store(pool.clone(), vec![], ())),
         )
     }
 

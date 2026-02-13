@@ -13,9 +13,10 @@ use thiserror::Error;
 
 use st0x_execution::{FractionalShares, Symbol};
 
+use st0x_event_sorcery::SendError;
+
 use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
-use crate::event_sourced::SendError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {

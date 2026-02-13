@@ -16,17 +16,16 @@
 //! 5. Extract and return it in [`WiredQueries`]
 
 use alloy::primitives::Address;
-use cqrs_es::persist::GenericQuery;
+use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 use st0x_dto::ServerMessage;
+use st0x_event_sorcery::{Cons, Nil, Projection, SqliteProjection, Store, StoreBuilder, Unwired};
 
-use super::wire::{Cons, CqrsBuilder, Nil, UnwiredQuery};
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::EquityRedemption;
-use crate::event_sourced::{SqliteQuery, Store};
 use crate::inventory::InventoryView;
 use crate::position::Position;
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
@@ -45,14 +44,14 @@ type EventBroadcasterDeps =
 /// Exhaustive destructuring in [`Self::wire()`] ensures every field
 /// is handled.
 pub(super) struct QueryManifest {
-    rebalancing_trigger: UnwiredQuery<RebalancingTrigger, RebalancingTriggerDeps>,
-    event_broadcaster: UnwiredQuery<EventBroadcaster, EventBroadcasterDeps>,
-    position_view: UnwiredQuery<SqliteQuery<Position>, Cons<Position, Nil>>,
+    rebalancing_trigger: Unwired<RebalancingTrigger, RebalancingTriggerDeps>,
+    event_broadcaster: Unwired<EventBroadcaster, EventBroadcasterDeps>,
+    position_view: SqliteProjection<Position>,
 }
 
 /// All query processors after wiring is complete.
 pub(super) struct WiredQueries {
-    pub(super) position_view: Arc<SqliteQuery<Position>>,
+    pub(super) position_view: SqliteProjection<Position>,
 }
 
 /// Built CQRS frameworks from the wiring process.
@@ -84,16 +83,13 @@ impl QueryManifest {
 
         let event_broadcaster = EventBroadcaster::new(event_sender);
 
-        let position_view_repo = Arc::new(sqlite_es::SqliteViewRepository::new(
-            pool,
-            "position_view".to_string(),
-        ));
-        let position_view = GenericQuery::new(position_view_repo);
+        let position_repo = Arc::new(SqliteViewRepository::new(pool, "position_view".to_string()));
+        let position_view = Projection::new(position_repo);
 
         Self {
-            rebalancing_trigger: UnwiredQuery::new(rebalancing_trigger),
-            event_broadcaster: UnwiredQuery::new(event_broadcaster),
-            position_view: UnwiredQuery::new(position_view),
+            rebalancing_trigger: Unwired::new(rebalancing_trigger),
+            event_broadcaster: Unwired::new(event_broadcaster),
+            position_view,
         }
     }
 
@@ -112,37 +108,35 @@ impl QueryManifest {
             position_view,
         } = self;
 
-        let (position, (position_view, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<Position>::new(pool.clone())
-                .wire(rebalancing_trigger)
-                .wire(position_view)
-                .build(())
-                .await?;
+        let (position, (rebalancing_trigger, ())) = StoreBuilder::<Position>::new(pool.clone())
+            .with_projection(&position_view)
+            .wire_reactor(rebalancing_trigger)
+            .build(())
+            .await?;
 
         let (mint, (event_broadcaster, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<TokenizedEquityMint>::new(pool.clone())
-                .wire(rebalancing_trigger)
-                .wire(event_broadcaster)
+            StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+                .wire_reactor(rebalancing_trigger)
+                .wire_reactor(event_broadcaster)
                 .build(())
                 .await?;
 
         let (redemption, (event_broadcaster, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<EquityRedemption>::new(pool.clone())
-                .wire(rebalancing_trigger)
-                .wire(event_broadcaster)
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .wire_reactor(rebalancing_trigger)
+                .wire_reactor(event_broadcaster)
                 .build(())
                 .await?;
 
         let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<UsdcRebalance>::new(pool)
-                .wire(rebalancing_trigger)
-                .wire(event_broadcaster)
+            StoreBuilder::<UsdcRebalance>::new(pool)
+                .wire_reactor(rebalancing_trigger)
+                .wire_reactor(event_broadcaster)
                 .build(())
                 .await?;
 
         let _rebalancing_trigger = rebalancing_trigger.into_inner();
         let _event_broadcaster = event_broadcaster.into_inner();
-        let position_view = position_view.into_inner();
 
         Ok((
             BuiltFrameworks {

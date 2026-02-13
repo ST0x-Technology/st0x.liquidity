@@ -64,8 +64,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use st0x_event_sorcery::{DomainEvent, EventSourced};
+
 use crate::alpaca_wallet::AlpacaTransferId;
-use crate::event_sourced::{DomainEvent, EventSourced};
 use crate::threshold::Usdc;
 
 /// Unique identifier for a USDC rebalance operation.
@@ -81,6 +82,14 @@ impl UsdcRebalanceId {
 impl std::fmt::Display for UsdcRebalanceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for UsdcRebalanceId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -515,213 +524,191 @@ impl EventSourced for UsdcRebalance {
         }
     }
 
+    // All logic is a single pattern match mapping (event, state) -> next_state.
+    // Extracting arms into helpers would only add indirection without
+    // improving readability.
+    #[expect(clippy::too_many_lines)]
     fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
         use UsdcRebalanceEvent::*;
-        let mismatch = || Ok(None);
 
-        match event {
-            ConversionInitiated {
-                direction,
-                amount,
-                order_id,
-                initiated_at,
-            } => {
-                let Self::DepositConfirmed { .. } = state else {
-                    return mismatch();
-                };
-                Ok(Some(Self::Converting {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    order_id: *order_id,
-                    initiated_at: *initiated_at,
-                }))
-            }
-
-            ConversionConfirmed {
-                filled_amount,
-                converted_at,
-                ..
-            } => {
-                let Self::Converting {
-                    direction,
-                    amount,
-                    initiated_at,
-                    ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::ConversionComplete {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    filled_amount: *filled_amount,
-                    initiated_at: *initiated_at,
-                    converted_at: *converted_at,
-                }))
-            }
-
-            ConversionFailed { reason, failed_at } => {
-                let Self::Converting {
+        let next = match (event, state) {
+            (
+                ConversionInitiated {
                     direction,
                     amount,
                     order_id,
                     initiated_at,
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::ConversionFailed {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    order_id: *order_id,
-                    reason: reason.to_string(),
-                    initiated_at: *initiated_at,
-                    failed_at: *failed_at,
-                }))
-            }
+                },
+                Self::DepositConfirmed { .. },
+            ) => Self::Converting {
+                direction: direction.clone(),
+                amount: *amount,
+                order_id: *order_id,
+                initiated_at: *initiated_at,
+            },
 
-            Initiated {
-                withdrawal_ref,
-                initiated_at,
-                ..
-            } => {
-                let Self::ConversionComplete {
-                    direction,
+            (
+                ConversionConfirmed {
                     filled_amount,
+                    converted_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::Withdrawing {
-                    direction: direction.clone(),
-                    amount: *filled_amount,
-                    withdrawal_ref: withdrawal_ref.clone(),
-                    initiated_at: *initiated_at,
-                }))
-            }
-
-            WithdrawalConfirmed { confirmed_at } => {
-                let Self::Withdrawing {
+                },
+                Self::Converting {
                     direction,
                     amount,
                     initiated_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::WithdrawalComplete {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    initiated_at: *initiated_at,
-                    confirmed_at: *confirmed_at,
-                }))
-            }
+                },
+            ) => Self::ConversionComplete {
+                direction: direction.clone(),
+                amount: *amount,
+                filled_amount: *filled_amount,
+                initiated_at: *initiated_at,
+                converted_at: *converted_at,
+            },
 
-            WithdrawalFailed { reason, failed_at } => {
-                let Self::Withdrawing {
+            (
+                ConversionFailed { reason, failed_at },
+                Self::Converting {
+                    direction,
+                    amount,
+                    order_id,
+                    initiated_at,
+                },
+            ) => Self::ConversionFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                order_id: *order_id,
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            (
+                Initiated {
+                    withdrawal_ref,
+                    initiated_at,
+                    ..
+                },
+                Self::ConversionComplete {
+                    direction,
+                    filled_amount,
+                    ..
+                },
+            ) => Self::Withdrawing {
+                direction: direction.clone(),
+                amount: *filled_amount,
+                withdrawal_ref: withdrawal_ref.clone(),
+                initiated_at: *initiated_at,
+            },
+
+            (
+                WithdrawalConfirmed { confirmed_at },
+                Self::Withdrawing {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::WithdrawalComplete {
+                direction: direction.clone(),
+                amount: *amount,
+                initiated_at: *initiated_at,
+                confirmed_at: *confirmed_at,
+            },
+
+            (
+                WithdrawalFailed { reason, failed_at },
+                Self::Withdrawing {
                     direction,
                     amount,
                     withdrawal_ref,
                     initiated_at,
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::WithdrawalFailed {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    withdrawal_ref: withdrawal_ref.clone(),
-                    reason: reason.to_string(),
-                    initiated_at: *initiated_at,
-                    failed_at: *failed_at,
-                }))
-            }
+                },
+            ) => Self::WithdrawalFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                withdrawal_ref: withdrawal_ref.clone(),
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
 
-            BridgingInitiated {
-                burn_tx_hash,
-                burned_at,
-            } => {
-                let Self::WithdrawalComplete {
+            (
+                BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at,
+                },
+                Self::WithdrawalComplete {
                     direction,
                     amount,
                     initiated_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::Bridging {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    burn_tx_hash: *burn_tx_hash,
-                    initiated_at: *initiated_at,
-                    burned_at: *burned_at,
-                }))
-            }
+                },
+            ) => Self::Bridging {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                initiated_at: *initiated_at,
+                burned_at: *burned_at,
+            },
 
-            BridgeAttestationReceived {
-                attestation,
-                cctp_nonce,
-                attested_at,
-            } => {
-                let Self::Bridging {
+            (
+                BridgeAttestationReceived {
+                    attestation,
+                    cctp_nonce,
+                    attested_at,
+                },
+                Self::Bridging {
                     direction,
                     amount,
                     burn_tx_hash,
                     initiated_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::Attested {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    burn_tx_hash: *burn_tx_hash,
-                    cctp_nonce: *cctp_nonce,
-                    attestation: attestation.to_vec(),
-                    initiated_at: *initiated_at,
-                    attested_at: *attested_at,
-                }))
-            }
+                },
+            ) => Self::Attested {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                cctp_nonce: *cctp_nonce,
+                attestation: attestation.clone(),
+                initiated_at: *initiated_at,
+                attested_at: *attested_at,
+            },
 
-            Bridged {
-                mint_tx_hash,
-                amount_received,
-                fee_collected,
-                minted_at,
-            } => {
-                let Self::Attested {
+            (
+                Bridged {
+                    mint_tx_hash,
+                    amount_received,
+                    fee_collected,
+                    minted_at,
+                },
+                Self::Attested {
                     direction,
                     amount,
                     burn_tx_hash,
                     initiated_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::Bridged {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    amount_received: *amount_received,
-                    fee_collected: *fee_collected,
-                    burn_tx_hash: *burn_tx_hash,
-                    mint_tx_hash: *mint_tx_hash,
-                    initiated_at: *initiated_at,
-                    minted_at: *minted_at,
-                }))
-            }
+                },
+            ) => Self::Bridged {
+                direction: direction.clone(),
+                amount: *amount,
+                amount_received: *amount_received,
+                fee_collected: *fee_collected,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                minted_at: *minted_at,
+            },
 
-            BridgingFailed {
-                burn_tx_hash,
-                cctp_nonce,
-                reason,
-                failed_at,
-            } => {
-                let (Self::Bridging {
+            (
+                BridgingFailed {
+                    burn_tx_hash,
+                    cctp_nonce,
+                    reason,
+                    failed_at,
+                },
+                Self::Bridging {
                     direction,
                     amount,
                     initiated_at,
@@ -732,100 +719,91 @@ impl EventSourced for UsdcRebalance {
                     amount,
                     initiated_at,
                     ..
-                }) = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::BridgingFailed {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    burn_tx_hash: *burn_tx_hash,
-                    cctp_nonce: *cctp_nonce,
-                    reason: reason.to_string(),
-                    initiated_at: *initiated_at,
-                    failed_at: *failed_at,
-                }))
-            }
+                },
+            ) => Self::BridgingFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                cctp_nonce: *cctp_nonce,
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
 
-            DepositInitiated {
-                deposit_ref,
-                deposit_initiated_at,
-            } => {
-                let Self::Bridged {
+            (
+                DepositInitiated {
+                    deposit_ref,
+                    deposit_initiated_at,
+                },
+                Self::Bridged {
                     direction,
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
                     initiated_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::DepositInitiated {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    burn_tx_hash: *burn_tx_hash,
-                    mint_tx_hash: *mint_tx_hash,
-                    deposit_ref: deposit_ref.clone(),
-                    initiated_at: *initiated_at,
-                    deposit_initiated_at: *deposit_initiated_at,
-                }))
-            }
+                },
+            ) => Self::DepositInitiated {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                deposit_ref: deposit_ref.clone(),
+                initiated_at: *initiated_at,
+                deposit_initiated_at: *deposit_initiated_at,
+            },
 
-            DepositConfirmed {
-                deposit_confirmed_at,
-                ..
-            } => {
-                let Self::DepositInitiated {
+            (
+                DepositConfirmed {
+                    deposit_confirmed_at,
+                    ..
+                },
+                Self::DepositInitiated {
                     direction,
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
                     initiated_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::DepositConfirmed {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    burn_tx_hash: *burn_tx_hash,
-                    mint_tx_hash: *mint_tx_hash,
-                    initiated_at: *initiated_at,
-                    deposit_confirmed_at: *deposit_confirmed_at,
-                }))
-            }
+                },
+            ) => Self::DepositConfirmed {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                deposit_confirmed_at: *deposit_confirmed_at,
+            },
 
-            DepositFailed {
-                deposit_ref,
-                reason,
-                failed_at,
-            } => {
-                let Self::DepositInitiated {
+            (
+                DepositFailed {
+                    deposit_ref,
+                    reason,
+                    failed_at,
+                },
+                Self::DepositInitiated {
                     direction,
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
                     initiated_at,
                     ..
-                } = state
-                else {
-                    return mismatch();
-                };
-                Ok(Some(Self::DepositFailed {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    burn_tx_hash: *burn_tx_hash,
-                    mint_tx_hash: *mint_tx_hash,
-                    deposit_ref: deposit_ref.clone(),
-                    reason: reason.to_string(),
-                    initiated_at: *initiated_at,
-                    failed_at: *failed_at,
-                }))
-            }
-        }
+                },
+            ) => Self::DepositFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                deposit_ref: deposit_ref.clone(),
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            _ => return Ok(None),
+        };
+
+        Ok(Some(next))
     }
 
     async fn initialize(
@@ -888,302 +866,396 @@ impl EventSourced for UsdcRebalance {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use UsdcRebalanceCommand::*;
-        use UsdcRebalanceEvent::*;
-
         match command {
             InitiateConversion { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
-
-            ConfirmConversion { filled_amount } => match self {
-                Self::Converting { direction, .. } => Ok(vec![ConversionConfirmed {
-                    direction: direction.clone(),
-                    filled_amount,
-                    converted_at: Utc::now(),
-                }]),
-                Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
-                    Err(UsdcRebalanceError::ConversionAlreadyCompleted)
-                }
-                _ => Err(UsdcRebalanceError::ConversionNotInitiated),
-            },
-
-            FailConversion { reason } => match self {
-                Self::Converting { .. } => Ok(vec![ConversionFailed {
-                    reason,
-                    failed_at: Utc::now(),
-                }]),
-                Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
-                    Err(UsdcRebalanceError::ConversionAlreadyCompleted)
-                }
-                _ => Err(UsdcRebalanceError::ConversionNotInitiated),
-            },
-
-            InitiatePostDepositConversion {
-                order_id,
-                amount: command_amount,
-            } => match self {
-                Self::DepositConfirmed {
-                    direction, amount, ..
-                } => {
-                    if *direction != RebalanceDirection::BaseToAlpaca {
-                        return Err(UsdcRebalanceError::WrongDirectionForPostDepositConversion);
-                    }
-                    if command_amount != *amount {
-                        return Err(UsdcRebalanceError::ConversionAmountMismatch {
-                            expected: *amount,
-                            provided: command_amount,
-                        });
-                    }
-                    Ok(vec![ConversionInitiated {
-                        direction: direction.clone(),
-                        amount: *amount,
-                        order_id,
-                        initiated_at: Utc::now(),
-                    }])
-                }
-                _ => Err(UsdcRebalanceError::DepositNotConfirmed),
-            },
-
+            ConfirmConversion { filled_amount } => {
+                self.transition_confirm_conversion(filled_amount)
+            }
+            FailConversion { reason } => self.transition_fail_conversion(reason),
+            InitiatePostDepositConversion { order_id, amount } => {
+                self.transition_post_deposit_conversion(order_id, amount)
+            }
             Initiate {
                 direction,
                 amount,
                 withdrawal,
-            } => match self {
-                Self::ConversionComplete {
-                    direction: conv_direction,
-                    filled_amount: conv_filled_amount,
-                    ..
-                } => {
-                    if direction != *conv_direction {
-                        return Err(UsdcRebalanceError::InvalidCommand {
-                            command: "Initiate".to_string(),
-                            state: "ConversionComplete with different \
-                                    direction"
-                                .to_string(),
-                        });
-                    }
-                    if amount != *conv_filled_amount {
-                        return Err(UsdcRebalanceError::InvalidCommand {
-                            command: "Initiate".to_string(),
-                            state: format!(
-                                "ConversionComplete with amount \
-                                 mismatch: expected {}, got {}",
-                                conv_filled_amount.0, amount.0
-                            ),
-                        });
-                    }
-                    Ok(vec![Initiated {
-                        direction,
-                        amount: *conv_filled_amount,
-                        withdrawal_ref: withdrawal,
-                        initiated_at: Utc::now(),
-                    }])
-                }
-                _ => Err(UsdcRebalanceError::AlreadyInitiated),
-            },
-
-            ConfirmWithdrawal => match self {
-                Self::Withdrawing { .. } => Ok(vec![WithdrawalConfirmed {
-                    confirmed_at: Utc::now(),
-                }]),
-                Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. }
-                | Self::Bridging { .. }
-                | Self::Attested { .. }
-                | Self::Bridged { .. }
-                | Self::BridgingFailed { .. }
-                | Self::DepositInitiated { .. }
-                | Self::DepositConfirmed { .. }
-                | Self::DepositFailed { .. } => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-                _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
-            },
-
-            FailWithdrawal { reason } => match self {
-                Self::Withdrawing { .. } => Ok(vec![WithdrawalFailed {
-                    reason,
-                    failed_at: Utc::now(),
-                }]),
-                Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. }
-                | Self::Bridging { .. }
-                | Self::Attested { .. }
-                | Self::Bridged { .. }
-                | Self::BridgingFailed { .. }
-                | Self::DepositInitiated { .. }
-                | Self::DepositConfirmed { .. }
-                | Self::DepositFailed { .. } => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-                _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
-            },
-
-            InitiateBridging { burn_tx } => match self {
-                Self::Converting { .. }
-                | Self::ConversionComplete { .. }
-                | Self::ConversionFailed { .. }
-                | Self::Withdrawing { .. }
-                | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
-                Self::WithdrawalComplete { .. } => Ok(vec![BridgingInitiated {
-                    burn_tx_hash: burn_tx,
-                    burned_at: Utc::now(),
-                }]),
-                Self::Bridging { .. }
-                | Self::Attested { .. }
-                | Self::Bridged { .. }
-                | Self::BridgingFailed { .. }
-                | Self::DepositInitiated { .. }
-                | Self::DepositConfirmed { .. }
-                | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
-                    command: "InitiateBridging".to_string(),
-                    state: "Bridging".to_string(),
-                }),
-            },
-
+            } => self.transition_initiate_withdrawal(direction, amount, withdrawal),
+            ConfirmWithdrawal => self.transition_confirm_withdrawal(),
+            FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
+            InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
             ReceiveAttestation {
                 attestation,
                 cctp_nonce,
-            } => match self {
-                Self::Converting { .. }
-                | Self::ConversionComplete { .. }
-                | Self::ConversionFailed { .. }
-                | Self::Withdrawing { .. }
-                | Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
-                Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
-                    attestation,
-                    cctp_nonce,
-                    attested_at: Utc::now(),
-                }]),
-                Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
-                    command: "ReceiveAttestation".to_string(),
-                    state: "Attested".to_string(),
-                }),
-                Self::Bridged { .. }
-                | Self::BridgingFailed { .. }
-                | Self::DepositInitiated { .. }
-                | Self::DepositConfirmed { .. }
-                | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
-            },
-
+            } => self.transition_receive_attestation(attestation, cctp_nonce),
             ConfirmBridging {
                 mint_tx,
                 amount_received,
                 fee_collected,
-            } => match self {
-                Self::Converting { .. }
-                | Self::ConversionComplete { .. }
-                | Self::ConversionFailed { .. }
-                | Self::Withdrawing { .. }
-                | Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. }
-                | Self::Bridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
-                Self::Attested { .. } => Ok(vec![Bridged {
-                    mint_tx_hash: mint_tx,
-                    amount_received,
-                    fee_collected,
-                    minted_at: Utc::now(),
-                }]),
-                Self::Bridged { .. }
-                | Self::BridgingFailed { .. }
-                | Self::DepositInitiated { .. }
-                | Self::DepositConfirmed { .. }
-                | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
-            },
+            } => self.transition_confirm_bridging(mint_tx, amount_received, fee_collected),
+            FailBridging { reason } => self.transition_fail_bridging(reason),
+            InitiateDeposit { deposit } => self.transition_initiate_deposit(deposit),
+            ConfirmDeposit => self.transition_confirm_deposit(),
+            FailDeposit { reason } => self.transition_fail_deposit(reason),
+        }
+    }
+}
 
-            FailBridging { reason } => match self {
-                Self::Converting { .. }
-                | Self::ConversionComplete { .. }
-                | Self::ConversionFailed { .. }
-                | Self::Withdrawing { .. }
-                | Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
-                Self::Bridging { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
-                    burn_tx_hash: Some(*burn_tx_hash),
-                    cctp_nonce: None,
-                    reason,
-                    failed_at: Utc::now(),
-                }]),
-                Self::Attested {
-                    burn_tx_hash,
-                    cctp_nonce,
-                    ..
-                } => Ok(vec![BridgingFailed {
-                    burn_tx_hash: Some(*burn_tx_hash),
-                    cctp_nonce: Some(*cctp_nonce),
-                    reason,
-                    failed_at: Utc::now(),
-                }]),
-                Self::Bridged { .. }
-                | Self::BridgingFailed { .. }
-                | Self::DepositInitiated { .. }
-                | Self::DepositConfirmed { .. }
-                | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
-            },
+/// Transition handlers for each command, grouped by rebalance phase.
+///
+/// Extracted from the `transition` match to satisfy the
+/// `too_many_lines` lint while keeping each handler self-contained.
+impl UsdcRebalance {
+    fn transition_confirm_conversion(
+        &self,
+        filled_amount: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { direction, .. } => Ok(vec![ConversionConfirmed {
+                direction: direction.clone(),
+                filled_amount,
+                converted_at: Utc::now(),
+            }]),
+            Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
+                Err(UsdcRebalanceError::ConversionAlreadyCompleted)
+            }
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
+        }
+    }
 
-            InitiateDeposit { deposit } => match self {
-                Self::Converting { .. }
-                | Self::ConversionComplete { .. }
-                | Self::ConversionFailed { .. }
-                | Self::Withdrawing { .. }
-                | Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. }
-                | Self::Bridging { .. }
-                | Self::Attested { .. }
-                | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
-                Self::Bridged { .. } => Ok(vec![DepositInitiated {
-                    deposit_ref: deposit,
-                    deposit_initiated_at: Utc::now(),
-                }]),
-                Self::DepositInitiated { .. }
-                | Self::DepositConfirmed { .. }
-                | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
-                    command: "InitiateDeposit".to_string(),
+    fn transition_fail_conversion(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. } => Ok(vec![ConversionFailed {
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
+                Err(UsdcRebalanceError::ConversionAlreadyCompleted)
+            }
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
+        }
+    }
+
+    fn transition_post_deposit_conversion(
+        &self,
+        order_id: Uuid,
+        command_amount: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        let Self::DepositConfirmed {
+            direction, amount, ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::DepositNotConfirmed);
+        };
+        if *direction != RebalanceDirection::BaseToAlpaca {
+            return Err(UsdcRebalanceError::WrongDirectionForPostDepositConversion);
+        }
+        if command_amount != *amount {
+            return Err(UsdcRebalanceError::ConversionAmountMismatch {
+                expected: *amount,
+                provided: command_amount,
+            });
+        }
+        Ok(vec![ConversionInitiated {
+            direction: direction.clone(),
+            amount: *amount,
+            order_id,
+            initiated_at: Utc::now(),
+        }])
+    }
+
+    fn transition_initiate_withdrawal(
+        &self,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        withdrawal: TransferRef,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        let Self::ConversionComplete {
+            direction: conv_direction,
+            filled_amount: conv_filled_amount,
+            ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::AlreadyInitiated);
+        };
+        if direction != *conv_direction {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "Initiate".to_string(),
+                state: "ConversionComplete with different \
+                        direction"
+                    .to_string(),
+            });
+        }
+        if amount != *conv_filled_amount {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "Initiate".to_string(),
+                state: format!(
+                    "ConversionComplete with amount \
+                     mismatch: expected {}, got {}",
+                    conv_filled_amount.0, amount.0
+                ),
+            });
+        }
+        Ok(vec![Initiated {
+            direction,
+            amount: *conv_filled_amount,
+            withdrawal_ref: withdrawal,
+            initiated_at: Utc::now(),
+        }])
+    }
+
+    fn transition_confirm_withdrawal(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Withdrawing { .. } => Ok(vec![WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            }]),
+            Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
+        }
+    }
+
+    fn transition_fail_withdrawal(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Withdrawing { .. } => Ok(vec![WithdrawalFailed {
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
+        }
+    }
+
+    fn transition_initiate_bridging(
+        &self,
+        burn_tx: TxHash,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            Self::WithdrawalComplete { .. } => Ok(vec![BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            }]),
+            Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "InitiateBridging".to_string(),
+                state: "Bridging".to_string(),
+            }),
+        }
+    }
+
+    fn transition_receive_attestation(
+        &self,
+        attestation: Vec<u8>,
+        cctp_nonce: u64,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
+            Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
+                attestation,
+                cctp_nonce,
+                attested_at: Utc::now(),
+            }]),
+            Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "ReceiveAttestation".to_string(),
+                state: "Attested".to_string(),
+            }),
+            Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    fn transition_confirm_bridging(
+        &self,
+        mint_tx: TxHash,
+        amount_received: Usdc,
+        fee_collected: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
+            Self::Attested { .. } => Ok(vec![Bridged {
+                mint_tx_hash: mint_tx,
+                amount_received,
+                fee_collected,
+                minted_at: Utc::now(),
+            }]),
+            Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    fn transition_fail_bridging(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
+            Self::Bridging { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
+                burn_tx_hash: Some(*burn_tx_hash),
+                cctp_nonce: None,
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::Attested {
+                burn_tx_hash,
+                cctp_nonce,
+                ..
+            } => Ok(vec![BridgingFailed {
+                burn_tx_hash: Some(*burn_tx_hash),
+                cctp_nonce: Some(*cctp_nonce),
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    fn transition_initiate_deposit(
+        &self,
+        deposit: TransferRef,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
+            Self::Bridged { .. } => Ok(vec![DepositInitiated {
+                deposit_ref: deposit,
+                deposit_initiated_at: Utc::now(),
+            }]),
+            Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "InitiateDeposit".to_string(),
+                state: format!("{self:?}"),
+            }),
+        }
+    }
+
+    fn transition_confirm_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. }
+            | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
+                direction: direction.clone(),
+                deposit_confirmed_at: Utc::now(),
+            }]),
+            Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
+                Err(UsdcRebalanceError::InvalidCommand {
+                    command: "ConfirmDeposit".to_string(),
                     state: format!("{self:?}"),
-                }),
-            },
+                })
+            }
+        }
+    }
 
-            ConfirmDeposit => match self {
-                Self::Converting { .. }
-                | Self::ConversionComplete { .. }
-                | Self::ConversionFailed { .. }
-                | Self::Withdrawing { .. }
-                | Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. }
-                | Self::Bridging { .. }
-                | Self::Attested { .. }
-                | Self::BridgingFailed { .. }
-                | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
-                Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
-                    direction: direction.clone(),
-                    deposit_confirmed_at: Utc::now(),
-                }]),
-                Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
-                    Err(UsdcRebalanceError::InvalidCommand {
-                        command: "ConfirmDeposit".to_string(),
-                        state: format!("{self:?}"),
-                    })
-                }
-            },
-
-            FailDeposit { reason } => match self {
-                Self::Converting { .. }
-                | Self::ConversionComplete { .. }
-                | Self::ConversionFailed { .. }
-                | Self::Withdrawing { .. }
-                | Self::WithdrawalComplete { .. }
-                | Self::WithdrawalFailed { .. }
-                | Self::Bridging { .. }
-                | Self::Attested { .. }
-                | Self::BridgingFailed { .. }
-                | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
-                Self::DepositInitiated { deposit_ref, .. } => Ok(vec![DepositFailed {
-                    deposit_ref: Some(deposit_ref.clone()),
-                    reason,
-                    failed_at: Utc::now(),
-                }]),
-                Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
-                    Err(UsdcRebalanceError::InvalidCommand {
-                        command: "FailDeposit".to_string(),
-                        state: format!("{self:?}"),
-                    })
-                }
-            },
+    fn transition_fail_deposit(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. }
+            | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            Self::DepositInitiated { deposit_ref, .. } => Ok(vec![DepositFailed {
+                deposit_ref: Some(deposit_ref.clone()),
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
+                Err(UsdcRebalanceError::InvalidCommand {
+                    command: "FailDeposit".to_string(),
+                    state: format!("{self:?}"),
+                })
+            }
         }
     }
 }
@@ -1191,13 +1263,13 @@ impl EventSourced for UsdcRebalance {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::fixed_bytes;
-    use cqrs_es::{Aggregate, EventEnvelope, View};
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::{Aggregate, EventEnvelope, View};
     use std::collections::HashMap;
     use uuid::Uuid;
 
     use super::*;
-    use crate::lifecycle::{Lifecycle, LifecycleError};
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {

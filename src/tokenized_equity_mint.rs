@@ -51,7 +51,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 
-use crate::event_sourced::{DomainEvent, EventSourced};
+use st0x_event_sorcery::{DomainEvent, EventSourced};
 
 /// Tokenized equity mint aggregate state machine.
 ///
@@ -192,10 +192,12 @@ impl EventSourced for TokenizedEquityMint {
                 wallet,
                 requested_at: Utc::now(),
             }]),
-            RejectMint { .. } => Err(TokenizedEquityMintError::NotRequested),
-            AcknowledgeAcceptance { .. } => Err(TokenizedEquityMintError::NotRequested),
-            FailAcceptance { .. } => Err(TokenizedEquityMintError::NotAccepted),
-            ReceiveTokens { .. } => Err(TokenizedEquityMintError::NotAccepted),
+            RejectMint { .. } | AcknowledgeAcceptance { .. } => {
+                Err(TokenizedEquityMintError::NotRequested)
+            }
+            FailAcceptance { .. } | ReceiveTokens { .. } => {
+                Err(TokenizedEquityMintError::NotAccepted)
+            }
             Finalize => Err(TokenizedEquityMintError::TokensNotReceived),
         }
     }
@@ -287,6 +289,14 @@ impl IssuerRequestId {
 impl std::fmt::Display for IssuerRequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for IssuerRequestId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -555,11 +565,11 @@ impl TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::Aggregate;
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::Aggregate;
 
     use super::*;
-    use crate::lifecycle::{Lifecycle, LifecycleError};
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     #[tokio::test]
     async fn test_request_mint_from_uninitialized() {

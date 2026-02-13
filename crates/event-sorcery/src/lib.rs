@@ -83,7 +83,7 @@ mod testing;
 mod wire;
 
 pub use lifecycle::{Lifecycle, LifecycleError, Never};
-pub use projection::Projection;
+pub use projection::{Projection, SqliteProjection};
 pub use schema_registry::{Reconciler, SchemaRegistry};
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{TestHarness, TestResult, replay};
@@ -92,20 +92,24 @@ pub use wire::{Cons, Nil, StoreBuilder, Unwired};
 pub use wire::{TestStore, test_mem_store, test_store};
 
 use async_trait::async_trait;
+use cqrs_es::EventStore;
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{Aggregate, EventStore};
 
-/// Re-exported from cqrs-es so domain modules import from here,
-/// not from cqrs-es directly.
-pub use cqrs_es::DomainEvent;
-
-/// Re-exported for error matching in [`SendError`] and
-/// [`load_aggregate`] return types.
+pub use cqrs_es::Aggregate;
 pub use cqrs_es::AggregateError;
-
-/// Re-exported so consumers can write generic bounds over
-/// [`Projection`] without importing from cqrs-es directly.
+pub use cqrs_es::DomainEvent;
 pub use cqrs_es::persist::ViewRepository;
+
+// Test-only re-exports: let st0x-hedge test code access cqrs-es
+// internals without depending on cqrs-es directly.
+#[cfg(any(test, feature = "test-support"))]
+pub use cqrs_es::EventEnvelope;
+#[cfg(any(test, feature = "test-support"))]
+pub use cqrs_es::Query;
+#[cfg(any(test, feature = "test-support"))]
+pub use cqrs_es::View;
+#[cfg(any(test, feature = "test-support"))]
+pub use cqrs_es::test::TestFramework;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlite_es::{SqliteCqrs, SqliteEventRepository};

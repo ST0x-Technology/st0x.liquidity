@@ -14,12 +14,13 @@ use uuid::Uuid;
 
 use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
 
+use st0x_event_sorcery::Store;
+
 use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
 use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
-use crate::event_sourced::Store;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
@@ -909,15 +910,14 @@ mod tests {
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor};
 
+    use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
+
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
-    use crate::conductor::wire::test_cqrs;
-    use crate::lifecycle::LifecycleError;
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
-    use cqrs_es::AggregateError;
 
     const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
     const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
@@ -939,11 +939,11 @@ mod tests {
         Ethereum,
     >;
 
-    async fn create_test_cqrs() -> Arc<Store<UsdcRebalance>> {
+    async fn create_test_store_instance() -> Arc<Store<UsdcRebalance>> {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        Arc::new(test_cqrs(pool, vec![], ()))
+        Arc::new(test_store(pool, vec![], ()))
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal -> InitiateBridging ->
@@ -1141,7 +1141,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1196,7 +1196,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1258,7 +1258,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1344,7 +1344,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1379,7 +1379,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1483,7 +1483,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1528,7 +1528,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1579,7 +1579,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1623,7 +1623,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1675,7 +1675,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1785,7 +1785,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1850,7 +1850,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1918,7 +1918,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1983,7 +1983,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -2077,7 +2077,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("initiate-failure-test");
@@ -2151,7 +2151,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("failed-state-test");
@@ -2213,7 +2213,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("complete-state-test");
@@ -2296,7 +2296,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 

@@ -12,6 +12,8 @@ use tracing::{info, warn};
 
 use st0x_execution::Executor;
 
+use st0x_event_sorcery::{SqliteProjection, Store};
+
 use super::{
     Conductor, EventProcessingError, spawn_event_processor, spawn_inventory_poller,
     spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
@@ -19,7 +21,6 @@ use super::{
 };
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::event_sourced::{SqliteQuery, Store};
 use crate::inventory::InventorySnapshot;
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::trade::TradeEvent;
@@ -37,7 +38,7 @@ type TakeStream =
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
     pub(crate) position: Arc<Store<Position>>,
-    pub(crate) position_query: Arc<SqliteQuery<Position>>,
+    pub(crate) position_query: Arc<SqliteProjection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) vault_registry: Store<VaultRegistry>,
     pub(crate) snapshot: Store<InventorySnapshot>,

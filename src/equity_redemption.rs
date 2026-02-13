@@ -47,7 +47,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 
-use crate::event_sourced::{DomainEvent, EventSourced};
+use st0x_event_sorcery::{DomainEvent, EventSourced};
+
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 /// Unique identifier for a redemption aggregate instance.
@@ -63,6 +64,14 @@ impl RedemptionAggregateId {
 impl std::fmt::Display for RedemptionAggregateId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for RedemptionAggregateId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -282,8 +291,7 @@ impl EventSourced for EquityRedemption {
                 tx_hash,
                 sent_at: Utc::now(),
             }]),
-            Detect { .. } => Err(EquityRedemptionError::TokensNotSent),
-            FailDetection { .. } => Err(EquityRedemptionError::TokensNotSent),
+            Detect { .. } | FailDetection { .. } => Err(EquityRedemptionError::TokensNotSent),
             Complete => Err(EquityRedemptionError::NotPending),
             RejectRedemption { .. } => Err(EquityRedemptionError::NotPendingForRejection),
         }
@@ -448,11 +456,11 @@ impl EquityRedemption {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::Aggregate;
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::Aggregate;
 
     use super::*;
-    use crate::lifecycle::{Lifecycle, LifecycleError};
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     #[tokio::test]
     async fn test_send_tokens_from_uninitialized() {

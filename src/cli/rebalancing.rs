@@ -4,7 +4,6 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
-use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -13,6 +12,8 @@ use std::time::Duration;
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
 };
+
+use st0x_event_sorcery::StoreBuilder;
 
 use super::TransferDirection;
 use crate::alpaca_tokenization::{
@@ -25,7 +26,6 @@ use crate::cctp::{
 };
 use crate::config::{BrokerCtx, Ctx};
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::event_sourced::Store;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
@@ -78,7 +78,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
 
-            let mint_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
+            let mint_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
             let mint_manager = MintManager::new(tokenization_service, mint_store);
 
             let issuer_request_id =
@@ -105,7 +105,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Token Address: {token}")?;
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
-            let redemption_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
+            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
             let redemption_manager = RedemptionManager::new(tokenization_service, redemption_store);
 
             let aggregate_id =
@@ -210,7 +210,7 @@ where
         base_provider_with_wallet,
         ctx.evm.orderbook,
     ));
-    let usdc_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
+    let usdc_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
 
     let rebalance_manager = UsdcRebalanceManager::new(
         alpaca_broker,

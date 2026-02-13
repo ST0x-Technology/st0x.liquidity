@@ -4,9 +4,8 @@ use alloy::primitives::TxHash;
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::GenericQuery;
 use rust_decimal::Decimal;
-use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
@@ -17,9 +16,10 @@ use st0x_execution::{
     OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
 
+use st0x_event_sorcery::{Projection, Store, StoreBuilder};
+
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
-use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
 };
@@ -299,15 +299,16 @@ pub(super) async fn process_found_trade<W: Write>(
         pool.clone(),
         "position_view".to_string(),
     ));
-    let position_query = GenericQuery::new(position_view_repo.clone());
-    let position_cqrs: Arc<SqliteCqrs<Lifecycle<Position>>> = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        vec![Box::new(GenericQuery::new(position_view_repo))],
-        (),
-    ));
-    let (offchain_order_cqrs, _) = build_offchain_order_cqrs(pool, order_placer);
+    let position_query = Projection::new(Arc::clone(&position_view_repo));
+    let position_store: Arc<Store<Position>> = Arc::new(
+        StoreBuilder::new(pool.clone())
+            .with_projection(&position_query)
+            .build(())
+            .await?,
+    );
+    let (offchain_order_store, _) = build_offchain_order_cqrs(pool, order_placer).await?;
 
-    update_position_aggregate(&position_cqrs, &onchain_trade, ctx.execution_threshold).await;
+    update_position_aggregate(&position_store, &onchain_trade, ctx.execution_threshold).await;
 
     let executor_type = ctx.broker.to_supported_executor();
     let base_symbol = onchain_trade.symbol.base();
@@ -333,10 +334,9 @@ pub(super) async fn process_found_trade<W: Write>(
         "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
     )?;
 
-    let aggregate_id = params.symbol.to_string();
-    if let Err(error) = position_cqrs
-        .execute(
-            &aggregate_id,
+    if let Err(error) = position_store
+        .send(
+            &params.symbol,
             PositionCommand::PlaceOffChainOrder {
                 offchain_order_id,
                 shares: params.shares,
@@ -350,11 +350,9 @@ pub(super) async fn process_found_trade<W: Write>(
         error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {error}");
     }
 
-    let agg_id = offchain_order_id.to_string();
-
-    if let Err(error) = offchain_order_cqrs
-        .execute(
-            &agg_id,
+    if let Err(error) = offchain_order_store
+        .send(
+            &offchain_order_id,
             OffchainOrderCommand::Place {
                 symbol: params.symbol.clone(),
                 shares: params.shares,
@@ -373,16 +371,15 @@ pub(super) async fn process_found_trade<W: Write>(
 }
 
 async fn update_position_aggregate(
-    position_cqrs: &SqliteCqrs<Lifecycle<Position>>,
+    position_store: &Store<Position>,
     onchain_trade: &OnchainTrade,
     execution_threshold: ExecutionThreshold,
 ) {
     let base_symbol = onchain_trade.symbol.base();
-    let aggregate_id = base_symbol.to_string();
 
     acknowledge_fill(
-        position_cqrs,
-        &aggregate_id,
+        position_store,
+        base_symbol,
         onchain_trade,
         execution_threshold,
     )
@@ -408,8 +405,8 @@ fn extract_fill_params(
 }
 
 async fn acknowledge_fill(
-    position_cqrs: &SqliteCqrs<Lifecycle<Position>>,
-    aggregate_id: &str,
+    position_store: &Store<Position>,
+    symbol: &Symbol,
     onchain_trade: &OnchainTrade,
     execution_threshold: ExecutionThreshold,
 ) {
@@ -419,9 +416,9 @@ async fn acknowledge_fill(
         return;
     };
 
-    if let Err(error) = position_cqrs
-        .execute(
-            aggregate_id,
+    if let Err(error) = position_store
+        .send(
+            symbol,
             PositionCommand::AcknowledgeOnChainFill {
                 symbol: base_symbol.clone(),
                 threshold: execution_threshold,
