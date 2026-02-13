@@ -147,7 +147,7 @@ struct AnvilOrderBook<P> {
 }
 
 /// Places USDC contract code and storage directly at the canonical `USDC_BASE` address
-/// via Anvil cheatcodes. The system hardcodes this address for vault discovery, so the
+/// via Anvil cheat-codes. The system hardcodes this address for vault discovery, so the
 /// contract must live at that exact address -- a normal deploy would land elsewhere.
 ///
 /// Initializes the OpenZeppelin ERC20 storage layout: totalSupply, name ("USD Coin"),
