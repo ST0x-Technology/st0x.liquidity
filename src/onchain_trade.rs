@@ -12,8 +12,9 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_execution::{Direction, Symbol};
+
+use st0x_event_sorcery::{DomainEvent, EventSourced};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OnChainTradeId {
@@ -27,31 +28,19 @@ impl std::fmt::Display for OnChainTradeId {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum OnChainTradeIdParseError {
-    #[error("missing ':' separator in OnChainTradeId")]
-    MissingSeparator,
+impl FromStr for OnChainTradeId {
+    type Err = String;
 
-    #[error("invalid tx hash")]
-    TxHash(#[source] alloy::hex::FromHexError),
-
-    #[error("invalid log index")]
-    LogIndex(#[from] std::num::ParseIntError),
-}
-
-impl std::str::FromStr for OnChainTradeId {
-    type Err = OnChainTradeIdParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (tx_hash_str, log_index_str) = s
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (tx_hash_str, log_index_str) = value
             .split_once(':')
-            .ok_or(OnChainTradeIdParseError::MissingSeparator)?;
-
+            .ok_or_else(|| format!("expected 'tx_hash:log_index', got '{value}'"))?;
         let tx_hash = tx_hash_str
             .parse()
-            .map_err(OnChainTradeIdParseError::TxHash)?;
-        let log_index = log_index_str.parse()?;
-
+            .map_err(|err| format!("invalid tx_hash: {err}"))?;
+        let log_index = log_index_str
+            .parse()
+            .map_err(|err| format!("invalid log_index: {err}"))?;
         Ok(Self { tx_hash, log_index })
     }
 }
@@ -265,9 +254,8 @@ mod tests {
     use st0x_event_sorcery::{Aggregate, EventEnvelope, View};
     use std::collections::HashMap;
 
-    use st0x_event_sorcery::{Lifecycle, LifecycleError};
-
     use super::*;
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     fn make_envelope(
         aggregate_id: &str,

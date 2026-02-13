@@ -8,7 +8,6 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use st0x_dto::{EventStoreEntry, ServerMessage};
-use st0x_event_sorcery::Lifecycle;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Reactor};
 

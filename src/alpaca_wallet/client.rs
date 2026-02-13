@@ -60,8 +60,6 @@ pub enum AlpacaWalletError {
         previous: TransferStatus,
         next: TransferStatus,
     },
-    #[error("No whitelist entries found for address {address}")]
-    NoWhitelistEntries { address: Address },
 }
 
 pub struct AlpacaWalletClient {
@@ -145,32 +143,6 @@ impl AlpacaWalletClient {
         Ok(response)
     }
 
-    pub(super) async fn delete(&self, path: &str) -> Result<(), AlpacaWalletError> {
-        let url = format!("{}{}", self.base_url, path);
-        debug!("DELETE {url}");
-
-        let response = self
-            .client
-            .delete(&url)
-            .basic_auth(&self.api_key, Some(&self.api_secret))
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            return Err(AlpacaWalletError::ApiError { status, message });
-        }
-
-        Ok(())
-    }
-
     pub(super) fn account_id(&self) -> &AlpacaAccountId {
         &self.account_id
     }
@@ -233,19 +205,6 @@ impl AlpacaWalletClient {
         debug!("Whitelist creation response: {text}");
 
         Ok(serde_json::from_str::<WhitelistEntry>(&text)?)
-    }
-
-    /// Deletes a whitelist entry by its ID.
-    pub(super) async fn delete_whitelist_entry(
-        &self,
-        whitelist_id: &str,
-    ) -> Result<(), AlpacaWalletError> {
-        let path = format!(
-            "/v1/accounts/{}/wallets/whitelists/{whitelist_id}",
-            self.account_id
-        );
-
-        self.delete(&path).await
     }
 
     /// Gets or creates a wallet deposit address for a specific asset and network.

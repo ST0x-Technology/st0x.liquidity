@@ -10,8 +10,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use st0x_event_sorcery::{SqliteProjection, Store};
 use st0x_execution::Executor;
+
+use st0x_event_sorcery::{SqliteProjection, Store};
 
 use super::{
     Conductor, EventProcessingError, spawn_event_processor, spawn_inventory_poller,

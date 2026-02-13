@@ -11,7 +11,6 @@ use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use st0x_event_sorcery::Lifecycle;
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutorCtx,
     OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,

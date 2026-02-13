@@ -49,9 +49,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use st0x_execution::Symbol;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced};
-use st0x_execution::Symbol;
 
 /// Tokenized equity mint aggregate state machine.
 ///
@@ -295,8 +295,8 @@ impl std::fmt::Display for IssuerRequestId {
 impl std::str::FromStr for IssuerRequestId {
     type Err = std::convert::Infallible;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -568,9 +568,8 @@ mod tests {
     use rust_decimal_macros::dec;
     use st0x_event_sorcery::Aggregate;
 
-    use st0x_event_sorcery::{Lifecycle, LifecycleError};
-
     use super::*;
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     #[tokio::test]
     async fn test_request_mint_from_uninitialized() {

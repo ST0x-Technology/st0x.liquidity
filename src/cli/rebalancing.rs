@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_event_sorcery::{Store, StoreBuilder};
+use st0x_event_sorcery::StoreBuilder;
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
 };

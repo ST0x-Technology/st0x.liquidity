@@ -8,11 +8,11 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
+use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use st0x_event_sorcery::Store;
-use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Mint, MintError};
 use crate::alpaca_tokenization::{

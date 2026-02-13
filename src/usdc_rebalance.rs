@@ -88,8 +88,8 @@ impl std::fmt::Display for UsdcRebalanceId {
 impl std::str::FromStr for UsdcRebalanceId {
     type Err = std::convert::Infallible;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -1268,9 +1268,8 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{Lifecycle, LifecycleError};
-
     use super::*;
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {

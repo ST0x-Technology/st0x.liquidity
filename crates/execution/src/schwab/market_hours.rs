@@ -4,6 +4,7 @@ use chrono_tz::{Tz, US::Eastern};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use std::fmt::Write;
 use tracing::debug;
 
 use super::{SchwabAction, SchwabAuthCtx, SchwabError, SchwabTokens};
@@ -147,7 +148,6 @@ pub(crate) async fn fetch_market_hours(
     let mut url = format!("{}marketdata/v1/markets/equity", ctx.base_url()?);
 
     if let Some(date_param) = date {
-        use std::fmt::Write;
         write!(url, "?date={date_param}").map_err(|error| SchwabError::RequestFailed {
             action: SchwabAction::FormatUrl,
             status: reqwest::StatusCode::OK,

@@ -1,8 +1,9 @@
 use sqlx::SqlitePool;
 use tracing::{debug, info};
 
-use st0x_event_sorcery::{Lifecycle, Projection, ViewRepository};
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+
+use st0x_event_sorcery::{Lifecycle, Projection, ViewRepository};
 
 use crate::onchain::OnChainError;
 use crate::position::{Position, load_position};
@@ -111,8 +112,9 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::{Projection, SqliteProjection, Store};
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+
+    use st0x_event_sorcery::{Projection, SqliteProjection, Store};
 
     use super::*;
     use crate::position::{Position, PositionCommand};

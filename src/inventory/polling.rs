@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
-use st0x_event_sorcery::{Lifecycle, SendError, Store, load_aggregate};
 use st0x_execution::{Executor, InventoryResult};
+
+use st0x_event_sorcery::{SendError, Store, load_aggregate};
 
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
@@ -243,9 +244,9 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
     use sqlx::Row;
+    use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use st0x_event_sorcery::test_store;
-    use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;

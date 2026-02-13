@@ -12,12 +12,13 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use st0x_event_sorcery::{
-    DomainEvent, EventSourced, Lifecycle, LifecycleError, Projection, ViewRepository,
-};
 use st0x_execution::{
     ArithmeticError, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
     Symbol,
+};
+
+use st0x_event_sorcery::{
+    DomainEvent, EventSourced, Lifecycle, LifecycleError, Projection, ViewRepository,
 };
 
 use crate::offchain_order::{OffchainOrderId, PriceCents};
@@ -594,8 +595,9 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::Lifecycle;
     use st0x_execution::Positive;
+
+    use st0x_event_sorcery::Lifecycle;
 
     use super::*;
     use crate::threshold::Usdc;

@@ -11,9 +11,9 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use st0x_execution::{FractionalShares, Symbol};
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
-use st0x_execution::{FractionalShares, Symbol};
 
 use crate::threshold::Usdc;
 
@@ -31,33 +31,19 @@ impl std::fmt::Display for InventorySnapshotId {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum InventorySnapshotIdParseError {
-    #[error("missing ':' separator in InventorySnapshotId")]
-    MissingSeparator,
+impl FromStr for InventorySnapshotId {
+    type Err = String;
 
-    #[error("invalid orderbook address")]
-    Orderbook(#[source] alloy::hex::FromHexError),
-
-    #[error("invalid owner address")]
-    Owner(#[source] alloy::hex::FromHexError),
-}
-
-impl std::str::FromStr for InventorySnapshotId {
-    type Err = InventorySnapshotIdParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (orderbook_str, owner_str) = s
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (orderbook_str, owner_str) = value
             .split_once(':')
-            .ok_or(InventorySnapshotIdParseError::MissingSeparator)?;
-
+            .ok_or_else(|| format!("expected 'orderbook:owner', got '{value}'"))?;
         let orderbook = orderbook_str
             .parse()
-            .map_err(InventorySnapshotIdParseError::Orderbook)?;
+            .map_err(|err| format!("invalid orderbook address: {err}"))?;
         let owner = owner_str
             .parse()
-            .map_err(InventorySnapshotIdParseError::Owner)?;
-
+            .map_err(|err| format!("invalid owner address: {err}"))?;
         Ok(Self { orderbook, owner })
     }
 }
@@ -251,9 +237,8 @@ mod tests {
     use st0x_event_sorcery::Aggregate;
     use std::str::FromStr;
 
-    use st0x_event_sorcery::Lifecycle;
-
     use super::*;
+    use st0x_event_sorcery::Lifecycle;
 
     type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 

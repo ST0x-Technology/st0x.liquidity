@@ -23,14 +23,16 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
-use sqlite_es::SqliteViewRepository;
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{
-    Cons, Nil, Projection, SendError, SqliteProjection, Store, StoreBuilder, Unwired,
-};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecutor};
+
+use sqlite_es::SqliteViewRepository;
+
+use st0x_event_sorcery::{
+    Cons, Nil, Projection, SendError, SqliteProjection, Store, StoreBuilder, Unwired,
+};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
@@ -1487,7 +1489,6 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::{Lifecycle, test_store};
     use st0x_execution::{
         Direction, ExecutorOrderId, MarketOrder, MockExecutorCtx, Positive, Symbol, TryIntoExecutor,
     };
@@ -1503,6 +1504,7 @@ mod tests {
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
+    use st0x_event_sorcery::Lifecycle;
 
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -2491,7 +2493,8 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2516,7 +2519,8 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_equity_vault() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2541,7 +2545,8 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_from_take_event() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
         let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let queued_event = create_queued_take_event(order);
@@ -2571,7 +2576,8 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2594,7 +2600,8 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2629,7 +2636,8 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2686,7 +2694,7 @@ mod tests {
             SqliteViewRepository<Lifecycle<OffchainOrder>, Lifecycle<OffchainOrder>>,
         >,
     ) {
-        let onchain_trade = Arc::new(test_store(pool.clone(), vec![], ()));
+        let onchain_trade = Arc::new(st0x_event_sorcery::test_store(pool.clone(), vec![], ()));
 
         let position_view_repo = Arc::new(SqliteViewRepository::new(
             pool.clone(),
@@ -2714,8 +2722,8 @@ mod tests {
                 .unwrap(),
         );
 
-        let vault_registry = test_store(pool.clone(), vec![], ());
-        let snapshot = test_store(pool.clone(), vec![], ());
+        let vault_registry = st0x_event_sorcery::test_store(pool.clone(), vec![], ());
+        let snapshot = st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
         (
             CqrsFrameworks {
@@ -3236,7 +3244,8 @@ mod tests {
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // Seed vault registry so the trigger can resolve the token address.
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
         vault_registry
             .send(
                 &VaultRegistryId {
@@ -3473,7 +3482,7 @@ mod tests {
             Lifecycle<Position>,
             Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let projection = Projection::new(position_view_repo);
+        let projection = st0x_event_sorcery::Projection::new(position_view_repo);
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
                 .with_projection(&projection)
@@ -3527,7 +3536,8 @@ mod tests {
         let order_owner = address!("0x0000000000000000000000000000000000000002");
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> =
+            st0x_event_sorcery::test_store(pool.clone(), vec![], ());
         vault_registry
             .send(
                 &VaultRegistryId {
@@ -3602,7 +3612,7 @@ mod tests {
             Lifecycle<Position>,
             Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let projection = Projection::new(position_view_repo);
+        let projection = st0x_event_sorcery::Projection::new(position_view_repo);
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
                 .with_projection(&projection)

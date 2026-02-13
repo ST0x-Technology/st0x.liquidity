@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Lifecycle, Never};
 use st0x_execution::Symbol;
+
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -30,33 +31,19 @@ impl fmt::Display for VaultRegistryId {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum VaultRegistryIdParseError {
-    #[error("missing ':' separator in VaultRegistryId")]
-    MissingSeparator,
+impl FromStr for VaultRegistryId {
+    type Err = String;
 
-    #[error("invalid orderbook address")]
-    Orderbook(#[source] alloy::hex::FromHexError),
-
-    #[error("invalid owner address")]
-    Owner(#[source] alloy::hex::FromHexError),
-}
-
-impl std::str::FromStr for VaultRegistryId {
-    type Err = VaultRegistryIdParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (orderbook_str, owner_str) = s
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (orderbook_str, owner_str) = value
             .split_once(':')
-            .ok_or(VaultRegistryIdParseError::MissingSeparator)?;
-
+            .ok_or_else(|| format!("expected 'orderbook:owner', got '{value}'"))?;
         let orderbook = orderbook_str
             .parse()
-            .map_err(VaultRegistryIdParseError::Orderbook)?;
+            .map_err(|err| format!("invalid orderbook address: {err}"))?;
         let owner = owner_str
             .parse()
-            .map_err(VaultRegistryIdParseError::Owner)?;
-
+            .map_err(|err| format!("invalid owner address: {err}"))?;
         Ok(Self { orderbook, owner })
     }
 }
@@ -109,8 +96,6 @@ pub(crate) struct VaultRegistry {
     pub(crate) usdc_vault: Option<DiscoveredUsdcVault>,
     pub(crate) last_updated: DateTime<Utc>,
 }
-
-pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry>;
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
