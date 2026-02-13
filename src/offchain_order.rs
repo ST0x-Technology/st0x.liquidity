@@ -3,41 +3,42 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::GenericQuery;
 use serde::{Deserialize, Serialize};
-use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Lifecycle, SqliteQuery};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Lifecycle, Projection, Store, StoreBuilder};
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Positive,
     SupportedExecutor, Symbol,
 };
 
 /// Constructs the offchain order CQRS framework with its view
-/// query. Used by `Conductor::start`, CLI, and tests.
-pub(crate) fn build_offchain_order_cqrs(
+/// query. Used by CLI code.
+pub(crate) async fn build_offchain_order_cqrs(
     pool: &SqlitePool,
     order_placer: Arc<dyn OrderPlacer>,
-) -> (
-    Arc<SqliteCqrs<Lifecycle<OffchainOrder>>>,
-    Arc<SqliteQuery<OffchainOrder>>,
-) {
+) -> anyhow::Result<(
+    Arc<Store<OffchainOrder>>,
+    Projection<
+        OffchainOrder,
+        SqliteViewRepository<Lifecycle<OffchainOrder>, Lifecycle<OffchainOrder>>,
+    >,
+)> {
     let view_repo = Arc::new(SqliteViewRepository::new(
         pool.clone(),
         "offchain_order_view".to_string(),
     ));
-    let query = GenericQuery::new(view_repo.clone());
+    let projection = Projection::new(view_repo);
 
-    let cqrs = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        vec![Box::new(GenericQuery::new(view_repo))],
-        order_placer,
-    ));
+    let store = StoreBuilder::new(pool.clone())
+        .with_projection(&projection)
+        .build(order_placer)
+        .await?;
 
-    (cqrs, Arc::new(query))
+    Ok((Arc::new(store), projection))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -595,27 +596,12 @@ impl TryFrom<i64> for PriceCents {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::mem_store::MemStore;
-    use cqrs_es::{Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore};
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::{Aggregate, AggregateError};
 
-    use st0x_event_sorcery::LifecycleError;
+    use st0x_event_sorcery::{Lifecycle, LifecycleError, test_mem_store};
 
     use super::*;
-
-    type TestCqrs = CqrsFramework<Lifecycle<OffchainOrder>, MemStore<Lifecycle<OffchainOrder>>>;
-
-    fn test_cqrs() -> (MemStore<Lifecycle<OffchainOrder>>, TestCqrs) {
-        test_cqrs_with(noop_order_placer())
-    }
-
-    fn test_cqrs_with(
-        order_placer: Arc<dyn OrderPlacer>,
-    ) -> (MemStore<Lifecycle<OffchainOrder>>, TestCqrs) {
-        let store = MemStore::default();
-        let cqrs = CqrsFramework::new(store.clone(), vec![], order_placer);
-        (store, cqrs)
-    }
 
     fn failing_order_placer() -> Arc<dyn OrderPlacer> {
         struct Failing;
@@ -642,20 +628,13 @@ mod tests {
         }
     }
 
-    async fn load_order(
-        store: &MemStore<Lifecycle<OffchainOrder>>,
-        id: &str,
-    ) -> Lifecycle<OffchainOrder> {
-        store.load_aggregate(id).await.unwrap().aggregate().clone()
-    }
-
     #[tokio::test]
     async fn place_order_transitions_to_submitted() {
-        let (store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
 
-        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+        let Lifecycle::Live(inner) = store.load_by_id("order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Submitted { .. }));
@@ -663,11 +642,11 @@ mod tests {
 
     #[tokio::test]
     async fn place_with_failing_broker_transitions_to_failed() {
-        let (store, cqrs) = test_cqrs_with(failing_order_placer());
+        let store = test_mem_store::<OffchainOrder>(vec![], failing_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
 
-        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+        let Lifecycle::Live(inner) = store.load_by_id("order-1").await else {
             panic!("Expected Live state");
         };
         assert!(
@@ -678,11 +657,11 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_already_submitted() {
-        let (_store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
 
-        let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
+        let err = store.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
             err,
             AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
@@ -691,19 +670,20 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_filled() {
-        let (_store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::CompleteFill {
-                price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::CompleteFill {
+                    price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
 
-        let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
+        let err = store.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
             err,
             AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
@@ -712,19 +692,20 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_failed() {
-        let (_store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::MarkFailed {
-                error: "Market closed".to_string(),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::MarkFailed {
+                    error: "Market closed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
 
-        let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
+        let err = store.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
             err,
             AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
@@ -733,20 +714,21 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_from_submitted() {
-        let (store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::UpdatePartialFill {
-                shares_filled: FractionalShares::new(dec!(50)),
-                avg_price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(dec!(50)),
+                    avg_price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
 
-        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+        let Lifecycle::Live(inner) = store.load_by_id("order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::PartiallyFilled { .. }));
@@ -754,30 +736,32 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_updates_shares() {
-        let (store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::UpdatePartialFill {
-                shares_filled: FractionalShares::new(dec!(50)),
-                avg_price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::UpdatePartialFill {
-                shares_filled: FractionalShares::new(dec!(75)),
-                avg_price_cents: PriceCents(15050),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(dec!(50)),
+                    avg_price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(dec!(75)),
+                    avg_price_cents: PriceCents(15050),
+                },
+            )
+            .await
+            .unwrap();
 
         let Lifecycle::Live(OffchainOrder::PartiallyFilled { shares_filled, .. }) =
-            load_order(&store, "order-1").await
+            store.load_by_id("order-1").await
         else {
             panic!("Expected Live PartiallyFilled state");
         };
@@ -786,19 +770,20 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_submitted() {
-        let (store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::CompleteFill {
-                price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::CompleteFill {
+                    price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
 
-        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+        let Lifecycle::Live(inner) = store.load_by_id("order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Filled { .. }));
@@ -806,28 +791,30 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_partially_filled() {
-        let (store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::UpdatePartialFill {
-                shares_filled: FractionalShares::new(dec!(75)),
-                avg_price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::CompleteFill {
-                price_cents: PriceCents(15025),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(dec!(75)),
+                    avg_price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::CompleteFill {
+                    price_cents: PriceCents(15025),
+                },
+            )
+            .await
+            .unwrap();
 
-        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+        let Lifecycle::Live(inner) = store.load_by_id("order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Filled { .. }));
@@ -835,9 +822,9 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_uninitialized_order() {
-        let (_store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        let err = cqrs
+        let err = store
             .execute(
                 "order-1",
                 OffchainOrderCommand::CompleteFill {
@@ -854,19 +841,20 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_already_filled() {
-        let (_store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::CompleteFill {
-                price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::CompleteFill {
+                    price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
 
-        let err = cqrs
+        let err = store
             .execute(
                 "order-1",
                 OffchainOrderCommand::CompleteFill {
@@ -883,19 +871,20 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_submitted() {
-        let (store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::MarkFailed {
-                error: "Insufficient funds".to_string(),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::MarkFailed {
+                    error: "Insufficient funds".to_string(),
+                },
+            )
+            .await
+            .unwrap();
 
-        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+        let Lifecycle::Live(inner) = store.load_by_id("order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Failed { .. }));
@@ -903,28 +892,30 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_partially_filled() {
-        let (store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::UpdatePartialFill {
-                shares_filled: FractionalShares::new(dec!(50)),
-                avg_price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::MarkFailed {
-                error: "Order cancelled".to_string(),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(dec!(50)),
+                    avg_price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::MarkFailed {
+                    error: "Order cancelled".to_string(),
+                },
+            )
+            .await
+            .unwrap();
 
-        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+        let Lifecycle::Live(inner) = store.load_by_id("order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Failed { .. }));
@@ -932,19 +923,20 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fail_already_filled() {
-        let (_store, cqrs) = test_cqrs();
+        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
 
-        cqrs.execute("order-1", place_command()).await.unwrap();
-        cqrs.execute(
-            "order-1",
-            OffchainOrderCommand::CompleteFill {
-                price_cents: PriceCents(15000),
-            },
-        )
-        .await
-        .unwrap();
+        store.execute("order-1", place_command()).await.unwrap();
+        store
+            .execute(
+                "order-1",
+                OffchainOrderCommand::CompleteFill {
+                    price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap();
 
-        let err = cqrs
+        let err = store
             .execute(
                 "order-1",
                 OffchainOrderCommand::MarkFailed {

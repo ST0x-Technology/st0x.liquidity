@@ -9,7 +9,6 @@ use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use chrono::Utc;
-use cqrs_es::persist::GenericQuery;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -21,7 +20,7 @@ use st0x_execution::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use st0x_event_sorcery::{Lifecycle, SqliteQuery, Store, test_store};
+use st0x_event_sorcery::{Lifecycle, Projection, SqliteProjection, SqliteQuery, Store, test_store};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::alpaca_tokenization::tests::setup_anvil;
@@ -30,7 +29,6 @@ use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, OrderBook, Parser, Store as RainStore,
     TOFUTokenDecimals,
 };
-use crate::cctp::USDC_BASE;
 use crate::conductor::{
     EventProcessingError, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
@@ -38,6 +36,7 @@ use crate::conductor::{
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
 use crate::onchain::OnchainTrade;
+use crate::onchain::USDC_BASE;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
 use crate::position::{Position, load_position};
@@ -57,7 +56,7 @@ const MSFT_PRICE: u32 = 200;
 /// The `last_updated` timestamp is non-deterministic and is asserted against the loaded value.
 #[bon::builder]
 async fn assert_position(
-    query: &Arc<SqliteQuery<Position>>,
+    query: &SqliteProjection<Position>,
     symbol: &Symbol,
     net: FractionalShares,
     accumulated_long: FractionalShares,
@@ -581,12 +580,17 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
 ///
 /// Uses `ExecutorOrderPlacer(MockExecutor::new())` so that the `PlaceOrder`
 /// command atomically calls the mock executor and emits `Placed` + `Submitted`.
+///
+/// Creates a `Projection` and a separate `SqliteQuery` from the same
+/// `SqliteViewRepository`. The query is registered with the CQRS framework
+/// so it receives event dispatches, while the projection reads from the
+/// same underlying repo for type-safe loading.
 fn create_test_cqrs(
     pool: &SqlitePool,
 ) -> (
     TradeProcessingCqrs,
     Arc<Store<Position>>,
-    Arc<SqliteQuery<Position>>,
+    Arc<SqliteProjection<Position>>,
     Arc<Store<crate::offchain_order::OffchainOrder>>,
 ) {
     let onchain_trade = Arc::new(test_store(pool.clone(), vec![], ()));
@@ -595,10 +599,10 @@ fn create_test_cqrs(
         Lifecycle<Position>,
         Lifecycle<Position>,
     >::new(pool.clone(), "position_view".to_string()));
-    let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
+    let position_projection = Arc::new(Projection::new(position_view_repo.clone()));
     let position = Arc::new(test_store(
         pool.clone(),
-        vec![Box::new(GenericQuery::new(position_view_repo))],
+        vec![Box::new(SqliteQuery::<Position>::new(position_view_repo))],
         (),
     ));
 
@@ -613,19 +617,21 @@ fn create_test_cqrs(
     ));
     let offchain_order = Arc::new(test_store(
         pool.clone(),
-        vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+        vec![Box::new(SqliteQuery::<OffchainOrder>::new(
+            offchain_order_view_repo,
+        ))],
         order_placer,
     ));
 
     let cqrs = TradeProcessingCqrs {
         onchain_trade,
         position: position.clone(),
-        position_query: position_query.clone(),
+        position_query: position_projection.clone(),
         offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
     };
 
-    (cqrs, position, position_query, offchain_order)
+    (cqrs, position, position_projection, offchain_order)
 }
 
 #[tokio::test]

@@ -1060,13 +1060,10 @@ pub(crate) mod tests {
 
         let transfer_amount = U256::from(100_000u64);
 
-        assert!(
-            client
-                .send_tokens_for_redemption(token_address, transfer_amount)
-                .await
-                .is_ok(),
-            "expected successful transfer"
-        );
+        client
+            .send_tokens_for_redemption(token_address, transfer_amount)
+            .await
+            .unwrap();
 
         let balance = token
             .balanceOf(TEST_REDEMPTION_WALLET)

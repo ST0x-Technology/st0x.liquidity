@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use st0x_event_sorcery::{SqliteQuery, Store};
+use st0x_event_sorcery::{SqliteProjection, Store};
 use st0x_execution::Executor;
 
 use super::{
@@ -37,7 +37,7 @@ type TakeStream =
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
     pub(crate) position: Arc<Store<Position>>,
-    pub(crate) position_query: Arc<SqliteQuery<Position>>,
+    pub(crate) position_query: Arc<SqliteProjection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) vault_registry: Store<VaultRegistry>,
     pub(crate) snapshot: Store<InventorySnapshot>,

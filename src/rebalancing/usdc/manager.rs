@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
+use st0x_bridge::cctp::{AttestationResponse, CctpBridge};
+use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
 use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
 
@@ -19,7 +21,6 @@ use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
@@ -452,8 +453,8 @@ where
             .send(
                 id,
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: response.attestation.to_vec(),
-                    cctp_nonce: response.nonce_as_u64()?,
+                    attestation: response.as_bytes().to_vec(),
+                    cctp_nonce: response.nonce(),
                 },
             )
             .await?;
@@ -470,11 +471,7 @@ where
     ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
         let mint_receipt = match self
             .cctp_bridge
-            .mint(
-                BridgeDirection::EthereumToBase,
-                attestation_response.message,
-                attestation_response.attestation,
-            )
+            .mint(BridgeDirection::EthereumToBase, &attestation_response)
             .await
         {
             Ok(receipt) => receipt,
@@ -498,7 +495,7 @@ where
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
                     amount_received: u256_to_usdc(mint_receipt.amount)?,
-                    fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
+                    fee_collected: u256_to_usdc(mint_receipt.fee)?,
                 },
             )
             .await?;
@@ -506,7 +503,7 @@ where
         info!(
             mint_tx = %mint_receipt.tx,
             amount = %mint_receipt.amount,
-            fee = %mint_receipt.fee_collected,
+            fee = %mint_receipt.fee,
             "CCTP mint executed"
         );
         Ok(mint_receipt)
@@ -713,8 +710,8 @@ where
             .send(
                 id,
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: response.attestation.to_vec(),
-                    cctp_nonce: response.nonce_as_u64()?,
+                    attestation: response.as_bytes().to_vec(),
+                    cctp_nonce: response.nonce(),
                 },
             )
             .await?;
@@ -731,11 +728,7 @@ where
     ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
         let mint_receipt = match self
             .cctp_bridge
-            .mint(
-                BridgeDirection::BaseToEthereum,
-                attestation_response.message,
-                attestation_response.attestation,
-            )
+            .mint(BridgeDirection::BaseToEthereum, &attestation_response)
             .await
         {
             Ok(receipt) => receipt,
@@ -759,7 +752,7 @@ where
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
                     amount_received: u256_to_usdc(mint_receipt.amount)?,
-                    fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
+                    fee_collected: u256_to_usdc(mint_receipt.fee)?,
                 },
             )
             .await?;
@@ -767,7 +760,7 @@ where
         info!(
             mint_tx = %mint_receipt.tx,
             amount = %mint_receipt.amount,
-            fee = %mint_receipt.fee_collected,
+            fee = %mint_receipt.fee,
             "CCTP mint on Ethereum executed"
         );
         Ok(mint_receipt)
@@ -898,7 +891,6 @@ mod tests {
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::AggregateError;
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use rust_decimal_macros::dec;
@@ -906,19 +898,18 @@ mod tests {
     use sqlx::SqlitePool;
     use uuid::{Uuid, uuid};
 
-    use st0x_event_sorcery::{LifecycleError, test_store};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor};
+
+    use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
-    use crate::cctp::{CctpBridge, Evm};
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
 
-    const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
-    const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
     const TEST_VAULT_ID: VaultId = VaultId(b256!(
@@ -937,7 +928,7 @@ mod tests {
         Ethereum,
     >;
 
-    async fn create_test_cqrs() -> Arc<Store<UsdcRebalance>> {
+    async fn create_test_store_instance() -> Arc<Store<UsdcRebalance>> {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
@@ -1082,25 +1073,14 @@ mod tests {
     ) {
         let owner = signer.address();
 
-        let ethereum = Evm::new(
-            provider.clone(),
+        let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
+            ethereum_provider: provider.clone(),
+            base_provider: provider.clone(),
             owner,
-            USDC_ADDRESS,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let base = Evm::new(
-            provider.clone(),
-            owner,
-            USDC_ADDRESS,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let cctp_bridge = CctpBridge::new(ethereum, base).unwrap();
+            usdc_ethereum: USDC_ADDRESS,
+            usdc_base: USDC_ADDRESS,
+        })
+        .unwrap();
 
         let vault_service =
             VaultService::new(provider, ORDERBOOK_ADDRESS).with_required_confirmations(1);
@@ -1139,7 +1119,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1194,7 +1174,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1256,7 +1236,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1342,7 +1322,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1377,7 +1357,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1481,7 +1461,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1526,7 +1506,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1577,7 +1557,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1621,7 +1601,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1673,7 +1653,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1783,7 +1763,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1848,7 +1828,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1916,7 +1896,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1981,7 +1961,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -2075,7 +2055,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("initiate-failure-test");
@@ -2149,7 +2129,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("failed-state-test");
@@ -2211,7 +2191,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("complete-state-test");
@@ -2294,7 +2274,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 

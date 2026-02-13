@@ -11,8 +11,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::str::FromStr;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Lifecycle, Never};
 use st0x_execution::Symbol;
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
@@ -108,6 +109,8 @@ pub(crate) struct VaultRegistry {
     pub(crate) usdc_vault: Option<DiscoveredUsdcVault>,
     pub(crate) last_updated: DateTime<Utc>,
 }
+
+pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry>;
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,8 +270,7 @@ impl DomainEvent for VaultRegistryEvent {
 mod tests {
     use alloy::primitives::{address, b256};
     use async_trait::async_trait;
-    use cqrs_es::{Aggregate, EventEnvelope, Query, View};
-    use sqlite_es::sqlite_cqrs;
+    use st0x_event_sorcery::{Aggregate, EventEnvelope, Query, View};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -648,14 +650,12 @@ mod tests {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_OWNER,
         };
-        let aggregate_id = id.to_string();
-
         // Phase 1: emit an event with NO query processors
-        let bare_cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
+        let bare_store = st0x_event_sorcery::test_store::<VaultRegistry>(pool.clone(), vec![], ());
 
-        bare_cqrs
-            .execute(
-                &aggregate_id,
+        bare_store
+            .send(
+                &id,
                 VaultRegistryCommand::DiscoverEquityVault {
                     token: TEST_TOKEN,
                     vault_id: TEST_VAULT_ID,
@@ -669,15 +669,18 @@ mod tests {
         // Phase 2: create a NEW framework with a counting query processor
         let counter = Arc::new(AtomicUsize::new(0));
         let query = EventCounter(counter.clone());
-        let observed_cqrs =
-            sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![Box::new(query)], ());
+        let observed_store = st0x_event_sorcery::test_store::<VaultRegistry>(
+            pool.clone(),
+            vec![Box::new(query)],
+            (),
+        );
 
         // Phase 3: emit one more event through the new framework
         let new_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
-        observed_cqrs
-            .execute(
-                &aggregate_id,
+        observed_store
+            .send(
+                &id,
                 VaultRegistryCommand::DiscoverUsdcVault {
                     vault_id: new_vault_id,
                     discovered_in: TEST_TX_HASH,

@@ -5,6 +5,7 @@
 //! to reconcile tracked inventory with actual balances.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
@@ -246,8 +247,8 @@ impl DomainEvent for InventorySnapshotEvent {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::Aggregate;
     use rust_decimal::Decimal;
+    use st0x_event_sorcery::Aggregate;
     use std::str::FromStr;
 
     use st0x_event_sorcery::Lifecycle;

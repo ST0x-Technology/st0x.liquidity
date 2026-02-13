@@ -4,6 +4,8 @@
 //! Keyed by `(tx_hash, log_index)`. Can be enriched after
 //! the fact with gas costs and Pyth oracle price data.
 
+use std::str::FromStr;
+
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -259,8 +261,8 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::{Aggregate, EventEnvelope, View};
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::{Aggregate, EventEnvelope, View};
     use std::collections::HashMap;
 
     use st0x_event_sorcery::{Lifecycle, LifecycleError};

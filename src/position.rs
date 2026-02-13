@@ -12,7 +12,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, LifecycleError, SqliteQuery};
+use st0x_event_sorcery::{
+    DomainEvent, EventSourced, Lifecycle, LifecycleError, Projection, ViewRepository,
+};
 use st0x_execution::{
     ArithmeticError, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
     Symbol,
@@ -21,19 +23,17 @@ use st0x_execution::{
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
-pub(crate) async fn load_position(
-    query: &SqliteQuery<Position>,
+pub(crate) async fn load_position<Repo>(
+    query: &Projection<Position, Repo>,
     symbol: &Symbol,
-) -> Result<Option<Position>, PositionError> {
-    let aggregate_id = symbol.to_string();
-    let Some(lifecycle) = query.load(&aggregate_id).await else {
-        return Ok(None);
-    };
-    match lifecycle.live() {
-        Ok(position) => Ok(Some(position.clone())),
-        Err(LifecycleError::Uninitialized) => Ok(None),
-        Err(error) => Err(PositionError::Lifecycle(Box::new(error))),
-    }
+) -> Result<Option<Position>, PositionError>
+where
+    Repo: ViewRepository<Lifecycle<Position>, Lifecycle<Position>>,
+{
+    query
+        .load(symbol)
+        .await
+        .map_err(|error| PositionError::Lifecycle(Box::new(error)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -587,11 +587,12 @@ pub(crate) enum TriggerReason {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::test::TestFramework;
-    use cqrs_es::{Aggregate, EventEnvelope, View};
     use rust_decimal_macros::dec;
+    use sqlite_es::SqliteViewRepository;
+    use st0x_event_sorcery::{Aggregate, EventEnvelope, TestFramework, View};
     use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     use st0x_event_sorcery::Lifecycle;
     use st0x_execution::Positive;
@@ -1586,14 +1587,13 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_none_when_no_aggregate_exists() {
         let pool = crate::test_utils::setup_test_db().await;
-        let view_repo =
-            std::sync::Arc::new(sqlite_es::SqliteViewRepository::<
-                Lifecycle<Position>,
-                Lifecycle<Position>,
-            >::new(pool.clone(), "position_view".to_string()));
-        let query = cqrs_es::persist::GenericQuery::new(view_repo);
+        let view_repo = Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "position_view".to_string(),
+        ));
+        let projection = Projection::new(view_repo);
 
-        let result = load_position(&query, &Symbol::new("AAPL").unwrap())
+        let result = load_position(&projection, &Symbol::new("AAPL").unwrap())
             .await
             .unwrap();
 
@@ -1619,14 +1619,13 @@ mod tests {
         .await
         .unwrap();
 
-        let view_repo =
-            std::sync::Arc::new(sqlite_es::SqliteViewRepository::<
-                Lifecycle<Position>,
-                Lifecycle<Position>,
-            >::new(pool.clone(), "position_view".to_string()));
-        let query = cqrs_es::persist::GenericQuery::new(view_repo);
+        let view_repo = Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "position_view".to_string(),
+        ));
+        let projection = Projection::new(view_repo);
 
-        let result = load_position(&query, &Symbol::new("AAPL").unwrap())
+        let result = load_position(&projection, &Symbol::new("AAPL").unwrap())
             .await
             .unwrap();
 
@@ -1639,19 +1638,17 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_position_for_live_lifecycle() {
         let pool = crate::test_utils::setup_test_db().await;
-        let view_repo =
-            std::sync::Arc::new(sqlite_es::SqliteViewRepository::<
-                Lifecycle<Position>,
-                Lifecycle<Position>,
-            >::new(pool.clone(), "position_view".to_string()));
-        let position_query =
-            std::sync::Arc::new(cqrs_es::persist::GenericQuery::new(view_repo.clone()));
-
-        let store = st0x_event_sorcery::test_store(
+        let view_repo = Arc::new(SqliteViewRepository::new(
             pool.clone(),
-            vec![Box::new(cqrs_es::persist::GenericQuery::new(view_repo))],
-            (),
-        );
+            "position_view".to_string(),
+        ));
+        let projection = Projection::new(view_repo);
+
+        let store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
+            .with_projection(&projection)
+            .build(())
+            .await
+            .unwrap();
 
         let symbol = Symbol::new("AAPL").unwrap();
 
@@ -1674,7 +1671,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = load_position(&position_query, &symbol).await.unwrap();
+        let result = load_position(&projection, &symbol).await.unwrap();
 
         let position = result.expect("Should return Some for live lifecycle");
         assert_eq!(position.symbol, symbol);

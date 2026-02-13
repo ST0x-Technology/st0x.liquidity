@@ -197,7 +197,7 @@ mod tests {
     };
     use crate::bindings::{IERC20, TestERC20};
 
-    async fn create_test_cqrs() -> Arc<Store<EquityRedemption>> {
+    async fn create_test_store_instance() -> Arc<Store<EquityRedemption>> {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         Arc::new(test_store(pool, vec![], ()))
@@ -210,7 +210,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
         let manager = RedemptionManager::new(service, cqrs);
 
         let symbol = Symbol::new("AAPL").unwrap();
@@ -238,7 +238,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
         let manager = RedemptionManager::new(service, cqrs);
 
         let redeem_trait: &dyn Redeem = &manager;
@@ -363,7 +363,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
         let manager = RedemptionManager::new(service, cqrs);
 
         manager

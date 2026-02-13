@@ -291,8 +291,7 @@ impl EventSourced for EquityRedemption {
                 tx_hash,
                 sent_at: Utc::now(),
             }]),
-            Detect { .. } => Err(EquityRedemptionError::TokensNotSent),
-            FailDetection { .. } => Err(EquityRedemptionError::TokensNotSent),
+            Detect { .. } | FailDetection { .. } => Err(EquityRedemptionError::TokensNotSent),
             Complete => Err(EquityRedemptionError::NotPending),
             RejectRedemption { .. } => Err(EquityRedemptionError::NotPendingForRejection),
         }
@@ -457,8 +456,8 @@ impl EquityRedemption {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::Aggregate;
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::Aggregate;
 
     use st0x_event_sorcery::{Lifecycle, LifecycleError};
 

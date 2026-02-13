@@ -1,55 +1,50 @@
-//! Query handler that dispatches InventorySnapshot events to InventoryView.
+//! Reactor that dispatches InventorySnapshot events to InventoryView.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use cqrs_es::{EventEnvelope, Query};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use st0x_event_sorcery::Lifecycle;
+use st0x_event_sorcery::Reactor;
 
 use super::snapshot::InventorySnapshot;
 use super::view::InventoryView;
 
-/// Query handler that forwards InventorySnapshot events to a shared InventoryView.
+/// Reactor that forwards InventorySnapshot events to a shared InventoryView.
 ///
-/// This component implements the Query trait to receive events emitted by the
+/// This component implements the Reactor trait to receive events emitted by the
 /// InventorySnapshot aggregate and apply them to the InventoryView for reconciliation.
-pub(crate) struct InventorySnapshotQuery {
+pub(crate) struct InventorySnapshotReactor {
     inventory: Arc<RwLock<InventoryView>>,
 }
 
-impl InventorySnapshotQuery {
+impl InventorySnapshotReactor {
     pub(crate) fn new(inventory: Arc<RwLock<InventoryView>>) -> Self {
         Self { inventory }
     }
 }
 
 #[async_trait]
-impl Query<Lifecycle<InventorySnapshot>> for InventorySnapshotQuery {
-    async fn dispatch(
+impl Reactor<InventorySnapshot> for InventorySnapshotReactor {
+    async fn react(
         &self,
-        _aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<InventorySnapshot>>],
+        _id: &<InventorySnapshot as st0x_event_sorcery::EventSourced>::Id,
+        event: &<InventorySnapshot as st0x_event_sorcery::EventSourced>::Event,
     ) {
         let now = Utc::now();
 
-        for envelope in events {
-            let event = &envelope.payload;
+        let mut inventory = self.inventory.write().await;
 
-            let mut inventory = self.inventory.write().await;
-
-            match inventory.clone().apply_snapshot_event(event, now) {
-                Ok(updated) => {
-                    *inventory = updated;
-                    drop(inventory);
-                }
-                Err(error) => {
-                    drop(inventory);
-                    warn!(%error, "Failed to apply inventory snapshot event");
-                }
+        match inventory.clone().apply_snapshot_event(event, now) {
+            Ok(updated) => {
+                *inventory = updated;
+                drop(inventory);
+            }
+            Err(error) => {
+                drop(inventory);
+                warn!(%error, "Failed to apply inventory snapshot event");
             }
         }
     }
@@ -57,15 +52,17 @@ impl Query<Lifecycle<InventorySnapshot>> for InventorySnapshotQuery {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
 
     use chrono::Utc;
     use rust_decimal::Decimal;
 
     use st0x_execution::{FractionalShares, Symbol};
 
+    use alloy::primitives::Address;
+
     use super::*;
-    use crate::inventory::snapshot::InventorySnapshotEvent;
+    use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::{Imbalance, ImbalanceThreshold};
     use crate::threshold::Usdc;
 
@@ -84,24 +81,13 @@ mod tests {
         }
     }
 
-    fn create_event_envelope(
-        event: InventorySnapshotEvent,
-    ) -> EventEnvelope<Lifecycle<InventorySnapshot>> {
-        EventEnvelope {
-            aggregate_id: "test".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::default(),
-        }
-    }
-
     #[tokio::test]
     async fn dispatch_applies_onchain_equity_event_to_inventory() {
         let aapl = test_symbol();
         let inventory = Arc::new(RwLock::new(
             InventoryView::default().with_equity(aapl.clone()),
         ));
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory));
 
         let mut balances = BTreeMap::new();
         balances.insert(aapl.clone(), test_shares(100));
@@ -111,9 +97,12 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(event)])
-            .await;
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
+
+        query.react(&id, &event).await;
 
         // 100 shares onchain, 0 offchain -> ratio = 1.0, target = 0.5 -> TooMuchOnchain
         let imbalance = inventory
@@ -133,16 +122,19 @@ mod tests {
     #[tokio::test]
     async fn dispatch_applies_onchain_cash_event_to_inventory() {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory));
 
         let event = InventorySnapshotEvent::OnchainCash {
             usdc_balance: Usdc(Decimal::from(1000)),
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(event)])
-            .await;
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
+
+        query.react(&id, &event).await;
 
         // 1000 USDC onchain, 0 offchain -> ratio = 1.0, target = 0.5 -> TooMuchOnchain
         let imbalance = inventory
@@ -165,7 +157,7 @@ mod tests {
         let inventory = Arc::new(RwLock::new(
             InventoryView::default().with_equity(aapl.clone()),
         ));
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory));
 
         let mut positions = BTreeMap::new();
         positions.insert(aapl.clone(), test_shares(50));
@@ -175,9 +167,12 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(event)])
-            .await;
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
+
+        query.react(&id, &event).await;
 
         // 0 onchain, 50 offchain -> ratio = 0.0, target = 0.5 -> TooMuchOffchain
         let imbalance = inventory
@@ -197,16 +192,19 @@ mod tests {
     #[tokio::test]
     async fn dispatch_applies_offchain_cash_event_to_inventory() {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory));
 
         let event = InventorySnapshotEvent::OffchainCash {
             cash_balance_cents: 50_000_000, // $500,000.00
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(event)])
-            .await;
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
+
+        query.react(&id, &event).await;
 
         // 0 onchain, 500000 USDC offchain -> ratio = 0.0, target = 0.5 -> TooMuchOffchain
         let imbalance = inventory
@@ -229,23 +227,35 @@ mod tests {
         let inventory = Arc::new(RwLock::new(
             InventoryView::default().with_equity(aapl.clone()),
         ));
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory));
 
         let mut balances = BTreeMap::new();
         balances.insert(aapl.clone(), test_shares(100));
 
-        let events = vec![
-            create_event_envelope(InventorySnapshotEvent::OnchainEquity {
-                balances,
-                fetched_at: Utc::now(),
-            }),
-            create_event_envelope(InventorySnapshotEvent::OnchainCash {
-                usdc_balance: Usdc(Decimal::from(5000)),
-                fetched_at: Utc::now(),
-            }),
-        ];
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
-        query.dispatch("test-id", &events).await;
+        query
+            .react(
+                &id,
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await;
+
+        query
+            .react(
+                &id,
+                &InventorySnapshotEvent::OnchainCash {
+                    usdc_balance: Usdc(Decimal::from(5000)),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await;
 
         let view = inventory.read().await;
 

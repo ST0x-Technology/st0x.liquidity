@@ -192,10 +192,12 @@ impl EventSourced for TokenizedEquityMint {
                 wallet,
                 requested_at: Utc::now(),
             }]),
-            RejectMint { .. } => Err(TokenizedEquityMintError::NotRequested),
-            AcknowledgeAcceptance { .. } => Err(TokenizedEquityMintError::NotRequested),
-            FailAcceptance { .. } => Err(TokenizedEquityMintError::NotAccepted),
-            ReceiveTokens { .. } => Err(TokenizedEquityMintError::NotAccepted),
+            RejectMint { .. } | AcknowledgeAcceptance { .. } => {
+                Err(TokenizedEquityMintError::NotRequested)
+            }
+            FailAcceptance { .. } | ReceiveTokens { .. } => {
+                Err(TokenizedEquityMintError::NotAccepted)
+            }
             Finalize => Err(TokenizedEquityMintError::TokensNotReceived),
         }
     }
@@ -563,8 +565,8 @@ impl TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::Aggregate;
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::Aggregate;
 
     use st0x_event_sorcery::{Lifecycle, LifecycleError};
 

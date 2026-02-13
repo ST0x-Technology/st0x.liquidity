@@ -292,3 +292,251 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::EventSourced;
+
+    /// Test entity: a simple counter with controllable error behavior.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Counter {
+        value: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum CounterEvent {
+        Created {
+            initial: u32,
+        },
+        Incremented,
+        /// evolve returns Ok(None) for this, triggering Mismatch.
+        Invalid,
+        /// evolve returns Err for this, triggering Apply.
+        Broken,
+    }
+
+    impl DomainEvent for CounterEvent {
+        fn event_type(&self) -> String {
+            format!("{self:?}")
+        }
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+    #[error("domain error")]
+    struct CounterError;
+
+    enum CounterCommand {
+        Create { initial: u32 },
+        Increment,
+        Fail,
+    }
+
+    #[async_trait]
+    impl EventSourced for Counter {
+        type Id = String;
+        type Event = CounterEvent;
+        type Command = CounterCommand;
+        type Error = CounterError;
+        type Services = ();
+
+        const AGGREGATE_TYPE: &'static str = "Counter";
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &CounterEvent) -> Option<Self> {
+            match event {
+                CounterEvent::Created { initial } => Some(Self { value: *initial }),
+                _ => None,
+            }
+        }
+
+        fn evolve(event: &CounterEvent, state: &Self) -> Result<Option<Self>, CounterError> {
+            match event {
+                CounterEvent::Created { .. } | CounterEvent::Invalid => Ok(None),
+                CounterEvent::Incremented => Ok(Some(Self {
+                    value: state.value + 1,
+                })),
+                CounterEvent::Broken => Err(CounterError),
+            }
+        }
+
+        async fn initialize(
+            command: CounterCommand,
+            _services: &(),
+        ) -> Result<Vec<CounterEvent>, CounterError> {
+            match command {
+                CounterCommand::Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
+                CounterCommand::Increment => Ok(vec![CounterEvent::Incremented]),
+                CounterCommand::Fail => Err(CounterError),
+            }
+        }
+
+        async fn transition(
+            &self,
+            command: CounterCommand,
+            _services: &(),
+        ) -> Result<Vec<CounterEvent>, CounterError> {
+            match command {
+                CounterCommand::Create { .. } => Ok(vec![]),
+                CounterCommand::Increment => Ok(vec![CounterEvent::Incremented]),
+                CounterCommand::Fail => Err(CounterError),
+            }
+        }
+    }
+
+    #[test]
+    fn originate_success_transitions_to_live() {
+        let mut lifecycle = Lifecycle::<Counter>::default();
+
+        lifecycle.apply(CounterEvent::Created { initial: 10 });
+
+        assert_eq!(lifecycle, Lifecycle::Live(Counter { value: 10 }));
+    }
+
+    #[test]
+    fn originate_none_transitions_to_failed_mismatch() {
+        let mut lifecycle = Lifecycle::<Counter>::default();
+
+        lifecycle.apply(CounterEvent::Incremented);
+
+        assert!(matches!(
+            lifecycle,
+            Lifecycle::Failed {
+                error: LifecycleError::Mismatch { .. },
+                last_valid_state: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn evolve_success_stays_live_with_new_state() {
+        let mut lifecycle = Lifecycle::Live(Counter { value: 5 });
+
+        lifecycle.apply(CounterEvent::Incremented);
+
+        assert_eq!(lifecycle, Lifecycle::Live(Counter { value: 6 }));
+    }
+
+    #[test]
+    fn evolve_mismatch_transitions_to_failed_with_last_valid_state() {
+        let mut lifecycle = Lifecycle::Live(Counter { value: 5 });
+
+        lifecycle.apply(CounterEvent::Invalid);
+
+        match lifecycle {
+            Lifecycle::Failed {
+                error: LifecycleError::Mismatch { .. },
+                last_valid_state: Some(last),
+            } => assert_eq!(*last, Counter { value: 5 }),
+            other => panic!("expected Failed with Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evolve_domain_error_transitions_to_failed_apply() {
+        let mut lifecycle = Lifecycle::Live(Counter { value: 5 });
+
+        lifecycle.apply(CounterEvent::Broken);
+
+        match lifecycle {
+            Lifecycle::Failed {
+                error: LifecycleError::Apply(CounterError),
+                last_valid_state: Some(last),
+            } => assert_eq!(*last, Counter { value: 5 }),
+            other => panic!("expected Failed with Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_state_is_sticky() {
+        let mut lifecycle = Lifecycle::<Counter>::Failed {
+            error: LifecycleError::Uninitialized,
+            last_valid_state: None,
+        };
+
+        lifecycle.apply(CounterEvent::Created { initial: 99 });
+
+        assert!(matches!(
+            lifecycle,
+            Lifecycle::Failed {
+                error: LifecycleError::Uninitialized,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_uninitialized_delegates_to_initialize() {
+        let lifecycle = Lifecycle::<Counter>::default();
+
+        let events = lifecycle
+            .handle(CounterCommand::Create { initial: 42 }, &())
+            .await
+            .unwrap();
+
+        assert_eq!(events, vec![CounterEvent::Created { initial: 42 }]);
+    }
+
+    #[tokio::test]
+    async fn handle_live_delegates_to_transition() {
+        let lifecycle = Lifecycle::Live(Counter { value: 0 });
+
+        let events = lifecycle
+            .handle(CounterCommand::Increment, &())
+            .await
+            .unwrap();
+
+        assert_eq!(events, vec![CounterEvent::Incremented]);
+    }
+
+    #[tokio::test]
+    async fn handle_maps_domain_error_to_lifecycle_apply() {
+        let lifecycle = Lifecycle::Live(Counter { value: 0 });
+
+        let error = lifecycle
+            .handle(CounterCommand::Fail, &())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, LifecycleError::Apply(CounterError));
+    }
+
+    #[tokio::test]
+    async fn handle_failed_returns_stored_error() {
+        let stored_error = LifecycleError::Uninitialized;
+        let lifecycle = Lifecycle::<Counter>::Failed {
+            error: stored_error.clone(),
+            last_valid_state: None,
+        };
+
+        let error = lifecycle
+            .handle(CounterCommand::Increment, &())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, stored_error);
+    }
+
+    #[test]
+    fn view_update_applies_event_to_lifecycle() {
+        let mut lifecycle = Lifecycle::<Counter>::default();
+        let envelope = EventEnvelope {
+            aggregate_id: "test".to_string(),
+            sequence: 1,
+            payload: CounterEvent::Created { initial: 7 },
+            metadata: HashMap::new(),
+        };
+
+        lifecycle.update(&envelope);
+
+        assert_eq!(lifecycle, Lifecycle::Live(Counter { value: 7 }));
+    }
+}

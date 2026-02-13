@@ -167,7 +167,7 @@ impl TradeDetails {
 
 /// Determines onchain trade direction and ticker based on onchain symbol configuration.
 ///
-/// If the on-chain order has USDC as input and a tokenized stock (0x or s1 suffix) as
+/// If the on-chain order has USDC as input and a tokenized stock (t prefix) as
 /// output then it means the order received USDC and gave away a tokenized stock,
 /// i.e. sold the tokenized stock onchain.
 fn determine_schwab_trade_details(

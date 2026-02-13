@@ -69,8 +69,8 @@ The project uses a strict document hierarchy:
 4. **Tests** - Downstream from plan. Written before implementation (TDD).
 5. **Implementation** - Makes the tests pass.
 
-**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → plan
-the implementation.
+**Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
+plan the implementation.
 
 ## Plan & Review
 
@@ -336,7 +336,7 @@ For detailed implementation requirements and module organization, see
 - Parses onchain events into actionable trade data with strict validation
 - Expects symbol pairs of USDC + tokenized equity with "t" prefix (e.g.,
   "tAAPL")
-- Determines Schwab trade direction: buying tokenized equity onchain → selling
+- Determines Schwab trade direction: buying tokenized equity onchain -> selling
   on Schwab
 - Calculates prices in cents and maintains onchain/offchain trade ratios
 
@@ -345,7 +345,7 @@ For detailed implementation requirements and module organization, see
 - Each blockchain event spawns independent async execution flow
 - Handles throughput mismatch: fast onchain events vs slower Schwab API calls
 - No artificial concurrency limits - processes events as they arrive
-- Flow: Parse Event → SQLite Deduplication Check → Schwab API Call → Record
+- Flow: Parse Event -> SQLite Deduplication Check -> Schwab API Call -> Record
   Result
 
 ### Authentication & API Integration
@@ -377,7 +377,7 @@ For detailed implementation requirements and module organization, see
 - `symbol_locks`: Per-symbol execution concurrency control
 
 **Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
-tracking (pending → completed/failed), retry logic with exponential backoff
+tracking (pending -> completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
@@ -666,14 +666,24 @@ you MUST fix the underlying code problems, not suppress the warnings.
 
 **Required approach for clippy issues:**
 
-1. **Refactor the code** to address the root cause of the lint violation
-2. **Break down large functions** into smaller, more focused functions
-3. **Improve code structure** to meet clippy's standards
-4. **Use proper error handling** instead of suppressing warnings
+Clippy lint errors are not about the exact specific cosmetic thing -- they are
+often indications of poor design or broader things worth reconsidering. Upon
+encountering a lint violation:
 
-When encountering a clippy issue: understand why it's flagged, refactor to
-address the root cause, and ask permission before suppressing if you believe
-it's incorrect.
+1. **Re-evaluate the design** in the context of what was flagged. If the lint
+   reveals a flaw in the broader design or architecture, fix that
+2. **Refactor the code** to address the root cause of the lint violation
+3. **Break down large functions** into smaller, more focused functions
+4. **Improve code structure** to meet clippy's standards
+5. **Use proper error handling** instead of suppressing warnings
+6. If the violation is intentional and makes perfect sense in context, **stop
+   and request explicit permission** from the user before suppressing
+
+**FORBIDDEN: Obscure workarounds that silence the linter without fixing the
+problem.** Do not restructure code in weird ways, add unnecessary indirection,
+wrap things in newtypes, or use any other trick whose sole purpose is making the
+lint go away. Either fix the underlying design issue the lint is pointing at, or
+request permission to suppress. There is no third option.
 
 **Exception**: Lint suppression inside `sol!` macros is acceptable for issues
 from contract ABI signatures we cannot control.
@@ -730,7 +740,7 @@ Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 #### ASCII only in code
 
-Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
+Use ASCII characters only in code and comments. For arrows, use `->` not `->`.
 Unicode breaks vim navigation and grep workflows.
 
 #### No single-letter variables or arguments
@@ -855,3 +865,12 @@ just inline the call. A function that only wraps another function call adds a
 name to learn and a place to jump to without reducing complexity. Helpers earn
 their existence by encapsulating multi-step logic, not by renaming a single
 operation.
+
+#### Don't split simple-but-long pattern matches
+
+A function that consists of a single `match` with many trivial arms (e.g. state
+machine transitions, event mapping) should stay as one function even if it
+exceeds line count lints. Each arm is simple field mapping -- extracting arms
+into helpers adds indirection without improving readability. When
+`too_many_lines` fires on such functions, request permission to suppress the
+lint rather than extracting helpers that exist only to satisfy the line count.

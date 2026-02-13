@@ -8,16 +8,13 @@
 
 use alloy::primitives::Address;
 use alloy::providers::Provider;
-use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{AggregateContext, EventStore};
 use futures_util::future::try_join_all;
-use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
-use st0x_event_sorcery::{Lifecycle, SendError, Store};
+use st0x_event_sorcery::{Lifecycle, SendError, Store, load_aggregate};
 use st0x_execution::{Executor, InventoryResult};
 
 use crate::inventory::snapshot::{
@@ -120,24 +117,12 @@ where
     async fn load_vault_registry(
         &self,
     ) -> Result<Option<VaultRegistry>, InventoryPollingError<E::Error>> {
-        let repo = SqliteEventRepository::new(self.pool.clone());
-        let store =
-            PersistedEventStore::<SqliteEventRepository, Lifecycle<VaultRegistry>>::new_event_store(
-                repo,
-            );
-
-        let aggregate_id = VaultRegistryId {
+        let vault_registry_id = VaultRegistryId {
             orderbook: self.orderbook,
             owner: self.order_owner,
-        }
-        .to_string();
-        let aggregate_context = store.load_aggregate(&aggregate_id).await?;
-        let aggregate = aggregate_context.aggregate();
+        };
 
-        match aggregate {
-            Lifecycle::Live(registry) => Ok(Some(registry.clone())),
-            Lifecycle::Uninitialized | Lifecycle::Failed { .. } => Ok(None),
-        }
+        Ok(load_aggregate::<VaultRegistry>(self.pool.clone(), &vault_registry_id).await?)
     }
 
     async fn poll_onchain_equity(

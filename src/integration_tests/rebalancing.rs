@@ -4,7 +4,6 @@ use alloy::providers::ProviderBuilder;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
-use cqrs_es::persist::GenericQuery;
 use httpmock::Mock;
 use httpmock::prelude::*;
 use rust_decimal_macros::dec;
@@ -17,7 +16,7 @@ use st0x_execution::{
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
-use st0x_event_sorcery::{Lifecycle, Store, test_store};
+use st0x_event_sorcery::{Lifecycle, SqliteQuery, Store, test_store, test_store_with_reactors};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::alpaca_tokenization::tests::{
@@ -118,13 +117,14 @@ fn build_position_cqrs_with_trigger(
         Lifecycle<Position>,
         Lifecycle<Position>,
     >::new(pool.clone(), "position_view".to_string()));
+    let query = SqliteQuery::<Position>::new(view_repo);
 
-    let queries: Vec<Box<dyn cqrs_es::Query<Lifecycle<Position>>>> = vec![
-        Box::new(GenericQuery::new(view_repo)),
-        Box::new(Arc::clone(trigger)),
-    ];
-
-    Arc::new(test_store(pool.clone(), queries, ()))
+    Arc::new(test_store_with_reactors(
+        pool.clone(),
+        vec![Box::new(query)],
+        vec![Box::new(Arc::clone(trigger))],
+        (),
+    ))
 }
 
 /// Shared state for equity rebalancing tests (mint and redemption) that

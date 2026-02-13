@@ -241,7 +241,7 @@ mod tests {
     };
     use crate::test_utils::setup_test_db;
 
-    async fn create_test_cqrs() -> Arc<Store<TokenizedEquityMint>> {
+    async fn create_test_store_instance() -> Arc<Store<TokenizedEquityMint>> {
         let pool = setup_test_db().await;
         Arc::new(test_store(pool, vec![], ()))
     }
@@ -310,7 +310,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
@@ -347,7 +347,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
@@ -398,7 +398,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
@@ -427,7 +427,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs().await;
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
