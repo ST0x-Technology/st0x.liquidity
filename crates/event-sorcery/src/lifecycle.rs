@@ -5,18 +5,18 @@
 //! `Aggregate` impl that delegates to [`EventSourced`] methods,
 //! eliminating per-entity boilerplate.
 //!
-//! See [`event_sourced`](crate::event_sourced) for the full
-//! design rationale.
+//! See the [crate root](crate) for the full design rationale.
 
 use async_trait::async_trait;
 use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 
-use crate::event_sourced::EventSourced;
+use crate::{EventSourced, Reactor};
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
 ///
@@ -27,8 +27,8 @@ use crate::event_sourced::EventSourced;
 ///
 /// Application code should not construct or match on `Lifecycle`
 /// directly in most cases. Interact through
-/// [`Store::send`](crate::event_sourced::Store::send) for
-/// commands and through views for queries.
+/// [`Store::send`](crate::Store::send) for commands and through
+/// views for queries.
 ///
 /// # State machine
 ///
@@ -49,7 +49,7 @@ use crate::event_sourced::EventSourced;
 // The empty bound avoids redundant constraints that confuse the
 // compiler when Entity has complex associated types.
 #[serde(bound = "")]
-pub(crate) enum Lifecycle<Entity: EventSourced> {
+pub enum Lifecycle<Entity: EventSourced> {
     Uninitialized,
     Live(Entity),
     Failed {
@@ -59,7 +59,7 @@ pub(crate) enum Lifecycle<Entity: EventSourced> {
 }
 
 impl<Entity: EventSourced> Lifecycle<Entity> {
-    pub(crate) fn live(&self) -> Result<&Entity, LifecycleError<Entity>>
+    pub fn live(&self) -> Result<&Entity, LifecycleError<Entity>>
     where
         Entity::Error: Clone,
     {
@@ -94,7 +94,7 @@ impl<Entity: EventSourced> Default for Lifecycle<Entity> {
 // `Entity::Error: Serialize + Deserialize` bounds that are
 // already guaranteed by EventSourced's DomainError supertrait.
 #[serde(bound = "")]
-pub(crate) enum LifecycleError<Entity: EventSourced> {
+pub enum LifecycleError<Entity: EventSourced> {
     #[error("operation on uninitialized state")]
     Uninitialized,
 
@@ -120,7 +120,7 @@ pub(crate) enum LifecycleError<Entity: EventSourced> {
 /// command handling nor event application can fail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("never")]
-pub(crate) enum Never {}
+pub enum Never {}
 
 /// Bridges [`EventSourced`] to cqrs-es `Aggregate`.
 ///
@@ -168,9 +168,8 @@ where
 
     fn apply(&mut self, event: Self::Event) {
         *self = match std::mem::take(self) {
-            Self::Uninitialized => match Entity::originate(&event) {
-                Some(state) => Self::Live(state),
-                None => {
+            Self::Uninitialized => Entity::originate(&event).map_or_else(
+                || {
                     let err = LifecycleError::Mismatch {
                         state: Box::new(Self::Uninitialized),
                         event,
@@ -180,8 +179,9 @@ where
                         error: err,
                         last_valid_state: None,
                     }
-                }
-            },
+                },
+                Self::Live,
+            ),
 
             Self::Live(state) => match Entity::evolve(&event, &state) {
                 Ok(Some(new_state)) => Self::Live(new_state),
@@ -234,5 +234,61 @@ where
 {
     async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
         QueryImpl::dispatch(self, aggregate_id, events).await;
+    }
+}
+
+/// Enables sharing a single reactor across multiple CQRS
+/// frameworks via `Arc`.
+#[async_trait]
+impl<R, Entity> Reactor<Entity> for Arc<R>
+where
+    R: Reactor<Entity>,
+    Entity: EventSourced,
+{
+    async fn react(&self, id: &Entity::Id, event: &Entity::Event) {
+        R::react(self, id, event).await;
+    }
+}
+
+/// Enables boxed reactors for test infrastructure.
+#[async_trait]
+impl<Entity> Reactor<Entity> for Box<dyn Reactor<Entity>>
+where
+    Entity: EventSourced,
+{
+    async fn react(&self, id: &Entity::Id, event: &Entity::Event) {
+        (**self).react(id, event).await;
+    }
+}
+
+/// Bridges a [`Reactor<Entity>`] to `cqrs_es::Query<Lifecycle<Entity>>`.
+///
+/// Parses the stringly-typed aggregate ID into `Entity::Id` and
+/// dispatches each event individually. Used internally by
+/// [`StoreBuilder`](crate::StoreBuilder) to register Reactor impls
+/// with the cqrs-es framework.
+pub(crate) struct ReactorBridge<R>(pub(crate) R);
+
+#[async_trait]
+impl<R, Entity> Query<Lifecycle<Entity>> for ReactorBridge<R>
+where
+    R: Reactor<Entity>,
+    Entity: EventSourced,
+    <Entity::Id as FromStr>::Err: Debug,
+    Lifecycle<Entity>: Aggregate<Event = Entity::Event>,
+{
+    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
+        let Ok(typed_id) = aggregate_id.parse::<Entity::Id>() else {
+            warn!(
+                aggregate_id = aggregate_id,
+                aggregate_type = Entity::AGGREGATE_TYPE,
+                "Failed to parse aggregate ID in reactor bridge"
+            );
+            return;
+        };
+
+        for envelope in events {
+            self.0.react(&typed_id, &envelope.payload).await;
+        }
     }
 }

@@ -2,8 +2,8 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 
 disallowed-methods = [
-  { path = "sqlite_es::sqlite_cqrs", reason = "use CqrsBuilder from conductor::wire instead" },
-  { path = "cqrs_es::CqrsFramework::new", reason = "use our type-safe wiring instead" },
+  { path = "sqlite_es::sqlite_cqrs", reason = "use CqrsBuilder from event-sorcery instead" },
+  { path = "cqrs_es::CqrsFramework::new", reason = "use event-sorcery's type-safe wiring instead" },
 ]
 
 too-many-lines-threshold = 200

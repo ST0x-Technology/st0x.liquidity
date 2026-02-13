@@ -11,7 +11,7 @@
 //! the schema registry for reprojection, so the registry must be
 //! self-sufficient.
 //!
-//! [`SCHEMA_VERSION`]: crate::event_sourced::EventSourced::SCHEMA_VERSION
+//! [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
 
 use std::collections::BTreeMap;
 
@@ -21,15 +21,15 @@ use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use tracing::info;
 
-use crate::event_sourced::{DomainEvent, EventSourced};
 use crate::lifecycle::{Lifecycle, Never};
+use crate::{DomainEvent, EventSourced};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
 
 /// Tracks schema versions for all aggregates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct SchemaRegistry {
+pub struct SchemaRegistry {
     versions: BTreeMap<String, u64>,
 }
 
@@ -40,7 +40,7 @@ impl SchemaRegistry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum SchemaRegistryEvent {
+pub enum SchemaRegistryEvent {
     VersionUpdated { name: String, version: u64 },
 }
 
@@ -55,13 +55,13 @@ impl DomainEvent for SchemaRegistryEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum SchemaRegistryCommand {
+pub enum SchemaRegistryCommand {
     Register { name: String, version: u64 },
 }
 
 #[async_trait]
 impl EventSourced for SchemaRegistry {
-    type Id = &'static str;
+    type Id = String;
     type Event = SchemaRegistryEvent;
     type Command = SchemaRegistryCommand;
     type Error = Never;
@@ -111,13 +111,13 @@ impl EventSourced for SchemaRegistry {
 /// Reads state by replaying all SchemaRegistry events from the event
 /// store (no views, no snapshots). Writes go through the CQRS
 /// framework to maintain event sourcing invariants.
-pub(crate) struct Reconciler {
+pub struct Reconciler {
     cqrs: SqliteCqrs<Lifecycle<SchemaRegistry>>,
     pool: SqlitePool,
 }
 
 impl Reconciler {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         #[allow(clippy::disallowed_methods)]
         let cqrs = sqlite_es::sqlite_cqrs(pool.clone(), vec![], ());
         Self { cqrs, pool }
@@ -156,7 +156,7 @@ impl Reconciler {
     ///
     /// Returns `true` if snapshots were cleared (schema changed),
     /// `false` if versions matched.
-    pub(crate) async fn reconcile<Entity: EventSourced>(&self) -> Result<bool, anyhow::Error> {
+    pub async fn reconcile<Entity: EventSourced>(&self) -> Result<bool, anyhow::Error> {
         let name = Entity::AGGREGATE_TYPE;
         let current_version = Entity::SCHEMA_VERSION;
 
@@ -304,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn reconciler_detects_version_change() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
 
         let reconciler = Reconciler::new(pool);
 
@@ -320,7 +320,7 @@ mod tests {
     #[tokio::test]
     async fn load_registry_replays_from_events() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
 
         let reconciler = Reconciler::new(pool);
 

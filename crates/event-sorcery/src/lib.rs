@@ -75,19 +75,43 @@
 //! immediately obvious whether code belongs to this crate or
 //! to cqrs-es.
 
+mod lifecycle;
+mod projection;
+mod schema_registry;
+#[cfg(any(test, feature = "test-support"))]
+mod testing;
+mod wire;
+
+pub use lifecycle::{Lifecycle, LifecycleError, Never};
+pub use projection::Projection;
+pub use schema_registry::{Reconciler, SchemaRegistry};
+#[cfg(any(test, feature = "test-support"))]
+pub use testing::{TestHarness, TestResult, replay};
+pub use wire::{Cons, Nil, StoreBuilder, Unwired};
+#[cfg(any(test, feature = "test-support"))]
+pub use wire::{TestStore, test_mem_store, test_store};
+
 use async_trait::async_trait;
-use cqrs_es::persist::GenericQuery;
-use cqrs_es::{Aggregate, AggregateError};
+use cqrs_es::persist::PersistedEventStore;
+use cqrs_es::{Aggregate, EventStore};
 
 /// Re-exported from cqrs-es so domain modules import from here,
 /// not from cqrs-es directly.
-pub(crate) use cqrs_es::DomainEvent;
+pub use cqrs_es::DomainEvent;
+
+/// Re-exported for error matching in [`SendError`] and
+/// [`load_aggregate`] return types.
+pub use cqrs_es::AggregateError;
+
+/// Re-exported so consumers can write generic bounds over
+/// [`Projection`] without importing from cqrs-es directly.
+pub use cqrs_es::persist::ViewRepository;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sqlite_es::{SqliteCqrs, SqliteViewRepository};
+use sqlite_es::{SqliteCqrs, SqliteEventRepository};
+use sqlx::SqlitePool;
 use std::fmt::{Debug, Display};
-
-use crate::lifecycle::{Lifecycle, LifecycleError};
+use std::str::FromStr;
 
 /// The core abstraction for event-sourced domain entities.
 ///
@@ -149,13 +173,9 @@ use crate::lifecycle::{Lifecycle, LifecycleError};
 /// - `transition`: Handle a command against existing state.
 ///   Receives `&self` (the domain type, not `Lifecycle`), so
 ///   the handler only deals with live state.
-///
-/// [`Never`]: crate::lifecycle::Never
 #[async_trait]
-pub(crate) trait EventSourced:
-    Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned
-{
-    type Id: Display;
+pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned {
+    type Id: Display + FromStr + Send + Sync;
     type Event: DomainEvent + Eq;
     type Command: Send + Sync;
     type Error: DomainError;
@@ -202,17 +222,6 @@ pub(crate) trait EventSourced:
     ) -> Result<Vec<Self::Event>, Self::Error>;
 }
 
-/// Convenience alias for a `GenericQuery` backed by SQLite that
-/// materializes a `Lifecycle<Entity>` as its own view.
-///
-/// Used as the query type for entity views:
-/// `SqliteQuery<Position>`
-pub(crate) type SqliteQuery<Entity> = GenericQuery<
-    SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
-    Lifecycle<Entity>,
-    Lifecycle<Entity>,
->;
-
 /// Type-safe command dispatch for an event-sourced entity.
 ///
 /// Wraps `SqliteCqrs<Lifecycle<Entity>>` and enforces that
@@ -224,18 +233,18 @@ pub(crate) type SqliteQuery<Entity> = GenericQuery<
 /// # Usage
 ///
 /// ```ignore
-/// let positions: Store<Position> = /* built by CqrsBuilder */;
+/// let positions: Store<Position> = /* built by StoreBuilder */;
 ///
 /// // Typed ID -- can't accidentally pass an OffchainOrderId
 /// let symbol = Symbol::new("AAPL").unwrap();
 /// positions.send(&symbol, PositionCommand::AcknowledgeFill { .. }).await?;
 /// ```
 ///
-/// Produced by [`CqrsBuilder::build()`] during conductor
+/// Produced by [`StoreBuilder::build()`] during conductor
 /// startup. The builder handles CQRS framework construction,
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
-pub(crate) struct Store<Entity: EventSourced> {
+pub struct Store<Entity: EventSourced> {
     inner: SqliteCqrs<Lifecycle<Entity>>,
 }
 
@@ -250,10 +259,10 @@ where
 {
     /// Wrap an existing `SqliteCqrs` framework.
     ///
-    /// Prefer using `CqrsBuilder::build()` which handles wiring
+    /// Prefer using `StoreBuilder::build()` which handles wiring
     /// and reconciliation. This constructor exists for cases
     /// where direct construction is needed (e.g., tests).
-    pub(crate) fn new(inner: SqliteCqrs<Lifecycle<Entity>>) -> Self {
+    pub fn new(inner: SqliteCqrs<Lifecycle<Entity>>) -> Self {
         Self { inner }
     }
 
@@ -264,7 +273,7 @@ where
     /// - Uninitialized -> `Entity::initialize`
     /// - Live -> `Entity::transition`
     /// - Failed -> returns the stored error
-    pub(crate) async fn send(
+    pub async fn send(
         &self,
         id: &Entity::Id,
         command: Entity::Command,
@@ -278,7 +287,33 @@ where
 /// Wraps the cqrs-es `AggregateError` containing a
 /// `LifecycleError` so that consumers don't import from cqrs-es
 /// or lifecycle directly.
-pub(crate) type SendError<Entity> = AggregateError<LifecycleError<Entity>>;
+pub type SendError<Entity> = AggregateError<LifecycleError<Entity>>;
+
+/// Load an entity's current state directly from the event store.
+///
+/// Bypasses the CQRS framework -- no query processors are
+/// dispatched. Use this when you need to read aggregate state
+/// outside of a command flow (e.g., loading `VaultRegistry` to
+/// look up a token address).
+///
+/// Returns `Some(entity)` if live, `None` if uninitialized or
+/// failed.
+pub async fn load_aggregate<Entity: EventSourced>(
+    pool: SqlitePool,
+    id: &Entity::Id,
+) -> Result<Option<Entity>, AggregateError<LifecycleError<Entity>>> {
+    let repo = SqliteEventRepository::new(pool);
+    let store =
+        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_event_store(repo);
+
+    let aggregate_id = id.to_string();
+    let context = store.load_aggregate(&aggregate_id).await?;
+
+    match &context.aggregate {
+        Lifecycle::Live(entity) => Ok(Some(entity.clone())),
+        Lifecycle::Uninitialized | Lifecycle::Failed { .. } => Ok(None),
+    }
+}
 
 /// Bounds required for domain error types used with
 /// [`EventSourced`].
@@ -288,7 +323,7 @@ pub(crate) type SendError<Entity> = AggregateError<LifecycleError<Entity>>;
 /// `PartialEq`, and `Eq`. This trait captures those bounds in
 /// one place so implementors see a single meaningful name
 /// instead of a long bound list.
-pub(crate) trait DomainError:
+pub trait DomainError:
     std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
 {
 }
@@ -296,4 +331,18 @@ pub(crate) trait DomainError:
 impl<T> DomainError for T where
     T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
 {
+}
+
+/// Event reactor for a specific entity type.
+///
+/// Replaces `cqrs_es::Query<Lifecycle<E>>` with a cleaner
+/// interface: typed IDs instead of `&str`, one event at a time
+/// instead of an array of envelopes, and no Lifecycle leak.
+///
+/// Internally bridged to `Query<Lifecycle<E>>` via
+/// [`ReactorBridge`](lifecycle::ReactorBridge) so that
+/// cqrs-es continues to work unmodified.
+#[async_trait]
+pub trait Reactor<Entity: EventSourced>: Send + Sync {
+    async fn react(&self, id: &Entity::Id, event: &Entity::Event);
 }
