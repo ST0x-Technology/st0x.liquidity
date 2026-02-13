@@ -1,6 +1,8 @@
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::AnvilInstance;
-use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256, utils::parse_units};
+use alloy::primitives::{
+    Address, B256, Bytes, LogData, U256, address, keccak256, utils::parse_units,
+};
 use alloy::providers::ProviderBuilder;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::rpc::types::Log;
@@ -37,7 +39,7 @@ use crate::onchain::OnchainTrade;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
 use crate::position::{Position, PositionAggregate, PositionCqrs, PositionQuery, load_position};
-use crate::queue::QueuedEvent;
+use crate::queue::{self, QueuedEvent};
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
@@ -85,7 +87,8 @@ struct AnvilTrade {
     queued_event: QueuedEvent,
     tx_hash: B256,
     log_index: u64,
-    vault_id: B256,
+    input_vault_id: B256,
+    output_vault_id: B256,
 }
 
 impl AnvilTrade {
@@ -282,11 +285,13 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
 
     /// Parses a `TakeOrderV3` log through the full `OnchainTrade` pipeline and
     /// wraps the result into an `AnvilTrade` ready for CQRS processing.
+    #[builder]
     async fn take_log_to_anvil_trade(
         &self,
         take_log: &Log,
         order_owner: Address,
-        vault_id: B256,
+        input_vault_id: B256,
+        output_vault_id: B256,
     ) -> AnvilTrade {
         let take_event = take_log.log_decode::<TakeOrderV3>().unwrap().data().clone();
         let take_event_for_queue = take_event.clone();
@@ -334,7 +339,8 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             queued_event,
             tx_hash,
             log_index,
-            vault_id,
+            input_vault_id,
+            output_vault_id,
         }
     }
 
@@ -393,12 +399,11 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             .unwrap()
             .0;
 
-        // Each order gets a unique vault_id to prevent vault balance leaking between
-        // orders. Without this, Buy and Sell orders on the same symbol share equity
-        // vaults, causing incorrect take amounts.
-        let vault_id = B256::random();
-        let input_vault_id = vault_id;
-        let output_vault_id = vault_id;
+        // Each order gets unique vault IDs to prevent vault balance leaking between
+        // orders. Input and output use distinct IDs so tests can verify correct
+        // mapping in vault discovery (e.g. USDC vault_id != equity vault_id).
+        let input_vault_id = B256::random();
+        let output_vault_id = B256::random();
 
         let order_config = IOrderBookV5::OrderConfigV4 {
             evaluable: IOrderBookV5::EvaluableV4 {
@@ -527,7 +532,12 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             .find(|log| log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
             .expect("TakeOrderV3 event not found");
 
-        self.take_log_to_anvil_trade(take_log, order.owner, vault_id)
+        self.take_log_to_anvil_trade()
+            .take_log(take_log)
+            .order_owner(order.owner)
+            .input_vault_id(input_vault_id)
+            .output_vault_id(output_vault_id)
+            .call()
             .await
     }
 }
@@ -1261,7 +1271,22 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
             "OffchainOrderEvent::Submitted",
         ),
     ];
-    assert_events(&pool, &expected).await;
+    let events = assert_events(&pool, &expected).await;
+
+    // Payload spot-checks: financial values in the single-trade threshold crossing
+    let filled = &events[0].payload["OnChainOrderFilled"];
+    assert_eq!(filled["amount"].as_str().unwrap(), "1");
+    assert_eq!(filled["direction"].as_str().unwrap(), "Sell");
+    assert_eq!(filled["price_usdc"].as_str().unwrap(), "100");
+
+    let placed_pos = &events[2].payload["OffChainOrderPlaced"];
+    assert_eq!(placed_pos["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(placed_pos["shares"].as_str().unwrap(), "1");
+
+    let placed = &events[3].payload["Placed"];
+    assert_eq!(placed["symbol"].as_str().unwrap(), TEST_AAPL);
+    assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(placed["shares"].as_str().unwrap(), "1");
 
     Ok(())
 }
@@ -1463,8 +1488,15 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
         assert_eq!(ve.aggregate_id, vault_agg_id);
     }
 
-    // Sell order: input=USDC, output=equity. Vault discovery processes input first.
-    let expected_vault_id = format!("{:#x}", t1.vault_id);
+    // Sell order: input=USDC (receives USDC), output=equity (gives equity).
+    // Vault discovery processes input first, so UsdcVaultDiscovered uses input_vault_id
+    // and EquityVaultDiscovered uses output_vault_id.
+    let expected_usdc_vault_id = format!("{:#x}", t1.input_vault_id);
+    let expected_equity_vault_id = format!("{:#x}", t1.output_vault_id);
+    assert_ne!(
+        expected_usdc_vault_id, expected_equity_vault_id,
+        "Input and output vault IDs must be distinct to detect swap bugs"
+    );
 
     assert_eq!(
         vault_events[0].event_type,
@@ -1474,7 +1506,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
         vault_events[0].payload["UsdcVaultDiscovered"]["vault_id"]
             .as_str()
             .unwrap(),
-        expected_vault_id
+        expected_usdc_vault_id
     );
 
     assert_eq!(
@@ -1486,7 +1518,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     assert_eq!(equity_payload["symbol"].as_str().unwrap(), TEST_AAPL);
     assert_eq!(
         equity_payload["vault_id"].as_str().unwrap(),
-        expected_vault_id
+        expected_equity_vault_id
     );
     assert_eq!(
         equity_payload["token"].as_str().unwrap(),
@@ -1825,6 +1857,102 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
             // Trade 2 events: only onchain fill, no offchain order
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
             ExpectedEvent::new("OnChainTrade", &t2_agg, "OnChainTradeEvent::Filled"),
+        ],
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Tests that the event queue deduplicates identical onchain events (same tx_hash + log_index),
+/// ensuring the CQRS pipeline processes each blockchain event exactly once.
+#[tokio::test]
+async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ob = setup_anvil_orderbook().await;
+    let pool = setup_test_db().await;
+    let (cqrs, _position_cqrs, position_query, _offchain_order_cqrs) = create_test_cqrs(&pool);
+    let symbol = Symbol::new(TEST_AAPL).unwrap();
+
+    let t1 = ob
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.5)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
+        .await;
+
+    // Build a Log with the trade's tx_hash/log_index for queue enqueue
+    let enqueue_log = Log {
+        inner: alloy::primitives::Log {
+            address: ob.orderbook_addr,
+            data: LogData::default(),
+        },
+        block_hash: None,
+        block_number: Some(t1.queued_event.block_number),
+        block_timestamp: None,
+        transaction_hash: Some(t1.tx_hash),
+        transaction_index: Some(0),
+        log_index: Some(t1.log_index),
+        removed: false,
+    };
+
+    let TradeEvent::TakeOrderV3(ref take_event) = t1.queued_event.event else {
+        panic!("Expected TakeOrderV3 event");
+    };
+
+    // Enqueue the same event twice -- second insert should be silently ignored
+    queue::enqueue(&pool, take_event.as_ref(), &enqueue_log)
+        .await
+        .unwrap();
+    queue::enqueue(&pool, take_event.as_ref(), &enqueue_log)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        queue::count_unprocessed(&pool).await.unwrap(),
+        1,
+        "Duplicate enqueue should result in only 1 unprocessed event"
+    );
+
+    // Process the single queued event through the CQRS pipeline
+    let queued = queue::get_next_unprocessed_event(&pool)
+        .await
+        .unwrap()
+        .expect("Should have one unprocessed event");
+    let event_id = queued.id.expect("Queued event should have an id");
+
+    t1.submit(&pool, event_id, &cqrs).await?;
+
+    // Re-enqueue after processing -- should still be ignored (row exists with processed=1)
+    queue::enqueue(&pool, take_event.as_ref(), &enqueue_log)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        queue::count_unprocessed(&pool).await.unwrap(),
+        0,
+        "Re-enqueue of processed event should be ignored"
+    );
+
+    // Verify exactly one set of CQRS events was emitted
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(dec!(-0.5)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(0.5)))
+        .pending(None)
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
+
+    let t1_agg = t1.aggregate_id();
+    assert_events(
+        &pool,
+        &[
+            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
+            ExpectedEvent::new("OnChainTrade", &t1_agg, "OnChainTradeEvent::Filled"),
         ],
     )
     .await;
