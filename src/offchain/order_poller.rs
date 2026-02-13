@@ -12,7 +12,7 @@ use st0x_execution::{
     ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
 
-use st0x_event_sorcery::{Lifecycle, SendError, Store};
+use st0x_event_sorcery::{SendError, Store};
 
 use super::execution::find_orders_by_status;
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, PriceCents};
@@ -110,12 +110,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             find_orders_by_status(&self.pool, OrderStatus::Submitted)
                 .await?
                 .into_iter()
-                .filter(|(_, lifecycle)| {
-                    lifecycle
-                        .live()
-                        .map(|order| order.executor() == executor_type)
-                        .unwrap_or(false)
-                })
+                .filter(|(_, order)| order.executor() == executor_type)
                 .collect();
 
         if submitted_executions.is_empty() {
@@ -125,12 +120,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         info!("Polling {} submitted orders", submitted_executions.len());
 
-        for (offchain_order_id, aggregate) in &submitted_executions {
-            let Lifecycle::Live(order) = aggregate else {
-                warn!(%offchain_order_id, "Skipping non-live aggregate");
-                continue;
-            };
-
+        for (offchain_order_id, order) in &submitted_executions {
             if let Err(error) = self.poll_execution_status(*offchain_order_id, order).await {
                 error!("Failed to poll execution {offchain_order_id}: {error}");
             }

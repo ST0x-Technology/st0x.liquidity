@@ -7,10 +7,13 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use alloy::hex::FromHexError;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
 use st0x_execution::{FractionalShares, Symbol};
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
@@ -31,19 +34,33 @@ impl std::fmt::Display for InventorySnapshotId {
     }
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum ParseInventorySnapshotIdError {
+    #[error("expected 'orderbook:owner', got '{id_provided}'")]
+    MissingDelimiter { id_provided: String },
+
+    #[error("invalid orderbook address: {0}")]
+    Orderbook(FromHexError),
+
+    #[error("invalid owner address: {0}")]
+    Owner(FromHexError),
+}
+
 impl FromStr for InventorySnapshotId {
-    type Err = String;
+    type Err = ParseInventorySnapshotIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (orderbook_str, owner_str) = value
-            .split_once(':')
-            .ok_or_else(|| format!("expected 'orderbook:owner', got '{value}'"))?;
+        let (orderbook_str, owner_str) = value.split_once(':').ok_or_else(|| {
+            ParseInventorySnapshotIdError::MissingDelimiter {
+                id_provided: value.to_string(),
+            }
+        })?;
         let orderbook = orderbook_str
             .parse()
-            .map_err(|err| format!("invalid orderbook address: {err}"))?;
+            .map_err(ParseInventorySnapshotIdError::Orderbook)?;
         let owner = owner_str
             .parse()
-            .map_err(|err| format!("invalid owner address: {err}"))?;
+            .map_err(ParseInventorySnapshotIdError::Owner)?;
         Ok(Self { orderbook, owner })
     }
 }

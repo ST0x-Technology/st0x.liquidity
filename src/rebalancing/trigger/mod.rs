@@ -532,7 +532,7 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive};
+    use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
@@ -1441,6 +1441,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         }
     }
 

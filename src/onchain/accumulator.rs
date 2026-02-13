@@ -3,7 +3,7 @@ use tracing::{debug, info};
 
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
-use st0x_event_sorcery::{Lifecycle, Projection, ViewRepository};
+use st0x_event_sorcery::Projection;
 
 use crate::onchain::OnChainError;
 use crate::position::{Position, load_position};
@@ -22,14 +22,11 @@ pub(crate) struct ExecutionParams {
 /// exceeds the configured threshold. The Position aggregate already tracks
 /// pending executions — `is_ready_for_execution` returns `None` if one
 /// is already in flight.
-pub(crate) async fn check_execution_readiness<Repo>(
-    position_query: &Projection<Position, Repo>,
+pub(crate) async fn check_execution_readiness(
+    position_query: &Projection<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
-) -> Result<Option<ExecutionParams>, OnChainError>
-where
-    Repo: ViewRepository<Lifecycle<Position>, Lifecycle<Position>>,
-{
+) -> Result<Option<ExecutionParams>, OnChainError> {
     let Some(position) = load_position(position_query, symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
@@ -71,14 +68,11 @@ where
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
-pub(crate) async fn check_all_positions<Repo>(
+pub(crate) async fn check_all_positions(
     pool: &SqlitePool,
-    position_query: &Projection<Position, Repo>,
+    position_query: &Projection<Position>,
     executor_type: SupportedExecutor,
-) -> Result<Vec<ExecutionParams>, OnChainError>
-where
-    Repo: ViewRepository<Lifecycle<Position>, Lifecycle<Position>>,
-{
+) -> Result<Vec<ExecutionParams>, OnChainError> {
     let symbols = sqlx::query_scalar!("SELECT symbol FROM position_view WHERE symbol IS NOT NULL")
         .fetch_all(pool)
         .await?;
@@ -114,7 +108,7 @@ mod tests {
 
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
-    use st0x_event_sorcery::{Projection, SqliteProjection, Store};
+    use st0x_event_sorcery::{Projection, Store};
 
     use super::*;
     use crate::position::{Position, PositionCommand};
@@ -123,7 +117,7 @@ mod tests {
 
     async fn create_test_position_infra(
         pool: &SqlitePool,
-    ) -> (Store<Position>, SqliteProjection<Position>) {
+    ) -> (Store<Position>, Projection<Position>) {
         let view_repo = Arc::new(SqliteViewRepository::new(
             pool.clone(),
             "position_view".to_string(),

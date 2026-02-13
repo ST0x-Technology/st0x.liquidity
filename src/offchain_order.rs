@@ -14,20 +14,14 @@ use st0x_execution::{
     SupportedExecutor, Symbol,
 };
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Lifecycle, Projection, Store, StoreBuilder};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, Store, StoreBuilder};
 
 /// Constructs the offchain order CQRS framework with its view
 /// query. Used by CLI code.
 pub(crate) async fn build_offchain_order_cqrs(
     pool: &SqlitePool,
     order_placer: Arc<dyn OrderPlacer>,
-) -> anyhow::Result<(
-    Arc<Store<OffchainOrder>>,
-    Projection<
-        OffchainOrder,
-        SqliteViewRepository<Lifecycle<OffchainOrder>, Lifecycle<OffchainOrder>>,
-    >,
-)> {
+) -> anyhow::Result<(Arc<Store<OffchainOrder>>, Projection<OffchainOrder>)> {
     let view_repo = Arc::new(SqliteViewRepository::new(
         pool.clone(),
         "offchain_order_view".to_string(),

@@ -4,13 +4,16 @@
 //! Keyed by `(tx_hash, log_index)`. Can be enriched after
 //! the fact with gas costs and Pyth oracle price data.
 
+use std::num::ParseIntError;
 use std::str::FromStr;
 
+use alloy::hex::FromHexError;
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use st0x_execution::{Direction, Symbol};
 
@@ -28,19 +31,30 @@ impl std::fmt::Display for OnChainTradeId {
     }
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum ParseOnChainTradeIdError {
+    #[error("expected 'tx_hash:log_index', got '{id_provided}'")]
+    MissingDelimiter { id_provided: String },
+
+    #[error("invalid tx_hash: {0}")]
+    TxHash(#[from] FromHexError),
+
+    #[error("invalid log_index: {0}")]
+    LogIndex(#[from] ParseIntError),
+}
+
 impl FromStr for OnChainTradeId {
-    type Err = String;
+    type Err = ParseOnChainTradeIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (tx_hash_str, log_index_str) = value
-            .split_once(':')
-            .ok_or_else(|| format!("expected 'tx_hash:log_index', got '{value}'"))?;
-        let tx_hash = tx_hash_str
-            .parse()
-            .map_err(|err| format!("invalid tx_hash: {err}"))?;
-        let log_index = log_index_str
-            .parse()
-            .map_err(|err| format!("invalid log_index: {err}"))?;
+        let (tx_hash_str, log_index_str) =
+            value
+                .split_once(':')
+                .ok_or_else(|| ParseOnChainTradeIdError::MissingDelimiter {
+                    id_provided: value.to_string(),
+                })?;
+        let tx_hash = tx_hash_str.parse()?;
+        let log_index = log_index_str.parse()?;
         Ok(Self { tx_hash, log_index })
     }
 }

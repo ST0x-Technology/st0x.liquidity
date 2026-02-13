@@ -219,7 +219,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlx::SqlitePool;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use uuid::Uuid;
 
     use st0x_event_sorcery::test_store;
@@ -254,6 +254,8 @@ mod tests {
                 api_secret: "test_secret".to_string(),
                 account_id: Uuid::nil().to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::default(),
             },
         }
     }
@@ -341,6 +343,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         };
         let broker = Arc::new(
             AlpacaBrokerApi::try_from_ctx(broker_auth)
@@ -425,6 +429,8 @@ mod tests {
             api_secret: "invalid_secret".to_string(),
             account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         };
 
         // Verify the error can be converted to SpawnRebalancerError

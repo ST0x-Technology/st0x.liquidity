@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use st0x_execution::Executor;
 
-use st0x_event_sorcery::{SqliteProjection, Store};
+use st0x_event_sorcery::{Projection, Store};
 
 use super::{
     Conductor, EventProcessingError, spawn_event_processor, spawn_inventory_poller,
@@ -38,7 +38,7 @@ type TakeStream =
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
     pub(crate) position: Arc<Store<Position>>,
-    pub(crate) position_query: Arc<SqliteProjection<Position>>,
+    pub(crate) position_query: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) vault_registry: Store<VaultRegistry>,
     pub(crate) snapshot: Store<InventorySnapshot>,

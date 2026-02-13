@@ -17,20 +17,15 @@ use st0x_execution::{
     Symbol,
 };
 
-use st0x_event_sorcery::{
-    DomainEvent, EventSourced, Lifecycle, LifecycleError, Projection, ViewRepository,
-};
+use st0x_event_sorcery::{DomainEvent, EventSourced, LifecycleError, Projection};
 
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
-pub(crate) async fn load_position<Repo>(
-    query: &Projection<Position, Repo>,
+pub(crate) async fn load_position(
+    query: &Projection<Position>,
     symbol: &Symbol,
-) -> Result<Option<Position>, PositionError>
-where
-    Repo: ViewRepository<Lifecycle<Position>, Lifecycle<Position>>,
-{
+) -> Result<Option<Position>, PositionError> {
     query
         .load(symbol)
         .await

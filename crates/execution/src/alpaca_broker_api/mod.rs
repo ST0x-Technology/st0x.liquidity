@@ -51,14 +51,22 @@ impl fmt::Display for TimeInForce {
     }
 }
 
-impl FromStr for TimeInForce {
-    type Err = String;
+#[derive(Debug, Error)]
+#[error("invalid time-in-force: {time_in_force_provided}")]
+pub struct ParseTimeInForceError {
+    time_in_force_provided: String,
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+impl FromStr for TimeInForce {
+    type Err = ParseTimeInForceError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
             "day" => Ok(Self::Day),
             "market-on-close" | "market_on_close" | "cls" => Ok(Self::MarketOnClose),
-            _ => Err(format!("invalid time-in-force: {s}")),
+            _ => Err(ParseTimeInForceError {
+                time_in_force_provided: value.to_string(),
+            }),
         }
     }
 }

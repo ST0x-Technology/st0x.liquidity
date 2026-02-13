@@ -30,9 +30,7 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecut
 
 use sqlite_es::SqliteViewRepository;
 
-use st0x_event_sorcery::{
-    Cons, Nil, Projection, SendError, SqliteProjection, Store, StoreBuilder, Unwired,
-};
+use st0x_event_sorcery::{Cons, Nil, Projection, SendError, Store, StoreBuilder, Unwired};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
@@ -72,7 +70,7 @@ pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 struct TradeProcessingCqrs {
     onchain_trade: Arc<Store<OnChainTrade>>,
     position: Arc<Store<Position>>,
-    position_query: Arc<SqliteProjection<Position>>,
+    position_query: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
 }
@@ -436,7 +434,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     market_maker_wallet: Address,
 ) -> anyhow::Result<(
     Arc<Store<Position>>,
-    Arc<SqliteProjection<Position>>,
+    Arc<Projection<Position>>,
     JoinHandle<()>,
 )> {
     info!("Initializing rebalancing infrastructure");
@@ -504,7 +502,7 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
 /// (without rebalancing trigger). Used when rebalancing is disabled.
 async fn build_position_cqrs(
     pool: &SqlitePool,
-) -> anyhow::Result<(Arc<Store<Position>>, Arc<SqliteProjection<Position>>)> {
+) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
     let position_view_repo = Arc::new(SqliteViewRepository::new(
         pool.clone(),
         "position_view".to_string(),
@@ -633,7 +631,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
     pool: SqlitePool,
     position: Arc<Store<Position>>,
-    position_query: Arc<SqliteProjection<Position>>,
+    position_query: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
@@ -1329,7 +1327,7 @@ async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
     pool: &SqlitePool,
     position: &Store<Position>,
-    position_query: &SqliteProjection<Position>,
+    position_query: &Projection<Position>,
     offchain_order: &Arc<Store<OffchainOrder>>,
     threshold: &ExecutionThreshold,
 ) -> Result<(), EventProcessingError>

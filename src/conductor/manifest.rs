@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Cons, Nil, Projection, SqliteProjection, Store, StoreBuilder, Unwired};
+use st0x_event_sorcery::{Cons, Nil, Projection, Store, StoreBuilder, Unwired};
 
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::EquityRedemption;
@@ -46,12 +46,12 @@ type EventBroadcasterDeps =
 pub(super) struct QueryManifest {
     rebalancing_trigger: Unwired<RebalancingTrigger, RebalancingTriggerDeps>,
     event_broadcaster: Unwired<EventBroadcaster, EventBroadcasterDeps>,
-    position_view: SqliteProjection<Position>,
+    position_view: Projection<Position>,
 }
 
 /// All query processors after wiring is complete.
 pub(super) struct WiredQueries {
-    pub(super) position_view: SqliteProjection<Position>,
+    pub(super) position_view: Projection<Position>,
 }
 
 /// Built CQRS frameworks from the wiring process.

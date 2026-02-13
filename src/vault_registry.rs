@@ -5,6 +5,7 @@
 //! - **Equity Vaults**: Hold tokenized equities (token != USDC)
 //! - **USDC Vaults**: Hold USDC for trading
 
+use alloy::hex::FromHexError;
 use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+use thiserror::Error;
 
 use st0x_execution::Symbol;
 
@@ -31,19 +33,34 @@ impl fmt::Display for VaultRegistryId {
     }
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum ParseVaultRegistryIdError {
+    #[error("expected 'orderbook:owner', got '{id_provided}'")]
+    MissingDelimiter { id_provided: String },
+
+    #[error("invalid orderbook address: {0}")]
+    Orderbook(FromHexError),
+
+    #[error("invalid owner address: {0}")]
+    Owner(FromHexError),
+}
+
 impl FromStr for VaultRegistryId {
-    type Err = String;
+    type Err = ParseVaultRegistryIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (orderbook_str, owner_str) = value
-            .split_once(':')
-            .ok_or_else(|| format!("expected 'orderbook:owner', got '{value}'"))?;
+        let (orderbook_str, owner_str) =
+            value
+                .split_once(':')
+                .ok_or_else(|| ParseVaultRegistryIdError::MissingDelimiter {
+                    id_provided: value.to_string(),
+                })?;
         let orderbook = orderbook_str
             .parse()
-            .map_err(|err| format!("invalid orderbook address: {err}"))?;
+            .map_err(ParseVaultRegistryIdError::Orderbook)?;
         let owner = owner_str
             .parse()
-            .map_err(|err| format!("invalid owner address: {err}"))?;
+            .map_err(ParseVaultRegistryIdError::Owner)?;
         Ok(Self { orderbook, owner })
     }
 }
@@ -96,8 +113,6 @@ pub(crate) struct VaultRegistry {
     pub(crate) usdc_vault: Option<DiscoveredUsdcVault>,
     pub(crate) last_updated: DateTime<Utc>,
 }
-
-pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

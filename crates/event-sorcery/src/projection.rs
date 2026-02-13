@@ -12,22 +12,21 @@ use std::sync::Arc;
 use crate::EventSourced;
 use crate::lifecycle::{Lifecycle, LifecycleError};
 
-/// SQLite-backed projection -- the concrete type used in
-/// production wiring.
-pub type SqliteProjection<Entity> =
-    Projection<Entity, SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>>;
-
 /// Materialized view of an event-sourced entity.
 ///
 /// Provides [`load`](Self::load) to retrieve the current entity
-/// state. The `Repo` type parameter determines the storage
-/// backend (e.g., `SqliteViewRepository` for SQLite).
+/// state. Backed by SQLite in production; the `Repo` parameter
+/// defaults to `SqliteViewRepository` so consumers write
+/// `Projection<Position>` without seeing `Lifecycle`.
 ///
 /// Constructed via [`new`](Self::new) during wiring in
 /// [`StoreBuilder`](crate::StoreBuilder) or directly in CLI/test code.
 pub struct Projection<
     Entity: EventSourced,
-    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
+    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> = SqliteViewRepository<
+        Lifecycle<Entity>,
+        Lifecycle<Entity>,
+    >,
 > {
     inner: Arc<GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>>>,
 }

@@ -13,6 +13,7 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
+    TimeInForce,
 };
 
 use super::TransferDirection;
@@ -174,6 +175,8 @@ where
         api_secret: alpaca_auth.api_secret.clone(),
         account_id: rebalancing_config.alpaca_account_id.to_string(),
         mode: Some(broker_mode),
+        asset_cache_ttl: std::time::Duration::from_secs(3600),
+        time_in_force: TimeInForce::default(),
     };
 
     let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
@@ -507,7 +510,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use std::str::FromStr;
     use url::Url;
 
@@ -544,6 +547,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         });
         ctx
     }
@@ -688,6 +693,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
@@ -710,6 +717,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Production),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {

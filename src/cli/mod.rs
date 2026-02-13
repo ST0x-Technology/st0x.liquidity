@@ -1787,8 +1787,7 @@ mod tests {
             .unwrap();
         assert_eq!(executions.len(), 1);
 
-        let (order_id, lifecycle) = &executions[0];
-        let order = lifecycle.live().unwrap();
+        let (order_id, order) = &executions[0];
         assert_eq!(
             order.shares(),
             Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
@@ -1889,7 +1888,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(executions.len(), 1);
-        let order = executions[0].1.live().unwrap();
+        let order = &executions[0].1;
         assert_eq!(
             order.shares(),
             Positive::new(FractionalShares::new(dec!(5))).unwrap()

@@ -11,9 +11,8 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use st0x_execution::{FractionalShares, Symbol};
-
 use st0x_event_sorcery::SendError;
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};

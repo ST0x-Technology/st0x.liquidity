@@ -614,6 +614,13 @@ reviewing code that uses configuration instead of reading secrets directly.
   "documenting the gap" or "will fix later". A failing test is the correct way
   to flag broken code - it forces the issue to be addressed. Tests that pass
   while asserting wrong behavior are worse than no tests at all.
+- **CRITICAL: NEVER delete, skip, or bypass existing tests or checks to make a
+  refactor easier.** If a refactor breaks existing tests, you MUST either: (1)
+  adapt the tests to the new design while preserving their coverage, (2) find a
+  design that keeps the tests passing, or (3) stop and ask the user how to
+  proceed. Replacing tests with comments like "these no longer apply" or
+  "validated by other means" is strictly forbidden. Tests are constraints on
+  correctness -- if your change can't satisfy them, the change is wrong.
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
