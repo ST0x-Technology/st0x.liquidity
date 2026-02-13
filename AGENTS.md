@@ -862,3 +862,12 @@ just inline the call. A function that only wraps another function call adds a
 name to learn and a place to jump to without reducing complexity. Helpers earn
 their existence by encapsulating multi-step logic, not by renaming a single
 operation.
+
+#### Don't split simple-but-long pattern matches
+
+A function that consists of a single `match` with many trivial arms (e.g. state
+machine transitions, event mapping) should stay as one function even if it
+exceeds line count lints. Each arm is simple field mapping -- extracting arms
+into helpers adds indirection without improving readability. When
+`too_many_lines` fires on such functions, request permission to suppress the
+lint rather than extracting helpers that exist only to satisfy the line count.
