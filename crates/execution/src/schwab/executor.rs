@@ -1,6 +1,5 @@
 use alloy::primitives::FixedBytes;
 use async_trait::async_trait;
-use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -10,7 +9,8 @@ use crate::schwab::SchwabAuthCtx;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, TryIntoExecutor,
+    Direction, ExecutionError, Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState,
+    OrderStatus, OrderUpdate, Positive, Symbol, TryIntoExecutor,
 };
 
 /// Everything the Schwab executor needs to initialize: auth credentials,
@@ -95,8 +95,8 @@ impl Executor for Schwab {
                 MarketStatus::Open => {
                     // Market is open, return time until close
                     if let Some(end_time) = market_hours.end {
-                        let market_close = end_time.with_timezone(&Utc);
-                        let now = Utc::now();
+                        let market_close = end_time.with_timezone(&chrono::Utc);
+                        let now = chrono::Utc::now();
                         if market_close > now {
                             let duration = (market_close - now)
                                 .to_std()
@@ -110,8 +110,8 @@ impl Executor for Schwab {
                 MarketStatus::Closed => {
                     // Market is closed, wait until next open
                     if let Some(start_time) = market_hours.start {
-                        let next_open = start_time.with_timezone(&Utc);
-                        let now = Utc::now();
+                        let next_open = start_time.with_timezone(&chrono::Utc);
+                        let now = chrono::Utc::now();
                         if next_open > now {
                             let wait_duration = (next_open - now)
                                 .to_std()
@@ -218,6 +218,61 @@ impl Executor for Schwab {
                 order_id: order_id.clone(),
             })
         }
+    }
+
+    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
+        info!("Polling pending orders");
+
+        // Query database directly for submitted orders
+        let rows = sqlx::query!(
+            "SELECT * FROM offchain_trades WHERE status = 'SUBMITTED' ORDER BY id ASC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut updates = Vec::new();
+
+        for row in rows {
+            let Some(order_id_value) = row.order_id else {
+                return Err(ExecutionError::MissingOrderId {
+                    status: OrderStatus::Submitted,
+                });
+            };
+
+            // Get current status from Schwab API
+            match self.get_order_status(&order_id_value).await {
+                Ok(current_state) => {
+                    // Only include orders that have changed status
+                    if !matches!(current_state, OrderState::Submitted { .. }) {
+                        let price_cents = match &current_state {
+                            OrderState::Filled { price_cents, .. } => Some(*price_cents),
+                            _ => None,
+                        };
+
+                        let symbol = Symbol::new(row.symbol)?;
+                        let shares = Positive::new(FractionalShares::from_f64(row.shares)?)?;
+                        let direction: Direction = row.direction.parse()?;
+
+                        updates.push(OrderUpdate {
+                            order_id: order_id_value.clone(),
+                            symbol,
+                            shares,
+                            direction,
+                            status: current_state.status(),
+                            updated_at: chrono::Utc::now(),
+                            price_cents,
+                        });
+                    }
+                }
+                Err(e) => {
+                    // Log error but continue with other orders
+                    info!("Failed to get status for order {}: {}", order_id_value, e);
+                }
+            }
+        }
+
+        info!("Found {} order updates", updates.len());
+        Ok(updates)
     }
 
     fn to_supported_executor(&self) -> crate::SupportedExecutor {

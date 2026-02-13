@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::AlpacaTradingApiError;
 use super::auth::{AlpacaTradingApiClient, AlpacaTradingApiCtx};
 use crate::{
-    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor,
+    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
     TryIntoExecutor,
 };
 
@@ -79,6 +79,10 @@ impl Executor for AlpacaTradingApi {
                 error_reason: None,
             }),
         }
+    }
+
+    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
+        super::order::poll_pending_orders(self.client.client()).await
     }
 
     fn to_supported_executor(&self) -> SupportedExecutor {

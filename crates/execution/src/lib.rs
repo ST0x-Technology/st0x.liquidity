@@ -611,6 +611,28 @@ pub trait TryIntoExecutor {
     -> Result<Self::Executor, <Self::Executor as Executor>::Error>;
 }
 
+/// The order ID assigned by the executor (broker) when an order is placed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorOrderId(String);
+
+impl ExecutorOrderId {
+    pub fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl AsRef<str> for ExecutorOrderId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for ExecutorOrderId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;

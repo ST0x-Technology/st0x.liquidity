@@ -20,10 +20,14 @@ pub struct OrderPlacement<OrderId> {
 }
 
 #[derive(Debug)]
-pub(crate) struct OrderUpdate {
-    pub(crate) status: OrderStatus,
-    pub(crate) updated_at: DateTime<Utc>,
-    pub(crate) price_cents: Option<u64>,
+pub struct OrderUpdate<OrderId> {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub status: OrderStatus,
+    pub updated_at: DateTime<Utc>,
+    pub price_cents: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

@@ -357,25 +357,16 @@ mod tests {
 
         let owner = signer.address();
 
-        let ethereum_evm = Evm::new(
-            ethereum_provider,
-            owner,
-            USDC_ETHEREUM,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let base_evm_for_cctp = Evm::new(
-            base_provider.clone(),
-            owner,
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
+        let cctp = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                ethereum_provider,
+                base_provider: base_provider.clone(),
+                owner,
+                usdc_ethereum: USDC_ETHEREUM,
+                usdc_base: USDC_BASE,
+            })
+            .unwrap(),
+        );
         let vault = Arc::new(
             VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
         );

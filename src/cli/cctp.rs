@@ -114,7 +114,8 @@ fn build_cctp_bridge<BP: Provider + Clone>(
     rebalancing: &RebalancingCtx,
     base_provider: BP,
     signer: PrivateKeySigner,
-) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, CctpError> {
+) -> Result<CctpBridge<impl Provider + Clone + 'static, impl Provider + Clone + 'static>, CctpError>
+{
     let owner = signer.address();
 
     let ethereum_provider = ProviderBuilder::new()

@@ -80,10 +80,9 @@ pub(super) async fn wait_until_market_open(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use httpmock::prelude::*;
     use serde_json::json;
-
-    use super::*;
 
     fn create_test_client(mock_server: &MockServer) -> Client {
         let api_info =
