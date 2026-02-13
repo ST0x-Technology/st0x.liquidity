@@ -19,7 +19,7 @@ use st0x_execution::{
 };
 
 use crate::event_sourced::{EventSourced, SqliteQuery};
-use crate::lifecycle::{Lifecycle, LifecycleError};
+use crate::lifecycle::LifecycleError;
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
@@ -598,6 +598,7 @@ mod tests {
     use st0x_execution::Positive;
 
     use super::*;
+    use crate::lifecycle::Lifecycle;
     use crate::threshold::Usdc;
 
     fn one_share_threshold() -> ExecutionThreshold {

@@ -13,6 +13,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
+use cqrs_es::persist::GenericQuery;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -222,7 +223,11 @@ impl Conductor {
             backfill_events(pool, &provider, &ctx.evm, end_block).await?;
         }
 
-        let onchain_trade = Arc::new(CqrsBuilder::<OnChainTrade>::new(pool.clone()).build(()));
+        let onchain_trade = Arc::new(
+            CqrsBuilder::<OnChainTrade>::new(pool.clone())
+                .build(())
+                .await?,
+        );
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
@@ -246,17 +251,23 @@ impl Conductor {
                 (position, position_query, Some(rebalancer_handle))
             }
             None => {
-                let (position, position_query) = build_position_cqrs(pool);
+                let (position, position_query) = build_position_cqrs(pool).await?;
                 (position, position_query, None)
             }
         };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
-        let offchain_order =
-            Arc::new(CqrsBuilder::<OffchainOrder>::new(pool.clone()).build(order_placer));
-        let vault_registry = CqrsBuilder::<VaultRegistry>::new(pool.clone()).build(());
+        let offchain_order = Arc::new(
+            CqrsBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await?,
+        );
 
-        let snapshot = build_inventory_snapshot_store(pool, inventory.clone());
+        let vault_registry = CqrsBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await?;
+
+        let snapshot = build_inventory_snapshot_store(pool, inventory.clone()).await?;
 
         let frameworks = CqrsFrameworks {
             onchain_trade,
@@ -371,7 +382,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         event_sender,
     );
 
-    let (built, wired) = manifest.wire(pool.clone());
+    let (built, wired) = manifest.wire(pool.clone()).await?;
 
     let frameworks = RebalancingCqrsFrameworks {
         mint: Arc::new(built.mint),
@@ -412,30 +423,33 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
 
 /// Constructs the position CQRS framework with its view query
 /// (without rebalancing trigger). Used when rebalancing is disabled.
-fn build_position_cqrs(pool: &SqlitePool) -> (Arc<Store<Position>>, Arc<SqliteQuery<Position>>) {
+async fn build_position_cqrs(
+    pool: &SqlitePool,
+) -> anyhow::Result<(Arc<Store<Position>>, Arc<SqliteQuery<Position>>)> {
     let position_view_repo = Arc::new(sqlite_es::SqliteViewRepository::new(
         pool.clone(),
         "position_view".to_string(),
     ));
-    let position_query = cqrs_es::persist::GenericQuery::new(position_view_repo.clone());
+    let position_query = GenericQuery::new(position_view_repo.clone());
 
     let view: wire::UnwiredQuery<SqliteQuery<Position>, wire::Cons<Position, wire::Nil>> =
-        wire::UnwiredQuery::new(cqrs_es::persist::GenericQuery::new(position_view_repo));
+        wire::UnwiredQuery::new(GenericQuery::new(position_view_repo));
 
     let (store, (view, ())) = CqrsBuilder::<Position>::new(pool.clone())
         .wire(view)
-        .build(());
+        .build(())
+        .await?;
 
     drop(view);
 
-    (Arc::new(store), Arc::new(position_query))
+    Ok((Arc::new(store), Arc::new(position_query)))
 }
 
 /// Constructs the inventory snapshot store with its query.
-fn build_inventory_snapshot_store(
+async fn build_inventory_snapshot_store(
     pool: &SqlitePool,
     inventory: Arc<RwLock<InventoryView>>,
-) -> Store<InventorySnapshot> {
+) -> anyhow::Result<Store<InventorySnapshot>> {
     let snapshot_query = InventorySnapshotQuery::new(inventory);
 
     let query: wire::UnwiredQuery<
@@ -445,9 +459,10 @@ fn build_inventory_snapshot_store(
 
     let (store, (_query, ())) = CqrsBuilder::<InventorySnapshot>::new(pool.clone())
         .wire(query)
-        .build(());
+        .build(())
+        .await?;
 
-    store
+    Ok(store)
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
@@ -1365,7 +1380,7 @@ mod tests {
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::inventory::ImbalanceThreshold;
     use crate::lifecycle::Lifecycle;
-    use crate::offchain_order::{OffchainOrderId, PriceCents, build_offchain_order_cqrs};
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
@@ -1415,7 +1430,8 @@ mod tests {
         let config = create_test_ctx_with_order_owner(Address::ZERO);
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -1471,7 +1487,8 @@ mod tests {
         let config = create_test_ctx_with_order_owner(Address::ZERO);
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -1525,7 +1542,8 @@ mod tests {
         let config = create_test_ctx_with_order_owner(Address::ZERO);
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -1580,7 +1598,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1609,7 +1628,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1642,7 +1662,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1676,7 +1697,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1707,7 +1729,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1745,7 +1768,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1784,7 +1808,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -2534,7 +2559,7 @@ mod tests {
     fn create_cqrs_frameworks_with_order_placer(
         pool: &SqlitePool,
         order_placer: Arc<dyn OrderPlacer>,
-    ) -> CqrsFrameworks {
+    ) -> (CqrsFrameworks, Arc<SqliteQuery<OffchainOrder>>) {
         let onchain_trade = Arc::new(wire::test_cqrs(pool.clone(), vec![], ()));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
@@ -2548,18 +2573,33 @@ mod tests {
             (),
         ));
 
-        let offchain_order = Arc::new(wire::test_cqrs(pool.clone(), vec![], order_placer));
+        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<OffchainOrder>,
+            Lifecycle<OffchainOrder>,
+        >::new(
+            pool.clone(), "offchain_order_view".to_string()
+        ));
+        let offchain_order_query = Arc::new(GenericQuery::new(offchain_order_view_repo.clone()));
+        let offchain_order = Arc::new(wire::test_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+            order_placer,
+        ));
+
         let vault_registry = wire::test_cqrs(pool.clone(), vec![], ());
         let snapshot = wire::test_cqrs(pool.clone(), vec![], ());
 
-        CqrsFrameworks {
-            onchain_trade,
-            position,
-            position_query,
-            offchain_order,
-            vault_registry,
-            snapshot,
-        }
+        (
+            CqrsFrameworks {
+                onchain_trade,
+                position,
+                position_query,
+                offchain_order,
+                vault_registry,
+                snapshot,
+            },
+            offchain_order_query,
+        )
     }
 
     fn trade_processing_cqrs_with_threshold(
@@ -2612,7 +2652,8 @@ mod tests {
     #[tokio::test]
     async fn trade_below_threshold_does_not_place_order() {
         let pool = setup_test_db().await;
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
@@ -2661,7 +2702,8 @@ mod tests {
     #[tokio::test]
     async fn trade_above_threshold_places_offchain_order() {
         let pool = setup_test_db().await;
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
@@ -2695,8 +2737,6 @@ mod tests {
             "Position should track the pending offchain order"
         );
 
-        let (_, offchain_order_query) = build_offchain_order_cqrs(&pool, succeeding_order_placer());
-
         let offchain_lifecycle = offchain_order_query
             .load(&offchain_order_id.to_string())
             .await
@@ -2715,7 +2755,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_trades_accumulate_then_trigger() {
         let pool = setup_test_db().await;
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
@@ -2769,7 +2810,8 @@ mod tests {
     #[tokio::test]
     async fn pending_order_blocks_new_execution() {
         let pool = setup_test_db().await;
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
@@ -2828,7 +2870,8 @@ mod tests {
     #[tokio::test]
     async fn periodic_checker_executes_after_order_completion() {
         let pool = setup_test_db().await;
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
@@ -2927,7 +2970,8 @@ mod tests {
     #[tokio::test]
     async fn restart_recovery_processes_unprocessed_queue_items() {
         let pool = setup_test_db().await;
-        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let (frameworks, _offchain_order_query) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
@@ -3561,7 +3605,7 @@ mod tests {
 
         // First "session": create position store, execute commands.
         {
-            let (position_store, position_query) = build_position_cqrs(&pool);
+            let (position_store, position_query) = build_position_cqrs(&pool).await.unwrap();
 
             position_store
                 .send(
@@ -3594,7 +3638,7 @@ mod tests {
 
         // Second "session": create NEW position store against the same pool.
         {
-            let (_position_store, position_query) = build_position_cqrs(&pool);
+            let (_position_store, position_query) = build_position_cqrs(&pool).await.unwrap();
 
             let position = crate::position::load_position(&position_query, &symbol)
                 .await

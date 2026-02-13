@@ -74,6 +74,8 @@ use sqlx::SqlitePool;
 use crate::event_sourced::{EventSourced, Store};
 use crate::lifecycle::Lifecycle;
 
+use super::schema_registry::Reconciler;
+
 /// Type-level cons cell for building linked lists of entities.
 ///
 /// Forms a compile-time linked list:
@@ -89,10 +91,10 @@ pub(crate) struct Nil;
 
 /// A query processor with compile-time wiring dependencies.
 ///
-/// Wraps an `Arc<Q>` and tracks which entities it still needs to
-/// be wired to via the `Deps` phantom type. The inner Arc is only
-/// extractable via [`into_inner`](Self::into_inner) when
-/// `Deps = Nil`.
+/// Wraps an `Arc<Processor>` and tracks which entities it still
+/// needs to be wired to via the `Deps` phantom type. The inner
+/// Arc is only extractable via [`into_inner`](Self::into_inner)
+/// when `Deps = Nil`.
 ///
 /// # Type Parameter Evolution
 ///
@@ -100,28 +102,28 @@ pub(crate) struct Nil;
 /// new instance with the head entity removed from `Deps`:
 ///
 /// ```text
-/// UnwiredQuery<Q, Cons<A, Cons<B, Nil>>>
+/// UnwiredQuery<Processor, Cons<A, Cons<B, Nil>>>
 ///     --wire to A-->
-/// UnwiredQuery<Q, Cons<B, Nil>>
+/// UnwiredQuery<Processor, Cons<B, Nil>>
 ///     --wire to B-->
-/// UnwiredQuery<Q, Nil>
+/// UnwiredQuery<Processor, Nil>
 ///     --into_inner-->
-/// Arc<Q>
+/// Arc<Processor>
 /// ```
 #[must_use = "query must be wired via CqrsBuilder, \
               then extracted with into_inner"]
-pub(crate) struct UnwiredQuery<Q, Deps> {
-    query: Arc<Q>,
+pub(crate) struct UnwiredQuery<Processor, Deps> {
+    query: Arc<Processor>,
     _deps: PhantomData<Deps>,
 }
 
-impl<Q, Deps> UnwiredQuery<Q, Deps> {
+impl<Processor, Deps> UnwiredQuery<Processor, Deps> {
     /// Creates a new unwired query with the given dependencies.
     ///
     /// The `Deps` type parameter should encode all
     /// [`EventSourced`] entities this query needs to be wired to
     /// before it can be used.
-    pub(crate) fn new(query: Q) -> Self {
+    pub(crate) fn new(query: Processor) -> Self {
         Self {
             query: Arc::new(query),
             _deps: PhantomData,
@@ -129,14 +131,14 @@ impl<Q, Deps> UnwiredQuery<Q, Deps> {
     }
 }
 
-impl<Q> UnwiredQuery<Q, Nil> {
+impl<Processor> UnwiredQuery<Processor, Nil> {
     /// Extracts the inner Arc. Only available when all
     /// dependencies are satisfied.
     ///
     /// This method's availability is the compile-time proof that
     /// all required entities have been wired via
     /// [`CqrsBuilder::wire`].
-    pub(crate) fn into_inner(self) -> Arc<Q> {
+    pub(crate) fn into_inner(self) -> Arc<Processor> {
         self.query
     }
 }
@@ -170,11 +172,17 @@ impl<E: EventSourced> CqrsBuilder<E, ()> {
 
     /// Builds the CQRS framework when no queries were wired.
     ///
+    /// Reconciles the entity's schema version before constructing
+    /// the framework, clearing stale snapshots if the version
+    /// changed.
+    ///
     /// Returns a [`Store`] for type-safe command dispatch.
-    pub(crate) fn build(self, services: E::Services) -> Store<E> {
+    pub(crate) async fn build(self, services: E::Services) -> Result<Store<E>, anyhow::Error> {
+        Reconciler::new(self.pool.clone()).reconcile::<E>().await?;
+
         #[allow(clippy::disallowed_methods)]
         let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
-        Store::new(cqrs)
+        Ok(Store::new(cqrs))
     }
 }
 
@@ -221,12 +229,19 @@ impl<E: EventSourced, H, T> CqrsBuilder<E, (H, T)> {
     /// Builds the CQRS framework, returning a [`Store`] with all
     /// wired queries.
     ///
-    /// Destructure the returned tuple to continue wiring to other
-    /// builders or extract via [`UnwiredQuery::into_inner`].
-    pub(crate) fn build(self, services: E::Services) -> (Store<E>, (H, T)) {
+    /// Reconciles the entity's schema version before constructing
+    /// the framework. Destructure the returned tuple to continue
+    /// wiring to other builders or extract via
+    /// [`UnwiredQuery::into_inner`].
+    pub(crate) async fn build(
+        self,
+        services: E::Services,
+    ) -> Result<(Store<E>, (H, T)), anyhow::Error> {
+        Reconciler::new(self.pool.clone()).reconcile::<E>().await?;
+
         #[allow(clippy::disallowed_methods)]
         let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
-        (Store::new(cqrs), self.wired)
+        Ok((Store::new(cqrs), self.wired))
     }
 }
 
@@ -419,14 +434,18 @@ mod tests {
         let (_store_a, (single, (multi, ()))) = CqrsBuilder::<AggregateA>::new(pool.clone())
             .wire(multi)
             .wire(single)
-            .build(());
+            .build(())
+            .await
+            .unwrap();
 
         let _single_arc: Arc<SingleEntityQuery> = single.into_inner();
 
         // Build AggregateB Store
         let (_store_b, (multi, ())) = CqrsBuilder::<AggregateB>::new(pool.clone())
             .wire(multi)
-            .build(());
+            .build(())
+            .await
+            .unwrap();
 
         let _multi_arc: Arc<MultiEntityQuery> = multi.into_inner();
     }

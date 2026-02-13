@@ -16,7 +16,7 @@ use std::fmt;
 use st0x_execution::Symbol;
 
 use crate::event_sourced::EventSourced;
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Never;
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -246,6 +246,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::lifecycle::Lifecycle;
     use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");

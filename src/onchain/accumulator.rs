@@ -5,7 +5,7 @@ use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, S
 
 use crate::event_sourced::SqliteQuery;
 use crate::onchain::OnChainError;
-use crate::position::load_position;
+use crate::position::{Position, load_position};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionParams {

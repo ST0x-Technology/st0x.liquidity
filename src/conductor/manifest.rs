@@ -102,7 +102,10 @@ impl QueryManifest {
     /// Destructures `self` to ensure every field is handled. If you
     /// add a new query to the manifest, this method won't compile
     /// until you wire it.
-    pub(super) fn wire(self, pool: SqlitePool) -> (BuiltFrameworks, WiredQueries) {
+    pub(super) async fn wire(
+        self,
+        pool: SqlitePool,
+    ) -> anyhow::Result<(BuiltFrameworks, WiredQueries)> {
         let Self {
             rebalancing_trigger,
             event_broadcaster,
@@ -113,31 +116,35 @@ impl QueryManifest {
             CqrsBuilder::<Position>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(position_view)
-                .build(());
+                .build(())
+                .await?;
 
         let (mint, (event_broadcaster, (rebalancing_trigger, ()))) =
             CqrsBuilder::<TokenizedEquityMint>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
-                .build(());
+                .build(())
+                .await?;
 
         let (redemption, (event_broadcaster, (rebalancing_trigger, ()))) =
             CqrsBuilder::<EquityRedemption>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
-                .build(());
+                .build(())
+                .await?;
 
         let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) =
             CqrsBuilder::<UsdcRebalance>::new(pool)
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
-                .build(());
+                .build(())
+                .await?;
 
         let _rebalancing_trigger = rebalancing_trigger.into_inner();
         let _event_broadcaster = event_broadcaster.into_inner();
         let position_view = position_view.into_inner();
 
-        (
+        Ok((
             BuiltFrameworks {
                 position,
                 mint,
@@ -145,6 +152,6 @@ impl QueryManifest {
                 usdc,
             },
             WiredQueries { position_view },
-        )
+        ))
     }
 }
