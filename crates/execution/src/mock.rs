@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::{
     ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement, OrderState,
-    SupportedExecutor, TryIntoExecutor,
+    OrderUpdate, SupportedExecutor, TryIntoExecutor,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -123,6 +123,19 @@ impl Executor for MockExecutor {
             order_id: order_id.clone(),
             price_cents: 10000, // $100.00 mock price
         })
+    }
+
+    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
+        if self.should_fail {
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
+            });
+        }
+
+        warn!("[TEST] Polling pending orders - no pending orders in test mode");
+
+        // Return empty list since test orders are immediately "filled"
+        Ok(Vec::new())
     }
 
     fn to_supported_executor(&self) -> SupportedExecutor {
@@ -241,6 +254,23 @@ mod tests {
         assert!(matches!(
             executor.place_market_order(order).await.unwrap_err(),
             ExecutionError::MockFailure { message } if message == "Simulated API error"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_success() {
+        let executor = MockExecutor::new();
+
+        assert!(executor.poll_pending_orders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_failure() {
+        let executor = MockExecutor::with_failure("Connection timeout");
+
+        assert!(matches!(
+            executor.poll_pending_orders().await.unwrap_err(),
+            ExecutionError::MockFailure { message } if message == "Connection timeout"
         ));
     }
 

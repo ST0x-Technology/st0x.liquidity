@@ -35,7 +35,6 @@ use st0x_event_sorcery::{
 };
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
-use crate::cctp::USDC_BASE;
 use crate::config::{Ctx, CtxError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
@@ -44,6 +43,7 @@ use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
+use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{
     ExecutionParams, check_all_positions, check_execution_readiness,
 };

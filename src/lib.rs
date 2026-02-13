@@ -19,7 +19,6 @@ mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
-mod cctp;
 pub mod cli;
 mod conductor;
 pub mod config;

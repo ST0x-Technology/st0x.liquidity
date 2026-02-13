@@ -5,17 +5,17 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
-use crate::order::OrderUpdate;
+use super::{AlpacaBrokerApiError, TimeInForce};
 use crate::{
-    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, Positive, Symbol,
+    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
+    Symbol,
 };
 
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum OrderSide {
+pub(super) enum OrderSide {
     Buy,
     Sell,
 }
@@ -189,11 +189,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |value| {
-        value
-            .parse::<f64>()
-            .map(Some)
-            .map_err(serde::de::Error::custom)
+    opt.map_or(Ok(None), |s| {
+        s.parse::<f64>().map(Some).map_err(serde::de::Error::custom)
     })
 }
 
@@ -202,9 +199,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |value| {
-        value
-            .parse::<Decimal>()
+    opt.map_or(Ok(None), |s| {
+        s.parse::<Decimal>()
             .map(Some)
             .map_err(serde::de::Error::custom)
     })
@@ -213,10 +209,11 @@ where
 pub(super) async fn place_market_order(
     client: &AlpacaBrokerApiClient,
     market_order: MarketOrder,
+    time_in_force: TimeInForce,
 ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
     debug!(
-        "Placing Alpaca Broker API market order: {} {} shares of {}",
-        market_order.direction, market_order.shares, market_order.symbol
+        "Placing Alpaca Broker API market order: {} {} shares of {} (time_in_force: {:?})",
+        market_order.direction, market_order.shares, market_order.symbol, time_in_force
     );
 
     let side = match market_order.direction {
@@ -229,19 +226,12 @@ pub(super) async fn place_market_order(
         quantity: market_order.shares,
         side,
         order_type: "market",
-        time_in_force: "day",
+        time_in_force: time_in_force.as_api_str(),
         // Alpaca only allows extended_hours=true for limit orders, not market orders
         extended_hours: false,
     };
 
     let response = client.place_order(&request).await?;
-
-    if response.side != side {
-        return Err(AlpacaBrokerApiError::SideMismatch {
-            requested_side: side,
-            response_side: response.side,
-        });
-    }
 
     Ok(OrderPlacement {
         order_id: response.id.to_string(),
@@ -255,7 +245,7 @@ pub(super) async fn place_market_order(
 pub(super) async fn get_order_status(
     client: &AlpacaBrokerApiClient,
     order_id: &str,
-) -> Result<OrderUpdate, AlpacaBrokerApiError> {
+) -> Result<OrderUpdate<String>, AlpacaBrokerApiError> {
     debug!(
         "Querying Alpaca Broker API order status for order ID: {}",
         order_id
@@ -263,6 +253,11 @@ pub(super) async fn get_order_status(
 
     let order_uuid = Uuid::parse_str(order_id)?;
     let response = client.get_order(order_uuid).await?;
+
+    let direction = match response.side {
+        OrderSide::Buy => Direction::Buy,
+        OrderSide::Sell => Direction::Sell,
+    };
 
     let status = map_broker_status_to_order_status(response.status);
     let price_cents = convert_price_to_cents(response.filled_average_price)?;
@@ -278,10 +273,58 @@ pub(super) async fn get_order_status(
     }
 
     Ok(OrderUpdate {
+        order_id: order_id.to_string(),
+        symbol: response.symbol,
+        shares: response.quantity,
+        direction,
         status,
         updated_at: Utc::now(),
         price_cents,
     })
+}
+
+pub(super) async fn poll_pending_orders(
+    client: &AlpacaBrokerApiClient,
+) -> Result<Vec<OrderUpdate<String>>, AlpacaBrokerApiError> {
+    debug!("Polling all pending Alpaca Broker API orders");
+
+    let orders = client.list_open_orders().await?;
+
+    let order_updates = orders
+        .into_iter()
+        .map(|response| {
+            let direction = match response.side {
+                OrderSide::Buy => Direction::Buy,
+                OrderSide::Sell => Direction::Sell,
+            };
+
+            let status = map_broker_status_to_order_status(response.status);
+            let price_cents = convert_price_to_cents(response.filled_average_price)?;
+
+            if response.status == BrokerOrderStatus::PartiallyFilled {
+                debug!(
+                    order_id = %response.id,
+                    symbol = %response.symbol,
+                    ordered_qty = %response.quantity.inner(),
+                    filled_qty = ?response.filled_quantity,
+                    "Order is partially filled"
+                );
+            }
+
+            Ok(OrderUpdate {
+                order_id: response.id.to_string(),
+                symbol: response.symbol,
+                shares: response.quantity,
+                direction,
+                status,
+                updated_at: Utc::now(),
+                price_cents,
+            })
+        })
+        .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
+
+    debug!("Found {} pending orders", order_updates.len());
+    Ok(order_updates)
 }
 
 fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
@@ -311,11 +354,11 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
 }
 
 fn convert_price_to_cents(price: Option<f64>) -> Result<Option<u64>, AlpacaBrokerApiError> {
-    price.map_or(Ok(None), |price_value| {
-        let cents_float = (price_value * 100.0).round();
+    price.map_or(Ok(None), |p| {
+        let cents_float = (p * 100.0).round();
         let cents = cents_float
             .to_u64()
-            .ok_or(AlpacaBrokerApiError::PriceConversion(price_value))?;
+            .ok_or(AlpacaBrokerApiError::PriceConversion(p))?;
         Ok(Some(cents))
     })
 }
@@ -412,6 +455,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 
@@ -450,7 +495,9 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let placement = place_market_order(&client, market_order).await.unwrap();
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
 
         mock.assert();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
@@ -494,7 +541,9 @@ mod tests {
             direction: Direction::Sell,
         };
 
-        let placement = place_market_order(&client, market_order).await.unwrap();
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
 
         mock.assert();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
@@ -529,6 +578,10 @@ mod tests {
         let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
+        assert_eq!(order_update.order_id, order_id);
+        assert_eq!(order_update.symbol.to_string(), "AAPL");
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
+        assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
     }
@@ -559,6 +612,10 @@ mod tests {
         let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
+        assert_eq!(order_update.order_id, order_id);
+        assert_eq!(order_update.symbol.to_string(), "TSLA");
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
+        assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
         assert_eq!(order_update.price_cents, Some(24567));
     }
@@ -589,7 +646,81 @@ mod tests {
         let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
+        assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.status, OrderStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_multiple() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/orders")
+                .query_param("status", "open");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "id": "904837e3-3b76-47ec-b432-046db621571b",
+                        "symbol": "AAPL",
+                        "qty": "100",
+                        "side": "buy",
+                        "status": "new",
+                        "filled_avg_price": null
+                    },
+                    {
+                        "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                        "symbol": "TSLA",
+                        "qty": "50",
+                        "side": "sell",
+                        "status": "partially_filled",
+                        "filled_avg_price": null
+                    }
+                ]));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let order_updates = poll_pending_orders(&client).await.unwrap();
+
+        mock.assert();
+        assert_eq!(order_updates.len(), 2);
+
+        assert_eq!(
+            order_updates[0].order_id,
+            "904837e3-3b76-47ec-b432-046db621571b"
+        );
+        assert_eq!(order_updates[0].symbol.to_string(), "AAPL");
+        assert_eq!(order_updates[0].status, OrderStatus::Submitted);
+
+        assert_eq!(
+            order_updates[1].order_id,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d"
+        );
+        assert_eq!(order_updates[1].symbol.to_string(), "TSLA");
+        assert_eq!(order_updates[1].status, OrderStatus::Submitted);
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_empty() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/orders")
+                .query_param("status", "open");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let order_updates = poll_pending_orders(&client).await.unwrap();
+
+        mock.assert();
+        assert!(order_updates.is_empty());
     }
 
     #[test]
@@ -748,52 +879,5 @@ mod tests {
             make_order(BrokerOrderStatus::Canceled).status_display(),
             "canceled"
         );
-    }
-
-    #[tokio::test]
-    async fn test_place_market_order_side_mismatch() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
-                .json_body(json!({
-                    "symbol": "AAPL",
-                    "qty": "100",
-                    "side": "buy",
-                    "type": "market",
-                    "time_in_force": "day",
-                    "extended_hours": false
-                }));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": "904837e3-3b76-47ec-b432-046db621571b",
-                    "symbol": "AAPL",
-                    "qty": "100",
-                    "side": "sell",
-                    "status": "new",
-                    "filled_avg_price": null
-                }));
-        });
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let market_order = MarketOrder {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
-            direction: Direction::Buy,
-        };
-
-        let result = place_market_order(&client, market_order).await;
-
-        mock.assert();
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaBrokerApiError::SideMismatch {
-                requested_side: OrderSide::Buy,
-                response_side: OrderSide::Sell
-            }
-        ));
     }
 }

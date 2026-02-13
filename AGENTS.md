@@ -69,8 +69,8 @@ The project uses a strict document hierarchy:
 4. **Tests** - Downstream from plan. Written before implementation (TDD).
 5. **Implementation** - Makes the tests pass.
 
-**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → plan
-the implementation.
+**Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
+plan the implementation.
 
 ## Plan & Review
 
@@ -333,7 +333,7 @@ For detailed implementation requirements and module organization, see
 - Parses onchain events into actionable trade data with strict validation
 - Expects symbol pairs of USDC + tokenized equity with "t" prefix (e.g.,
   "tAAPL")
-- Determines Schwab trade direction: buying tokenized equity onchain → selling
+- Determines Schwab trade direction: buying tokenized equity onchain -> selling
   on Schwab
 - Calculates prices in cents and maintains onchain/offchain trade ratios
 
@@ -342,7 +342,7 @@ For detailed implementation requirements and module organization, see
 - Each blockchain event spawns independent async execution flow
 - Handles throughput mismatch: fast onchain events vs slower Schwab API calls
 - No artificial concurrency limits - processes events as they arrive
-- Flow: Parse Event → SQLite Deduplication Check → Schwab API Call → Record
+- Flow: Parse Event -> SQLite Deduplication Check -> Schwab API Call -> Record
   Result
 
 ### Authentication & API Integration
@@ -374,7 +374,7 @@ For detailed implementation requirements and module organization, see
 - `symbol_locks`: Per-symbol execution concurrency control
 
 **Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
-tracking (pending → completed/failed), retry logic with exponential backoff
+tracking (pending -> completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
@@ -737,7 +737,7 @@ Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 #### ASCII only in code
 
-Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
+Use ASCII characters only in code and comments. For arrows, use `->` not `->`.
 Unicode breaks vim navigation and grep workflows.
 
 #### No single-letter variables or arguments

@@ -97,6 +97,8 @@ pub(crate) struct VaultRegistry {
     pub(crate) last_updated: DateTime<Utc>,
 }
 
+pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
+
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DiscoveredEquityVault {

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use base64::engine::general_purpose;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Serialize;
 use tracing::debug;
@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
 use super::auth::{AccountResponse, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+use super::executor::AssetResponse;
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
+use crate::Symbol;
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
@@ -32,7 +34,7 @@ impl std::fmt::Debug for AlpacaBrokerApiClient {
 impl AlpacaBrokerApiClient {
     pub(crate) fn new(ctx: &AlpacaBrokerApiCtx) -> Result<Self, AlpacaBrokerApiError> {
         let credentials = format!("{}:{}", ctx.api_key, ctx.api_secret);
-        let encoded_credentials = general_purpose::STANDARD.encode(credentials.as_bytes());
+        let encoded_credentials = BASE64_STANDARD.encode(credentials.as_bytes());
         let auth_value = format!("Basic {encoded_credentials}");
 
         let headers = HeaderMap::from_iter([
@@ -105,6 +107,30 @@ impl AlpacaBrokerApiClient {
 
         debug!("Fetching order {} from {}", order_id, url);
 
+        self.get(&url).await
+    }
+
+    /// List open orders
+    pub(super) async fn list_open_orders(
+        &self,
+    ) -> Result<Vec<OrderResponse>, AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders?status=open",
+            self.base_url, self.account_id
+        );
+
+        debug!("Listing open orders from {}", url);
+
+        self.get(&url).await
+    }
+
+    /// Get asset information by symbol
+    pub(super) async fn get_asset(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<AssetResponse, AlpacaBrokerApiError> {
+        let url = format!("{}/v1/assets/{symbol}", self.base_url);
+        debug!("Fetching asset info for {symbol}");
         self.get(&url).await
     }
 
@@ -183,6 +209,7 @@ mod tests {
     use httpmock::prelude::*;
 
     use super::*;
+    use crate::alpaca_broker_api::{AssetStatus, TimeInForce};
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
@@ -190,6 +217,8 @@ mod tests {
             api_secret: "test_secret_key".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 
@@ -290,6 +319,58 @@ mod tests {
         mock.assert();
         assert!(
             matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_asset_success() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let asset = client.get_asset(&symbol).await.unwrap();
+
+        mock.assert();
+        assert_eq!(asset.status, AssetStatus::Active);
+        assert!(asset.tradable);
+    }
+
+    #[tokio::test]
+    async fn test_get_asset_not_found() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/INVALID");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "code": 40_410_000,
+                    "message": "asset not found for INVALID"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("INVALID").unwrap();
+        let result = client.get_asset(&symbol).await;
+
+        mock.assert();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 404)
         );
     }
 }

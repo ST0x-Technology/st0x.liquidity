@@ -7,14 +7,14 @@ use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 
+use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
+use st0x_bridge::{Attestation, Bridge, BridgeDirection};
+
 use super::CctpChain;
 use crate::bindings::IERC20;
-use crate::cctp::{
-    BridgeDirection, CctpBridge, CctpError, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
-    USDC_BASE, USDC_ETHEREUM,
-};
 use crate::config::Ctx;
 use crate::onchain::http_client_with_retry;
+use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::RebalancingCtx;
 use crate::threshold::Usdc;
 
@@ -96,17 +96,15 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     writeln!(
         stdout,
         "   Attestation received ({} bytes)",
-        response.attestation.len()
+        response.as_bytes().len()
     )?;
 
     writeln!(stdout, "\n3. Minting USDC on {dest:?}...")?;
-    let mint_receipt = cctp_bridge
-        .mint(direction, response.message, response.attestation)
-        .await?;
+    let mint_receipt = cctp_bridge.mint(direction, &response).await?;
     writeln!(
         stdout,
         "Bridge complete! Mint tx: {}\n  Amount received: {} (fee: {})",
-        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee
     )?;
 
     Ok(())
@@ -126,23 +124,13 @@ fn build_cctp_bridge<BP: Provider + Clone>(
         .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
 
-    let ethereum = Evm::new(
+    CctpBridge::try_from_ctx(CctpCtx {
         ethereum_provider,
-        owner,
-        USDC_ETHEREUM,
-        TOKEN_MESSENGER_V2,
-        MESSAGE_TRANSMITTER_V2,
-    );
-
-    let base = Evm::new(
         base_provider,
         owner,
-        USDC_BASE,
-        TOKEN_MESSENGER_V2,
-        MESSAGE_TRANSMITTER_V2,
-    );
-
-    CctpBridge::new(ethereum, base)
+        usdc_ethereum: USDC_ETHEREUM,
+        usdc_base: USDC_BASE,
+    })
 }
 
 pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send + Sync + 'static>(
@@ -178,17 +166,15 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     writeln!(
         stdout,
         "   Attestation received ({} bytes)",
-        response.attestation.len()
+        response.as_bytes().len()
     )?;
 
     writeln!(stdout, "   Calling receiveMessage on {dest_chain:?}...")?;
-    let mint_receipt = cctp_bridge
-        .mint(direction, response.message, response.attestation)
-        .await?;
+    let mint_receipt = cctp_bridge.mint(direction, &response).await?;
     writeln!(
         stdout,
         "CCTP transfer recovered! Mint tx: {}\n  Amount received: {} (fee: {})",
-        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee
     )?;
 
     Ok(())

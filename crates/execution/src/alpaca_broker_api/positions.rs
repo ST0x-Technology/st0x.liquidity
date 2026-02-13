@@ -133,6 +133,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::alpaca_broker_api::TimeInForce;
     use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
@@ -141,6 +142,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 
@@ -190,7 +193,7 @@ mod tests {
         let aapl = state
             .positions
             .iter()
-            .find(|position| position.symbol.to_string() == "AAPL")
+            .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
         assert_eq!(aapl.quantity, FractionalShares::new(Decimal::new(105, 1)));
         assert_eq!(aapl.market_value_cents, Some(157_500));

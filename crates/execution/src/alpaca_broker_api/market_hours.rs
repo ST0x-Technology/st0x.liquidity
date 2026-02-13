@@ -23,16 +23,16 @@ fn deserialize_date<'de, D>(deserializer: D) -> Result<NaiveDate, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let date_str = String::deserialize(deserializer)?;
-    NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(serde::de::Error::custom)
+    let s = String::deserialize(deserializer)?;
+    NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(serde::de::Error::custom)
 }
 
 fn deserialize_time<'de, D>(deserializer: D) -> Result<NaiveTime, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let time_str = String::deserialize(deserializer)?;
-    NaiveTime::parse_from_str(&time_str, "%H:%M").map_err(serde::de::Error::custom)
+    let s = String::deserialize(deserializer)?;
+    NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom)
 }
 
 enum MarketStatus {
@@ -212,6 +212,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::alpaca_broker_api::TimeInForce;
     use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
@@ -220,6 +221,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 

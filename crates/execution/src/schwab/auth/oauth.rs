@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use tracing::{debug, info};
 use url::Url;
 
-use super::super::{SchwabAction, SchwabError, tokens::SchwabTokens};
+use super::super::{SchwabError, tokens::SchwabTokens};
 
 static DEFAULT_REDIRECT_URI: LazyLock<Result<Url, url::ParseError>> =
     LazyLock::new(|| Url::parse("https://127.0.0.1"));
@@ -58,6 +58,9 @@ pub(crate) struct SchwabAuthResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountNumbers {
+    // Field exists in API response but isn't currently used
+    #[allow(dead_code)]
+    pub account_number: String,
     pub hash_value: String,
 }
 
@@ -91,7 +94,7 @@ impl SchwabAuthCtx {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(SchwabError::RequestFailed {
-                action: SchwabAction::GetAccountHash,
+                action: "get account hash".to_string(),
                 status,
                 body,
             });
@@ -161,7 +164,7 @@ impl SchwabAuthCtx {
             let status = response.status();
             let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
-                action: SchwabAction::GetTokens,
+                action: "get tokens".to_string(),
                 status,
                 body,
             });
@@ -216,7 +219,7 @@ impl SchwabAuthCtx {
             let status = response.status();
             let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
-                action: SchwabAction::TokenRequest,
+                action: "token request".to_string(),
                 status,
                 body,
             });
@@ -237,7 +240,7 @@ async fn extract_error_body(response: reqwest::Response) -> String {
     let is_gzipped = response
         .headers()
         .get("content-encoding")
-        .map(HeaderValue::as_bytes)
+        .map(reqwest::header::HeaderValue::as_bytes)
         == Some(b"gzip");
 
     if is_gzipped {
@@ -379,7 +382,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == SchwabAction::GetTokens && status.as_u16() == 400
+            if action == "get tokens" && status.as_u16() == 400
         ));
     }
 
@@ -734,7 +737,7 @@ mod tests {
         assert_eq!(mock.hits(), 1);
         match error {
             SchwabError::RequestFailed { action, status, .. } => {
-                assert_eq!(action, SchwabAction::GetTokens);
+                assert_eq!(action, "get tokens");
                 assert_eq!(status.as_u16(), 500);
             }
             other => panic!("Expected RequestFailed error, got: {other:?}"),

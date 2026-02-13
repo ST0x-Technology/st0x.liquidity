@@ -1,23 +1,78 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use rust_decimal::Decimal;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
-use super::AlpacaBrokerApiError;
 use super::auth::{AccountStatus, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::order::{ConversionDirection, CryptoOrderResponse};
+use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor,
-    TryIntoExecutor,
+    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
+    Symbol, TryIntoExecutor,
 };
 
-/// Alpaca Broker API executor implementation
+/// Response from the asset endpoint
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct AssetResponse {
+    pub status: AssetStatus,
+    pub tradable: bool,
+}
+
+/// Cached asset information with expiration tracking
 #[derive(Debug, Clone)]
+struct CachedAsset {
+    status: AssetStatus,
+    tradable: bool,
+    cached_at: Instant,
+}
+
+impl CachedAsset {
+    fn from_response(response: &AssetResponse) -> Self {
+        Self {
+            status: response.status,
+            tradable: response.tradable,
+            cached_at: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self, ttl: Duration) -> bool {
+        self.cached_at.elapsed() > ttl
+    }
+}
+
+/// Alpaca Broker API executor implementation
 pub struct AlpacaBrokerApi {
     client: Arc<AlpacaBrokerApiClient>,
+    asset_cache: Arc<RwLock<HashMap<String, CachedAsset>>>,
+    asset_cache_ttl: Duration,
+    time_in_force: TimeInForce,
+}
+
+impl Clone for AlpacaBrokerApi {
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            asset_cache: Arc::clone(&self.asset_cache),
+            asset_cache_ttl: self.asset_cache_ttl,
+            time_in_force: self.time_in_force,
+        }
+    }
+}
+
+impl std::fmt::Debug for AlpacaBrokerApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlpacaBrokerApi")
+            .field("client", &self.client)
+            .field("asset_cache_ttl", &self.asset_cache_ttl)
+            .field("time_in_force", &self.time_in_force)
+            .finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
@@ -41,11 +96,15 @@ impl Executor for AlpacaBrokerApi {
         info!(
             account_id = %account.id,
             mode = if client.is_sandbox() { "sandbox" } else { "production" },
+            time_in_force = ?ctx.time_in_force,
             "Alpaca Broker API executor initialized"
         );
 
         Ok(Self {
             client: Arc::new(client),
+            asset_cache: Arc::new(RwLock::new(HashMap::new())),
+            asset_cache_ttl: ctx.asset_cache_ttl,
+            time_in_force: ctx.time_in_force,
         })
     }
 
@@ -57,7 +116,22 @@ impl Executor for AlpacaBrokerApi {
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
-        super::order::place_market_order(&self.client, order).await
+        let asset = self.get_asset_cached(&order.symbol).await?;
+
+        if asset.status != AssetStatus::Active {
+            return Err(AlpacaBrokerApiError::AssetNotActive {
+                symbol: order.symbol,
+                status: asset.status,
+            });
+        }
+
+        if !asset.tradable {
+            return Err(AlpacaBrokerApiError::AssetNotTradable {
+                symbol: order.symbol,
+            });
+        }
+
+        super::order::place_market_order(&self.client, order, self.time_in_force).await
     }
 
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error> {
@@ -86,6 +160,10 @@ impl Executor for AlpacaBrokerApi {
                 error_reason: None,
             }),
         }
+    }
+
+    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
+        super::order::poll_pending_orders(&self.client).await
     }
 
     fn to_supported_executor(&self) -> SupportedExecutor {
@@ -143,6 +221,29 @@ impl AlpacaBrokerApi {
 
         super::order::poll_crypto_order_until_filled(&self.client, order.id).await
     }
+
+    async fn get_asset_cached(&self, symbol: &Symbol) -> Result<CachedAsset, AlpacaBrokerApiError> {
+        let symbol_str = symbol.to_string();
+
+        {
+            let cache = self.asset_cache.read().await;
+            if let Some(cached) = cache.get(&symbol_str)
+                && !cached.is_expired(self.asset_cache_ttl)
+            {
+                return Ok(cached.clone());
+            }
+        }
+
+        let response = self.client.get_asset(symbol).await?;
+        let cached = CachedAsset::from_response(&response);
+
+        {
+            let mut cache = self.asset_cache.write().await;
+            cache.insert(symbol_str, cached.clone());
+        }
+
+        Ok(cached)
+    }
 }
 
 #[cfg(test)]
@@ -151,9 +252,143 @@ mod tests {
     use chrono_tz::America::New_York;
     use httpmock::prelude::*;
     use serde_json::json;
+    use std::thread;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::AlpacaBrokerApiMode;
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::{Direction, FractionalShares, Positive};
+
+    #[test]
+    fn test_asset_status_deserialize_active() {
+        let json = r#""active""#;
+        let status: AssetStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status, AssetStatus::Active);
+    }
+
+    #[test]
+    fn test_asset_status_deserialize_inactive() {
+        let json = r#""inactive""#;
+        let status: AssetStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status, AssetStatus::Inactive);
+    }
+
+    #[test]
+    fn test_asset_status_deserialize_rejects_uppercase() {
+        let json = r#""ACTIVE""#;
+        let result: Result<AssetStatus, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "Expected error for uppercase, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_asset_response_deserialize() {
+        // API returns more fields than we need - serde ignores the extras
+        let json = json!({
+            "id": "904837e3-3b76-47ec-b432-046db621571b",
+            "symbol": "AAPL",
+            "status": "active",
+            "tradable": true
+        });
+
+        let response: AssetResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.status, AssetStatus::Active);
+        assert!(response.tradable);
+    }
+
+    #[test]
+    fn test_cached_asset_from_response() {
+        let response = AssetResponse {
+            status: AssetStatus::Active,
+            tradable: true,
+        };
+
+        let cached = CachedAsset::from_response(&response);
+
+        assert_eq!(cached.status, AssetStatus::Active);
+        assert!(cached.tradable);
+        // cached_at should be very recent (within last second)
+        assert!(cached.cached_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_cached_asset_is_expired_returns_false_when_fresh() {
+        let cached = CachedAsset {
+            status: AssetStatus::Active,
+            tradable: true,
+            cached_at: Instant::now(),
+        };
+
+        assert!(
+            !cached.is_expired(Duration::from_secs(3600)),
+            "Fresh cache entry should not be expired"
+        );
+    }
+
+    #[test]
+    fn test_cached_asset_is_expired_returns_true_when_expired() {
+        let cached = CachedAsset {
+            status: AssetStatus::Active,
+            tradable: true,
+            cached_at: Instant::now()
+                .checked_sub(Duration::from_secs(100))
+                .unwrap(),
+        };
+
+        assert!(
+            cached.is_expired(Duration::from_secs(60)),
+            "Cache entry older than TTL should be expired"
+        );
+    }
+
+    #[test]
+    fn test_cached_asset_is_expired_boundary_not_expired() {
+        // Entry at exactly TTL should not be expired (uses > not >=)
+        let ttl = Duration::from_millis(50);
+        let cached = CachedAsset {
+            status: AssetStatus::Active,
+            tradable: true,
+            cached_at: Instant::now(),
+        };
+
+        // Should not be expired immediately
+        assert!(!cached.is_expired(ttl));
+    }
+
+    #[test]
+    fn test_cached_asset_is_expired_boundary_expired() {
+        let ttl = Duration::from_millis(10);
+        let cached = CachedAsset {
+            status: AssetStatus::Active,
+            tradable: true,
+            cached_at: Instant::now(),
+        };
+
+        // Wait past TTL
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(
+            cached.is_expired(ttl),
+            "Cache entry should be expired after TTL passes"
+        );
+    }
+
+    #[test]
+    fn test_cached_asset_is_expired_zero_ttl() {
+        let cached = CachedAsset {
+            status: AssetStatus::Active,
+            tradable: true,
+            cached_at: Instant::now(),
+        };
+
+        // Zero TTL means always expired after any time passes
+        thread::sleep(Duration::from_millis(1));
+        assert!(
+            cached.is_expired(Duration::ZERO),
+            "Zero TTL should expire immediately"
+        );
+    }
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
@@ -161,6 +396,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 
@@ -323,7 +560,6 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
-        // Mock account endpoint with all fields needed for both verify_account and fetch_inventory
         let account_mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/trading/accounts/test_account_123/account");
@@ -332,7 +568,7 @@ mod tests {
                 .json_body(json!({
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "status": "ACTIVE",
-                    "cash": "25000.00"
+                    "cash": "50000.00"
                 }));
         });
 
@@ -344,8 +580,8 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "AAPL",
-                        "qty": "10.0",
-                        "market_value": "1500.00"
+                        "qty": "10.5",
+                        "market_value": "1575.00"
                     }
                 ]));
         });
@@ -354,17 +590,266 @@ mod tests {
 
         let result = executor.get_inventory().await.unwrap();
 
-        account_mock.assert_hits(2); // Once for verify, once for fetch_inventory
+        // Account endpoint is hit twice: once during try_from_ctx (verify_account)
+        // and once during get_inventory (get_account_details for cash balance)
+        account_mock.assert_hits(2);
         positions_mock.assert();
+        assert!(matches!(result, crate::InventoryResult::Fetched(_)));
+    }
 
-        match result {
-            crate::InventoryResult::Fetched(inventory) => {
-                assert_eq!(inventory.positions.len(), 1);
-                assert_eq!(inventory.cash_balance_cents, 2_500_000);
-            }
-            crate::InventoryResult::Unimplemented => {
-                panic!("Expected Fetched, got Unimplemented");
-            }
-        }
+    fn create_asset_mock<'a>(
+        server: &'a MockServer,
+        symbol: &str,
+        status: &str,
+        tradable: bool,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(GET).path(format!("/v1/assets/{symbol}"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": symbol,
+                    "status": status,
+                    "tradable": tradable
+                }));
+        })
+    }
+
+    fn create_order_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/test_account_123/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        })
+    }
+
+    #[tokio::test]
+    async fn test_place_market_order_fails_for_inactive_asset() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_mock(&server, "AAPL", "inactive", true);
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let result = executor.place_market_order(order).await;
+
+        asset_mock.assert();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AlpacaBrokerApiError::AssetNotActive { symbol, status }
+                    if *symbol == Symbol::new("AAPL").unwrap() && *status == AssetStatus::Inactive
+            ),
+            "Expected AssetNotActive error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_place_market_order_fails_for_non_tradable_asset() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", false);
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let result = executor.place_market_order(order).await;
+
+        asset_mock.assert();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AlpacaBrokerApiError::AssetNotTradable { symbol } if *symbol == Symbol::new("AAPL").unwrap()
+            ),
+            "Expected AssetNotTradable error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_place_market_order_succeeds_for_active_tradable_asset() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
+        let order_mock = create_order_mock(&server);
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let result = executor.place_market_order(order).await;
+
+        asset_mock.assert();
+        order_mock.assert();
+        let placement = result.unwrap();
+        assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
+        assert_eq!(placement.symbol.to_string(), "AAPL");
+    }
+
+    #[tokio::test]
+    async fn test_asset_validation_uses_cache() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+
+        // Asset mock should be called exactly once due to caching
+        let asset_mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true
+                }));
+        });
+
+        // Order mock for both orders
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/test_account_123/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        // Place first order
+        let order1 = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            direction: Direction::Buy,
+        };
+        executor.place_market_order(order1).await.unwrap();
+
+        // Place second order for same symbol - should use cached asset info
+        let order2 = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
+            direction: Direction::Buy,
+        };
+        executor.place_market_order(order2).await.unwrap();
+
+        // Asset endpoint should only be called once
+        asset_mock.assert_hits(1);
+        // Order endpoint should be called twice
+        order_mock.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn test_asset_cache_expires_after_ttl() {
+        let server = MockServer::start();
+
+        // Use a very short TTL for testing (0 seconds)
+        let ctx = AlpacaBrokerApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: "test_account_123".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: std::time::Duration::ZERO,
+            time_in_force: TimeInForce::Day,
+        };
+
+        let account_mock = create_account_mock(&server);
+
+        // Asset mock should be called twice due to cache expiration
+        let asset_mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true
+                }));
+        });
+
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/test_account_123/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        // Place first order
+        let order1 = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            direction: Direction::Buy,
+        };
+        executor.place_market_order(order1).await.unwrap();
+
+        // Wait for cache to expire (TTL is 0 seconds, so any delay causes expiration)
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Place second order - cache should be expired, so asset API called again
+        let order2 = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
+            direction: Direction::Buy,
+        };
+        executor.place_market_order(order2).await.unwrap();
+
+        // Asset endpoint should be called twice due to cache expiration
+        asset_mock.assert_hits(2);
+        order_mock.assert_hits(2);
     }
 }

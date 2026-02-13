@@ -1,42 +1,7 @@
 use reqwest::header::InvalidHeaderValue;
-use std::fmt;
 use thiserror::Error;
 
-use crate::WholeSharesError;
-
-/// Identifies the Schwab API operation that failed, used in error context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchwabAction {
-    PlaceOrder,
-    GetOrderStatus,
-    ExtractOrderId,
-    GetAccountHash,
-    GetTokens,
-    TokenRequest,
-    FormatUrl,
-    FetchMarketHours,
-    ParseMarketHours,
-    ParseMarketHoursDate,
-    ParseDatetime,
-}
-
-impl fmt::Display for SchwabAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PlaceOrder => write!(f, "place order"),
-            Self::GetOrderStatus => write!(f, "get order status"),
-            Self::ExtractOrderId => write!(f, "extract order ID"),
-            Self::GetAccountHash => write!(f, "get account hash"),
-            Self::GetTokens => write!(f, "get tokens"),
-            Self::TokenRequest => write!(f, "token request"),
-            Self::FormatUrl => write!(f, "format URL"),
-            Self::FetchMarketHours => write!(f, "fetch market hours"),
-            Self::ParseMarketHours => write!(f, "parse market hours"),
-            Self::ParseMarketHoursDate => write!(f, "parse market hours date"),
-            Self::ParseDatetime => write!(f, "parse datetime"),
-        }
-    }
-}
+use crate::InvalidSharesError;
 
 mod auth;
 mod encryption;
@@ -105,34 +70,35 @@ pub enum SchwabError {
     AccountIndexOutOfBounds { index: usize, count: usize },
 
     /// Schwab API request completed with non-success HTTP status.
-    /// `action`: The attempted operation.
+    /// `action`: Description of the attempted operation.
     /// `status`: HTTP status code returned.
     /// `body`: Response body text.
     #[error("{action} failed with status: {status}, body: {body}")]
     RequestFailed {
-        action: SchwabAction,
+        action: String,
         status: reqwest::StatusCode,
         body: String,
     },
 
-    /// Integer conversion failed during configuration.
-    #[error("Configuration integer conversion failed: {0}")]
-    IntegerConversion(#[from] std::num::TryFromIntError),
+    /// Broker configuration validation failed during initialization.
+    #[error("Invalid configuration: {0}")]
+    InvalidConfiguration(String),
 
     /// Order execution database persistence failed, wraps [`crate::error::PersistenceError`].
     #[error("Execution persistence error: {0}")]
     ExecutionPersistence(#[from] crate::error::PersistenceError),
 
     /// Schwab API response body parsing failed.
-    /// `action`: The attempted operation.
+    /// `action`: Description of the attempted operation.
     /// `response_text`: Raw API response body.
-    /// `source`: The JSON deserialization error.
-    #[error("Failed to parse API response: {action}, response: {response_text}, error: {source}")]
+    /// `parse_error`: Error message from parser.
+    #[error(
+        "Failed to parse API response: {action}, response: {response_text}, error: {parse_error}"
+    )]
     ApiResponseParse {
-        action: SchwabAction,
+        action: String,
         response_text: String,
-        #[source]
-        source: serde_json::Error,
+        parse_error: String,
     },
 
     /// Token encryption or decryption failed, wraps [`encryption::EncryptionError`].
@@ -141,7 +107,7 @@ pub enum SchwabError {
 
     /// Invalid share quantity for Schwab API (requires whole shares).
     #[error("Invalid shares for Schwab API: {0}")]
-    WholeShares(#[from] WholeSharesError),
+    InvalidShares(#[from] InvalidSharesError),
 }
 
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {
@@ -235,7 +201,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == SchwabAction::GetTokens && status.as_u16() == 401
+            if action == "get tokens" && status.as_u16() == 401
         ));
     }
 
@@ -255,7 +221,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == SchwabAction::GetTokens && status.as_u16() == 500
+            if action == "get tokens" && status.as_u16() == 500
         ));
     }
 

@@ -61,7 +61,7 @@ async fn execute_trade<E: Executor>(
 }
 
 // Use with any implementation
-let schwab = SchwabExecutor::try_from_config(config).await?;
+let schwab = SchwabExecutor::try_from_ctx(config).await?;
 execute_trade(&schwab, "AAPL", 10).await?;
 ```
 

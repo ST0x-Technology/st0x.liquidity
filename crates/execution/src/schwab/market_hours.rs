@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use std::fmt::Write;
 use tracing::debug;
 
-use super::{SchwabAction, SchwabAuthCtx, SchwabError, SchwabTokens};
+use super::{SchwabAuthCtx, SchwabError, SchwabTokens};
 
 /// Market session types for trading hours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,10 +148,10 @@ pub(crate) async fn fetch_market_hours(
     let mut url = format!("{}marketdata/v1/markets/equity", ctx.base_url()?);
 
     if let Some(date_param) = date {
-        write!(url, "?date={date_param}").map_err(|error| SchwabError::RequestFailed {
-            action: SchwabAction::FormatUrl,
+        write!(url, "?date={date_param}").map_err(|e| SchwabError::RequestFailed {
+            action: "format URL".to_string(),
             status: reqwest::StatusCode::OK,
-            body: format!("Failed to format date parameter: {error}"),
+            body: format!("Failed to format date parameter: {e}"),
         })?;
     }
 
@@ -169,7 +169,7 @@ pub(crate) async fn fetch_market_hours(
             .await
             .unwrap_or_else(|_| "Failed to read response body".to_string());
         return Err(SchwabError::RequestFailed {
-            action: SchwabAction::FetchMarketHours,
+            action: "fetch market hours".to_string(),
             status,
             body,
         });
@@ -186,7 +186,7 @@ fn parse_market_hours_response(
 ) -> Result<MarketHours, SchwabError> {
     let Some(equity) = response.equity else {
         return Err(SchwabError::RequestFailed {
-            action: SchwabAction::ParseMarketHours,
+            action: "parse market hours".to_string(),
             status: reqwest::StatusCode::OK,
             body: "No equity market hours in response".to_string(),
         });
@@ -194,16 +194,16 @@ fn parse_market_hours_response(
 
     let Some(eq) = equity.eq else {
         return Err(SchwabError::RequestFailed {
-            action: SchwabAction::ParseMarketHours,
+            action: "parse market hours".to_string(),
             status: reqwest::StatusCode::OK,
             body: "No EQ section in equity market hours".to_string(),
         });
     };
 
-    let date = parse_date(&eq.date).map_err(|error| SchwabError::RequestFailed {
-        action: SchwabAction::ParseMarketHoursDate,
+    let date = parse_date(&eq.date).map_err(|e| SchwabError::RequestFailed {
+        action: "parse market hours date".to_string(),
         status: reqwest::StatusCode::OK,
-        body: format!("Invalid date format '{}': {error}", eq.date),
+        body: format!("Invalid date format '{}': {e}", eq.date),
     })?;
 
     // If market is closed (weekends/holidays), return closed market hours
@@ -280,7 +280,7 @@ fn parse_datetime(datetime_str: &str, date: NaiveDate) -> Result<DateTime<Utc>, 
 
     // Return proper error for unsupported formats
     Err(SchwabError::RequestFailed {
-        action: SchwabAction::ParseDatetime,
+        action: "parse datetime".to_string(),
         status: reqwest::StatusCode::OK,
         body: format!("Unsupported datetime format: '{datetime_str}'"),
     })
@@ -430,7 +430,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == SchwabAction::FetchMarketHours && status.as_u16() == 500
+            if action == "fetch market hours" && status.as_u16() == 500
         ));
     }
 
@@ -512,7 +512,7 @@ mod tests {
         assert!(matches!(
             parse_datetime("invalid-time", date).unwrap_err(),
             SchwabError::RequestFailed { action, .. }
-            if action == SchwabAction::ParseDatetime
+            if action == "parse datetime"
         ));
     }
 }
