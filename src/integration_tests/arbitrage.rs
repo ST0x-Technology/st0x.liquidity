@@ -256,6 +256,7 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
     }
 }
 
+#[bon::bon]
 impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
     /// Deploys an equity token for the given symbol if one doesn't already exist.
     /// Returns the token address (newly deployed or cached from a previous call).
@@ -342,6 +343,7 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
     ///
     /// Equity tokens are deployed on first use per symbol and reused for subsequent calls.
     /// For Buy direction, only `price = 1` is supported (Rain expression ioRatio limitation).
+    #[builder]
     async fn take_order(
         &mut self,
         symbol: &str,
@@ -596,7 +598,12 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
 
     // Trade 1: 0.5 shares Sell, below whole-share threshold
     let t1 = ob
-        .take_order(TEST_AAPL, 0.5, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.5)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
     let result1 = t1.submit(&pool, 1, &cqrs).await?;
@@ -624,7 +631,12 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
 
     // Trade 2: 0.7 shares Sell, total net = -1.2, crosses threshold
     let t2 = ob
-        .take_order(TEST_AAPL, 0.7, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.7)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t2_agg = t2.aggregate_id();
     let order_id = t2
@@ -722,13 +734,23 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 
     // Two trades: 0.5 + 0.7 = 1.2 shares, crosses threshold
     let t1 = ob
-        .take_order(TEST_AAPL, 0.5, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.5)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
     t1.submit(&pool, 1, &cqrs).await?;
 
     let t2 = ob
-        .take_order(TEST_AAPL, 0.7, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.7)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t2_agg = t2.aggregate_id();
     let order_id = t2
@@ -833,6 +855,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 /// Position state or event streams. Initial submissions are concurrent to verify
 /// different-symbol trades can be processed in parallel without interference.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
@@ -842,12 +865,22 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Phase 1: concurrent submission of different-symbol trades, then AAPL accumulation
     let t1 = ob
-        .take_order(TEST_AAPL, 0.6, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.6)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
 
     let t2 = ob
-        .take_order(TEST_MSFT, 0.4, Direction::Sell, MSFT_PRICE)
+        .take_order()
+        .symbol(TEST_MSFT)
+        .amount(0.4)
+        .direction(Direction::Sell)
+        .price(MSFT_PRICE)
+        .call()
         .await;
     let t2_agg = t2.aggregate_id();
 
@@ -857,7 +890,12 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert!(r2?.is_none());
 
     let t3 = ob
-        .take_order(TEST_AAPL, 0.6, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.6)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t3_agg = t3.aggregate_id();
     let aapl_order_id = t3
@@ -970,7 +1008,12 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
 
     // MSFT crosses threshold (0.4 + 0.6 = 1.0, exactly at threshold)
     let t4 = ob
-        .take_order(TEST_MSFT, 0.6, Direction::Sell, MSFT_PRICE)
+        .take_order()
+        .symbol(TEST_MSFT)
+        .amount(0.6)
+        .direction(Direction::Sell)
+        .price(MSFT_PRICE)
+        .call()
         .await;
     let t4_agg = t4.aggregate_id();
     let msft_order_id = t4
@@ -1063,7 +1106,14 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.5 shares, below threshold
-    let t1 = ob.take_order(TEST_AAPL, 0.5, Direction::Buy, 1).await;
+    let t1 = ob
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.5)
+        .direction(Direction::Buy)
+        .price(1)
+        .call()
+        .await;
     let t1_agg = t1.aggregate_id();
     let result1 = t1.submit(&pool, 1, &cqrs).await?;
     assert!(result1.is_none(), "Below threshold");
@@ -1080,7 +1130,14 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .await;
 
     // Trade 2: Buy 0.7 shares, crosses threshold -> hedge is Sell
-    let t2 = ob.take_order(TEST_AAPL, 0.7, Direction::Buy, 1).await;
+    let t2 = ob
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.7)
+        .direction(Direction::Buy)
+        .price(1)
+        .call()
+        .await;
     let t2_agg = t2.aggregate_id();
     let order_id = t2
         .submit(&pool, 2, &cqrs)
@@ -1168,7 +1225,12 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let t1 = ob
-        .take_order(TEST_AAPL, 1.0, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(1.0)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
     let order_id = t1
@@ -1213,7 +1275,12 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
 
     // Complete a full hedge cycle so position net=0
     let t1 = ob
-        .take_order(TEST_AAPL, 1.0, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(1.0)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     t1.submit(&pool, 1, &cqrs)
         .await?
@@ -1254,7 +1321,12 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
 
     // First cycle: 1.0 share sell -> hedge -> fill
     let t1 = ob
-        .take_order(TEST_AAPL, 1.0, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(1.0)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
     let order1 = t1
@@ -1276,7 +1348,12 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
 
     // Second cycle: another 1.5 share sell -> crosses threshold again
     let t2 = ob
-        .take_order(TEST_AAPL, 1.5, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(1.5)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t2_agg = t2.aggregate_id();
     let order2 = t2
@@ -1350,7 +1427,12 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     let (cqrs, _, _, _) = create_test_cqrs(&pool);
 
     let t1 = ob
-        .take_order(TEST_AAPL, 1.0, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(1.0)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     t1.submit(&pool, 1, &cqrs).await?;
 
@@ -1425,7 +1507,12 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let t1 = ob
-        .take_order(TEST_AAPL, 0.001, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.001)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
     let result = t1.submit(&pool, 1, &cqrs).await?;
@@ -1464,7 +1551,12 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let t1 = ob
-        .take_order(TEST_AAPL, 500.0, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(500.0)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
     let order_id = t1
@@ -1514,7 +1606,14 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.8 AAPL -> net=+0.8, below threshold
-    let t1 = ob.take_order(TEST_AAPL, 0.8, Direction::Buy, 1).await;
+    let t1 = ob
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.8)
+        .direction(Direction::Buy)
+        .price(1)
+        .call()
+        .await;
     let t1_agg = t1.aggregate_id();
     assert!(t1.submit(&pool, 1, &cqrs).await?.is_none());
 
@@ -1531,7 +1630,12 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 
     // Trade 2: Sell 0.5 AAPL -> net=+0.3, below threshold
     let t2 = ob
-        .take_order(TEST_AAPL, 0.5, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.5)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t2_agg = t2.aggregate_id();
     assert!(t2.submit(&pool, 2, &cqrs).await?.is_none());
@@ -1549,7 +1653,12 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 
     // Trade 3: Sell 0.8 AAPL -> net=-0.5, below threshold
     let t3 = ob
-        .take_order(TEST_AAPL, 0.8, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.8)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t3_agg = t3.aggregate_id();
     assert!(t3.submit(&pool, 3, &cqrs).await?.is_none());
@@ -1567,7 +1676,12 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 
     // Trade 4: Sell 0.6 AAPL -> net=-1.1, crosses threshold -> Buy hedge for 1.1 shares
     let t4 = ob
-        .take_order(TEST_AAPL, 0.6, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.6)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t4_agg = t4.aggregate_id();
     let order_id = t4
@@ -1642,7 +1756,12 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
 
     // Trade 1: Sell 1.5 AAPL -> crosses threshold, offchain order placed
     let t1 = ob
-        .take_order(TEST_AAPL, 1.5, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(1.5)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t1_agg = t1.aggregate_id();
     let order_id = t1
@@ -1664,7 +1783,12 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
 
     // Trade 2: Sell 0.5 more while pending -> position updates, but no new offchain order
     let t2 = ob
-        .take_order(TEST_AAPL, 0.5, Direction::Sell, AAPL_PRICE)
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(0.5)
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
         .await;
     let t2_agg = t2.aggregate_id();
     let result2 = t2.submit(&pool, 2, &cqrs).await?;
