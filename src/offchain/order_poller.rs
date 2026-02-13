@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlite_es::SqliteCqrs;
@@ -8,6 +5,8 @@ use sqlx::SqlitePool;
 use st0x_execution::{
     ArithmeticError, Executor, ExecutorOrderId, FractionalShares, OrderState, OrderStatus, Symbol,
 };
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 

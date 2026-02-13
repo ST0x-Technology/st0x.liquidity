@@ -4,19 +4,18 @@ use clap::Parser;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
+use st0x_execution::schwab::SchwabAuthConfig;
+use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
 use std::path::PathBuf;
 use tracing::Level;
-
-use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
 
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmConfig;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError, RebalancingTomlFields};
 use crate::telemetry::HyperDxConfig;
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
-use st0x_execution::schwab::SchwabAuthConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]

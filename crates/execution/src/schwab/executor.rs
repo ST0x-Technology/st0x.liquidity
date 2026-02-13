@@ -486,10 +486,11 @@ mod tests {
         });
 
         let broker = SchwabExecutor { auth, pool };
-        // This test should not complete because the method loops when market is closed
-        // We'll just verify it starts correctly by not panicking immediately
+        // The method loops with a 60s sleep when the market is closed.
+        // Use 2s timeout: enough for the HTTP request to the mock server
+        // to complete, but well under the 60s sleep. Under this value makes cargo nextest fail.
         tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(2),
             broker.wait_until_market_open(),
         )
         .await
