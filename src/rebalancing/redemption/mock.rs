@@ -2,9 +2,10 @@
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Redeem, RedemptionError};
 use crate::equity_redemption::RedemptionAggregateId;
