@@ -9,13 +9,15 @@ use httpmock::Mock;
 use httpmock::prelude::*;
 use rust_decimal_macros::dec;
 use serde_json::json;
-use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
+
+use st0x_event_sorcery::{Lifecycle, Store, test_store};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::alpaca_tokenization::tests::{
@@ -25,9 +27,8 @@ use crate::alpaca_tokenization::tests::{
 use crate::bindings::{IERC20, TestERC20};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
-use crate::lifecycle::{Lifecycle, Never};
-use crate::offchain_order::{OffchainOrder, PriceCents};
-use crate::position::{Position, PositionAggregate, PositionCommand};
+use crate::offchain_order::{OffchainOrderId, PriceCents};
+use crate::position::{Position, PositionCommand};
 use crate::rebalancing::mint::mock::MockMint;
 use crate::rebalancing::redemption::mock::MockRedeem;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
@@ -38,7 +39,7 @@ use crate::rebalancing::{
 use crate::test_utils::setup_test_db;
 use crate::threshold::{ExecutionThreshold, Usdc};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
-use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
+use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
@@ -47,11 +48,14 @@ const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000
 async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address) {
     let vault_id = B256::from(keccak256(symbol.to_string().as_bytes()));
 
-    let cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
-    let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+    let cqrs = test_store::<VaultRegistry>(pool.clone(), vec![], ());
+    let id = VaultRegistryId {
+        orderbook: TEST_ORDERBOOK,
+        owner: TEST_ORDER_OWNER,
+    };
 
-    cqrs.execute(
-        &aggregate_id,
+    cqrs.send(
+        &id,
         VaultRegistryCommand::DiscoverEquityVault {
             token,
             vault_id,
@@ -109,20 +113,18 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
 fn build_position_cqrs_with_trigger(
     pool: &SqlitePool,
     trigger: &Arc<RebalancingTrigger>,
-) -> Arc<sqlite_es::SqliteCqrs<PositionAggregate>> {
-    let view_repo = Arc::new(
-        SqliteViewRepository::<PositionAggregate, PositionAggregate>::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ),
-    );
+) -> Arc<Store<Position>> {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        Lifecycle<Position>,
+        Lifecycle<Position>,
+    >::new(pool.clone(), "position_view".to_string()));
 
-    let queries: Vec<Box<dyn cqrs_es::Query<PositionAggregate>>> = vec![
+    let queries: Vec<Box<dyn cqrs_es::Query<Lifecycle<Position>>>> = vec![
         Box::new(GenericQuery::new(view_repo)),
         Box::new(Arc::clone(trigger)),
     ];
 
-    Arc::new(sqlite_cqrs(pool.clone(), queries, ()))
+    Arc::new(test_store(pool.clone(), queries, ()))
 }
 
 /// Shared state for equity rebalancing tests (mint and redemption) that
@@ -132,14 +134,14 @@ struct EquityTriggerFixture {
     symbol: Symbol,
     aggregate_id: String,
     trigger: Arc<RebalancingTrigger>,
-    position_cqrs: Arc<PositionCqrs>,
+    position_cqrs: Arc<Store<Position>>,
     receiver: mpsc::Receiver<TriggeredOperation>,
 }
 
 async fn setup_equity_trigger() -> EquityTriggerFixture {
     let pool = setup_test_db().await;
     let symbol = Symbol::new("AAPL").unwrap();
-    let aggregate_id = Position::aggregate_id(&symbol);
+    let aggregate_id = symbol.to_string();
 
     let inventory = Arc::new(RwLock::new(
         InventoryView::default().with_equity(symbol.clone()),
@@ -244,12 +246,10 @@ fn sample_completed_response(id: &str) -> serde_json::Value {
     })
 }
 
-type PositionCqrs = sqlite_es::SqliteCqrs<PositionAggregate>;
-
 enum Imbalance<'a> {
     Equity {
-        position_cqrs: &'a PositionCqrs,
-        aggregate_id: &'a str,
+        position_cqrs: &'a Store<Position>,
+        symbol: &'a Symbol,
         onchain: rust_decimal::Decimal,
         offchain: rust_decimal::Decimal,
     },
@@ -264,14 +264,16 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
     match imbalance {
         Imbalance::Equity {
             position_cqrs,
-            aggregate_id,
+            symbol,
             onchain,
             offchain,
         } => {
             position_cqrs
-                .execute(
-                    aggregate_id,
+                .send(
+                    symbol,
                     PositionCommand::AcknowledgeOnChainFill {
+                        symbol: symbol.clone(),
+                        threshold: ExecutionThreshold::whole_share(),
                         trade_id: crate::position::TradeId {
                             tx_hash: TxHash::random(),
                             log_index: 0,
@@ -285,11 +287,11 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                 .await
                 .unwrap();
 
-            let offchain_order_id = OffchainOrder::aggregate_id();
+            let offchain_order_id = OffchainOrderId::new();
 
             position_cqrs
-                .execute(
-                    aggregate_id,
+                .send(
+                    symbol,
                     PositionCommand::PlaceOffChainOrder {
                         offchain_order_id,
                         shares: Positive::new(FractionalShares::new(offchain)).unwrap(),
@@ -302,11 +304,11 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                 .unwrap();
 
             position_cqrs
-                .execute(
-                    aggregate_id,
+                .send(
+                    symbol,
                     PositionCommand::CompleteOffChainOrder {
                         offchain_order_id,
-                        shares_filled: FractionalShares::new(offchain),
+                        shares_filled: Positive::new(FractionalShares::new(offchain)).unwrap(),
                         direction: Direction::Buy,
                         executor_order_id: ExecutorOrderId::new("ORD1"),
                         price_cents: PriceCents(15000),
@@ -349,7 +351,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     // Without VaultRegistry seeded, the trigger silently skips Mint operations.
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
-        aggregate_id: &aggregate_id,
+        symbol: &symbol,
         onchain: dec!(20),
         offchain: dec!(80),
     })
@@ -365,11 +367,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
 
-    let mint_cqrs = Arc::new(sqlite_cqrs::<Lifecycle<TokenizedEquityMint, Never>>(
-        pool.clone(),
-        vec![],
-        (),
-    ));
+    let mint_cqrs = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), vec![], ()));
     let mint_mgr = MintManager::new(service, mint_cqrs);
 
     // json_body_partial acts as an implicit assertion: the mock only matches if
@@ -402,9 +400,11 @@ async fn equity_offchain_imbalance_triggers_mint() {
     // One more onchain sell triggers the CQRS -> trigger -> Mint flow now that
     // VaultRegistry is seeded. Inventory: 19 onchain, 80 offchain = 19.2%.
     position_cqrs
-        .execute(
-            &aggregate_id,
+        .send(
+            &symbol,
             PositionCommand::AcknowledgeOnChainFill {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
                 trade_id: crate::position::TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 2,
@@ -437,11 +437,16 @@ async fn equity_offchain_imbalance_triggers_mint() {
         .expect("Expected at least one TokenizedEquityMint event")
         .aggregate_id
         .clone();
-    let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+    let vault_agg_id = VaultRegistryId {
+        orderbook: TEST_ORDERBOOK,
+        owner: TEST_ORDER_OWNER,
+    }
+    .to_string();
 
     let events = assert_events(
         &pool,
         &[
+            ExpectedEvent::new("Position", &aggregate_id, "PositionEvent::Initialized"),
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
@@ -492,14 +497,14 @@ async fn equity_offchain_imbalance_triggers_mint() {
     .await;
 
     // Verify event payloads capture the correct data from the API interaction
-    let mint_requested = &events[5].payload["MintRequested"];
+    let mint_requested = &events[6].payload["MintRequested"];
     assert_eq!(
         mint_requested["symbol"].as_str().unwrap(),
         "AAPL",
         "MintRequested should target the correct symbol"
     );
 
-    let mint_accepted = &events[6].payload["MintAccepted"];
+    let mint_accepted = &events[7].payload["MintAccepted"];
     assert_eq!(
         mint_accepted["tokenization_request_id"].as_str().unwrap(),
         "mint_int_test",
@@ -570,18 +575,14 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
 
-    let redemption_cqrs = Arc::new(sqlite_cqrs::<Lifecycle<EquityRedemption, Never>>(
-        pool.clone(),
-        vec![],
-        (),
-    ));
+    let redemption_cqrs = Arc::new(test_store::<EquityRedemption>(pool.clone(), vec![], ()));
     let redeem_mgr = RedemptionManager::new(service, redemption_cqrs);
 
     // Build inventory: 79 onchain, 20 offchain = 79.8% ratio -> TooMuchOnchain.
     // Without VaultRegistry seeded, the trigger silently skips Redemption operations.
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
-        aggregate_id: &aggregate_id,
+        symbol: &symbol,
         onchain: dec!(79),
         offchain: dec!(20),
     })
@@ -605,9 +606,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     // One more onchain buy triggers the CQRS -> trigger -> Redemption flow.
     // Inventory: 80 onchain, 20 offchain = 80%, excess = 80 - 50 = 30 shares.
     position_cqrs
-        .execute(
-            &aggregate_id,
+        .send(
+            &symbol,
             PositionCommand::AcknowledgeOnChainFill {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
                 trade_id: crate::position::TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 2,
@@ -655,11 +658,16 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         .expect("Expected at least one EquityRedemption event")
         .aggregate_id
         .clone();
-    let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+    let vault_agg_id = VaultRegistryId {
+        orderbook: TEST_ORDERBOOK,
+        owner: TEST_ORDER_OWNER,
+    }
+    .to_string();
 
     let events = assert_events(
         &pool,
         &[
+            ExpectedEvent::new("Position", &aggregate_id, "PositionEvent::Initialized"),
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
@@ -705,7 +713,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
 
     // Verify event payloads capture the correct data from the onchain + API interaction
-    let tokens_sent = &events[5].payload["TokensSent"];
+    let tokens_sent = &events[6].payload["TokensSent"];
     assert_eq!(
         tokens_sent["symbol"].as_str().unwrap(),
         "AAPL",
@@ -717,7 +725,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         "TokensSent tx_hash should match the deterministic Anvil hash"
     );
 
-    let detected = &events[6].payload["Detected"];
+    let detected = &events[7].payload["Detected"];
     assert_eq!(
         detected["tokenization_request_id"].as_str().unwrap(),
         "redeem_int_test",
@@ -901,7 +909,7 @@ async fn mint_api_failure_produces_rejected_event() {
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
-        aggregate_id: &aggregate_id,
+        symbol: &symbol,
         onchain: dec!(20),
         offchain: dec!(80),
     })
@@ -916,11 +924,7 @@ async fn mint_api_failure_produces_rejected_event() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
 
-    let mint_cqrs = Arc::new(sqlite_cqrs::<Lifecycle<TokenizedEquityMint, Never>>(
-        pool.clone(),
-        vec![],
-        (),
-    ));
+    let mint_cqrs = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), vec![], ()));
     let mint_mgr = MintManager::new(service, mint_cqrs);
 
     // Mock returns HTTP 500 for the mint request
@@ -939,9 +943,11 @@ async fn mint_api_failure_produces_rejected_event() {
 
     // One more sell triggers the CQRS -> trigger -> Mint flow
     position_cqrs
-        .execute(
-            &aggregate_id,
+        .send(
+            &symbol,
             PositionCommand::AcknowledgeOnChainFill {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
                 trade_id: crate::position::TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 2,
@@ -969,12 +975,17 @@ async fn mint_api_failure_produces_rejected_event() {
         .expect("Expected at least one TokenizedEquityMint event")
         .aggregate_id
         .clone();
-    let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+    let vault_agg_id = VaultRegistryId {
+        orderbook: TEST_ORDERBOOK,
+        owner: TEST_ORDER_OWNER,
+    }
+    .to_string();
 
     // MintRequested is emitted before the API call, MintRejected after the failure
     let events = assert_events(
         &pool,
         &[
+            ExpectedEvent::new("Position", &aggregate_id, "PositionEvent::Initialized"),
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
@@ -1014,7 +1025,7 @@ async fn mint_api_failure_produces_rejected_event() {
     )
     .await;
 
-    let rejected = &events[6].payload["MintRejected"];
+    let rejected = &events[7].payload["MintRejected"];
     assert!(
         rejected["reason"]
             .as_str()

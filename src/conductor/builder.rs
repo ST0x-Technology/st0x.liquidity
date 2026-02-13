@@ -10,6 +10,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use st0x_event_sorcery::{SqliteQuery, Store};
 use st0x_execution::Executor;
 
 use super::{
@@ -19,7 +20,6 @@ use super::{
 };
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::event_sourced::{SqliteQuery, Store};
 use crate::inventory::InventorySnapshot;
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::trade::TradeEvent;

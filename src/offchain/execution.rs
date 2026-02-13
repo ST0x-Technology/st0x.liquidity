@@ -1,8 +1,8 @@
 use sqlx::SqlitePool;
 
+use st0x_event_sorcery::Lifecycle;
 use st0x_execution::OrderStatus;
 
-use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{OffchainOrder, OffchainOrderId};
 use crate::onchain::OnChainError;
 

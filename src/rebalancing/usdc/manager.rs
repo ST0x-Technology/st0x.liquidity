@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
+use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
 
 use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
@@ -19,7 +20,6 @@ use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
 use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
-use crate::event_sourced::Store;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
@@ -898,14 +898,15 @@ mod tests {
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
+    use cqrs_es::AggregateError;
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlx::SqlitePool;
-
     use uuid::{Uuid, uuid};
 
+    use st0x_event_sorcery::{LifecycleError, test_store};
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor};
 
@@ -913,11 +914,8 @@ mod tests {
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
-    use crate::conductor::wire::test_cqrs;
-    use crate::lifecycle::LifecycleError;
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
-    use cqrs_es::AggregateError;
 
     const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
     const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
@@ -943,7 +941,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        Arc::new(test_cqrs(pool, vec![], ()))
+        Arc::new(test_store(pool, vec![], ()))
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal -> InitiateBridging ->

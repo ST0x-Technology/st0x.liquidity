@@ -8,9 +8,10 @@ use cqrs_es::{EventEnvelope, Query};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use st0x_event_sorcery::Lifecycle;
+
 use super::snapshot::InventorySnapshot;
 use super::view::InventoryView;
-use crate::lifecycle::Lifecycle;
 
 /// Query handler that forwards InventorySnapshot events to a shared InventoryView.
 ///

@@ -12,6 +12,7 @@ use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
 
+use st0x_event_sorcery::Lifecycle;
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutorCtx,
     OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
@@ -19,7 +20,6 @@ use st0x_execution::{
 
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
-use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
 };

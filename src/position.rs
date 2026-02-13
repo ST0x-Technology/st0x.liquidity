@@ -12,13 +12,12 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use st0x_event_sorcery::{DomainEvent, EventSourced, LifecycleError, SqliteQuery};
 use st0x_execution::{
     ArithmeticError, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
     Symbol,
 };
 
-use crate::event_sourced::{DomainEvent, EventSourced, SqliteQuery};
-use crate::lifecycle::LifecycleError;
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
@@ -594,10 +593,10 @@ mod tests {
     use std::collections::HashMap;
     use std::str::FromStr;
 
+    use st0x_event_sorcery::Lifecycle;
     use st0x_execution::Positive;
 
     use super::*;
-    use crate::lifecycle::Lifecycle;
     use crate::threshold::Usdc;
 
     fn one_share_threshold() -> ExecutionThreshold {
@@ -1648,7 +1647,7 @@ mod tests {
         let position_query =
             std::sync::Arc::new(cqrs_es::persist::GenericQuery::new(view_repo.clone()));
 
-        let store = crate::conductor::wire::test_cqrs(
+        let store = st0x_event_sorcery::test_store(
             pool.clone(),
             vec![Box::new(cqrs_es::persist::GenericQuery::new(view_repo))],
             (),

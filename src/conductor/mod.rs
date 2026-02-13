@@ -5,8 +5,6 @@
 
 mod builder;
 mod manifest;
-pub(crate) mod schema_registry;
-pub(crate) mod wire;
 
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -27,6 +25,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
+use st0x_event_sorcery::{Cons, Nil, SendError, SqliteQuery, Store, StoreBuilder, Unwired};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecutor};
@@ -34,7 +33,6 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecut
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::{Ctx, CtxError};
-use crate::event_sourced::{SendError, SqliteQuery, Store};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
 };
@@ -62,16 +60,15 @@ use crate::threshold::ExecutionThreshold;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 
 use self::manifest::QueryManifest;
-use self::wire::CqrsBuilder;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
-struct TradeProcessingCqrs {
-    onchain_trade: Arc<Store<OnChainTrade>>,
-    position: Arc<Store<Position>>,
-    position_query: Arc<SqliteQuery<Position>>,
-    offchain_order: Arc<Store<OffchainOrder>>,
-    execution_threshold: ExecutionThreshold,
+pub(crate) struct TradeProcessingCqrs {
+    pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
+    pub(crate) position: Arc<Store<Position>>,
+    pub(crate) position_query: Arc<SqliteQuery<Position>>,
+    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) execution_threshold: ExecutionThreshold,
 }
 
 pub(crate) struct Conductor {
@@ -190,10 +187,10 @@ where
 }
 
 /// Context for vault discovery operations during trade processing.
-struct VaultDiscoveryCtx<'a> {
-    vault_registry: &'a Store<VaultRegistry>,
-    orderbook: Address,
-    order_owner: Address,
+pub(crate) struct VaultDiscoveryCtx<'a> {
+    pub(crate) vault_registry: &'a Store<VaultRegistry>,
+    pub(crate) orderbook: Address,
+    pub(crate) order_owner: Address,
 }
 
 impl Conductor {
@@ -224,7 +221,7 @@ impl Conductor {
         }
 
         let onchain_trade = Arc::new(
-            CqrsBuilder::<OnChainTrade>::new(pool.clone())
+            StoreBuilder::<OnChainTrade>::new(pool.clone())
                 .build(())
                 .await?,
         );
@@ -258,12 +255,12 @@ impl Conductor {
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
         let offchain_order = Arc::new(
-            CqrsBuilder::<OffchainOrder>::new(pool.clone())
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .build(order_placer)
                 .await?,
         );
 
-        let vault_registry = CqrsBuilder::<VaultRegistry>::new(pool.clone())
+        let vault_registry = StoreBuilder::<VaultRegistry>::new(pool.clone())
             .build(())
             .await?;
 
@@ -432,10 +429,10 @@ async fn build_position_cqrs(
     ));
     let position_query = GenericQuery::new(position_view_repo.clone());
 
-    let view: wire::UnwiredQuery<SqliteQuery<Position>, wire::Cons<Position, wire::Nil>> =
-        wire::UnwiredQuery::new(GenericQuery::new(position_view_repo));
+    let view: Unwired<SqliteQuery<Position>, Cons<Position, Nil>> =
+        Unwired::new(GenericQuery::new(position_view_repo));
 
-    let (store, (view, ())) = CqrsBuilder::<Position>::new(pool.clone())
+    let (store, (view, ())) = StoreBuilder::<Position>::new(pool.clone())
         .wire(view)
         .build(())
         .await?;
@@ -452,12 +449,10 @@ async fn build_inventory_snapshot_store(
 ) -> anyhow::Result<Store<InventorySnapshot>> {
     let snapshot_query = InventorySnapshotQuery::new(inventory);
 
-    let query: wire::UnwiredQuery<
-        InventorySnapshotQuery,
-        wire::Cons<InventorySnapshot, wire::Nil>,
-    > = wire::UnwiredQuery::new(snapshot_query);
+    let query: Unwired<InventorySnapshotQuery, Cons<InventorySnapshot, Nil>> =
+        Unwired::new(snapshot_query);
 
-    let (store, (_query, ())) = CqrsBuilder::<InventorySnapshot>::new(pool.clone())
+    let (store, (_query, ())) = StoreBuilder::<InventorySnapshot>::new(pool.clone())
         .wire(query)
         .build(())
         .await?;
@@ -1095,7 +1090,7 @@ async fn execute_acknowledge_fill(
     }
 }
 
-async fn process_queued_trade(
+pub(crate) async fn process_queued_trade(
     executor_type: SupportedExecutor,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
@@ -1370,6 +1365,7 @@ mod tests {
     use sqlite_es::SqliteViewRepository;
     use std::sync::Arc;
 
+    use st0x_event_sorcery::{Lifecycle, test_store};
     use st0x_execution::{
         Direction, ExecutorOrderId, MarketOrder, MockExecutorCtx, Positive, Symbol, TryIntoExecutor,
     };
@@ -1381,7 +1377,6 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::inventory::ImbalanceThreshold;
-    use crate::lifecycle::Lifecycle;
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
@@ -2373,7 +2368,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2398,7 +2393,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_equity_vault() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2423,7 +2418,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_from_take_event() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
 
         let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let queued_event = create_queued_take_event(order);
@@ -2453,7 +2448,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2476,7 +2471,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2511,7 +2506,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2562,14 +2557,14 @@ mod tests {
         pool: &SqlitePool,
         order_placer: Arc<dyn OrderPlacer>,
     ) -> (CqrsFrameworks, Arc<SqliteQuery<OffchainOrder>>) {
-        let onchain_trade = Arc::new(wire::test_cqrs(pool.clone(), vec![], ()));
+        let onchain_trade = Arc::new(test_store(pool.clone(), vec![], ()));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
             Lifecycle<Position>,
             Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
         let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
-        let position = Arc::new(wire::test_cqrs(
+        let position = Arc::new(test_store(
             pool.clone(),
             vec![Box::new(GenericQuery::new(position_view_repo))],
             (),
@@ -2582,14 +2577,14 @@ mod tests {
             pool.clone(), "offchain_order_view".to_string()
         ));
         let offchain_order_query = Arc::new(GenericQuery::new(offchain_order_view_repo.clone()));
-        let offchain_order = Arc::new(wire::test_cqrs(
+        let offchain_order = Arc::new(test_store(
             pool.clone(),
             vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
             order_placer,
         ));
 
-        let vault_registry = wire::test_cqrs(pool.clone(), vec![], ());
-        let snapshot = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry = test_store(pool.clone(), vec![], ());
+        let snapshot = test_store(pool.clone(), vec![], ());
 
         (
             CqrsFrameworks {
@@ -3113,7 +3108,7 @@ mod tests {
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // Seed vault registry so the trigger can resolve the token address.
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
         vault_registry
             .send(
                 &VaultRegistryId {
@@ -3157,7 +3152,7 @@ mod tests {
             Lifecycle<Position>,
             Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_store = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(test_store(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))
@@ -3242,7 +3237,7 @@ mod tests {
             Lifecycle<Position>,
             Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_store = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(test_store(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))
@@ -3348,7 +3343,7 @@ mod tests {
             Lifecycle<Position>,
             Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_store = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(test_store(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))
@@ -3402,7 +3397,7 @@ mod tests {
         let order_owner = address!("0x0000000000000000000000000000000000000002");
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
-        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), vec![], ());
         vault_registry
             .send(
                 &VaultRegistryId {
@@ -3477,7 +3472,7 @@ mod tests {
             Lifecycle<Position>,
             Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_store = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(test_store(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))

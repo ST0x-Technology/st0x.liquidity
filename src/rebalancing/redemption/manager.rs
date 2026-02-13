@@ -7,14 +7,15 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
+
+use st0x_event_sorcery::Store;
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Redeem, RedemptionError};
 use crate::alpaca_tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
-use crate::event_sourced::Store;
 
 pub(crate) struct RedemptionManager<P>
 where
@@ -182,25 +183,24 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::ext::AnvilApi as _;
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::CqrsFramework;
-    use cqrs_es::mem_store::MemStore;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
-    use sqlx::SqlitePool;
     use serde_json::json;
+    use sqlx::SqlitePool;
+
+    use st0x_event_sorcery::test_store;
 
     use super::*;
     use crate::alpaca_tokenization::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
         tokenization_requests_path,
     };
-    use crate::conductor::wire::test_cqrs;
     use crate::bindings::{IERC20, TestERC20};
 
     async fn create_test_cqrs() -> Arc<Store<EquityRedemption>> {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        Arc::new(test_cqrs(pool, vec![], ()))
+        Arc::new(test_store(pool, vec![], ()))
     }
 
     #[tokio::test]
@@ -363,7 +363,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_cqrs().await;
         let manager = RedemptionManager::new(service, cqrs);
 
         manager

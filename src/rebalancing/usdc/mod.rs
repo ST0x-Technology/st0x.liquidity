@@ -14,11 +14,11 @@ use thiserror::Error;
 
 use alloy::primitives::ruint::FromUintError;
 
+use st0x_event_sorcery::SendError;
 use st0x_execution::AlpacaBrokerApiError;
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::cctp::CctpError;
-use crate::event_sourced::SendError;
 use crate::onchain::vault::VaultError;
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::UsdcRebalanceId;

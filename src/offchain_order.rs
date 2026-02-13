@@ -10,13 +10,11 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use st0x_event_sorcery::{DomainEvent, EventSourced, Lifecycle, SqliteQuery};
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Positive,
     SupportedExecutor, Symbol,
 };
-
-use crate::event_sourced::{DomainEvent, EventSourced, SqliteQuery};
-use crate::lifecycle::Lifecycle;
 
 /// Constructs the offchain order CQRS framework with its view
 /// query. Used by `Conductor::start`, CLI, and tests.
@@ -601,8 +599,9 @@ mod tests {
     use cqrs_es::{Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore};
     use rust_decimal_macros::dec;
 
+    use st0x_event_sorcery::LifecycleError;
+
     use super::*;
-    use crate::lifecycle::LifecycleError;
 
     type TestCqrs = CqrsFramework<Lifecycle<OffchainOrder>, MemStore<Lifecycle<OffchainOrder>>>;
 

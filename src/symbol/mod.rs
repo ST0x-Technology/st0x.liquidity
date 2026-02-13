@@ -37,6 +37,14 @@ impl TryFrom<&str> for Symbol {
     }
 }
 
+impl std::str::FromStr for Symbol {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s)
+    }
+}
+
 impl From<Symbol> for String {
     fn from(symbol: Symbol) -> Self {
         symbol.0

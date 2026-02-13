@@ -10,11 +10,8 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_execution::{Direction, Symbol};
-
-use crate::event_sourced::DomainEvent;
-
-use crate::event_sourced::EventSourced;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OnChainTradeId {
@@ -25,6 +22,35 @@ pub(crate) struct OnChainTradeId {
 impl std::fmt::Display for OnChainTradeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.tx_hash, self.log_index)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OnChainTradeIdParseError {
+    #[error("missing ':' separator in OnChainTradeId")]
+    MissingSeparator,
+
+    #[error("invalid tx hash")]
+    TxHash(#[source] alloy::hex::FromHexError),
+
+    #[error("invalid log index")]
+    LogIndex(#[from] std::num::ParseIntError),
+}
+
+impl std::str::FromStr for OnChainTradeId {
+    type Err = OnChainTradeIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (tx_hash_str, log_index_str) = s
+            .split_once(':')
+            .ok_or(OnChainTradeIdParseError::MissingSeparator)?;
+
+        let tx_hash = tx_hash_str
+            .parse()
+            .map_err(OnChainTradeIdParseError::TxHash)?;
+        let log_index = log_index_str.parse()?;
+
+        Ok(Self { tx_hash, log_index })
     }
 }
 
@@ -237,8 +263,9 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
+
     use super::*;
-    use crate::lifecycle::{Lifecycle, LifecycleError};
 
     fn make_envelope(
         aggregate_id: &str,

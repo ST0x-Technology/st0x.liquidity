@@ -10,10 +10,10 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::event_sourced::{DomainEvent, EventSourced};
-use crate::lifecycle::Never;
 use crate::threshold::Usdc;
 
 /// Typed identifier for InventorySnapshot aggregates, keyed
@@ -27,6 +27,37 @@ pub(crate) struct InventorySnapshotId {
 impl std::fmt::Display for InventorySnapshotId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.orderbook, self.owner)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InventorySnapshotIdParseError {
+    #[error("missing ':' separator in InventorySnapshotId")]
+    MissingSeparator,
+
+    #[error("invalid orderbook address")]
+    Orderbook(#[source] alloy::hex::FromHexError),
+
+    #[error("invalid owner address")]
+    Owner(#[source] alloy::hex::FromHexError),
+}
+
+impl std::str::FromStr for InventorySnapshotId {
+    type Err = InventorySnapshotIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (orderbook_str, owner_str) = s
+            .split_once(':')
+            .ok_or(InventorySnapshotIdParseError::MissingSeparator)?;
+
+        let orderbook = orderbook_str
+            .parse()
+            .map_err(InventorySnapshotIdParseError::Orderbook)?;
+        let owner = owner_str
+            .parse()
+            .map_err(InventorySnapshotIdParseError::Owner)?;
+
+        Ok(Self { orderbook, owner })
     }
 }
 
@@ -219,8 +250,9 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
+    use st0x_event_sorcery::Lifecycle;
+
     use super::*;
-    use crate::lifecycle::Lifecycle;
 
     type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 

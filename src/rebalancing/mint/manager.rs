@@ -8,15 +8,16 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
+
+use st0x_event_sorcery::Store;
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Mint, MintError};
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::event_sourced::Store;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
@@ -231,17 +232,18 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use st0x_event_sorcery::test_store;
+
     use super::*;
     use crate::alpaca_tokenization::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
         tokenization_requests_path,
     };
-    use crate::conductor::wire::test_cqrs;
     use crate::test_utils::setup_test_db;
 
     async fn create_test_cqrs() -> Arc<Store<TokenizedEquityMint>> {
         let pool = setup_test_db().await;
-        Arc::new(test_cqrs(pool, vec![], ()))
+        Arc::new(test_store(pool, vec![], ()))
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {

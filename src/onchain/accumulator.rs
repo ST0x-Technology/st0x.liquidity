@@ -1,9 +1,9 @@
 use sqlx::SqlitePool;
 use tracing::{debug, info};
 
+use st0x_event_sorcery::SqliteQuery;
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
-use crate::event_sourced::SqliteQuery;
 use crate::onchain::OnChainError;
 use crate::position::{Position, load_position};
 
@@ -106,10 +106,10 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
+    use st0x_event_sorcery::Store;
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
     use super::*;
-    use crate::event_sourced::Store;
     use crate::position::{Position, PositionCommand};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -120,7 +120,7 @@ mod tests {
             "position_view".to_string(),
         ));
         let position_query = GenericQuery::new(view_repo.clone());
-        let position_store = crate::conductor::wire::test_cqrs(
+        let position_store = st0x_event_sorcery::test_store(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),

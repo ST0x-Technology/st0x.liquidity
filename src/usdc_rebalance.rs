@@ -64,8 +64,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use st0x_event_sorcery::{DomainEvent, EventSourced};
+
 use crate::alpaca_wallet::AlpacaTransferId;
-use crate::event_sourced::{DomainEvent, EventSourced};
 use crate::threshold::Usdc;
 
 /// Unique identifier for a USDC rebalance operation.
@@ -81,6 +82,14 @@ impl UsdcRebalanceId {
 impl std::fmt::Display for UsdcRebalanceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for UsdcRebalanceId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
     }
 }
 
@@ -1196,8 +1205,9 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
+    use st0x_event_sorcery::{Lifecycle, LifecycleError};
+
     use super::*;
-    use crate::lifecycle::{Lifecycle, LifecycleError};
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {

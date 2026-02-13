@@ -377,6 +377,7 @@ pub struct TestStore<Entity: EventSourced> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::unwrap_used)]
 impl<Entity: EventSourced> TestStore<Entity>
 where
     Lifecycle<Entity>: cqrs_es::Aggregate<

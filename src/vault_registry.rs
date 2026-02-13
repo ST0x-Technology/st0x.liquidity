@@ -12,10 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
 use st0x_execution::Symbol;
-
-use crate::event_sourced::{DomainEvent, EventSourced};
-use crate::lifecycle::Never;
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -28,6 +26,37 @@ pub(crate) struct VaultRegistryId {
 impl fmt::Display for VaultRegistryId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.orderbook, self.owner)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VaultRegistryIdParseError {
+    #[error("missing ':' separator in VaultRegistryId")]
+    MissingSeparator,
+
+    #[error("invalid orderbook address")]
+    Orderbook(#[source] alloy::hex::FromHexError),
+
+    #[error("invalid owner address")]
+    Owner(#[source] alloy::hex::FromHexError),
+}
+
+impl std::str::FromStr for VaultRegistryId {
+    type Err = VaultRegistryIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (orderbook_str, owner_str) = s
+            .split_once(':')
+            .ok_or(VaultRegistryIdParseError::MissingSeparator)?;
+
+        let orderbook = orderbook_str
+            .parse()
+            .map_err(VaultRegistryIdParseError::Orderbook)?;
+        let owner = owner_str
+            .parse()
+            .map_err(VaultRegistryIdParseError::Owner)?;
+
+        Ok(Self { orderbook, owner })
     }
 }
 
@@ -244,8 +273,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use st0x_event_sorcery::Lifecycle;
+
     use super::*;
-    use crate::lifecycle::Lifecycle;
     use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");

@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
+use st0x_event_sorcery::Store;
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
 };
@@ -25,7 +26,6 @@ use crate::cctp::{
 };
 use crate::config::{BrokerCtx, Ctx};
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::event_sourced::Store;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;

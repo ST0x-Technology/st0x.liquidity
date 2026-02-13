@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
+use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
 
 use super::usdc::UsdcRebalanceManager;
@@ -22,7 +23,6 @@ use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
 use crate::equity_redemption::EquityRedemption;
-use crate::event_sourced::Store;
 use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -230,12 +230,13 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlx::SqlitePool;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use uuid::Uuid;
+
+    use st0x_event_sorcery::test_store;
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
-    use crate::conductor::wire::test_cqrs;
     use crate::inventory::ImbalanceThreshold;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
@@ -412,9 +413,9 @@ mod tests {
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
 
         let (_tx, rx) = mpsc::channel(100);
-        let mint_store = Arc::new(test_cqrs(pool.clone(), vec![], ()));
-        let redemption_store = Arc::new(test_cqrs(pool.clone(), vec![], ()));
-        let usdc_store = Arc::new(test_cqrs(pool, vec![], ()));
+        let mint_store = Arc::new(test_store(pool.clone(), vec![], ()));
+        let redemption_store = Arc::new(test_store(pool.clone(), vec![], ()));
+        let usdc_store = Arc::new(test_store(pool, vec![], ()));
 
         let _rebalancer = services.into_rebalancer(
             &rebalancing_ctx,

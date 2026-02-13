@@ -22,11 +22,10 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 use st0x_dto::ServerMessage;
+use st0x_event_sorcery::{Cons, Nil, SqliteQuery, Store, StoreBuilder, Unwired};
 
-use super::wire::{Cons, CqrsBuilder, Nil, UnwiredQuery};
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::EquityRedemption;
-use crate::event_sourced::{SqliteQuery, Store};
 use crate::inventory::InventoryView;
 use crate::position::Position;
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
@@ -45,9 +44,9 @@ type EventBroadcasterDeps =
 /// Exhaustive destructuring in [`Self::wire()`] ensures every field
 /// is handled.
 pub(super) struct QueryManifest {
-    rebalancing_trigger: UnwiredQuery<RebalancingTrigger, RebalancingTriggerDeps>,
-    event_broadcaster: UnwiredQuery<EventBroadcaster, EventBroadcasterDeps>,
-    position_view: UnwiredQuery<SqliteQuery<Position>, Cons<Position, Nil>>,
+    rebalancing_trigger: Unwired<RebalancingTrigger, RebalancingTriggerDeps>,
+    event_broadcaster: Unwired<EventBroadcaster, EventBroadcasterDeps>,
+    position_view: Unwired<SqliteQuery<Position>, Cons<Position, Nil>>,
 }
 
 /// All query processors after wiring is complete.
@@ -91,9 +90,9 @@ impl QueryManifest {
         let position_view = GenericQuery::new(position_view_repo);
 
         Self {
-            rebalancing_trigger: UnwiredQuery::new(rebalancing_trigger),
-            event_broadcaster: UnwiredQuery::new(event_broadcaster),
-            position_view: UnwiredQuery::new(position_view),
+            rebalancing_trigger: Unwired::new(rebalancing_trigger),
+            event_broadcaster: Unwired::new(event_broadcaster),
+            position_view: Unwired::new(position_view),
         }
     }
 
@@ -113,28 +112,28 @@ impl QueryManifest {
         } = self;
 
         let (position, (position_view, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<Position>::new(pool.clone())
+            StoreBuilder::<Position>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(position_view)
                 .build(())
                 .await?;
 
         let (mint, (event_broadcaster, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<TokenizedEquityMint>::new(pool.clone())
+            StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
                 .build(())
                 .await?;
 
         let (redemption, (event_broadcaster, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<EquityRedemption>::new(pool.clone())
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
                 .build(())
                 .await?;
 
         let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) =
-            CqrsBuilder::<UsdcRebalance>::new(pool)
+            StoreBuilder::<UsdcRebalance>::new(pool)
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
                 .build(())

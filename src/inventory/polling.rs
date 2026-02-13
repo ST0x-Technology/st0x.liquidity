@@ -17,13 +17,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
+use st0x_event_sorcery::{Lifecycle, SendError, Store};
 use st0x_execution::{Executor, InventoryResult};
 
-use crate::event_sourced::{SendError, Store};
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
-use crate::lifecycle::Lifecycle;
 use crate::onchain::vault::{VaultError, VaultId, VaultService};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
@@ -259,10 +258,11 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
     use sqlx::Row;
+
+    use st0x_event_sorcery::test_store;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
-    use crate::conductor::wire::test_cqrs;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::VaultRegistryCommand;
@@ -322,7 +322,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -369,7 +369,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -412,7 +412,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -444,7 +444,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         // Should succeed without error
@@ -493,7 +493,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -540,7 +540,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -581,7 +581,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -614,7 +614,7 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) {
-        let store = test_cqrs::<VaultRegistry>(pool.clone(), vec![], ());
+        let store = test_store::<VaultRegistry>(pool.clone(), vec![], ());
         let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
@@ -640,7 +640,7 @@ mod tests {
         order_owner: Address,
         vault_id: B256,
     ) {
-        let store = test_cqrs::<VaultRegistry>(pool.clone(), vec![], ());
+        let store = test_store::<VaultRegistry>(pool.clone(), vec![], ());
         let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
@@ -673,7 +673,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -717,7 +717,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -762,7 +762,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -806,7 +806,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -837,7 +837,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_cqrs(pool.clone(), vec![], ()),
+            test_store(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();

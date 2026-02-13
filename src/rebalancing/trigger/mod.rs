@@ -18,12 +18,12 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
+use st0x_event_sorcery::{Lifecycle, LifecycleError};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
-use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
@@ -609,7 +609,6 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::lifecycle::Lifecycle;
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;

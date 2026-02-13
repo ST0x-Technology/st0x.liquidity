@@ -4,6 +4,8 @@
 //! and [`TestHarness`] for BDD-style command testing. Both operate
 //! at the EventSourced level, hiding Lifecycle/Aggregate internals.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use cqrs_es::Aggregate;
 
 use crate::EventSourced;
@@ -90,7 +92,7 @@ where
     Entity::Event: PartialEq + std::fmt::Debug,
 {
     /// Assert that the command produced exactly these events.
-    pub fn then_expect_events(self, expected: Vec<Entity::Event>) {
+    pub fn then_expect_events(self, expected: &[Entity::Event]) {
         let events = self
             .result
             .expect("expected events but command returned error");

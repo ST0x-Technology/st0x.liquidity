@@ -91,6 +91,14 @@ pub use wire::{Cons, Nil, StoreBuilder, Unwired};
 #[cfg(any(test, feature = "test-support"))]
 pub use wire::{TestStore, test_mem_store, test_store};
 
+/// Convenience alias for a SQLite-backed CQRS view query over a
+/// [`Lifecycle`]-wrapped entity.
+pub type SqliteQuery<Entity> = cqrs_es::persist::GenericQuery<
+    sqlite_es::SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
+    Lifecycle<Entity>,
+    Lifecycle<Entity>,
+>;
+
 use async_trait::async_trait;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, EventStore};
