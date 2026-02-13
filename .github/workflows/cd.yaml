@@ -40,16 +40,19 @@ jobs:
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
+      - name: Resolve host IP
+        run: |
+          host_ip=$(nix run .#resolveIp)
+          echo "::add-mask::$host_ip"
+          echo "HOST_IP=$host_ip" >> "$GITHUB_ENV"
+
       - name: Trust host key
         run: |
           host_key=$(nix eval --raw --file keys.nix keys.host)
-          echo "* $host_key" > ~/.ssh/known_hosts
+          echo "$HOST_IP $host_key" > ~/.ssh/known_hosts
 
       - name: Build Solidity artifacts
         run: nix run .#prepSolArtifacts
-
-      - name: Mask host IP
-        run: echo "::add-mask::$(nix run .#resolveIp)"
 
       - name: Build and deploy
         run: nix run .#deployAll
