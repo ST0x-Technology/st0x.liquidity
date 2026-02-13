@@ -7,15 +7,15 @@ use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
+use crate::order::OrderUpdate;
 use crate::{
     Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, Positive, Symbol,
-    order::OrderUpdate,
 };
 
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum OrderSide {
+pub enum OrderSide {
     Buy,
     Sell,
 }
@@ -100,6 +100,7 @@ pub(super) struct OrderResponse {
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub filled_quantity: Option<Decimal>,
+    pub side: OrderSide,
     pub status: BrokerOrderStatus,
     #[serde(
         rename = "filled_avg_price",
@@ -188,8 +189,11 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |s| {
-        s.parse::<f64>().map(Some).map_err(serde::de::Error::custom)
+    opt.map_or(Ok(None), |value| {
+        value
+            .parse::<f64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom)
     })
 }
 
@@ -198,8 +202,9 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |s| {
-        s.parse::<Decimal>()
+    opt.map_or(Ok(None), |value| {
+        value
+            .parse::<Decimal>()
             .map(Some)
             .map_err(serde::de::Error::custom)
     })
@@ -230,6 +235,13 @@ pub(super) async fn place_market_order(
     };
 
     let response = client.place_order(&request).await?;
+
+    if response.side != side {
+        return Err(AlpacaBrokerApiError::SideMismatch {
+            requested_side: side,
+            response_side: response.side,
+        });
+    }
 
     Ok(OrderPlacement {
         order_id: response.id.to_string(),
@@ -299,11 +311,11 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
 }
 
 fn convert_price_to_cents(price: Option<f64>) -> Result<Option<u64>, AlpacaBrokerApiError> {
-    price.map_or(Ok(None), |p| {
-        let cents_float = (p * 100.0).round();
+    price.map_or(Ok(None), |price_value| {
+        let cents_float = (price_value * 100.0).round();
         let cents = cents_float
             .to_u64()
-            .ok_or(AlpacaBrokerApiError::PriceConversion(p))?;
+            .ok_or(AlpacaBrokerApiError::PriceConversion(price_value))?;
         Ok(Some(cents))
     })
 }
@@ -392,21 +404,21 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
-    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
+            mode: Some(mode),
         }
     }
 
     #[tokio::test]
     async fn test_place_market_order_buy_success() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -431,17 +443,16 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
+        let placement = place_market_order(&client, market_order).await.unwrap();
 
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
@@ -451,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn test_place_market_order_sell_success() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -476,17 +487,16 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
             direction: Direction::Sell,
         };
 
-        let result = place_market_order(&client, market_order).await;
+        let placement = place_market_order(&client, market_order).await.unwrap();
 
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
@@ -496,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_pending() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let order_id = "904837e3-3b76-47ec-b432-046db621571b";
 
         let mock = server.mock(|when, then| {
@@ -515,11 +525,10 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
-        let result = get_order_status(&client, order_id).await;
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
     }
@@ -527,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_filled() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
 
         let mock = server.mock(|when, then| {
@@ -546,11 +555,10 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
-        let result = get_order_status(&client, order_id).await;
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.status, OrderStatus::Filled);
         assert_eq!(order_update.price_cents, Some(24567));
     }
@@ -558,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_rejected() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let order_id = "c7ca82d4-3c95-4f89-9b42-abc123def456";
 
         let mock = server.mock(|when, then| {
@@ -577,11 +585,10 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
-        let result = get_order_status(&client, order_id).await;
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.status, OrderStatus::Failed);
     }
 
@@ -633,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn test_convert_usdc_to_usd() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -659,13 +666,14 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = Decimal::from_str("1000.50").unwrap();
 
-        let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd).await;
+        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd)
+            .await
+            .unwrap();
 
         mock.assert();
-        let order = result.unwrap();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(order.symbol, "USDCUSD");
         assert_eq!(order.quantity, Decimal::from_str("1000.50").unwrap());
@@ -675,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn test_convert_usd_to_usdc() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -701,13 +709,14 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = Decimal::from_str("500").unwrap();
 
-        let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc).await;
+        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc)
+            .await
+            .unwrap();
 
         mock.assert();
-        let order = result.unwrap();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
         assert_eq!(order.quantity, Decimal::from_str("500").unwrap());
@@ -739,5 +748,52 @@ mod tests {
             make_order(BrokerOrderStatus::Canceled).status_display(),
             "canceled"
         );
+    }
+
+    #[tokio::test]
+    async fn test_place_market_order_side_mismatch() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/test_account_123/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "sell",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let result = place_market_order(&client, market_order).await;
+
+        mock.assert();
+        assert!(matches!(
+            result.unwrap_err(),
+            AlpacaBrokerApiError::SideMismatch {
+                requested_side: OrderSide::Buy,
+                response_side: OrderSide::Sell
+            }
+        ));
     }
 }

@@ -1,7 +1,7 @@
 //! Mint operations for tokenized equity.
 //!
-//! This module provides the trait and implementations for minting tokenized equities
-//! through the Alpaca tokenization API.
+//! This module provides the trait and implementations for minting
+//! tokenized equities through the Alpaca tokenization API.
 
 pub(crate) mod manager;
 #[cfg(test)]
@@ -9,12 +9,13 @@ pub(crate) mod mock;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
-use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
+use st0x_execution::{FractionalShares, Symbol};
+
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
+use crate::event_sourced::SendError;
+use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
@@ -22,7 +23,7 @@ pub(crate) enum MintError {
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
+    Aggregate(#[from] SendError<TokenizedEquityMint>),
 
     #[error("Mint request was rejected by Alpaca")]
     Rejected,

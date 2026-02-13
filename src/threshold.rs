@@ -1,13 +1,18 @@
 //! Execution threshold configuration for position management.
+//!
+//! Determines the minimum position imbalance (whole-share or
+//! dollar-value based) required before placing an offsetting
+//! broker order.
 
 use alloy::primitives::U256;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
-use std::str::FromStr;
 
 use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Positive};
+use std::ops::{Add, Mul, Sub};
+use std::str::FromStr;
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,8 +71,7 @@ impl Usdc {
             .checked_mul(USDC_DECIMAL_SCALE)
             .ok_or(UsdcConversionError::Overflow)?;
 
-        U256::from_str_radix(&scaled.trunc().to_string(), 10)
-            .map_err(UsdcConversionError::ParseError)
+        Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
     }
 }
 
@@ -87,7 +91,7 @@ impl From<Usdc> for Decimal {
     }
 }
 
-impl std::ops::Mul<Decimal> for Usdc {
+impl Mul<Decimal> for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 
     fn mul(self, rhs: Decimal) -> Self::Output {
@@ -102,7 +106,7 @@ impl std::ops::Mul<Decimal> for Usdc {
     }
 }
 
-impl std::ops::Add for Usdc {
+impl Add for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -117,7 +121,7 @@ impl std::ops::Add for Usdc {
     }
 }
 
-impl std::ops::Sub for Usdc {
+impl Sub for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -158,7 +162,7 @@ impl ExecutionThreshold {
 
     #[cfg(test)]
     pub(crate) fn whole_share() -> Self {
-        Self::Shares(Positive::new(FractionalShares::new(rust_decimal::Decimal::ONE)).unwrap())
+        Self::Shares(Positive::new(FractionalShares::new(Decimal::ONE)).unwrap())
     }
 }
 
@@ -172,9 +176,10 @@ pub enum InvalidThresholdError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
+
+    use super::*;
 
     fn arb_decimal() -> impl Strategy<Value = Decimal> {
         (any::<i64>(), 0u32..=10).prop_map(|(mantissa, scale)| Decimal::new(mantissa, scale))
@@ -227,26 +232,25 @@ mod tests {
 
     #[test]
     fn dollar_threshold_accepts_positive() {
-        let result = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE));
-        assert!(result.is_ok());
+        ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
     }
 
     #[test]
     fn usdc_add_succeeds() {
-        let a = Usdc(Decimal::ONE);
-        let b = Usdc(Decimal::TWO);
+        let smaller = Usdc(Decimal::ONE);
+        let larger = Usdc(Decimal::TWO);
 
-        let result = (a + b).unwrap();
+        let result = (smaller + larger).unwrap();
 
         assert_eq!(result.0, Decimal::from(3));
     }
 
     #[test]
     fn usdc_sub_succeeds() {
-        let a = Usdc(Decimal::from(5));
-        let b = Usdc(Decimal::TWO);
+        let larger = Usdc(Decimal::from(5));
+        let smaller = Usdc(Decimal::TWO);
 
-        let result = (a - b).unwrap();
+        let result = (larger - smaller).unwrap();
 
         assert_eq!(result.0, Decimal::from(3));
     }
@@ -256,9 +260,7 @@ mod tests {
         let max = Usdc(Decimal::MAX);
         let one = Usdc(Decimal::ONE);
 
-        let result = max + one;
-
-        let err = result.unwrap_err();
+        let err = (max + one).unwrap_err();
         assert_eq!(err.operation, "+");
         assert_eq!(err.lhs, max);
         assert_eq!(err.rhs, one);
@@ -269,9 +271,7 @@ mod tests {
         let min = Usdc(Decimal::MIN);
         let one = Usdc(Decimal::ONE);
 
-        let result = min - one;
-
-        let err = result.unwrap_err();
+        let err = (min - one).unwrap_err();
         assert_eq!(err.operation, "-");
         assert_eq!(err.lhs, min);
         assert_eq!(err.rhs, one);

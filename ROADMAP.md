@@ -7,7 +7,12 @@
 - [ ] [#263 Check offchain inventory before placing counter trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/263)
 - [ ] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
 - [ ] [#105 Run the Alpaca instance without whole share accumulation](https://github.com/ST0x-Technology/st0x.liquidity/issues/105)
-- [ ] [#251 Manual operations on trading venues not detected by inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/issues/251)
+- [ ] [#258 BUG: Alpaca Broker API should be expected with rebalancing enabled, not Alpaca Trading API](https://github.com/ST0x-Technology/st0x.liquidity/issues/258)
+- [ ] [#282 USDC inventory not updated from Position events (Buy/Sell trades)](https://github.com/ST0x-Technology/st0x.liquidity/issues/282)
+- [ ] [#283 USDC rebalancing trigger doesn't fire after USDC inventory changes](https://github.com/ST0x-Technology/st0x.liquidity/issues/283)
+- [ ] [#284 Equity mint completion trusts Alpaca API without onchain verification](https://github.com/ST0x-Technology/st0x.liquidity/issues/284)
+- [ ] [#276 EquityPosition market_value_cents truncates sub-cent precision](https://github.com/ST0x-Technology/st0x.liquidity/issues/276)
+- [ ] [#277 No automatic retry after offchain order failure](https://github.com/ST0x-Technology/st0x.liquidity/issues/277)
 
 **CQRS/ES Phase 3 - Complete Migration:**
 
@@ -58,25 +63,37 @@ both Schwab and Alpaca bot instances.
 Split monolith into focused crates for faster builds, stricter abstraction
 boundaries, and reduced coupling. Sequenced around CQRS/ES migration.
 
+**Prerequisites:**
+
+- [ ] [#267 Use cqrs-es Services to make OffchainOrder aggregate self-contained](https://github.com/ST0x-Technology/st0x.liquidity/issues/267)
+
 **Phase 2: Integration Layer Extraction**
 
 Extract external API wrappers (no CQRS/ES dependencies):
 
-- [ ] [#195 Multi-crate architecture: extract integration layer crates](https://github.com/ST0x-Technology/st0x.liquidity/issues/195) -
-      st0x-tokenization, st0x-bridge, st0x-vault crates
+- [ ] [#268 Extract st0x-bridge crate with Bridge trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/268)
+- [ ] [#269 Extract st0x-tokenization crate with Tokenizer trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/269)
+- [ ] [#270 Extract st0x-vault crate with Vault trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/270)
 
 **Phase 3: Rebalancing Domain Extraction**
 
 Extract rebalancing logic (already clean CQRS):
 
-- [ ] [#196 Multi-crate architecture: extract st0x-rebalance crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/196)
+- [ ] [#271 Extract st0x-rebalance crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/271)
 
 **Phase 4: Hedging Extraction & Application Layer** (after CQRS migration
 Phase 3)
 
 Extract hedging logic and create application binary:
 
-- [ ] [#197 Multi-crate architecture: extract st0x-hedge library and create st0x-server](https://github.com/ST0x-Technology/st0x.liquidity/issues/197)
+- [ ] [#272 Convert st0x-hedge to library crate and create st0x-server binary](https://github.com/ST0x-Technology/st0x.liquidity/issues/272)
+
+---
+
+## Backlog: Testing
+
+- [ ] [#285 Integration test plan](https://github.com/ST0x-Technology/st0x.liquidity/issues/285)
+- [ ] [#264 Set up end-to-end testing infrastructure](https://github.com/ST0x-Technology/st0x.liquidity/issues/264)
 
 ---
 
@@ -84,13 +101,15 @@ Extract hedging logic and create application binary:
 
 **Infrastructure:**
 
-- [ ] [#234 Spec out infrastructure and deployment improvements](https://github.com/ST0x-Technology/st0x.liquidity/issues/234)
+- [ ] [#286 No TLS configured for dashboard and WebSocket traffic](https://github.com/ST0x-Technology/st0x.liquidity/issues/286)
+- [ ] [#275 Optimise Fireblocks transfers: use vault-to-vault for issuance bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/275)
 - [ ] [#77 Set up Kafka](https://github.com/ST0x-Technology/st0x.liquidity/issues/77) -
       Event streaming infrastructure
 - [ ] [#78 Integrate Kafka in bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/78)
 
 **Production Enhancements:**
 
+- [ ] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
 - [ ] [#36 Set up Git Hooks for formatting](https://github.com/ST0x-Technology/st0x.liquidity/issues/36) -
       Automated formatting and linting checks
 
@@ -123,6 +142,27 @@ Extract hedging logic and create application binary:
 
 - [ ] [#16 Handle reorgs](https://github.com/ST0x-Technology/st0x.liquidity/issues/16) -
       Handle blockchain reorganizations safely
+
+---
+
+## Completed: CI/CD Improvements
+
+- [x] [#256 Implement CI/CD improvements from infra deployment spec](https://github.com/ST0x-Technology/st0x.liquidity/issues/256)
+  - PR:
+    [#259 Terraform infra provisioning and Nix-powered secret management and service deployments](https://github.com/ST0x-Technology/st0x.liquidity/pull/259)
+
+---
+
+## Completed: Production Fixes (Jan 2026)
+
+- [x] [#251 Manual operations on trading venues not detected by inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/issues/251)
+  - PR:
+    [#253 Fix inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/253)
+- [x] [#234 Spec out infrastructure and deployment improvements](https://github.com/ST0x-Technology/st0x.liquidity/issues/234)
+  - PR:
+    [#237 Propose better deployment and infra setup](https://github.com/ST0x-Technology/st0x.liquidity/pull/237)
+- PR:
+  [#266 Fix cqrs inventory management](https://github.com/ST0x-Technology/st0x.liquidity/pull/266)
 
 ---
 

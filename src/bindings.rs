@@ -1,3 +1,6 @@
+//! Solidity contract ABI bindings for raindex orderbook, ERC20,
+//! and Pyth oracle contracts.
+
 use alloy::sol;
 
 sol!(

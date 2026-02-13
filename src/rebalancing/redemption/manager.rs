@@ -1,12 +1,12 @@
 //! RedemptionManager orchestrates the EquityRedemption workflow.
 //!
-//! Coordinates between `AlpacaTokenizationService` and the `EquityRedemption` aggregate
-//! to execute the full redemption lifecycle: send tokens -> poll detection -> poll completion.
+//! Coordinates between `AlpacaTokenizationService` and the
+//! `EquityRedemption` aggregate to execute the full redemption
+//! lifecycle: send tokens -> poll detection -> poll completion.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
-use cqrs_es::{CqrsFramework, EventStore};
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
@@ -14,25 +14,23 @@ use tracing::{info, instrument, warn};
 use super::{Redeem, RedemptionError};
 use crate::alpaca_tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
-use crate::lifecycle::{Lifecycle, Never};
+use crate::event_sourced::Store;
 
-pub(crate) struct RedemptionManager<P, ES>
+pub(crate) struct RedemptionManager<P>
 where
     P: Provider + Clone,
-    ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
     service: Arc<AlpacaTokenizationService<P>>,
-    cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
+    cqrs: Arc<Store<EquityRedemption>>,
 }
 
-impl<P, ES> RedemptionManager<P, ES>
+impl<P> RedemptionManager<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
     pub(crate) fn new(
         service: Arc<AlpacaTokenizationService<P>>,
-        cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
+        cqrs: Arc<Store<EquityRedemption>>,
     ) -> Self {
         Self { service, cqrs }
     }
@@ -69,8 +67,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &aggregate_id.0,
+            .send(
+                aggregate_id,
                 EquityRedemptionCommand::SendTokens {
                     symbol,
                     quantity: quantity.inner(),
@@ -87,8 +85,8 @@ where
             Err(e) => {
                 warn!("Polling for redemption detection failed: {e}");
                 self.cqrs
-                    .execute(
-                        &aggregate_id.0,
+                    .send(
+                        aggregate_id,
                         EquityRedemptionCommand::FailDetection {
                             reason: format!("Detection polling failed: {e}"),
                         },
@@ -99,8 +97,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &aggregate_id.0,
+            .send(
+                aggregate_id,
                 EquityRedemptionCommand::Detect {
                     tokenization_request_id: detected.id.clone(),
                 },
@@ -121,8 +119,8 @@ where
             Err(e) => {
                 warn!("Polling for completion failed: {e}");
                 self.cqrs
-                    .execute(
-                        &aggregate_id.0,
+                    .send(
+                        aggregate_id,
                         EquityRedemptionCommand::RejectRedemption {
                             reason: format!("Completion polling failed: {e}"),
                         },
@@ -135,7 +133,7 @@ where
         match completed.status {
             TokenizationRequestStatus::Completed => {
                 self.cqrs
-                    .execute(&aggregate_id.0, EquityRedemptionCommand::Complete)
+                    .send(aggregate_id, EquityRedemptionCommand::Complete)
                     .await?;
 
                 info!("Redemption workflow completed successfully");
@@ -143,8 +141,8 @@ where
             }
             TokenizationRequestStatus::Rejected => {
                 self.cqrs
-                    .execute(
-                        &aggregate_id.0,
+                    .send(
+                        aggregate_id,
                         EquityRedemptionCommand::RejectRedemption {
                             reason: "Redemption rejected by Alpaca".to_string(),
                         },
@@ -160,11 +158,9 @@ where
 }
 
 #[async_trait]
-impl<P, ES> Redeem for RedemptionManager<P, ES>
+impl<P> Redeem for RedemptionManager<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<EquityRedemption, Never>> + Send + Sync,
-    ES::AC: Send,
 {
     async fn execute_redemption(
         &self,
@@ -190,6 +186,7 @@ mod tests {
     use cqrs_es::mem_store::MemStore;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
+    use sqlx::SqlitePool;
     use serde_json::json;
 
     use super::*;
@@ -197,16 +194,13 @@ mod tests {
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
         tokenization_requests_path,
     };
+    use crate::conductor::wire::test_cqrs;
     use crate::bindings::{IERC20, TestERC20};
 
-    type TestCqrs = CqrsFramework<
-        Lifecycle<EquityRedemption, Never>,
-        MemStore<Lifecycle<EquityRedemption, Never>>,
-    >;
-
-    fn create_test_cqrs() -> Arc<TestCqrs> {
-        let store = MemStore::default();
-        Arc::new(CqrsFramework::new(store, vec![], ()))
+    async fn create_test_cqrs() -> Arc<Store<EquityRedemption>> {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        Arc::new(test_cqrs(pool, vec![], ()))
     }
 
     #[tokio::test]
@@ -216,7 +210,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_cqrs().await;
         let manager = RedemptionManager::new(service, cqrs);
 
         let symbol = Symbol::new("AAPL").unwrap();
@@ -244,7 +238,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_cqrs().await;
         let manager = RedemptionManager::new(service, cqrs);
 
         let redeem_trait: &dyn Redeem = &manager;

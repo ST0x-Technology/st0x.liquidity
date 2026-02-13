@@ -74,7 +74,7 @@ where
         if allowance < amount {
             let pending = match self.usdc.approve(spender, amount).send().await {
                 Ok(pending) => pending,
-                Err(e) => return Err(handle_contract_error(e).await),
+                Err(error) => return Err(handle_contract_error(error).await),
             };
 
             // Wait for multiple confirmations to ensure state propagates across
@@ -118,7 +118,7 @@ where
             .await
         {
             Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
+            Err(error) => return Err(handle_contract_error(error).await),
         };
 
         let receipt = pending.get_receipt().await?;
@@ -155,7 +155,7 @@ where
             .await
         {
             Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
+            Err(error) => return Err(handle_contract_error(error).await),
         };
 
         let receipt = pending.get_receipt().await?;

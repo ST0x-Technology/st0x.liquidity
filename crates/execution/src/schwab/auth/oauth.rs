@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use tracing::{debug, info};
 use url::Url;
 
-use super::super::{SchwabError, tokens::SchwabTokens};
+use super::super::{SchwabAction, SchwabError, tokens::SchwabTokens};
 
 static DEFAULT_REDIRECT_URI: LazyLock<Result<Url, url::ParseError>> =
     LazyLock::new(|| Url::parse("https://127.0.0.1"));
@@ -19,7 +19,7 @@ static DEFAULT_BASE_URL: LazyLock<Result<Url, url::ParseError>> =
     LazyLock::new(|| Url::parse("https://api.schwabapi.com"));
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SchwabAuthConfig {
+pub struct SchwabAuthCtx {
     pub app_key: String,
     pub app_secret: String,
     pub redirect_uri: Option<Url>,
@@ -28,7 +28,7 @@ pub struct SchwabAuthConfig {
     pub encryption_key: FixedBytes<32>,
 }
 
-impl SchwabAuthConfig {
+impl SchwabAuthCtx {
     pub fn redirect_uri(&self) -> Result<&Url, url::ParseError> {
         self.redirect_uri.as_ref().map_or_else(
             || DEFAULT_REDIRECT_URI.as_ref().map_err(ToOwned::to_owned),
@@ -58,13 +58,10 @@ pub(crate) struct SchwabAuthResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountNumbers {
-    // Field exists in API response but isn't currently used
-    #[allow(dead_code)]
-    pub account_number: String,
     pub hash_value: String,
 }
 
-impl SchwabAuthConfig {
+impl SchwabAuthCtx {
     pub async fn get_account_hash(&self, pool: &SqlitePool) -> Result<String, SchwabError> {
         let access_token = SchwabTokens::get_valid_access_token(pool, self).await?;
 
@@ -94,7 +91,7 @@ impl SchwabAuthConfig {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(SchwabError::RequestFailed {
-                action: "get account hash".to_string(),
+                action: SchwabAction::GetAccountHash,
                 status,
                 body,
             });
@@ -164,7 +161,7 @@ impl SchwabAuthConfig {
             let status = response.status();
             let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
-                action: "get tokens".to_string(),
+                action: SchwabAction::GetTokens,
                 status,
                 body,
             });
@@ -219,7 +216,7 @@ impl SchwabAuthConfig {
             let status = response.status();
             let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
-                action: "token request".to_string(),
+                action: SchwabAction::TokenRequest,
                 status,
                 body,
             });
@@ -240,7 +237,7 @@ async fn extract_error_body(response: reqwest::Response) -> String {
     let is_gzipped = response
         .headers()
         .get("content-encoding")
-        .map(reqwest::header::HeaderValue::as_bytes)
+        .map(HeaderValue::as_bytes)
         == Some(b"gzip");
 
     if is_gzipped {
@@ -267,8 +264,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_config() -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_ctx() -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
@@ -278,8 +275,8 @@ mod tests {
         }
     }
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_ctx_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
@@ -291,14 +288,14 @@ mod tests {
 
     #[test]
     fn test_schwab_auth_env_get_auth_url() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let expected_url = "https://api.schwabapi.com/v1/oauth/authorize?client_id=test_app_key&redirect_uri=https%3A%2F%2F127.0.0.1%2F";
-        assert_eq!(config.get_auth_url().unwrap(), expected_url);
+        assert_eq!(ctx.get_auth_url().unwrap(), expected_url);
     }
 
     #[test]
     fn test_schwab_auth_env_get_auth_url_custom_base_url() {
-        let config = SchwabAuthConfig {
+        let ctx = SchwabAuthCtx {
             app_key: "custom_key".to_string(),
             app_secret: "custom_secret".to_string(),
             redirect_uri: Some(Url::parse("https://custom.redirect.com").expect("test url")),
@@ -307,12 +304,12 @@ mod tests {
             encryption_key: TEST_ENCRYPTION_KEY,
         };
         let expected_url = "https://custom.api.com/v1/oauth/authorize?client_id=custom_key&redirect_uri=https%3A%2F%2Fcustom.redirect.com%2F";
-        assert_eq!(config.get_auth_url().unwrap(), expected_url);
+        assert_eq!(ctx.get_auth_url().unwrap(), expected_url);
     }
 
     #[test]
     fn test_schwab_auth_env_get_auth_url_with_special_characters() {
-        let config = SchwabAuthConfig {
+        let ctx = SchwabAuthCtx {
             app_key: "test key with spaces & symbols!".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: Some(
@@ -324,13 +321,13 @@ mod tests {
             encryption_key: TEST_ENCRYPTION_KEY,
         };
         let expected_url = "https://api.schwabapi.com/v1/oauth/authorize?client_id=test%20key%20with%20spaces%20%26%20symbols%21&redirect_uri=https%3A%2F%2Fexample.com%2Fcallback%3Fparam%3Dvalue%26other%3Dtest";
-        assert_eq!(config.get_auth_url().unwrap(), expected_url);
+        assert_eq!(ctx.get_auth_url().unwrap(), expected_url);
     }
 
     #[tokio::test]
     async fn test_get_tokens_success() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "test_access_token",
@@ -353,11 +350,9 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
-
+        let tokens = ctx.get_tokens_from_code("test_code").await.unwrap();
         mock.assert();
 
-        let tokens = result.unwrap();
         assert_eq!(tokens.access_token, "test_access_token");
         assert_eq!(tokens.refresh_token, "test_refresh_token");
 
@@ -369,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_http_error() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -378,20 +373,20 @@ mod tests {
                 .json_body(json!({"error": "invalid_request"}));
         });
 
-        let result = config.get_tokens_from_code("invalid_code").await;
-
+        let error = ctx.get_tokens_from_code("invalid_code").await.unwrap_err();
         mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "get tokens" && status.as_u16() == 400
+            if action == SchwabAction::GetTokens && status.as_u16() == 400
         ));
     }
 
     #[tokio::test]
     async fn test_get_tokens_json_parse_error() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -400,16 +395,16 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
-
+        let error = ctx.get_tokens_from_code("test_code").await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[tokio::test]
     async fn test_get_tokens_missing_fields() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "test_access_token"
@@ -422,16 +417,16 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
-
+        let error = ctx.get_tokens_from_code("test_code").await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[tokio::test]
     async fn test_get_tokens_with_special_characters() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "access_token_with_special_chars_!@#$%^&*()",
@@ -445,12 +440,12 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config
+        let tokens = ctx
             .get_tokens_from_code("code_with_special_chars_!@#$%^&*()")
-            .await;
-
+            .await
+            .unwrap();
         mock.assert();
-        let tokens = result.unwrap();
+
         assert_eq!(
             tokens.access_token,
             "access_token_with_special_chars_!@#$%^&*()"
@@ -464,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_tokens_success() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "new_access_token",
@@ -486,11 +481,9 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.refresh_tokens("old_refresh_token").await;
-
+        let tokens = ctx.refresh_tokens("old_refresh_token").await.unwrap();
         mock.assert();
 
-        let tokens = result.unwrap();
         assert_eq!(tokens.access_token, "new_access_token");
         assert_eq!(tokens.refresh_token, "new_refresh_token");
 
@@ -502,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_tokens_http_error() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -511,19 +504,19 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let result = config.refresh_tokens("invalid_refresh_token").await;
-
+        let error = ctx
+            .refresh_tokens("invalid_refresh_token")
+            .await
+            .unwrap_err();
         mock.assert();
-        assert!(matches!(
-            result.unwrap_err(),
-            SchwabError::RequestFailed { .. }
-        ));
+
+        assert!(matches!(error, SchwabError::RequestFailed { .. }));
     }
 
     #[tokio::test]
     async fn test_refresh_tokens_json_parse_error() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -532,16 +525,16 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = config.refresh_tokens("test_refresh_token").await;
-
+        let error = ctx.refresh_tokens("test_refresh_token").await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[tokio::test]
     async fn test_refresh_tokens_missing_fields() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "new_access_token"
@@ -554,10 +547,10 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.refresh_tokens("test_refresh_token").await;
-
+        let error = ctx.refresh_tokens("test_refresh_token").await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[test]
@@ -588,8 +581,8 @@ mod tests {
     }
 
     #[test]
-    fn test_schwab_auth_config_defaults() {
-        let config = SchwabAuthConfig {
+    fn test_schwab_auth_ctx_defaults() {
+        let ctx = SchwabAuthCtx {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
@@ -598,21 +591,18 @@ mod tests {
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
+        assert_eq!(ctx.redirect_uri().unwrap().as_str(), "https://127.0.0.1/");
         assert_eq!(
-            config.redirect_uri().unwrap().as_str(),
-            "https://127.0.0.1/"
-        );
-        assert_eq!(
-            config.base_url().unwrap().as_str(),
+            ctx.base_url().unwrap().as_str(),
             "https://api.schwabapi.com/"
         );
-        assert_eq!(config.account_index(), 0);
+        assert_eq!(ctx.account_index(), 0);
     }
 
     #[tokio::test]
     async fn test_get_account_hash_success() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -637,17 +627,17 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let hash = ctx.get_account_hash(&pool).await.unwrap();
         mock.assert();
-        assert_eq!(result.unwrap(), "ABC123DEF456");
+
+        assert_eq!(hash, "ABC123DEF456");
     }
 
     #[tokio::test]
     async fn test_get_account_hash_with_custom_index() {
         let server = MockServer::start();
-        let mut config = create_test_config_with_mock_server(&server);
-        config.account_index = Some(1);
+        let mut ctx = create_test_ctx_with_mock_server(&server);
+        ctx.account_index = Some(1);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -672,17 +662,17 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let hash = ctx.get_account_hash(&pool).await.unwrap();
         mock.assert();
-        assert_eq!(result.unwrap(), "XYZ789GHI012");
+
+        assert_eq!(hash, "XYZ789GHI012");
     }
 
     #[tokio::test]
     async fn test_get_account_hash_index_out_of_bounds() {
         let server = MockServer::start();
-        let mut config = create_test_config_with_mock_server(&server);
-        config.account_index = Some(2);
+        let mut ctx = create_test_ctx_with_mock_server(&server);
+        ctx.account_index = Some(2);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -700,11 +690,11 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let error = ctx.get_account_hash(&pool).await.unwrap_err();
         mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::AccountIndexOutOfBounds { index: 2, count: 1 }
         ));
     }
@@ -712,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_account_hash_no_accounts() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -723,28 +713,28 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let error = ctx.get_account_hash(&pool).await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::NoAccountsFound));
+
+        assert!(matches!(error, SchwabError::NoAccountsFound));
     }
 
     #[tokio::test]
     async fn test_get_tokens_from_code_no_retries_on_failure() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
             then.status(500);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
+        let error = ctx.get_tokens_from_code("test_code").await.unwrap_err();
 
         assert_eq!(mock.hits(), 1);
-        match result {
-            Err(SchwabError::RequestFailed { action, status, .. }) => {
-                assert_eq!(action, "get tokens");
+        match error {
+            SchwabError::RequestFailed { action, status, .. } => {
+                assert_eq!(action, SchwabAction::GetTokens);
                 assert_eq!(status.as_u16(), 500);
             }
             other => panic!("Expected RequestFailed error, got: {other:?}"),

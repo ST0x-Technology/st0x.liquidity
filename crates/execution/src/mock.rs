@@ -11,9 +11,9 @@ use crate::{
     SupportedExecutor, TryIntoExecutor,
 };
 
-/// Configuration for MockExecutor
+/// Context for MockExecutor (unit struct - no context needed)
 #[derive(Debug, Clone, Default)]
-pub struct MockExecutorConfig;
+pub struct MockExecutorCtx;
 
 /// Unified test executor for dry-run mode and testing that logs operations without executing real trades
 #[derive(Debug, Clone)]
@@ -76,9 +76,9 @@ impl Default for MockExecutor {
 impl Executor for MockExecutor {
     type Error = ExecutionError;
     type OrderId = String;
-    type Config = MockExecutorConfig;
+    type Ctx = MockExecutorCtx;
 
-    async fn try_from_config(_config: Self::Config) -> Result<Self, Self::Error> {
+    async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
         warn!("[MOCK] Initializing mock executor - always ready in dry-run mode");
         Ok(Self::new())
     }
@@ -166,13 +166,13 @@ impl Executor for MockExecutor {
 }
 
 #[async_trait]
-impl TryIntoExecutor for MockExecutorConfig {
+impl TryIntoExecutor for MockExecutorCtx {
     type Executor = MockExecutor;
 
     async fn try_into_executor(
         self,
     ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        MockExecutor::try_from_config(self).await
+        MockExecutor::try_from_ctx(self).await
     }
 }
 
@@ -184,11 +184,8 @@ mod tests {
     use crate::{Direction, FractionalShares, Positive, Symbol};
 
     #[tokio::test]
-    async fn test_try_from_config_success() {
-        let result = MockExecutor::try_from_config(MockExecutorConfig).await;
-        assert!(result.is_ok());
-
-        let executor = result.unwrap();
+    async fn test_try_from_ctx_success() {
+        let executor = MockExecutor::try_from_ctx(MockExecutorCtx).await.unwrap();
         assert!(!executor.should_fail);
         assert_eq!(executor.failure_message, "");
     }
@@ -196,20 +193,21 @@ mod tests {
     #[tokio::test]
     async fn test_wait_until_market_open_always_returns_none() {
         let executor = MockExecutor::new();
-        let result = executor.wait_until_market_open().await;
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::time::Duration::MAX);
+        assert_eq!(
+            executor.wait_until_market_open().await.unwrap(),
+            std::time::Duration::MAX
+        );
     }
 
     #[tokio::test]
     async fn test_failure_executor_wait_until_market_open() {
         let executor = MockExecutor::with_failure("Test failure");
-        let result = executor.wait_until_market_open().await;
 
-        assert!(result.is_ok());
-        let dur = result.unwrap();
-        assert_eq!(dur, std::time::Duration::MAX);
+        assert_eq!(
+            executor.wait_until_market_open().await.unwrap(),
+            std::time::Duration::MAX
+        );
     }
 
     #[tokio::test]
@@ -236,8 +234,7 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = executor.place_market_order(order).await;
-        let placement = result.unwrap();
+        let placement = executor.place_market_order(order).await.unwrap();
 
         assert!(placement.order_id.starts_with("TEST_"));
         assert_eq!(placement.symbol, Symbol::new("AAPL").unwrap());
@@ -257,9 +254,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = executor.place_market_order(order).await;
         assert!(matches!(
-            result.unwrap_err(),
+            executor.place_market_order(order).await.unwrap_err(),
             ExecutionError::MockFailure { message } if message == "Simulated API error"
         ));
     }
@@ -267,19 +263,20 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_success() {
         let executor = MockExecutor::new();
-        let result = executor.get_order_status(&"TEST_1".to_string()).await;
 
-        let state = result.unwrap();
+        let state = executor
+            .get_order_status(&"TEST_1".to_string())
+            .await
+            .unwrap();
         assert!(matches!(state, OrderState::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_get_order_status_failure() {
         let executor = MockExecutor::with_failure("Test failure");
-        let result = executor.get_order_status(&"TEST_1".to_string()).await;
 
         assert!(matches!(
-            result.unwrap_err(),
+            executor.get_order_status(&"TEST_1".to_string()).await.unwrap_err(),
             ExecutionError::OrderNotFound { order_id } if order_id == "TEST_1"
         ));
     }

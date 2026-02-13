@@ -4,6 +4,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::Symbol;
+use crate::alpaca_broker_api::order::OrderSide;
 
 mod auth;
 mod client;
@@ -12,7 +13,7 @@ mod market_hours;
 mod order;
 mod positions;
 
-pub use auth::{AccountStatus, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+pub use auth::{AccountStatus, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use order::{ConversionDirection, CryptoOrderResponse};
 
@@ -86,5 +87,13 @@ pub enum AlpacaBrokerApiError {
     MarketValueConversion {
         symbol: Symbol,
         market_value: Option<Decimal>,
+    },
+    #[error(
+        "Response side {response_side:?} does not match \
+         requested side {requested_side:?}"
+    )]
+    SideMismatch {
+        requested_side: OrderSide,
+        response_side: OrderSide,
     },
 }

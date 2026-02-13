@@ -27,14 +27,14 @@ impl AlpacaBrokerApiMode {
 }
 
 #[derive(Clone, Deserialize)]
-pub struct AlpacaBrokerApiAuthConfig {
+pub struct AlpacaBrokerApiCtx {
     pub api_key: String,
     pub api_secret: String,
     pub account_id: String,
     pub mode: Option<AlpacaBrokerApiMode>,
 }
 
-impl AlpacaBrokerApiAuthConfig {
+impl AlpacaBrokerApiCtx {
     pub fn mode(&self) -> AlpacaBrokerApiMode {
         self.mode.clone().unwrap_or(AlpacaBrokerApiMode::Sandbox)
     }
@@ -53,9 +53,9 @@ impl AlpacaBrokerApiAuthConfig {
     }
 }
 
-impl std::fmt::Debug for AlpacaBrokerApiAuthConfig {
+impl std::fmt::Debug for AlpacaBrokerApiCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlpacaBrokerApiAuthConfig")
+        f.debug_struct("AlpacaBrokerApiCtx")
             .field("api_key", &"[REDACTED]")
             .field("api_secret", &"[REDACTED]")
             .field("account_id", &self.account_id)
@@ -91,21 +91,12 @@ pub(super) struct AccountResponse {
 mod tests {
     use super::*;
 
-    fn create_test_sandbox_config() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
             account_id: "test_account_123".to_string(),
-            mode: None,
-        }
-    }
-
-    fn create_test_production_config() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
-            api_key: "test_key_id".to_string(),
-            api_secret: "test_secret_key".to_string(),
-            account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Production),
+            mode: Some(mode),
         }
     }
 
@@ -123,29 +114,29 @@ mod tests {
 
     #[test]
     fn test_alpaca_broker_api_auth_env_base_url() {
-        let sandbox_config = create_test_sandbox_config();
+        let sandbox_ctx = create_test_ctx(AlpacaBrokerApiMode::Sandbox);
         assert_eq!(
-            sandbox_config.base_url(),
+            sandbox_ctx.base_url(),
             "https://broker-api.sandbox.alpaca.markets"
         );
 
-        let production_config = create_test_production_config();
+        let production_ctx = create_test_ctx(AlpacaBrokerApiMode::Production);
         assert_eq!(
-            production_config.base_url(),
+            production_ctx.base_url(),
             "https://broker-api.alpaca.markets"
         );
     }
 
     #[test]
     fn test_alpaca_broker_api_auth_env_debug_redacts_secrets() {
-        let config = AlpacaBrokerApiAuthConfig {
+        let ctx = AlpacaBrokerApiCtx {
             api_key: "super_secret_key_123".to_string(),
             api_secret: "ultra_secret_secret_456".to_string(),
             account_id: "account_789".to_string(),
             mode: None,
         };
 
-        let debug_output = format!("{config:?}");
+        let debug_output = format!("{ctx:?}");
 
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("super_secret_key_123"));

@@ -10,17 +10,18 @@ pub(crate) mod mock;
 pub(crate) use manager::UsdcRebalanceManager;
 
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
 use thiserror::Error;
 
 use alloy::primitives::ruint::FromUintError;
 
+use st0x_execution::AlpacaBrokerApiError;
+
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::cctp::CctpError;
+use crate::event_sourced::SendError;
 use crate::onchain::vault::VaultError;
 use crate::threshold::Usdc;
-use crate::usdc_rebalance::{UsdcRebalanceError, UsdcRebalanceId};
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use crate::usdc_rebalance::UsdcRebalanceId;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcRebalanceManagerError {
@@ -33,7 +34,7 @@ pub(crate) enum UsdcRebalanceManagerError {
     #[error("Vault error: {0}")]
     Vault(#[from] VaultError),
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<UsdcRebalanceError>),
+    Aggregate(#[from] SendError<crate::usdc_rebalance::UsdcRebalance>),
     #[error("Withdrawal failed with terminal status: {status}")]
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]

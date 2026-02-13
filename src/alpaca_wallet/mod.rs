@@ -1,22 +1,25 @@
-//! Alpaca crypto wallet API client for deposits and withdrawals.
+//! Alpaca Broker API crypto wallet client for USDC deposits and withdrawals.
 //!
-//! This module provides a client for interacting with Alpaca's crypto wallet API,
+//! This module integrates with the wallet endpoints of the Alpaca Broker API,
 //! supporting USDC deposits and withdrawals.
 //!
 //! # Authentication
 //!
-//! Authentication uses Alpaca API credentials (API key and secret).
+//! Authentication uses Alpaca Broker API credentials (API key and secret).
 //! The client automatically fetches and caches the account ID.
 //!
 //! # Whitelisting
 //!
-//! Alpaca requires addresses to be whitelisted before withdrawals. After whitelisting,
-//! there is a 24-hour approval period before the address can be used.
+//! Alpaca requires addresses to be whitelisted before
+//! withdrawals. After whitelisting, there is a 24-hour
+//! approval period before the address can be used.
 //!
 //! # Transfer Lifecycle
 //!
-//! Transfers progress through states: Pending → Processing → Complete/Failed.
-//! Use `poll_transfer_until_complete()` to wait for a transfer to reach a terminal state.
+//! Transfers progress through states:
+//! Pending -> Processing -> Complete/Failed.
+//! Use `poll_transfer_until_complete()` to wait for a
+//! transfer to reach a terminal state.
 
 mod client;
 mod status;
@@ -208,12 +211,11 @@ mod tests {
         let asset = TokenSymbol::new("USDC");
         let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let result = service
-            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
-            .await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            service
+                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .await
+                .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }
         ));
         whitelist_mock.assert();
@@ -243,12 +245,11 @@ mod tests {
 
         let asset = TokenSymbol::new("USDC");
 
-        let result = service
-            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
-            .await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            service
+                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .await
+                .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }
         ));
         whitelist_mock.assert();

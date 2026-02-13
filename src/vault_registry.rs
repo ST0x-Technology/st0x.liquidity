@@ -5,18 +5,80 @@
 //! - **Equity Vaults**: Hold tokenized equities (token != USDC)
 //! - **USDC Vaults**: Hold USDC for trading
 
-use std::collections::BTreeMap;
-
 use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+
 use st0x_execution::Symbol;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::event_sourced::{DomainEvent, EventSourced};
+use crate::lifecycle::Never;
 
-pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
+/// Typed identifier for VaultRegistry aggregates, keyed by
+/// orderbook and owner address pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VaultRegistryId {
+    pub(crate) orderbook: Address,
+    pub(crate) owner: Address,
+}
+
+impl fmt::Display for VaultRegistryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.orderbook, self.owner)
+    }
+}
+
+#[async_trait]
+impl EventSourced for VaultRegistry {
+    type Id = VaultRegistryId;
+    type Event = VaultRegistryEvent;
+    type Command = VaultRegistryCommand;
+    type Error = Never;
+    type Services = ();
+
+    const AGGREGATE_TYPE: &'static str = "VaultRegistry";
+    const SCHEMA_VERSION: u64 = 1;
+
+    fn originate(event: &Self::Event) -> Option<Self> {
+        let mut registry = Self::empty(event.timestamp());
+        registry.apply_event(event);
+        Some(registry)
+    }
+
+    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        let mut new_registry = state.clone();
+        new_registry.apply_event(event);
+        Ok(Some(new_registry))
+    }
+
+    async fn initialize(
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![Self::command_to_event(command)])
+    }
+
+    async fn transition(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![Self::command_to_event(command)])
+    }
+}
+
+/// Registry state tracking all discovered vaults for an orderbook/owner pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VaultRegistry {
+    /// Discovered equity vaults, keyed by token address
+    pub(crate) equity_vaults: BTreeMap<Address, DiscoveredEquityVault>,
+    /// Discovered USDC vault (at most one per owner)
+    pub(crate) usdc_vault: Option<DiscoveredUsdcVault>,
+    pub(crate) last_updated: DateTime<Utc>,
+}
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,27 +98,12 @@ pub(crate) struct DiscoveredUsdcVault {
     pub(crate) discovered_at: DateTime<Utc>,
 }
 
-/// Registry state tracking all discovered vaults for an orderbook/owner pair.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VaultRegistry {
-    /// Discovered equity vaults, keyed by token address
-    pub(crate) equity_vaults: BTreeMap<Address, DiscoveredEquityVault>,
-    /// Discovered USDC vault (at most one per owner)
-    pub(crate) usdc_vault: Option<DiscoveredUsdcVault>,
-    pub(crate) last_updated: DateTime<Utc>,
-}
-
 impl VaultRegistry {
-    /// Creates the aggregate ID from orderbook and owner addresses.
-    pub(crate) fn aggregate_id(orderbook: Address, owner: Address) -> String {
-        format!("{orderbook}:{owner}")
-    }
-
     pub(crate) fn token_by_symbol(&self, symbol: &Symbol) -> Option<Address> {
         self.equity_vaults
             .values()
-            .find(|v| v.symbol == *symbol)
-            .map(|v| v.token)
+            .find(|vault| vault.symbol == *symbol)
+            .map(|vault| vault.token)
     }
 
     fn empty(timestamp: DateTime<Utc>) -> Self {
@@ -65,18 +112,6 @@ impl VaultRegistry {
             usdc_vault: None,
             last_updated: timestamp,
         }
-    }
-
-    pub(crate) fn from_event(event: &VaultRegistryEvent) -> Self {
-        let mut registry = Self::empty(event.timestamp());
-        registry.apply_event(event);
-        registry
-    }
-
-    pub(crate) fn apply_transition(event: &VaultRegistryEvent, registry: &Self) -> Self {
-        let mut new_registry = registry.clone();
-        new_registry.apply_event(event);
-        new_registry
     }
 
     fn apply_event(&mut self, event: &VaultRegistryEvent) {
@@ -115,36 +150,10 @@ impl VaultRegistry {
             }
         }
     }
-}
 
-#[async_trait]
-impl Aggregate for Lifecycle<VaultRegistry, Never> {
-    type Command = VaultRegistryCommand;
-    type Event = VaultRegistryEvent;
-    type Error = VaultRegistryError;
-    type Services = ();
-
-    fn aggregate_type() -> String {
-        "VaultRegistry".to_string()
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        *self = self
-            .clone()
-            .transition(&event, |event, state| {
-                Ok(VaultRegistry::apply_transition(event, state))
-            })
-            .or_initialize(&event, |event| Ok(VaultRegistry::from_event(event)));
-    }
-
-    async fn handle(
-        &self,
-        command: Self::Command,
-        _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    fn command_to_event(command: VaultRegistryCommand) -> VaultRegistryEvent {
         let now = Utc::now();
-
-        let event = match command {
+        match command {
             VaultRegistryCommand::DiscoverEquityVault {
                 token,
                 vault_id,
@@ -157,7 +166,6 @@ impl Aggregate for Lifecycle<VaultRegistry, Never> {
                 discovered_at: now,
                 symbol,
             },
-
             VaultRegistryCommand::DiscoverUsdcVault {
                 vault_id,
                 discovered_in,
@@ -166,16 +174,8 @@ impl Aggregate for Lifecycle<VaultRegistry, Never> {
                 discovered_in,
                 discovered_at: now,
             },
-        };
-
-        Ok(vec![event])
+        }
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum VaultRegistryError {
-    #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,15 +237,15 @@ impl DomainEvent for VaultRegistryEvent {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
+    use async_trait::async_trait;
+    use cqrs_es::{Aggregate, EventEnvelope, Query, View};
+    use sqlite_es::sqlite_cqrs;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
-    use cqrs_es::{EventEnvelope, Query, View};
-    use sqlite_es::sqlite_cqrs;
-
     use super::*;
+    use crate::lifecycle::Lifecycle;
     use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
@@ -260,7 +260,7 @@ mod tests {
         aggregate_id: &str,
         sequence: usize,
         event: VaultRegistryEvent,
-    ) -> EventEnvelope<VaultRegistryAggregate> {
+    ) -> EventEnvelope<Lifecycle<VaultRegistry>> {
         EventEnvelope {
             aggregate_id: aggregate_id.to_string(),
             sequence,
@@ -275,14 +275,18 @@ mod tests {
 
     #[test]
     fn aggregate_id_format() {
-        let id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
-        assert!(id.contains(&TEST_ORDERBOOK.to_string()));
-        assert!(id.contains(&TEST_OWNER.to_string()));
+        let id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_OWNER,
+        };
+        let id_str = id.to_string();
+        assert!(id_str.contains(&TEST_ORDERBOOK.to_string()));
+        assert!(id_str.contains(&TEST_OWNER.to_string()));
     }
 
     #[tokio::test]
     async fn first_equity_discovery_initializes_registry() {
-        let aggregate = VaultRegistryAggregate::default();
+        let aggregate = Lifecycle::<VaultRegistry>::default();
 
         let command = VaultRegistryCommand::DiscoverEquityVault {
             token: TEST_TOKEN,
@@ -309,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_usdc_discovery_initializes_registry() {
-        let aggregate = VaultRegistryAggregate::default();
+        let aggregate = Lifecycle::<VaultRegistry>::default();
 
         let command = VaultRegistryCommand::DiscoverUsdcVault {
             vault_id: TEST_VAULT_ID,
@@ -328,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_equity_vault_on_existing_registry() {
-        let mut aggregate = VaultRegistryAggregate::default();
+        let mut aggregate = Lifecycle::<VaultRegistry>::default();
         aggregate.apply(VaultRegistryEvent::UsdcVaultDiscovered {
             vault_id: TEST_VAULT_ID,
             discovered_in: TEST_TX_HASH,
@@ -360,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_usdc_vault_on_existing_registry() {
-        let mut aggregate = VaultRegistryAggregate::default();
+        let mut aggregate = Lifecycle::<VaultRegistry>::default();
         aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
@@ -386,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn rediscovering_vault_updates_it() {
-        let mut aggregate = VaultRegistryAggregate::default();
+        let mut aggregate = Lifecycle::<VaultRegistry>::default();
         aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
@@ -419,7 +423,7 @@ mod tests {
 
     #[test]
     fn apply_initializes_and_updates_state() {
-        let mut aggregate = VaultRegistryAggregate::default();
+        let mut aggregate = Lifecycle::<VaultRegistry>::default();
 
         aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
             token: TEST_TOKEN,
@@ -451,8 +455,12 @@ mod tests {
 
     #[test]
     fn view_update_applies_events() {
-        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
-        let mut view = VaultRegistryAggregate::default();
+        let id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_OWNER,
+        };
+        let aggregate_id = id.to_string();
+        let mut view = Lifecycle::<VaultRegistry>::default();
 
         let discover_envelope = make_envelope(
             &aggregate_id,
@@ -477,8 +485,12 @@ mod tests {
 
     #[test]
     fn multiple_equity_vaults_can_be_registered() {
-        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
-        let mut view = VaultRegistryAggregate::default();
+        let id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_OWNER,
+        };
+        let aggregate_id = id.to_string();
+        let mut view = Lifecycle::<VaultRegistry>::default();
 
         let token_2 = address!("0x2222222222222222222222222222222222222222");
         let vault_id_2 =
@@ -518,7 +530,7 @@ mod tests {
 
     #[test]
     fn token_by_symbol_returns_address_for_known_symbol() {
-        let mut aggregate = VaultRegistryAggregate::default();
+        let mut aggregate = Lifecycle::<VaultRegistry>::default();
         aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
@@ -536,7 +548,7 @@ mod tests {
 
     #[test]
     fn token_by_symbol_returns_none_for_unknown_symbol() {
-        let mut aggregate = VaultRegistryAggregate::default();
+        let mut aggregate = Lifecycle::<VaultRegistry>::default();
         aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
@@ -557,7 +569,7 @@ mod tests {
 
     #[test]
     fn token_by_symbol_distinguishes_multiple_equities() {
-        let mut aggregate = VaultRegistryAggregate::default();
+        let mut aggregate = Lifecycle::<VaultRegistry>::default();
         let token_2 = address!("0x2222222222222222222222222222222222222222");
         let vault_id_2 =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
@@ -590,8 +602,8 @@ mod tests {
     struct EventCounter(Arc<AtomicUsize>);
 
     #[async_trait]
-    impl Query<VaultRegistryAggregate> for EventCounter {
-        async fn dispatch(&self, _id: &str, _events: &[EventEnvelope<VaultRegistryAggregate>]) {
+    impl Query<Lifecycle<VaultRegistry>> for EventCounter {
+        async fn dispatch(&self, _id: &str, _events: &[EventEnvelope<Lifecycle<VaultRegistry>>]) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -602,10 +614,14 @@ mod tests {
     #[tokio::test]
     async fn query_processors_only_see_new_events_not_historical() {
         let pool = setup_test_db().await;
-        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
+        let id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_OWNER,
+        };
+        let aggregate_id = id.to_string();
 
         // Phase 1: emit an event with NO query processors
-        let bare_cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+        let bare_cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
 
         bare_cqrs
             .execute(
@@ -624,7 +640,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let query = EventCounter(counter.clone());
         let observed_cqrs =
-            sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![Box::new(query)], ());
+            sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![Box::new(query)], ());
 
         // Phase 3: emit one more event through the new framework
         let new_vault_id =

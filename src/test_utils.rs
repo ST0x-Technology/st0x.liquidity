@@ -1,16 +1,21 @@
-use alloy::primitives::{LogData, address, bytes, fixed_bytes};
+//! Shared test fixtures: database setup, stub orders/logs,
+//! and builders for onchain trades and offchain executions.
+
+use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_execution::Direction;
-use st0x_execution::schwab::{SchwabAuthConfig, SchwabTokens};
+
+use st0x_execution::{Direction, FractionalShares, SchwabTokens};
 
 use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
+use crate::config::SchwabAuth;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
-/// unit-tests. The exact values are not important – only that the
+/// unit-tests. The exact values are not important -- only that the
 /// structure is valid and deterministic.
 pub(crate) fn get_test_order() -> OrderV4 {
     OrderV4 {
@@ -24,21 +29,21 @@ pub(crate) fn get_test_order() -> OrderV4 {
         validInputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
             IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
         ],
         validOutputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
             IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
         ],
     }
@@ -79,16 +84,17 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
     pool
 }
 
-/// Centralized test token setup to eliminate duplication across test files.
-/// Creates and stores test tokens in the database for Schwab API authentication.
-pub(crate) async fn setup_test_tokens(pool: &SqlitePool, config: &SchwabAuthConfig) {
+/// Centralized test token setup to eliminate duplication
+/// across test files. Creates and stores test tokens in
+/// the database for Schwab API authentication.
+pub(crate) async fn setup_test_tokens(pool: &SqlitePool, auth: &SchwabAuth) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
         access_token_fetched_at: Utc::now(),
         refresh_token: "test_refresh_token".to_string(),
         refresh_token_fetched_at: Utc::now(),
     };
-    tokens.store(pool, &config.encryption_key).await.unwrap();
+    tokens.store(pool, &auth.encryption_key).await.unwrap();
 }
 
 /// Builder for creating OnchainTrade test instances with sensible defaults.
@@ -112,12 +118,12 @@ impl OnchainTradeBuilder {
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
                 log_index: 1,
-                symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+                symbol: "tAAPL".parse::<TokenizedEquitySymbol>().unwrap(),
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                amount: 1.0,
+                amount: FractionalShares::new(Decimal::ONE),
                 direction: Direction::Buy,
-                price: Usdc::new(150.0).unwrap(),
-                block_timestamp: None,
+                price: Usdc::new(Decimal::new(150, 0)).unwrap(),
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: None,
                 effective_gas_price: None,
@@ -136,32 +142,26 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_equity_token(mut self, token: alloy::primitives::Address) -> Self {
+    pub(crate) fn with_equity_token(mut self, token: Address) -> Self {
         self.trade.equity_token = token;
         self
     }
 
     #[must_use]
-    pub(crate) fn with_amount(mut self, amount: f64) -> Self {
-        self.trade.amount = amount;
+    pub(crate) fn with_amount(mut self, amount: Decimal) -> Self {
+        self.trade.amount = FractionalShares::new(amount);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_price(mut self, price: f64) -> Self {
+    pub(crate) fn with_price(mut self, price: Decimal) -> Self {
         self.trade.price = Usdc::new(price).unwrap();
         self
     }
 
     #[must_use]
-    pub(crate) fn with_log_index(mut self, log_index: u64) -> Self {
-        self.trade.log_index = log_index;
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_block_timestamp(mut self, ts: chrono::DateTime<chrono::Utc>) -> Self {
-        self.trade.block_timestamp = Some(ts);
+    pub(crate) fn with_log_index(mut self, index: u64) -> Self {
+        self.trade.log_index = index;
         self
     }
 

@@ -17,46 +17,27 @@ pub mod schwab;
 #[cfg(test)]
 pub mod test_utils;
 
-pub use alpaca_broker_api::AlpacaBrokerApi;
-pub use alpaca_trading_api::AlpacaTradingApi;
+pub use alpaca_broker_api::{
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode,
+    ConversionDirection,
+};
+pub use alpaca_trading_api::{
+    AlpacaTradingApi, AlpacaTradingApiCtx, AlpacaTradingApiError, AlpacaTradingApiMode,
+};
 pub use error::PersistenceError;
-pub use mock::{MockExecutor, MockExecutorConfig};
+pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus};
-pub use schwab::SchwabExecutor;
-
-/// The order ID assigned by the executor (broker) when an order is placed.
-///
-/// Wraps the executor's string order ID for type safety in the CQRS domain.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExecutorOrderId(String);
-
-impl ExecutorOrderId {
-    pub fn new(id: &(impl ToString + ?Sized)) -> Self {
-        Self(id.to_string())
-    }
-}
-
-impl AsRef<str> for ExecutorOrderId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for ExecutorOrderId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from_url};
 
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     type OrderId: Display + Debug + Send + Sync + Clone;
-    type Config: Send + Sync + Clone + 'static;
+    type Ctx: Send + Sync + Clone + 'static;
 
-    /// Create and validate executor instance from config
+    /// Create and validate executor instance from context
     /// All initialization and validation happens here
-    async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error>
+    async fn try_from_ctx(ctx: Self::Ctx) -> Result<Self, Self::Error>
     where
         Self: Sized;
 
@@ -145,20 +126,16 @@ impl std::str::FromStr for Symbol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub enum InvalidSharesError {
-    #[error("Shares cannot be zero")]
-    Zero,
-    #[error("Value must be positive, got {0}")]
-    NonPositive(Decimal),
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Value must be positive, got {0}")]
+pub struct NonPositiveError(pub Decimal);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WholeSharesError {
     #[error("Cannot convert fractional shares {0} to whole shares")]
     Fractional(Decimal),
     #[error("Shares value {0} exceeds u64 range")]
     Overflow(Decimal),
-    #[error(transparent)]
-    TryFromInt(#[from] std::num::TryFromIntError),
-    #[error(transparent)]
-    DecimalConversion(#[from] rust_decimal::Error),
 }
 
 /// Wrapper that guarantees the inner value is positive (greater than zero).
@@ -172,12 +149,12 @@ impl<T> Positive<T>
 where
     T: PartialOrd + HasZero + Copy,
 {
-    pub fn new(value: T) -> Result<Self, InvalidSharesError>
+    pub fn new(value: T) -> Result<Self, NonPositiveError>
     where
         T: Into<Decimal>,
     {
         if value <= T::ZERO {
-            return Err(InvalidSharesError::NonPositive(value.into()));
+            return Err(NonPositiveError(value.into()));
         }
         Ok(Self(value))
     }
@@ -219,42 +196,6 @@ pub trait HasZero: PartialOrd + Sized {
 
     fn is_negative(&self) -> bool {
         self < &Self::ZERO
-    }
-}
-
-/// Share quantity newtype wrapper with validation
-///
-/// Represents whole share quantities with bounds checking.
-/// Values are constrained to 1..=u32::MAX for practical trading limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct Shares(u32);
-
-impl Shares {
-    pub fn new(shares: u64) -> Result<Self, InvalidSharesError> {
-        if shares == 0 {
-            return Err(InvalidSharesError::Zero);
-        }
-        Ok(Self(u32::try_from(shares)?))
-    }
-
-    pub fn value(&self) -> u32 {
-        self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for Shares {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let shares = u64::deserialize(deserializer)?;
-        Self::new(shares).map_err(serde::de::Error::custom)
-    }
-}
-
-impl Display for Shares {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
@@ -315,7 +256,7 @@ impl FractionalShares {
     }
 
     /// Creates FractionalShares from an f64 value (typically from database REAL column).
-    pub fn from_f64(value: f64) -> Result<Self, InvalidSharesError> {
+    pub fn from_f64(value: f64) -> Result<Self, rust_decimal::Error> {
         let decimal = Decimal::try_from(value)?;
         Ok(Self(decimal))
     }
@@ -438,16 +379,13 @@ impl Positive<FractionalShares> {
 
     /// Converts to whole shares count, returning error if value has a fractional part
     /// or exceeds u64 range. Use this when the target API does not support fractional shares.
-    pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {
+    pub fn to_whole_shares(self) -> Result<u64, WholeSharesError> {
         let inner = self.inner();
         if !inner.is_whole() {
-            return Err(InvalidSharesError::Fractional(inner.0));
+            return Err(WholeSharesError::Fractional(inner.0));
         }
 
-        inner
-            .0
-            .to_u64()
-            .ok_or(InvalidSharesError::Overflow(inner.0))
+        inner.0.to_u64().ok_or(WholeSharesError::Overflow(inner.0))
     }
 }
 
@@ -604,11 +542,11 @@ pub enum ExecutionError {
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
     #[error(transparent)]
-    InvalidShares(#[from] InvalidSharesError),
+    NonPositive(#[from] NonPositiveError),
+    #[error(transparent)]
+    WholeShares(#[from] WholeSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
-    #[error("Negative shares value: {value}")]
-    NegativeShares { value: f64 },
     #[error("Price {price} cannot be converted to cents")]
     PriceConversion { price: f64 },
     #[error("Numeric conversion error: {0}")]
@@ -617,13 +555,37 @@ pub enum ExecutionError {
     DateTimeParse(#[from] chrono::ParseError),
 }
 
-/// Trait for converting executor-specific configs into their corresponding executor implementations
+/// Trait for converting executor contexts into their corresponding executor implementations
 #[async_trait]
 pub trait TryIntoExecutor {
     type Executor: Executor;
 
     async fn try_into_executor(self)
     -> Result<Self::Executor, <Self::Executor as Executor>::Error>;
+}
+
+/// The order ID assigned by the executor (broker) when an order is placed.
+///
+/// Wraps the executor's string order ID for type safety in the CQRS domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorOrderId(String);
+
+impl ExecutorOrderId {
+    pub fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl AsRef<str> for ExecutorOrderId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for ExecutorOrderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[cfg(test)]
@@ -650,7 +612,7 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(dec!(1.212))).unwrap();
         let err = shares.to_whole_shares().unwrap_err();
         assert!(
-            matches!(err, InvalidSharesError::Fractional(v) if v == dec!(1.212)),
+            matches!(err, WholeSharesError::Fractional(v) if v == dec!(1.212)),
             "Expected Fractional error with value 1.212, got: {err:?}"
         );
     }
@@ -818,36 +780,6 @@ mod tests {
         assert_eq!(symbol.to_string(), "ABCDEFGHIJ");
     }
 
-    #[test]
-    fn test_shares_new_valid() {
-        let shares = Shares::new(100).unwrap();
-        assert_eq!(shares.to_string(), "100");
-    }
-
-    #[test]
-    fn test_shares_new_zero_fails() {
-        let result = Shares::new(0);
-        assert!(matches!(result.unwrap_err(), InvalidSharesError::Zero));
-    }
-
-    #[test]
-    fn test_shares_new_max_boundary() {
-        let shares = Shares::new(u64::from(u32::MAX)).unwrap();
-        assert_eq!(shares.to_string(), u32::MAX.to_string());
-
-        let result = Shares::new(u64::from(u32::MAX) + 1);
-        assert!(matches!(
-            result.unwrap_err(),
-            InvalidSharesError::TryFromInt(_)
-        ));
-    }
-
-    #[test]
-    fn test_shares_new_one() {
-        let shares = Shares::new(1).unwrap();
-        assert_eq!(shares.to_string(), "1");
-    }
-
     proptest! {
         #[test]
         fn fractional_shares_construction_preserves_value(
@@ -866,7 +798,7 @@ mod tests {
         ) {
             let decimal = Decimal::new(mantissa, scale);
             let result = Positive::new(FractionalShares::new(decimal));
-            prop_assert!(matches!(result, Err(InvalidSharesError::NonPositive(_))));
+            prop_assert!(matches!(result, Err(NonPositiveError(_))));
         }
 
         #[test]
@@ -896,7 +828,7 @@ mod tests {
                 let shares = Positive::new(FractionalShares::new(decimal)).unwrap();
                 prop_assert!(matches!(
                     shares.to_whole_shares(),
-                    Err(InvalidSharesError::Fractional(_))
+                    Err(WholeSharesError::Fractional(_))
                 ));
             }
         }
@@ -949,22 +881,62 @@ mod tests {
     }
 
     #[test]
-    fn executor_order_id_new_stores_value() {
-        let id = ExecutorOrderId::new("ORD-123");
-        assert_eq!(id.as_ref(), "ORD-123");
+    fn executor_order_id_new_from_string() {
+        let id = ExecutorOrderId::new("12345");
+        assert_eq!(id.to_string(), "12345");
     }
 
     #[test]
-    fn executor_order_id_display_matches_inner() {
-        let id = ExecutorOrderId::new("ORD-456");
-        assert_eq!(id.to_string(), "ORD-456");
+    fn executor_order_id_new_from_string_ref() {
+        let order_id_str = "abc-123-xyz".to_string();
+        let id = ExecutorOrderId::new(&order_id_str);
+        assert_eq!(id.to_string(), "abc-123-xyz");
     }
 
     #[test]
-    fn executor_order_id_serialization_roundtrip() {
-        let id = ExecutorOrderId::new("ORD-789");
-        let json = serde_json::to_string(&id).unwrap();
-        let deserialized: ExecutorOrderId = serde_json::from_str(&json).unwrap();
-        assert_eq!(id, deserialized);
+    fn executor_order_id_display_impl() {
+        let id = ExecutorOrderId::new("order_789");
+        assert_eq!(format!("{id}"), "order_789");
+        assert_eq!(format!("{id}"), "order_789");
+    }
+
+    #[test]
+    fn executor_order_id_as_ref_str() {
+        let id = ExecutorOrderId::new("test-id");
+        let s: &str = id.as_ref();
+        assert_eq!(s, "test-id");
+    }
+
+    #[test]
+    fn executor_order_id_equality() {
+        let id1 = ExecutorOrderId::new("same-id");
+        let id2 = ExecutorOrderId::new("same-id");
+        let id3 = ExecutorOrderId::new("different-id");
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+        assert_ne!(id2, id3);
+    }
+
+    #[test]
+    fn executor_order_id_clone() {
+        let id1 = ExecutorOrderId::new("clone-test");
+        let id2 = id1.clone();
+
+        assert_eq!(id1, id2);
+        assert_eq!(id1.to_string(), id2.to_string());
+    }
+
+    #[test]
+    fn executor_order_id_empty_string() {
+        let id = ExecutorOrderId::new("");
+        assert_eq!(id.to_string(), "");
+        assert_eq!(id.as_ref(), "");
+    }
+
+    #[test]
+    fn executor_order_id_special_characters() {
+        let id = ExecutorOrderId::new("order-123_ABC.xyz/456");
+        assert_eq!(id.to_string(), "order-123_ABC.xyz/456");
     }
 }

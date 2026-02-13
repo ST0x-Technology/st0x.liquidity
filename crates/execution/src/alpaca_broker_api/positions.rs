@@ -133,21 +133,21 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
-    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
+            mode: Some(mode),
         }
     }
 
     #[tokio::test]
     async fn fetch_inventory_returns_positions_and_cash() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
@@ -178,7 +178,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let state = fetch_inventory(&client).await.unwrap();
 
         positions_mock.assert();
@@ -190,7 +190,7 @@ mod tests {
         let aapl = state
             .positions
             .iter()
-            .find(|p| p.symbol.to_string() == "AAPL")
+            .find(|position| position.symbol.to_string() == "AAPL")
             .unwrap();
         assert_eq!(aapl.quantity, FractionalShares::new(Decimal::new(105, 1)));
         assert_eq!(aapl.market_value_cents, Some(157_500));
@@ -199,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_inventory_handles_empty_positions() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
@@ -219,7 +219,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let state = fetch_inventory(&client).await.unwrap();
 
         positions_mock.assert();
@@ -232,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_inventory_returns_error_on_invalid_symbol() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
@@ -258,22 +258,19 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
-        let result = fetch_inventory(&client).await;
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaBrokerApiError::InvalidSymbol(_)
-        ));
+        assert!(matches!(error, AlpacaBrokerApiError::InvalidSymbol(_)));
     }
 
     #[tokio::test]
     async fn fetch_inventory_returns_error_on_market_value_overflow() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         // i64::MAX is 9_223_372_036_854_775_807, so a value whose cents
         // representation exceeds that will fail to_i64().
@@ -302,14 +299,14 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
-        let result = fetch_inventory(&client).await;
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
         ));
     }
@@ -317,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_inventory_returns_error_on_fractional_cents_in_market_value() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
@@ -344,14 +341,14 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
-        let result = fetch_inventory(&client).await;
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
         ));
     }
@@ -359,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_inventory_returns_error_on_fractional_cents_in_cash() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
@@ -380,15 +377,12 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
-        let result = fetch_inventory(&client).await;
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaBrokerApiError::FractionalCents(_)
-        ));
+        assert!(matches!(error, AlpacaBrokerApiError::FractionalCents(_)));
     }
 }

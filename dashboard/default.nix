@@ -4,13 +4,11 @@ let bunDeps = bun2nix.fetchBunDeps { bunNix = ./bun.nix; };
 in pkgs.stdenv.mkDerivation {
   pname = "st0x-dashboard";
   version = "0.1.0";
-
   src = ../.;
 
   nativeBuildInputs = [ bun2nix.hook pkgs.bun st0x-dto ];
 
   inherit bunDeps;
-
   bunRoot = "dashboard";
 
   dontUseBunBuild = true;

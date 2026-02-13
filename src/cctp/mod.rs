@@ -1,14 +1,16 @@
 //! Circle CCTP bridge service for cross-chain USDC transfers.
 //!
-//! This module provides a service layer for bridging USDC between Ethereum mainnet
-//! and Base using Circle's Cross-Chain Transfer Protocol (CCTP) V2 with fast transfers.
+//! This module provides a service layer for bridging USDC between
+//! Ethereum mainnet and Base using Circle's Cross-Chain Transfer
+//! Protocol (CCTP) V2 with fast transfers.
 //!
 //! ## Overview
 //!
-//! Circle CCTP enables native USDC transfers between blockchains by burning on the
-//! source chain and minting on the destination chain. This implementation uses
-//! **CCTP V2 Fast Transfer** which reduces transfer time from 13-19 minutes per chain
-//! to ~40-70 seconds for a cost of 1 basis point (0.01%) per transfer.
+//! Circle CCTP enables native USDC transfers between blockchains by
+//! burning on the source chain and minting on the destination chain.
+//! This implementation uses **CCTP V2 Fast Transfer** which reduces
+//! transfer time from 13-19 minutes per chain to ~40-70 seconds for a
+//! cost of 1 basis point (0.01%) per transfer.
 //!
 //! ## Supported Chains
 //!
@@ -19,28 +21,35 @@
 //!
 //! The CCTP bridge flow consists of three steps:
 //!
-//! 1. **Burn**: Lock and burn USDC on source chain via `TokenMessengerV2.depositForBurn()`
-//! 2. **Attest**: Poll Circle's attestation API for signed message (fast transfer: ~20-30s)
-//! 3. **Mint**: Mint native USDC on destination chain via `MessageTransmitterV2.receiveMessage()`
+//! 1. **Burn**: Lock and burn USDC on source chain via
+//!    `TokenMessengerV2.depositForBurn()`
+//! 2. **Attest**: Poll Circle's attestation API for signed message
+//!    (fast transfer: ~20-30s)
+//! 3. **Mint**: Mint native USDC on destination chain via
+//!    `MessageTransmitterV2.receiveMessage()`
 //!
 //! ## Usage
 //!
 //! ```rust,ignore
 //! // Create bridge instance
-//! let ethereum = Evm::new(ethereum_provider, owner, usdc, token_messenger, message_transmitter);
-//! let base = Evm::new(base_provider, owner, usdc, token_messenger, message_transmitter);
+//! let ethereum = Evm::new(ethereum_provider, owner, usdc,
+//!     token_messenger, message_transmitter);
+//! let base = Evm::new(base_provider, owner, usdc,
+//!     token_messenger, message_transmitter);
 //! let bridge = CctpBridge::new(ethereum, base);
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
 //! let amount = U256::from(1_000_000); // 1 USDC
-//! let tx_hash = bridge.burn(BridgeDirection::EthereumToBase, amount, recipient).await?;
+//! let tx_hash = bridge.burn(BridgeDirection::EthereumToBase, amount,
+//!     recipient).await?;
 //! ```
 //!
 //! ## CCTP V2 Fast Transfer
 //!
-//! Fast transfers are enabled by setting `minFinalityThreshold` to 1000 in the
-//! `depositForBurn()` call. The fee is dynamically queried from Circle's API
-//! (`/v2/burn/USDC/fees`) before each burn operation.
+//! Fast transfers are enabled by setting `minFinalityThreshold` to
+//! 1000 in the `depositForBurn()` call. The fee is dynamically
+//! queried from Circle's API (`/v2/burn/USDC/fees`) before each burn
+//! operation.
 //!
 //! **Timing**: ~40s Base->Ethereum, ~70s Ethereum->Base (measured)
 //! **Cost**: 1 basis point (0.01%) of transfer amount
@@ -375,7 +384,7 @@ where
         // Find the fast transfer fee (threshold 1000)
         let fast_fee = fee_entries
             .iter()
-            .find(|e| e.finality_threshold == FAST_TRANSFER_THRESHOLD)
+            .find(|entry| entry.finality_threshold == FAST_TRANSFER_THRESHOLD)
             .ok_or(CctpError::FastTransferFeeNotAvailable { direction })?
             .minimum_fee;
 
@@ -664,9 +673,7 @@ mod tests {
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };
 
-        let result = fetch_attestation.retry(backoff).await;
-
-        assert!(result.is_ok(), "Expected attestation to succeed");
+        fetch_attestation.retry(backoff).await.unwrap();
         assert_eq!(mock.hits(), 1, "Expected exactly 1 API call");
     }
 
@@ -720,17 +727,10 @@ mod tests {
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };
 
-        let result = fetch_attestation.retry(backoff).await;
+        let error = fetch_attestation.retry(backoff).await.unwrap_err();
 
         assert!(
-            result.is_err(),
-            "Expected attestation to fail after max retries"
-        );
-        assert!(
-            matches!(
-                result.unwrap_err(),
-                AttestationError::NotYetAvailable { status: 404 }
-            ),
+            matches!(error, AttestationError::NotYetAvailable { status: 404 }),
             "Expected AttestationError::NotYetAvailable with status 404"
         );
         assert!(
@@ -1797,8 +1797,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_) | CctpError::Contract(_)),
-            "got: {err:?}"
+            matches!(err, CctpError::Revert(_)),
+            "expected CctpError::Revert, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),
@@ -1836,8 +1836,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_) | CctpError::Contract(_)),
-            "got: {err:?}"
+            matches!(err, CctpError::Revert(_)),
+            "expected CctpError::Revert, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),
@@ -1880,8 +1880,8 @@ mod tests {
 
     #[test]
     fn extract_nonce_from_minimum_length_message_succeeds() {
-        let expected_nonce: [u8; 32] = core::array::from_fn(|i| {
-            u8::try_from(i + 1).expect("index 0..31 + 1 always fits in u8")
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
         });
         let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &[]);
 

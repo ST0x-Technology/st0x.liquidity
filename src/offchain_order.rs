@@ -1,54 +1,59 @@
-//! OffchainOrder aggregate for tracking broker order lifecycle.
-
-use std::sync::Arc;
+//! OffchainOrder CQRS/ES aggregate for tracking broker
+//! order lifecycle: Pending -> Submitted -> Filled/Failed.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent};
+use cqrs_es::persist::GenericQuery;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, MarketOrder, Positive, SupportedExecutor, Symbol,
-};
-use tracing::error;
+use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+use sqlx::SqlitePool;
+use std::sync::Arc;
 use uuid::Uuid;
 
-use sqlite_es::SqliteCqrs;
+use st0x_execution::{
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Positive,
+    SupportedExecutor, Symbol,
+};
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::event_sourced::{DomainEvent, EventSourced, SqliteQuery};
+use crate::lifecycle::Lifecycle;
 
-/// Abstraction for placing broker orders, injected via cqrs-es Services.
-/// Implementations handle executor-specific details (symbol mapping, API calls).
-#[async_trait]
-pub(crate) trait OrderPlacer: Send + Sync {
-    async fn place_market_order(
-        &self,
-        order: MarketOrder,
-    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>;
+/// Constructs the offchain order CQRS framework with its view
+/// query. Used by `Conductor::start`, CLI, and tests.
+pub(crate) fn build_offchain_order_cqrs(
+    pool: &SqlitePool,
+    order_placer: Arc<dyn OrderPlacer>,
+) -> (
+    Arc<SqliteCqrs<Lifecycle<OffchainOrder>>>,
+    Arc<SqliteQuery<OffchainOrder>>,
+) {
+    let view_repo = Arc::new(SqliteViewRepository::new(
+        pool.clone(),
+        "offchain_order_view".to_string(),
+    ));
+    let query = GenericQuery::new(view_repo.clone());
+
+    let cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(GenericQuery::new(view_repo))],
+        order_placer,
+    ));
+
+    (cqrs, Arc::new(query))
 }
-
-pub(crate) type OffchainOrderAggregate = Lifecycle<OffchainOrder, Never>;
-pub(crate) type OffchainOrderCqrs = SqliteCqrs<OffchainOrderAggregate>;
-pub(crate) type OffchainOrderServices = Arc<dyn OrderPlacer>;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub(crate) struct OffchainOrderId(Uuid);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PriceCents(pub(crate) u64);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum OffchainOrder {
     Pending {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
     },
     Submitted {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         executor_order_id: ExecutorOrderId,
@@ -57,7 +62,7 @@ pub(crate) enum OffchainOrder {
     },
     PartiallyFilled {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         shares_filled: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
@@ -69,7 +74,7 @@ pub(crate) enum OffchainOrder {
     },
     Filled {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         executor_order_id: ExecutorOrderId,
@@ -80,7 +85,7 @@ pub(crate) enum OffchainOrder {
     },
     Failed {
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         error: String,
@@ -89,599 +94,406 @@ pub(crate) enum OffchainOrder {
     },
 }
 
-impl std::fmt::Display for OffchainOrderId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+#[async_trait]
+impl EventSourced for OffchainOrder {
+    type Id = OffchainOrderId;
+    type Event = OffchainOrderEvent;
+    type Command = OffchainOrderCommand;
+    type Error = OffchainOrderError;
+    type Services = Arc<dyn OrderPlacer>;
+
+    const AGGREGATE_TYPE: &'static str = "OffchainOrder";
+    const SCHEMA_VERSION: u64 = 1;
+
+    fn originate(event: &Self::Event) -> Option<Self> {
+        use OffchainOrderEvent::*;
+        match event {
+            Placed {
+                symbol,
+                shares,
+                direction,
+                executor,
+                placed_at,
+            } => Some(Self::Pending {
+                symbol: symbol.clone(),
+                shares: *shares,
+                direction: *direction,
+                executor: *executor,
+                placed_at: *placed_at,
+            }),
+            _ => None,
+        }
     }
-}
 
-impl std::str::FromStr for OffchainOrderId {
-    type Err = uuid::Error;
+    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        use OffchainOrderEvent::*;
+        match event {
+            Placed { .. } => Ok(None),
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse().map(Self)
+            Submitted {
+                executor_order_id,
+                submitted_at,
+            } => {
+                let Self::Pending {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                } = state
+                else {
+                    return Ok(None);
+                };
+
+                Ok(Some(Self::Submitted {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    executor: *executor,
+                    executor_order_id: executor_order_id.clone(),
+                    placed_at: *placed_at,
+                    submitted_at: *submitted_at,
+                }))
+            }
+
+            PartiallyFilled {
+                shares_filled,
+                avg_price_cents,
+                partially_filled_at,
+            } => Ok(match state {
+                Self::Submitted {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                }
+                | Self::PartiallyFilled {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                    ..
+                } => Some(Self::PartiallyFilled {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    shares_filled: *shares_filled,
+                    direction: *direction,
+                    executor: *executor,
+                    executor_order_id: executor_order_id.clone(),
+                    avg_price_cents: *avg_price_cents,
+                    placed_at: *placed_at,
+                    submitted_at: *submitted_at,
+                    partially_filled_at: *partially_filled_at,
+                }),
+
+                Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => None,
+            }),
+
+            Filled {
+                price_cents,
+                filled_at,
+            } => Ok(match state {
+                Self::Submitted {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                }
+                | Self::PartiallyFilled {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                    ..
+                } => Some(Self::Filled {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    executor: *executor,
+                    executor_order_id: executor_order_id.clone(),
+                    price_cents: *price_cents,
+                    placed_at: *placed_at,
+                    submitted_at: *submitted_at,
+                    filled_at: *filled_at,
+                }),
+
+                Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => None,
+            }),
+
+            Failed { error, failed_at } => Ok(match state {
+                Self::Pending {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                }
+                | Self::Submitted {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                    ..
+                }
+                | Self::PartiallyFilled {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                    ..
+                } => Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    executor: *executor,
+                    error: error.to_string(),
+                    placed_at: *placed_at,
+                    failed_at: *failed_at,
+                }),
+
+                Self::Filled { .. } | Self::Failed { .. } => None,
+            }),
+        }
+    }
+
+    async fn initialize(
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        use OffchainOrderCommand::*;
+        match command {
+            Place {
+                symbol,
+                shares,
+                direction,
+                executor,
+            } => {
+                let now = Utc::now();
+                let market_order = MarketOrder {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction,
+                };
+
+                let placed = OffchainOrderEvent::Placed {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at: now,
+                };
+
+                match services.place_market_order(market_order).await {
+                    Ok(executor_order_id) => Ok(vec![
+                        placed,
+                        OffchainOrderEvent::Submitted {
+                            executor_order_id,
+                            submitted_at: now,
+                        },
+                    ]),
+                    Err(error) => Ok(vec![
+                        placed,
+                        OffchainOrderEvent::Failed {
+                            error: error.to_string(),
+                            failed_at: now,
+                        },
+                    ]),
+                }
+            }
+
+            _ => Err(OffchainOrderError::NotPlaced),
+        }
+    }
+
+    async fn transition(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            OffchainOrderCommand::Place { .. } => Err(OffchainOrderError::AlreadyPlaced),
+
+            OffchainOrderCommand::UpdatePartialFill {
+                shares_filled,
+                avg_price_cents,
+            } => match self {
+                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                    Ok(vec![OffchainOrderEvent::PartiallyFilled {
+                        shares_filled,
+                        avg_price_cents,
+                        partially_filled_at: Utc::now(),
+                    }])
+                }
+                Self::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Self::Filled { .. } | Self::Failed { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
+
+            OffchainOrderCommand::CompleteFill { price_cents } => match self {
+                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                    Ok(vec![OffchainOrderEvent::Filled {
+                        price_cents,
+                        filled_at: Utc::now(),
+                    }])
+                }
+                Self::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Self::Filled { .. } | Self::Failed { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
+
+            OffchainOrderCommand::MarkFailed { error } => match self {
+                Self::Pending { .. } | Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                    Ok(vec![OffchainOrderEvent::Failed {
+                        error,
+                        failed_at: Utc::now(),
+                    }])
+                }
+                Self::Filled { .. } | Self::Failed { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
+        }
     }
 }
 
 impl OffchainOrder {
-    pub(crate) fn aggregate_id() -> OffchainOrderId {
-        OffchainOrderId(Uuid::new_v4())
-    }
-
     pub(crate) fn symbol(&self) -> &Symbol {
+        use OffchainOrder::*;
         match self {
-            Self::Pending { symbol, .. }
-            | Self::Submitted { symbol, .. }
-            | Self::PartiallyFilled { symbol, .. }
-            | Self::Filled { symbol, .. }
-            | Self::Failed { symbol, .. } => symbol,
+            Pending { symbol, .. }
+            | Submitted { symbol, .. }
+            | PartiallyFilled { symbol, .. }
+            | Filled { symbol, .. }
+            | Failed { symbol, .. } => symbol,
         }
     }
 
-    pub(crate) fn shares(&self) -> FractionalShares {
+    pub(crate) fn shares(&self) -> Positive<FractionalShares> {
+        use OffchainOrder::*;
         match self {
-            Self::Pending { shares, .. }
-            | Self::Submitted { shares, .. }
-            | Self::PartiallyFilled { shares, .. }
-            | Self::Filled { shares, .. }
-            | Self::Failed { shares, .. } => *shares,
+            Pending { shares, .. }
+            | Submitted { shares, .. }
+            | PartiallyFilled { shares, .. }
+            | Filled { shares, .. }
+            | Failed { shares, .. } => *shares,
         }
     }
 
     pub(crate) fn direction(&self) -> Direction {
+        use OffchainOrder::*;
         match self {
-            Self::Pending { direction, .. }
-            | Self::Submitted { direction, .. }
-            | Self::PartiallyFilled { direction, .. }
-            | Self::Filled { direction, .. }
-            | Self::Failed { direction, .. } => *direction,
+            Pending { direction, .. }
+            | Submitted { direction, .. }
+            | PartiallyFilled { direction, .. }
+            | Filled { direction, .. }
+            | Failed { direction, .. } => *direction,
+        }
+    }
+
+    pub(crate) fn executor(&self) -> SupportedExecutor {
+        use OffchainOrder::*;
+        match self {
+            Pending { executor, .. }
+            | Submitted { executor, .. }
+            | PartiallyFilled { executor, .. }
+            | Filled { executor, .. }
+            | Failed { executor, .. } => *executor,
         }
     }
 
     pub(crate) fn executor_order_id(&self) -> Option<&ExecutorOrderId> {
+        use OffchainOrder::*;
         match self {
-            Self::Pending { .. } | Self::Failed { .. } => None,
-            Self::Submitted {
+            Submitted {
                 executor_order_id, ..
             }
-            | Self::PartiallyFilled {
+            | PartiallyFilled {
                 executor_order_id, ..
             }
-            | Self::Filled {
+            | Filled {
                 executor_order_id, ..
             } => Some(executor_order_id),
-        }
-    }
 
-    pub(crate) fn apply_transition(
-        event: &OffchainOrderEvent,
-        order: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
-        match event {
-            OffchainOrderEvent::Submitted {
-                executor_order_id,
-                submitted_at,
-            } => Self::apply_submitted(order, executor_order_id, *submitted_at, event),
-
-            OffchainOrderEvent::PartiallyFilled {
-                shares_filled,
-                avg_price_cents,
-                partially_filled_at,
-            } => Self::apply_partially_filled(
-                order,
-                *shares_filled,
-                *avg_price_cents,
-                *partially_filled_at,
-                event,
-            ),
-
-            OffchainOrderEvent::Filled {
-                price_cents,
-                filled_at,
-            } => Self::apply_filled(order, *price_cents, *filled_at, event),
-
-            OffchainOrderEvent::Failed { error, failed_at } => {
-                Self::apply_failed(order, error, *failed_at, event)
-            }
-
-            OffchainOrderEvent::Migrated { .. } | OffchainOrderEvent::Placed { .. } => {
-                Err(LifecycleError::Mismatch {
-                    state: format!("{order:?}"),
-                    event: event.event_type(),
-                })
-            }
-        }
-    }
-
-    fn apply_submitted(
-        order: &Self,
-        executor_order_id: &ExecutorOrderId,
-        submitted_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Pending {
-            symbol,
-            shares,
-            direction,
-            executor,
-            placed_at,
-        } = order
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{order:?}"),
-                event: event.event_type(),
-            });
-        };
-
-        Ok(Self::Submitted {
-            symbol: symbol.clone(),
-            shares: *shares,
-            direction: *direction,
-            executor: *executor,
-            executor_order_id: executor_order_id.clone(),
-            placed_at: *placed_at,
-            submitted_at,
-        })
-    }
-
-    fn apply_partially_filled(
-        order: &Self,
-        shares_filled: FractionalShares,
-        avg_price_cents: PriceCents,
-        partially_filled_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        match order {
-            Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-                ..
-            } => Ok(Self::PartiallyFilled {
-                symbol: symbol.clone(),
-                shares: *shares,
-                shares_filled,
-                direction: *direction,
-                executor: *executor,
-                executor_order_id: executor_order_id.clone(),
-                avg_price_cents,
-                placed_at: *placed_at,
-                submitted_at: *submitted_at,
-                partially_filled_at,
-            }),
-
-            Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
-                Err(LifecycleError::Mismatch {
-                    state: format!("{order:?}"),
-                    event: event.event_type(),
-                })
-            }
-        }
-    }
-
-    fn apply_filled(
-        order: &Self,
-        price_cents: PriceCents,
-        filled_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        match order {
-            Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-                ..
-            } => Ok(Self::Filled {
-                symbol: symbol.clone(),
-                shares: *shares,
-                direction: *direction,
-                executor: *executor,
-                executor_order_id: executor_order_id.clone(),
-                price_cents,
-                placed_at: *placed_at,
-                submitted_at: *submitted_at,
-                filled_at,
-            }),
-
-            Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
-                Err(LifecycleError::Mismatch {
-                    state: format!("{order:?}"),
-                    event: event.event_type(),
-                })
-            }
-        }
-    }
-
-    fn apply_failed(
-        order: &Self,
-        error: &str,
-        failed_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        match order {
-            Self::Pending {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-            }
-            | Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-                ..
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-                ..
-            } => Ok(Self::Failed {
-                symbol: symbol.clone(),
-                shares: *shares,
-                direction: *direction,
-                executor: *executor,
-                error: error.to_string(),
-                placed_at: *placed_at,
-                failed_at,
-            }),
-
-            Self::Filled { .. } | Self::Failed { .. } => Err(LifecycleError::Mismatch {
-                state: format!("{order:?}"),
-                event: event.event_type(),
-            }),
-        }
-    }
-
-    pub(crate) fn from_event(event: &OffchainOrderEvent) -> Result<Self, LifecycleError<Never>> {
-        match event {
-            OffchainOrderEvent::Placed {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-            } => Ok(Self::Pending {
-                symbol: symbol.clone(),
-                shares: shares.inner(),
-                direction: *direction,
-                executor: *executor,
-                placed_at: *placed_at,
-            }),
-
-            OffchainOrderEvent::Migrated {
-                symbol,
-                shares,
-                direction,
-                executor,
-                status,
-                executor_order_id,
-                price_cents,
-                executed_at,
-                migrated_at,
-            } => match status {
-                MigratedOrderStatus::Pending => Ok(Self::Pending {
-                    symbol: symbol.clone(),
-                    shares: shares.inner(),
-                    direction: *direction,
-                    executor: *executor,
-                    placed_at: executed_at.unwrap_or(*migrated_at),
-                }),
-                MigratedOrderStatus::Submitted => Ok(Self::Submitted {
-                    symbol: symbol.clone(),
-                    shares: shares.inner(),
-                    direction: *direction,
-                    executor: *executor,
-                    executor_order_id: executor_order_id
-                        .clone()
-                        .unwrap_or_else(|| ExecutorOrderId::new("unknown")),
-                    placed_at: *migrated_at,
-                    submitted_at: executed_at.unwrap_or(*migrated_at),
-                }),
-                MigratedOrderStatus::Filled => Ok(Self::Filled {
-                    symbol: symbol.clone(),
-                    shares: shares.inner(),
-                    direction: *direction,
-                    executor: *executor,
-                    executor_order_id: executor_order_id
-                        .clone()
-                        .unwrap_or_else(|| ExecutorOrderId::new("unknown")),
-                    price_cents: price_cents.unwrap_or(PriceCents(0)),
-                    placed_at: *migrated_at,
-                    submitted_at: *migrated_at,
-                    filled_at: executed_at.unwrap_or(*migrated_at),
-                }),
-                MigratedOrderStatus::Failed { error } => Ok(Self::Failed {
-                    symbol: symbol.clone(),
-                    shares: shares.inner(),
-                    direction: *direction,
-                    executor: *executor,
-                    error: error.clone(),
-                    placed_at: *migrated_at,
-                    failed_at: executed_at.unwrap_or(*migrated_at),
-                }),
-            },
-
-            _ => Err(LifecycleError::Mismatch {
-                state: "Uninitialized".into(),
-                event: event.event_type(),
-            }),
+            Pending { .. } | Failed { .. } => None,
         }
     }
 }
+
+/// Type-erased order placement capability injected into the OffchainOrder
+/// aggregate via cqrs-es Services.
+///
+/// This trait exists because the `Executor` trait has associated types
+/// (`Error`, `OrderId`, `Ctx`) which make it non-object-safe - you cannot
+/// write `Arc<dyn Executor>`. This trait provides the minimal surface needed
+/// by the aggregate (just `place_market_order`) with erased error/ID types,
+/// allowing different executor implementations to be used
+/// via `Arc<dyn OrderPlacer>`.
+#[async_trait]
+pub(crate) trait OrderPlacer: Send + Sync {
+    async fn place_market_order(
+        &self,
+        order: MarketOrder,
+    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Bridges `Executor` (which has associated types and is not object-safe)
+/// to `OrderPlacer` (object-safe).
+pub(crate) struct ExecutorOrderPlacer<E>(pub E);
 
 #[async_trait]
-impl Aggregate for Lifecycle<OffchainOrder, Never> {
-    type Command = OffchainOrderCommand;
-    type Event = OffchainOrderEvent;
-    type Error = OffchainOrderError;
-    type Services = OffchainOrderServices;
-
-    fn aggregate_type() -> String {
-        "OffchainOrder".to_string()
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        *self = self
-            .clone()
-            .transition(&event, OffchainOrder::apply_transition)
-            .or_initialize(&event, OffchainOrder::from_event);
-    }
-
-    async fn handle(
+impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
+    async fn place_market_order(
         &self,
-        command: Self::Command,
-        services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match (self.live(), &command) {
-            (
-                Err(LifecycleError::Uninitialized),
-                OffchainOrderCommand::PlaceOrder {
-                    symbol,
-                    shares,
-                    direction,
-                    executor,
-                },
-            ) => handle_place_order(services, symbol, *shares, *direction, *executor).await,
-
-            (
-                Err(LifecycleError::Uninitialized),
-                OffchainOrderCommand::Place {
-                    symbol,
-                    shares,
-                    direction,
-                    executor,
-                },
-            ) => Ok(vec![OffchainOrderEvent::Placed {
-                symbol: symbol.clone(),
-                shares: *shares,
-                direction: *direction,
-                executor: *executor,
-                placed_at: Utc::now(),
-            }]),
-
-            (
-                Ok(_),
-                OffchainOrderCommand::PlaceOrder { .. } | OffchainOrderCommand::Place { .. },
-            ) => Err(OffchainOrderError::AlreadyPlaced),
-
-            (Err(e), _) => Err(e.into()),
-
-            (Ok(order), OffchainOrderCommand::ConfirmSubmission { executor_order_id }) => {
-                handle_confirm_submission(order, executor_order_id)
-            }
-
-            (
-                Ok(order),
-                OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled,
-                    avg_price_cents,
-                },
-            ) => handle_partial_fill(order, *shares_filled, *avg_price_cents),
-
-            (Ok(order), OffchainOrderCommand::CompleteFill { price_cents }) => {
-                handle_complete_fill(order, *price_cents)
-            }
-
-            (Ok(order), OffchainOrderCommand::MarkFailed { error }) => {
-                handle_mark_failed(order, error)
-            }
-        }
+        order: MarketOrder,
+    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+        let placement = self.0.place_market_order(order).await?;
+        Ok(ExecutorOrderId::new(&placement.order_id))
     }
 }
 
-fn handle_confirm_submission(
-    order: &OffchainOrder,
-    executor_order_id: &ExecutorOrderId,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
-    match order {
-        OffchainOrder::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
-            executor_order_id: executor_order_id.clone(),
-            submitted_at: Utc::now(),
-        }]),
-        OffchainOrder::Submitted {
-            executor_order_id: existing_id,
-            ..
-        } => {
-            if existing_id == executor_order_id {
-                Ok(vec![])
-            } else {
-                Err(OffchainOrderError::ConflictingExecutorOrderId {
-                    existing: existing_id.clone(),
-                    attempted: executor_order_id.clone(),
-                })
-            }
-        }
-        OffchainOrder::PartiallyFilled { .. }
-        | OffchainOrder::Filled { .. }
-        | OffchainOrder::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
-    }
-}
+#[cfg(test)]
+pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
+    struct Noop;
 
-async fn handle_place_order(
-    services: &OffchainOrderServices,
-    symbol: &Symbol,
-    shares: Positive<FractionalShares>,
-    direction: Direction,
-    executor: SupportedExecutor,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
-    let market_order = MarketOrder {
-        symbol: symbol.clone(),
-        shares,
-        direction,
-    };
-
-    let executor_order_id = services
-        .place_market_order(market_order)
-        .await
-        .map_err(OffchainOrderError::BrokerPlacement)?;
-
-    let now = Utc::now();
-
-    Ok(vec![
-        OffchainOrderEvent::Placed {
-            symbol: symbol.clone(),
-            shares,
-            direction,
-            executor,
-            placed_at: now,
-        },
-        OffchainOrderEvent::Submitted {
-            executor_order_id,
-            submitted_at: now,
-        },
-    ])
-}
-
-fn handle_partial_fill(
-    order: &OffchainOrder,
-    shares_filled: FractionalShares,
-    avg_price_cents: PriceCents,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
-    match order {
-        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
-            Ok(vec![OffchainOrderEvent::PartiallyFilled {
-                shares_filled,
-                avg_price_cents,
-                partially_filled_at: Utc::now(),
-            }])
-        }
-        OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
-        OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
-            Err(OffchainOrderError::AlreadyCompleted)
+    #[async_trait]
+    impl OrderPlacer for Noop {
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(ExecutorOrderId::new("noop"))
         }
     }
+
+    Arc::new(Noop)
 }
 
-fn handle_complete_fill(
-    order: &OffchainOrder,
-    price_cents: PriceCents,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
-    match order {
-        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
-            Ok(vec![OffchainOrderEvent::Filled {
-                price_cents,
-                filled_at: Utc::now(),
-            }])
-        }
-        OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
-        OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
-            Err(OffchainOrderError::AlreadyCompleted)
-        }
-    }
-}
-
-fn handle_mark_failed(
-    order: &OffchainOrder,
-    error: &str,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
-    match order {
-        OffchainOrder::Pending { .. }
-        | OffchainOrder::Submitted { .. }
-        | OffchainOrder::PartiallyFilled { .. } => Ok(vec![OffchainOrderEvent::Failed {
-            error: error.to_owned(),
-            failed_at: Utc::now(),
-        }]),
-        OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
-            Err(OffchainOrderError::AlreadyCompleted)
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum OffchainOrderError {
-    #[error("Cannot place order: order has already been placed")]
-    AlreadyPlaced,
-    #[error("Cannot confirm submission: order has not been submitted to broker yet")]
-    NotSubmitted,
-    #[error("Cannot update order: order has already been completed (filled or failed)")]
-    AlreadyCompleted,
-    #[error("Cannot submit order: order has already been submitted")]
-    AlreadySubmitted,
-    #[error(
-        "Cannot confirm submission: order already submitted with different executor_order_id \
-         (existing: {existing:?}, attempted: {attempted:?})"
-    )]
-    ConflictingExecutorOrderId {
-        existing: ExecutorOrderId,
-        attempted: ExecutorOrderId,
-    },
-    #[error("Broker order placement failed: {0}")]
-    BrokerPlacement(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
-}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PriceCents(pub(crate) u64);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OffchainOrderCommand {
-    /// Atomically places a broker order via Services and emits a single event
-    /// containing both order params and the broker-assigned order ID.
-    /// Replaces the crash-vulnerable Place + ConfirmSubmission two-step flow.
-    PlaceOrder {
-        symbol: Symbol,
-        shares: Positive<FractionalShares>,
-        direction: Direction,
-        executor: SupportedExecutor,
-    },
     Place {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
-    },
-    ConfirmSubmission {
-        executor_order_id: ExecutorOrderId,
     },
     UpdatePartialFill {
         shares_filled: FractionalShares,
@@ -696,40 +508,7 @@ pub(crate) enum OffchainOrderCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum MigratedOrderStatus {
-    Pending,
-    Submitted,
-    Filled,
-    Failed { error: String },
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("Price in cents cannot be negative: {0}")]
-pub(crate) struct NegativePriceCents(pub i64);
-
-impl TryFrom<i64> for PriceCents {
-    type Error = NegativePriceCents;
-
-    fn try_from(value: i64) -> Result<Self, Self::Error> {
-        u64::try_from(value)
-            .map(Self)
-            .map_err(|_| NegativePriceCents(value))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum OffchainOrderEvent {
-    Migrated {
-        symbol: Symbol,
-        shares: Positive<FractionalShares>,
-        direction: Direction,
-        executor: SupportedExecutor,
-        status: MigratedOrderStatus,
-        executor_order_id: Option<ExecutorOrderId>,
-        price_cents: Option<PriceCents>,
-        executed_at: Option<DateTime<Utc>>,
-        migrated_at: DateTime<Utc>,
-    },
     Placed {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
@@ -759,7 +538,6 @@ pub(crate) enum OffchainOrderEvent {
 impl DomainEvent for OffchainOrderEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::Migrated { .. } => "OffchainOrderEvent::Migrated".to_string(),
             Self::Placed { .. } => "OffchainOrderEvent::Placed".to_string(),
             Self::Submitted { .. } => "OffchainOrderEvent::Submitted".to_string(),
             Self::PartiallyFilled { .. } => "OffchainOrderEvent::PartiallyFilled".to_string(),
@@ -773,574 +551,418 @@ impl DomainEvent for OffchainOrderEvent {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn noop_order_placer() -> OffchainOrderServices {
-    struct NoopOrderPlacer;
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub(crate) struct OffchainOrderId(Uuid);
 
-    #[async_trait]
-    impl OrderPlacer for NoopOrderPlacer {
-        async fn place_market_order(
-            &self,
-            _order: MarketOrder,
-        ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-            unimplemented!("NoopOrderPlacer: should not be called in this context")
-        }
+impl std::fmt::Display for OffchainOrderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
+}
 
-    Arc::new(NoopOrderPlacer)
+impl std::str::FromStr for OffchainOrderId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+impl OffchainOrderId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum OffchainOrderError {
+    #[error("Cannot place order: order has already been placed")]
+    AlreadyPlaced,
+    #[error("Cannot confirm submission: order has not been submitted to broker yet")]
+    NotSubmitted,
+    #[error("Cannot update order: order has already been completed (filled or failed)")]
+    AlreadyCompleted,
+    #[error("Order has not been placed yet")]
+    NotPlaced,
+}
+
+impl TryFrom<i64> for PriceCents {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        u64::try_from(value).map(Self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use cqrs_es::mem_store::MemStore;
+    use cqrs_es::{Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore};
     use rust_decimal_macros::dec;
 
-    fn services() -> OffchainOrderServices {
-        noop_order_placer()
+    use super::*;
+    use crate::lifecycle::LifecycleError;
+
+    type TestCqrs = CqrsFramework<Lifecycle<OffchainOrder>, MemStore<Lifecycle<OffchainOrder>>>;
+
+    fn test_cqrs() -> (MemStore<Lifecycle<OffchainOrder>>, TestCqrs) {
+        test_cqrs_with(noop_order_placer())
     }
 
-    #[tokio::test]
-    async fn test_place_order() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
+    fn test_cqrs_with(
+        order_placer: Arc<dyn OrderPlacer>,
+    ) -> (MemStore<Lifecycle<OffchainOrder>>, TestCqrs) {
+        let store = MemStore::default();
+        let cqrs = CqrsFramework::new(store.clone(), vec![], order_placer);
+        (store, cqrs)
+    }
 
-        let command = OffchainOrderCommand::Place {
-            symbol: symbol.clone(),
+    fn failing_order_placer() -> Arc<dyn OrderPlacer> {
+        struct Failing;
+
+        #[async_trait]
+        impl OrderPlacer for Failing {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+                Err("Broker rejected order".into())
+            }
+        }
+
+        Arc::new(Failing)
+    }
+
+    fn place_command() -> OffchainOrderCommand {
+        OffchainOrderCommand::Place {
+            symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-        };
+        }
+    }
 
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], OffchainOrderEvent::Placed { .. }));
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(inner) = order else {
-            panic!("Expected Live state");
-        };
-        assert!(matches!(inner, OffchainOrder::Pending { .. }));
+    async fn load_order(
+        store: &MemStore<Lifecycle<OffchainOrder>>,
+        id: &str,
+    ) -> Lifecycle<OffchainOrder> {
+        store.load_aggregate(id).await.unwrap().aggregate().clone()
     }
 
     #[tokio::test]
-    async fn test_cannot_place_when_already_pending() {
-        let order = Lifecycle::Live(OffchainOrder::Pending {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            placed_at: Utc::now(),
-        });
+    async fn place_order_transitions_to_submitted() {
+        let (store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::Place {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-        };
+        cqrs.execute("order-1", place_command()).await.unwrap();
 
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_place_when_filled() {
-        let order = Lifecycle::Live(OffchainOrder::Filled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            filled_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::Place {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_place_when_failed() {
-        let order = Lifecycle::Live(OffchainOrder::Failed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            error: "Market closed".to_string(),
-            placed_at: Utc::now(),
-            failed_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::Place {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
-    }
-
-    #[tokio::test]
-    async fn test_confirm_submission_after_place() {
-        let mut order = Lifecycle::Live(OffchainOrder::Pending {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            placed_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::ConfirmSubmission {
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-        };
-
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], OffchainOrderEvent::Submitted { .. }));
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(inner) = order else {
+        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Submitted { .. }));
     }
 
     #[tokio::test]
-    async fn test_cannot_confirm_submission_if_not_placed() {
-        let order = Lifecycle::<OffchainOrder, Never>::default();
+    async fn place_with_failing_broker_transitions_to_failed() {
+        let (store, cqrs) = test_cqrs_with(failing_order_placer());
 
-        let command = OffchainOrderCommand::ConfirmSubmission {
-            executor_order_id: ExecutorOrderId::new("ORD123"),
+        cqrs.execute("order-1", place_command()).await.unwrap();
+
+        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+            panic!("Expected Live state");
         };
+        assert!(
+            matches!(&inner, OffchainOrder::Failed { error, .. } if error.contains("Broker rejected")),
+            "Expected Failed with broker error, got: {inner:?}"
+        );
+    }
 
-        let result = order.handle(command, &services()).await;
+    #[tokio::test]
+    async fn cannot_place_when_already_submitted() {
+        let (_store, cqrs) = test_cqrs();
 
+        cqrs.execute("order-1", place_command()).await.unwrap();
+
+        let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
-            result,
-            Err(OffchainOrderError::State(LifecycleError::Uninitialized))
+            err,
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
         ));
     }
 
     #[tokio::test]
-    async fn test_submit_with_different_order_id_fails() {
-        let order = Lifecycle::Live(OffchainOrder::Submitted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-        });
+    async fn cannot_place_when_filled() {
+        let (_store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::ConfirmSubmission {
-            executor_order_id: ExecutorOrderId::new("ORD456"),
-        };
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::CompleteFill {
+                price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
 
-        let result = order.handle(command, &services()).await;
-
+        let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
-            result,
-            Err(OffchainOrderError::ConflictingExecutorOrderId { .. })
+            err,
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
         ));
     }
 
     #[tokio::test]
-    async fn test_partial_fill_from_submitted() {
-        let mut order = Lifecycle::Live(OffchainOrder::Submitted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-        });
+    async fn cannot_place_when_failed() {
+        let (_store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::UpdatePartialFill {
-            shares_filled: FractionalShares::new(dec!(50)),
-            avg_price_cents: PriceCents(15000),
-        };
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::MarkFailed {
+                error: "Market closed".to_string(),
+            },
+        )
+        .await
+        .unwrap();
 
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
+        let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
-            events[0],
-            OffchainOrderEvent::PartiallyFilled { .. }
+            err,
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
         ));
+    }
 
-        order.apply(events[0].clone());
+    #[tokio::test]
+    async fn partial_fill_from_submitted() {
+        let (store, cqrs) = test_cqrs();
 
-        let Lifecycle::Live(inner) = order else {
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::UpdatePartialFill {
+                shares_filled: FractionalShares::new(dec!(50)),
+                avg_price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::PartiallyFilled { .. }));
     }
 
     #[tokio::test]
-    async fn test_partial_fill_updates_from_partially_filled() {
-        let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            shares_filled: FractionalShares::new(dec!(50)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            avg_price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            partially_filled_at: Utc::now(),
-        });
+    async fn partial_fill_updates_shares() {
+        let (store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::UpdatePartialFill {
-            shares_filled: FractionalShares::new(dec!(75)),
-            avg_price_cents: PriceCents(15050),
-        };
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::UpdatePartialFill {
+                shares_filled: FractionalShares::new(dec!(50)),
+                avg_price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::UpdatePartialFill {
+                shares_filled: FractionalShares::new(dec!(75)),
+                avg_price_cents: PriceCents(15050),
+            },
+        )
+        .await
+        .unwrap();
 
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(OffchainOrder::PartiallyFilled { shares_filled, .. }) = order else {
+        let Lifecycle::Live(OffchainOrder::PartiallyFilled { shares_filled, .. }) =
+            load_order(&store, "order-1").await
+        else {
             panic!("Expected Live PartiallyFilled state");
         };
-
         assert_eq!(shares_filled, FractionalShares::new(dec!(75)));
     }
 
     #[tokio::test]
-    async fn test_complete_fill_from_submitted() {
-        let mut order = Lifecycle::Live(OffchainOrder::Submitted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-        });
+    async fn complete_fill_from_submitted() {
+        let (store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::CompleteFill {
-            price_cents: PriceCents(15000),
-        };
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::CompleteFill {
+                price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
 
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], OffchainOrderEvent::Filled { .. }));
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(inner) = order else {
+        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Filled { .. }));
     }
 
     #[tokio::test]
-    async fn test_complete_fill_from_partially_filled() {
-        let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            shares_filled: FractionalShares::new(dec!(75)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            avg_price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            partially_filled_at: Utc::now(),
-        });
+    async fn complete_fill_from_partially_filled() {
+        let (store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::CompleteFill {
-            price_cents: PriceCents(15025),
-        };
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::UpdatePartialFill {
+                shares_filled: FractionalShares::new(dec!(75)),
+                avg_price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::CompleteFill {
+                price_cents: PriceCents(15025),
+            },
+        )
+        .await
+        .unwrap();
 
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(inner) = order else {
+        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
             panic!("Expected Live state");
         };
         assert!(matches!(inner, OffchainOrder::Filled { .. }));
     }
 
     #[tokio::test]
-    async fn test_cannot_fill_if_not_submitted() {
-        let order = Lifecycle::Live(OffchainOrder::Pending {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            placed_at: Utc::now(),
-        });
+    async fn cannot_fill_uninitialized_order() {
+        let (_store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::CompleteFill {
-            price_cents: PriceCents(15000),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::NotSubmitted)));
+        let err = cqrs
+            .execute(
+                "order-1",
+                OffchainOrderCommand::CompleteFill {
+                    price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::NotPlaced))
+        ));
     }
 
     #[tokio::test]
-    async fn test_cannot_fill_already_filled() {
-        let order = Lifecycle::Live(OffchainOrder::Filled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            filled_at: Utc::now(),
-        });
+    async fn cannot_fill_already_filled() {
+        let (_store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::CompleteFill {
-            price_cents: PriceCents(15000),
-        };
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::CompleteFill {
+                price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
 
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
+        let err = cqrs
+            .execute(
+                "order-1",
+                OffchainOrderCommand::CompleteFill {
+                    price_cents: PriceCents(15000),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyCompleted))
+        ));
     }
 
     #[tokio::test]
-    async fn test_mark_failed_from_pending() {
-        let mut order = Lifecycle::Live(OffchainOrder::Pending {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            placed_at: Utc::now(),
-        });
+    async fn mark_failed_from_submitted() {
+        let (store, cqrs) = test_cqrs();
 
-        let command = OffchainOrderCommand::MarkFailed {
-            error: "Market closed".to_string(),
-        };
-
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], OffchainOrderEvent::Failed { .. }));
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(inner) = order else {
-            panic!("Expected Live state");
-        };
-        assert!(matches!(inner, OffchainOrder::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_mark_failed_from_submitted() {
-        let mut order = Lifecycle::Live(OffchainOrder::Submitted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::MarkFailed {
-            error: "Insufficient funds".to_string(),
-        };
-
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(inner) = order else {
-            panic!("Expected Live state");
-        };
-        assert!(matches!(inner, OffchainOrder::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_mark_failed_from_partially_filled() {
-        let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            shares_filled: FractionalShares::new(dec!(50)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            avg_price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            partially_filled_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::MarkFailed {
-            error: "Order cancelled".to_string(),
-        };
-
-        let events = order.handle(command, &services()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(inner) = order else {
-            panic!("Expected Live state");
-        };
-        assert!(matches!(inner, OffchainOrder::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_fail_already_filled() {
-        let order = Lifecycle::Live(OffchainOrder::Filled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            filled_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::MarkFailed {
-            error: "Test error".to_string(),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
-    }
-
-    #[tokio::test]
-    async fn test_migrated_event_pending_status() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: MigratedOrderStatus::Pending,
-            executor_order_id: None,
-            price_cents: None,
-            executed_at: None,
-            migrated_at: Utc::now(),
-        };
-
-        order.apply(event);
-
-        let Lifecycle::Live(inner) = order else {
-            panic!("Expected Live state");
-        };
-        assert!(matches!(inner, OffchainOrder::Pending { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_migrated_event_submitted_status() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: MigratedOrderStatus::Submitted,
-            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
-            price_cents: None,
-            executed_at: Some(Utc::now()),
-            migrated_at: Utc::now(),
-        };
-
-        order.apply(event);
-
-        let Lifecycle::Live(inner) = order else {
-            panic!("Expected Live state");
-        };
-        assert!(matches!(inner, OffchainOrder::Submitted { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_migrated_event_filled_status() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: MigratedOrderStatus::Filled,
-            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
-            price_cents: Some(PriceCents(15000)),
-            executed_at: Some(Utc::now()),
-            migrated_at: Utc::now(),
-        };
-
-        order.apply(event);
-
-        let Lifecycle::Live(inner) = order else {
-            panic!("Expected Live state");
-        };
-        assert!(matches!(inner, OffchainOrder::Filled { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_migrated_event_failed_status() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
-            direction: Direction::Sell,
-            executor: SupportedExecutor::Schwab,
-            status: MigratedOrderStatus::Failed {
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::MarkFailed {
                 error: "Insufficient funds".to_string(),
             },
-            executor_order_id: None,
-            price_cents: None,
-            executed_at: Some(Utc::now()),
-            migrated_at: Utc::now(),
-        };
+        )
+        .await
+        .unwrap();
 
-        order.apply(event);
-
-        let Lifecycle::Live(OffchainOrder::Failed { error, .. }) = order else {
-            panic!("Expected Live Failed state");
+        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+            panic!("Expected Live state");
         };
-        assert_eq!(error, "Insufficient funds");
+        assert!(matches!(inner, OffchainOrder::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn mark_failed_from_partially_filled() {
+        let (store, cqrs) = test_cqrs();
+
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::UpdatePartialFill {
+                shares_filled: FractionalShares::new(dec!(50)),
+                avg_price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::MarkFailed {
+                error: "Order cancelled".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let Lifecycle::Live(inner) = load_order(&store, "order-1").await else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, OffchainOrder::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn cannot_fail_already_filled() {
+        let (_store, cqrs) = test_cqrs();
+
+        cqrs.execute("order-1", place_command()).await.unwrap();
+        cqrs.execute(
+            "order-1",
+            OffchainOrderCommand::CompleteFill {
+                price_cents: PriceCents(15000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = cqrs
+            .execute(
+                "order-1",
+                OffchainOrderCommand::MarkFailed {
+                    error: "Test error".to_string(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyCompleted))
+        ));
     }
 
     #[test]
-    fn test_transition_on_uninitialized_corrupts_state() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
+    fn transition_on_uninitialized_corrupts_state() {
+        let mut order = Lifecycle::<OffchainOrder>::default();
 
         let event = OffchainOrderEvent::Submitted {
             executor_order_id: ExecutorOrderId::new("ORD123"),
@@ -1350,299 +972,5 @@ mod tests {
         order.apply(event);
 
         assert!(matches!(order, Lifecycle::Failed { .. }));
-    }
-
-    fn succeeding_order_placer() -> OffchainOrderServices {
-        struct SucceedingOrderPlacer;
-
-        #[async_trait]
-        impl OrderPlacer for SucceedingOrderPlacer {
-            async fn place_market_order(
-                &self,
-                _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(ExecutorOrderId::new("BROKER_ORD_42"))
-            }
-        }
-
-        Arc::new(SucceedingOrderPlacer)
-    }
-
-    fn failing_order_placer() -> OffchainOrderServices {
-        struct FailingOrderPlacer;
-
-        #[async_trait]
-        impl OrderPlacer for FailingOrderPlacer {
-            async fn place_market_order(
-                &self,
-                _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-                Err("broker connection refused".into())
-            }
-        }
-
-        Arc::new(FailingOrderPlacer)
-    }
-
-    #[tokio::test]
-    async fn test_place_order_command_emits_placed_and_submitted() {
-        let mut order = Lifecycle::<OffchainOrder, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        let command = OffchainOrderCommand::PlaceOrder {
-            symbol: symbol.clone(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-        };
-
-        let events = order
-            .handle(command, &succeeding_order_placer())
-            .await
-            .unwrap();
-
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], OffchainOrderEvent::Placed { .. }));
-        assert!(matches!(events[1], OffchainOrderEvent::Submitted { .. }));
-
-        if let OffchainOrderEvent::Submitted {
-            executor_order_id, ..
-        } = &events[1]
-        {
-            assert_eq!(executor_order_id, &ExecutorOrderId::new("BROKER_ORD_42"));
-        }
-
-        for event in events {
-            order.apply(event);
-        }
-
-        let Lifecycle::Live(OffchainOrder::Submitted {
-            executor_order_id, ..
-        }) = &order
-        else {
-            panic!("Expected Submitted state after PlaceOrder, got {order:?}");
-        };
-        assert_eq!(executor_order_id, &ExecutorOrderId::new("BROKER_ORD_42"));
-    }
-
-    #[tokio::test]
-    async fn test_place_order_command_broker_failure() {
-        let order = Lifecycle::<OffchainOrder, Never>::default();
-
-        let command = OffchainOrderCommand::PlaceOrder {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-        };
-
-        let result = order.handle(command, &failing_order_placer()).await;
-
-        assert!(matches!(
-            result,
-            Err(OffchainOrderError::BrokerPlacement(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_place_order_when_already_placed() {
-        let order = Lifecycle::Live(OffchainOrder::Submitted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::PlaceOrder {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-        };
-
-        let result = order.handle(command, &succeeding_order_placer()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_confirm_submission_on_filled_order() {
-        let order = Lifecycle::Live(OffchainOrder::Filled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            filled_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::ConfirmSubmission {
-            executor_order_id: ExecutorOrderId::new("ORD456"),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadySubmitted)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_partial_fill_pending_order() {
-        let order = Lifecycle::Live(OffchainOrder::Pending {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            placed_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::UpdatePartialFill {
-            shares_filled: FractionalShares::new(dec!(50)),
-            avg_price_cents: PriceCents(15000),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::NotSubmitted)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_partial_fill_filled_order() {
-        let order = Lifecycle::Live(OffchainOrder::Filled {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            executor_order_id: ExecutorOrderId::new("ORD123"),
-            price_cents: PriceCents(15000),
-            placed_at: Utc::now(),
-            submitted_at: Utc::now(),
-            filled_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::UpdatePartialFill {
-            shares_filled: FractionalShares::new(dec!(50)),
-            avg_price_cents: PriceCents(15000),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_partial_fill_failed_order() {
-        let order = Lifecycle::Live(OffchainOrder::Failed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            error: "Market closed".to_string(),
-            placed_at: Utc::now(),
-            failed_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::UpdatePartialFill {
-            shares_filled: FractionalShares::new(dec!(50)),
-            avg_price_cents: PriceCents(15000),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_complete_fill_failed_order() {
-        let order = Lifecycle::Live(OffchainOrder::Failed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            error: "Market closed".to_string(),
-            placed_at: Utc::now(),
-            failed_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::CompleteFill {
-            price_cents: PriceCents(15000),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_fail_already_failed_order() {
-        let order = Lifecycle::Live(OffchainOrder::Failed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            error: "Market closed".to_string(),
-            placed_at: Utc::now(),
-            failed_at: Utc::now(),
-        });
-
-        let command = OffchainOrderCommand::MarkFailed {
-            error: "Another error".to_string(),
-        };
-
-        let result = order.handle(command, &services()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
-    }
-
-    /// ConfirmSubmission is idempotent: retrying with the same executor_order_id
-    /// on an already-submitted order is a no-op (returns empty events). This
-    /// ensures resilience against duplicate command delivery or retries after
-    /// transient failures.
-    #[tokio::test]
-    async fn test_confirm_submission_not_idempotent_blocks_retry_recovery() {
-        let mut order = Lifecycle::Live(OffchainOrder::Pending {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(dec!(100)),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            placed_at: Utc::now(),
-        });
-
-        let executor_order_id = ExecutorOrderId::new("ORD-SAME-123");
-
-        let command = OffchainOrderCommand::ConfirmSubmission {
-            executor_order_id: executor_order_id.clone(),
-        };
-        let events = order.handle(command, &services()).await.unwrap();
-        assert_eq!(events.len(), 1);
-        order.apply(events[0].clone());
-
-        let Lifecycle::Live(OffchainOrder::Submitted {
-            executor_order_id: stored_id,
-            ..
-        }) = &order
-        else {
-            panic!("Expected Submitted state");
-        };
-        assert_eq!(stored_id, &executor_order_id);
-
-        let retry_command = OffchainOrderCommand::ConfirmSubmission {
-            executor_order_id: executor_order_id.clone(),
-        };
-
-        let retry_result = order.handle(retry_command, &services()).await;
-
-        let events = retry_result
-            .expect("Retry with same executor_order_id should succeed for idempotent behavior");
-
-        assert!(
-            events.is_empty(),
-            "Idempotent retry should return empty events vec, got {events:?}"
-        );
     }
 }

@@ -5,8 +5,10 @@ mod usdc;
 
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
+use chrono::Utc;
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
+use cqrs_es::{AggregateContext, AggregateError, EventEnvelope, EventStore, Query};
+use serde::Deserialize;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -16,21 +18,17 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
-use chrono::Utc;
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
-use st0x_execution::{ArithmeticError, FractionalShares, Symbol};
+use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
-use crate::lifecycle::{Lifecycle, Never};
-use crate::position::{Position, PositionAggregate, PositionEvent};
+use crate::lifecycle::{Lifecycle, LifecycleError};
+use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
-use crate::vault_registry::VaultRegistry;
-
-use crate::vault_registry::VaultRegistryError;
+use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
@@ -40,35 +38,38 @@ enum TokenAddressError {
     #[error("vault registry aggregate in failed state")]
     Failed,
     #[error(transparent)]
-    Persistence(#[from] cqrs_es::AggregateError<VaultRegistryError>),
+    Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
 }
 
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
-pub enum RebalancingConfigError {
+pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
     #[error("broker account_id is not a valid UUID: {0}")]
     InvalidAccountId(#[from] uuid::Error),
 }
 
-/// TOML fields for rebalancing configuration.
-/// Alpaca auth is NOT included here - it's derived from the broker config
-/// to eliminate duplication and ensure consistency.
-#[derive(Clone, serde::Deserialize)]
-pub(crate) struct RebalancingTomlFields {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RebalancingSecrets {
+    pub(crate) ethereum_rpc_url: Url,
+    pub(crate) evm_private_key: B256,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
     pub(crate) redemption_wallet: Address,
-    pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
 }
 
 /// Runtime configuration for rebalancing operations.
-/// Constructed from `RebalancingTomlFields` + broker's `AlpacaBrokerApiAuthConfig`.
+/// Constructed from `RebalancingConfig` + `RebalancingSecrets` + broker's `AlpacaBrokerApiCtx`.
 #[derive(Clone)]
-pub(crate) struct RebalancingConfig {
+pub(crate) struct RebalancingCtx {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
     /// Issuer's wallet for tokenized equity redemptions.
@@ -79,36 +80,37 @@ pub(crate) struct RebalancingConfig {
     /// Derived from broker config's account_id.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Cloned from broker config - ensures consistency.
-    pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
+    pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
 }
 
-impl RebalancingConfig {
-    /// Construct from TOML fields and broker's Alpaca auth config.
+impl RebalancingCtx {
+    /// Construct from config, secrets, and broker's Alpaca auth.
     ///
-    /// This is the ONLY way to construct a `RebalancingConfig`, which enforces
-    /// the invariant that rebalancing always has valid `AlpacaBrokerApiAuthConfig`.
-    pub(crate) fn from_toml_and_broker(
-        toml: RebalancingTomlFields,
-        broker_auth: AlpacaBrokerApiAuthConfig,
-    ) -> Result<Self, RebalancingConfigError> {
+    /// This is the ONLY way to construct a `RebalancingCtx`, which enforces
+    /// the invariant that rebalancing always has valid `AlpacaBrokerApiCtx`.
+    pub(crate) fn new(
+        config: RebalancingConfig,
+        secrets: RebalancingSecrets,
+        broker_auth: AlpacaBrokerApiCtx,
+    ) -> Result<Self, RebalancingCtxError> {
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
 
         Ok(Self {
-            equity_threshold: toml.equity_threshold,
-            usdc_threshold: toml.usdc_threshold,
-            redemption_wallet: toml.redemption_wallet,
-            ethereum_rpc_url: toml.ethereum_rpc_url,
-            evm_private_key: toml.evm_private_key,
-            usdc_vault_id: toml.usdc_vault_id,
+            equity_threshold: config.equity_threshold,
+            usdc_threshold: config.usdc_threshold,
+            redemption_wallet: config.redemption_wallet,
+            ethereum_rpc_url: secrets.ethereum_rpc_url,
+            evm_private_key: secrets.evm_private_key,
+            usdc_vault_id: config.usdc_vault_id,
             alpaca_account_id,
             alpaca_broker_auth: broker_auth,
         })
     }
 }
 
-impl std::fmt::Debug for RebalancingConfig {
+impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RebalancingConfig")
+        f.debug_struct("RebalancingCtx")
             .field("equity_threshold", &self.equity_threshold)
             .field("usdc_threshold", &self.usdc_threshold)
             .field("redemption_wallet", &self.redemption_wallet)
@@ -183,12 +185,8 @@ impl RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<PositionAggregate> for RebalancingTrigger {
-    async fn dispatch(
-        &self,
-        aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<Position, ArithmeticError<FractionalShares>>>],
-    ) {
+impl Query<Lifecycle<Position>> for RebalancingTrigger {
+    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Position>>]) {
         let Ok(symbol) = Symbol::new(aggregate_id) else {
             warn!(aggregate_id = %aggregate_id, "Invalid symbol in position aggregate_id");
             return;
@@ -202,11 +200,11 @@ impl Query<PositionAggregate> for RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
+impl Query<Lifecycle<TokenizedEquityMint>> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>],
     ) {
         let Some((symbol, quantity)) = Self::extract_mint_info(events) else {
             warn!(aggregate_id = %aggregate_id, "No MintRequested event found in mint dispatch");
@@ -229,11 +227,11 @@ impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
+impl Query<Lifecycle<EquityRedemption>> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+        events: &[EventEnvelope<Lifecycle<EquityRedemption>>],
     ) {
         let Some((symbol, quantity)) = Self::extract_redemption_info(events) else {
             warn!(aggregate_id = %aggregate_id, "No TokensSent event found in redemption dispatch");
@@ -256,11 +254,11 @@ impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
+impl Query<Lifecycle<UsdcRebalance>> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance>>],
     ) {
         let Some((direction, amount)) = Self::extract_usdc_rebalance_info(events) else {
             warn!(aggregate_id = %aggregate_id, "No Initiated event found in USDC rebalance dispatch");
@@ -297,8 +295,8 @@ impl RebalancingTrigger {
             return;
         };
 
-        if let Err(e) = self.sender.try_send(operation.clone()) {
-            warn!(error = %e, "Failed to send triggered operation");
+        if let Err(error) = self.sender.try_send(operation.clone()) {
+            warn!(error = %error, "Failed to send triggered operation");
             return;
         }
 
@@ -313,8 +311,8 @@ impl RebalancingTrigger {
                 error!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
                 return None;
             }
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
+            Err(error) => {
+                error!(symbol = %symbol, error = %error, "Failed to load vault registry");
                 return None;
             }
         };
@@ -334,12 +332,16 @@ impl RebalancingTrigger {
         symbol: &Symbol,
     ) -> Result<Option<Address>, TokenAddressError> {
         let repo = SqliteEventRepository::new(self.pool.clone());
-        let store = PersistedEventStore::<
-            SqliteEventRepository,
-            Lifecycle<VaultRegistry, Never>,
-        >::new_event_store(repo);
+        let store =
+            PersistedEventStore::<SqliteEventRepository, Lifecycle<VaultRegistry>>::new_event_store(
+                repo,
+            );
 
-        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
+        let aggregate_id = VaultRegistryId {
+            orderbook: self.orderbook,
+            owner: self.order_owner,
+        }
+        .to_string();
         let aggregate_context = store.load_aggregate(&aggregate_id).await?;
 
         match aggregate_context.aggregate() {
@@ -364,8 +366,8 @@ impl RebalancingTrigger {
             return;
         };
 
-        if let Err(e) = self.sender.try_send(operation.clone()) {
-            warn!(error = %e, "Failed to send USDC triggered operation");
+        if let Err(error) = self.sender.try_send(operation.clone()) {
+            warn!(error = %error, "Failed to send USDC triggered operation");
             return;
         }
 
@@ -376,7 +378,7 @@ impl RebalancingTrigger {
     /// Clears the in-progress flag for an equity symbol.
     pub(crate) fn clear_equity_in_progress(&self, symbol: &Symbol) {
         let mut guard = match self.equity_in_progress.write() {
-            Ok(g) => g,
+            Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
         guard.remove(symbol);
@@ -388,8 +390,8 @@ impl RebalancingTrigger {
     }
 
     async fn apply_position_event_and_check(&self, symbol: &Symbol, event: &PositionEvent) {
-        if let Err(e) = self.apply_position_event_to_inventory(symbol, event).await {
-            warn!(symbol = %symbol, error = %e, "Failed to apply position event to inventory");
+        if let Err(error) = self.apply_position_event_to_inventory(symbol, event).await {
+            warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
             return;
         }
 
@@ -412,7 +414,7 @@ impl RebalancingTrigger {
     }
 
     fn extract_mint_info(
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>],
     ) -> Option<(Symbol, FractionalShares)> {
         for envelope in events {
             if let TokenizedEquityMintEvent::MintRequested {
@@ -426,9 +428,7 @@ impl RebalancingTrigger {
         None
     }
 
-    fn has_terminal_mint_event(
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
-    ) -> bool {
+    fn has_terminal_mint_event(events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>]) -> bool {
         events.iter().any(|envelope| {
             matches!(
                 envelope.payload,
@@ -456,14 +456,14 @@ impl RebalancingTrigger {
                 *inventory = new_inventory;
                 drop(inventory);
             }
-            Err(e) => {
-                warn!(symbol = %symbol, error = %e, "Failed to apply mint event to inventory");
+            Err(error) => {
+                warn!(symbol = %symbol, error = %error, "Failed to apply mint event to inventory");
             }
         }
     }
 
     fn extract_redemption_info(
-        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+        events: &[EventEnvelope<Lifecycle<EquityRedemption>>],
     ) -> Option<(Symbol, FractionalShares)> {
         for envelope in events {
             if let EquityRedemptionEvent::TokensSent {
@@ -478,7 +478,7 @@ impl RebalancingTrigger {
     }
 
     fn has_terminal_redemption_event(
-        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+        events: &[EventEnvelope<Lifecycle<EquityRedemption>>],
     ) -> bool {
         events.iter().any(|envelope| {
             matches!(
@@ -507,14 +507,14 @@ impl RebalancingTrigger {
                 *inventory = new_inventory;
                 drop(inventory);
             }
-            Err(e) => {
-                warn!(symbol = %symbol, error = %e, "Failed to apply redemption event to inventory");
+            Err(error) => {
+                warn!(symbol = %symbol, error = %error, "Failed to apply redemption event to inventory");
             }
         }
     }
 
     fn extract_usdc_rebalance_info(
-        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance>>],
     ) -> Option<(RebalanceDirection, Usdc)> {
         for envelope in events {
             if let UsdcRebalanceEvent::Initiated {
@@ -528,7 +528,7 @@ impl RebalancingTrigger {
     }
 
     fn has_terminal_usdc_rebalance_event(
-        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance>>],
     ) -> bool {
         // IMPORTANT: This function must work with incremental dispatch - cqrs-es 0.4
         // only sends newly committed events to Query::dispatch, not full history.
@@ -583,8 +583,8 @@ impl RebalancingTrigger {
                 *inventory = new_inventory;
                 drop(inventory);
             }
-            Err(e) => {
-                warn!(error = %e, "Failed to apply USDC rebalance event to inventory");
+            Err(error) => {
+                warn!(error = %error, "Failed to apply USDC rebalance event to inventory");
             }
         }
     }
@@ -600,7 +600,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlite_es::sqlite_cqrs;
-    use st0x_execution::Direction;
+    use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -610,9 +610,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::lifecycle::Lifecycle;
-    use st0x_execution::ExecutorOrderId;
-
-    use crate::offchain_order::{OffchainOrder, PriceCents};
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -664,7 +662,13 @@ mod tests {
         }
 
         trigger.check_and_trigger_equity(&symbol).await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -674,7 +678,13 @@ mod tests {
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
 
         trigger.check_and_trigger_usdc().await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -714,7 +724,13 @@ mod tests {
         trigger.check_and_trigger_equity(&symbol).await;
         trigger.check_and_trigger_usdc().await;
 
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     fn shares(n: i64) -> FractionalShares {
@@ -737,8 +753,8 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            offchain_order_id: OffchainOrder::aggregate_id(),
-            shares_filled,
+            offchain_order_id: OffchainOrderId::new(),
+            shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
             executor_order_id: ExecutorOrderId::new("ORD1"),
             price_cents: PriceCents(15000),
@@ -751,8 +767,12 @@ mod tests {
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
-        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
+        let aggregate_id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        }
+        .to_string();
 
         cqrs.execute(
             &aggregate_id,
@@ -860,7 +880,13 @@ mod tests {
 
         // Verify no operation was triggered.
         trigger.check_and_trigger_equity(&symbol).await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -887,7 +913,13 @@ mod tests {
         while receiver.try_recv().is_ok() {}
 
         trigger.check_and_trigger_equity(&symbol).await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -913,7 +945,13 @@ mod tests {
             .await;
 
         // No operation should be triggered.
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -995,7 +1033,7 @@ mod tests {
 
     fn make_mint_envelope(
         event: TokenizedEquityMintEvent,
-    ) -> EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> {
+    ) -> EventEnvelope<Lifecycle<TokenizedEquityMint>> {
         EventEnvelope {
             aggregate_id: "mint-123".to_string(),
             sequence: 1,
@@ -1041,7 +1079,10 @@ mod tests {
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
             "Expected no operation due to inflight"
         );
     }
@@ -1182,7 +1223,7 @@ mod tests {
 
     fn make_redemption_envelope(
         event: EquityRedemptionEvent,
-    ) -> EventEnvelope<Lifecycle<EquityRedemption, Never>> {
+    ) -> EventEnvelope<Lifecycle<EquityRedemption>> {
         EventEnvelope {
             aggregate_id: "redemption-123".to_string(),
             sequence: 1,
@@ -1219,7 +1260,10 @@ mod tests {
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
             "Expected no operation due to inflight"
         );
     }
@@ -1410,7 +1454,7 @@ mod tests {
 
     fn make_usdc_rebalance_envelope(
         event: UsdcRebalanceEvent,
-    ) -> EventEnvelope<Lifecycle<UsdcRebalance, Never>> {
+    ) -> EventEnvelope<Lifecycle<UsdcRebalance>> {
         EventEnvelope {
             aggregate_id: "usdc-rebalance-123".to_string(),
             sequence: 1,
@@ -1745,11 +1789,9 @@ mod tests {
         ));
     }
 
-    fn valid_rebalancing_toml() -> &'static str {
+    fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [equity_threshold]
@@ -1762,64 +1804,77 @@ mod tests {
         "#
     }
 
-    fn test_broker_auth() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn valid_rebalancing_secrets_toml() -> &'static str {
+        r#"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#
+    }
+
+    fn test_broker_auth() -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-            mode: Some(st0x_execution::alpaca_broker_api::AlpacaBrokerApiMode::Sandbox),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
         }
     }
 
     #[test]
-    fn deserialize_toml_fields_succeeds() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+    fn deserialize_config_succeeds() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        assert_eq!(toml_fields.equity_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.equity_threshold.deviation, dec!(0.2));
-        assert_eq!(toml_fields.usdc_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.usdc_threshold.deviation, dec!(0.3));
+        assert_eq!(config.equity_threshold.target, dec!(0.5));
+        assert_eq!(config.equity_threshold.deviation, dec!(0.2));
+        assert_eq!(config.usdc_threshold.target, dec!(0.5));
+        assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
         assert_eq!(
-            toml_fields.redemption_wallet,
+            config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
         );
     }
 
     #[test]
-    fn from_toml_and_broker_constructs_config() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+    fn deserialize_secrets_succeeds() {
+        let _secrets: RebalancingSecrets =
+            toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+    }
 
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
+    #[test]
+    fn new_constructs_ctx() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        assert_eq!(config.alpaca_broker_auth.api_key, "test_key");
-        assert_eq!(config.alpaca_broker_auth.api_secret, "test_secret");
+        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
+
+        assert_eq!(ctx.alpaca_broker_auth.api_key, "test_key");
+        assert_eq!(ctx.alpaca_broker_auth.api_secret, "test_secret");
         assert_eq!(
-            config.alpaca_account_id,
+            ctx.alpaca_account_id,
             AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"))
         );
     }
 
     #[test]
-    fn from_toml_and_broker_fails_with_invalid_account_id() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+    fn new_fails_with_invalid_account_id() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
         let mut broker_auth = test_broker_auth();
         broker_auth.account_id = "not-a-uuid".to_string();
 
-        let result = RebalancingConfig::from_toml_and_broker(toml_fields, broker_auth);
+        let result = RebalancingCtx::new(config, secrets, broker_auth);
 
         assert!(
-            matches!(result, Err(RebalancingConfigError::InvalidAccountId(_))),
+            matches!(result, Err(RebalancingCtxError::InvalidAccountId(_))),
             "Expected InvalidAccountId error, got {result:?}"
         );
     }
 
     #[test]
     fn deserialize_with_custom_thresholds() {
-        let toml_str = r#"
+        let config: RebalancingConfig = toml::from_str(
+            r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [equity_threshold]
@@ -1829,23 +1884,22 @@ mod tests {
             [usdc_threshold]
             target = "0.4"
             deviation = "0.15"
-        "#;
+        "#,
+        )
+        .unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let toml_fields: RebalancingTomlFields = toml::from_str(toml_str).unwrap();
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
+        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
 
-        assert_eq!(config.equity_threshold.target, dec!(0.6));
-        assert_eq!(config.equity_threshold.deviation, dec!(0.1));
-        assert_eq!(config.usdc_threshold.target, dec!(0.4));
-        assert_eq!(config.usdc_threshold.deviation, dec!(0.15));
+        assert_eq!(ctx.equity_threshold.target, dec!(0.6));
+        assert_eq!(ctx.equity_threshold.deviation, dec!(0.1));
+        assert_eq!(ctx.usdc_threshold.target, dec!(0.4));
+        assert_eq!(ctx.usdc_threshold.deviation, dec!(0.15));
     }
 
     #[test]
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [equity_threshold]
@@ -1857,34 +1911,30 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("redemption_wallet"),
+            "Expected missing redemption_wallet error, got: {error}"
+        );
     }
 
     #[test]
     fn deserialize_missing_evm_private_key_fails() {
         let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
             ethereum_rpc_url = "https://eth.example.com"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-
-            [equity_threshold]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("evm_private_key"),
+            "Expected missing evm_private_key error, got: {error}"
+        );
     }
 
     #[test]
     fn deserialize_missing_equity_threshold_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [usdc_threshold]
@@ -1892,10 +1942,14 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("equity_threshold"),
+            "Expected missing equity_threshold error, got: {error}"
+        );
     }
 
-    type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;
+    type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance>;
     type UsdcRebalanceMemStore = MemStore<UsdcRebalanceLifecycle>;
 
     /// Spy query that records all dispatched events for verification.

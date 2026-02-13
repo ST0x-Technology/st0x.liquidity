@@ -1,7 +1,7 @@
 //! Redemption operations for tokenized equity.
 //!
-//! This module provides the trait and implementations for redeeming tokenized equities
-//! through the Alpaca tokenization API.
+//! This module provides the trait and implementations for redeeming
+//! tokenized equities through the Alpaca tokenization API.
 
 pub(crate) mod manager;
 #[cfg(test)]
@@ -9,12 +9,13 @@ pub(crate) mod mock;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
-use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
+use st0x_execution::{FractionalShares, Symbol};
+
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
+use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
+use crate::event_sourced::SendError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
@@ -22,7 +23,7 @@ pub(crate) enum RedemptionError {
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<EquityRedemptionError>),
+    Aggregate(#[from] SendError<EquityRedemption>),
 
     #[error("Redemption was rejected by Alpaca")]
     Rejected,

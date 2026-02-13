@@ -1,4 +1,7 @@
-use alloy::primitives::{Address, B256, Bytes, U256, address};
+//! Pyth oracle price feed integration for onchain price lookups via
+//! transaction traces.
+
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::providers::ext::DebugApi;
 use alloy::rpc::types::trace::geth::{
@@ -7,7 +10,7 @@ use alloy::rpc::types::trace::geth::{
 use alloy::sol_types::{SolCall, SolType};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::FromPrimitive;
 use tracing::{debug, error, info, warn};
 
 use crate::bindings::IPyth::{
@@ -37,8 +40,6 @@ pub enum PythError {
     ArithmeticOverflow,
     #[error("RPC error while fetching trace: {0}")]
     Rpc(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("Failed to convert Pyth data: {0}")]
-    ConversionFailed(&'static str),
     #[error("Invalid timestamp value: {0}")]
     InvalidTimestamp(U256),
     #[error("Exponent conversion failed: {0}")]
@@ -55,27 +56,23 @@ pub struct PythCall {
 }
 
 pub(super) struct PythPricing {
-    pub price: f64,
-    pub confidence: f64,
+    pub price: Decimal,
+    pub confidence: Decimal,
     pub exponent: i32,
     pub publish_time: DateTime<Utc>,
 }
 
 impl PythPricing {
     pub(super) async fn try_from_tx_hash<P: Provider>(
-        tx_hash: B256,
+        tx_hash: TxHash,
         provider: P,
         symbol: &str,
         feed_id_cache: &FeedIdCache,
     ) -> Result<Self, PythError> {
         let pyth_price = extract_pyth_price(tx_hash, &provider, symbol, feed_id_cache).await?;
 
-        let price_decimal = pyth_price.to_decimal()?;
-        let price_f64 = price_decimal.to_f64().ok_or(PythError::ConversionFailed(
-            "Price to f64 conversion failed",
-        ))?;
-
-        let confidence_f64 = scale_with_exponent(pyth_price.conf, pyth_price.expo)?;
+        let price = pyth_price.to_decimal()?;
+        let confidence = scale_with_exponent(pyth_price.conf, pyth_price.expo)?;
 
         let publish_time_i64 = i64::try_from(pyth_price.publishTime)
             .map_err(|_| PythError::InvalidTimestamp(pyth_price.publishTime))?;
@@ -84,18 +81,18 @@ impl PythPricing {
             .ok_or(PythError::InvalidTimestamp(pyth_price.publishTime))?;
 
         Ok(Self {
-            price: price_f64,
-            confidence: confidence_f64,
+            price,
+            confidence,
             exponent: pyth_price.expo,
             publish_time,
         })
     }
 }
 
-fn scale_with_exponent(value: u64, exponent: i32) -> Result<f64, PythError> {
+fn scale_with_exponent(value: u64, exponent: i32) -> Result<Decimal, PythError> {
     let decimal_value = Decimal::from(value);
 
-    let scaled = if exponent >= 0 {
+    if exponent >= 0 {
         let multiplier = (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
             acc.checked_mul(Decimal::from(10_i64))
                 .ok_or(PythError::ArithmeticOverflow)
@@ -103,7 +100,7 @@ fn scale_with_exponent(value: u64, exponent: i32) -> Result<f64, PythError> {
 
         decimal_value
             .checked_mul(multiplier)
-            .ok_or(PythError::ArithmeticOverflow)?
+            .ok_or(PythError::ArithmeticOverflow)
     } else {
         let abs_exponent = exponent
             .checked_abs()
@@ -116,12 +113,8 @@ fn scale_with_exponent(value: u64, exponent: i32) -> Result<f64, PythError> {
 
         decimal_value
             .checked_div(divisor)
-            .ok_or(PythError::ArithmeticOverflow)?
-    };
-
-    scaled.to_f64().ok_or(PythError::ConversionFailed(
-        "Decimal to f64 conversion failed",
-    ))
+            .ok_or(PythError::ArithmeticOverflow)
+    }
 }
 
 pub fn find_pyth_calls(trace: &GethTrace) -> Result<Vec<PythCall>, PythError> {
@@ -211,7 +204,7 @@ impl Price {
 }
 
 pub async fn extract_pyth_price<P>(
-    tx_hash: B256,
+    tx_hash: TxHash,
     provider: &P,
     symbol: &str,
     cache: &FeedIdCache,
@@ -234,7 +227,7 @@ where
 
 fn parse_non_empty_pyth_calls(
     pyth_calls: &[PythCall],
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<(&PythCall, &[PythCall]), PythError> {
     let Some((first, rest)) = pyth_calls.split_first() else {
         warn!("No Pyth call found in transaction {tx_hash}");
@@ -250,7 +243,7 @@ async fn find_matching_pyth_call<'a>(
     rest: &'a [PythCall],
     symbol: &str,
     cache: &FeedIdCache,
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<&'a PythCall, PythError> {
     let cached_feed_id = cache.get(symbol).await;
 
@@ -267,7 +260,7 @@ fn find_call_by_cached_feed_id<'a>(
     rest: &'a [PythCall],
     feed_id: B256,
     symbol: &str,
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<&'a PythCall, PythError> {
     debug!("Found cached feed ID for {symbol}: {feed_id}");
 
@@ -275,7 +268,10 @@ fn find_call_by_cached_feed_id<'a>(
         .chain(rest.iter())
         .find(|call| call.price_feed_id == feed_id)
         .ok_or_else(|| {
-            warn!("No Pyth call found matching cached feed ID {feed_id} for {symbol} in transaction {tx_hash}");
+            warn!(
+                "No Pyth call found matching cached feed ID {feed_id} \
+                 for {symbol} in transaction {tx_hash}"
+            );
             PythError::NoMatchingFeedId(feed_id)
         })
 }
@@ -292,16 +288,16 @@ async fn cache_new_feed_id(cache: &FeedIdCache, symbol: &str, call: &PythCall) {
 fn extract_and_log_price(
     matching_call: &PythCall,
     symbol: &str,
-    tx_hash: B256,
+    tx_hash: TxHash,
 ) -> Result<Price, PythError> {
     debug!(
         "Using Pyth call at depth {} with feed ID {} for price extraction",
         matching_call.depth, matching_call.price_feed_id
     );
 
-    let price = decode_pyth_price(&matching_call.output).map_err(|e| {
-        error!("Failed to extract Pyth price from {tx_hash}: {e}");
-        e
+    let price = decode_pyth_price(&matching_call.output).map_err(|error| {
+        error!("Failed to extract Pyth price from {tx_hash}: {error}");
+        error
     })?;
 
     info!(
@@ -312,7 +308,7 @@ fn extract_and_log_price(
     Ok(price)
 }
 
-async fn fetch_transaction_trace<P>(tx_hash: B256, provider: &P) -> Result<GethTrace, PythError>
+async fn fetch_transaction_trace<P>(tx_hash: TxHash, provider: &P) -> Result<GethTrace, PythError>
 where
     P: Provider,
 {
@@ -326,7 +322,7 @@ where
     let trace = provider
         .debug_trace_transaction(tx_hash, options)
         .await
-        .map_err(|e| PythError::Rpc(Box::new(e)))?;
+        .map_err(|error| PythError::Rpc(Box::new(error)))?;
 
     Ok(trace)
 }
@@ -338,6 +334,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::trace::geth::FourByteFrame;
+    use rust_decimal_macros::dec;
 
     fn create_test_call_frame(
         to: Address,
@@ -588,7 +585,7 @@ mod tests {
             price: 100_000,
             conf: 500,
             expo: -5,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let encoded = Price::abi_encode(&price);
@@ -619,7 +616,7 @@ mod tests {
             price: 123_456_789,
             conf: 1000,
             expo: -8,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -633,7 +630,7 @@ mod tests {
             price: 42,
             conf: 1,
             expo: 0,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -647,7 +644,7 @@ mod tests {
             price: 123,
             conf: 10,
             expo: 3,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -671,7 +668,7 @@ mod tests {
                 price: price_value,
                 conf: 100,
                 expo,
-                publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+                publishTime: U256::from(1_700_000_000u64),
             };
 
             let decimal = price.to_decimal().unwrap();
@@ -690,7 +687,7 @@ mod tests {
             price: -50_000_000,
             conf: 1000,
             expo: -6,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -704,7 +701,7 @@ mod tests {
             price: 18_250,
             conf: 10,
             expo: -2,
-            publishTime: alloy::primitives::U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_700_000_000u64),
         };
 
         let decimal = price.to_decimal().unwrap();
@@ -718,7 +715,7 @@ mod tests {
             price: 999_999_999,
             conf: 5000,
             expo: -8,
-            publishTime: alloy::primitives::U256::from(1_700_123_456u64),
+            publishTime: U256::from(1_700_123_456u64),
         };
 
         let encoded = Price::abi_encode(&original_price);
@@ -737,25 +734,25 @@ mod tests {
     #[test]
     fn test_scale_with_exponent_negative() {
         let result = scale_with_exponent(123_456_789, -8).unwrap();
-        assert!((result - 1.234_567_89).abs() < 0.000_000_01);
+        assert_eq!(result, dec!(1.23456789));
     }
 
     #[test]
     fn test_scale_with_exponent_positive() {
         let result = scale_with_exponent(123, 3).unwrap();
-        assert!((result - 123_000.0).abs() < 0.01);
+        assert_eq!(result, dec!(123000));
     }
 
     #[test]
     fn test_scale_with_exponent_zero() {
         let result = scale_with_exponent(42, 0).unwrap();
-        assert!((result - 42.0).abs() < 0.01);
+        assert_eq!(result, dec!(42));
     }
 
     #[test]
     fn test_scale_with_exponent_decimal_overflow() {
         let result = scale_with_exponent(u64::MAX, 10);
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
@@ -797,19 +794,17 @@ mod tests {
         };
 
         let pricing = PythPricing {
-            price: 182.50,
-            confidence: 0.10,
+            price: dec!(182.50),
+            confidence: dec!(0.10),
             exponent: -8,
             publish_time: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         };
 
         let price_decimal = price.to_decimal().unwrap();
-        let price_f64 = price_decimal.to_f64().unwrap();
+        assert_eq!(price_decimal, pricing.price);
 
-        assert!((price_f64 - pricing.price).abs() < 0.01);
-
-        let confidence_f64 = scale_with_exponent(price.conf, price.expo).unwrap();
-        assert!((confidence_f64 - pricing.confidence).abs() < 0.01);
+        let confidence_decimal = scale_with_exponent(price.conf, price.expo).unwrap();
+        assert_eq!(confidence_decimal, pricing.confidence);
     }
 
     #[tokio::test]
@@ -829,9 +824,10 @@ mod tests {
         let tx_hash = B256::repeat_byte(0xff);
         let cache = FeedIdCache::new();
 
-        let result = extract_pyth_price(tx_hash, &provider, "TEST", &cache).await;
-
-        assert!(matches!(result, Err(PythError::NoPythCall)));
+        assert!(matches!(
+            extract_pyth_price(tx_hash, &provider, "TEST", &cache).await,
+            Err(PythError::NoPythCall)
+        ));
     }
 
     #[tokio::test]
@@ -866,8 +862,9 @@ mod tests {
         let tx_hash = B256::repeat_byte(0xff);
         let cache = FeedIdCache::new();
 
-        let result = PythPricing::try_from_tx_hash(tx_hash, provider, "TEST", &cache).await;
-
-        assert!(matches!(result, Err(PythError::InvalidTimestamp(_))));
+        assert!(matches!(
+            PythPricing::try_from_tx_hash(tx_hash, provider, "TEST", &cache).await,
+            Err(PythError::InvalidTimestamp(_))
+        ));
     }
 }

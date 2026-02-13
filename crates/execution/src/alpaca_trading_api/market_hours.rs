@@ -80,9 +80,10 @@ pub(super) async fn wait_until_market_open(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use httpmock::prelude::*;
     use serde_json::json;
+
+    use super::*;
 
     fn create_test_client(mock_server: &MockServer) -> Client {
         let api_info =
@@ -107,10 +108,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = wait_until_market_open(&client).await;
+        let duration = wait_until_market_open(&client).await.unwrap();
 
         mock.assert();
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 
@@ -131,10 +131,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = wait_until_market_open(&client).await;
+        let duration = wait_until_market_open(&client).await.unwrap();
 
         mock.assert();
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 }

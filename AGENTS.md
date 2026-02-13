@@ -11,6 +11,31 @@ the limit:
 - **Remove redundancy** - if a guideline duplicates another, keep one reference
 - **Shorten explanations** - preserve the rule, reduce the elaboration
 
+## Documentation
+
+**Before doing any work**, read these documents:
+
+1. **[SPEC.md](SPEC.md)** — the north star. Describes what this service should
+   be. All new features must be spec'ed here first. If your change contradicts
+   the spec, either update the spec first (with user approval) or change your
+   approach. Implementation is downstream from the spec.
+2. **[docs/domain.md](docs/domain.md)** — naming conventions and domain
+   terminology. All code must use the names defined here. If a name isn't in
+   this doc, check existing code for precedent before inventing one.
+
+**Read when relevant** to your task:
+
+- [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
+  `::random()`, mocks, encoding, compile-time macros
+- [docs/cqrs.md](docs/cqrs.md) - CQRS/ES patterns (upcasters, views, replay,
+  services)
+
+**Update at the end:**
+
+- **README.md** — if project structure, features, commands, or architecture
+  changed
+- **ROADMAP.md** — mark completed issues, link PRs
+
 ## Ownership Principles
 
 **CRITICAL: Take full ownership. Never deflect responsibility.**
@@ -21,6 +46,10 @@ the limit:
   ENTIRE file meets the limit, not just your additions.
 - **No warnings or errors pass through** - CI and review catch everything. If
   you see a warning/error, it's your responsibility to fix it now.
+- **Work until all tasks are complete** - do not stop until every assigned task
+  is done, unless you need input from the user to proceed. If blocked on one
+  task, move to the next. Only stop working when the task list is clear or you
+  genuinely cannot proceed without user input.
 
 ## Communication
 
@@ -305,8 +334,8 @@ For detailed implementation requirements and module organization, see
 **Trade Conversion Logic ([`Trade` struct and methods in `src/trade/mod.rs`])**
 
 - Parses onchain events into actionable trade data with strict validation
-- Expects symbol pairs of USDC + tokenized equity with "0x" suffix (e.g.,
-  "AAPL0x")
+- Expects symbol pairs of USDC + tokenized equity with "t" prefix (e.g.,
+  "tAAPL")
 - Determines Schwab trade direction: buying tokenized equity onchain → selling
   on Schwab
 - Calculates prices in cents and maintains onchain/offchain trade ratios
@@ -352,8 +381,14 @@ tracking (pending → completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
-All configuration is via TOML files passed with `--config-file`. See
-`example.toml` for available options.
+Configuration is split into plaintext config (`--config`, see
+`example.config.toml`) and encrypted secrets (`--secrets`, see
+`example.secrets.toml`). The reporter binary only takes `--config` (no secrets).
+
+### Naming Conventions
+
+Code names must be consistent with **[docs/domain.md](docs/domain.md)**, which
+is the source of truth for terminology and naming conventions.
 
 ### Code Quality & Best Practices
 
@@ -380,8 +415,8 @@ All configuration is via TOML files passed with `--config-file`. See
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and
   authentication tokens
-- **Symbol Suffix Convention**: Tokenized equities use "0x" suffix to
-  distinguish from base assets
+- **Symbol Prefix Convention**: Tokenized equities use "t" prefix to distinguish
+  from base assets (e.g., tAAPL, tTSLA, tSPYM)
 - **Price Direction Logic**: Onchain buy = offchain sell (and vice versa) to
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
@@ -449,22 +484,25 @@ All configuration is via TOML files passed with `--config-file`. See
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
   braces jumping between blocks and for easier reading
-- **CRITICAL: Import Organization**: Follow a consistent two-group import
+- **CRITICAL: Import Organization**: Follow a consistent three-group import
   pattern throughout the codebase:
   - **Group 1 - External imports**: All imports from external crates including
-    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines between
-    external imports.
-  - **Empty line separating the groups**
-  - **Group 2 - Internal imports**: All imports from our codebase using
-    `crate::` and `super::`. No empty lines between internal imports.
-  - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
-    within a group
+    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines within.
+  - **Empty line**
+  - **Group 2 - Workspace imports**: Imports from other workspace crates
+    (`st0x_execution`). No empty lines within.
+  - **Empty line**
+  - **Group 3 - Crate-internal imports**: Imports using `crate::` and `super::`.
+    No empty lines within.
+  - Groups 2 or 3 may be absent if unused; never add an empty group
+  - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
+    **Sole exception**: enum variant imports (`use MyEnum::*` or
+    `use MyEnum::{A, B, C}`) inside function bodies to avoid repetitive
+    qualification. Enum variant imports are never allowed at module level.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
-  - Example: `use std::sync::Arc; use alloy::primitives::Address;` [blank line]
-    `use crate::foo::Bar; use super::Baz;`
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
   module is clear (e.g. use `info!` instead of `tracing::info!`). Never use
@@ -481,6 +519,13 @@ All configuration is via TOML files passed with `--config-file`. See
   - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
   - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
     interpolation
+  - **FORBIDDEN**: Using `format!()` to convert typed values into String fields
+    in error variants (e.g., `format!("{side:?}")`) - store the actual typed
+    value instead
+  - **FORBIDDEN**: Unpacking newtypes into their inner type to store in error
+    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`, not
+    `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
+    representation. Never discard type safety by extracting inner values.
   - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
     preserve all type information
   - **REQUIRED**: Each error variant must preserve the complete error chain with
@@ -550,30 +595,10 @@ Unauthorized access to secrets can lead to:
 - Financial losses
 - Security breaches
 
-#### Files That Require Explicit Permission
-
-The following files MUST NOT be read without explicit user permission:
-
-- `.env` - Environment variables containing API keys, secrets, and credentials
-- `.env.*` - Environment-specific configuration files (`.env.local`,
-  `.env.production`, etc.)
-- `credentials.json` - Credential storage files
-- `*.key`, `*.pem` - Private keys and certificates
-- `*.p12`, `*.pfx` - Certificate bundles
-- Database files containing sensitive data (unless necessary for debugging with
-  permission)
-- Any file that may contain API keys, tokens, passwords, or other secrets
-
-#### Required Practice
-
-**Before reading any file that may contain secrets:**
-
-1. **Ask the user explicitly** for permission to read the file
-2. **Explain why** you need to read it
-3. **Wait for confirmation** before proceeding
-
-**Alternatives**: Ask user to verify env vars are set, request sanitized output,
-check `.env.example` instead of `.env`, or review code that uses configuration.
+**Protected files** (require explicit permission): `.env*`, `credentials.json`,
+`*.key`, `*.pem`, `*.p12`, `*.pfx`, database files with sensitive data. Ask
+permission, explain why, wait for confirmation. Prefer `.env.example` or
+reviewing code that uses configuration instead of reading secrets directly.
 
 ### Testing Strategy
 
@@ -612,13 +637,9 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
 
 #### Writing Meaningful Tests
 
-Tests should verify our application logic, not just language features. Avoid
-tests that only exercise struct construction or field access without testing any
-business logic.
-
-❌ Bad: Testing struct field assignments (just tests Rust, not our code). ✅
-Good: Testing actual business logic like `config.calculate_next_poll_delay()`
-returning values within expected bounds.
+Tests must verify application logic, not language features. Testing struct field
+assignments is useless; test actual behavior like
+`config.calculate_next_poll_delay()` returning expected values.
 
 ### Workflow Best Practices
 
@@ -631,6 +652,11 @@ returning values within expected bounds.
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
+- **CRITICAL: Do NOT run clippy until ALL substantive work is done.** Clippy is
+  a polish step. Running it while tasks remain open is wasted effort -
+  subsequent code changes will introduce new lint issues. Complete every task on
+  the list first (`cargo check` + `cargo test` passing), then run clippy as a
+  final pass before handing over.
 
 #### CRITICAL: Lint Policy
 
@@ -688,47 +714,17 @@ that cannot be expressed through code structure alone.
   without access to your internal state. If the code needs explanation, explain
   WHAT it does and WHY - not which task number led to writing it.
 
-#### Good Comment Examples
+#### Examples
 
-```rust
-// If the on-chain order has USDC as input and an 0x tokenized stock as
-// output then it means the order received USDC and gave away an 0x  
-// tokenized stock, i.e. sold, which means that to take the opposite
-// trade in schwab we need to buy and vice versa.
-let (schwab_ticker, schwab_instruction) = 
-    if onchain_input_symbol == "USDC" && onchain_output_symbol.ends_with("0x") {
-        // ... complex mapping logic
-    }
+Good: explaining non-obvious business logic ("USDC input + t-prefix output means
+the order sold tokenized equity, so hedge by buying on Schwab"), test data
+context ("9 shares with 18 decimal places"), or external system constraints
+("ClearV2 doesn't contain amounts, so query AfterClear").
 
-// We need to get the corresponding AfterClear event as ClearV2 doesn't
-// contain the amounts. So we query the same block number, filter out
-// logs with index lower than the ClearV2 log index and with tx hashes
-// that don't match the ClearV2 tx hash.
-let after_clear_logs = provider.get_logs(/* ... */).await?;
+Bad: restating what code does (`// Store test tokens`), redundant with function
+name, test section markers (`// 1. Test token refresh`).
 
-// Test data representing 9 shares with 18 decimal places
-alice_output: U256::from_str("9000000000000000000").unwrap(), // 9 shares (18 dps)
-
-/// Helper that converts a fixed-decimal `U256` amount into an `f64` using
-/// the provided number of decimals.
-///
-/// NOTE: Parsing should never fail but precision may be lost.
-fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
-```
-
-#### Bad Comment Examples
-
-```rust
-// ❌ Redundant - function name says this: spawn_automatic_token_refresh(pool, env);
-// ❌ Obvious from context: // Store test tokens
-// ❌ Test section markers: // 1. Test token refresh integration
-```
-
-#### Comment Maintenance
-
-Use `///` doc comments for public APIs. Remove/update comments when refactoring.
-If a comment is needed to explain what code does, consider refactoring instead.
-Keep comments focused on "why" rather than "what".
+Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 ### Code style
 
@@ -737,62 +733,74 @@ Keep comments focused on "why" rather than "what".
 Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
 Unicode breaks vim navigation and grep workflows.
 
+#### No single-letter variables or arguments
+
+Single-letter names (`e`, `x`, `n`, `s`, etc.) are **FORBIDDEN** everywhere -
+variables, function arguments, closure parameters, generic type params in
+function signatures. Always use descriptive names. The only exception is
+conventional iterator variables in very short closures where the type makes the
+meaning unambiguous (e.g., `|event| event.payload`), but even then prefer a
+descriptive name.
+
 #### Module Organization
 
-Organize code within modules by importance and visibility:
+Organize code within modules by importance to the reader, not by when it was
+added. Public API first, then private implementation, then tests. A reader
+should understand what a module provides and how to use it before encountering
+implementation details.
 
-- **Public API first**: Place public functions, types, and traits at the top of
-  the module where they are immediately visible to consumers
-- **Private helpers below public code**: Place private helper functions, types,
-  and traits immediately after the public code that uses them
-- **Implementation blocks next to type definitions**: Place `impl` blocks after
-  the type definition
+**Module docstrings**: Every module should have a `//!` docstring explaining
+what it provides. This makes it obvious what parts of the module are most
+important (and should be placed higher up) while also helping identify when
+something doesn't belong in the module and should be moved elsewhere.
 
-This organization pattern makes the module's public interface clear at a glance
-and keeps implementation details appropriately subordinate.
+**Determining importance**: What a module _does_ (types consumers use, functions
+they call) matters more than what _supports_ it (error types, internal helpers,
+private traits). If code A uses code B, then A is more important than B -
+because B exists to serve A, not the other way around. For example, a function
+that can fail is more important than the error type it returns, since the error
+type is a byproduct of the function's implementation.
 
-**Example:** Public types first -> impl blocks -> public functions -> private
-helpers.
+#### Line width in docstrings and macros
 
-This pattern applies across the entire workspace, including both the main crate
-and sub-crates like `st0x-execution`.
+All doc comments (`//!` and `///`) and long strings inside attribute macros
+(e.g., `#[error(...)]`) must not exceed 100 characters per line. `cargo fmt`
+does not enforce this (without nightly rustfmt), so be careful and check
+manually.
 
-#### Use `.unwrap` over boolean result assertions in tests
+For multi-line `#[error]` strings, use `\` continuation:
 
-Instead of `assert!(result.is_err()); assert!(matches!(...))`, write
-`assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));` directly.
-Similarly, instead of `assert!(result.is_ok()); assert_eq!(...)`, write
-`assert_eq!(result.unwrap(), "expected_value");` so unexpected values are shown.
+```rust
+#[error(
+    "Expected IO to contain USDC and one tokenized equity \
+     (t prefix) but got {0} and {1}"
+)]
+```
+
+#### Never use `is_err()`/`is_ok()` assertions in tests
+
+`assert!(result.is_err())` is never acceptable - every error test must verify
+the exact error variant:
+
+```rust
+// FORBIDDEN: doesn't check which error
+assert!(result.is_err());
+
+// REQUIRED: unwrap first, then assert the exact variant
+let error = result.unwrap_err();
+assert!(matches!(error, SomeError::SpecificVariant { .. }));
+```
+
+`assert!(result.is_ok())` is equally bad - just call `.unwrap()`.
+
+**FORBIDDEN**: `assert!(x.is_err())`, `assert!(x.is_ok())`
 
 #### Assertions must be specific
 
-Test assertions must check for the exact expected behavior, not vague
-alternatives. Never use `||` in assertions to accept multiple possible outcomes
-unless those outcomes are genuinely equivalent.
-
-```rust
-// ❌ BAD - Lazy, accepts vaguely similar outcomes
-assert!(
-    output.contains("Failed") || output.contains("❌"),
-    "Output should indicate failure"
-);
-
-// ❌ BAD - Too permissive, doesn't verify actual behavior
-assert!(result.is_some());
-
-// ✅ GOOD - Checks for exact expected output
-assert!(
-    output.contains("❌ Failed to place order"),
-    "Expected failure message, got: {output}"
-);
-
-// ✅ GOOD - Verifies specific value
-assert_eq!(result.unwrap().order_id, "12345");
-```
-
-If you find yourself writing `||` in an assertion, ask: are these outcomes
-actually equivalent? If not, you probably don't understand what the code should
-do, and need to investigate before writing the test.
+Check for exact expected behavior. Never use `||` in assertions to accept
+multiple outcomes unless genuinely equivalent. Use `assert_eq!` with specific
+values, not `assert!(result.is_some())`. If writing `||` in an assertion, you
+likely don't understand the expected behavior - investigate first.
 
 #### Type modeling examples
 
@@ -802,73 +810,20 @@ enums, newtypes, or other constructs best represent the concept at hand.
 
 ##### Make invalid states unrepresentable:
 
-Instead of using multiple fields that can contradict each other:
-
-```rust
-// ❌ Bad: Multiple fields can be in invalid combinations
-pub struct Order {
-    pub status: String,  // "pending", "completed", "failed"
-    pub order_id: Option<String>,  // Some when completed, None when pending
-    pub executed_at: Option<DateTime<Utc>>,  // Some when completed
-    pub price_cents: Option<i64>,  // Some when completed
-    pub error_reason: Option<String>,  // Some when failed
-}
-```
-
-Use enum variants to encode valid states:
-
-```rust
-// ✅ Good: Each state has exactly the data it needs
-pub enum OrderStatus {
-    Pending,
-    Completed {
-        order_id: String,
-        executed_at: DateTime<Utc>,
-        price_cents: i64,
-    },
-    Failed {
-        failed_at: DateTime<Utc>,
-        error_reason: String,
-    },
-}
-```
+Instead of multiple optional fields that can contradict each other (e.g.,
+`status: String` + `order_id: Option<String>` + `error_reason: Option<String>`),
+use enum variants where each state carries exactly the data it needs.
 
 ##### Use newtypes for domain concepts:
 
-```rust
-// ❌ Bad: Easy to mix up parameters of the same type
-fn place_order(symbol: String, account: String, amount: i64, price: i64) { }
-
-// ✅ Good: Type system prevents mixing incompatible values
-#[derive(Debug, Clone)]
-struct Symbol(String);
-
-#[derive(Debug, Clone)]
-struct AccountId(String);
-
-#[derive(Debug)]
-struct Shares(i64);
-
-#[derive(Debug)]
-struct PriceCents(i64);
-
-fn place_order(symbol: Symbol, account: AccountId, amount: Shares, price: PriceCents) { }
-```
+Wrap primitives in newtypes to prevent mixing incompatible values at call sites
+(e.g., `Symbol(String)`, `AccountId(String)`, `Shares(i64)`, `PriceCents(i64)`).
 
 ##### The Typestate Pattern:
 
-Encodes runtime state in compile-time types, eliminating runtime checks.
-
-```rust
-// ✅ Good: State transitions enforced at compile time
-struct Task<State> { data: TaskData, state: State }
-impl Task<Start> { fn begin(self) -> Task<InProgress> { ... } }
-impl Task<InProgress> { fn complete(self) -> Task<Complete> { ... } }
-```
-
-Use typestate for protocol enforcement (`Connection<Unauthenticated>` →
-`Connection<Authenticated>`) and builder patterns (`RequestBuilder<NoUrl>` →
-`RequestBuilder<HasUrl>`).
+Encode runtime state in compile-time types to eliminate runtime checks. Use for
+protocol enforcement and builder patterns (e.g., `Connection<Unauthenticated>`
+-> `Connection<Authenticated>`).
 
 #### Avoid deep nesting
 
@@ -878,35 +833,10 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 ##### Techniques for flat code:
 
-```rust
-// ❌ Nested: if let Some(data) = data { if !data.is_empty() { if data.len() > 5 { ... } } }
-// ✅ Flat with early returns:
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    let data = data.ok_or(Error::None)?;
-    if data.is_empty() { return Err(Error::Empty); }
-    if data.len() <= 5 { return Err(Error::TooShort); }
-    Ok(data.to_uppercase())
-}
-```
-
-##### Use let-else pattern for guard clauses:
-
-```rust
-// Use let-else to flatten nested if-let chains
-let Some(trade_data) = convert_event_to_trade(event) else {
-    return Err(Error::ConversionFailed);
-};
-let Some(symbol) = trade_data.extract_symbol() else {
-    return Err(Error::NoSymbol);
-};
-```
-
-##### Use pattern matching with guards:
-
-```rust
-// ❌ Nested if-let: if let Some(data) = input { if state == Ready && data.is_valid() { ... } }
-// ✅ Pattern match: match (input, state) { (Some(d), Ready) if d.is_valid() => process(d), ... }
-```
+- **Early returns** with `?` and `return Err(...)` instead of nested `if let`
+- **let-else** for guard clauses:
+  `let Some(value) = expr else { return Err(...); };`
+- **Pattern matching with guards** instead of nested `if let` chains
 
 #### Struct field access
 
@@ -917,3 +847,11 @@ Use struct literal syntax directly (`SchwabTokens { access_token: "...", ... }`)
 and access fields directly (`tokens.access_token`). Don't create `fn new()`
 constructors or `fn field(&self)` getters unless they add meaningful logic
 beyond setting/getting field values.
+
+#### No one-liner helpers
+
+If a helper function's body is a single expression, it's useless indirection --
+just inline the call. A function that only wraps another function call adds a
+name to learn and a place to jump to without reducing complexity. Helpers earn
+their existence by encapsulating multi-step logic, not by renaming a single
+operation.

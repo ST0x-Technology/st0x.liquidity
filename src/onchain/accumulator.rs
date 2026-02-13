@@ -1,10 +1,11 @@
 use sqlx::SqlitePool;
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 use tracing::{debug, info};
 
-use crate::error::OnChainError;
-use crate::position::{PositionQuery, load_position};
-use crate::threshold::ExecutionThreshold;
+use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+
+use crate::event_sourced::SqliteQuery;
+use crate::onchain::OnChainError;
+use crate::position::{Position, load_position};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionParams {
@@ -21,18 +22,16 @@ pub(crate) struct ExecutionParams {
 /// pending executions — `is_ready_for_execution` returns `None` if one
 /// is already in flight.
 pub(crate) async fn check_execution_readiness(
-    position_query: &PositionQuery,
+    position_query: &SqliteQuery<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
-    threshold: &ExecutionThreshold,
 ) -> Result<Option<ExecutionParams>, OnChainError> {
     let Some(position) = load_position(position_query, symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };
 
-    let Some((direction, shares)) = position.is_ready_for_execution(executor_type, threshold)?
-    else {
+    let Some((direction, shares)) = position.is_ready_for_execution(executor_type)? else {
         debug!(
             symbol = %symbol,
             net = %position.net,
@@ -70,9 +69,8 @@ pub(crate) async fn check_execution_readiness(
 )]
 pub(crate) async fn check_all_positions(
     pool: &SqlitePool,
-    position_query: &PositionQuery,
+    position_query: &SqliteQuery<Position>,
     executor_type: SupportedExecutor,
-    threshold: &ExecutionThreshold,
 ) -> Result<Vec<ExecutionParams>, OnChainError> {
     let symbols = sqlx::query_scalar!("SELECT symbol FROM position_view WHERE symbol IS NOT NULL")
         .fetch_all(pool)
@@ -84,7 +82,7 @@ pub(crate) async fn check_all_positions(
         let symbol = Symbol::new(&symbol_str)?;
 
         if let Some(params) =
-            check_execution_readiness(position_query, &symbol, executor_type, threshold).await?
+            check_execution_readiness(position_query, &symbol, executor_type).await?
         {
             ready.push(params);
         }
@@ -101,67 +99,70 @@ pub(crate) async fn check_all_positions(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use alloy::primitives::TxHash;
     use cqrs_es::persist::GenericQuery;
     use rust_decimal_macros::dec;
     use sqlite_es::SqliteViewRepository;
     use sqlx::SqlitePool;
-    use st0x_execution::{FractionalShares, Positive, SupportedExecutor, Symbol};
+    use std::sync::Arc;
+
+    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
     use super::*;
-    use crate::position::{Position, PositionCommand, PositionCqrs, PositionQuery};
+    use crate::event_sourced::Store;
+    use crate::position::{Position, PositionCommand};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
 
-    fn create_test_position_infra(pool: &SqlitePool) -> (PositionCqrs, PositionQuery) {
+    fn create_test_position_infra(pool: &SqlitePool) -> (Store<Position>, SqliteQuery<Position>) {
         let view_repo = Arc::new(SqliteViewRepository::new(
             pool.clone(),
             "position_view".to_string(),
         ));
         let position_query = GenericQuery::new(view_repo.clone());
-        let position_cqrs: PositionCqrs = sqlite_es::sqlite_cqrs(
+        let position_store = crate::conductor::wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),
         );
-        (position_cqrs, position_query)
+        (position_store, position_query)
     }
 
     async fn initialize_position_with_fill(
-        cqrs: &PositionCqrs,
+        store: &Store<Position>,
         symbol: &Symbol,
         amount: FractionalShares,
-        direction: st0x_execution::Direction,
+        direction: Direction,
     ) {
-        cqrs.execute(
-            &Position::aggregate_id(symbol),
-            PositionCommand::AcknowledgeOnChainFill {
-                trade_id: crate::position::TradeId {
-                    tx_hash: alloy::primitives::TxHash::random(),
-                    log_index: 1,
+        store
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: crate::position::TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount,
+                    direction,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
                 },
-                amount,
-                direction,
-                price_usdc: dec!(150.0),
-                block_timestamp: chrono::Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn check_execution_readiness_returns_none_when_no_position() {
         let pool = setup_test_db().await;
-        let (_cqrs, query) = create_test_position_infra(&pool);
-        let threshold = ExecutionThreshold::whole_share();
+        let (_store, query) = create_test_position_infra(&pool);
 
         let result = check_execution_readiness(
             &query,
             &Symbol::new("AAPL").unwrap(),
             SupportedExecutor::Schwab,
-            &threshold,
         )
         .await
         .unwrap();
@@ -172,22 +173,20 @@ mod tests {
     #[tokio::test]
     async fn check_execution_readiness_returns_none_below_threshold() {
         let pool = setup_test_db().await;
-        let (cqrs, query) = create_test_position_infra(&pool);
+        let (store, query) = create_test_position_infra(&pool);
         let symbol = Symbol::new("AAPL").unwrap();
-        let threshold = ExecutionThreshold::whole_share();
 
         initialize_position_with_fill(
-            &cqrs,
+            &store,
             &symbol,
             FractionalShares::new(dec!(0.5)),
-            st0x_execution::Direction::Buy,
+            Direction::Buy,
         )
         .await;
 
-        let result =
-            check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab, &threshold)
-                .await
-                .unwrap();
+        let result = check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab)
+            .await
+            .unwrap();
 
         assert!(result.is_none());
     }
@@ -195,23 +194,21 @@ mod tests {
     #[tokio::test]
     async fn check_execution_readiness_returns_params_above_threshold() {
         let pool = setup_test_db().await;
-        let (cqrs, query) = create_test_position_infra(&pool);
+        let (store, query) = create_test_position_infra(&pool);
         let symbol = Symbol::new("AAPL").unwrap();
-        let threshold = ExecutionThreshold::whole_share();
 
         initialize_position_with_fill(
-            &cqrs,
+            &store,
             &symbol,
             FractionalShares::new(dec!(1.5)),
-            st0x_execution::Direction::Buy,
+            Direction::Buy,
         )
         .await;
 
-        let params =
-            check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab, &threshold)
-                .await
-                .unwrap()
-                .expect("should be ready for execution");
+        let params = check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab)
+            .await
+            .unwrap()
+            .expect("should be ready for execution");
 
         assert_eq!(params.symbol, symbol);
         assert_eq!(
@@ -221,7 +218,7 @@ mod tests {
         );
         assert_eq!(
             params.direction,
-            st0x_execution::Direction::Sell,
+            Direction::Sell,
             "Positive net (long) -> sell offchain to hedge"
         );
     }
@@ -229,31 +226,30 @@ mod tests {
     #[tokio::test]
     async fn check_all_positions_finds_ready_symbols() {
         let pool = setup_test_db().await;
-        let (cqrs, query) = create_test_position_infra(&pool);
-        let threshold = ExecutionThreshold::whole_share();
+        let (store, query) = create_test_position_infra(&pool);
 
         let aapl = Symbol::new("AAPL").unwrap();
         let msft = Symbol::new("MSFT").unwrap();
 
         // AAPL: below threshold
         initialize_position_with_fill(
-            &cqrs,
+            &store,
             &aapl,
             FractionalShares::new(dec!(0.3)),
-            st0x_execution::Direction::Buy,
+            Direction::Buy,
         )
         .await;
 
         // MSFT: above threshold
         initialize_position_with_fill(
-            &cqrs,
+            &store,
             &msft,
             FractionalShares::new(dec!(2.0)),
-            st0x_execution::Direction::Sell,
+            Direction::Sell,
         )
         .await;
 
-        let ready = check_all_positions(&pool, &query, SupportedExecutor::Schwab, &threshold)
+        let ready = check_all_positions(&pool, &query, SupportedExecutor::Schwab)
             .await
             .unwrap();
 
@@ -265,7 +261,7 @@ mod tests {
         );
         assert_eq!(
             ready[0].direction,
-            st0x_execution::Direction::Buy,
+            Direction::Buy,
             "Negative net (short) -> buy offchain to hedge"
         );
     }

@@ -26,7 +26,10 @@ impl std::fmt::Display for OrderStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseOrderStatusError {
-    #[error("Invalid order status: '{0}'. Expected one of: PENDING, SUBMITTED, FILLED, FAILED")]
+    #[error(
+        "Invalid order status: '{0}'. Expected one of: \
+         PENDING, SUBMITTED, FILLED, FAILED"
+    )]
     InvalidStatus(String),
 }
 
@@ -41,5 +44,46 @@ impl std::str::FromStr for OrderStatus {
             "FAILED" => Ok(Self::Failed),
             _ => Err(ParseOrderStatusError::InvalidStatus(s.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn serde_round_trip() {
+        for status in [
+            OrderStatus::Pending,
+            OrderStatus::Submitted,
+            OrderStatus::Filled,
+            OrderStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let deserialized: OrderStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, deserialized, "round-trip failed for {status}");
+        }
+    }
+
+    #[test]
+    fn display_from_str_round_trip() {
+        for status in [
+            OrderStatus::Pending,
+            OrderStatus::Submitted,
+            OrderStatus::Filled,
+            OrderStatus::Failed,
+        ] {
+            let displayed = status.to_string();
+            let parsed = OrderStatus::from_str(&displayed).unwrap();
+            assert_eq!(status, parsed, "round-trip failed for {displayed}");
+        }
+    }
+
+    #[test]
+    fn from_str_invalid() {
+        let err = OrderStatus::from_str("UNKNOWN").unwrap_err();
+        assert!(matches!(err, ParseOrderStatusError::InvalidStatus(s) if s == "UNKNOWN"));
     }
 }

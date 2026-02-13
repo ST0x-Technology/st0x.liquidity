@@ -1,32 +1,54 @@
+//! Polls broker APIs for order status updates and reconciles fills.
+
 use num_traits::ToPrimitive;
 use rand::Rng;
-use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_execution::{
-    ArithmeticError, Executor, ExecutorOrderId, FractionalShares, OrderState, OrderStatus, Symbol,
-};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
-use super::execution::find_executions_by_symbol_status_and_broker;
-use crate::error::OrderPollingError;
-use crate::lifecycle::Lifecycle;
-use crate::offchain_order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId, PriceCents,
+use st0x_execution::{
+    ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
+
+use super::execution::find_orders_by_status;
+use crate::event_sourced::{SendError, Store};
+use crate::lifecycle::Lifecycle;
+use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, PriceCents};
+use crate::onchain::OnChainError;
 use crate::position::{Position, PositionCommand};
 
-type PositionCqrs = SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>;
+/// Order polling errors for order status monitoring.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OrderPollingError {
+    #[error("Executor error: {0}")]
+    Executor(Box<dyn std::error::Error + Send + Sync>),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] PersistenceError),
+    #[error("Onchain error: {0}")]
+    OnChain(#[from] OnChainError),
+    #[error("Offchain order aggregate error: {0}")]
+    OffchainOrderAggregate(#[from] SendError<OffchainOrder>),
+    #[error("Position aggregate error: {0}")]
+    PositionAggregate(#[from] SendError<Position>),
+}
+
+impl From<ExecutionError> for OrderPollingError {
+    fn from(err: ExecutionError) -> Self {
+        Self::Executor(Box::new(err))
+    }
+}
 
 #[derive(Debug, Clone)]
-pub struct OrderPollerConfig {
+pub struct OrderPollerCtx {
     pub polling_interval: Duration,
     pub max_jitter: Duration,
 }
 
-impl Default for OrderPollerConfig {
+impl Default for OrderPollerCtx {
     fn default() -> Self {
         Self {
             polling_interval: Duration::from_secs(15),
@@ -36,45 +58,45 @@ impl Default for OrderPollerConfig {
 }
 
 pub struct OrderStatusPoller<E: Executor> {
-    config: OrderPollerConfig,
+    ctx: OrderPollerCtx,
     pool: SqlitePool,
     interval: Interval,
     executor: E,
-    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-    position_cqrs: Arc<PositionCqrs>,
+    offchain_order: Arc<Store<OffchainOrder>>,
+    position: Arc<Store<Position>>,
 }
 
 impl<E: Executor> OrderStatusPoller<E> {
     pub fn new(
-        config: OrderPollerConfig,
+        ctx: OrderPollerCtx,
         pool: SqlitePool,
         executor: E,
-        offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-        position_cqrs: Arc<PositionCqrs>,
+        offchain_order: Arc<Store<OffchainOrder>>,
+        position: Arc<Store<Position>>,
     ) -> Self {
-        let interval = interval(config.polling_interval);
+        let interval = interval(ctx.polling_interval);
 
         Self {
-            config,
+            ctx,
             pool,
             interval,
             executor,
-            offchain_order_cqrs,
-            position_cqrs,
+            offchain_order,
+            position,
         }
     }
 
     pub async fn run(mut self) -> Result<(), OrderPollingError> {
         info!(
             "Starting order status poller with interval: {:?}",
-            self.config.polling_interval
+            self.ctx.polling_interval
         );
 
         loop {
             self.interval.tick().await;
 
-            if let Err(e) = self.poll_pending_orders().await {
-                error!("Polling cycle failed: {e}");
+            if let Err(error) = self.poll_pending_orders().await {
+                error!("Polling cycle failed: {error}");
             }
         }
     }
@@ -84,13 +106,17 @@ impl<E: Executor> OrderStatusPoller<E> {
         debug!("Starting polling cycle for submitted orders");
 
         let executor_type = self.executor.to_supported_executor();
-        let submitted_executions = find_executions_by_symbol_status_and_broker(
-            &self.pool,
-            None,
-            OrderStatus::Submitted,
-            Some(executor_type),
-        )
-        .await?;
+        let submitted_executions: Vec<_> =
+            find_orders_by_status(&self.pool, OrderStatus::Submitted)
+                .await?
+                .into_iter()
+                .filter(|(_, lifecycle)| {
+                    lifecycle
+                        .live()
+                        .map(|order| order.executor() == executor_type)
+                        .unwrap_or(false)
+                })
+                .collect();
 
         if submitted_executions.is_empty() {
             debug!("No submitted orders to poll");
@@ -105,8 +131,8 @@ impl<E: Executor> OrderStatusPoller<E> {
                 continue;
             };
 
-            if let Err(e) = self.poll_execution_status(*offchain_order_id, order).await {
-                error!("Failed to poll execution {offchain_order_id}: {e}");
+            if let Err(error) = self.poll_execution_status(*offchain_order_id, order).await {
+                error!("Failed to poll execution {offchain_order_id}: {error}");
             }
 
             self.add_jittered_delay().await;
@@ -135,13 +161,13 @@ impl<E: Executor> OrderStatusPoller<E> {
         let parsed_order_id = self
             .executor
             .parse_order_id(executor_order_id.as_ref())
-            .map_err(|e| OrderPollingError::Executor(Box::new(e)))?;
+            .map_err(|error| OrderPollingError::Executor(Box::new(error)))?;
 
         let order_state = self
             .executor
             .get_order_status(&parsed_order_id)
             .await
-            .map_err(|e| OrderPollingError::Executor(Box::new(e)))?;
+            .map_err(|error| OrderPollingError::Executor(Box::new(error)))?;
 
         match &order_state {
             OrderState::Filled {
@@ -194,7 +220,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         );
 
         self.complete_offchain_order_fill(offchain_order_id, price_cents)
-            .await;
+            .await?;
 
         self.complete_position_order(
             offchain_order_id,
@@ -203,29 +229,21 @@ impl<E: Executor> OrderStatusPoller<E> {
             executor_order_id,
             broker_timestamp,
         )
-        .await;
-
-        Ok(())
+        .await
     }
 
     async fn complete_offchain_order_fill(
         &self,
         offchain_order_id: OffchainOrderId,
         price_cents: PriceCents,
-    ) {
-        let offchain_aggregate_id = offchain_order_id.to_string();
-        if let Err(e) = self
-            .offchain_order_cqrs
-            .execute(
-                &offchain_aggregate_id,
+    ) -> Result<(), OrderPollingError> {
+        self.offchain_order
+            .send(
+                &offchain_order_id,
                 OffchainOrderCommand::CompleteFill { price_cents },
             )
-            .await
-        {
-            error!(
-                "Failed to execute OffchainOrder::CompleteFill for execution {offchain_order_id}: {e}"
-            );
-        }
+            .await?;
+        Ok(())
     }
 
     async fn complete_position_order(
@@ -235,13 +253,11 @@ impl<E: Executor> OrderStatusPoller<E> {
         price_cents: PriceCents,
         executor_order_id: &ExecutorOrderId,
         broker_timestamp: chrono::DateTime<chrono::Utc>,
-    ) {
+    ) -> Result<(), OrderPollingError> {
         let symbol = order.symbol();
-        let position_aggregate_id = Position::aggregate_id(symbol);
-        if let Err(e) = self
-            .position_cqrs
-            .execute(
-                &position_aggregate_id,
+        self.position
+            .send(
+                symbol,
                 PositionCommand::CompleteOffChainOrder {
                     offchain_order_id,
                     shares_filled: order.shares(),
@@ -251,12 +267,8 @@ impl<E: Executor> OrderStatusPoller<E> {
                     broker_timestamp,
                 },
             )
-            .await
-        {
-            error!(
-                "Failed to execute Position::CompleteOffChainOrder for execution {offchain_order_id}, symbol {symbol}: {e}"
-            );
-        }
+            .await?;
+        Ok(())
     }
 
     async fn handle_failed_order(
@@ -274,34 +286,26 @@ impl<E: Executor> OrderStatusPoller<E> {
         );
 
         self.mark_offchain_order_failed(offchain_order_id, &error_message)
-            .await;
+            .await?;
 
         self.fail_position_order(offchain_order_id, symbol, error_message)
-            .await;
-
-        Ok(())
+            .await
     }
 
     async fn mark_offchain_order_failed(
         &self,
         offchain_order_id: OffchainOrderId,
         error_message: &str,
-    ) {
-        let offchain_aggregate_id = offchain_order_id.to_string();
-        if let Err(e) = self
-            .offchain_order_cqrs
-            .execute(
-                &offchain_aggregate_id,
+    ) -> Result<(), OrderPollingError> {
+        self.offchain_order
+            .send(
+                &offchain_order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: error_message.to_owned(),
                 },
             )
-            .await
-        {
-            error!(
-                "Failed to execute OffchainOrder::MarkFailed for execution {offchain_order_id}: {e}"
-            );
-        }
+            .await?;
+        Ok(())
     }
 
     async fn fail_position_order(
@@ -309,28 +313,22 @@ impl<E: Executor> OrderStatusPoller<E> {
         offchain_order_id: OffchainOrderId,
         symbol: &Symbol,
         error_message: String,
-    ) {
-        let position_aggregate_id = Position::aggregate_id(symbol);
-        if let Err(e) = self
-            .position_cqrs
-            .execute(
-                &position_aggregate_id,
+    ) -> Result<(), OrderPollingError> {
+        self.position
+            .send(
+                symbol,
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id,
                     error: error_message,
                 },
             )
-            .await
-        {
-            error!(
-                "Failed to execute Position::FailOffChainOrder for execution {offchain_order_id}, symbol {symbol}: {e}"
-            );
-        }
+            .await?;
+        Ok(())
     }
 
     async fn add_jittered_delay(&self) {
-        if self.config.max_jitter > Duration::ZERO {
-            let max_jitter_u128 = self.config.max_jitter.as_millis().min(u128::from(u64::MAX));
+        if self.ctx.max_jitter > Duration::ZERO {
+            let max_jitter_u128 = self.ctx.max_jitter.as_millis().min(u128::from(u64::MAX));
             let max_jitter_millis = max_jitter_u128.to_u64().unwrap_or(u64::MAX);
             let jitter_millis = rand::thread_rng().gen_range(0..max_jitter_millis);
             let jitter = Duration::from_millis(jitter_millis);
@@ -343,39 +341,41 @@ impl<E: Executor> OrderStatusPoller<E> {
 mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use sqlite_es::sqlite_cqrs;
+    use rust_decimal_macros::dec;
+
     use st0x_execution::{
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
-    fn create_test_frameworks(pool: &SqlitePool) -> (Arc<OffchainOrderCqrs>, Arc<PositionCqrs>) {
+    fn create_test_frameworks(
+        pool: &SqlitePool,
+    ) -> (Arc<Store<OffchainOrder>>, Arc<Store<Position>>) {
         (
-            Arc::new(sqlite_cqrs(
+            Arc::new(test_cqrs(
                 pool.clone(),
                 vec![],
                 crate::offchain_order::noop_order_placer(),
             )),
-            Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            Arc::new(test_cqrs(pool.clone(), vec![], ())),
         )
     }
 
     async fn setup_position_with_onchain_fill(
-        position_cqrs: &PositionCqrs,
+        position_store: &Store<Position>,
         symbol: &Symbol,
         tokenized_symbol: &str,
-        amount: f64,
+        amount: Decimal,
     ) {
-        let aggregate_id = Position::aggregate_id(symbol);
-
         let mut onchain_trade = OnchainTradeBuilder::new()
             .with_symbol(tokenized_symbol)
             .with_amount(amount)
-            .with_price(150.0)
+            .with_price(dec!(150.0))
             .build();
         onchain_trade.direction = Direction::Buy;
         onchain_trade.block_timestamp = Some(Utc::now());
@@ -384,14 +384,15 @@ mod tests {
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
-        let decimal_amount =
-            FractionalShares::new(Decimal::try_from(onchain_trade.amount).unwrap());
-        let price_usdc = Decimal::try_from(onchain_trade.price.value()).unwrap();
+        let decimal_amount = onchain_trade.amount;
+        let price_usdc = onchain_trade.price.value();
 
-        position_cqrs
-            .execute(
-                &aggregate_id,
+        position_store
+            .send(
+                symbol,
                 PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
                     trade_id,
                     amount: decimal_amount,
                     direction: onchain_trade.direction,
@@ -408,20 +409,17 @@ mod tests {
         shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
-        order_id: &'a str,
     }
 
     async fn setup_offchain_order_aggregate(
-        offchain_order_cqrs: &OffchainOrderCqrs,
-        position_cqrs: &PositionCqrs,
+        offchain_order_store: &Store<OffchainOrder>,
+        position_store: &Store<Position>,
         offchain_order_id: OffchainOrderId,
         params: TestOrderParams<'_>,
     ) {
-        let offchain_agg_id = offchain_order_id.to_string();
-
-        offchain_order_cqrs
-            .execute(
-                &offchain_agg_id,
+        offchain_order_store
+            .send(
+                &offchain_order_id,
                 OffchainOrderCommand::Place {
                     symbol: params.symbol.clone(),
                     shares: params.shares,
@@ -432,10 +430,9 @@ mod tests {
             .await
             .unwrap();
 
-        let position_agg_id = Position::aggregate_id(params.symbol);
-        position_cqrs
-            .execute(
-                &position_agg_id,
+        position_store
+            .send(
+                params.symbol,
                 PositionCommand::PlaceOffChainOrder {
                     offchain_order_id,
                     shares: params.shares,
@@ -446,56 +443,45 @@ mod tests {
             )
             .await
             .unwrap();
-
-        offchain_order_cqrs
-            .execute(
-                &offchain_agg_id,
-                OffchainOrderCommand::ConfirmSubmission {
-                    executor_order_id: ExecutorOrderId::new(params.order_id),
-                },
-            )
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
     async fn test_handle_filled_order_executes_cqrs_commands() {
         let pool = setup_test_db().await;
-        let (offchain_order_cqrs, position_cqrs) = create_test_frameworks(&pool);
+        let (offchain_order_store, position_store) = create_test_frameworks(&pool);
         let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let ctx = OrderPollerCtx::default();
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
 
-        setup_position_with_onchain_fill(&position_cqrs, &symbol, "AAPL0x", 10.0).await;
+        setup_position_with_onchain_fill(&position_store, &symbol, "tAAPL", dec!(10)).await;
 
-        let offchain_order_id = OffchainOrder::aggregate_id();
+        let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(
-            &offchain_order_cqrs,
-            &position_cqrs,
+            &offchain_order_store,
+            &position_store,
             offchain_order_id,
             TestOrderParams {
                 symbol: &symbol,
                 shares,
                 direction: Direction::Buy,
                 executor: SupportedExecutor::Schwab,
-                order_id: "ORD123",
             },
         )
         .await;
 
         let poller = OrderStatusPoller::new(
-            config,
+            ctx,
             pool.clone(),
             broker,
-            offchain_order_cqrs,
-            position_cqrs,
+            offchain_order_store,
+            position_store,
         );
 
         let order = OffchainOrder::Submitted {
             symbol: symbol.clone(),
-            shares: shares.inner(),
+            shares,
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             executor_order_id: ExecutorOrderId::new("ORD123"),
@@ -503,7 +489,7 @@ mod tests {
             submitted_at: Utc::now(),
         };
 
-        let result = poller
+        poller
             .handle_filled_order(
                 offchain_order_id,
                 &order,
@@ -511,8 +497,8 @@ mod tests {
                 &ExecutorOrderId::new("ORD123"),
                 Utc::now(),
             )
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = offchain_order_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
@@ -537,50 +523,50 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(position_events.len(), 3);
-        assert_eq!(position_events[0], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[1], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderFilled");
+        assert_eq!(position_events.len(), 4);
+        assert_eq!(position_events[0], "PositionEvent::Initialized");
+        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
+        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
+        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFilled");
     }
 
     #[tokio::test]
     async fn test_handle_failed_order_executes_cqrs_commands() {
         let pool = setup_test_db().await;
-        let (offchain_order_cqrs, position_cqrs) = create_test_frameworks(&pool);
+        let (offchain_order_store, position_store) = create_test_frameworks(&pool);
         let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let ctx = OrderPollerCtx::default();
 
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
 
-        setup_position_with_onchain_fill(&position_cqrs, &symbol, "TSLA0x", 5.0).await;
+        setup_position_with_onchain_fill(&position_store, &symbol, "tTSLA", dec!(5)).await;
 
-        let offchain_order_id = OffchainOrder::aggregate_id();
+        let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(
-            &offchain_order_cqrs,
-            &position_cqrs,
+            &offchain_order_store,
+            &position_store,
             offchain_order_id,
             TestOrderParams {
                 symbol: &symbol,
                 shares,
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
-                order_id: "ORD456",
             },
         )
         .await;
 
         let poller = OrderStatusPoller::new(
-            config,
+            ctx,
             pool.clone(),
             broker,
-            offchain_order_cqrs,
-            position_cqrs,
+            offchain_order_store,
+            position_store,
         );
 
         let order = OffchainOrder::Submitted {
             symbol: symbol.clone(),
-            shares: shares.inner(),
+            shares,
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             executor_order_id: ExecutorOrderId::new("ORD456"),
@@ -588,10 +574,10 @@ mod tests {
             submitted_at: Utc::now(),
         };
 
-        let result = poller
+        poller
             .handle_failed_order(offchain_order_id, &order, "Broker API timeout".to_string())
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = offchain_order_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
@@ -616,9 +602,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(position_events.len(), 3);
-        assert_eq!(position_events[0], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[1], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderFailed");
+        assert_eq!(position_events.len(), 4);
+        assert_eq!(position_events[0], "PositionEvent::Initialized");
+        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
+        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
+        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFailed");
     }
 }

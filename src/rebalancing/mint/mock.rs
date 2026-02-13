@@ -2,9 +2,10 @@
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Mint, MintError};
 use crate::tokenized_equity_mint::IssuerRequestId;
@@ -170,14 +171,14 @@ mod tests {
     async fn failing_mock_still_increments_call_count() {
         let mock = MockMint::failing();
 
-        let _ = mock
-            .execute_mint(
-                &IssuerRequestId::new("x"),
-                Symbol::new("AAPL").unwrap(),
-                FractionalShares::new(dec!(1)),
-                Address::ZERO,
-            )
-            .await;
+        mock.execute_mint(
+            &IssuerRequestId::new("x"),
+            Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(dec!(1)),
+            Address::ZERO,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(mock.calls(), 1);
     }
@@ -186,14 +187,14 @@ mod tests {
     async fn failing_mock_still_captures_last_call() {
         let mock = MockMint::failing();
 
-        let _ = mock
-            .execute_mint(
-                &IssuerRequestId::new("captured"),
-                Symbol::new("NVDA").unwrap(),
-                FractionalShares::new(dec!(50)),
-                Address::ZERO,
-            )
-            .await;
+        mock.execute_mint(
+            &IssuerRequestId::new("captured"),
+            Symbol::new("NVDA").unwrap(),
+            FractionalShares::new(dec!(50)),
+            Address::ZERO,
+        )
+        .await
+        .unwrap_err();
 
         let call = mock.last_call().unwrap();
         assert_eq!(call.issuer_request_id, "captured");

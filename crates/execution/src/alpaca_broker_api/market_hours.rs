@@ -23,16 +23,16 @@ fn deserialize_date<'de, D>(deserializer: D) -> Result<NaiveDate, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(serde::de::Error::custom)
+    let date_str = String::deserialize(deserializer)?;
+    NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(serde::de::Error::custom)
 }
 
 fn deserialize_time<'de, D>(deserializer: D) -> Result<NaiveTime, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom)
+    let time_str = String::deserialize(deserializer)?;
+    NaiveTime::parse_from_str(&time_str, "%H:%M").map_err(serde::de::Error::custom)
 }
 
 enum MarketStatus {
@@ -212,14 +212,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
-    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
+            mode: Some(mode),
         }
     }
 
@@ -234,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_next_trading_day() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -252,7 +252,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let from_date = NaiveDate::from_ymd_opt(2025, 1, 4).unwrap();
         let next_day = find_next_trading_day(&client, from_date).await.unwrap();
 
@@ -263,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_next_trading_day_no_days_found() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/v1/calendar");
@@ -272,13 +272,13 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let from_date = NaiveDate::from_ymd_opt(2025, 1, 4).unwrap();
-        let result = find_next_trading_day(&client, from_date).await;
+        let error = find_next_trading_day(&client, from_date).await.unwrap_err();
 
         mock.assert();
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaBrokerApiError::NoTradingDaysFound { .. }
         ));
     }
@@ -310,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_calendar_with_naivedate() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -328,7 +328,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let date = NaiveDate::from_ymd_opt(2025, 1, 6).unwrap();
         let calendar = get_calendar(&client, date, date).await.unwrap();
 

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::debug;
 
-use super::{SchwabAuthConfig, SchwabError, SchwabTokens};
+use super::{SchwabAction, SchwabAuthCtx, SchwabError, SchwabTokens};
 
 /// Market session types for trading hours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +127,12 @@ struct TimeRange {
 ///
 /// Uses the `/marketdata/v1/markets/{marketId}` endpoint with "equity" as the market ID.
 /// Returns market hours in Eastern timezone per the API specification.
-pub async fn fetch_market_hours(
-    config: &SchwabAuthConfig,
+pub(crate) async fn fetch_market_hours(
+    ctx: &SchwabAuthCtx,
     pool: &SqlitePool,
     date: Option<&str>,
 ) -> Result<MarketHours, SchwabError> {
-    let access_token = SchwabTokens::get_valid_access_token(pool, config).await?;
+    let access_token = SchwabTokens::get_valid_access_token(pool, ctx).await?;
 
     let headers = [
         (
@@ -144,14 +144,14 @@ pub async fn fetch_market_hours(
     .into_iter()
     .collect::<HeaderMap>();
 
-    let mut url = format!("{}marketdata/v1/markets/equity", config.base_url()?);
+    let mut url = format!("{}marketdata/v1/markets/equity", ctx.base_url()?);
 
     if let Some(date_param) = date {
         use std::fmt::Write;
-        write!(url, "?date={date_param}").map_err(|e| SchwabError::RequestFailed {
-            action: "format URL".to_string(),
+        write!(url, "?date={date_param}").map_err(|error| SchwabError::RequestFailed {
+            action: SchwabAction::FormatUrl,
             status: reqwest::StatusCode::OK,
-            body: format!("Failed to format date parameter: {e}"),
+            body: format!("Failed to format date parameter: {error}"),
         })?;
     }
 
@@ -169,7 +169,7 @@ pub async fn fetch_market_hours(
             .await
             .unwrap_or_else(|_| "Failed to read response body".to_string());
         return Err(SchwabError::RequestFailed {
-            action: "fetch market hours".to_string(),
+            action: SchwabAction::FetchMarketHours,
             status,
             body,
         });
@@ -186,7 +186,7 @@ fn parse_market_hours_response(
 ) -> Result<MarketHours, SchwabError> {
     let Some(equity) = response.equity else {
         return Err(SchwabError::RequestFailed {
-            action: "parse market hours".to_string(),
+            action: SchwabAction::ParseMarketHours,
             status: reqwest::StatusCode::OK,
             body: "No equity market hours in response".to_string(),
         });
@@ -194,16 +194,16 @@ fn parse_market_hours_response(
 
     let Some(eq) = equity.eq else {
         return Err(SchwabError::RequestFailed {
-            action: "parse market hours".to_string(),
+            action: SchwabAction::ParseMarketHours,
             status: reqwest::StatusCode::OK,
             body: "No EQ section in equity market hours".to_string(),
         });
     };
 
-    let date = parse_date(&eq.date).map_err(|e| SchwabError::RequestFailed {
-        action: "parse market hours date".to_string(),
+    let date = parse_date(&eq.date).map_err(|error| SchwabError::RequestFailed {
+        action: SchwabAction::ParseMarketHoursDate,
         status: reqwest::StatusCode::OK,
-        body: format!("Invalid date format '{}': {e}", eq.date),
+        body: format!("Invalid date format '{}': {error}", eq.date),
     })?;
 
     // If market is closed (weekends/holidays), return closed market hours
@@ -280,7 +280,7 @@ fn parse_datetime(datetime_str: &str, date: NaiveDate) -> Result<DateTime<Utc>, 
 
     // Return proper error for unsupported formats
     Err(SchwabError::RequestFailed {
-        action: "parse datetime".to_string(),
+        action: SchwabAction::ParseDatetime,
         status: reqwest::StatusCode::OK,
         body: format!("Unsupported datetime format: '{datetime_str}'"),
     })
@@ -293,8 +293,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_ctx_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
@@ -307,9 +307,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_market_hours_open_market() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &config).await;
+        setup_test_tokens(&pool, &ctx).await;
 
         let mock_response = json!({
             "equity": {
@@ -349,10 +349,9 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&config, &pool, None).await;
-
+        let market_hours = fetch_market_hours(&ctx, &pool, None).await.unwrap();
         mock.assert();
-        let market_hours = result.unwrap();
+
         assert_eq!(
             market_hours.date,
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap()
@@ -366,9 +365,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_market_hours_closed_market() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &config).await;
+        setup_test_tokens(&pool, &ctx).await;
 
         let mock_response = json!({
             "equity": {
@@ -395,10 +394,11 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&config, &pool, Some("2025-01-04")).await;
-
+        let market_hours = fetch_market_hours(&ctx, &pool, Some("2025-01-04"))
+            .await
+            .unwrap();
         mock.assert();
-        let market_hours = result.unwrap();
+
         assert_eq!(
             market_hours.date,
             NaiveDate::from_ymd_opt(2025, 1, 4).unwrap()
@@ -413,9 +413,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_market_hours_api_error() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &config).await;
+        setup_test_tokens(&pool, &ctx).await;
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/marketdata/v1/markets/equity");
@@ -424,22 +424,22 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result = fetch_market_hours(&config, &pool, None).await;
-
+        let error = fetch_market_hours(&ctx, &pool, None).await.unwrap_err();
         mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "fetch market hours" && status.as_u16() == 500
+            if action == SchwabAction::FetchMarketHours && status.as_u16() == 500
         ));
     }
 
     #[tokio::test]
     async fn test_fetch_market_hours_invalid_response() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &config).await;
+        setup_test_tokens(&pool, &ctx).await;
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/marketdata/v1/markets/equity");
@@ -448,10 +448,10 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = fetch_market_hours(&config, &pool, None).await;
-
+        let error = fetch_market_hours(&ctx, &pool, None).await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[test]
@@ -469,48 +469,50 @@ mod tests {
             MarketSession::AfterHours
         );
 
-        let result = "INVALID".parse::<MarketSession>();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid market session: INVALID");
+        assert_eq!(
+            "INVALID".parse::<MarketSession>().unwrap_err(),
+            "Invalid market session: INVALID"
+        );
     }
 
     #[test]
     fn test_parse_date_valid() {
-        let result = parse_date("2025-01-03");
         assert_eq!(
-            result.unwrap(),
+            parse_date("2025-01-03").unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap()
         );
     }
 
     #[test]
     fn test_parse_date_invalid() {
-        let result = parse_date("invalid-date");
-        assert!(result.is_err());
+        let error = parse_date("invalid-date").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid"),
+            "Expected parse error for invalid date, got: {error}"
+        );
     }
 
     #[test]
     fn test_parse_datetime_rfc3339() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        let result = parse_datetime("2025-01-03T09:30:00-05:00", date);
-        assert!(result.is_ok());
+        let parsed = parse_datetime("2025-01-03T09:30:00-05:00", date).unwrap();
+        assert_eq!(parsed, Utc.with_ymd_and_hms(2025, 1, 3, 14, 30, 0).unwrap());
     }
 
     #[test]
     fn test_parse_datetime_time_only() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        let result = parse_datetime("09:30:00", date);
-        assert!(result.is_ok());
+        let parsed = parse_datetime("09:30:00", date).unwrap();
+        assert_eq!(parsed, Utc.with_ymd_and_hms(2025, 1, 3, 14, 30, 0).unwrap());
     }
 
     #[test]
     fn test_parse_datetime_invalid() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        let result = parse_datetime("invalid-time", date);
         assert!(matches!(
-            result.unwrap_err(),
+            parse_datetime("invalid-time", date).unwrap_err(),
             SchwabError::RequestFailed { action, .. }
-            if action == "parse datetime"
+            if action == SchwabAction::ParseDatetime
         ));
     }
 }

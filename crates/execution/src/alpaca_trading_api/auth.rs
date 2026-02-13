@@ -26,13 +26,13 @@ impl AlpacaTradingApiMode {
 }
 
 #[derive(Clone, Deserialize)]
-pub struct AlpacaTradingApiAuthConfig {
+pub struct AlpacaTradingApiCtx {
     pub api_key: String,
     pub api_secret: String,
     pub trading_mode: Option<AlpacaTradingApiMode>,
 }
 
-impl AlpacaTradingApiAuthConfig {
+impl AlpacaTradingApiCtx {
     pub fn trading_mode(&self) -> AlpacaTradingApiMode {
         self.trading_mode
             .clone()
@@ -48,9 +48,9 @@ impl AlpacaTradingApiAuthConfig {
     }
 }
 
-impl std::fmt::Debug for AlpacaTradingApiAuthConfig {
+impl std::fmt::Debug for AlpacaTradingApiCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlpacaTradingApiAuthConfig")
+        f.debug_struct("AlpacaTradingApiCtx")
             .field("api_key", &"[REDACTED]")
             .field("api_secret", &"[REDACTED]")
             .field("trading_mode", &self.trading_mode())
@@ -58,7 +58,7 @@ impl std::fmt::Debug for AlpacaTradingApiAuthConfig {
     }
 }
 
-/// Alpaca Trading API client wrapper with authentication and configuration
+/// Alpaca Trading API client wrapper with authentication and context
 pub struct AlpacaTradingApiClient {
     client: Client,
     trading_mode: AlpacaTradingApiMode,
@@ -74,17 +74,15 @@ impl std::fmt::Debug for AlpacaTradingApiClient {
 }
 
 impl AlpacaTradingApiClient {
-    pub(crate) fn new(
-        config: &AlpacaTradingApiAuthConfig,
-    ) -> Result<Self, super::AlpacaTradingApiError> {
-        let base_url = config.base_url();
-        let api_info = apca::ApiInfo::from_parts(&base_url, &config.api_key, &config.api_secret)?;
+    pub(crate) fn new(ctx: &AlpacaTradingApiCtx) -> Result<Self, super::AlpacaTradingApiError> {
+        let base_url = ctx.base_url();
+        let api_info = apca::ApiInfo::from_parts(&base_url, &ctx.api_key, &ctx.api_secret)?;
 
         let client = Client::new(api_info);
 
         Ok(Self {
             client,
-            trading_mode: config.trading_mode(),
+            trading_mode: ctx.trading_mode(),
         })
     }
 
@@ -106,16 +104,16 @@ impl AlpacaTradingApiClient {
 mod tests {
     use super::*;
 
-    fn create_test_paper_config() -> AlpacaTradingApiAuthConfig {
-        AlpacaTradingApiAuthConfig {
+    fn create_test_paper_ctx() -> AlpacaTradingApiCtx {
+        AlpacaTradingApiCtx {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Paper),
         }
     }
 
-    fn create_test_live_config() -> AlpacaTradingApiAuthConfig {
-        AlpacaTradingApiAuthConfig {
+    fn create_test_live_ctx() -> AlpacaTradingApiCtx {
+        AlpacaTradingApiCtx {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Live),
@@ -135,18 +133,18 @@ mod tests {
     }
 
     #[test]
-    fn test_alpaca_trading_api_client_new_valid_config() {
-        let config = create_test_paper_config();
-        let result = AlpacaTradingApiClient::new(&config);
+    fn test_alpaca_trading_api_client_new_valid_ctx() {
+        let ctx = create_test_paper_ctx();
+        let result = AlpacaTradingApiClient::new(&ctx);
 
         let client = result.unwrap();
         assert!(client.is_paper_trading());
     }
 
     #[test]
-    fn test_alpaca_trading_api_client_new_live_config() {
-        let config = create_test_live_config();
-        let result = AlpacaTradingApiClient::new(&config);
+    fn test_alpaca_trading_api_client_new_live_ctx() {
+        let ctx = create_test_live_ctx();
+        let result = AlpacaTradingApiClient::new(&ctx);
 
         let client = result.unwrap();
         assert!(!client.is_paper_trading());
@@ -154,13 +152,13 @@ mod tests {
 
     #[test]
     fn test_alpaca_trading_api_client_new_empty_credentials() {
-        let empty_config = AlpacaTradingApiAuthConfig {
+        let empty_ctx = AlpacaTradingApiCtx {
             api_key: String::new(),
             api_secret: String::new(),
             trading_mode: None,
         };
 
-        let result = AlpacaTradingApiClient::new(&empty_config);
+        let result = AlpacaTradingApiClient::new(&empty_ctx);
 
         let client = result.unwrap();
         assert!(client.is_paper_trading());
@@ -168,11 +166,11 @@ mod tests {
 
     #[test]
     fn test_alpaca_trading_api_client_paper_vs_live_state_consistency() {
-        let paper_config = create_test_paper_config();
-        let live_config = create_test_live_config();
+        let paper_ctx = create_test_paper_ctx();
+        let live_ctx = create_test_live_ctx();
 
-        let paper_client = AlpacaTradingApiClient::new(&paper_config).unwrap();
-        let live_client = AlpacaTradingApiClient::new(&live_config).unwrap();
+        let paper_client = AlpacaTradingApiClient::new(&paper_ctx).unwrap();
+        let live_client = AlpacaTradingApiClient::new(&live_ctx).unwrap();
 
         assert!(paper_client.is_paper_trading());
         assert!(!live_client.is_paper_trading());
@@ -180,13 +178,13 @@ mod tests {
 
     #[test]
     fn test_alpaca_trading_api_auth_env_debug_redacts_secrets() {
-        let config = AlpacaTradingApiAuthConfig {
+        let ctx = AlpacaTradingApiCtx {
             api_key: "secret_key_id_123".to_string(),
             api_secret: "super_secret_key_456".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Paper),
         };
 
-        let debug_output = format!("{config:?}");
+        let debug_output = format!("{ctx:?}");
 
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("secret_key_id_123"));
@@ -196,8 +194,8 @@ mod tests {
 
     #[test]
     fn test_alpaca_trading_api_client_debug_does_not_leak_credentials() {
-        let config = create_test_paper_config();
-        let client = AlpacaTradingApiClient::new(&config).unwrap();
+        let ctx = create_test_paper_ctx();
+        let client = AlpacaTradingApiClient::new(&ctx).unwrap();
 
         let debug_output = format!("{client:?}");
 

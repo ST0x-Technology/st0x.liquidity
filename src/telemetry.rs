@@ -1,8 +1,8 @@
 //! HyperDX observability integration for trace export.
 //!
 //! This module provides optional OpenTelemetry trace export to HyperDX for real-time
-//! monitoring and debugging of bot operations. When enabled via the `HYPERDX_API_KEY`
-//! environment variable, traces are batched and exported to HyperDX. When disabled,
+//! monitoring and debugging of bot operations. When enabled via the `[hyperdx]` section
+//! in the secrets TOML file, traces are batched and exported to HyperDX. When disabled,
 //! the bot runs normally with console-only logging.
 //!
 //! # Architecture
@@ -26,12 +26,12 @@
 //! # Usage
 //!
 //! ```ignore
-//! // Optional telemetry setup through config
-//! let config = Config::load_file(&path)?;
-//! let log_level: tracing::Level = (&config.log_level).into();
+//! // Optional telemetry setup through ctx
+//! let ctx = Ctx::load_files(&config_path, &secrets_path)?;
+//! let log_level: tracing::Level = (&ctx.log_level).into();
 //!
-//! let telemetry_guard = if let Some(ref hyperdx) = config.hyperdx {
-//!     match hyperdx.setup_telemetry(log_level) {
+//! let telemetry_guard = if let Some(ref telemetry) = ctx.telemetry {
+//!     match telemetry.setup(log_level) {
 //!         Ok(guard) => Some(guard),
 //!         Err(e) => {
 //!             eprintln!("Failed to setup telemetry: {e}");
@@ -65,34 +65,62 @@ use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct HyperDxConfig {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TelemetryConfig {
+    pub(crate) service_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TelemetrySecrets {
+    pub(crate) api_key: String,
+}
+
+#[derive(Clone)]
+pub struct TelemetryCtx {
     pub(crate) api_key: String,
     pub(crate) service_name: String,
 }
 
-impl HyperDxConfig {
-    pub fn setup_telemetry(
-        &self,
-        log_level: tracing::Level,
-    ) -> Result<TelemetryGuard, TelemetryError> {
+impl std::fmt::Debug for TelemetryCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryCtx")
+            .field("api_key", &"[REDACTED]")
+            .field("service_name", &self.service_name)
+            .finish()
+    }
+}
+
+impl TelemetryCtx {
+    pub(crate) fn new(
+        config: Option<TelemetryConfig>,
+        secrets: Option<TelemetrySecrets>,
+    ) -> Result<Option<Self>, TelemetryAssemblyError> {
+        match (config, secrets) {
+            (Some(config), Some(secrets)) => Ok(Some(Self {
+                api_key: secrets.api_key,
+                service_name: config.service_name,
+            })),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(TelemetryAssemblyError::SecretsMissing),
+            (None, Some(_)) => Err(TelemetryAssemblyError::ConfigMissing),
+        }
+    }
+
+    pub fn setup(&self, log_level: tracing::Level) -> Result<TelemetryGuard, TelemetryError> {
         let headers = HashMap::from([("authorization".to_string(), self.api_key.clone())]);
 
-        let http_client = std::thread::spawn(|| {
-            reqwest::blocking::Client::builder()
-                .gzip(true)
-                .build()
-                .map_err(|e| format!("Failed to build HTTP client: {e}"))
-        })
-        .join()
-        .map_err(|_| TelemetryError::ThreadSpawn)?
-        .map_err(TelemetryError::HttpClient)?;
+        let http_client =
+            std::thread::spawn(|| reqwest::blocking::Client::builder().gzip(true).build())
+                .join()??;
 
         let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
@@ -147,21 +175,6 @@ impl HyperDxConfig {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum TelemetryError {
-    #[error("Failed to build OTLP exporter")]
-    OtlpExporter(#[from] ExporterBuildError),
-
-    #[error("Failed to build HTTP client")]
-    HttpClient(String),
-
-    #[error("Failed to spawn HTTP client thread")]
-    ThreadSpawn,
-
-    #[error("Failed to set global subscriber")]
-    Subscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
-}
-
 pub struct TelemetryGuard {
     tracer_provider: SdkTracerProvider,
 }
@@ -172,15 +185,41 @@ impl Drop for TelemetryGuard {
         // This blocks until all pending exports complete or timeout.
         // The BatchSpanProcessor uses scheduled_delay (3s) as its export interval,
         // and force_flush waits for pending exports with its own internal timeout.
-        if let Err(e) = self.tracer_provider.force_flush() {
-            eprintln!("Failed to flush telemetry spans: {e:?}");
+        if let Err(error) = self.tracer_provider.force_flush() {
+            eprintln!("Failed to flush telemetry spans: {error:?}");
         }
 
         // Shutdown the tracer provider to clean up background threads and resources.
         // This ensures the BatchSpanProcessor's background thread terminates cleanly.
-        if let Err(e) = self.tracer_provider.shutdown() {
-            eprintln!("Failed to shutdown telemetry provider: {e:?}");
+        if let Err(error) = self.tracer_provider.shutdown() {
+            eprintln!("Failed to shutdown telemetry provider: {error:?}");
         }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum TelemetryAssemblyError {
+    #[error("telemetry config present but telemetry secrets missing")]
+    SecretsMissing,
+    #[error("telemetry secrets present but telemetry config missing")]
+    ConfigMissing,
+}
+
+#[derive(Debug, Error)]
+pub enum TelemetryError {
+    #[error("HTTP client builder thread panicked")]
+    ThreadJoin,
+    #[error("Failed to build HTTP client")]
+    HttpClient(#[from] reqwest::Error),
+    #[error("Failed to build OTLP exporter")]
+    OtlpExporter(#[from] ExporterBuildError),
+    #[error("Failed to set global subscriber")]
+    Subscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
+}
+
+impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
+    fn from(_: Box<dyn std::any::Any + Send>) -> Self {
+        Self::ThreadJoin
     }
 }
 
@@ -201,3 +240,15 @@ impl Drop for TelemetryGuard {
 /// auto-instrumentation, this distinction is somewhat artificial but
 /// maintained for semantic clarity.
 const TRACER_NAME: &str = "st0x-tracer";
+
+pub fn setup_tracing(log_level: &crate::config::LogLevel) {
+    let level: tracing::Level = log_level.into();
+    let default_filter = format!("st0x_hedge={level},st0x_execution={level}");
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
+        )
+        .init();
+}

@@ -7,7 +7,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
-use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus, order::OrderUpdate};
+use crate::order::OrderUpdate;
+use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus};
 
 pub(super) async fn place_market_order(
     client: &Client,
@@ -112,7 +113,6 @@ fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
         // so new statuses may be added. We conservatively treat unknown statuses
         // as Failed to avoid incorrect handling. This will log a warning when
         // we encounter an unknown status, prompting us to update this mapping.
-        #[allow(unreachable_patterns)]
         unknown => {
             debug!("Unknown Alpaca order status encountered: {unknown:?}, treating as Failed");
             OrderStatus::Failed
@@ -140,7 +140,6 @@ fn extract_price_cents_from_order(
 
 #[cfg(test)]
 mod tests {
-    use apca::api::v2::order::Amount;
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -148,20 +147,6 @@ mod tests {
 
     use super::*;
     use crate::{FractionalShares, Positive, Symbol};
-
-    fn extract_shares_from_amount(
-        amount: &order::Amount,
-    ) -> Result<Positive<FractionalShares>, AlpacaTradingApiError> {
-        match amount {
-            order::Amount::Quantity { quantity } => {
-                let qty_decimal: Decimal = quantity.to_string().parse()?;
-                Ok(Positive::new(FractionalShares::new(qty_decimal))?)
-            }
-            order::Amount::Notional { .. } => {
-                Err(AlpacaTradingApiError::NotionalOrdersNotSupported)
-            }
-        }
-    }
 
     fn create_test_client(mock_server: &MockServer) -> Client {
         let api_info =
@@ -228,10 +213,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let placement = place_market_order(&client, market_order).await.unwrap();
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
@@ -297,10 +280,8 @@ mod tests {
             direction: Direction::Sell,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let placement = place_market_order(&client, market_order).await.unwrap();
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
@@ -328,10 +309,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let error = place_market_order(&client, market_order).await.unwrap_err();
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
@@ -356,10 +335,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let error = place_market_order(&client, market_order).await.unwrap_err();
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
@@ -383,10 +360,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
+        let error = place_market_order(&client, market_order).await.unwrap_err();
         mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
@@ -430,10 +405,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
     }
@@ -478,10 +452,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.status, OrderStatus::Filled);
         assert_eq!(order_update.price_cents, Some(24567));
     }
@@ -526,10 +499,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.status, OrderStatus::Failed);
         assert_eq!(order_update.price_cents, None);
     }
@@ -574,23 +546,11 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
-    }
-
-    #[test]
-    fn test_extract_shares_from_notional_amount_returns_error() {
-        let quantity_amount = Amount::Quantity {
-            quantity: 100.into(),
-        };
-
-        let result = extract_shares_from_amount(&quantity_amount);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().inner().inner(), Decimal::from(100));
     }
 
     proptest! {

@@ -1,13 +1,17 @@
+//! Processes ClearV3 events from the Raindex orderbook with
+//! fallback to transaction receipts.
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::{debug, info};
 
+use super::OnChainError;
 use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-use crate::error::{OnChainError, TradeValidationError};
+use crate::onchain::trade::TradeValidationError;
 use crate::onchain::{
-    EvmConfig,
+    EvmCtx,
     pyth::FeedIdCache,
     trade::{OnchainTrade, OrderFill},
 };
@@ -17,7 +21,7 @@ impl OnchainTrade {
     /// Creates OnchainTrade directly from ClearV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
     pub async fn try_from_clear_v3<P: Provider>(
-        config: &EvmConfig,
+        evm_ctx: &EvmCtx,
         cache: &SymbolCache,
         provider: P,
         event: ClearV3,
@@ -60,7 +64,7 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        let after_clear = fetch_after_clear_event(&provider, config, &log).await?;
+        let after_clear = fetch_after_clear_event(&provider, evm_ctx, &log).await?;
 
         let ClearStateChangeV2 {
             aliceOutput,
@@ -126,7 +130,7 @@ impl OnchainTrade {
 /// returned 0 AfterClearV2 logs, but `get_transaction_receipt` showed both logs present.
 async fn fetch_after_clear_event<P: Provider>(
     provider: &P,
-    config: &EvmConfig,
+    evm_ctx: &EvmCtx,
     log: &Log,
 ) -> Result<AfterClearV2, OnChainError> {
     let block_number = log
@@ -137,7 +141,7 @@ async fn fetch_after_clear_event<P: Provider>(
 
     let filter = Filter::new()
         .select(block_number)
-        .address(config.orderbook)
+        .address(evm_ctx.orderbook)
         .event_signature(AfterClearV2::SIGNATURE_HASH);
 
     let after_clear_logs = provider.get_logs(&filter).await?;
@@ -153,7 +157,7 @@ async fn fetch_after_clear_event<P: Provider>(
     // Some RPC nodes fail to return logs via eth_getLogs for historical blocks,
     // but the logs are present in the transaction receipt.
     let receipt = provider.get_transaction_receipt(tx_hash).await?;
-    let Some(r) = receipt else {
+    let Some(tx_receipt) = receipt else {
         return Err(TradeValidationError::NodeReceiptMissing {
             block_number,
             tx_hash,
@@ -163,8 +167,8 @@ async fn fetch_after_clear_event<P: Provider>(
     };
 
     // Find the AfterClearV2 log in the receipt with log_index > clear_log_index
-    for receipt_log in r.inner.logs() {
-        if receipt_log.address() != config.orderbook {
+    for receipt_log in tx_receipt.inner.logs() {
+        if receipt_log.address() != evm_ctx.orderbook {
             continue;
         }
 
@@ -193,11 +197,12 @@ async fn fetch_after_clear_event<P: Provider>(
     }
 
     // Check what's actually in the receipt for error reporting
-    let clear_in_receipt = r.inner.logs().iter().any(|l| {
-        l.address() == config.orderbook && l.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
+    let clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
+        log.address() == evm_ctx.orderbook && log.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
     });
-    let after_clear_in_receipt = r.inner.logs().iter().any(|l| {
-        l.address() == config.orderbook && l.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
+    let after_clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
+        log.address() == evm_ctx.orderbook
+            && log.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
     });
 
     if clear_in_receipt && !after_clear_in_receipt {
@@ -222,13 +227,17 @@ async fn fetch_after_clear_event<P: Provider>(
 mod tests {
     use alloy::hex;
     use alloy::primitives::{
-        Address, B256, Bytes, IntoLogData, LogData, U256, address, fixed_bytes, uint,
+        Address, B256, Bytes, IntoLogData, LogData, TxHash, U256, address, fixed_bytes, uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
+    use rust_decimal_macros::dec;
     use serde_json::json;
+    use url::Url;
+
+    use st0x_execution::FractionalShares;
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -239,9 +248,9 @@ mod tests {
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
 
-    fn create_test_config() -> EvmConfig {
-        EvmConfig {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+    fn create_test_ctx() -> EvmCtx {
+        EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             order_owner: Some(get_test_order().owner),
             deployment_block: 1,
@@ -307,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_alice_order_match() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -360,36 +369,36 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
 
     #[tokio::test]
     async fn test_try_from_clear_v3_bob_order_match() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -436,10 +445,10 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (AAPL0x)
+        // Mock decimals() then symbol() calls for input token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
@@ -450,27 +459,27 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
 
     #[tokio::test]
     async fn test_try_from_clear_v3_no_order_match() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let different_order1 = {
@@ -492,13 +501,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -508,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_missing_block_number() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -528,25 +537,25 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoBlockNumber)
+            OnChainError::Validation(TradeValidationError::NoBlockNumber)
         ));
     }
 
     #[tokio::test]
     async fn test_try_from_clear_v3_missing_after_clear_log() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -583,13 +592,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -601,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_after_clear_wrong_transaction() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -655,13 +664,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -673,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_after_clear_wrong_log_index() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -725,13 +734,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -743,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_clear_v3_alice_and_bob_both_match() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -791,30 +800,30 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         // Should process Alice first (alice_hash_matches is checked first)
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
@@ -845,7 +854,7 @@ mod tests {
 
     fn create_test_log(
         orderbook: Address,
-        tx_hash: B256,
+        tx_hash: TxHash,
         log_data: LogData,
         log_index: u64,
     ) -> Log {
@@ -865,7 +874,7 @@ mod tests {
     }
 
     fn create_receipt_json_with_logs(
-        tx_hash: B256,
+        tx_hash: TxHash,
         logs: &[serde_json::Value],
     ) -> serde_json::Value {
         json!({
@@ -887,7 +896,7 @@ mod tests {
 
     fn create_receipt_log_json(
         address: Address,
-        tx_hash: B256,
+        tx_hash: TxHash,
         log_index: u64,
         topics: &[B256],
         data: Bytes,
@@ -908,7 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_after_clear_multiple_logs_picks_first_match() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -943,34 +952,34 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 
     #[tokio::test]
     async fn test_fetch_after_clear_equal_log_index_rejected() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1022,13 +1031,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1041,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_after_clear_mixed_transactions_finds_correct() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1088,29 +1097,29 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        // Mock decimals() then symbol() calls for output token (tAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 
     fn create_after_clear_log_data() -> (Vec<B256>, Bytes) {
@@ -1125,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_to_receipt_when_get_logs_returns_empty() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1157,36 +1166,36 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
 
     #[tokio::test]
     async fn test_fallback_receipt_with_multiple_logs_picks_correct_after_clear() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1232,34 +1241,34 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 
     #[tokio::test]
     async fn test_fallback_receipt_rejects_wrong_contract_address() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1295,13 +1304,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1313,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_receipt_rejects_log_index_less_than_or_equal_to_clear() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1348,13 +1357,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1366,7 +1375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_after_clear_missing_from_receipt_error() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1397,13 +1406,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1415,7 +1424,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_receipt_ignores_wrong_event_signature() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1453,13 +1462,13 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await;
 
@@ -1471,7 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_get_logs_has_wrong_tx_but_receipt_has_correct() {
-        let config = create_test_config();
+        let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
         let order = get_test_order();
@@ -1516,28 +1525,28 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        // Mock decimals() then symbol() calls for output token (tAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
-            &config,
+            &ctx,
             &cache,
             provider,
             clear_event,
             clear_log,
             &feed_id_cache,
-            config.order_owner.unwrap(),
+            ctx.order_owner.unwrap(),
         )
         .await
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 }

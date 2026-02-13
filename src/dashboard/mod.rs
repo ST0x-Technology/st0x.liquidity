@@ -1,14 +1,16 @@
+//! WebSocket-based dashboard for real-time server state streaming.
+
 use futures_util::SinkExt;
 use rocket::{Route, State, get, routes};
 use rocket_ws::{Channel, Message, WebSocket};
 use tokio::sync::broadcast;
 use tracing::warn;
 
+use st0x_dto::{InitialState, ServerMessage};
+
 mod event;
 
 pub(crate) use event::EventBroadcaster;
-pub use st0x_dto::export_bindings;
-pub(crate) use st0x_dto::{InitialState, ServerMessage};
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
@@ -25,15 +27,15 @@ fn ws_endpoint(ws: WebSocket, broadcast: &State<Broadcast>) -> Channel<'_> {
             // #181 (trades), #182 (rebalances), #183 (circuit breaker), #184 (auth).
             let initial = ServerMessage::Initial(Box::new(InitialState::stub()));
             let json = match serde_json::to_string(&initial) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("Failed to serialize initial state: {e}");
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    warn!("Failed to serialize initial state: {error}");
                     return Ok(());
                 }
             };
 
-            if let Err(e) = stream.send(Message::Text(json)).await {
-                warn!("Failed to send initial state: {e}");
+            if let Err(error) = stream.send(Message::Text(json)).await {
+                warn!("Failed to send initial state: {error}");
                 return Ok(());
             }
 
@@ -41,20 +43,20 @@ fn ws_endpoint(ws: WebSocket, broadcast: &State<Broadcast>) -> Channel<'_> {
                 match receiver.recv().await {
                     Ok(msg) => {
                         let json = match serde_json::to_string(&msg) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                warn!("Failed to serialize message: {e}");
+                            Ok(serialized) => serialized,
+                            Err(error) => {
+                                warn!("Failed to serialize message: {error}");
                                 continue;
                             }
                         };
 
-                        if let Err(e) = stream.send(Message::Text(json)).await {
-                            warn!("Failed to send message to client: {e}");
+                        if let Err(error) = stream.send(Message::Text(json)).await {
+                            warn!("Failed to send message to client: {error}");
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Client lagged, skipped {n} messages");
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("Client lagged, skipped {skipped} messages");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         break;
@@ -73,7 +75,6 @@ pub(crate) fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures_util::StreamExt;
     use futures_util::future::join_all;
     use rocket::config::Config;
@@ -81,6 +82,8 @@ mod tests {
     use st0x_dto::EventStoreEntry;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
+
+    use super::*;
 
     fn create_test_broadcast() -> Broadcast {
         let (sender, _) = broadcast::channel(256);
@@ -267,7 +270,7 @@ mod tests {
                 .next()
                 .await
                 .unwrap_or_else(|| panic!("client{} stream closed", i + 1))
-                .unwrap_or_else(|e| panic!("client{} message error: {}", i + 1, e));
+                .unwrap_or_else(|error| panic!("client{} message error: {}", i + 1, error));
 
             let text = msg.into_text().expect("expected text message");
             let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
@@ -319,7 +322,7 @@ mod tests {
         for (i, result) in results.into_iter().enumerate() {
             let msg = result
                 .unwrap_or_else(|| panic!("client{} stream closed", i + 1))
-                .unwrap_or_else(|e| panic!("client{} error: {}", i + 1, e));
+                .unwrap_or_else(|error| panic!("client{} error: {}", i + 1, error));
 
             let text = msg.into_text().expect("expected text");
             let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");

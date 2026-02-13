@@ -3,9 +3,10 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
+
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
@@ -39,6 +40,7 @@ pub(crate) enum Imbalance<T> {
 
 /// Threshold configuration for imbalance detection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
     pub(crate) target: Decimal,
@@ -355,9 +357,10 @@ impl InventoryView {
     fn update_equity(
         self,
         symbol: &Symbol,
-        f: impl FnOnce(
+        update: impl FnOnce(
             Inventory<FractionalShares>,
-        ) -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
+        )
+            -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         let inventory = self
@@ -365,7 +368,7 @@ impl InventoryView {
             .get(symbol)
             .ok_or_else(|| InventoryViewError::UnknownSymbol(symbol.clone()))?;
 
-        let updated = f(inventory.clone())?;
+        let updated = update(inventory.clone())?;
 
         let mut equities = self.equities;
         equities.insert(symbol.clone(), updated);
@@ -379,10 +382,10 @@ impl InventoryView {
 
     fn update_usdc(
         self,
-        f: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
+        update: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let updated = f(self.usdc)?;
+        let updated = update(self.usdc)?;
 
         Ok(Self {
             usdc: updated,
@@ -423,7 +426,7 @@ impl InventoryView {
                 direction,
                 ..
             } => {
-                let shares = *shares_filled;
+                let shares = shares_filled.inner();
                 self.update_equity(
                     symbol,
                     |inv| match direction {
@@ -434,9 +437,10 @@ impl InventoryView {
                 )
             }
 
-            PositionEvent::Migrated { .. }
+            PositionEvent::Initialized { .. }
             | PositionEvent::OffChainOrderPlaced { .. }
-            | PositionEvent::OffChainOrderFailed { .. } => Ok(Self {
+            | PositionEvent::OffChainOrderFailed { .. }
+            | PositionEvent::ThresholdUpdated { .. } => Ok(Self {
                 last_updated: timestamp,
                 ..self
             }),
@@ -547,8 +551,8 @@ impl InventoryView {
     /// Applies a USDC rebalance event to update USDC inventory.
     ///
     /// - `Initiated`: Move amount from source venue's available to inflight.
-    ///   - `AlpacaToBase`: offchain → onchain (move offchain to inflight)
-    ///   - `BaseToAlpaca`: onchain → offchain (move onchain to inflight)
+    ///   - `AlpacaToBase`: offchain -> onchain (move offchain to inflight)
+    ///   - `BaseToAlpaca`: onchain -> offchain (move onchain to inflight)
     /// - `WithdrawalConfirmed`: No balance change (awaiting bridge).
     /// - `WithdrawalFailed`: Keep inflight until manually resolved.
     /// - `BridgingInitiated`, `BridgeAttestationReceived`: No balance change.
@@ -710,12 +714,13 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
+    use st0x_execution::{ExecutorOrderId, Positive};
+
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use st0x_execution::ExecutorOrderId;
-
-    use crate::offchain_order::{OffchainOrder, PriceCents};
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
+    use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
 
     fn shares(n: i64) -> FractionalShares {
@@ -910,8 +915,8 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            offchain_order_id: OffchainOrder::aggregate_id(),
-            shares_filled,
+            offchain_order_id: OffchainOrderId::new(),
+            shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
             executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
@@ -1017,10 +1022,10 @@ mod tests {
         };
 
         let event_time = original_time + chrono::Duration::hours(1);
-        let event = PositionEvent::OffChainOrderFailed {
-            offchain_order_id: OffchainOrder::aggregate_id(),
-            error: "test".to_string(),
-            failed_at: event_time,
+        let event = PositionEvent::Initialized {
+            symbol: symbol.clone(),
+            threshold: ExecutionThreshold::whole_share(),
+            initialized_at: event_time,
         };
 
         let updated = view.apply_position_event(&symbol, &event).unwrap();

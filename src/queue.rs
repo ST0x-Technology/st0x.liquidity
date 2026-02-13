@@ -1,18 +1,18 @@
-use alloy::primitives::B256;
+use alloy::primitives::TxHash;
 use alloy::rpc::types::Log;
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::num::TryFromIntError;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
-use crate::error::EventQueueError;
 use crate::onchain::trade::TradeEvent;
 
 /// Trait for events that can be enqueued
-pub trait Enqueueable {
+pub(crate) trait Enqueueable {
     fn to_trade_event(&self) -> TradeEvent;
 }
 
@@ -31,7 +31,7 @@ impl Enqueueable for TakeOrderV3 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueuedEvent {
     pub(crate) id: Option<i64>,
-    pub(crate) tx_hash: B256,
+    pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) block_number: u64,
     pub(crate) event: TradeEvent,
@@ -39,6 +39,25 @@ pub(crate) struct QueuedEvent {
     pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) processed_at: Option<DateTime<Utc>>,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
+}
+
+/// Event queue persistence and processing errors.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EventQueueError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Log missing required field: {0}")]
+    MissingLogField(&'static str),
+    #[error("Queued event missing ID")]
+    MissingQueuedEventId,
+    #[error("Event ID {0} not found in queue")]
+    MissingEventId(i64),
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] TryFromIntError),
+    #[error("Event serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Invalid tx_hash format: {0}")]
+    InvalidTxHash(#[from] alloy::hex::FromHexError),
 }
 
 async fn enqueue_event(
@@ -102,7 +121,8 @@ async fn enqueue_event(
     Ok(())
 }
 
-/// Gets the next unprocessed event from the queue, ordered by block number then log index
+/// Gets the next unprocessed event from the queue,
+/// ordered by block number then log index.
 #[tracing::instrument(skip(pool), level = tracing::Level::DEBUG)]
 pub(crate) async fn get_next_unprocessed_event(
     pool: &SqlitePool,
@@ -132,7 +152,7 @@ pub(crate) async fn get_next_unprocessed_event(
         return Ok(None);
     };
 
-    let tx_hash = B256::from_str(&row.tx_hash)?;
+    let tx_hash = TxHash::from_str(&row.tx_hash)?;
 
     let event: TradeEvent = serde_json::from_str(&row.event_data)?;
 
@@ -155,7 +175,7 @@ pub(crate) async fn mark_event_processed(
     pool: &SqlitePool,
     event_id: i64,
 ) -> Result<(), EventQueueError> {
-    sqlx::query!(
+    let result = sqlx::query!(
         r#"
         UPDATE event_queue
         SET processed = 1, processed_at = CURRENT_TIMESTAMP
@@ -166,13 +186,16 @@ pub(crate) async fn mark_event_processed(
     .execute(pool)
     .await?;
 
+    if result.rows_affected() == 0 {
+        return Err(EventQueueError::MissingEventId(event_id));
+    }
+
     Ok(())
 }
 
 /// Generic function to enqueue any event that implements Enqueueable
-#[allow(clippy::future_not_send)]
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(crate) async fn enqueue<E: Enqueueable>(
+pub(crate) async fn enqueue<E: Enqueueable + Sync>(
     pool: &SqlitePool,
     event: &E,
     log: &Log,
@@ -203,12 +226,12 @@ pub(crate) async fn enqueue_buffer(
                 }
             };
 
-            if let Err(e) = result {
+            if let Err(error) = result {
                 let event_type = match event {
                     TradeEvent::ClearV3(_) => "ClearV3",
                     TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
                 };
-                error!("Failed to enqueue buffered {event_type} event: {e}");
+                error!("Failed to enqueue buffered {event_type} event: {error}");
             }
         })
         .buffer_unordered(CONCURRENT_ENQUEUE_LIMIT)
@@ -245,12 +268,13 @@ pub(crate) async fn get_max_processed_block(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{B256, LogData, address, b256};
+
     use super::*;
     use crate::bindings::IOrderBookV5::{
         ClearConfigV2, ClearV3, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::{LogData, address, b256};
 
     #[tokio::test]
     async fn test_enqueue_and_process_event() {
@@ -274,7 +298,6 @@ mod tests {
             removed: false,
         };
 
-        // Create a test event
         let test_event = TradeEvent::ClearV3(Box::new(ClearV3 {
             sender: log.inner.address,
             alice: OrderV4::default(),
@@ -282,16 +305,13 @@ mod tests {
             clearConfig: ClearConfigV2::default(),
         }));
 
-        // Enqueue event
         enqueue_event(&pool, &log, test_event.clone())
             .await
             .unwrap();
 
-        // Check unprocessed count
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
 
-        // Get next unprocessed event
         let queued_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(queued_event.tx_hash, log.transaction_hash.unwrap());
         assert_eq!(queued_event.log_index, 5);
@@ -299,16 +319,13 @@ mod tests {
         assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
         assert!(!queued_event.processed);
 
-        // Mark as processed
         mark_event_processed(&pool, queued_event.id.unwrap())
             .await
             .unwrap();
 
-        // Check unprocessed count is now 0
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 0);
 
-        // Should return None for next unprocessed
         let next_event = get_next_unprocessed_event(&pool).await.unwrap();
         assert!(next_event.is_none());
     }
@@ -335,15 +352,13 @@ mod tests {
             removed: false,
         };
 
-        // Create a test event
         let test_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log.inner.address,
             config: TakeOrderConfigV4::default(),
-            input: alloy::primitives::B256::ZERO,
-            output: alloy::primitives::B256::ZERO,
+            input: B256::ZERO,
+            output: B256::ZERO,
         }));
 
-        // Enqueue same event twice
         enqueue_event(&pool, &log, test_event.clone())
             .await
             .unwrap();
@@ -351,7 +366,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Should only have one event due to unique constraint
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
     }
@@ -360,7 +374,6 @@ mod tests {
     async fn test_event_ordering() {
         let pool = setup_test_db().await;
 
-        // Create multiple events with different timestamps
         for i in 0..3 {
             let log = Log {
                 inner: alloy::primitives::Log {
@@ -387,7 +400,6 @@ mod tests {
             enqueue_event(&pool, &log, test_event).await.unwrap();
         }
 
-        // Events should be returned in creation order
         for i in 0..3 {
             let event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
             assert_eq!(event.log_index, i);
@@ -450,8 +462,8 @@ mod tests {
         let take_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log2.inner.address,
             config: TakeOrderConfigV4::default(),
-            input: alloy::primitives::B256::ZERO,
-            output: alloy::primitives::B256::ZERO,
+            input: B256::ZERO,
+            output: B256::ZERO,
         }));
 
         let event_buffer = vec![(clear_event, log1), (take_event, log2)];

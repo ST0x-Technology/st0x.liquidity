@@ -1,8 +1,10 @@
-//! Alpaca tokenization API client for mint and redemption operations.
+//! Alpaca tokenization API client for mint and redemption
+//! operations.
 //!
-//! This module provides a client for interacting with Alpaca's tokenization API,
-//! which enables converting offchain shares to onchain tokens (minting) and
-//! converting onchain tokens back to offchain shares (redemption).
+//! This module provides a client for interacting with Alpaca's
+//! tokenization API, which enables converting offchain shares to
+//! onchain tokens (minting) and converting onchain tokens back to
+//! offchain shares (redemption).
 //!
 //! # API Endpoints
 //!
@@ -227,7 +229,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|s| s.parse().map_err(serde::de::Error::custom))
+    opt.map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -240,8 +242,8 @@ where
 
     match opt {
         None => Ok(None),
-        Some(s) if s.is_empty() => Ok(None),
-        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -414,11 +416,15 @@ where
 
         if status.is_success() {
             let body = response.text().await?;
-            let tokenization_request: TokenizationRequest =
-                serde_json::from_str(&body).map_err(|e| {
-                    error!(body = %body, error = %e, "Failed to deserialize tokenization response");
-                    e
+            let tokenization_request: TokenizationRequest = serde_json::from_str(&body)
+                .inspect_err(|error| {
+                    error!(
+                        body = %body,
+                        error = %error,
+                        "Failed to deserialize tokenization response"
+                    );
                 })?;
+
             debug!(request_id = %tokenization_request.id.0, "Mint request created");
             return Ok(tokenization_request);
         }
@@ -484,10 +490,14 @@ where
             let body = response.text().await?;
             debug!(body = %body, "List requests response body");
 
-            let requests: Vec<TokenizationRequest> = serde_json::from_str(&body).map_err(|e| {
-                error!(body = %body, error = %e, "Failed to deserialize list requests response");
-                e
-            })?;
+            let requests: Vec<TokenizationRequest> =
+                serde_json::from_str(&body).inspect_err(|error| {
+                    error!(
+                        body = %body,
+                        error = %error,
+                        "Failed to deserialize list requests response"
+                    );
+                })?;
 
             return Ok(requests);
         }
@@ -511,7 +521,7 @@ where
 
         requests
             .into_iter()
-            .find(|r| r.id == *id)
+            .find(|request| request.id == *id)
             .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
     }
 
@@ -535,7 +545,7 @@ where
 
         let pending = match erc20.transfer(self.redemption_wallet, amount).send().await {
             Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
+            Err(error) => return Err(handle_contract_error(error).await),
         };
 
         let receipt = pending.get_receipt().await?;
@@ -566,7 +576,7 @@ where
 
         Ok(requests
             .into_iter()
-            .find(|r| r.tx_hash.as_ref() == Some(tx_hash)))
+            .find(|request| request.tx_hash.as_ref() == Some(tx_hash)))
     }
 
     /// Poll until a tokenization request reaches a terminal state (Completed or Rejected).
@@ -814,9 +824,8 @@ pub(crate) mod tests {
         });
 
         let request = create_mint_request();
-        let result = client.request_mint(request).await;
 
-        let err = result.unwrap_err();
+        let err = client.request_mint(request).await.unwrap_err();
         assert!(
             matches!(&err, AlpacaTokenizationError::InsufficientPosition { symbol } if symbol.to_string() == "AAPL"),
             "expected InsufficientPosition for AAPL, got: {err:?}"
@@ -842,9 +851,8 @@ pub(crate) mod tests {
         });
 
         let request = create_mint_request();
-        let result = client.request_mint(request).await;
 
-        let err = result.unwrap_err();
+        let err = client.request_mint(request).await.unwrap_err();
         assert!(
             matches!(&err, AlpacaTokenizationError::InvalidParameters { details } if details.contains("invalid wallet address")),
             "expected InvalidParameters with 'invalid wallet address', got: {err:?}"
@@ -1005,9 +1013,8 @@ pub(crate) mod tests {
         });
 
         let id = TokenizationRequestId("nonexistent".to_string());
-        let result = client.get_request(&id).await;
 
-        let err = result.unwrap_err();
+        let err = client.get_request(&id).await.unwrap_err();
         assert!(
             matches!(&err, AlpacaTokenizationError::RequestNotFound { id: found_id } if found_id.0 == "nonexistent"),
             "expected RequestNotFound, got: {err:?}"
@@ -1052,13 +1059,13 @@ pub(crate) mod tests {
         );
 
         let transfer_amount = U256::from(100_000u64);
-        let result = client
-            .send_tokens_for_redemption(token_address, transfer_amount)
-            .await;
 
         assert!(
-            result.is_ok(),
-            "expected successful transfer, got: {result:?}"
+            client
+                .send_tokens_for_redemption(token_address, transfer_amount)
+                .await
+                .is_ok(),
+            "expected successful transfer"
         );
 
         let balance = token
@@ -1195,10 +1202,9 @@ pub(crate) mod tests {
 
         let hash: TxHash =
             fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-        let result = client.find_redemption_by_tx(&hash).await.unwrap();
 
         assert!(
-            result.is_none(),
+            client.find_redemption_by_tx(&hash).await.unwrap().is_none(),
             "expected None when redemption not yet detected"
         );
 

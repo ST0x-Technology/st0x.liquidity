@@ -5,8 +5,7 @@ mod executor;
 mod market_hours;
 mod order;
 
-pub use AlpacaTradingApiError as Error;
-pub use auth::{AlpacaTradingApiAuthConfig, AlpacaTradingApiMode};
+pub use auth::{AlpacaTradingApiCtx, AlpacaTradingApiMode};
 pub use executor::AlpacaTradingApi;
 pub use market_hours::MarketHoursError;
 
@@ -28,8 +27,8 @@ pub enum AlpacaTradingApiError {
     InvalidOrderId(#[from] uuid::Error),
     #[error("Empty symbol")]
     EmptySymbol(#[from] crate::EmptySymbolError),
-    #[error("Invalid shares: {0}")]
-    InvalidShares(#[from] crate::InvalidSharesError),
+    #[error(transparent)]
+    NonPositive(#[from] crate::NonPositiveError),
     #[error("Decimal parse error: {0}")]
     DecimalParse(#[from] rust_decimal::Error),
     #[error("Num parse error: {0}")]

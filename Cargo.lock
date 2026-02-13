@@ -6643,6 +6643,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-event-sorcery"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cqrs-es",
+ "serde",
+ "serde_json",
+ "sqlite-es",
+ "sqlx",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "st0x-execution"
 version = "0.1.0"
 dependencies = [
@@ -6716,6 +6732,7 @@ dependencies = [
  "sqlite-es",
  "sqlx",
  "st0x-dto",
+ "st0x-event-sorcery",
  "st0x-execution",
  "temp-env",
  "tempfile",
