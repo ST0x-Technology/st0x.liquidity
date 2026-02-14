@@ -90,6 +90,9 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to reject before redemption was detected as pending
     #[error("Cannot reject: not in pending state")]
     NotPendingForRejection,
+    /// Attempted to send tokens when redemption is already in progress
+    #[error("Already started")]
+    AlreadyStarted,
     /// Attempted to modify a completed redemption operation
     #[error("Already completed")]
     AlreadyCompleted,
@@ -307,8 +310,9 @@ impl EventSourced for EquityRedemption {
         use EquityRedemptionEvent::*;
         match command {
             SendTokens { .. } => match self {
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                _ => Err(EquityRedemptionError::AlreadyCompleted),
+                _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
             Detect {
@@ -459,7 +463,9 @@ impl EquityRedemption {
 mod tests {
     use rust_decimal_macros::dec;
 
-    use st0x_event_sorcery::{Aggregate, Lifecycle, LifecycleError};
+    use st0x_event_sorcery::{
+        Aggregate, AggregateError, Lifecycle, LifecycleError, test_mem_store,
+    };
 
     use super::*;
 
@@ -935,5 +941,89 @@ mod tests {
 
         let result = EquityRedemption::originate(&event);
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn send_tokens_when_tokens_already_sent_returns_already_started() {
+        let store = test_mem_store::<EquityRedemption>(vec![], ());
+        let id = RedemptionAggregateId::new("redemption-1");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::SendTokens {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: dec!(10),
+                    redemption_wallet: Address::random(),
+                    tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .send(
+                &id,
+                EquityRedemptionCommand::SendTokens {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: dec!(10),
+                    redemption_wallet: Address::random(),
+                    tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AggregateError::UserError(LifecycleError::Apply(EquityRedemptionError::AlreadyStarted))
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_tokens_when_pending_returns_already_started() {
+        let store = test_mem_store::<EquityRedemption>(vec![], ());
+        let id = RedemptionAggregateId::new("redemption-1");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::SendTokens {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: dec!(10),
+                    redemption_wallet: Address::random(),
+                    tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Detect {
+                    tokenization_request_id: TokenizationRequestId("REQ123".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .send(
+                &id,
+                EquityRedemptionCommand::SendTokens {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: dec!(10),
+                    redemption_wallet: Address::random(),
+                    tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AggregateError::UserError(LifecycleError::Apply(EquityRedemptionError::AlreadyStarted))
+        ));
     }
 }

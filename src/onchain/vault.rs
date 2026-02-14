@@ -254,11 +254,11 @@ where
 
 /// Converts a Float (bytes32) amount to Decimal.
 ///
-/// Uses the rain-math-float library's format() method to convert the Float to a string,
-/// then parses it to Decimal for precise financial arithmetic.
+/// Uses format_with_scientific(false) to avoid scientific notation
+/// (e.g. "1e20") that Decimal::from_str cannot parse.
 fn float_to_decimal(float: B256) -> Result<Decimal, VaultError> {
     let float = Float::from_raw(float);
-    let formatted = float.format()?;
+    let formatted = float.format_with_scientific(false)?;
     Ok(formatted.parse::<Decimal>()?)
 }
 
@@ -274,6 +274,7 @@ mod tests {
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::transports::{RpcError, TransportErrorKind};
+    use proptest::prelude::*;
 
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
 
@@ -664,5 +665,72 @@ mod tests {
 
         let expected = FractionalShares::new(Decimal::from(700));
         assert_eq!(balance, expected, "Expected 700 shares but got {balance:?}");
+    }
+
+    /// Values with large exponents produce scientific notation from
+    /// Float::format(), which Decimal::from_str cannot parse.
+    /// format_with_scientific(false) prevents this.
+    #[test]
+    fn large_exponent_does_not_produce_scientific_notation() {
+        let float = Float::parse("100000000000000000000".to_string())
+            .expect("valid Float from decimal string");
+
+        let decimal = float_to_decimal(float.get_inner()).unwrap();
+        assert_eq!(decimal, Decimal::from(100_000_000_000_000_000_000_u128));
+    }
+
+    proptest! {
+        /// Roundtrip: decimal string -> Float::parse -> float_to_decimal ->
+        /// Decimal matches the original string.
+        #[test]
+        fn roundtrip_from_decimal_string(
+            integer in 0u64..1_000_000_000,
+            fraction in 0u32..1_000_000,
+        ) {
+            let input = format!("{integer}.{fraction:06}");
+            let float = Float::parse(input.clone()).map_err(|err| {
+                TestCaseError::Reject(format!("Float::parse rejected {input}: {err}").into())
+            })?;
+
+            let decimal = float_to_decimal(float.get_inner()).map_err(|err| {
+                TestCaseError::fail(format!(
+                    "float_to_decimal failed for {input}: {err}"
+                ))
+            })?;
+
+            // Re-parse original to compare as Decimal (avoids string format differences)
+            let expected: Decimal = input.parse().unwrap();
+            prop_assert_eq!(decimal, expected);
+        }
+
+        /// Roundtrip: random bytes -> float_to_decimal -> Float::parse ->
+        /// get_inner produces equivalent Float value.
+        #[test]
+        fn roundtrip_from_raw_bytes(raw in any::<[u8; 32]>()) {
+            let bytes = B256::from(raw);
+            let float = Float::from_raw(bytes);
+
+            // Skip values that rain-math-float considers invalid
+            if float.format_with_scientific(false).is_err() {
+                return Ok(());
+            }
+
+            let decimal = match float_to_decimal(bytes) {
+                Ok(dec) => dec,
+                Err(_) => return Ok(()),
+            };
+
+            let roundtripped = Float::parse(decimal.to_string()).map_err(|err| {
+                TestCaseError::fail(format!(
+                    "Float::parse failed on float_to_decimal output '{decimal}': {err}"
+                ))
+            })?;
+
+            // Compare via formatted decimal strings (Float internal representation
+            // may differ but the decimal value should be equivalent)
+            let original_str = float.format_with_scientific(false).unwrap();
+            let roundtripped_str = roundtripped.format_with_scientific(false).unwrap();
+            prop_assert_eq!(original_str, roundtripped_str);
+        }
     }
 }

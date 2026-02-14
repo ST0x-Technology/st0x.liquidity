@@ -249,11 +249,11 @@ impl DomainEvent for InventorySnapshotEvent {
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
-    use st0x_event_sorcery::Aggregate;
     use std::str::FromStr;
 
+    use st0x_event_sorcery::{Aggregate, Lifecycle};
+
     use super::*;
-    use st0x_event_sorcery::Lifecycle;
 
     type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 
