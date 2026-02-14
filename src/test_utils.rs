@@ -142,12 +142,6 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_equity_token(mut self, token: alloy::primitives::Address) -> Self {
-        self.trade.equity_token = token;
-        self
-    }
-
-    #[must_use]
     pub(crate) fn with_amount(mut self, amount: f64) -> Self {
         self.trade.amount = amount;
         self

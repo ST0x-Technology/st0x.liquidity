@@ -25,6 +25,7 @@ use crate::shares::SharesConversionError;
 pub(crate) mod accumulator;
 pub(crate) mod backfill;
 mod clear;
+pub(crate) mod event_processor;
 pub(crate) mod io;
 pub(crate) mod position_calculator;
 pub(crate) mod pyth;

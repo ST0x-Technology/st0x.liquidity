@@ -4,14 +4,14 @@
 //! directional exposure by executing offsetting trades on
 //! traditional brokerages.
 
+use apalis_sql::sqlite::SqliteStorage;
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{error, info, info_span, warn};
+use tracing::{error, info, info_span};
 
 use st0x_dto::ServerMessage;
-
 mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
@@ -48,7 +48,7 @@ pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 #[cfg(test)]
 pub mod test_utils;
 
-use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
+use st0x_execution::{Executor, MockExecutorCtx, TryIntoExecutor};
 
 use crate::config::{BrokerCtx, Ctx};
 
@@ -57,7 +57,26 @@ pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     let _enter = launch_span.enter();
 
     let pool = ctx.get_sqlite_pool().await?;
-    sqlx::migrate!().run(&pool).await?;
+
+    // Both apalis and our code use sqlx migrations, which share a single
+    // `_sqlx_migrations` table. Each migrator validates that all previously
+    // applied migrations exist in its own migration set -- so running either
+    // migrator after the other will fail with `VersionMissing` unless both
+    // use `set_ignore_missing(true)`.
+    //
+    // We cannot call `SqliteStorage::setup()` because it runs apalis
+    // migrations without `ignore_missing`. Instead, we get the apalis
+    // migrator directly and run both with `ignore_missing`.
+    sqlx::query("PRAGMA journal_mode = 'WAL'")
+        .execute(&pool)
+        .await?;
+
+    SqliteStorage::<()>::migrations()
+        .set_ignore_missing(true)
+        .run(&pool)
+        .await?;
+
+    sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
 
@@ -160,90 +179,31 @@ async fn run(
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
-    const RERUN_DELAY_SECS: u64 = 10;
-
-    loop {
-        let result = Box::pin(run_bot_session(&ctx, &pool, event_sender.clone())).await;
-
-        match result {
-            Ok(()) => {
-                info!("Bot session completed successfully");
-                break Ok(());
-            }
-            Err(e) => {
-                if let Some(execution_error) = e.downcast_ref::<ExecutionError>()
-                    && matches!(
-                        execution_error,
-                        ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
-                    )
-                {
-                    warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
-                    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-                    continue;
-                }
-
-                error!("Bot session failed: {e}");
-                return Err(e);
-            }
-        }
-    }
-}
-
-#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
-async fn run_bot_session(
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()> {
     match &ctx.broker {
         BrokerCtx::DryRun => {
             info!("Initializing test executor for dry-run mode");
             let executor = MockExecutorCtx.try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            Box::pin(run_with_executor(ctx, pool, executor, event_sender)).await
         }
         BrokerCtx::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let executor = schwab_ctx.try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            Box::pin(run_with_executor(ctx, pool, executor, event_sender)).await
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             info!("Initializing Alpaca Trading API executor");
             let executor = alpaca_auth.clone().try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            Box::pin(run_with_executor(ctx, pool, executor, event_sender)).await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             info!("Initializing Alpaca Broker API executor");
             let executor = alpaca_auth.clone().try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            Box::pin(run_with_executor(ctx, pool, executor, event_sender)).await
         }
     }
 }
@@ -255,12 +215,17 @@ async fn run_with_executor<E>(
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()>
 where
-    E: Executor + Clone + Send + 'static,
+    E: Executor + Clone + Send + Sync + Unpin + 'static,
     conductor::EventProcessingError: From<E::Error>,
 {
     let executor_maintenance = executor.run_executor_maintenance().await;
 
-    conductor::run_market_hours_loop(executor, ctx, pool, executor_maintenance, event_sender).await
+    let handle =
+        conductor::start(&ctx, &pool, executor, executor_maintenance, event_sender).await?;
+
+    handle.wait().await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -272,7 +237,16 @@ mod tests {
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        SqliteStorage::<()>::migrations()
+            .set_ignore_missing(true)
+            .run(&pool)
+            .await
+            .unwrap();
+        sqlx::migrate!()
+            .set_ignore_missing(true)
+            .run(&pool)
+            .await
+            .unwrap();
         pool
     }
 

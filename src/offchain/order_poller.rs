@@ -1,16 +1,25 @@
 //! Polls broker APIs for order status updates and reconciles fills.
+//!
+//! The core polling logic lives in [`PollOrderStatusCtx`], which performs
+//! a single polling cycle. [`PollOrderStatusJob`] wraps this as an apalis
+//! job, while [`OrderStatusPoller`] wraps it in an interval-based loop
+//! for direct spawning.
 
+use apalis::prelude::Data;
 use num_traits::ToPrimitive;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use st0x_execution::{ExecutionError, Executor, OrderState, OrderStatus, PersistenceError, Symbol};
+use std::fmt;
+use std::marker::PhantomData;
 use std::time::Duration;
-use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
 use super::execution::{
     OffchainExecution, find_execution_by_id, find_executions_by_symbol_status_and_broker,
 };
+use crate::conductor::job::{Job, Label};
 use crate::dual_write::DualWriteContext;
 use crate::lock::{clear_execution_lease, clear_pending_execution_id, renew_execution_lease};
 use crate::onchain::OnChainError;
@@ -49,49 +58,22 @@ impl Default for OrderPollerConfig {
     }
 }
 
-pub struct OrderStatusPoller<E: Executor> {
-    config: OrderPollerConfig,
-    pool: SqlitePool,
-    interval: Interval,
-    executor: E,
-    dual_write_context: DualWriteContext,
+/// Runtime dependencies for order status polling.
+///
+/// Contains everything needed to perform a single polling iteration.
+/// Used both by [`PollOrderStatusJob`] (apalis) and
+/// [`OrderStatusPoller`] (direct spawning).
+#[derive(Clone)]
+pub(crate) struct PollOrderStatusCtx<E> {
+    pub(crate) pool: SqlitePool,
+    pub(crate) executor: E,
+    pub(crate) dual_write_context: DualWriteContext,
+    pub(crate) max_jitter: Duration,
 }
 
-impl<E: Executor> OrderStatusPoller<E> {
-    pub fn new(
-        config: OrderPollerConfig,
-        pool: SqlitePool,
-        executor: E,
-        dual_write_context: DualWriteContext,
-    ) -> Self {
-        let interval = interval(config.polling_interval);
-
-        Self {
-            config,
-            pool,
-            interval,
-            executor,
-            dual_write_context,
-        }
-    }
-
-    pub async fn run(mut self) -> Result<(), OrderPollingError> {
-        info!(
-            "Starting order status poller with interval: {:?}",
-            self.config.polling_interval
-        );
-
-        loop {
-            self.interval.tick().await;
-
-            if let Err(e) = self.poll_pending_orders().await {
-                error!("Polling cycle failed: {e}");
-            }
-        }
-    }
-
+impl<E: Executor> PollOrderStatusCtx<E> {
     #[tracing::instrument(skip(self), level = tracing::Level::DEBUG)]
-    async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
+    pub(crate) async fn poll_once(&self) -> Result<(), OrderPollingError> {
         debug!("Starting polling cycle for submitted orders");
 
         let executor_type = self.executor.to_supported_executor();
@@ -160,7 +142,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             .await
     }
 
-    async fn process_order_state(
+    pub(crate) async fn process_order_state(
         &self,
         execution_id: i64,
         order_id: &str,
@@ -172,7 +154,8 @@ impl<E: Executor> OrderStatusPoller<E> {
             OrderState::Failed { .. } => self.handle_failed_order(execution_id, order_state).await,
             OrderState::Pending | OrderState::Submitted { .. } => {
                 debug!(
-                    "Order {order_id} (execution {execution_id}) still pending with state: {order_state:?}"
+                    "Order {order_id} (execution {execution_id}) \
+                     still pending with state: {order_state:?}"
                 );
 
                 let mut tx = self.pool.begin().await?;
@@ -192,7 +175,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         }
     }
 
-    async fn handle_filled_order(
+    pub(crate) async fn handle_filled_order(
         &self,
         execution_id: i64,
         order_state: &OrderState,
@@ -234,7 +217,8 @@ impl<E: Executor> OrderStatusPoller<E> {
             crate::dual_write::record_fill(&self.dual_write_context, execution_with_state).await
         {
             error!(
-                "Failed to execute OffchainOrder::CompleteFill command for execution {execution_id}: {e}"
+                "Failed to execute OffchainOrder::CompleteFill \
+                 command for execution {execution_id}: {e}"
             );
         }
 
@@ -246,13 +230,15 @@ impl<E: Executor> OrderStatusPoller<E> {
         .await
         {
             error!(
-                "Failed to execute Position::CompleteOffChainOrder command for execution {execution_id}, symbol {}: {e}",
+                "Failed to execute Position::CompleteOffChainOrder \
+                 command for execution {execution_id}, \
+                 symbol {}: {e}",
                 execution_with_state.symbol
             );
         }
     }
 
-    async fn handle_failed_order(
+    pub(crate) async fn handle_failed_order(
         &self,
         execution_id: i64,
         order_state: &OrderState,
@@ -285,7 +271,8 @@ impl<E: Executor> OrderStatusPoller<E> {
         .await
         {
             error!(
-                "Failed to execute OffchainOrder::MarkFailed command for execution {execution_id}: {e}"
+                "Failed to execute OffchainOrder::MarkFailed \
+                 command for execution {execution_id}: {e}"
             );
         }
 
@@ -298,7 +285,9 @@ impl<E: Executor> OrderStatusPoller<E> {
         .await
         {
             error!(
-                "Failed to execute Position::FailOffChainOrder command for execution {execution_id}, symbol {symbol}: {e}"
+                "Failed to execute Position::FailOffChainOrder \
+                 command for execution {execution_id}, \
+                 symbol {symbol}: {e}"
             );
         }
     }
@@ -328,13 +317,54 @@ impl<E: Executor> OrderStatusPoller<E> {
     }
 
     async fn add_jittered_delay(&self) {
-        if self.config.max_jitter > Duration::ZERO {
-            let max_jitter_u128 = self.config.max_jitter.as_millis().min(u128::from(u64::MAX));
+        if self.max_jitter > Duration::ZERO {
+            let max_jitter_u128 = self.max_jitter.as_millis().min(u128::from(u64::MAX));
             let max_jitter_millis = max_jitter_u128.to_u64().unwrap_or(u64::MAX);
             let jitter_millis = rand::thread_rng().gen_range(0..max_jitter_millis);
             let jitter = Duration::from_millis(jitter_millis);
             tokio::time::sleep(jitter).await;
         }
+    }
+}
+
+/// Apalis job that performs a single order status polling cycle.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct PollOrderStatusJob<E>(#[serde(skip)] PhantomData<E>);
+
+impl<E> fmt::Debug for PollOrderStatusJob<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PollOrderStatusJob").finish()
+    }
+}
+
+impl<E> Clone for PollOrderStatusJob<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Copy for PollOrderStatusJob<E> {}
+
+impl<E> Default for PollOrderStatusJob<E> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<E> Job for PollOrderStatusJob<E>
+where
+    E: Executor + Clone + Send + Sync + Unpin + 'static,
+{
+    type Ctx = PollOrderStatusCtx<E>;
+    type Error = OrderPollingError;
+
+    fn label(&self) -> Label {
+        Label::new("poll-order-status")
+    }
+
+    async fn run(self, ctx: Data<Self::Ctx>) -> Result<(), Self::Error> {
+        ctx.poll_once().await
     }
 }
 
@@ -385,6 +415,19 @@ mod tests {
     use crate::offchain_order::BrokerOrderId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+
+    fn test_ctx(
+        pool: SqlitePool,
+        executor: MockExecutor,
+        dual_write_context: DualWriteContext,
+    ) -> PollOrderStatusCtx<MockExecutor> {
+        PollOrderStatusCtx {
+            pool,
+            executor,
+            dual_write_context,
+            max_jitter: Duration::ZERO,
+        }
+    }
 
     async fn setup_position_with_onchain_fill(
         dual_write_context: &DualWriteContext,
@@ -437,11 +480,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_poll_order_status_job_delegates_to_poll_once() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let executor = MockExecutor::default();
+        let ctx = test_ctx(pool, executor, dual_write_context);
+
+        let job: PollOrderStatusJob<MockExecutor> = PollOrderStatusJob::default();
+        job.run(Data::new(ctx)).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_handle_filled_order_executes_dual_write_commands() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let executor = MockExecutor::default();
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
@@ -482,9 +535,8 @@ mod tests {
             executed_at: Utc::now(),
         };
 
-        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-        poller
-            .handle_filled_order(execution_id, &filled_state)
+        let ctx = test_ctx(pool.clone(), executor, dual_write_context);
+        ctx.handle_filled_order(execution_id, &filled_state)
             .await
             .unwrap();
 
@@ -522,8 +574,7 @@ mod tests {
     async fn test_handle_failed_order_executes_dual_write_commands() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let executor = MockExecutor::default();
 
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
@@ -563,9 +614,8 @@ mod tests {
             error_reason: Some("Broker API timeout".to_string()),
         };
 
-        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-        poller
-            .handle_failed_order(execution_id, &failed_state)
+        let ctx = test_ctx(pool.clone(), executor, dual_write_context);
+        ctx.handle_failed_order(execution_id, &failed_state)
             .await
             .unwrap();
 
@@ -657,10 +707,9 @@ mod tests {
     async fn test_finalize_order_returns_execution_not_found_error_for_missing_execution() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let executor = MockExecutor::default();
 
-        let poller = OrderStatusPoller::new(config, pool, broker, dual_write_context);
+        let ctx = test_ctx(pool, executor, dual_write_context);
 
         let nonexistent_execution_id = 99999;
         let filled_state = OrderState::Filled {
@@ -669,7 +718,7 @@ mod tests {
             executed_at: Utc::now(),
         };
 
-        let result = poller
+        let result = ctx
             .handle_filled_order(nonexistent_execution_id, &filled_state)
             .await;
 
@@ -695,8 +744,7 @@ mod tests {
     async fn test_handle_filled_order_clears_pending_execution_id_and_symbol_lock() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let executor = MockExecutor::default();
 
         let symbol = Symbol::new("BMNR").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(1))).unwrap();
@@ -740,9 +788,8 @@ mod tests {
             executed_at: Utc::now(),
         };
 
-        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-        poller
-            .handle_filled_order(execution_id, &filled_state)
+        let ctx = test_ctx(pool.clone(), executor, dual_write_context);
+        ctx.handle_filled_order(execution_id, &filled_state)
             .await
             .expect("handle_filled_order should succeed");
 
@@ -764,13 +811,11 @@ mod tests {
     async fn test_process_pending_order_renews_execution_lease() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let executor = MockExecutor::default();
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
 
-        // Create execution in SUBMITTED state
         let mut tx = pool.begin().await.unwrap();
         let submitted_state = OrderState::Submitted {
             order_id: "ORD123".to_string(),
@@ -787,19 +832,19 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        // Set up a symbol lock with an old timestamp (10 minutes ago)
         let symbol_str = symbol.to_string();
         sqlx::query(
-            "INSERT INTO symbol_locks (symbol, locked_at) VALUES (?1, datetime('now', '-10 minutes'))",
+            "INSERT INTO symbol_locks (symbol, locked_at) \
+             VALUES (?1, datetime('now', '-10 minutes'))",
         )
         .bind(&symbol_str)
         .execute(&pool)
         .await
         .unwrap();
 
-        // Verify the lock has old timestamp
         let old_lock_count: i64 = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM symbol_locks WHERE symbol = ?1 AND locked_at < datetime('now', '-5 minutes')",
+            "SELECT COUNT(*) FROM symbol_locks \
+             WHERE symbol = ?1 AND locked_at < datetime('now', '-5 minutes')",
             symbol_str
         )
         .fetch_one(&pool)
@@ -810,17 +855,15 @@ mod tests {
             "Lock should have old timestamp before processing"
         );
 
-        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
+        let ctx = test_ctx(pool.clone(), executor, dual_write_context);
 
-        // Process order state as still Submitted - should renew the lease
-        poller
-            .process_order_state(execution_id, "ORD123", &submitted_state, &symbol)
+        ctx.process_order_state(execution_id, "ORD123", &submitted_state, &symbol)
             .await
             .expect("process_order_state should succeed");
 
-        // Verify the lock timestamp was renewed (now recent, not old)
         let renewed_lock_count: i64 = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM symbol_locks WHERE symbol = ?1 AND locked_at > datetime('now', '-1 minute')",
+            "SELECT COUNT(*) FROM symbol_locks \
+             WHERE symbol = ?1 AND locked_at > datetime('now', '-1 minute')",
             symbol_str
         )
         .fetch_one(&pool)
@@ -836,13 +879,11 @@ mod tests {
     async fn test_process_pending_order_without_lock_does_not_fail() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockExecutor::default();
-        let config = OrderPollerConfig::default();
+        let executor = MockExecutor::default();
 
         let symbol = Symbol::new("MSFT").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
 
-        // Create execution in SUBMITTED state but no symbol lock
         let mut tx = pool.begin().await.unwrap();
         let submitted_state = OrderState::Submitted {
             order_id: "ORD456".to_string(),
@@ -859,10 +900,9 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
+        let ctx = test_ctx(pool.clone(), executor, dual_write_context);
 
-        // Processing should succeed even without a lock (renewal returns false but doesn't error)
-        let result = poller
+        let result = ctx
             .process_order_state(execution_id, "ORD456", &submitted_state, &symbol)
             .await;
 

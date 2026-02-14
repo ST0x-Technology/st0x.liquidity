@@ -10,35 +10,35 @@ For the architectural overview and job processing flows, see
 
 ```
 task-supervisor (outermost - runs indefinitely, restarts crashed tasks)
-  |-- DEX WebSocket listener
-  +-- apalis Monitor (the entire worker pool)
+  |-- apalis Monitor (event processing worker pool)
+  |-- Event receiver (WS -> SqliteStorage)
+  |-- Order poller (interval-based)
+  |-- Position checker (interval-based)
+  |-- Inventory poller (interval-based, optional)
+  |-- Executor maintenance (optional, one-shot)
+  +-- Rebalancer (optional, one-shot)
 
-apalis (work layer - finite jobs with persistent queue)
-  |-- ProcessOnchainEvent        (persistent, event-driven)
-  |-- PlaceOffchainOrder         (persistent, event-driven)
-  |-- EnrichOnchainTrade         (persistent, event-driven)
-  |-- ExecuteRebalancing         (persistent, event-driven)
-  |-- ExecuteMint                (persistent, event-driven)
-  |-- ExecuteRedemption          (persistent, event-driven)
-  |-- PollOrderStatus            (cron, 5s)
-  |-- CheckAccumulatedPositions  (cron, 10s)
-  |-- PollInventory              (cron, 60s)
-  |-- ExecutorMaintenance        (cron, 30min)
-  +-- ComputeAnalytics           (cron, future)
+apalis (work layer - persistent job queue)
+  +-- ProcessOnchainEvent (persistent, event-driven)
 ```
 
 **task-supervisor** handles anything that must run indefinitely. Each task
 implements `SupervisedTask` and is registered with a `SupervisorBuilder`. The
-supervisor restarts crashed tasks with exponential backoff. The DEX WebSocket
-listener has its own internal reconnect logic for transient failures; the
-supervisor handles catastrophic failures (panics, unexpected exits).
+supervisor restarts crashed tasks with exponential backoff.
 
-**apalis** handles finite jobs. It gives us retry with backoff, persistence
-across restarts, ordered execution within a worker, and visibility into job
-state - all backed by the same SQLite database the rest of the system uses.
+Cron-like tasks (order poller, position checker, inventory poller) are
+`SupervisedTask` implementations with an internal `tokio::time::interval` loop.
+Pre-spawned tasks (executor maintenance, rebalancer) are wrapped in
+`JoinHandleTask` which waits on the existing `JoinHandle`.
 
-The bridge: supervised tasks detect events and push typed apalis jobs to the
-persistent queue.
+**apalis** handles persistent event processing. `ProcessOnchainEventJob` is the
+only apalis job type. It provides retry with backoff, persistence across
+restarts, and ordered execution - all backed by the same SQLite database the
+rest of the system uses.
+
+The bridge: the event receiver task receives blockchain events from WebSocket
+streams and pushes `ProcessOnchainEventJob` instances to `SqliteStorage`. The
+apalis Monitor picks them up and processes them.
 
 ## task-supervisor API
 
@@ -60,14 +60,13 @@ their dependencies as plain struct fields (no DI framework).
 ### SupervisorBuilder
 
 ```rust
-SupervisorBuilder::default()
-    .with_task("dex-websocket", ws_listener)
+SupervisorBuilder::new()
+    .with_task("order-poller", order_poller_task)
+    .with_task("position-checker", position_checker_task)
     .with_task("apalis-monitor", monitor_task)
+    .with_task("event-receiver", receiver_task)
     .with_unlimited_restarts()
     .with_base_restart_delay(Duration::from_secs(5))
-    .with_max_backoff_exponent(5)        // caps at 5s * 2^5 = 160s
-    .with_health_check_interval(Duration::from_millis(200))
-    .with_task_being_stable_after(Duration::from_secs(80))
     .build()
     .run()  // -> SupervisorHandle
 ```
@@ -94,8 +93,8 @@ restart limit).
 
 ## apalis API
 
-[apalis](https://github.com/apalis-dev/apalis) (v1.0.0-rc.4) is a tower-based
-job processing framework.
+[apalis](https://github.com/apalis-dev/apalis) (v0.7.4) is a tower-based job
+processing framework.
 
 ### Job trait
 
@@ -115,48 +114,30 @@ trait Job:
 ```
 
 Each job is a serializable struct. Its `Ctx` associated type holds all
-dependencies (CQRS instances, backend handles, view repos) as a single struct:
+dependencies (CQRS instances, backend handles, caches) as a single struct:
 
 ```rust
 #[derive(Clone)]
-struct PlaceOffchainOrderCtx {
-    position_cqrs: Arc<SqliteCqrs<Position>>,
-    offchain_order_cqrs: Arc<SqliteCqrs<OffchainOrder>>,
-    broker: Arc<dyn Executor>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PlaceOffchainOrder { symbol: Symbol, shares: Shares }
-
-impl Job for PlaceOffchainOrder {
-    type Ctx = PlaceOffchainOrderCtx;
-    type Error = PlaceOffchainOrderError;
-
-    fn label(&self) -> Label { Label::new("place-offchain-order") }
-
-    async fn run(self, ctx: Data<Self::Ctx>) -> Result<(), Self::Error> {
-        // ...
-    }
+struct ProcessOnchainEventCtx<P, E> {
+    pool: SqlitePool,
+    ctx: Ctx,
+    executor: E,
+    provider: P,
+    dual_write_context: DualWriteContext,
+    cache: SymbolCache,
+    feed_id_cache: Arc<FeedIdCache>,
+    vault_registry_cqrs: Arc<SqliteCqrs<VaultRegistryAggregate>>,
 }
 ```
 
 ### Worker registration
 
 ```rust
-let monitor = Monitor::new();
-
-monitor.register(
-    WorkerBuilder::new("place-offchain-order")
-        .data(place_order_ctx)
-        .backend(storage.clone())
-        .build_fn(PlaceOffchainOrder::run),
-);
-
-monitor.register(
-    WorkerBuilder::new("poll-order-status")
-        .data(poll_ctx)
-        .backend(cron_storage)
-        .build_fn(PollOrderStatus::run),
+let monitor = Monitor::new().register(
+    WorkerBuilder::new("process-onchain-event")
+        .data(process_ctx)
+        .backend(event_storage.clone())
+        .build_fn(ProcessOnchainEventJob::run),
 );
 ```
 
@@ -189,19 +170,20 @@ in `_sqlx_migrations`. Use `sqlx migrate run --ignore-missing`.
 
 1. **Run migrations** - apalis migrations first, then app migrations (both with
    `set_ignore_missing(true)`)
-2. **Build CQRS frameworks** - one `SqliteCqrs<A>` per aggregate, with query
-   processors and Services wired in
-3. **Build apalis workers** - one `WorkerBuilder` per job type, each with its
-   `Ctx` and backend
-4. **Build apalis Monitor** - register all workers
-5. **Build supervised tasks** - wrap the Monitor and the DEX WebSocket listener
+2. **Connect WebSocket** - subscribe to ClearV3 and TakeOrderV3 event streams
+3. **Backfill events** - determine cutoff block, backfill missed events
+4. **Build CQRS frameworks** - one `SqliteCqrs<A>` per aggregate
+5. **Build ProcessOnchainEventCtx** - bundles all processing dependencies
+6. **Drain legacy event_queue** - migrate unprocessed events from the legacy
+   `event_queue` table to apalis `SqliteStorage`
+7. **Spawn Monitor and receiver** - Monitor processes jobs from storage;
+   receiver pushes new blockchain events to storage
+8. **Build supervised tasks** - wrap pollers, maintenance, and spawned handles
    as `SupervisedTask` impls
-6. **Start supervisor** -
-   `SupervisorBuilder::default().with_task(...).build()
-   .run()` returns a
+9. **Start supervisor** -
+   `SupervisorBuilder::new().with_task(...).build().run()` returns a
    `SupervisorHandle`
-7. **Wait** - `handle.wait()` blocks until shutdown
+10. **Wait** - `handle.wait()` blocks until shutdown
 
-The supervisor runs both tasks concurrently. The WebSocket listener pushes jobs
-to the persistent queue as blockchain events arrive. The apalis Monitor
-processes them through the registered workers.
+The `start()` function in `src/conductor/mod.rs` replaces the old `Conductor`
+struct. It returns a `SupervisorHandle` that the caller waits on.
