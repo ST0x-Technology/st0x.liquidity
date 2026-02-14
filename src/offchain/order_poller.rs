@@ -359,7 +359,7 @@ mod tests {
         Arc<Store<Position>>,
     ) {
         (
-            Projection::<OffchainOrder>::sqlite(pool.clone(), "offchain_order_view"),
+            Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap(),
             Arc::new(test_store(
                 pool.clone(),
                 vec![],
@@ -451,7 +451,8 @@ mod tests {
     #[tokio::test]
     async fn test_handle_filled_order_executes_cqrs_commands() {
         let pool = setup_test_db().await;
-        let (offchain_order_store, position_store) = create_test_frameworks(&pool);
+        let (offchain_order_projection, offchain_order_store, position_store) =
+            create_test_frameworks(&pool);
         let broker = MockExecutor::default();
         let ctx = OrderPollerCtx::default();
 
@@ -478,6 +479,7 @@ mod tests {
             ctx,
             pool.clone(),
             broker,
+            offchain_order_projection,
             offchain_order_store,
             position_store,
         );
@@ -536,7 +538,8 @@ mod tests {
     #[tokio::test]
     async fn test_handle_failed_order_executes_cqrs_commands() {
         let pool = setup_test_db().await;
-        let (offchain_order_store, position_store) = create_test_frameworks(&pool);
+        let (offchain_order_projection, offchain_order_store, position_store) =
+            create_test_frameworks(&pool);
         let broker = MockExecutor::default();
         let ctx = OrderPollerCtx::default();
 
@@ -563,6 +566,7 @@ mod tests {
             ctx,
             pool.clone(),
             broker,
+            offchain_order_projection,
             offchain_order_store,
             position_store,
         );

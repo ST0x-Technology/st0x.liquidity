@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use st0x_execution::Symbol;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Table};
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -74,6 +74,7 @@ impl EventSourced for VaultRegistry {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "VaultRegistry";
+    const PROJECTION: Option<Table> = None;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use st0x_execution::{Direction, Symbol};
 
-use st0x_event_sorcery::{DomainEvent, EventSourced};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OnChainTradeId {
@@ -80,6 +80,7 @@ impl EventSourced for OnChainTrade {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
+    const PROJECTION: Option<Table> = None;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

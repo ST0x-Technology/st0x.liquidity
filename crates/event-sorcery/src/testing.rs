@@ -221,6 +221,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::Table;
 
     /// Minimal counter entity for testing replay and harness.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

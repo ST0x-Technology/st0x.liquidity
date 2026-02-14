@@ -71,7 +71,7 @@ impl QueryManifest {
         inventory: Arc<RwLock<InventoryView>>,
         operation_sender: mpsc::Sender<TriggeredOperation>,
         event_sender: broadcast::Sender<ServerMessage>,
-    ) -> Self {
+    ) -> Result<Self, st0x_event_sorcery::ProjectionError> {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,
             pool.clone(),
@@ -83,13 +83,13 @@ impl QueryManifest {
 
         let event_broadcaster = EventBroadcaster::new(event_sender);
 
-        let position_view = Projection::<Position>::sqlite(pool, "position_view");
+        let position_view = Projection::<Position>::sqlite(pool)?;
 
-        Self {
+        Ok(Self {
             rebalancing_trigger: Unwired::new(rebalancing_trigger),
             event_broadcaster: Unwired::new(event_broadcaster),
             position_view,
-        }
+        })
     }
 
     /// Wires all query processors and builds their CQRS frameworks.

@@ -15,7 +15,7 @@ use st0x_execution::{
     SupportedExecutor, Symbol,
 };
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, Store, StoreBuilder};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, Store, StoreBuilder, Table};
 
 /// Constructs the offchain order CQRS framework with its view
 /// query. Used by CLI code.
@@ -23,7 +23,7 @@ pub(crate) async fn build_offchain_order_cqrs(
     pool: &SqlitePool,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<(Arc<Store<OffchainOrder>>, Projection<OffchainOrder>)> {
-    let projection = Projection::<OffchainOrder>::sqlite(pool.clone(), "offchain_order_view");
+    let projection = Projection::<OffchainOrder>::sqlite(pool.clone())?;
 
     let store = StoreBuilder::new(pool.clone())
         .with_projection(&projection)
@@ -94,6 +94,7 @@ impl EventSourced for OffchainOrder {
     type Services = Arc<dyn OrderPlacer>;
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
+    const PROJECTION: Option<Table> = Some(Table("offchain_order_view"));
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

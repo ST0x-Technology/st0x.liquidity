@@ -22,7 +22,7 @@ use sqlx::SqlitePool;
 use tracing::info;
 
 use crate::lifecycle::{Lifecycle, Never};
-use crate::{DomainEvent, EventSourced};
+use crate::{DomainEvent, EventSourced, Table};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";

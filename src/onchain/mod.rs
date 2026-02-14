@@ -125,6 +125,8 @@ pub(crate) enum OnChainError {
     Json(#[from] serde_json::Error),
     #[error("UUID parse error: {0}")]
     Uuid(#[from] uuid::Error),
+    #[error("Projection query error: {0}")]
+    Projection(#[from] st0x_event_sorcery::ProjectionError),
 }
 
 impl From<sqlx::Error> for OnChainError {

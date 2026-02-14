@@ -328,8 +328,12 @@ impl Conductor {
         };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let offchain_order_query =
+            Arc::new(Projection::<OffchainOrder>::sqlite(pool.clone())?);
+
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .with_projection(&*offchain_order_query)
                 .build(order_placer)
                 .await?,
         );
@@ -345,6 +349,7 @@ impl Conductor {
             position,
             position_query,
             offchain_order,
+            offchain_order_query,
             vault_registry,
             snapshot,
         };
@@ -451,7 +456,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         inventory.clone(),
         operation_sender,
         event_sender,
-    );
+    )?;
 
     let (built, wired) = manifest.wire(pool.clone()).await?;
 
@@ -501,7 +506,7 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
 async fn build_position_cqrs(
     pool: &SqlitePool,
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
-    let position_view = Projection::<Position>::sqlite(pool.clone(), "position_view");
+    let position_view = Projection::<Position>::sqlite(pool.clone())?;
 
     let store = StoreBuilder::<Position>::new(pool.clone())
         .with_projection(&position_view)
@@ -2688,7 +2693,7 @@ mod tests {
     ) -> (CqrsFrameworks, Projection<OffchainOrder>) {
         let onchain_trade = Arc::new(st0x_event_sorcery::test_store(pool.clone(), vec![], ()));
 
-        let position_projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
                 .with_projection(&position_projection)
@@ -2698,7 +2703,7 @@ mod tests {
         );
 
         let offchain_order_projection =
-            Projection::<OffchainOrder>::sqlite(pool.clone(), "offchain_order_view");
+            Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .with_projection(&offchain_order_projection)
@@ -2710,16 +2715,19 @@ mod tests {
         let vault_registry = st0x_event_sorcery::test_store(pool.clone(), vec![], ());
         let snapshot = st0x_event_sorcery::test_store(pool.clone(), vec![], ());
 
+        let offchain_order_query = Arc::new(offchain_order_projection);
+
         (
             CqrsFrameworks {
                 onchain_trade,
                 position,
                 position_query: Arc::new(position_projection),
                 offchain_order,
+                offchain_order_query: offchain_order_query.clone(),
                 vault_registry,
                 snapshot,
             },
-            offchain_order_projection,
+            offchain_order_query,
         )
     }
 
@@ -3270,7 +3278,7 @@ mod tests {
             operation_sender,
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
                 .with_projection(&projection)
@@ -3351,7 +3359,7 @@ mod tests {
             operation_sender,
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
                 .with_projection(&projection)
@@ -3453,7 +3461,7 @@ mod tests {
             operation_sender,
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
                 .with_projection(&projection)
@@ -3579,7 +3587,7 @@ mod tests {
             operation_sender,
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
                 .with_projection(&projection)

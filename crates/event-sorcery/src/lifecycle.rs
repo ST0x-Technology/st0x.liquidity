@@ -298,7 +298,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::EventSourced;
+    use crate::{EventSourced, Table};
 
     /// Test entity: a simple counter with controllable error behavior.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

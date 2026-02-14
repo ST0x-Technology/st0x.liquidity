@@ -231,6 +231,7 @@ impl EventSourced for EquityRedemption {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "EquityRedemption";
+    const PROJECTION: Option<Table> = None;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

@@ -1,4 +1,3 @@
-use sqlx::SqlitePool;
 use tracing::{debug, info};
 
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};

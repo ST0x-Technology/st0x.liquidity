@@ -862,6 +862,20 @@ and access fields directly (`tokens.access_token`). Don't create `fn new()`
 constructors or `fn field(&self)` getters unless they add meaningful logic
 beyond setting/getting field values.
 
+#### Prefer destructuring over `.0` access
+
+For newtypes, prefer `let TypeName(inner) = value` over `value.0`. The
+destructuring pattern names the type explicitly, making the code
+self-documenting:
+
+```rust
+// GOOD: reader sees exactly what type is being unwrapped
+let Table(table) = Entity::PROJECTION.ok_or(ProjectionError::NoTable)?;
+
+// BAD: .0 is opaque — reader must look up what type this is
+let table = entity_projection.0;
+```
+
 #### No one-liner helpers
 
 If a helper function's body is a single expression, it's useless indirection --

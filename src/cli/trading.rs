@@ -295,7 +295,7 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let position_query = Projection::<Position>::sqlite(pool.clone(), "position_view");
+    let position_query = Projection::<Position>::sqlite(pool.clone())?;
     let position_store: Arc<Store<Position>> = Arc::new(
         StoreBuilder::new(pool.clone())
             .with_projection(&position_query)

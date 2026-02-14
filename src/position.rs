@@ -17,7 +17,7 @@ use st0x_execution::{
     Symbol,
 };
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, LifecycleError, Projection};
+use st0x_event_sorcery::{DomainEvent, EventSourced, LifecycleError, Projection, Table};
 
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
@@ -53,6 +53,7 @@ impl EventSourced for Position {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "Position";
+    const PROJECTION: Option<Table> = Some(Table("position_view"));
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -1582,7 +1583,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_none_when_no_aggregate_exists() {
         let pool = crate::test_utils::setup_test_db().await;
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
         let result = load_position(&projection, &Symbol::new("AAPL").unwrap())
             .await
@@ -1610,7 +1611,7 @@ mod tests {
         .await
         .unwrap();
 
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
         let result = load_position(&projection, &Symbol::new("AAPL").unwrap())
             .await
@@ -1625,7 +1626,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_position_for_live_lifecycle() {
         let pool = crate::test_utils::setup_test_db().await;
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
         let store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
             .with_projection(&projection)

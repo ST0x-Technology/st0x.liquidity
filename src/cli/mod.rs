@@ -1814,7 +1814,8 @@ mod tests {
             result.as_ref().err()
         );
 
-        let executions = find_orders_by_status(&pool, OrderStatus::Submitted)
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap()
+            .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
         assert_eq!(executions.len(), 1);
@@ -1916,7 +1917,8 @@ mod tests {
             result1.as_ref().err()
         );
 
-        let executions = find_orders_by_status(&pool, OrderStatus::Submitted)
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap()
+            .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
         assert_eq!(executions.len(), 1);
