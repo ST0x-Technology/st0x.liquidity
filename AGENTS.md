@@ -324,8 +324,8 @@ Configuration is split into plaintext config (`--config`, see
 
 ### Naming Conventions
 
-Code names must be consistent with **[docs/domain.md](docs/domain.md)**, which
-is the source of truth for terminology and naming conventions.
+Code names must be consistent with **[docs/domain.md](docs/domain.md)** (domain
+glossary) and **[docs/naming.md](docs/naming.md)** (naming conventions).
 
 ### Code Quality & Best Practices
 
