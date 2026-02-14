@@ -928,7 +928,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        Arc::new(test_store(pool, vec![], ()))
+        Arc::new(test_store(pool, ()))
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal -> InitiateBridging ->

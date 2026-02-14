@@ -117,7 +117,7 @@ impl EventSourced for OffchainOrder {
         }
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use OffchainOrderEvent::*;
         match event {
             Placed { .. } => Ok(None),
@@ -132,7 +132,7 @@ impl EventSourced for OffchainOrder {
                     direction,
                     executor,
                     placed_at,
-                } = state
+                } = entity
                 else {
                     return Ok(None);
                 };
@@ -152,7 +152,7 @@ impl EventSourced for OffchainOrder {
                 shares_filled,
                 avg_price_cents,
                 partially_filled_at,
-            } => Ok(match state {
+            } => Ok(match entity {
                 Self::Submitted {
                     symbol,
                     shares,
@@ -190,7 +190,7 @@ impl EventSourced for OffchainOrder {
             Filled {
                 price_cents,
                 filled_at,
-            } => Ok(match state {
+            } => Ok(match entity {
                 Self::Submitted {
                     symbol,
                     shares,
@@ -224,7 +224,7 @@ impl EventSourced for OffchainOrder {
                 Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => None,
             }),
 
-            Failed { error, failed_at } => Ok(match state {
+            Failed { error, failed_at } => Ok(match entity {
                 Self::Pending {
                     symbol,
                     shares,
@@ -952,7 +952,7 @@ mod tests {
 
         let error = replay::<OffchainOrder>(vec![event]).unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[tokio::test]

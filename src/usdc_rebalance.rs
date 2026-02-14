@@ -531,10 +531,10 @@ impl EventSourced for UsdcRebalance {
     // Extracting arms into helpers would only add indirection without
     // improving readability.
     #[expect(clippy::too_many_lines)]
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use UsdcRebalanceEvent::*;
 
-        let next = match (event, state) {
+        let next = match (event, entity) {
             (
                 ConversionInitiated {
                     direction,
@@ -1368,7 +1368,7 @@ mod tests {
         }])
         .unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[test]
@@ -1391,7 +1391,7 @@ mod tests {
         ])
         .unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
     }
 
     #[tokio::test]
@@ -2747,7 +2747,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalAlreadyCompleted)
         ));
     }
 
@@ -2775,7 +2775,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotConfirmed)
         ));
     }
 
@@ -2815,7 +2815,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+            LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyCompleted)
         ));
     }
 
@@ -2858,7 +2858,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+            LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyCompleted)
         ));
     }
 
@@ -3555,7 +3555,7 @@ mod tests {
         }])
         .unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[test]
@@ -3576,6 +3576,6 @@ mod tests {
         ])
         .unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
     }
 }

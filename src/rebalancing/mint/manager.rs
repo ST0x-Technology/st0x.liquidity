@@ -243,7 +243,7 @@ mod tests {
 
     async fn create_test_store_instance() -> Arc<Store<TokenizedEquityMint>> {
         let pool = setup_test_db().await;
-        Arc::new(test_store(pool, vec![], ()))
+        Arc::new(test_store(pool, ()))
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {

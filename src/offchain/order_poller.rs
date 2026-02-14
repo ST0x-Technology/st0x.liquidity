@@ -2,7 +2,6 @@
 
 use num_traits::ToPrimitive;
 use rand::Rng;
-use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Interval, interval};
@@ -62,7 +61,6 @@ impl Default for OrderPollerCtx {
 
 pub struct OrderStatusPoller<E: Executor> {
     ctx: OrderPollerCtx,
-    pool: SqlitePool,
     interval: Interval,
     executor: E,
     offchain_order_projection: Projection<OffchainOrder>,
@@ -73,7 +71,6 @@ pub struct OrderStatusPoller<E: Executor> {
 impl<E: Executor> OrderStatusPoller<E> {
     pub fn new(
         ctx: OrderPollerCtx,
-        pool: SqlitePool,
         executor: E,
         offchain_order_projection: Projection<OffchainOrder>,
         offchain_order: Arc<Store<OffchainOrder>>,
@@ -83,7 +80,6 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         Self {
             ctx,
-            pool,
             interval,
             executor,
             offchain_order_projection,
@@ -344,6 +340,8 @@ mod tests {
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
 
+    use sqlx::SqlitePool;
+
     use st0x_event_sorcery::test_store;
 
     use super::*;
@@ -362,10 +360,9 @@ mod tests {
             Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap(),
             Arc::new(test_store(
                 pool.clone(),
-                vec![],
                 crate::offchain_order::noop_order_placer(),
             )),
-            Arc::new(test_store(pool.clone(), vec![], ())),
+            Arc::new(test_store(pool.clone(), ())),
         )
     }
 
@@ -477,7 +474,6 @@ mod tests {
 
         let poller = OrderStatusPoller::new(
             ctx,
-            pool.clone(),
             broker,
             offchain_order_projection,
             offchain_order_store,
@@ -564,7 +560,6 @@ mod tests {
 
         let poller = OrderStatusPoller::new(
             ctx,
-            pool.clone(),
             broker,
             offchain_order_projection,
             offchain_order_store,

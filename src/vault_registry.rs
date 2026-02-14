@@ -83,8 +83,8 @@ impl EventSourced for VaultRegistry {
         Some(registry)
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
-        let mut new_registry = state.clone();
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
+        let mut new_registry = entity.clone();
         new_registry.apply_event(event);
         Ok(Some(new_registry))
     }

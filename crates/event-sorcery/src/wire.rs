@@ -186,7 +186,7 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
     /// guarantees aren't needed. Production code should use
     /// [`wire`](StoreBuilder::wire) with [`Unwired`] instead.
     #[must_use]
-    pub fn with_query(mut self, query: impl Query<Lifecycle<Entity>> + 'static) -> Self {
+    pub(crate) fn with_query(mut self, query: impl Query<Lifecycle<Entity>> + 'static) -> Self {
         self.queries.push(Box::new(query));
         self
     }
@@ -409,7 +409,7 @@ mod tests {
             Some(Self)
         }
 
-        fn evolve(_event: &EventA, _state: &Self) -> Result<Option<Self>, Never> {
+        fn evolve(_entity: &Self, _event: &EventA) -> Result<Option<Self>, Never> {
             Ok(Some(Self))
         }
 
@@ -438,7 +438,7 @@ mod tests {
             Some(Self)
         }
 
-        fn evolve(_event: &EventB, _state: &Self) -> Result<Option<Self>, Never> {
+        fn evolve(_entity: &Self, _event: &EventB) -> Result<Option<Self>, Never> {
             Ok(Some(Self))
         }
 

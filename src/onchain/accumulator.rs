@@ -111,6 +111,8 @@ mod tests {
 
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
+    use sqlx::SqlitePool;
+
     use st0x_event_sorcery::{Projection, Store};
 
     use super::*;

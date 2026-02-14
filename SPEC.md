@@ -1037,7 +1037,7 @@ trait EventSourced {
 
     // Event-side: reconstruct state from event log
     fn originate(event: &Self::Event) -> Option<Self>;
-    fn evolve(event: &Self::Event, state: &Self)
+    fn evolve(entity: &Self, event: &Self::Event)
         -> Result<Option<Self>, Self::Error>;
 
     // Command-side: process commands to produce events

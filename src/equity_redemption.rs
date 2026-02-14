@@ -254,7 +254,7 @@ impl EventSourced for EquityRedemption {
         }
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use EquityRedemptionEvent::*;
         Ok(match event {
             TokensSent { .. } => None,
@@ -262,18 +262,18 @@ impl EventSourced for EquityRedemption {
             Detected {
                 tokenization_request_id,
                 detected_at,
-            } => state.try_apply_detected(tokenization_request_id, *detected_at),
+            } => entity.try_apply_detected(tokenization_request_id, *detected_at),
 
             DetectionFailed { reason, failed_at } => {
-                state.try_apply_detection_failed(reason, *failed_at)
+                entity.try_apply_detection_failed(reason, *failed_at)
             }
 
-            Completed { completed_at } => state.try_apply_completed(*completed_at),
+            Completed { completed_at } => entity.try_apply_completed(*completed_at),
 
             RedemptionRejected {
                 reason,
                 rejected_at,
-            } => state.try_apply_redemption_rejected(reason, *rejected_at),
+            } => entity.try_apply_redemption_rejected(reason, *rejected_at),
         })
     }
 

@@ -78,7 +78,7 @@ impl EventSourced for Position {
         }
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use PositionEvent::*;
         match event {
             OnChainOrderFilled {
@@ -89,22 +89,22 @@ impl EventSourced for Position {
                 ..
             } => match direction {
                 Direction::Buy => Ok(Some(Self {
-                    net: (state.net + *amount)?,
-                    accumulated_long: (state.accumulated_long + *amount)?,
+                    net: (entity.net + *amount)?,
+                    accumulated_long: (entity.accumulated_long + *amount)?,
                     last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
-                    ..state.clone()
+                    ..entity.clone()
                 })),
                 Direction::Sell => Ok(Some(Self {
-                    net: (state.net - *amount)?,
-                    accumulated_short: (state.accumulated_short + *amount)?,
+                    net: (entity.net - *amount)?,
+                    accumulated_short: (entity.accumulated_short + *amount)?,
                     last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
-                    ..state.clone()
+                    ..entity.clone()
                 })),
             },
 
-            OffChainOrderPlaced { .. } if state.pending_offchain_order_id.is_some() => Ok(None),
+            OffChainOrderPlaced { .. } if entity.pending_offchain_order_id.is_some() => Ok(None),
 
             OffChainOrderPlaced {
                 offchain_order_id,
@@ -113,12 +113,12 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 pending_offchain_order_id: Some(*offchain_order_id),
                 last_updated: Some(*placed_at),
-                ..state.clone()
+                ..entity.clone()
             })),
 
             OffChainOrderFilled {
                 offchain_order_id, ..
-            } if state.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
+            } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
 
             OffChainOrderFilled {
                 shares_filled,
@@ -127,27 +127,27 @@ impl EventSourced for Position {
                 ..
             } => match direction {
                 Direction::Sell => Ok(Some(Self {
-                    net: (state.net - shares_filled.inner())?,
+                    net: (entity.net - shares_filled.inner())?,
                     pending_offchain_order_id: None,
                     last_updated: Some(*broker_timestamp),
-                    ..state.clone()
+                    ..entity.clone()
                 })),
                 Direction::Buy => Ok(Some(Self {
-                    net: (state.net + shares_filled.inner())?,
+                    net: (entity.net + shares_filled.inner())?,
                     pending_offchain_order_id: None,
                     last_updated: Some(*broker_timestamp),
-                    ..state.clone()
+                    ..entity.clone()
                 })),
             },
 
             OffChainOrderFailed {
                 offchain_order_id, ..
-            } if state.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
+            } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
 
             OffChainOrderFailed { failed_at, .. } => Ok(Some(Self {
                 pending_offchain_order_id: None,
                 last_updated: Some(*failed_at),
-                ..state.clone()
+                ..entity.clone()
             })),
 
             ThresholdUpdated {
@@ -157,7 +157,7 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 threshold: *new_threshold,
                 last_updated: Some(*updated_at),
-                ..state.clone()
+                ..entity.clone()
             })),
 
             Initialized { .. } => Ok(None),
@@ -1086,7 +1086,7 @@ mod tests {
         }])
         .unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[test]

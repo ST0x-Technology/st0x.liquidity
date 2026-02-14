@@ -696,7 +696,7 @@ mod tests {
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let store = st0x_event_sorcery::test_store::<VaultRegistry>(pool.clone(), vec![], ());
+        let store = st0x_event_sorcery::test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,

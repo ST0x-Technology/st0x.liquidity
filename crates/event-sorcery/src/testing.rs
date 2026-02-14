@@ -20,16 +20,14 @@ use crate::{EventSourced, Store};
 /// lifecycle error if originate/evolve fails.
 pub fn replay<Entity: EventSourced>(
     events: impl IntoIterator<Item = Entity::Event>,
-) -> Result<Entity, LifecycleError<Entity>> {
+) -> Result<Option<Entity>, LifecycleError<Entity>> {
     let mut lifecycle = Lifecycle::<Entity>::default();
 
     for event in events {
         lifecycle.apply(event);
     }
 
-    lifecycle
-        .into_result()
-        .and_then(|opt| opt.ok_or(LifecycleError::Uninitialized))
+    lifecycle.into_result()
 }
 
 /// BDD-style test harness for EventSourced implementations.
@@ -128,16 +126,14 @@ where
 
 /// Test-only escape hatch for creating CQRS frameworks directly.
 ///
-/// Tests often need CQRS with specific configurations that don't
-/// fit the production wiring pattern. Use this instead of
-/// `sqlite_es::sqlite_cqrs`.
+/// Create a SQLite-backed Store with no reactors, for tests that
+/// need persistence but no event processing side-effects.
 pub fn test_store<Entity: EventSourced>(
     pool: sqlx::SqlitePool,
-    queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
     services: Entity::Services,
 ) -> Store<Entity> {
     #[allow(clippy::disallowed_methods)]
-    let cqrs = sqlite_es::sqlite_cqrs(pool, queries, services);
+    let cqrs = sqlite_es::sqlite_cqrs(pool, vec![], services);
     Store::new(cqrs)
 }
 
@@ -285,15 +281,14 @@ mod tests {
             }
         }
 
-        fn evolve(event: &CounterEvent, state: &Self) -> Result<Option<Self>, CounterError> {
+        fn evolve(entity: &Self, event: &CounterEvent) -> Result<Option<Self>, CounterError> {
             use CounterEvent::*;
 
             match event {
                 Incremented => {
-                    let next = state
-                        .value
-                        .checked_add(1)
-                        .ok_or(CounterError::Overflow { value: state.value })?;
+                    let next = entity.value.checked_add(1).ok_or(CounterError::Overflow {
+                        value: entity.value,
+                    })?;
                     Ok(Some(Self { value: next }))
                 }
                 Created { .. } | ResetToZero => Ok(None),
@@ -335,22 +330,22 @@ mod tests {
     }
 
     #[test]
-    fn replay_empty_events_returns_uninitialized() {
-        let error = replay::<Counter>(vec![]).unwrap_err();
+    fn replay_empty_events_returns_none() {
+        let result = replay::<Counter>(vec![]).unwrap();
 
-        assert!(matches!(error, LifecycleError::Uninitialized));
+        assert!(result.is_none());
     }
 
     #[test]
-    fn replay_mismatch_on_originate_returns_failed() {
+    fn replay_cant_originate_returns_error() {
         // Incremented is not a genesis event, so originate returns None
         let error = replay::<Counter>(vec![CounterEvent::Incremented]).unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[test]
-    fn replay_mismatch_on_evolve_returns_failed() {
+    fn replay_unexpected_event_on_evolve_returns_error() {
         // ResetToZero causes evolve to return Ok(None)
         let error = replay::<Counter>(vec![
             CounterEvent::Created { initial: 5 },
@@ -358,7 +353,7 @@ mod tests {
         ])
         .unwrap_err();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
     }
 
     #[tokio::test]

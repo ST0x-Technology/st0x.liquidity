@@ -397,9 +397,9 @@ mod tests {
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
 
         let (_tx, rx) = mpsc::channel(100);
-        let mint_store = Arc::new(test_store(pool.clone(), vec![], ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), vec![], ()));
-        let usdc_store = Arc::new(test_store(pool, vec![], ()));
+        let mint_store = Arc::new(test_store(pool.clone(), ()));
+        let redemption_store = Arc::new(test_store(pool.clone(), ()));
+        let usdc_store = Arc::new(test_store(pool, ()));
 
         let _rebalancer = services.into_rebalancer(
             &rebalancing_ctx,

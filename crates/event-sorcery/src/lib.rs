@@ -203,14 +203,14 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     /// [`LifecycleError::Mismatch`].
     fn originate(event: &Self::Event) -> Option<Self>;
 
-    /// Derive new state from an event applied to existing state.
+    /// Derive new entity from an event applied to the current one.
     ///
-    /// - `Ok(Some(new_state))` -- event applied successfully
-    /// - `Ok(None)` -- event doesn't apply to current state
-    ///   (becomes [`LifecycleError::Mismatch`])
+    /// - `Ok(Some(new_entity))` -- event applied successfully
+    /// - `Ok(None)` -- event doesn't apply to current entity
+    ///   (becomes [`LifecycleError::UnexpectedEvent`])
     /// - `Err(error)` -- domain error during application
     ///   (becomes [`LifecycleError::Apply`])
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error>;
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error>;
 
     /// Handle a command when the entity doesn't exist yet.
     ///
@@ -259,21 +259,13 @@ pub struct Store<Entity: EventSourced> {
     inner: SqliteCqrs<Lifecycle<Entity>>,
 }
 
-impl<Entity: EventSourced> Store<Entity>
-where
-    Lifecycle<Entity>: Aggregate<
-            Command = Entity::Command,
-            Event = Entity::Event,
-            Error = LifecycleError<Entity>,
-            Services = Entity::Services,
-        >,
-{
+impl<Entity: EventSourced> Store<Entity> {
     /// Wrap an existing `SqliteCqrs` framework.
     ///
     /// Prefer using `StoreBuilder::build()` which handles wiring
     /// and reconciliation. This constructor exists for cases
     /// where direct construction is needed (e.g., tests).
-    pub fn new(inner: SqliteCqrs<Lifecycle<Entity>>) -> Self {
+    pub(crate) fn new(inner: SqliteCqrs<Lifecycle<Entity>>) -> Self {
         Self { inner }
     }
 

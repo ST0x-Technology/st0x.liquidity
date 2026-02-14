@@ -78,9 +78,9 @@ impl EventSourced for SchemaRegistry {
         Some(Self { versions })
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         let SchemaRegistryEvent::VersionUpdated { name, version } = event;
-        let mut new_state = state.clone();
+        let mut new_state = entity.clone();
         new_state.versions.insert(name.clone(), *version);
         Ok(Some(new_state))
     }
@@ -143,7 +143,7 @@ impl Reconciler {
             state = match state {
                 None => SchemaRegistry::originate(&event),
                 Some(current) => {
-                    let evolved = SchemaRegistry::evolve(&event, &current)?;
+                    let evolved = SchemaRegistry::evolve(&current, &event)?;
                     Some(evolved.unwrap_or(current))
                 }
             };

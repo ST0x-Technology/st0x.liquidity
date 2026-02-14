@@ -308,7 +308,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -355,7 +355,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -398,7 +398,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -430,7 +430,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         // Should succeed without error
@@ -479,7 +479,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -526,7 +526,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -567,7 +567,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -600,7 +600,7 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) {
-        let store = test_store::<VaultRegistry>(pool.clone(), vec![], ());
+        let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
@@ -626,7 +626,7 @@ mod tests {
         order_owner: Address,
         vault_id: B256,
     ) {
-        let store = test_store::<VaultRegistry>(pool.clone(), vec![], ());
+        let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
@@ -659,7 +659,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -703,7 +703,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -748,7 +748,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -792,7 +792,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -823,7 +823,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            test_store(pool.clone(), vec![], ()),
+            test_store(pool.clone(), ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();

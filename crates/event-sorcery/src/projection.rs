@@ -137,6 +137,21 @@ impl<Entity: EventSourced> Projection<Entity> {
     /// Creates a SQLite-backed projection using
     /// [`EventSourced::PROJECTION`].
     ///
+    /// Load a single entity by ID from the materialized view.
+    ///
+    /// Delegates to `ViewRepository::load` (the cqrs-es
+    /// projection path), then unwraps the internal `Lifecycle`
+    /// wrapper. Returns `None` if the entity doesn't exist or
+    /// hasn't been initialized yet.
+    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, LifecycleError<Entity>> {
+        let view_id = id.to_string();
+
+        match self.repo.load(&view_id).await {
+            Ok(Some(lifecycle)) => lifecycle.into_result(),
+            Ok(None) | Err(_) => Ok(None),
+        }
+    }
+
     /// Returns `Err(ProjectionError::NoTable)` if the entity has
     /// no materialized view configured (`PROJECTION = None`).
     pub fn sqlite(pool: SqlitePool) -> Result<Self, ProjectionError> {
@@ -263,8 +278,7 @@ impl<Entity: EventSourced, Repo> Projection<Entity, Repo>
 where
     Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
 {
-    /// Creates a projection from any view repository backend.
-    pub fn new(repo: Arc<Repo>) -> Self {
+    pub(crate) fn new(repo: Arc<Repo>) -> Self {
         Self {
             repo,
             pool: None,
@@ -273,34 +287,6 @@ where
         }
     }
 
-    /// Load the current entity state from the materialized view.
-    ///
-    /// Returns:
-    /// - `Ok(Some(entity))` if the entity is live
-    /// - `Ok(None)` if the entity has not been initialized
-    /// - `Err(error)` if the entity is in a failed lifecycle state
-    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, LifecycleError<Entity>>
-    where
-        Entity::Error: Clone,
-    {
-        let aggregate_id = id.to_string();
-        let lifecycle = match self.repo.load(&aggregate_id).await {
-            Ok(Some(lifecycle)) => lifecycle,
-            Ok(None) | Err(_) => return Ok(None),
-        };
-
-        match lifecycle {
-            Lifecycle::Live(entity) => Ok(Some(entity)),
-            Lifecycle::Uninitialized => Ok(None),
-            Lifecycle::Failed { error, .. } => Err(error),
-        }
-    }
-
-    /// Construct a GenericQuery for wiring with StoreBuilder.
-    ///
-    /// GenericQuery implements `cqrs_es::Query<Lifecycle<Entity>>`
-    /// natively via `View::update`, so it can be registered
-    /// directly with the CQRS framework.
     pub(crate) fn inner_query(&self) -> GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>> {
         GenericQuery::new(Arc::clone(&self.repo))
     }
@@ -411,8 +397,8 @@ mod tests {
             })
         }
 
-        fn evolve(_event: &TestEvent, state: &Self) -> Result<Option<Self>, Never> {
-            Ok(Some(state.clone()))
+        fn evolve(entity: &Self, _event: &TestEvent) -> Result<Option<Self>, Never> {
+            Ok(Some(entity.clone()))
         }
 
         async fn initialize(_command: (), _services: &()) -> Result<Vec<TestEvent>, Never> {
@@ -509,12 +495,12 @@ mod tests {
 
     #[tokio::test]
     async fn load_failed_returns_error() {
-        let error = LifecycleError::Uninitialized;
+        let error = LifecycleError::EventCantOriginate { event: TestEvent };
         let repo = InMemoryRepo::with(vec![(
             "id-1",
             Lifecycle::Failed {
                 error: error.clone(),
-                last_valid_state: None,
+                last_valid_entity: None,
             },
         )]);
         let projection = Projection::new(Arc::new(repo));

@@ -33,14 +33,14 @@ use crate::{EventSourced, Reactor};
 /// # State machine
 ///
 /// ```text
-/// Uninitialized --originate(event)--> Live(state)
-/// Uninitialized --originate(None)---> Failed { Mismatch }
+/// Uninitialized --originate(entity)--> Live(entity)
+/// Uninitialized --originate(None)----> Failed { EventCantOriginate }
 ///
-/// Live(state) --evolve(Ok(Some))--> Live(new_state)
-/// Live(state) --evolve(Ok(None))--> Failed { Mismatch }
-/// Live(state) --evolve(Err(e))----> Failed { Apply(e) }
+/// Live(entity) --evolve(Ok(Some))----> Live(new_entity)
+/// Live(entity) --evolve(Ok(None))----> Failed { UnexpectedEvent }
+/// Live(entity) --evolve(Err(e))------> Failed { Apply(e) }
 ///
-/// Failed { .. } ---- any event ----> Failed { .. } (unchanged)
+/// Failed { .. } ---- any event ------> Failed { AlreadyFailed }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 // Override serde's inferred bounds. Without this, serde derives
@@ -54,7 +54,7 @@ pub(crate) enum Lifecycle<Entity: EventSourced> {
     Live(Entity),
     Failed {
         error: LifecycleError<Entity>,
-        last_valid_state: Option<Box<Entity>>,
+        last_valid_entity: Option<Box<Entity>>,
     },
 }
 
@@ -92,18 +92,18 @@ impl<Entity: EventSourced> Default for Lifecycle<Entity> {
 // already guaranteed by EventSourced's DomainError supertrait.
 #[serde(bound = "")]
 pub enum LifecycleError<Entity: EventSourced> {
-    #[error("operation on uninitialized state")]
-    Uninitialized,
-
-    #[error("initialization on already-live state")]
-    AlreadyInitialized,
-
-    #[error("event '{event:?}' not applicable to state '{state:?}'")]
-    Mismatch {
-        state: Box<Lifecycle<Entity>>,
+    #[error("event '{event:?}' cannot originate entity")]
+    EventCantOriginate { event: Entity::Event },
+    #[error("event '{event:?}' not applicable to entity '{entity:?}'")]
+    UnexpectedEvent {
+        entity: Box<Entity>,
         event: Entity::Event,
     },
-
+    #[error("event '{event:?}' applied to already-failed lifecycle")]
+    AlreadyFailed {
+        failure: Box<LifecycleError<Entity>>,
+        event: Entity::Event,
+    },
     #[error(transparent)]
     Apply(Entity::Error),
 }
@@ -154,7 +154,7 @@ where
                 .await
                 .map_err(LifecycleError::Apply),
 
-            Self::Live(state) => state
+            Self::Live(entity) => entity
                 .transition(command, services)
                 .await
                 .map_err(LifecycleError::Apply),
@@ -167,30 +167,27 @@ where
         *self = match std::mem::take(self) {
             Self::Uninitialized => Entity::originate(&event).map_or_else(
                 || {
-                    let err = LifecycleError::Mismatch {
-                        state: Box::new(Self::Uninitialized),
-                        event,
-                    };
+                    let err = LifecycleError::EventCantOriginate { event };
                     error!("lifecycle failed during originate: {err}");
                     Self::Failed {
                         error: err,
-                        last_valid_state: None,
+                        last_valid_entity: None,
                     }
                 },
                 Self::Live,
             ),
 
-            Self::Live(state) => match Entity::evolve(&event, &state) {
-                Ok(Some(new_state)) => Self::Live(new_state),
+            Self::Live(entity) => match Entity::evolve(&entity, &event) {
+                Ok(Some(new_entity)) => Self::Live(new_entity),
                 Ok(None) => {
-                    let err = LifecycleError::Mismatch {
-                        state: Box::new(Self::Live(state.clone())),
+                    let err = LifecycleError::UnexpectedEvent {
+                        entity: Box::new(entity.clone()),
                         event,
                     };
                     error!("lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
-                        last_valid_state: Some(Box::new(state)),
+                        last_valid_entity: Some(Box::new(entity)),
                     }
                 }
                 Err(domain_err) => {
@@ -198,12 +195,25 @@ where
                     error!("lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
-                        last_valid_state: Some(Box::new(state)),
+                        last_valid_entity: Some(Box::new(entity)),
                     }
                 }
             },
 
-            failed @ Self::Failed { .. } => failed,
+            Self::Failed {
+                error,
+                last_valid_entity,
+            } => {
+                let err = LifecycleError::AlreadyFailed {
+                    failure: Box::new(error),
+                    event,
+                };
+                error!("lifecycle already failed, ignoring event: {err}");
+                Self::Failed {
+                    error: err,
+                    last_valid_entity,
+                }
+            }
         };
     }
 }
@@ -356,13 +366,14 @@ mod tests {
             }
         }
 
-        fn evolve(event: &CounterEvent, state: &Self) -> Result<Option<Self>, CounterError> {
+        fn evolve(entity: &Self, event: &CounterEvent) -> Result<Option<Self>, CounterError> {
+            use CounterEvent::*;
             match event {
-                CounterEvent::Created { .. } | CounterEvent::Invalid => Ok(None),
-                CounterEvent::Incremented => Ok(Some(Self {
-                    value: state.value + 1,
+                Broken => Err(CounterError),
+                Created { .. } | Invalid => Ok(None),
+                Incremented => Ok(Some(Self {
+                    value: entity.value + 1,
                 })),
-                CounterEvent::Broken => Err(CounterError),
             }
         }
 
@@ -370,10 +381,11 @@ mod tests {
             command: CounterCommand,
             _services: &(),
         ) -> Result<Vec<CounterEvent>, CounterError> {
+            use CounterCommand::*;
             match command {
-                CounterCommand::Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
-                CounterCommand::Increment => Ok(vec![CounterEvent::Incremented]),
-                CounterCommand::Fail => Err(CounterError),
+                Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
+                Increment => Ok(vec![CounterEvent::Incremented]),
+                Fail => Err(CounterError),
             }
         }
 
@@ -408,8 +420,8 @@ mod tests {
         assert!(matches!(
             lifecycle,
             Lifecycle::Failed {
-                error: LifecycleError::Mismatch { .. },
-                last_valid_state: None,
+                error: LifecycleError::EventCantOriginate { .. },
+                last_valid_entity: None,
             }
         ));
     }
@@ -424,17 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn evolve_mismatch_transitions_to_failed_with_last_valid_state() {
+    fn evolve_mismatch_transitions_to_failed_with_last_valid_entity() {
         let mut lifecycle = Lifecycle::Live(Counter { value: 5 });
 
         lifecycle.apply(CounterEvent::Invalid);
 
         match lifecycle {
             Lifecycle::Failed {
-                error: LifecycleError::Mismatch { .. },
-                last_valid_state: Some(last),
+                error: LifecycleError::UnexpectedEvent { .. },
+                last_valid_entity: Some(last),
             } => assert_eq!(*last, Counter { value: 5 }),
-            other => panic!("expected Failed with Mismatch, got {other:?}"),
+            other => panic!("expected Failed with UnexpectedEvent, got {other:?}"),
         }
     }
 
@@ -447,7 +459,7 @@ mod tests {
         match lifecycle {
             Lifecycle::Failed {
                 error: LifecycleError::Apply(CounterError),
-                last_valid_state: Some(last),
+                last_valid_entity: Some(last),
             } => assert_eq!(*last, Counter { value: 5 }),
             other => panic!("expected Failed with Apply, got {other:?}"),
         }
@@ -455,9 +467,13 @@ mod tests {
 
     #[test]
     fn failed_state_is_sticky() {
+        let prior_error = LifecycleError::EventCantOriginate {
+            event: CounterEvent::Incremented,
+        };
+
         let mut lifecycle = Lifecycle::<Counter>::Failed {
-            error: LifecycleError::Uninitialized,
-            last_valid_state: None,
+            error: prior_error,
+            last_valid_entity: None,
         };
 
         lifecycle.apply(CounterEvent::Created { initial: 99 });
@@ -465,7 +481,7 @@ mod tests {
         assert!(matches!(
             lifecycle,
             Lifecycle::Failed {
-                error: LifecycleError::Uninitialized,
+                error: LifecycleError::AlreadyFailed { .. },
                 ..
             }
         ));
@@ -509,10 +525,12 @@ mod tests {
 
     #[tokio::test]
     async fn handle_failed_returns_stored_error() {
-        let stored_error = LifecycleError::Uninitialized;
+        let stored_error = LifecycleError::EventCantOriginate {
+            event: CounterEvent::Incremented,
+        };
         let lifecycle = Lifecycle::<Counter>::Failed {
             error: stored_error.clone(),
-            last_valid_state: None,
+            last_valid_entity: None,
         };
 
         let error = lifecycle

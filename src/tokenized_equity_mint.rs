@@ -149,21 +149,23 @@ impl EventSourced for TokenizedEquityMint {
         }
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use TokenizedEquityMintEvent::*;
         Ok(match event {
             MintRequested { .. } => None,
             MintRejected {
                 reason,
                 rejected_at,
-            } => state.try_apply_rejected(reason, *rejected_at),
+            } => entity.try_apply_rejected(reason, *rejected_at),
             MintAccepted {
                 issuer_request_id,
                 tokenization_request_id,
                 accepted_at,
-            } => state.try_apply_accepted(issuer_request_id, tokenization_request_id, *accepted_at),
+            } => {
+                entity.try_apply_accepted(issuer_request_id, tokenization_request_id, *accepted_at)
+            }
             MintAcceptanceFailed { reason, failed_at } => {
-                state.try_apply_acceptance_failed(reason, *failed_at)
+                entity.try_apply_acceptance_failed(reason, *failed_at)
             }
             TokensReceived {
                 tx_hash,
@@ -171,9 +173,9 @@ impl EventSourced for TokenizedEquityMint {
                 shares_minted,
                 received_at,
             } => {
-                state.try_apply_tokens_received(*tx_hash, receipt_id, *shares_minted, *received_at)
+                entity.try_apply_tokens_received(*tx_hash, receipt_id, *shares_minted, *received_at)
             }
-            MintCompleted { completed_at } => state.try_apply_completed(*completed_at),
+            MintCompleted { completed_at } => entity.try_apply_completed(*completed_at),
         })
     }
 

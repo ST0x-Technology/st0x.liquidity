@@ -188,7 +188,6 @@ where
 
         let order_poller = spawn_order_poller(
             &self.common.ctx,
-            &self.common.pool,
             self.common.executor.clone(),
             (*self.common.frameworks.offchain_order_query).clone(),
             self.common.frameworks.offchain_order.clone(),
@@ -203,7 +202,6 @@ where
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
-            self.common.pool.clone(),
             self.common.frameworks.position.clone(),
             self.common.frameworks.position_query.clone(),
             self.common.frameworks.offchain_order.clone(),

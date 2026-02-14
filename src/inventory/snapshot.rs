@@ -102,8 +102,8 @@ impl EventSourced for InventorySnapshot {
         Some(snapshot)
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
-        let mut snapshot = state.clone();
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
+        let mut snapshot = entity.clone();
         snapshot.apply_event(event);
         Ok(Some(snapshot))
     }
