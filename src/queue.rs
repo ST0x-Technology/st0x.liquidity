@@ -198,8 +198,6 @@ pub(crate) enum EventQueueError {
     Database(#[from] sqlx::Error),
     #[error("Log missing required field: {0}")]
     MissingLogField(&'static str),
-    #[error("Queued event missing ID")]
-    MissingEventId,
     #[error("Integer conversion error: {0}")]
     IntConversion(#[from] TryFromIntError),
     #[error("Event serialization failed: {0}")]

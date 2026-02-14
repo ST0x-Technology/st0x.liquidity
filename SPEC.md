@@ -130,19 +130,360 @@ excellent async ecosystem for handling concurrent trading flows.
 - Generate unique identifiers using transaction hash and log index for trade
   tracking
 
-#### Event-Driven Async Architecture
+#### Orchestration Architecture
 
-- Each blockchain event spawns an independent async execution flow using Rust's
-  async/await
-- Multiple trade flows run concurrently without blocking each other
-- Handles throughput mismatch: fast onchain events vs slower broker
-  execution/confirmation
-- No artificial concurrency limits - process events as fast as they arrive
-- Tokio async runtime manages hundreds of concurrent trades efficiently on
-  limited hardware
-- Each flow: Parse Event -> Event Queue -> Deduplication Check -> Position
-  Accumulation -> Broker Execution (when threshold reached) -> Record Result
-- Failed flows retry independently without affecting other trades
+The system uses a two-layer orchestration model. For crate-level API details,
+code examples, migration ordering, and startup sequence, see
+[docs/conductor.md](docs/conductor.md).
+
+##### Supervision Layer
+
+The outermost layer supervises anything that runs indefinitely. If a task
+crashes, the supervisor restarts it with exponential backoff. These are the
+"eyes" of the system:
+
+| Task                   | Purpose                                              |
+| ---------------------- | ---------------------------------------------------- |
+| DEX WebSocket listener | Stream consumer - pushes `ProcessOnchainEvent` jobs  |
+| Job worker pool        | Runs all job workers; restarts from persistent queue |
+
+The DEX WebSocket listener is a **stream producer** - it connects to an Ethereum
+node, filters for Clear/TakeOrder events, and pushes jobs to the persistent
+queue. It lives in the supervisor layer because it has no natural completion
+point and must be restarted if the connection drops.
+
+The job worker pool is itself a supervised task. If it crashes, the supervisor
+restarts it and workers resume from the persistent queue (no jobs are lost
+because they're in SQLite).
+
+##### Job Layer
+
+The work layer processes typed jobs that have a beginning and an end. Each job
+type gets its own storage, handler, and concurrency limit. These are the "hands"
+of the system.
+
+The bridge between the layers is simple: supervised tasks push jobs to the
+persistent queue.
+
+##### Job Taxonomy
+
+Jobs fall into two categories based on how they're triggered:
+
+1. **Persistent jobs** (event-driven): Pushed to the queue by supervised tasks,
+   CQRS query processors, or other job handlers. Survive crashes. Examples:
+   `ProcessOnchainEvent`, `PlaceOffchainOrder`, `ExecuteRebalancing`,
+   `EnrichOnchainTrade`.
+
+2. **Cron jobs** (time-driven): Scheduled at fixed intervals. Examples:
+   `PollOrderStatus`, `CheckAccumulatedPositions`, `PollInventory`,
+   `ExecutorMaintenance`, `ComputeAnalytics` (future).
+
+##### Dependency Injection Layers
+
+Dependency injection operates at three distinct layers, each with its own
+lifetime and scope:
+
+- **Supervision layer**: Dependencies are plain struct fields on each supervised
+  task, set at construction time before the supervisor starts. The WebSocket
+  listener holds a queue handle to push jobs; the job worker pool holds all
+  registered workers. No runtime DI framework - just Rust struct construction.
+
+- **Orchestration layer**: Injects dependencies into **job handlers**. This is
+  where a handler receives the tools it needs to do its work: CQRS framework
+  instances (`Cqrs<A>`), persistent job queues (to push downstream jobs), and
+  view repositories (to read projections).
+
+- **Domain layer (CQRS `Aggregate::Services`)**: Injects dependencies into
+  **aggregate command handlers**. This is where an aggregate's `handle()` method
+  receives the external capabilities it needs to process a command: broker APIs,
+  blockchain providers, tokenization services. Configured once when constructing
+  the `CqrsFramework` (see `docs/cqrs.md`).
+
+The layers are strictly hierarchical. The supervisor owns the worker pool, the
+worker pool owns the workers, workers receive CQRS framework instances, and the
+CQRS framework internally passes `Services` into aggregate `handle()`. Each
+layer only talks to the one directly below it - a job handler never touches
+`Services` directly, and the supervisor never touches job-layer DI.
+
+<!-- DIAGRAM CANDIDATES - pick the best, delete the rest -->
+
+<!--
+  All diagrams below show the same complete system. Pick the rendering
+  that works best on GitHub, delete the rest, and we'll refine.
+
+  Arrow legend (flowcharts):
+    ==>  thick   = job enqueue (durable, async)
+    -->  solid   = CQRS command (job -> aggregate)
+
+    -.-> dashed  = CQRS event reaction (aggregate -> query processor)
+    "via Services" label = aggregate calls external API through
+                           Aggregate::Services during command handling
+
+Shape legend (flowcharts): [Rectangle] = apalis job (Rounded) = CQRS aggregate
+{{Hexagon}} = CQRS query processor ([Stadium]) = external system
+
+Color legend (Options 1 and 3): Blue = external system Orange = apalis job Green
+= CQRS query processor Purple = CQRS aggregate -->
+
+##### Option 1: Color-coded, TD layout
+
+```mermaid
+graph TD
+    classDef ext fill:#4a6fa5,color:#fff,stroke:#365880
+    classDef job fill:#e8a838,color:#000,stroke:#b8832a
+    classDef qry fill:#6aad6e,color:#000,stroke:#4a8a4e
+    classDef agg fill:#c078b0,color:#000,stroke:#995890
+
+    BLOCKCHAIN([Blockchain]):::ext
+    BROKER([Broker API]):::ext
+    RPC([Ethereum RPC]):::ext
+    TOKENIZER([Tokenization API]):::ext
+    BRIDGE([Bridge API]):::ext
+    VAULT([Vault API]):::ext
+
+    POE[ProcessOnchainEvent]:::job
+    EOT[EnrichOnchainTrade]:::job
+    PFO[PlaceOffchainOrder]:::job
+    EUSDC[ExecuteUsdcRebalancing]:::job
+    EMINT[ExecuteMint]:::job
+    EREDEEM[ExecuteRedemption]:::job
+    POLLORD[PollOrderStatus]:::job
+    CAP[CheckAccumulatedPositions]:::job
+    POLLINV[PollInventory]:::job
+    EMAINT[ExecutorMaintenance]:::job
+
+    TM{{TradeManager}}:::qry
+    OM{{OrderManager}}:::qry
+    RT{{RebalancingTrigger}}:::qry
+
+    OT(OnChainTrade):::agg
+    P(Position):::agg
+    OO(OffchainOrder):::agg
+    INV(InventorySnapshot):::agg
+    USDC(UsdcRebalance):::agg
+    MINTA(Mint):::agg
+    REDEEMA(Redemption):::agg
+
+    BLOCKCHAIN ==>|push| POE
+
+    POE -->|Witness| OT
+    OT -.->|Filled| TM
+    TM -->|AcknowledgeOnChainFill| P
+    P -.->|OffChainOrderPlaced| OM
+    OM ==>|push| PFO
+    POE ==>|push| EOT
+
+    PFO -->|ConfirmSubmission| OO
+    OO -->|via Services| BROKER
+
+    POLLORD -->|poll status| BROKER
+    POLLORD -->|CompleteFill| OO
+    OO -.->|Filled| OM
+    OM -->|CompleteOffChainOrder| P
+
+    EOT -->|Enrich| OT
+    OT -->|via Services| RPC
+
+    CAP ==>|push| PFO
+
+    POLLINV -->|poll balances| BROKER
+    POLLINV -->|RecordSnapshot| INV
+
+    P -.->|events| RT
+    INV -.->|events| RT
+    RT ==>|push| EUSDC
+    RT ==>|push| EMINT
+    RT ==>|push| EREDEEM
+
+    EUSDC -->|commands| USDC
+    USDC -->|via Services| BRIDGE
+
+    EMINT -->|commands| MINTA
+    MINTA -->|via Services| TOKENIZER
+    MINTA -->|via Services| BRIDGE
+    MINTA -->|via Services| VAULT
+
+    EREDEEM -->|commands| REDEEMA
+    REDEEMA -->|via Services| TOKENIZER
+    REDEEMA -->|via Services| BRIDGE
+    REDEEMA -->|via Services| VAULT
+
+    EMAINT -->|maintain| BROKER
+```
+
+##### Option 2: Subgraph boundaries, TD layout
+
+```mermaid
+graph TD
+    subgraph ext[External Systems]
+        BLOCKCHAIN([Blockchain])
+        BROKER([Broker API])
+        RPC([Ethereum RPC])
+        TOKENIZER([Tokenization API])
+        BRIDGE([Bridge API])
+        VAULT([Vault API])
+    end
+
+    subgraph jobs[Apalis Jobs]
+        POE[ProcessOnchainEvent]
+        EOT[EnrichOnchainTrade]
+        PFO[PlaceOffchainOrder]
+        EUSDC[ExecuteUsdcRebalancing]
+        EMINT[ExecuteMint]
+        EREDEEM[ExecuteRedemption]
+        POLLORD[PollOrderStatus]
+        CAP[CheckAccumulatedPositions]
+        POLLINV[PollInventory]
+        EMAINT[ExecutorMaintenance]
+    end
+
+    subgraph domain[CQRS Domain]
+        TM{{TradeManager}}
+        OM{{OrderManager}}
+        RT{{RebalancingTrigger}}
+        OT(OnChainTrade)
+        P(Position)
+        OO(OffchainOrder)
+        INV(InventorySnapshot)
+        USDC(UsdcRebalance)
+        MINTA(Mint)
+        REDEEMA(Redemption)
+    end
+
+    BLOCKCHAIN ==>|push| POE
+
+    POE -->|Witness| OT
+    OT -.->|Filled| TM
+    TM -->|AcknowledgeOnChainFill| P
+    P -.->|OffChainOrderPlaced| OM
+    OM ==>|push| PFO
+    POE ==>|push| EOT
+
+    PFO -->|ConfirmSubmission| OO
+    OO -->|via Services| BROKER
+
+    POLLORD -->|poll status| BROKER
+    POLLORD -->|CompleteFill| OO
+    OO -.->|Filled| OM
+    OM -->|CompleteOffChainOrder| P
+
+    EOT -->|Enrich| OT
+    OT -->|via Services| RPC
+
+    CAP ==>|push| PFO
+
+    POLLINV -->|poll balances| BROKER
+    POLLINV -->|RecordSnapshot| INV
+
+    P -.->|events| RT
+    INV -.->|events| RT
+    RT ==>|push| EUSDC
+    RT ==>|push| EMINT
+    RT ==>|push| EREDEEM
+
+    EUSDC -->|commands| USDC
+    USDC -->|via Services| BRIDGE
+
+    EMINT -->|commands| MINTA
+    MINTA -->|via Services| TOKENIZER
+    MINTA -->|via Services| BRIDGE
+    MINTA -->|via Services| VAULT
+
+    EREDEEM -->|commands| REDEEMA
+    REDEEMA -->|via Services| TOKENIZER
+    REDEEMA -->|via Services| BRIDGE
+    REDEEMA -->|via Services| VAULT
+
+    EMAINT -->|maintain| BROKER
+```
+
+##### Option 3: Color-coded, LR layout
+
+```mermaid
+graph LR
+    classDef ext fill:#4a6fa5,color:#fff,stroke:#365880
+    classDef job fill:#e8a838,color:#000,stroke:#b8832a
+    classDef qry fill:#6aad6e,color:#000,stroke:#4a8a4e
+    classDef agg fill:#c078b0,color:#000,stroke:#995890
+
+    BLOCKCHAIN([Blockchain]):::ext
+    BROKER([Broker API]):::ext
+    RPC([Ethereum RPC]):::ext
+    TOKENIZER([Tokenization API]):::ext
+    BRIDGE([Bridge API]):::ext
+    VAULT([Vault API]):::ext
+
+    POE[ProcessOnchainEvent]:::job
+    EOT[EnrichOnchainTrade]:::job
+    PFO[PlaceOffchainOrder]:::job
+    EUSDC[ExecuteUsdcRebalancing]:::job
+    EMINT[ExecuteMint]:::job
+    EREDEEM[ExecuteRedemption]:::job
+    POLLORD[PollOrderStatus]:::job
+    CAP[CheckAccumulatedPositions]:::job
+    POLLINV[PollInventory]:::job
+    EMAINT[ExecutorMaintenance]:::job
+
+    TM{{TradeManager}}:::qry
+    OM{{OrderManager}}:::qry
+    RT{{RebalancingTrigger}}:::qry
+
+    OT(OnChainTrade):::agg
+    P(Position):::agg
+    OO(OffchainOrder):::agg
+    INV(InventorySnapshot):::agg
+    USDC(UsdcRebalance):::agg
+    MINTA(Mint):::agg
+    REDEEMA(Redemption):::agg
+
+    BLOCKCHAIN ==>|push| POE
+
+    POE -->|Witness| OT
+    OT -.->|Filled| TM
+    TM -->|AcknowledgeOnChainFill| P
+    P -.->|OffChainOrderPlaced| OM
+    OM ==>|push| PFO
+    POE ==>|push| EOT
+
+    PFO -->|ConfirmSubmission| OO
+    OO -->|via Services| BROKER
+
+    POLLORD -->|poll status| BROKER
+    POLLORD -->|CompleteFill| OO
+    OO -.->|Filled| OM
+    OM -->|CompleteOffChainOrder| P
+
+    EOT -->|Enrich| OT
+    OT -->|via Services| RPC
+
+    CAP ==>|push| PFO
+
+    POLLINV -->|poll balances| BROKER
+    POLLINV -->|RecordSnapshot| INV
+
+    P -.->|events| RT
+    INV -.->|events| RT
+    RT ==>|push| EUSDC
+    RT ==>|push| EMINT
+    RT ==>|push| EREDEEM
+
+    EUSDC -->|commands| USDC
+    USDC -->|via Services| BRIDGE
+
+    EMINT -->|commands| MINTA
+    MINTA -->|via Services| TOKENIZER
+    MINTA -->|via Services| BRIDGE
+    MINTA -->|via Services| VAULT
+
+    EREDEEM -->|commands| REDEEMA
+    REDEEMA -->|via Services| TOKENIZER
+    REDEEMA -->|via Services| BRIDGE
+    REDEEMA -->|via Services| VAULT
+
+    EMAINT -->|maintain| BROKER
+```
+
+<!-- END DIAGRAM CANDIDATES -->
 
 ### Trade Execution
 
@@ -383,10 +724,10 @@ The system provides two top-level capabilities:
 ├───────────────────────────────────────────────────────────────────────┤
 │                                                                       │
 │  st0x-hedge                            st0x-rebalance                 │
-│  ├─ Conductor                          ├─ Rebalancer                  │
-│  ├─ Accumulator                        ├─ Trigger logic               │
+│  ├─ Conductor (apalis orchestration)   ├─ Rebalancer                  │
+│  ├─ Job handlers                       ├─ Trigger logic               │
 │  ├─ Position tracking                  ├─ Mint/Redeem managers        │
-│  └─ Queue processing                   └─ CQRS aggregates             │
+│  └─ CQRS aggregates                    └─ CQRS aggregates             │
 │                                                                       │
 │  depends on: execution                 depends on: tokenization,      │
 │                                                    bridge, vault      │
@@ -2556,124 +2897,187 @@ enum Resolution {
 This would provide complete audit trail for all manual interventions and allow
 proper tracking of asset movements that required manual resolution.
 
-### Event Processing Flow
+### Job Processing Flows
 
-#### OnChain Event Processing
+This section describes how jobs orchestrate the system's event processing,
+replacing the previous conductor-based `tokio::spawn` tasks. The DEX WebSocket
+listener runs as a supervised task that pushes jobs to the persistent queue.
+Each job is a serializable struct processed by a dedicated worker (see
+[docs/conductor.md](docs/conductor.md) for implementation details).
 
-**Current Flow** (Event-driven with Conductor):
+#### Job Types
+
+| Job                         | Type          | Replaces                           | Concurrency    | Retry | Timeout |
+| --------------------------- | ------------- | ---------------------------------- | -------------- | ----- | ------- |
+| `ProcessOnchainEvent`       | Persistent    | Event processor + queue processor  | 1 (ordered)    | 3     | 30s     |
+| `PlaceOffchainOrder`        | Persistent    | Queue processor (broker execution) | 1 (per symbol) | 3     | 60s     |
+| `EnrichOnchainTrade`        | Persistent    | Inline Pyth extraction             | unbounded      | 5     | 120s    |
+| `ExecuteRebalancing`        | Persistent    | Rebalancer task                    | 1              | 3     | 300s    |
+| `PollOrderStatus`           | Cron (5s)     | Order poller task                  | 1              | 0     | 30s     |
+| `CheckAccumulatedPositions` | Cron (10s)    | Position checker task              | 1              | 0     | 30s     |
+| `PollInventory`             | Cron (60s)    | Inventory poller task              | 1              | 0     | 60s     |
+| `ExecutorMaintenance`       | Cron (30min)  | Executor maintenance task          | 1              | 1     | 60s     |
+| `ComputeAnalytics`          | Cron (future) | Reporter binary                    | 1              | 1     | 300s    |
+
+#### Job Dependency Graph
+
+##### Job-to-Job Flow
+
+How jobs produce other jobs. Solid arrows are persistent job pushes, dashed
+arrows are external reads/calls.
+
+```mermaid
+graph LR
+    WS[DEX WebSocket] -->|push| POE[ProcessOnchainEvent]
+    POE -->|push| PFO[PlaceOffchainOrder]
+    POE -->|push| EOT[EnrichOnchainTrade]
+    CAP[CheckAccumulatedPositions] -->|push| PFO
+    RT[RebalancingTrigger] -->|push| ER[ExecuteRebalancing]
+
+    POS[PollOrderStatus] -.->|reads| Broker[Broker API]
+    PI[PollInventory] -.->|reads| Broker
+    EM[ExecutorMaintenance] -.->|calls| Broker
+    CA[ComputeAnalytics] -.->|reads| Views[CQRS Views]
+```
+
+##### Job-to-Aggregate Mapping
+
+Which jobs write to which CQRS aggregates.
+
+```mermaid
+graph LR
+    POE[ProcessOnchainEvent] --> OT[OnChainTrade]
+    POE --> P[Position]
+    EOT[EnrichOnchainTrade] --> OT
+    PFO[PlaceOffchainOrder] --> OO[OffchainOrder]
+    PFO --> P
+    POS[PollOrderStatus] --> OO
+    POS --> P
+    ER[ExecuteRebalancing] --> REB[UsdcRebalance]
+    PI[PollInventory] --> INV[InventorySnapshot]
+```
+
+#### Trade Processing Pipeline
+
+The core latency-sensitive path: blockchain event to hedge order placement.
 
 ```mermaid
 sequenceDiagram
     participant BC as Blockchain
-    participant DER as DEX Event Receiver
-    participant EP as Event Processor
-    participant Q as Event Queue (SQLite)
-    participant QP as Queue Processor
-    participant Acc as Accumulator
+    participant WS as DEX WebSocket
+    participant Q as Persistent Queue
+    participant POE as ProcessOnchainEvent
+    participant OT as OnChainTrade Agg
+    participant P as Position Agg
+    participant PFO as PlaceOffchainOrder
+    participant OO as OffchainOrder Agg
     participant Broker as Broker API
-    participant OP as Order Poller
-    participant PC as Position Checker
 
-    BC->>DER: ClearV2/TakeOrderV2 event
-    DER->>EP: Send via channel
-    EP->>Q: Enqueue event
+    BC->>WS: ClearV2/TakeOrderV2
+    WS->>Q: push ProcessOnchainEvent
 
-    loop Process Queue
-        QP->>Q: Get next unprocessed
-        Q-->>QP: Queued event
-        QP->>QP: Convert to OnchainTrade
-        QP->>Acc: Process trade
-        Acc->>Acc: Update accumulators
-        alt Threshold met
-            Acc-->>QP: Create pending execution
-            QP->>Broker: Place market order
-        end
-        QP->>Q: Mark processed
+    Q->>POE: dequeue
+    POE->>OT: OnChainTradeCommand::Witness
+    OT-->>POE: OnChainTradeEvent::Filled
+    POE->>P: PositionCommand::AcknowledgeOnChainFill
+    alt Threshold met
+        P-->>POE: [OnChainOrderFilled, OffChainOrderPlaced]
+        POE->>Q: push PlaceOffchainOrder
+    else Threshold not met
+        P-->>POE: [OnChainOrderFilled]
     end
+    POE->>Q: push EnrichOnchainTrade
 
-    loop Poll Orders
-        OP->>Broker: Get order status
-        Broker-->>OP: Order filled
-        OP->>Acc: Update execution status
-    end
+    Q->>PFO: dequeue
+    PFO->>Broker: Place market order
+    PFO->>OO: OffchainOrderCommand::ConfirmSubmission
+    OO-->>PFO: OffchainOrderEvent::Submitted
 
-    loop Periodic Check
-        PC->>Acc: Check accumulated positions
-        alt Position ready
-            PC->>Broker: Execute accumulated order
-        end
-    end
+    Note over Broker,OO: Order fill detected by PollOrderStatus cron
+    PFO->>OO: OffchainOrderCommand::CompleteFill
+    OO-->>PFO: OffchainOrderEvent::Filled
+    PFO->>P: PositionCommand::CompleteOffChainOrder
+    P-->>PFO: PositionEvent::OffChainOrderFilled
 ```
 
-**New Flow** (CQRS/ES with Managers):
+#### Enrichment Pipeline
+
+Decoupled from the trade pipeline to avoid blocking latency-sensitive hedging on
+slow RPC calls. Currently extracts Pyth oracle reference prices; designed to
+accommodate future enrichment sources.
 
 ```mermaid
 sequenceDiagram
-    participant BC as Blockchain
-    participant App as Application Layer
-    participant OT as OnChainTrade Aggregate
-    participant TM as TradeManager
-    participant P as Position Aggregate
-    participant OM as OrderManager
-    participant OO as OffchainOrder Aggregate
-    participant Broker as Broker API
-    participant Views as Views
+    participant Q as Persistent Queue
+    participant EOT as EnrichOnchainTrade
+    participant RPC as Ethereum RPC
+    participant OT as OnChainTrade Agg
 
-    BC->>App: Blockchain Event
-    App->>App: Parse
-    App->>OT: OnChainTradeCommand::Witness
-    OT->>OT: handle()
-    OT-->>App: OnChainTradeEvent::Filled
-    App->>Views: Persist & Publish
-
-    App->>TM: OnChainTradeEvent::Filled
-    TM->>TM: Extract trade data
-    TM->>P: PositionCommand::AcknowledgeOnChainFill
-    P->>P: Check threshold
-    alt Threshold not met
-        P-->>TM: [PositionEvent::OnChainOrderFilled]
-    else Threshold met
-        P-->>TM: [PositionEvent::OnChainOrderFilled,<br/>PositionEvent::OffChainOrderPlaced]
-    end
-    TM->>Views: Persist & Update
-
-    TM->>OM: PositionEvent::OffChainOrderPlaced
-    OM->>Broker: Execute trade
-    OM->>OO: OffchainOrderCommand::ConfirmSubmission
-    OO-->>OM: OffchainOrderEvent::Submitted
-    OM->>Views: Persist
-    OM->>OM: Poll for fill
-    OM->>OO: OffchainOrderCommand::CompleteFill
-    OO-->>OM: OffchainOrderEvent::Filled
-    OM->>Views: Persist & Publish
-
-    OM->>P: PositionCommand::CompleteOffChainOrder
-    P-->>OM: PositionEvent::OffChainOrderFilled
-    OM->>Views: Update
-
-    Note over App,Views: Metadata enrichment (async)
-    App->>App: Extract Pyth Price
-    App->>OT: OnChainTradeCommand::Enrich
-    OT-->>App: OnChainTradeEvent::Enriched
-    App->>Views: Update OnChainTradeView
+    Q->>EOT: dequeue
+    EOT->>RPC: debug_traceTransaction
+    RPC-->>EOT: Pyth price data
+    EOT->>OT: OnChainTradeCommand::Enrich
+    OT-->>EOT: OnChainTradeEvent::Enriched
 ```
 
-#### Manager Pattern
+#### Rebalancing Pipeline
 
-Managers coordinate between aggregates by subscribing to events and sending
-commands. They can be stateless (simple event->command reactions) or stateful
-(long-running processes with state).
+The `RebalancingTrigger` is a CQRS `Query` implementation registered on the
+Position and InventorySnapshot aggregates. When it observes events indicating a
+rebalancing condition, it pushes an `ExecuteRebalancing` job to the persistent
+queue instead of sending to an mpsc channel.
 
-**TradeManager**: Stateless - listens to OnChainTradeEvent::Filled and sends
-PositionCommand::AcknowledgeOnChainFill
+```mermaid
+sequenceDiagram
+    participant CQRS as CQRS Framework
+    participant RT as RebalancingTrigger<br/>(Query impl)
+    participant Q as Persistent Queue
+    participant ER as ExecuteRebalancing
+    participant R as UsdcRebalance Agg
+    participant Ext as External APIs
 
-**OrderManager**: Stateful - manages broker order lifecycle:
+    CQRS->>RT: dispatch(PositionEvent/InventoryEvent)
+    RT->>RT: Evaluate rebalancing condition
+    alt Rebalancing needed
+        RT->>Q: push ExecuteRebalancing
+    end
 
-- Listens to PositionEvent::OffChainOrderPlaced
-- Executes broker API calls
-- Polls for order completion
-- Tracks in-flight orders
-- Sends commands to OffchainOrder and Position aggregates
+    Q->>ER: dequeue
+    ER->>R: UsdcRebalanceCommand::Initialize
+    R-->>ER: UsdcRebalanceEvent::Initialized
+    ER->>Ext: Execute transfers
+    ER->>R: UsdcRebalanceCommand::Complete
+    R-->>ER: UsdcRebalanceEvent::Completed
+```
+
+#### Data Flow by Aggregate
+
+Which jobs write to which aggregates, and which jobs read from their views:
+
+| Aggregate         | Written by                                               | Read by                                                                  |
+| ----------------- | -------------------------------------------------------- | ------------------------------------------------------------------------ |
+| OnChainTrade      | ProcessOnchainEvent, EnrichOnchainTrade                  | ComputeAnalytics (future)                                                |
+| Position          | ProcessOnchainEvent, PlaceOffchainOrder, PollOrderStatus | CheckAccumulatedPositions, RebalancingTrigger, ComputeAnalytics (future) |
+| OffchainOrder     | PlaceOffchainOrder, PollOrderStatus                      | PollOrderStatus, ComputeAnalytics (future)                               |
+| InventorySnapshot | PollInventory                                            | RebalancingTrigger                                                       |
+| UsdcRebalance     | ExecuteRebalancing                                       | Dashboard (future)                                                       |
+| Mint / Redemption | ExecuteRebalancing                                       | Dashboard (future)                                                       |
+
+#### Market Hours Handling
+
+The supervisor runs 24/7 - both the DEX WebSocket listener and the job worker
+pool are always supervised. Market hours filtering happens as middleware on the
+relevant workers, not at the supervisor level.
+
+- **Always active**: ProcessOnchainEvent, EnrichOnchainTrade, PollInventory (and
+  the DEX WebSocket listener in the supervisor layer)
+- **Market hours only**: PlaceOffchainOrder, PollOrderStatus,
+  CheckAccumulatedPositions, ExecuteRebalancing, ExecutorMaintenance
+
+Jobs pushed outside trading hours remain in the persistent queue. The market
+hours middleware rejects them on dequeue, and they are retried when markets
+reopen. Graceful shutdown propagates from the supervisor through the worker
+pool, ensuring in-flight jobs complete before the process exits.
 
 #### Future Consideration: Reorg Handling
 

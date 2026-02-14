@@ -3,19 +3,29 @@
 //! Processes onchain trades through the position accumulator
 //! with duplicate detection, then triggers offsetting offchain
 //! orders when thresholds are met.
+//! [`CheckAccumulatedPositionsJob`] performs a single check cycle
+//! as an apalis job.
 
+use apalis::prelude::Data;
 use num_traits::ToPrimitive;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use st0x_execution::{
-    Direction, FractionalShares, OrderState, PersistenceError, Positive, SupportedExecutor, Symbol,
+    Direction, EmptySymbolError, Executor, FractionalShares, MarketOrder, OrderState,
+    PersistenceError, Positive, SupportedExecutor, Symbol,
 };
-use tracing::{debug, info, warn};
+use std::fmt;
+use std::marker::PhantomData;
+use tracing::{debug, error, info, warn};
 
 use super::OnChainError;
 use super::OnchainTrade;
+use crate::conductor::EventProcessingError;
+use crate::conductor::job::{Job, Label};
 use crate::dual_write::{DualWriteContext, load_position};
 use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_execution_lease};
-use crate::offchain::execution::OffchainExecution;
+use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
+use crate::offchain_order::BrokerOrderId;
 use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
 use crate::onchain::trade::TradeValidationError;
 use crate::trade_execution_link::TradeExecutionLink;
@@ -763,6 +773,200 @@ async fn process_symbol_execution(
     Ok(result)
 }
 
+/// Runtime dependencies for accumulated position checking.
+#[derive(Clone)]
+pub(crate) struct CheckAccumulatedPositionsCtx<E> {
+    pub(crate) pool: SqlitePool,
+    pub(crate) executor: E,
+    pub(crate) dual_write_context: DualWriteContext,
+}
+
+impl<E> CheckAccumulatedPositionsCtx<E>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+    pub(crate) async fn check_once(&self) -> Result<(), EventProcessingError> {
+        let executor_type = self.executor.to_supported_executor();
+        let executions =
+            check_all_accumulated_positions(&self.pool, &self.dual_write_context, executor_type)
+                .await?;
+
+        if executions.is_empty() {
+            debug!("No accumulated positions ready for execution");
+            return Ok(());
+        }
+
+        info!(
+            "Found {} accumulated positions ready for execution",
+            executions.len()
+        );
+
+        for execution in executions {
+            let Some(execution_id) = execution.id else {
+                error!(
+                    "Execution returned from \
+                     check_all_accumulated_positions has None ID"
+                );
+                continue;
+            };
+
+            info!(
+                "Executing accumulated position for symbol={}, \
+                 shares={}, direction={:?}, execution_id={}",
+                execution.symbol, execution.shares, execution.direction, execution_id
+            );
+
+            self.place_and_submit(execution, execution_id).await;
+        }
+
+        Ok(())
+    }
+
+    async fn place_and_submit(&self, execution: OffchainExecution, execution_id: i64) {
+        if let Err(e) = crate::dual_write::place_offchain_order(
+            &self.dual_write_context,
+            &execution,
+            &execution.symbol,
+        )
+        .await
+        {
+            error!(
+                execution_id,
+                symbol = %execution.symbol,
+                "Position::PlaceOffChainOrder command failed: {e}"
+            );
+        }
+
+        if let Err(e) = crate::dual_write::place_order(&self.dual_write_context, &execution).await {
+            error!(
+                execution_id,
+                symbol = %execution.symbol,
+                "OffchainOrder::Place command failed: {e}"
+            );
+        }
+
+        let pool = self.pool.clone();
+        let executor = self.executor.clone();
+        let dual_write_context = self.dual_write_context.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                Self::submit_to_broker(&executor, &pool, &dual_write_context, execution_id).await
+            {
+                error!(
+                    "Failed to execute accumulated position \
+                     for execution_id {execution_id}: {e}"
+                );
+            }
+        });
+    }
+
+    async fn submit_to_broker(
+        executor: &E,
+        pool: &SqlitePool,
+        dual_write_context: &DualWriteContext,
+        execution_id: i64,
+    ) -> Result<(), EventProcessingError> {
+        let execution = find_execution_by_id(pool, execution_id)
+            .await?
+            .ok_or(EventProcessingError::ExecutionNotFound(execution_id))?;
+
+        let market_order = MarketOrder {
+            symbol: to_executor_ticker(&execution.symbol)?,
+            shares: execution.shares,
+            direction: execution.direction,
+        };
+
+        let placement = executor.place_market_order(market_order).await?;
+        let broker_order_id = BrokerOrderId::new(&placement.order_id);
+
+        info!(
+            execution_id,
+            broker_order_id = ?broker_order_id,
+            "Order placed"
+        );
+
+        Self::confirm_broker_submission(dual_write_context, execution_id, broker_order_id).await;
+
+        Ok(())
+    }
+
+    async fn confirm_broker_submission(
+        dual_write_context: &DualWriteContext,
+        execution_id: i64,
+        broker_order_id: BrokerOrderId,
+    ) {
+        if let Err(e) = crate::dual_write::confirm_submission(
+            dual_write_context,
+            execution_id,
+            broker_order_id.clone(),
+        )
+        .await
+        {
+            error!(
+                execution_id,
+                broker_order_id = ?broker_order_id,
+                "OffchainOrder::ConfirmSubmission command failed: {e}"
+            );
+        }
+    }
+}
+
+/// Apalis job that checks accumulated positions and triggers
+/// offchain executions when thresholds are met.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct CheckAccumulatedPositionsJob<E>(#[serde(skip)] PhantomData<E>);
+
+impl<E> fmt::Debug for CheckAccumulatedPositionsJob<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckAccumulatedPositionsJob").finish()
+    }
+}
+
+impl<E> Clone for CheckAccumulatedPositionsJob<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Copy for CheckAccumulatedPositionsJob<E> {}
+
+impl<E> Default for CheckAccumulatedPositionsJob<E> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<E> Job for CheckAccumulatedPositionsJob<E>
+where
+    E: Executor + Clone + Send + Sync + Unpin + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    type Ctx = CheckAccumulatedPositionsCtx<E>;
+    type Error = EventProcessingError;
+
+    fn label(&self) -> Label {
+        Label::new("check-accumulated-positions")
+    }
+
+    async fn run(self, ctx: Data<Self::Ctx>) -> Result<(), Self::Error> {
+        ctx.check_once().await
+    }
+}
+
+/// Maps database symbols to current executor-recognized tickers.
+/// Handles corporate actions like SPLG -> SPYM rename (Oct 31, 2025).
+/// Remove once proper tSPYM tokens are issued onchain.
+fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
+    match symbol.to_string().as_str() {
+        "SPLG" => Symbol::new("SPYM"),
+        _ => Ok(symbol.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, FixedBytes, fixed_bytes};
@@ -771,9 +975,11 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    use st0x_execution::{FractionalShares, OrderStatus, Positive, Symbol};
+    use apalis::prelude::Data;
+    use st0x_execution::{FractionalShares, MockExecutor, OrderStatus, Positive, Symbol};
 
     use super::*;
+    use crate::conductor::job::Job;
     use crate::dual_write::DualWriteContext;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::offchain_order::{BrokerOrderId, OffchainOrder, OffchainOrderCommand};
@@ -3021,5 +3227,22 @@ mod tests {
         .unwrap();
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_accumulated_positions_job_delegates_to_check_once() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let executor = MockExecutor::default();
+
+        let ctx = CheckAccumulatedPositionsCtx {
+            pool,
+            executor,
+            dual_write_context,
+        };
+
+        let job: CheckAccumulatedPositionsJob<MockExecutor> =
+            CheckAccumulatedPositionsJob::default();
+        job.run(Data::new(ctx)).await.unwrap();
     }
 }

@@ -15,15 +15,22 @@ use crate::inventory::snapshot::{
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultError, VaultId, VaultService};
 use crate::vault_registry::{VaultRegistry, VaultRegistryError};
+use std::fmt;
+use std::marker::PhantomData;
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
+use apalis::prelude::Data;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, AggregateError, EventStore};
 use futures_util::future::try_join_all;
+use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteCqrs, SqliteEventRepository};
 use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
+
+use crate::conductor::job::{Job, Label};
 
 pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
@@ -50,12 +57,12 @@ pub(crate) struct InventoryPollingService<P, E>
 where
     P: Provider + Clone,
 {
-    vault_service: Arc<VaultService<P>>,
-    executor: E,
-    pool: SqlitePool,
-    orderbook: Address,
-    order_owner: Address,
-    snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+    pub(crate) vault_service: Arc<VaultService<P>>,
+    pub(crate) executor: E,
+    pub(crate) pool: SqlitePool,
+    pub(crate) orderbook: Address,
+    pub(crate) order_owner: Address,
+    pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 }
 
 impl<P, E> InventoryPollingService<P, E>
@@ -63,24 +70,6 @@ where
     P: Provider + Clone,
     E: Executor,
 {
-    pub(crate) fn new(
-        vault_service: Arc<VaultService<P>>,
-        executor: E,
-        pool: SqlitePool,
-        orderbook: Address,
-        order_owner: Address,
-        snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
-    ) -> Self {
-        Self {
-            vault_service,
-            executor,
-            pool,
-            orderbook,
-            order_owner,
-            snapshot_cqrs,
-        }
-    }
-
     /// Polls actual inventory from both venues and emits snapshot commands.
     ///
     /// 1. Queries onchain equity balances from discovered vaults
@@ -90,21 +79,17 @@ where
     ///
     /// Registered queries are dispatched when commands are executed.
     pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<E::Error>> {
-        let snapshot_aggregate_id =
-            InventorySnapshot::aggregate_id(self.orderbook, self.order_owner);
+        let aggregate_id = InventorySnapshot::aggregate_id(self.orderbook, self.order_owner);
 
-        self.poll_onchain(&snapshot_aggregate_id, &self.snapshot_cqrs)
-            .await?;
-        self.poll_offchain(&snapshot_aggregate_id, &self.snapshot_cqrs)
-            .await?;
+        self.poll_onchain(&aggregate_id).await?;
+        self.poll_offchain(&aggregate_id).await?;
 
         Ok(())
     }
 
     async fn poll_onchain(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        aggregate_id: &str,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         let vault_registry = self.load_vault_registry().await?;
 
@@ -113,10 +98,8 @@ where
             return Ok(());
         };
 
-        self.poll_onchain_equity(snapshot_aggregate_id, snapshot_cqrs, &registry)
-            .await?;
-        self.poll_onchain_cash(snapshot_aggregate_id, snapshot_cqrs, &registry)
-            .await?;
+        self.poll_onchain_equity(aggregate_id, &registry).await?;
+        self.poll_onchain_cash(aggregate_id, &registry).await?;
 
         Ok(())
     }
@@ -142,8 +125,7 @@ where
 
     async fn poll_onchain_equity(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        aggregate_id: &str,
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         if registry.equity_vaults.is_empty() {
@@ -176,9 +158,9 @@ where
             });
         }
 
-        snapshot_cqrs
+        self.snapshot_cqrs
             .execute(
-                snapshot_aggregate_id,
+                aggregate_id,
                 InventorySnapshotCommand::OnchainEquity { balances },
             )
             .await?;
@@ -188,8 +170,7 @@ where
 
     async fn poll_onchain_cash(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        aggregate_id: &str,
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         let Some(usdc_vault) = &registry.usdc_vault else {
@@ -202,9 +183,9 @@ where
             .get_usdc_balance(self.order_owner, VaultId(usdc_vault.vault_id))
             .await?;
 
-        snapshot_cqrs
+        self.snapshot_cqrs
             .execute(
-                snapshot_aggregate_id,
+                aggregate_id,
                 InventorySnapshotCommand::OnchainCash { usdc_balance },
             )
             .await?;
@@ -214,8 +195,7 @@ where
 
     async fn poll_offchain(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        aggregate_id: &str,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         let inventory_result = self
             .executor
@@ -234,16 +214,16 @@ where
             .map(|position| (position.symbol, position.quantity))
             .collect();
 
-        snapshot_cqrs
+        self.snapshot_cqrs
             .execute(
-                snapshot_aggregate_id,
+                aggregate_id,
                 InventorySnapshotCommand::OffchainEquity { positions },
             )
             .await?;
 
-        snapshot_cqrs
+        self.snapshot_cqrs
             .execute(
-                snapshot_aggregate_id,
+                aggregate_id,
                 InventorySnapshotCommand::OffchainCash {
                     cash_balance_cents: inventory.cash_balance_cents,
                 },
@@ -251,6 +231,56 @@ where
             .await?;
 
         Ok(())
+    }
+}
+
+/// Runtime dependencies for inventory polling, wrapped in Arc for
+/// clonability (SqliteCqrs is not Clone).
+#[derive(Clone)]
+pub(crate) struct PollInventoryCtx<P: Provider + Clone, E>(
+    pub(crate) Arc<InventoryPollingService<P, E>>,
+);
+
+/// Apalis job that polls inventory from onchain vaults and offchain
+/// broker accounts.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct PollInventoryJob<P, E>(#[serde(skip)] PhantomData<(P, E)>);
+
+impl<P, E> Job for PollInventoryJob<P, E>
+where
+    P: Provider + Clone + Send + Sync + Unpin + 'static,
+    E: Executor + Clone + Send + Sync + Unpin + 'static,
+{
+    type Ctx = PollInventoryCtx<P, E>;
+    type Error = InventoryPollingError<E::Error>;
+
+    fn label(&self) -> Label {
+        Label::new("poll-inventory")
+    }
+
+    async fn run(self, ctx: Data<Self::Ctx>) -> Result<(), Self::Error> {
+        ctx.0.poll_and_record().await
+    }
+}
+
+impl<P, E> fmt::Debug for PollInventoryJob<P, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PollInventoryJob").finish()
+    }
+}
+
+impl<P, E> Clone for PollInventoryJob<P, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P, E> Copy for PollInventoryJob<P, E> {}
+
+impl<P, E> Default for PollInventoryJob<P, E> {
+    fn default() -> Self {
+        Self(PhantomData)
     }
 }
 
@@ -318,14 +348,14 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory.clone());
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -365,14 +395,14 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -408,14 +438,14 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -440,14 +470,14 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         // Should succeed without error
         service.poll_and_record().await.unwrap();
@@ -489,14 +519,14 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -536,14 +566,14 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -577,14 +607,14 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -657,14 +687,14 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -701,14 +731,14 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -746,14 +776,14 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         service.poll_and_record().await.unwrap();
 
@@ -790,14 +820,14 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         let error = service.poll_and_record().await.unwrap_err();
 
@@ -821,14 +851,14 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
+        let service = InventoryPollingService {
             vault_service,
             executor,
-            pool.clone(),
+            pool: pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
-        );
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         let error = service.poll_and_record().await.unwrap_err();
 
@@ -872,5 +902,29 @@ mod tests {
                 serde_json::from_str(&payload).unwrap()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn test_poll_inventory_job_delegates_to_poll_and_record() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let (orderbook, order_owner) = test_addresses();
+
+        let executor = MockExecutor::default();
+
+        let service = InventoryPollingService {
+            vault_service,
+            executor,
+            pool: pool.clone(),
+            orderbook,
+            order_owner,
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
+
+        let ctx = PollInventoryCtx(Arc::new(service));
+
+        let job: PollInventoryJob<_, MockExecutor> = PollInventoryJob::default();
+        job.run(Data::new(ctx)).await.unwrap();
     }
 }

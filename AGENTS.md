@@ -324,8 +324,8 @@ Configuration is split into plaintext config (`--config`, see
 
 ### Naming Conventions
 
-Code names must be consistent with **[docs/domain.md](docs/domain.md)**, which
-is the source of truth for terminology and naming conventions.
+Code names must be consistent with **[docs/domain.md](docs/domain.md)** (domain
+glossary) and **[docs/naming.md](docs/naming.md)** (naming conventions).
 
 ### Code Quality & Best Practices
 
@@ -388,6 +388,8 @@ is the source of truth for terminology and naming conventions.
   - **ALLOWED**: Direct construction in test code, CLI code, and migration code
     (different execution contexts with intentionally different query processor
     needs)
+  - Read **[docs/conductor.md](docs/conductor.md)** before working on the
+    conductor (startup, supervision, job registration, worker wiring)
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
