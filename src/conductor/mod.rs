@@ -328,8 +328,7 @@ impl Conductor {
         };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
-        let offchain_order_query =
-            Arc::new(Projection::<OffchainOrder>::sqlite(pool.clone())?);
+        let offchain_order_query = Arc::new(Projection::<OffchainOrder>::sqlite(pool.clone())?);
 
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
@@ -2702,8 +2701,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let offchain_order_projection =
-            Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
+        let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .with_projection(&offchain_order_projection)

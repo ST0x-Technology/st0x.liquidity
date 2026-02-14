@@ -84,7 +84,7 @@ mod wire;
 
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
-pub use projection::{Column, Projection, ProjectionError, Table};
+pub use projection::{Column, Projection, ProjectionError, SqliteProjectionRepo, Table};
 pub use schema_registry::{Reconciler, SchemaRegistry};
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{TestHarness, TestResult, TestStore, replay, test_store};

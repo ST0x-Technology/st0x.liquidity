@@ -5,11 +5,13 @@
 //! backend (SQLite, Postgres, in-memory) that implements
 //! `ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>`.
 
-use cqrs_es::persist::{GenericQuery, ViewRepository};
+use async_trait::async_trait;
+use cqrs_es::persist::{GenericQuery, PersistenceError, ViewContext, ViewRepository};
 use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use sqlx::sqlite::Sqlite;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
@@ -19,9 +21,9 @@ use crate::lifecycle::{Lifecycle, LifecycleError};
 
 /// A materialized view table name.
 ///
-/// Used with [`EventSourced::TABLE`] to declare that an entity has
-/// a materialized view, and with [`Projection::sqlite`] to create
-/// the projection.
+/// Used with [`EventSourced::PROJECTION`] to declare that an
+/// entity has a materialized view, and with
+/// [`Projection::sqlite`] to create the projection.
 #[derive(Debug, Clone, Copy)]
 pub struct Table(pub &'static str);
 
@@ -33,7 +35,7 @@ impl std::fmt::Display for Table {
 
 /// A column name for view table queries.
 ///
-/// Used with [`Projection::find`] to query materialized views
+/// Used with [`Projection::filter`] to query materialized views
 /// by generated column values. Column existence is validated
 /// against the table schema at query time to catch stale
 /// generated columns early.
@@ -49,7 +51,7 @@ impl std::fmt::Display for Column {
 /// Errors from [`Projection`] query operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionError {
-    #[error("entity has no materialized view (TABLE = None)")]
+    #[error("entity has no materialized view (PROJECTION = None)")]
     NoTable,
     #[error(
         "operation requires a SQLite-backed projection \
@@ -72,48 +74,85 @@ pub enum ProjectionError {
     Sqlx(#[from] sqlx::Error),
 }
 
+/// SQLite view repository that hides [`Lifecycle`] from
+/// Projection's public type signature.
+///
+/// Without this newtype, the default `Repo` parameter would be
+/// `SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>`,
+/// leaking the `pub(crate)` `Lifecycle` type to external
+/// consumers. This wraps the underlying repository so that
+/// `Projection<Position>` expands to
+/// `Projection<Position, SqliteProjectionRepo<Position>>` — no
+/// `Lifecycle` visible.
+pub struct SqliteProjectionRepo<Entity: EventSourced> {
+    inner: SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
+}
+
+#[async_trait]
+impl<Entity: EventSourced> ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>
+    for SqliteProjectionRepo<Entity>
+{
+    async fn load(
+        &self,
+        aggregate_id: &str,
+    ) -> Result<Option<Lifecycle<Entity>>, PersistenceError> {
+        self.inner.load(aggregate_id).await
+    }
+
+    async fn load_with_context(
+        &self,
+        aggregate_id: &str,
+    ) -> Result<Option<(Lifecycle<Entity>, ViewContext)>, PersistenceError> {
+        self.inner.load_with_context(aggregate_id).await
+    }
+
+    async fn update_view(
+        &self,
+        view: Lifecycle<Entity>,
+        context: ViewContext,
+    ) -> Result<(), PersistenceError> {
+        self.inner.update_view(view, context).await
+    }
+}
+
 /// Materialized view of an event-sourced entity.
 ///
 /// Provides [`load`](Self::load) to retrieve a single entity by
 /// ID, [`load_all`](Self::load_all) to retrieve all live
-/// entities, and [`find`](Self::find) for typed column-filtered
-/// queries. Backed by SQLite in production; the `Repo` parameter
-/// defaults to `SqliteViewRepository` so consumers write
-/// `Projection<Position>`.
+/// entities, and [`filter`](Self::filter) for typed
+/// column-filtered queries. Backed by SQLite in production; the
+/// `Repo` parameter defaults to [`SqliteProjectionRepo`] so
+/// consumers write `Projection<Position>`.
 ///
 /// Constructed via [`sqlite`](Self::sqlite) during wiring or
 /// directly in CLI/test code.
-pub struct Projection<
-    Entity: EventSourced,
-    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> = SqliteViewRepository<
-        Lifecycle<Entity>,
-        Lifecycle<Entity>,
-    >,
-> {
-    inner: Arc<GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>>>,
+pub struct Projection<Entity: EventSourced, Repo = SqliteProjectionRepo<Entity>> {
+    repo: Arc<Repo>,
     pool: Option<SqlitePool>,
     table_name: Option<String>,
+    _entity: PhantomData<Entity>,
 }
 
 impl<Entity: EventSourced> Projection<Entity> {
-    /// Creates a SQLite-backed projection using [`EventSourced::TABLE`].
+    /// Creates a SQLite-backed projection using
+    /// [`EventSourced::PROJECTION`].
     ///
     /// Returns `Err(ProjectionError::NoTable)` if the entity has
-    /// no materialized view configured (`TABLE = None`).
+    /// no materialized view configured (`PROJECTION = None`).
     pub fn sqlite(pool: SqlitePool) -> Result<Self, ProjectionError> {
         let Table(table) = Entity::PROJECTION.ok_or(ProjectionError::NoTable)?;
-        let repo = Arc::new(
-            SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
+        let repo = Arc::new(SqliteProjectionRepo {
+            inner: SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
                 pool.clone(),
                 table.to_string(),
             ),
-        );
-        let query = GenericQuery::new(repo);
+        });
 
         Ok(Self {
-            inner: Arc::new(query),
+            repo,
             pool: Some(pool),
             table_name: Some(table.to_string()),
+            _entity: PhantomData,
         })
     }
 
@@ -224,13 +263,13 @@ impl<Entity: EventSourced, Repo> Projection<Entity, Repo>
 where
     Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
 {
-    /// Creates a new projection from a view repository.
+    /// Creates a projection from any view repository backend.
     pub fn new(repo: Arc<Repo>) -> Self {
-        let query = GenericQuery::new(repo);
         Self {
-            inner: Arc::new(query),
+            repo,
             pool: None,
             table_name: None,
+            _entity: PhantomData,
         }
     }
 
@@ -245,9 +284,11 @@ where
         Entity::Error: Clone,
     {
         let aggregate_id = id.to_string();
-        let Some(lifecycle) = self.inner.load(&aggregate_id).await else {
-            return Ok(None);
+        let lifecycle = match self.repo.load(&aggregate_id).await {
+            Ok(Some(lifecycle)) => lifecycle,
+            Ok(None) | Err(_) => return Ok(None),
         };
+
         match lifecycle {
             Lifecycle::Live(entity) => Ok(Some(entity)),
             Lifecycle::Uninitialized => Ok(None),
@@ -255,27 +296,23 @@ where
         }
     }
 
-    /// Access the inner GenericQuery for wiring with StoreBuilder.
+    /// Construct a GenericQuery for wiring with StoreBuilder.
     ///
     /// GenericQuery implements `cqrs_es::Query<Lifecycle<Entity>>`
-    /// natively via `View::update`, so it can be registered directly
-    /// with the CQRS framework.
-    pub(crate) fn inner_query(
-        &self,
-    ) -> Arc<GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>>> {
-        Arc::clone(&self.inner)
+    /// natively via `View::update`, so it can be registered
+    /// directly with the CQRS framework.
+    pub(crate) fn inner_query(&self) -> GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>> {
+        GenericQuery::new(Arc::clone(&self.repo))
     }
 }
 
-impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo>
-where
-    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
-{
+impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo> {
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
+            repo: Arc::clone(&self.repo),
             pool: self.pool.clone(),
             table_name: self.table_name.clone(),
+            _entity: PhantomData,
         }
     }
 }

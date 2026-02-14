@@ -59,32 +59,39 @@ pub(crate) async fn check_execution_readiness(
 
 /// Checks all positions for execution readiness.
 ///
-/// Queries the position_view for all active positions, then checks each
+/// Loads all active positions from the view, then checks each
 /// against its configured threshold. Returns execution parameters for
 /// positions that are ready.
 #[tracing::instrument(
-    skip(pool, position_query),
+    skip(position_query),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
 pub(crate) async fn check_all_positions(
-    pool: &SqlitePool,
     position_query: &Projection<Position>,
     executor_type: SupportedExecutor,
 ) -> Result<Vec<ExecutionParams>, OnChainError> {
-    let symbols = sqlx::query_scalar!("SELECT symbol FROM position_view WHERE symbol IS NOT NULL")
-        .fetch_all(pool)
-        .await?;
+    let all_positions = position_query.load_all().await?;
 
     let mut ready = Vec::new();
 
-    for symbol_str in symbols.into_iter().flatten() {
-        let symbol = Symbol::new(&symbol_str)?;
+    for (symbol, position) in &all_positions {
+        if let Some((direction, shares)) = position.is_ready_for_execution(executor_type)? {
+            let shares = Positive::new(shares)?;
 
-        if let Some(params) =
-            check_execution_readiness(position_query, &symbol, executor_type).await?
-        {
-            ready.push(params);
+            info!(
+                symbol = %symbol,
+                shares = %shares,
+                direction = ?direction,
+                "Position ready for execution"
+            );
+
+            ready.push(ExecutionParams {
+                symbol: symbol.clone(),
+                direction,
+                shares,
+                executor: executor_type,
+            });
         }
     }
 
@@ -101,7 +108,6 @@ pub(crate) async fn check_all_positions(
 mod tests {
     use alloy::primitives::TxHash;
     use rust_decimal_macros::dec;
-    use sqlx::SqlitePool;
 
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
@@ -115,7 +121,7 @@ mod tests {
     async fn create_test_position_infra(
         pool: &SqlitePool,
     ) -> (Store<Position>, Projection<Position>) {
-        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
             .with_projection(&projection)
             .build(())
@@ -245,7 +251,7 @@ mod tests {
         )
         .await;
 
-        let ready = check_all_positions(&pool, &query, SupportedExecutor::Schwab)
+        let ready = check_all_positions(&query, SupportedExecutor::Schwab)
             .await
             .unwrap();
 

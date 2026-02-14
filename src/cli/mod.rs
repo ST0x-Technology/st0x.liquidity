@@ -1814,7 +1814,8 @@ mod tests {
             result.as_ref().err()
         );
 
-        let executions = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap()
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
+            .unwrap()
             .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
@@ -1917,7 +1918,8 @@ mod tests {
             result1.as_ref().err()
         );
 
-        let executions = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap()
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
+            .unwrap()
             .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
