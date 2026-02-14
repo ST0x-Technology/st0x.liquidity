@@ -251,11 +251,8 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
-    use st0x_event_sorcery::{Aggregate, Lifecycle};
-
     use super::*;
-
-    type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
+    use st0x_event_sorcery::{TestHarness, replay};
 
     fn test_symbol(s: &str) -> Symbol {
         Symbol::new(s).unwrap()
@@ -267,20 +264,16 @@ mod tests {
 
     #[tokio::test]
     async fn first_command_initializes_aggregate() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OnchainEquity {
-                    balances: balances.clone(),
-                },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OnchainEquity {
+                balances: balances.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -296,27 +289,19 @@ mod tests {
 
     #[tokio::test]
     async fn record_onchain_equity_on_existing_aggregate() {
-        let mut aggregate = InventorySnapshotAggregate::default();
-
-        // First event initializes
-        aggregate.apply(InventorySnapshotEvent::OnchainCash {
-            usdc_balance: Usdc::from_str("1000").unwrap(),
-            fetched_at: Utc::now(),
-        });
-
-        // Second event updates
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OnchainEquity {
-                    balances: balances.clone(),
-                },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OnchainCash {
+                usdc_balance: Usdc::from_str("1000").unwrap(),
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::OnchainEquity {
+                balances: balances.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -332,14 +317,13 @@ mod tests {
 
     #[tokio::test]
     async fn record_onchain_cash_emits_event() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let usdc_balance = Usdc::from_str("10000.50").unwrap();
 
-        let events = aggregate
-            .handle(InventorySnapshotCommand::OnchainCash { usdc_balance }, &())
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OnchainCash { usdc_balance })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -355,20 +339,16 @@ mod tests {
 
     #[tokio::test]
     async fn record_offchain_equity_emits_event() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let mut positions = BTreeMap::new();
         positions.insert(test_symbol("AAPL"), test_shares(75));
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OffchainEquity {
-                    positions: positions.clone(),
-                },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OffchainEquity {
+                positions: positions.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -384,17 +364,13 @@ mod tests {
 
     #[tokio::test]
     async fn record_offchain_cash_emits_event() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let cash_balance_cents = 50_000_000; // $500,000.00
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OffchainCash { cash_balance_cents },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OffchainCash { cash_balance_cents })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -410,60 +386,47 @@ mod tests {
 
     #[test]
     fn apply_initializes_and_updates_state() {
-        let mut aggregate = InventorySnapshotAggregate::default();
-
-        // First event initializes
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
-            balances: balances.clone(),
-            fetched_at: Utc::now(),
-        });
-
-        let Lifecycle::Live(snapshot) = &aggregate else {
-            panic!("Expected Live state after first event");
-        };
-        assert_eq!(snapshot.onchain_equity, balances);
-        assert!(snapshot.onchain_cash.is_none());
-
-        // Second event updates
         let usdc = Usdc::from_str("5000").unwrap();
-        aggregate.apply(InventorySnapshotEvent::OnchainCash {
-            usdc_balance: usdc,
-            fetched_at: Utc::now(),
-        });
 
-        let Lifecycle::Live(snapshot) = &aggregate else {
-            panic!("Expected Live state after second event");
-        };
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OnchainEquity {
+                balances: balances.clone(),
+                fetched_at: Utc::now(),
+            },
+            InventorySnapshotEvent::OnchainCash {
+                usdc_balance: usdc,
+                fetched_at: Utc::now(),
+            },
+        ])
+        .unwrap();
+
         assert_eq!(snapshot.onchain_equity, balances);
         assert_eq!(snapshot.onchain_cash, Some(usdc));
     }
 
     #[test]
     fn subsequent_fetches_replace_previous_values() {
-        let mut aggregate = InventorySnapshotAggregate::default();
-
         let mut first_balances = BTreeMap::new();
         first_balances.insert(test_symbol("AAPL"), test_shares(100));
-
-        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
-            balances: first_balances,
-            fetched_at: Utc::now(),
-        });
 
         let mut second_balances = BTreeMap::new();
         second_balances.insert(test_symbol("MSFT"), test_shares(50));
 
-        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
-            balances: second_balances.clone(),
-            fetched_at: Utc::now(),
-        });
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OnchainEquity {
+                balances: first_balances,
+                fetched_at: Utc::now(),
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: second_balances.clone(),
+                fetched_at: Utc::now(),
+            },
+        ])
+        .unwrap();
 
-        let Lifecycle::Live(snapshot) = &aggregate else {
-            panic!("Expected Live state");
-        };
         assert_eq!(snapshot.onchain_equity, second_balances);
         assert!(!snapshot.onchain_equity.contains_key(&test_symbol("AAPL")));
     }

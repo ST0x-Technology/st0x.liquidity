@@ -1,13 +1,18 @@
 //! Test infrastructure for EventSourced entities.
 //!
-//! Provides [`replay`] for reconstructing entity state from events
-//! and [`TestHarness`] for BDD-style command testing. Both operate
+//! Provides [`replay`] for reconstructing entity state from events,
+//! [`TestHarness`] for BDD-style command testing, and [`TestStore`]
+//! for in-memory command dispatch with state inspection. All operate
 //! at the EventSourced level, hiding Lifecycle/Aggregate internals.
 
-use cqrs_es::Aggregate;
+use std::fmt::Debug;
+use std::str::FromStr;
 
-use crate::EventSourced;
-use crate::lifecycle::{Lifecycle, LifecycleError};
+use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
+
+use crate::Reactor;
+use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
+use crate::{EventSourced, Store};
 
 /// Replay events through EventSourced to reconstruct entity state.
 ///
@@ -22,11 +27,9 @@ pub fn replay<Entity: EventSourced>(
         lifecycle.apply(event);
     }
 
-    match lifecycle {
-        Lifecycle::Live(entity) => Ok(entity),
-        Lifecycle::Uninitialized => Err(LifecycleError::Uninitialized),
-        Lifecycle::Failed { error, .. } => Err(error),
-    }
+    lifecycle
+        .into_result()
+        .and_then(|opt| opt.ok_or(LifecycleError::Uninitialized))
 }
 
 /// BDD-style test harness for EventSourced implementations.
@@ -120,6 +123,94 @@ where
     pub fn events(self) -> Vec<Entity::Event> {
         self.result
             .expect("expected events but command returned error")
+    }
+}
+
+/// Test-only escape hatch for creating CQRS frameworks directly.
+///
+/// Tests often need CQRS with specific configurations that don't
+/// fit the production wiring pattern. Use this instead of
+/// `sqlite_es::sqlite_cqrs`.
+pub fn test_store<Entity: EventSourced>(
+    pool: sqlx::SqlitePool,
+    queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
+    services: Entity::Services,
+) -> Store<Entity> {
+    #[allow(clippy::disallowed_methods)]
+    let cqrs = sqlite_es::sqlite_cqrs(pool, queries, services);
+    Store::new(cqrs)
+}
+
+/// In-memory event store for unit tests.
+///
+/// Provides the same typed-ID interface as [`Store`] but backed
+/// by an in-memory store instead of SQLite. Also exposes
+/// [`load`](Self::load) for inspecting aggregate state after
+/// commands, which production [`Store`] intentionally omits
+/// (use projections instead).
+pub struct TestStore<Entity: EventSourced> {
+    mem_store: mem_store::MemStore<Lifecycle<Entity>>,
+    cqrs: CqrsFramework<Lifecycle<Entity>, mem_store::MemStore<Lifecycle<Entity>>>,
+}
+
+impl<Entity: EventSourced> TestStore<Entity>
+where
+    Lifecycle<Entity>: Aggregate<
+            Command = Entity::Command,
+            Event = Entity::Event,
+            Error = LifecycleError<Entity>,
+            Services = Entity::Services,
+        >,
+{
+    /// Create an in-memory TestStore for fast, isolated unit tests.
+    ///
+    /// Accepts [`Reactor`] impls which are internally bridged to
+    /// cqrs-es queries.
+    pub fn new(reactors: Vec<Box<dyn Reactor<Entity>>>, services: Entity::Services) -> Self
+    where
+        Entity: 'static,
+        <Entity::Id as FromStr>::Err: Debug,
+    {
+        let queries: Vec<Box<dyn Query<Lifecycle<Entity>>>> = reactors
+            .into_iter()
+            .map(|reactor| Box::new(ReactorBridge(reactor)) as Box<dyn Query<Lifecycle<Entity>>>)
+            .collect();
+
+        let mem_store = mem_store::MemStore::default();
+        #[allow(clippy::disallowed_methods)]
+        let cqrs = CqrsFramework::new(mem_store.clone(), queries, services);
+        Self { mem_store, cqrs }
+    }
+
+    /// Send a command to the entity identified by `id`.
+    pub async fn send(
+        &self,
+        id: &Entity::Id,
+        command: Entity::Command,
+    ) -> Result<(), crate::SendError<Entity>> {
+        self.cqrs.execute(&id.to_string(), command).await
+    }
+
+    /// Load the entity state by typed ID.
+    ///
+    /// Returns:
+    /// - `Ok(Some(entity))` if the entity is live
+    /// - `Ok(None)` if the entity has not been initialized
+    /// - `Err(error)` if the entity is in a failed lifecycle state
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test-only helper, panicking on error is fine"
+    )]
+    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, LifecycleError<Entity>>
+    where
+        Entity: Clone,
+    {
+        self.mem_store
+            .load_aggregate(&id.to_string())
+            .await
+            .unwrap()
+            .aggregate
+            .into_result()
     }
 }
 

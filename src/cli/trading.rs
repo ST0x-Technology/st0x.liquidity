@@ -5,7 +5,7 @@ use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sqlite_es::SqliteViewRepository;
+
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
@@ -295,11 +295,7 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let position_view_repo = Arc::new(SqliteViewRepository::new(
-        pool.clone(),
-        "position_view".to_string(),
-    ));
-    let position_query = Projection::new(Arc::clone(&position_view_repo));
+    let position_query = Projection::<Position>::sqlite(pool.clone(), "position_view");
     let position_store: Arc<Store<Position>> = Arc::new(
         StoreBuilder::new(pool.clone())
             .with_projection(&position_query)

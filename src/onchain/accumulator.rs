@@ -102,9 +102,7 @@ pub(crate) async fn check_all_positions(
 mod tests {
     use alloy::primitives::TxHash;
     use rust_decimal_macros::dec;
-    use sqlite_es::SqliteViewRepository;
     use sqlx::SqlitePool;
-    use std::sync::Arc;
 
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
@@ -118,11 +116,7 @@ mod tests {
     async fn create_test_position_infra(
         pool: &SqlitePool,
     ) -> (Store<Position>, Projection<Position>) {
-        let view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let projection = Projection::new(view_repo);
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
         let position_store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
             .with_projection(&projection)
             .build(())

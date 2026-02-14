@@ -538,6 +538,8 @@ mod tests {
     use tokio::sync::mpsc;
     use uuid::uuid;
 
+    use st0x_event_sorcery::TestStore;
+
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::offchain_order::{OffchainOrderId, PriceCents};
@@ -1606,20 +1608,17 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_deposit_confirmed_alone_for_base_to_alpaca() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
 
-        let aggregate_id = "base-to-alpaca-001";
+        let id = UsdcRebalanceId::new("base-to-alpaca-001");
         let tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
         // Execute full BaseToAlpaca flow - each command triggers a dispatch with only
         // the new event(s), so terminal detection must work without seeing history
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc(dec!(500)),
@@ -1630,21 +1629,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 12345,
@@ -1654,8 +1653,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
                     amount_received: Usdc(dec!(99.99)),
@@ -1666,8 +1665,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(tx_hash),
                 },
@@ -1676,7 +1675,7 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
 
@@ -1696,19 +1695,16 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_deposit_confirmed_alone_for_alpaca_to_base() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
 
-        let aggregate_id = "alpaca-to-base-001";
+        let id = UsdcRebalanceId::new("alpaca-to-base-001");
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(1000)),
@@ -1719,21 +1715,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 67890,
@@ -1743,8 +1739,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
                     amount_received: Usdc(dec!(99.99)),
@@ -1755,8 +1751,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(tx_hash),
                 },
@@ -1765,7 +1761,7 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
 
@@ -1783,17 +1779,14 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_withdrawal_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
 
-        let aggregate_id = "withdrawal-failed-test";
+        let id = UsdcRebalanceId::new("withdrawal-failed-test");
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(100)),
@@ -1804,8 +1797,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::FailWithdrawal {
                     reason: "Test failure".to_string(),
                 },
@@ -1827,19 +1820,16 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_bridging_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
 
-        let aggregate_id = "bridging-failed-test";
+        let id = UsdcRebalanceId::new("bridging-failed-test");
         let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(uuid::Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(100)),
@@ -1850,21 +1840,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::FailBridging {
                     reason: "Bridge timeout".to_string(),
                 },
@@ -1886,16 +1876,13 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_conversion_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
 
-        let aggregate_id = "conversion-failed-test";
+        let id = UsdcRebalanceId::new("conversion-failed-test");
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(100)),
@@ -1906,8 +1893,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::FailConversion {
                     reason: "Order rejected".to_string(),
                 },
@@ -1985,18 +1972,15 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_conversion_confirmed_alone_for_base_to_alpaca() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
 
-        let aggregate_id = "conversion-base-to-alpaca-001";
+        let id = UsdcRebalanceId::new("conversion-base-to-alpaca-001");
         let tx_hash =
             fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc(dec!(500)),
@@ -2007,21 +1991,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 99999,
@@ -2031,8 +2015,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
                     amount_received: Usdc(dec!(99.99)),
@@ -2043,8 +2027,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(tx_hash),
                 },
@@ -2053,14 +2037,14 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
 
         // Now start post-deposit conversion (USDC to USD)
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: uuid::Uuid::new_v4(),
                     amount: Usdc(dec!(500)),
@@ -2085,8 +2069,8 @@ mod tests {
         drop(terminal_results);
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmConversion {
                     filled_amount: Usdc(dec!(499)), // ~0.2% slippage
                 },

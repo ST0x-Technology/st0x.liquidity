@@ -567,28 +567,47 @@ impl TokenizedEquityMint {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
-    use st0x_event_sorcery::Aggregate;
 
     use super::*;
-    use st0x_event_sorcery::{Lifecycle, LifecycleError};
+    use st0x_event_sorcery::{LifecycleError, TestHarness, TestStore};
+
+    fn mint_requested_event() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintRequested {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
+            wallet: Address::random(),
+            requested_at: Utc::now(),
+        }
+    }
+
+    fn mint_accepted_event() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            accepted_at: Utc::now(),
+        }
+    }
+
+    fn tokens_received_event() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::TokensReceived {
+            tx_hash: TxHash::random(),
+            receipt_id: ReceiptId(U256::from(789)),
+            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            received_at: Utc::now(),
+        }
+    }
 
     #[tokio::test]
-    async fn test_request_mint_from_uninitialized() {
-        let aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::RequestMint {
-                    symbol: symbol.clone(),
-                    quantity: dec!(100.5),
-                    wallet,
-                },
-                &(),
-            )
+    async fn request_mint_from_uninitialized_produces_mint_requested() {
+        let events = TestHarness::<TokenizedEquityMint>::with(())
+            .given_no_previous_events()
+            .when(TokenizedEquityMintCommand::RequestMint {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: dec!(100.5),
+                wallet: Address::random(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -598,29 +617,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_acknowledge_acceptance_after_request() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::AcknowledgeAcceptance {
-                    issuer_request_id: IssuerRequestId("ISS123".to_string()),
-                    tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-                },
-                &(),
-            )
+    async fn acknowledge_acceptance_after_request() {
+        let events = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![mint_requested_event()])
+            .when(TokenizedEquityMintCommand::AcknowledgeAcceptance {
+                issuer_request_id: IssuerRequestId("ISS123".to_string()),
+                tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -630,38 +635,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_receive_tokens_after_acceptance() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        };
-        aggregate.apply(accepted_event);
-
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::ReceiveTokens {
-                    tx_hash,
-                    receipt_id: ReceiptId(U256::from(789)),
-                    shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-                },
-                &(),
-            )
+    async fn receive_tokens_after_acceptance() {
+        let events = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![mint_requested_event(), mint_accepted_event()])
+            .when(TokenizedEquityMintCommand::ReceiveTokens {
+                tx_hash: TxHash::random(),
+                receipt_id: ReceiptId(U256::from(789)),
+                shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -671,39 +654,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finalize_after_tokens_received() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        };
-        aggregate.apply(accepted_event);
-
-        let received_event = TokenizedEquityMintEvent::TokensReceived {
-            tx_hash,
-            receipt_id: ReceiptId(U256::from(789)),
-            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-            received_at: Utc::now(),
-        };
-        aggregate.apply(received_event);
-
-        let events = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
+    async fn finalize_after_tokens_received() {
+        let events = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![
+                mint_requested_event(),
+                mint_accepted_event(),
+                tokens_received_event(),
+            ])
+            .when(TokenizedEquityMintCommand::Finalize)
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -713,184 +673,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_mint_flow_end_to_end() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-        let tx_hash = TxHash::random();
+    async fn complete_mint_flow_end_to_end() {
+        let store = TestStore::<TokenizedEquityMint>::new(vec![], ());
+        let id = IssuerRequestId::new("end-to-end");
 
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-
-        let events = aggregate
-            .handle(
+        store
+            .send(
+                &id,
                 TokenizedEquityMintCommand::RequestMint {
-                    symbol: symbol.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
                     quantity: dec!(100.5),
-                    wallet,
+                    wallet: Address::random(),
                 },
-                &(),
             )
             .await
             .unwrap();
-        assert_eq!(events.len(), 1);
-        for event in events {
-            aggregate.apply(event);
-        }
 
-        let events = aggregate
-            .handle(
+        store
+            .send(
+                &id,
                 TokenizedEquityMintCommand::AcknowledgeAcceptance {
                     issuer_request_id: IssuerRequestId("ISS123".to_string()),
                     tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
                 },
-                &(),
             )
             .await
             .unwrap();
-        assert_eq!(events.len(), 1);
-        for event in events {
-            aggregate.apply(event);
-        }
 
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::ReceiveTokens {
-                    tx_hash,
-                    receipt_id: ReceiptId(U256::from(789)),
-                    shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        let events = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        assert!(matches!(
-            aggregate,
-            Lifecycle::Live(TokenizedEquityMint::Completed { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_acknowledge_before_request() {
-        let aggregate = Lifecycle::<TokenizedEquityMint>::default();
-
-        let result = aggregate
-            .handle(
-                TokenizedEquityMintCommand::AcknowledgeAcceptance {
-                    issuer_request_id: IssuerRequestId("ISS123".to_string()),
-                    tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-                },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(LifecycleError::Apply(
-                TokenizedEquityMintError::NotRequested
-            ))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_receive_tokens_before_acceptance() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let result = aggregate
-            .handle(
+        store
+            .send(
+                &id,
                 TokenizedEquityMintCommand::ReceiveTokens {
                     tx_hash: TxHash::random(),
                     receipt_id: ReceiptId(U256::from(789)),
                     shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(LifecycleError::Apply(TokenizedEquityMintError::NotAccepted))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_finalize_before_tokens_received() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        };
-        aggregate.apply(accepted_event);
-
-        let result = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(LifecycleError::Apply(
-                TokenizedEquityMintError::TokensNotReceived
-            ))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_reject_mint_from_requested_state() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::RejectMint {
-                    reason: "Alpaca API timeout".to_string(),
-                },
-                &(),
             )
             .await
             .unwrap();
+
+        store
+            .send(&id, TokenizedEquityMintCommand::Finalize)
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn cannot_acknowledge_before_request() {
+        let error = TestHarness::<TokenizedEquityMint>::with(())
+            .given_no_previous_events()
+            .when(TokenizedEquityMintCommand::AcknowledgeAcceptance {
+                issuer_request_id: IssuerRequestId("ISS123".to_string()),
+                tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(TokenizedEquityMintError::NotRequested)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cannot_receive_tokens_before_acceptance() {
+        let error = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![mint_requested_event()])
+            .when(TokenizedEquityMintCommand::ReceiveTokens {
+                tx_hash: TxHash::random(),
+                receipt_id: ReceiptId(U256::from(789)),
+                shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(TokenizedEquityMintError::NotAccepted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cannot_finalize_before_tokens_received() {
+        let error = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![mint_requested_event(), mint_accepted_event()])
+            .when(TokenizedEquityMintCommand::Finalize)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(TokenizedEquityMintError::TokensNotReceived)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reject_mint_from_requested_state() {
+        let events = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![mint_requested_event()])
+            .when(TokenizedEquityMintCommand::RejectMint {
+                reason: "Alpaca API timeout".to_string(),
+            })
+            .await
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -900,35 +788,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fail_acceptance_from_accepted_state() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        };
-        aggregate.apply(accepted_event);
-
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::FailAcceptance {
-                    reason: "Transaction reverted".to_string(),
-                },
-                &(),
-            )
+    async fn fail_acceptance_from_accepted_state() {
+        let events = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![mint_requested_event(), mint_accepted_event()])
+            .when(TokenizedEquityMintCommand::FailAcceptance {
+                reason: "Transaction reverted".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -938,141 +805,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_reject_mint_when_completed() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        };
-        aggregate.apply(accepted_event);
-
-        let received_event = TokenizedEquityMintEvent::TokensReceived {
-            tx_hash,
-            receipt_id: ReceiptId(U256::from(789)),
-            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-            received_at: Utc::now(),
-        };
-        aggregate.apply(received_event);
-
-        let completed_event = TokenizedEquityMintEvent::MintCompleted {
-            completed_at: Utc::now(),
-        };
-        aggregate.apply(completed_event);
-
-        let result = aggregate
-            .handle(
-                TokenizedEquityMintCommand::RejectMint {
-                    reason: "Cannot reject completed mint".to_string(),
+    async fn cannot_reject_mint_when_completed() {
+        let error = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![
+                mint_requested_event(),
+                mint_accepted_event(),
+                tokens_received_event(),
+                TokenizedEquityMintEvent::MintCompleted {
+                    completed_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+            ])
+            .when(TokenizedEquityMintCommand::RejectMint {
+                reason: "Cannot reject completed mint".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result,
-            Err(LifecycleError::Apply(
-                TokenizedEquityMintError::AlreadyCompleted
-            ))
+            error,
+            LifecycleError::Apply(TokenizedEquityMintError::AlreadyCompleted)
         ));
     }
 
     #[tokio::test]
-    async fn test_cannot_reject_mint_when_already_failed() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let rejected_event = TokenizedEquityMintEvent::MintRejected {
-            reason: "First rejection".to_string(),
-            rejected_at: Utc::now(),
-        };
-        aggregate.apply(rejected_event);
-
-        let result = aggregate
-            .handle(
-                TokenizedEquityMintCommand::RejectMint {
-                    reason: "Cannot reject again".to_string(),
+    async fn cannot_reject_mint_when_already_failed() {
+        let error = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![
+                mint_requested_event(),
+                TokenizedEquityMintEvent::MintRejected {
+                    reason: "First rejection".to_string(),
+                    rejected_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+            ])
+            .when(TokenizedEquityMintCommand::RejectMint {
+                reason: "Cannot reject again".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result,
-            Err(LifecycleError::Apply(
-                TokenizedEquityMintError::AlreadyFailed
-            ))
+            error,
+            LifecycleError::Apply(TokenizedEquityMintError::AlreadyFailed)
         ));
     }
 
     #[tokio::test]
-    async fn test_cannot_reject_mint_before_request() {
-        let aggregate = Lifecycle::<TokenizedEquityMint>::default();
-
-        let result = aggregate
-            .handle(
-                TokenizedEquityMintCommand::RejectMint {
-                    reason: "Cannot reject uninitialized".to_string(),
-                },
-                &(),
-            )
-            .await;
+    async fn cannot_reject_mint_before_request() {
+        let error = TestHarness::<TokenizedEquityMint>::with(())
+            .given_no_previous_events()
+            .when(TokenizedEquityMintCommand::RejectMint {
+                reason: "Cannot reject uninitialized".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result,
-            Err(LifecycleError::Apply(
-                TokenizedEquityMintError::NotRequested
-            ))
+            error,
+            LifecycleError::Apply(TokenizedEquityMintError::NotRequested)
         ));
     }
 
     #[tokio::test]
-    async fn test_cannot_fail_acceptance_before_acceptance() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let result = aggregate
-            .handle(
-                TokenizedEquityMintCommand::FailAcceptance {
-                    reason: "Cannot fail before acceptance".to_string(),
-                },
-                &(),
-            )
-            .await;
+    async fn cannot_fail_acceptance_before_acceptance() {
+        let error = TestHarness::<TokenizedEquityMint>::with(())
+            .given(vec![mint_requested_event()])
+            .when(TokenizedEquityMintCommand::FailAcceptance {
+                reason: "Cannot fail before acceptance".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result,
-            Err(LifecycleError::Apply(TokenizedEquityMintError::NotAccepted))
+            error,
+            LifecycleError::Apply(TokenizedEquityMintError::NotAccepted)
         ));
     }
 

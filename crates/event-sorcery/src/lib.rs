@@ -82,14 +82,13 @@ mod schema_registry;
 mod testing;
 mod wire;
 
-pub use lifecycle::{Lifecycle, LifecycleError, Never};
+use lifecycle::Lifecycle;
+pub use lifecycle::{LifecycleError, Never};
 pub use projection::Projection;
 pub use schema_registry::{Reconciler, SchemaRegistry};
 #[cfg(any(test, feature = "test-support"))]
-pub use testing::{TestHarness, TestResult, replay};
+pub use testing::{TestHarness, TestResult, TestStore, replay, test_store};
 pub use wire::{Cons, Nil, StoreBuilder, Unwired};
-#[cfg(any(test, feature = "test-support"))]
-pub use wire::{TestStore, test_mem_store, test_store};
 
 use async_trait::async_trait;
 use cqrs_es::EventStore;
@@ -313,10 +312,7 @@ pub async fn load_aggregate<Entity: EventSourced>(
     let aggregate_id = id.to_string();
     let context = store.load_aggregate(&aggregate_id).await?;
 
-    match &context.aggregate {
-        Lifecycle::Live(entity) => Ok(Some(entity.clone())),
-        Lifecycle::Uninitialized | Lifecycle::Failed { .. } => Ok(None),
-    }
+    Ok(context.aggregate.into_result().unwrap_or(None))
 }
 
 /// Bounds required for domain error types used with

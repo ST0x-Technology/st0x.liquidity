@@ -7,6 +7,7 @@
 
 use cqrs_es::persist::{GenericQuery, ViewRepository};
 use sqlite_es::SqliteViewRepository;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 
 use crate::EventSourced;
@@ -29,6 +30,20 @@ pub struct Projection<
     >,
 > {
     inner: Arc<GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>>>,
+}
+
+impl<Entity: EventSourced> Projection<Entity> {
+    /// Creates a SQLite-backed projection for the given table.
+    pub fn sqlite(pool: SqlitePool, table_name: impl Into<String>) -> Self {
+        let repo = Arc::new(
+            SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
+                pool,
+                table_name.into(),
+            ),
+        );
+
+        Self::new(repo)
+    }
 }
 
 impl<Entity: EventSourced, Repo> Projection<Entity, Repo>

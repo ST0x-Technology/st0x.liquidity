@@ -16,7 +16,7 @@
 //! 5. Extract and return it in [`WiredQueries`]
 
 use alloy::primitives::Address;
-use sqlite_es::SqliteViewRepository;
+
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -83,8 +83,7 @@ impl QueryManifest {
 
         let event_broadcaster = EventBroadcaster::new(event_sender);
 
-        let position_repo = Arc::new(SqliteViewRepository::new(pool, "position_view".to_string()));
-        let position_view = Projection::new(position_repo);
+        let position_view = Projection::<Position>::sqlite(pool, "position_view");
 
         Self {
             rebalancing_trigger: Unwired::new(rebalancing_trigger),

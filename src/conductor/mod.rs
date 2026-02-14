@@ -28,8 +28,6 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecutor};
 
-use sqlite_es::SqliteViewRepository;
-
 use st0x_event_sorcery::{Cons, Nil, Projection, SendError, Store, StoreBuilder, Unwired};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
@@ -503,11 +501,7 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
 async fn build_position_cqrs(
     pool: &SqlitePool,
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
-    let position_view_repo = Arc::new(SqliteViewRepository::new(
-        pool.clone(),
-        "position_view".to_string(),
-    ));
-    let position_view = Projection::new(position_view_repo);
+    let position_view = Projection::<Position>::sqlite(pool.clone(), "position_view");
 
     let store = StoreBuilder::<Position>::new(pool.clone())
         .with_projection(&position_view)
@@ -1502,7 +1496,6 @@ mod tests {
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
-    use st0x_event_sorcery::Lifecycle;
 
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -2685,20 +2678,10 @@ mod tests {
     async fn create_cqrs_frameworks_with_order_placer(
         pool: &SqlitePool,
         order_placer: Arc<dyn OrderPlacer>,
-    ) -> (
-        CqrsFrameworks,
-        Projection<
-            OffchainOrder,
-            SqliteViewRepository<Lifecycle<OffchainOrder>, Lifecycle<OffchainOrder>>,
-        >,
-    ) {
+    ) -> (CqrsFrameworks, Projection<OffchainOrder>) {
         let onchain_trade = Arc::new(st0x_event_sorcery::test_store(pool.clone(), vec![], ()));
 
-        let position_view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let position_projection = Projection::new(position_view_repo);
+        let position_projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
         let position = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
                 .with_projection(&position_projection)
@@ -2707,11 +2690,8 @@ mod tests {
                 .unwrap(),
         );
 
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "offchain_order_view".to_string(),
-        ));
-        let offchain_order_projection = Projection::new(offchain_order_view_repo);
+        let offchain_order_projection =
+            Projection::<OffchainOrder>::sqlite(pool.clone(), "offchain_order_view");
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .with_projection(&offchain_order_projection)
@@ -3283,12 +3263,7 @@ mod tests {
             operation_sender,
         ));
 
-        let projection = Projection::new(Arc::new(SqliteViewRepository::<
-            Lifecycle<Position>,
-            Lifecycle<Position>,
-        >::new(
-            pool.clone(), "position_view".to_string()
-        )));
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
                 .with_projection(&projection)
@@ -3369,12 +3344,7 @@ mod tests {
             operation_sender,
         ));
 
-        let projection = Projection::new(Arc::new(SqliteViewRepository::<
-            Lifecycle<Position>,
-            Lifecycle<Position>,
-        >::new(
-            pool.clone(), "position_view".to_string()
-        )));
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
                 .with_projection(&projection)
@@ -3476,11 +3446,7 @@ mod tests {
             operation_sender,
         ));
 
-        let position_view_repo = Arc::new(SqliteViewRepository::<
-            Lifecycle<Position>,
-            Lifecycle<Position>,
-        >::new(pool.clone(), "position_view".to_string()));
-        let projection = st0x_event_sorcery::Projection::new(position_view_repo);
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
                 .with_projection(&projection)
@@ -3606,11 +3572,7 @@ mod tests {
             operation_sender,
         ));
 
-        let position_view_repo = Arc::new(SqliteViewRepository::<
-            Lifecycle<Position>,
-            Lifecycle<Position>,
-        >::new(pool.clone(), "position_view".to_string()));
-        let projection = st0x_event_sorcery::Projection::new(position_view_repo);
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
                 .with_projection(&projection)

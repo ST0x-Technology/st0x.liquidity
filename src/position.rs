@@ -584,11 +584,9 @@ pub(crate) enum TriggerReason {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
-    use sqlite_es::SqliteViewRepository;
     use st0x_event_sorcery::{Aggregate, EventEnvelope, TestFramework, View};
     use std::collections::HashMap;
     use std::str::FromStr;
-    use std::sync::Arc;
 
     use st0x_execution::Positive;
 
@@ -1584,11 +1582,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_none_when_no_aggregate_exists() {
         let pool = crate::test_utils::setup_test_db().await;
-        let view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let projection = Projection::new(view_repo);
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
 
         let result = load_position(&projection, &Symbol::new("AAPL").unwrap())
             .await
@@ -1616,11 +1610,7 @@ mod tests {
         .await
         .unwrap();
 
-        let view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let projection = Projection::new(view_repo);
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
 
         let result = load_position(&projection, &Symbol::new("AAPL").unwrap())
             .await
@@ -1635,11 +1625,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_position_for_live_lifecycle() {
         let pool = crate::test_utils::setup_test_db().await;
-        let view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let projection = Projection::new(view_repo);
+        let projection = Projection::<Position>::sqlite(pool.clone(), "position_view");
 
         let store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
             .with_projection(&projection)

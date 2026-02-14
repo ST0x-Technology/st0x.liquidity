@@ -49,7 +49,7 @@ use crate::{EventSourced, Reactor};
 // The empty bound avoids redundant constraints that confuse the
 // compiler when Entity has complex associated types.
 #[serde(bound = "")]
-pub enum Lifecycle<Entity: EventSourced> {
+pub(crate) enum Lifecycle<Entity: EventSourced> {
     Uninitialized,
     Live(Entity),
     Failed {
@@ -59,14 +59,11 @@ pub enum Lifecycle<Entity: EventSourced> {
 }
 
 impl<Entity: EventSourced> Lifecycle<Entity> {
-    pub fn live(&self) -> Result<&Entity, LifecycleError<Entity>>
-    where
-        Entity::Error: Clone,
-    {
+    pub(crate) fn into_result(self) -> Result<Option<Entity>, LifecycleError<Entity>> {
         match self {
-            Self::Live(inner) => Ok(inner),
-            Self::Uninitialized => Err(LifecycleError::Uninitialized),
-            Self::Failed { error, .. } => Err(error.clone()),
+            Self::Live(entity) => Ok(Some(entity)),
+            Self::Uninitialized => Ok(None),
+            Self::Failed { error, .. } => Err(error),
         }
     }
 }

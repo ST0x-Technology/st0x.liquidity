@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlite_es::SqliteViewRepository;
+
 use sqlx::SqlitePool;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,11 +23,7 @@ pub(crate) async fn build_offchain_order_cqrs(
     pool: &SqlitePool,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<(Arc<Store<OffchainOrder>>, Projection<OffchainOrder>)> {
-    let view_repo = Arc::new(SqliteViewRepository::new(
-        pool.clone(),
-        "offchain_order_view".to_string(),
-    ));
-    let projection = Projection::new(view_repo);
+    let projection = Projection::<OffchainOrder>::sqlite(pool.clone(), "offchain_order_view");
 
     let store = StoreBuilder::new(pool.clone())
         .with_projection(&projection)
@@ -594,9 +590,7 @@ impl TryFrom<i64> for PriceCents {
 mod tests {
     use rust_decimal_macros::dec;
 
-    use st0x_event_sorcery::{
-        Aggregate, AggregateError, Lifecycle, LifecycleError, test_mem_store,
-    };
+    use st0x_event_sorcery::{AggregateError, LifecycleError, TestStore, replay};
 
     use super::*;
 
@@ -627,27 +621,23 @@ mod tests {
 
     #[tokio::test]
     async fn place_order_transitions_to_submitted() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
 
-        let Lifecycle::Live(inner) = store.load(&id).await else {
-            panic!("Expected Live state");
-        };
+        let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::Submitted { .. }));
     }
 
     #[tokio::test]
     async fn place_with_failing_broker_transitions_to_failed() {
-        let store = test_mem_store::<OffchainOrder>(vec![], failing_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], failing_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
 
-        let Lifecycle::Live(inner) = store.load(&id).await else {
-            panic!("Expected Live state");
-        };
+        let inner = store.load(&id).await.unwrap().unwrap();
         assert!(
             matches!(&inner, OffchainOrder::Failed { error, .. } if error.contains("Broker rejected")),
             "Expected Failed with broker error, got: {inner:?}"
@@ -656,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_already_submitted() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -670,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_filled() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -693,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_failed() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -716,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_from_submitted() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -731,15 +721,13 @@ mod tests {
             .await
             .unwrap();
 
-        let Lifecycle::Live(inner) = store.load(&id).await else {
-            panic!("Expected Live state");
-        };
+        let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::PartiallyFilled { .. }));
     }
 
     #[tokio::test]
     async fn partial_fill_updates_shares() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -764,17 +752,17 @@ mod tests {
             .await
             .unwrap();
 
-        let Lifecycle::Live(OffchainOrder::PartiallyFilled { shares_filled, .. }) =
-            store.load(&id).await
+        let OffchainOrder::PartiallyFilled { shares_filled, .. } =
+            store.load(&id).await.unwrap().unwrap()
         else {
-            panic!("Expected Live PartiallyFilled state");
+            panic!("Expected PartiallyFilled state");
         };
         assert_eq!(shares_filled, FractionalShares::new(dec!(75)));
     }
 
     #[tokio::test]
     async fn complete_fill_from_submitted() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -788,15 +776,13 @@ mod tests {
             .await
             .unwrap();
 
-        let Lifecycle::Live(inner) = store.load(&id).await else {
-            panic!("Expected Live state");
-        };
+        let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::Filled { .. }));
     }
 
     #[tokio::test]
     async fn complete_fill_from_partially_filled() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -820,15 +806,13 @@ mod tests {
             .await
             .unwrap();
 
-        let Lifecycle::Live(inner) = store.load(&id).await else {
-            panic!("Expected Live state");
-        };
+        let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::Filled { .. }));
     }
 
     #[tokio::test]
     async fn cannot_fill_uninitialized_order() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         let err = store
@@ -848,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_already_filled() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -879,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_submitted() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -893,15 +877,13 @@ mod tests {
             .await
             .unwrap();
 
-        let Lifecycle::Live(inner) = store.load(&id).await else {
-            panic!("Expected Live state");
-        };
+        let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::Failed { .. }));
     }
 
     #[tokio::test]
     async fn mark_failed_from_partially_filled() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -925,15 +907,13 @@ mod tests {
             .await
             .unwrap();
 
-        let Lifecycle::Live(inner) = store.load(&id).await else {
-            panic!("Expected Live state");
-        };
+        let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::Failed { .. }));
     }
 
     #[tokio::test]
     async fn cannot_fail_already_filled() {
-        let store = test_mem_store::<OffchainOrder>(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -963,17 +943,15 @@ mod tests {
     }
 
     #[test]
-    fn transition_on_uninitialized_corrupts_state() {
-        let mut order = Lifecycle::<OffchainOrder>::default();
-
+    fn non_genesis_event_on_uninitialized_produces_error() {
         let event = OffchainOrderEvent::Submitted {
             executor_order_id: ExecutorOrderId::new("ORD123"),
             submitted_at: Utc::now(),
         };
 
-        order.apply(event);
+        let error = replay::<OffchainOrder>(vec![event]).unwrap_err();
 
-        assert!(matches!(order, Lifecycle::Failed { .. }));
+        assert!(matches!(error, LifecycleError::Mismatch { .. }));
     }
 
     #[tokio::test]

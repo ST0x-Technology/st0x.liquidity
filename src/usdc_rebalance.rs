@@ -2365,14 +2365,14 @@ mod tests {
 
         aggregate.apply(events.into_iter().next().unwrap());
 
-        let UsdcRebalance::Bridged {
+        let Lifecycle::Live(UsdcRebalance::Bridged {
             direction,
             amount,
             burn_tx_hash: state_burn_tx,
             mint_tx_hash: state_mint_tx,
             initiated_at: state_initiated_at,
             ..
-        } = aggregate.live().unwrap()
+        }) = &aggregate
         else {
             panic!("Expected Bridged state");
         };
