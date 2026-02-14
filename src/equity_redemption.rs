@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 use std::str::FromStr;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
 use crate::tokenized_equity_mint::TokenizationRequestId;
 

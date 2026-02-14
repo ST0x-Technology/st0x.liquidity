@@ -358,6 +358,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::Table;
     use crate::lifecycle::Never;
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -401,6 +402,7 @@ mod tests {
         type Services = ();
 
         const AGGREGATE_TYPE: &'static str = "AggregateA";
+        const PROJECTION: Option<Table> = None;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &EventA) -> Option<Self> {
@@ -429,6 +431,7 @@ mod tests {
         type Services = ();
 
         const AGGREGATE_TYPE: &'static str = "AggregateB";
+        const PROJECTION: Option<Table> = None;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &EventB) -> Option<Self> {

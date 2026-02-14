@@ -84,7 +84,7 @@ mod wire;
 
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
-pub use projection::Projection;
+pub use projection::{Column, Projection, ProjectionError, Table};
 pub use schema_registry::{Reconciler, SchemaRegistry};
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{TestHarness, TestResult, TestStore, replay, test_store};
@@ -185,6 +185,14 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     type Services: Send + Sync;
 
     const AGGREGATE_TYPE: &'static str;
+
+    /// The materialized view table for this entity, if any.
+    ///
+    /// Set to `Some(Table("..."))` to enable [`Projection::sqlite`]
+    /// for this entity type. Set to `None` for entities without
+    /// materialized views.
+    const PROJECTION: Option<Table>;
+
     const SCHEMA_VERSION: u64;
 
     /// Create initial state from a genesis event.

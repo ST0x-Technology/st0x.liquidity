@@ -12,12 +12,13 @@ use st0x_execution::{
     ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
 
-use st0x_event_sorcery::{SendError, Store};
+use st0x_event_sorcery::{Column, Projection, SendError, Store};
 
-use super::execution::find_orders_by_status;
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, PriceCents};
 use crate::onchain::OnChainError;
 use crate::position::{Position, PositionCommand};
+
+const STATUS: Column = Column("status");
 
 /// Order polling errors for order status monitoring.
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +31,8 @@ pub(crate) enum OrderPollingError {
     Persistence(#[from] PersistenceError),
     #[error("Onchain error: {0}")]
     OnChain(#[from] OnChainError),
+    #[error("Projection query error: {0}")]
+    Projection(#[from] st0x_event_sorcery::ProjectionError),
     #[error("Offchain order aggregate error: {0}")]
     OffchainOrderAggregate(#[from] SendError<OffchainOrder>),
     #[error("Position aggregate error: {0}")]
@@ -62,6 +65,7 @@ pub struct OrderStatusPoller<E: Executor> {
     pool: SqlitePool,
     interval: Interval,
     executor: E,
+    offchain_order_projection: Projection<OffchainOrder>,
     offchain_order: Arc<Store<OffchainOrder>>,
     position: Arc<Store<Position>>,
 }
@@ -71,6 +75,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         ctx: OrderPollerCtx,
         pool: SqlitePool,
         executor: E,
+        offchain_order_projection: Projection<OffchainOrder>,
         offchain_order: Arc<Store<OffchainOrder>>,
         position: Arc<Store<Position>>,
     ) -> Self {
@@ -81,6 +86,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             pool,
             interval,
             executor,
+            offchain_order_projection,
             offchain_order,
             position,
         }
@@ -106,12 +112,13 @@ impl<E: Executor> OrderStatusPoller<E> {
         debug!("Starting polling cycle for submitted orders");
 
         let executor_type = self.executor.to_supported_executor();
-        let submitted_executions: Vec<_> =
-            find_orders_by_status(&self.pool, OrderStatus::Submitted)
-                .await?
-                .into_iter()
-                .filter(|(_, order)| order.executor() == executor_type)
-                .collect();
+        let submitted_executions: Vec<_> = self
+            .offchain_order_projection
+            .filter(STATUS, &OrderStatus::Submitted)
+            .await?
+            .into_iter()
+            .filter(|(_, order)| order.executor() == executor_type)
+            .collect();
 
         if submitted_executions.is_empty() {
             debug!("No submitted orders to poll");
@@ -346,8 +353,13 @@ mod tests {
 
     fn create_test_frameworks(
         pool: &SqlitePool,
-    ) -> (Arc<Store<OffchainOrder>>, Arc<Store<Position>>) {
+    ) -> (
+        Projection<OffchainOrder>,
+        Arc<Store<OffchainOrder>>,
+        Arc<Store<Position>>,
+    ) {
         (
+            Projection::<OffchainOrder>::sqlite(pool.clone(), "offchain_order_view"),
             Arc::new(test_store(
                 pool.clone(),
                 vec![],

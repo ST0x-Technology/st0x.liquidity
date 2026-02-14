@@ -39,6 +39,7 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) position_query: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) offchain_order_query: Arc<Projection<OffchainOrder>>,
     pub(crate) vault_registry: Store<VaultRegistry>,
     pub(crate) snapshot: Store<InventorySnapshot>,
 }
@@ -189,6 +190,7 @@ where
             &self.common.ctx,
             &self.common.pool,
             self.common.executor.clone(),
+            (*self.common.frameworks.offchain_order_query).clone(),
             self.common.frameworks.offchain_order.clone(),
             self.common.frameworks.position.clone(),
         );

@@ -8,20 +8,81 @@
 use cqrs_es::persist::{GenericQuery, ViewRepository};
 use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
+use sqlx::sqlite::Sqlite;
+use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::EventSourced;
 use crate::lifecycle::{Lifecycle, LifecycleError};
 
+/// A materialized view table name.
+///
+/// Used with [`EventSourced::TABLE`] to declare that an entity has
+/// a materialized view, and with [`Projection::sqlite`] to create
+/// the projection.
+#[derive(Debug, Clone, Copy)]
+pub struct Table(pub &'static str);
+
+impl std::fmt::Display for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// A column name for view table queries.
+///
+/// Used with [`Projection::find`] to query materialized views
+/// by generated column values. Column existence is validated
+/// against the table schema at query time to catch stale
+/// generated columns early.
+#[derive(Debug, Clone)]
+pub struct Column(pub &'static str);
+
+impl std::fmt::Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Errors from [`Projection`] query operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectionError {
+    #[error("entity has no materialized view (TABLE = None)")]
+    NoTable,
+    #[error(
+        "operation requires a SQLite-backed projection \
+         created via Projection::sqlite()"
+    )]
+    NotSqliteBacked,
+    #[error("column '{column}' does not exist in table '{table}'")]
+    ColumnNotFound { column: Column, table: String },
+    #[error(
+        "generated column '{column}' has all NULL values in \
+         table '{table}' ({row_count} rows) — likely stale \
+         JSON path in migration"
+    )]
+    StaleColumn {
+        column: Column,
+        table: String,
+        row_count: i64,
+    },
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+}
+
 /// Materialized view of an event-sourced entity.
 ///
-/// Provides [`load`](Self::load) to retrieve the current entity
-/// state. Backed by SQLite in production; the `Repo` parameter
+/// Provides [`load`](Self::load) to retrieve a single entity by
+/// ID, [`load_all`](Self::load_all) to retrieve all live
+/// entities, and [`find`](Self::find) for typed column-filtered
+/// queries. Backed by SQLite in production; the `Repo` parameter
 /// defaults to `SqliteViewRepository` so consumers write
-/// `Projection<Position>` without seeing `Lifecycle`.
+/// `Projection<Position>`.
 ///
-/// Constructed via [`new`](Self::new) during wiring in
-/// [`StoreBuilder`](crate::StoreBuilder) or directly in CLI/test code.
+/// Constructed via [`sqlite`](Self::sqlite) during wiring or
+/// directly in CLI/test code.
 pub struct Projection<
     Entity: EventSourced,
     Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> = SqliteViewRepository<
@@ -30,19 +91,132 @@ pub struct Projection<
     >,
 > {
     inner: Arc<GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>>>,
+    pool: Option<SqlitePool>,
+    table_name: Option<String>,
 }
 
 impl<Entity: EventSourced> Projection<Entity> {
-    /// Creates a SQLite-backed projection for the given table.
-    pub fn sqlite(pool: SqlitePool, table_name: impl Into<String>) -> Self {
+    /// Creates a SQLite-backed projection using [`EventSourced::TABLE`].
+    ///
+    /// Returns `Err(ProjectionError::NoTable)` if the entity has
+    /// no materialized view configured (`TABLE = None`).
+    pub fn sqlite(pool: SqlitePool) -> Result<Self, ProjectionError> {
+        let Table(table) = Entity::PROJECTION.ok_or(ProjectionError::NoTable)?;
         let repo = Arc::new(
             SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
-                pool,
-                table_name.into(),
+                pool.clone(),
+                table.to_string(),
             ),
         );
+        let query = GenericQuery::new(repo);
 
-        Self::new(repo)
+        Ok(Self {
+            inner: Arc::new(query),
+            pool: Some(pool),
+            table_name: Some(table.to_string()),
+        })
+    }
+
+    /// Load all live entities from the view table.
+    ///
+    /// Returns every entity in `Live` state, skipping
+    /// non-live aggregates with a warning.
+    pub async fn load_all(&self) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError>
+    where
+        <Entity::Id as FromStr>::Err: Debug,
+    {
+        let (pool, table) = self.sqlite_backing()?;
+
+        let query = format!(
+            "SELECT view_id, payload FROM {table}
+             ORDER BY view_id ASC"
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&query).fetch_all(pool).await?;
+
+        Ok(Self::parse_rows(rows))
+    }
+
+    /// Load all live entities where a generated column matches
+    /// a typed value.
+    ///
+    /// The value can be any domain type that implements
+    /// `sqlx::Type<Sqlite>` and `sqlx::Encode<Sqlite>` (e.g.,
+    /// `OrderStatus`), so callers pass typed values rather than
+    /// raw strings.
+    ///
+    /// Validates that the column exists in the table schema
+    /// and has at least one non-NULL value (catches stale
+    /// generated columns whose JSON paths drifted from the
+    /// actual serialization format).
+    pub async fn filter<V>(
+        &self,
+        column: Column,
+        value: &V,
+    ) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError>
+    where
+        for<'q> &'q V: sqlx::Encode<'q, Sqlite>,
+        V: sqlx::Type<Sqlite> + Send + Sync,
+        <Entity::Id as FromStr>::Err: Debug,
+    {
+        let (pool, table) = self.sqlite_backing()?;
+        validate_column(pool, table, &column).await?;
+
+        let column_name = column.0;
+        let query = format!(
+            "SELECT view_id, payload FROM {table}
+             WHERE {column_name} = ?1
+             ORDER BY view_id ASC"
+        );
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as(&query).bind(value).fetch_all(pool).await?;
+
+        Ok(Self::parse_rows(rows))
+    }
+
+    fn sqlite_backing(&self) -> Result<(&SqlitePool, &str), ProjectionError> {
+        let pool = self.pool.as_ref().ok_or(ProjectionError::NotSqliteBacked)?;
+
+        let table = self
+            .table_name
+            .as_deref()
+            .ok_or(ProjectionError::NotSqliteBacked)?;
+
+        Ok((pool, table))
+    }
+
+    fn parse_rows(rows: Vec<(String, String)>) -> Vec<(Entity::Id, Entity)>
+    where
+        <Entity::Id as FromStr>::Err: Debug,
+    {
+        rows.into_iter()
+            .filter_map(|(view_id, payload)| {
+                let id: Entity::Id = match view_id.parse() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        warn!(view_id, ?error, "Failed to parse view ID");
+                        return None;
+                    }
+                };
+
+                let lifecycle: Lifecycle<Entity> = match serde_json::from_str(&payload) {
+                    Ok(lifecycle) => lifecycle,
+                    Err(error) => {
+                        warn!(%id, ?error, "Failed to deserialize view payload");
+                        return None;
+                    }
+                };
+
+                match lifecycle {
+                    Lifecycle::Live(entity) => Some((id, entity)),
+                    _ => {
+                        warn!(%id, "Skipping non-live aggregate in view");
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 }
 
@@ -55,6 +229,8 @@ where
         let query = GenericQuery::new(repo);
         Self {
             inner: Arc::new(query),
+            pool: None,
+            table_name: None,
         }
     }
 
@@ -98,8 +274,56 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            pool: self.pool.clone(),
+            table_name: self.table_name.clone(),
         }
     }
+}
+
+/// Validates that a column exists in the table schema and returns
+/// an error if all values are NULL (indicates a stale generated
+/// column).
+async fn validate_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &Column,
+) -> Result<(), ProjectionError> {
+    let column_name = column.0;
+
+    let columns: Vec<(String,)> =
+        sqlx::query_as(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .fetch_all(pool)
+            .await?;
+
+    if !columns.iter().any(|(name,)| name == column_name) {
+        return Err(ProjectionError::ColumnNotFound {
+            column: column.clone(),
+            table: table.to_string(),
+        });
+    }
+
+    let row_count: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(pool)
+        .await?;
+
+    if row_count.0 > 0 {
+        let non_null_count: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {table}
+             WHERE {column_name} IS NOT NULL"
+        ))
+        .fetch_one(pool)
+        .await?;
+
+        if non_null_count.0 == 0 {
+            return Err(ProjectionError::StaleColumn {
+                column: column.clone(),
+                table: table.to_string(),
+                row_count: row_count.0,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -141,6 +365,7 @@ mod tests {
         type Services = ();
 
         const AGGREGATE_TYPE: &'static str = "TestEntity";
+        const PROJECTION: Option<Table> = None;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &TestEvent) -> Option<Self> {

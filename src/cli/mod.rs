@@ -690,14 +690,18 @@ mod tests {
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
 
+    use st0x_event_sorcery::{Column, Projection};
+
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{BrokerCtx, LogLevel, SchwabAuth};
-    use crate::offchain::execution::find_orders_by_status;
+    use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
+
+    const STATUS: Column = Column("status");
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 

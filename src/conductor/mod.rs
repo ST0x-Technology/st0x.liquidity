@@ -533,6 +533,7 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     ctx: &Ctx,
     pool: &SqlitePool,
     executor: E,
+    offchain_order_projection: Projection<OffchainOrder>,
     offchain_order: Arc<Store<OffchainOrder>>,
     position: Arc<Store<Position>>,
 ) -> JoinHandle<()> {
@@ -542,8 +543,14 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
         poller_ctx.polling_interval, poller_ctx.max_jitter
     );
 
-    let poller =
-        OrderStatusPoller::new(poller_ctx, pool.clone(), executor, offchain_order, position);
+    let poller = OrderStatusPoller::new(
+        poller_ctx,
+        pool.clone(),
+        executor,
+        offchain_order_projection,
+        offchain_order,
+        position,
+    );
     tokio::spawn(async move {
         if let Err(error) = poller.run().await {
             error!("Order poller failed: {error}");
@@ -1330,7 +1337,7 @@ where
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let ready_positions = check_all_positions(pool, position_query, executor_type).await?;
+    let ready_positions = check_all_positions(position_query, executor_type).await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
