@@ -23,7 +23,7 @@ pub(crate) enum MintError {
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] SendError<TokenizedEquityMint>),
+    Aggregate(Box<SendError<TokenizedEquityMint>>),
 
     #[error("Mint request was rejected by Alpaca")]
     Rejected,
@@ -42,6 +42,12 @@ pub(crate) enum MintError {
 
     #[error("Decimal overflow when scaling {0} to 18 decimals")]
     DecimalOverflow(FractionalShares),
+}
+
+impl From<SendError<TokenizedEquityMint>> for MintError {
+    fn from(error: SendError<TokenizedEquityMint>) -> Self {
+        Self::Aggregate(Box::new(error))
+    }
 }
 
 /// Trait for executing mint operations.

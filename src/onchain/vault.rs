@@ -715,9 +715,8 @@ mod tests {
                 return Ok(());
             }
 
-            let decimal = match float_to_decimal(bytes) {
-                Ok(dec) => dec,
-                Err(_) => return Ok(()),
+            let Ok(decimal) = float_to_decimal(bytes) else {
+                return Ok(());
             };
 
             let roundtripped = Float::parse(decimal.to_string()).map_err(|err| {

@@ -40,9 +40,7 @@ use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
 use crate::onchain::USDC_BASE;
-use crate::onchain::accumulator::{
-    ExecutionParams, check_all_positions, check_execution_readiness,
-};
+use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
@@ -1221,75 +1219,75 @@ async fn process_queued_trade(
 
     let base_symbol = trade.symbol.base();
 
-    let Some(params) =
+    let Some(execution) =
         check_execution_readiness(&cqrs.position_query, base_symbol, executor_type).await?
     else {
         return Ok(None);
     };
 
-    place_offchain_order(&params, cqrs).await
+    place_offchain_order(&execution, cqrs).await
 }
 
 async fn place_offchain_order(
-    params: &ExecutionParams,
+    execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     let offchain_order_id = OffchainOrderId::new();
 
-    execute_place_offchain_order(params, cqrs, offchain_order_id).await;
-    execute_create_offchain_order(params, cqrs, offchain_order_id).await;
+    execute_place_offchain_order(execution, cqrs, offchain_order_id).await;
+    execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
     Ok(Some(offchain_order_id))
 }
 
 async fn execute_place_offchain_order(
-    params: &ExecutionParams,
+    execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
 ) {
     let command = PositionCommand::PlaceOffChainOrder {
         offchain_order_id,
-        shares: params.shares,
-        direction: params.direction,
-        executor: params.executor,
+        shares: execution.shares,
+        direction: execution.direction,
+        executor: execution.executor,
         threshold: cqrs.execution_threshold,
     };
 
-    match cqrs.position.send(&params.symbol, command).await {
+    match cqrs.position.send(&execution.symbol, command).await {
         Ok(()) => info!(
             %offchain_order_id,
-            symbol = %params.symbol,
+            symbol = %execution.symbol,
             "Position::PlaceOffChainOrder succeeded"
         ),
         Err(error) => error!(
             %offchain_order_id,
-            symbol = %params.symbol,
+            symbol = %execution.symbol,
             "Position::PlaceOffChainOrder failed: {error}"
         ),
     }
 }
 
 async fn execute_create_offchain_order(
-    params: &ExecutionParams,
+    execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
 ) {
     let command = OffchainOrderCommand::Place {
-        symbol: params.symbol.clone(),
-        shares: params.shares,
-        direction: params.direction,
-        executor: params.executor,
+        symbol: execution.symbol.clone(),
+        shares: execution.shares,
+        direction: execution.direction,
+        executor: execution.executor,
     };
 
     match cqrs.offchain_order.send(&offchain_order_id, command).await {
         Ok(()) => info!(
             %offchain_order_id,
-            symbol = %params.symbol,
+            symbol = %execution.symbol,
             "OffchainOrder::Place succeeded"
         ),
         Err(error) => error!(
             %offchain_order_id,
-            symbol = %params.symbol,
+            symbol = %execution.symbol,
             "OffchainOrder::Place failed: {error}"
         ),
     }
@@ -1348,54 +1346,54 @@ where
         ready_positions.len()
     );
 
-    for params in ready_positions {
+    for execution in ready_positions {
         let offchain_order_id = OffchainOrderId::new();
 
         info!(
-            symbol = %params.symbol,
-            shares = %params.shares,
-            direction = ?params.direction,
+            symbol = %execution.symbol,
+            shares = %execution.shares,
+            direction = ?execution.direction,
             %offchain_order_id,
             "Executing accumulated position"
         );
 
         let command = PositionCommand::PlaceOffChainOrder {
             offchain_order_id,
-            shares: params.shares,
-            direction: params.direction,
-            executor: params.executor,
+            shares: execution.shares,
+            direction: execution.direction,
+            executor: execution.executor,
             threshold: *threshold,
         };
 
-        match position.send(&params.symbol, command).await {
+        match position.send(&execution.symbol, command).await {
             Ok(()) => info!(
                 %offchain_order_id,
-                symbol = %params.symbol,
+                symbol = %execution.symbol,
                 "Position::PlaceOffChainOrder succeeded"
             ),
             Err(error) => error!(
                 %offchain_order_id,
-                symbol = %params.symbol,
+                symbol = %execution.symbol,
                 "Position::PlaceOffChainOrder failed: {error}"
             ),
         }
 
         let command = OffchainOrderCommand::Place {
-            symbol: params.symbol.clone(),
-            shares: params.shares,
-            direction: params.direction,
-            executor: params.executor,
+            symbol: execution.symbol.clone(),
+            shares: execution.shares,
+            direction: execution.direction,
+            executor: execution.executor,
         };
 
         match offchain_order.send(&offchain_order_id, command).await {
             Ok(()) => info!(
                 %offchain_order_id,
-                symbol = %params.symbol,
+                symbol = %execution.symbol,
                 "OffchainOrder::Place succeeded"
             ),
             Err(error) => error!(
                 %offchain_order_id,
-                symbol = %params.symbol,
+                symbol = %execution.symbol,
                 "OffchainOrder::Place failed: {error}"
             ),
         }

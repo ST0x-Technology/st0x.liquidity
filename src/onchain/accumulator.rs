@@ -8,7 +8,7 @@ use crate::onchain::OnChainError;
 use crate::position::{Position, load_position};
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExecutionParams {
+pub(crate) struct ExecutionCtx {
     pub(crate) symbol: Symbol,
     pub(crate) direction: Direction,
     pub(crate) shares: Positive<FractionalShares>,
@@ -25,7 +25,7 @@ pub(crate) async fn check_execution_readiness(
     position_query: &Projection<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
-) -> Result<Option<ExecutionParams>, OnChainError> {
+) -> Result<Option<ExecutionCtx>, OnChainError> {
     let Some(position) = load_position(position_query, symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
@@ -49,7 +49,7 @@ pub(crate) async fn check_execution_readiness(
         "Position ready for execution"
     );
 
-    Ok(Some(ExecutionParams {
+    Ok(Some(ExecutionCtx {
         symbol: symbol.clone(),
         direction,
         shares,
@@ -70,7 +70,7 @@ pub(crate) async fn check_execution_readiness(
 pub(crate) async fn check_all_positions(
     position_query: &Projection<Position>,
     executor_type: SupportedExecutor,
-) -> Result<Vec<ExecutionParams>, OnChainError> {
+) -> Result<Vec<ExecutionCtx>, OnChainError> {
     let all_positions = position_query.load_all().await?;
 
     let mut ready = Vec::new();
@@ -86,7 +86,7 @@ pub(crate) async fn check_all_positions(
                 "Position ready for execution"
             );
 
-            ready.push(ExecutionParams {
+            ready.push(ExecutionCtx {
                 symbol: symbol.clone(),
                 direction,
                 shares,

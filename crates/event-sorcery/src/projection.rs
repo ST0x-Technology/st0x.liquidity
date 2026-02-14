@@ -245,18 +245,26 @@ impl<Entity: EventSourced> Projection<Entity> {
                     }
                 };
 
-                match lifecycle {
-                    Lifecycle::Live(entity) => Some((id, entity)),
-                    _ => {
-                        warn!(%id, "Skipping non-live aggregate in view");
-                        None
-                    }
+                if let Lifecycle::Live(entity) = lifecycle {
+                    Some((id, entity))
+                } else {
+                    warn!(%id, "Skipping non-live aggregate in view");
+                    None
                 }
             })
             .collect()
     }
 }
 
+// TODO: Projection's Repo parameter ideally encodes a
+// higher-kinded type — `Repo<Lifecycle<Entity>, Lifecycle<Entity>>`
+// — so the struct definition captures the relationship between
+// Repo and Entity without naming Lifecycle in bounds. Rust lacks
+// native HKT support, but GAT-based workarounds (e.g., a
+// `RepoFamily` trait with `type Repo<V, A>`) can emulate this.
+// For now we suppress the warning; proper decoupling deferred to
+// when this crate is extracted from the workspace.
+#[allow(private_bounds)]
 impl<Entity: EventSourced, Repo> Projection<Entity, Repo>
 where
     Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
@@ -298,6 +306,7 @@ impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo> {
 }
 
 #[async_trait]
+#[allow(private_bounds)]
 impl<Entity, Repo> Reactor<Entity> for Projection<Entity, Repo>
 where
     Entity: EventSourced + 'static,
