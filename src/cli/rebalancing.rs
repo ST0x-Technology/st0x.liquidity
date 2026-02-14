@@ -7,7 +7,6 @@ use alloy::signers::local::PrivateKeySigner;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::StoreBuilder;
@@ -311,7 +310,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Polling for tokens to arrive on Base...")?;
 
-    let poll_interval = Duration::from_secs(5);
+    let poll_interval = std::time::Duration::from_secs(5);
     let max_attempts = 60; // 5 minutes max
 
     for attempt in 1..=max_attempts {

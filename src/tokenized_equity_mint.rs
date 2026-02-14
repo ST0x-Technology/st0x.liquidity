@@ -50,6 +50,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
+use std::str::FromStr;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 
@@ -292,7 +293,7 @@ impl std::fmt::Display for IssuerRequestId {
     }
 }
 
-impl std::str::FromStr for IssuerRequestId {
+impl FromStr for IssuerRequestId {
     type Err = std::convert::Infallible;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {

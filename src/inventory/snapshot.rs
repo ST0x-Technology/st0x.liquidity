@@ -4,19 +4,17 @@
 //! onchain vaults and offchain brokers. Events are consumed by InventoryView
 //! to reconcile tracked inventory with actual balances.
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
-
 use alloy::hex::FromHexError;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::str::FromStr;
 use thiserror::Error;
 
-use st0x_execution::{FractionalShares, Symbol};
-
 use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::threshold::Usdc;
 

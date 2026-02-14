@@ -289,6 +289,86 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     Ok(())
 }
 
+pub(super) async fn alpaca_whitelist_list_command<W: Write>(
+    stdout: &mut W,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-whitelist-list requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("alpaca-whitelist-list requires rebalancing configuration")
+    })?;
+
+    let alpaca_wallet = AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    );
+
+    writeln!(stdout, "Fetching whitelisted addresses...")?;
+
+    let entries = alpaca_wallet.get_whitelisted_addresses().await?;
+
+    if entries.is_empty() {
+        writeln!(stdout, "\nNo whitelisted addresses found.")?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "\nFound {} whitelist entries:\n", entries.len())?;
+
+    for entry in &entries {
+        writeln!(stdout, "Entry {}", entry.id)?;
+        writeln!(stdout, "   Address: {}", entry.address)?;
+        writeln!(stdout, "   Asset: {}", entry.asset.as_ref())?;
+        writeln!(stdout, "   Chain: {}", entry.chain.as_ref())?;
+        writeln!(stdout, "   Status: {:?}", entry.status)?;
+        writeln!(stdout, "   Created: {}", entry.created_at)?;
+        writeln!(stdout)?;
+    }
+
+    Ok(())
+}
+
+pub(super) async fn alpaca_unwhitelist_command<W: Write>(
+    stdout: &mut W,
+    address: Address,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-unwhitelist requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = ctx
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-unwhitelist requires rebalancing configuration"))?;
+
+    writeln!(stdout, "Removing address from Alpaca whitelist")?;
+    writeln!(stdout, "   Address: {address}")?;
+
+    let alpaca_wallet = AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    );
+
+    let removed = alpaca_wallet.remove_whitelist_entries(&address).await?;
+
+    writeln!(stdout, "Removed {} whitelist entry/entries:", removed.len())?;
+    for entry in &removed {
+        writeln!(stdout, "   ID: {}", entry.id)?;
+        writeln!(stdout, "   Asset: {}", entry.asset.as_ref())?;
+        writeln!(stdout, "   Status was: {:?}", entry.status)?;
+        writeln!(stdout, "   Created: {}", entry.created_at)?;
+    }
+
+    Ok(())
+}
+
 pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,

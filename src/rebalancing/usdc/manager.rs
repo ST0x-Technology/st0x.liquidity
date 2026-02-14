@@ -830,22 +830,14 @@ where
 /// or values exceeding U256::MAX).
 fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
     if usdc.0.is_sign_negative() {
-        return Err(UsdcRebalanceManagerError::InvalidAmount(format!(
-            "USDC amount cannot be negative: {}",
-            usdc.0
-        )));
+        return Err(UsdcRebalanceManagerError::NegativeAmount { amount: usdc });
     }
 
     // USDC has 6 decimals
     let scaled = usdc
         .0
         .checked_mul(Decimal::from(1_000_000u64))
-        .ok_or_else(|| {
-            UsdcRebalanceManagerError::ArithmeticOverflow(format!(
-                "USDC amount overflow during scaling: {}",
-                usdc.0
-            ))
-        })?;
+        .ok_or_else(|| UsdcRebalanceManagerError::ArithmeticOverflow { amount: usdc })?;
 
     let integer = scaled.trunc().to_string();
 
@@ -1298,12 +1290,10 @@ mod tests {
     #[test]
     fn test_usdc_to_u256_negative_amount() {
         let amount = Usdc(dec!(-100));
+        let error = usdc_to_u256(amount).unwrap_err();
         assert!(
-            matches!(
-                usdc_to_u256(amount),
-                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-100")
-            ),
-            "Expected InvalidAmount error mentioning -100"
+            matches!(error, UsdcRebalanceManagerError::NegativeAmount { amount } if amount == Usdc(dec!(-100))),
+            "Expected NegativeAmount error, got: {error:?}"
         );
     }
 
@@ -1345,12 +1335,13 @@ mod tests {
         let id = UsdcRebalanceId::new("rebalance-base-001");
         let amount = Usdc(dec!(-500));
 
+        let error = manager
+            .execute_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
         assert!(
-            matches!(
-                manager.execute_base_to_alpaca(&id, amount).await,
-                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-500")
-            ),
-            "Expected InvalidAmount error mentioning -500"
+            matches!(error, UsdcRebalanceManagerError::NegativeAmount { amount } if amount == Usdc(dec!(-500))),
+            "Expected NegativeAmount error, got: {error:?}"
         );
     }
 

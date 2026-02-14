@@ -60,7 +60,9 @@ impl TokenizedEquitySymbol {
     pub(crate) fn parse(symbol: &str) -> Result<Self, OnChainError> {
         let Some(stripped) = symbol.strip_prefix('t') else {
             return Err(OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity(symbol.to_string()),
+                TradeValidationError::NotTokenizedEquity {
+                    symbol_provided: symbol.to_string(),
+                },
             ));
         };
 
@@ -212,8 +214,8 @@ mod tests {
             matches!(
                 err,
                 OnChainError::Validation(
-                    TradeValidationError::NotTokenizedEquity(ref symbol)
-                ) if symbol == "USDC"
+                    TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+                ) if symbol_provided == "USDC"
             ),
             "Expected NotTokenizedEquity for USDC, got: {err:?}"
         );
@@ -223,8 +225,8 @@ mod tests {
             matches!(
                 err,
                 OnChainError::Validation(
-                    TradeValidationError::NotTokenizedEquity(ref symbol)
-                ) if symbol == "AAPL"
+                    TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+                ) if symbol_provided == "AAPL"
             ),
             "Expected NotTokenizedEquity for AAPL, got: {err:?}"
         );
@@ -234,8 +236,8 @@ mod tests {
             matches!(
                 err,
                 OnChainError::Validation(
-                    TradeValidationError::NotTokenizedEquity(ref symbol)
-                ) if symbol.is_empty()
+                    TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+                ) if symbol_provided.is_empty()
             ),
             "Expected NotTokenizedEquity for empty, got: {err:?}"
         );
@@ -281,24 +283,24 @@ mod tests {
         assert!(matches!(
             error,
             OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity(ref symbol)
-            ) if symbol.is_empty()
+                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+            ) if symbol_provided.is_empty()
         ));
 
         let error = TokenizedEquitySymbol::parse("USDC").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity(ref symbol)
-            ) if symbol == "USDC"
+                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+            ) if symbol_provided == "USDC"
         ));
 
         let error = TokenizedEquitySymbol::parse("AAPL").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity(ref symbol)
-            ) if symbol == "AAPL"
+                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+            ) if symbol_provided == "AAPL"
         ));
 
         // Legacy formats are no longer accepted
@@ -306,16 +308,16 @@ mod tests {
         assert!(matches!(
             error,
             OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity(ref symbol)
-            ) if symbol == "AAPL0x"
+                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+            ) if symbol_provided == "AAPL0x"
         ));
 
         let error = TokenizedEquitySymbol::parse("NVDAs1").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity(ref symbol)
-            ) if symbol == "NVDAs1"
+                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
+            ) if symbol_provided == "NVDAs1"
         ));
     }
 

@@ -46,6 +46,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
+use std::str::FromStr;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 
@@ -67,7 +68,7 @@ impl std::fmt::Display for RedemptionAggregateId {
     }
 }
 
-impl std::str::FromStr for RedemptionAggregateId {
+impl FromStr for RedemptionAggregateId {
     type Err = std::convert::Infallible;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -457,10 +458,10 @@ impl EquityRedemption {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
-    use st0x_event_sorcery::Aggregate;
+
+    use st0x_event_sorcery::{Aggregate, Lifecycle, LifecycleError};
 
     use super::*;
-    use st0x_event_sorcery::{Lifecycle, LifecycleError};
 
     #[tokio::test]
     async fn test_send_tokens_from_uninitialized() {

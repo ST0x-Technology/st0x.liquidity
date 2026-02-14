@@ -880,12 +880,12 @@ async fn process_queue_step<P: Provider + Clone>(
     match process_next_queued_event(executor_type, ctx, pool, provider, cqrs, queue_context).await {
         Ok(Some(offchain_order_id)) => {
             info!(%offchain_order_id, "Offchain order placed successfully");
-            Duration::ZERO
+            std::time::Duration::ZERO
         }
-        Ok(None) => Duration::from_millis(100),
+        Ok(None) => std::time::Duration::from_millis(100),
         Err(error) => {
             error!("Error processing queued event: {error}");
-            Duration::from_millis(500)
+            std::time::Duration::from_millis(500)
         }
     }
 }
@@ -1857,7 +1857,7 @@ mod tests {
 
         let fake_rebalancer = tokio::spawn(async {
             loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         });
 
@@ -1896,7 +1896,7 @@ mod tests {
 
         let fake_rebalancer = tokio::spawn(async {
             loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         });
 
@@ -1936,7 +1936,7 @@ mod tests {
 
         let fake_rebalancer = tokio::spawn(async {
             loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         });
 
@@ -1957,7 +1957,7 @@ mod tests {
         conductor.abort_trading_tasks();
 
         // abort_trading_tasks aborts the rebalancer
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
 
         // Clean up remaining tasks

@@ -39,10 +39,10 @@ pub(crate) enum UsdcRebalanceManagerError {
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]
     DepositFailed { status: String },
-    #[error("Invalid amount: {0}")]
-    InvalidAmount(String),
-    #[error("Arithmetic overflow: {0}")]
-    ArithmeticOverflow(String),
+    #[error("USDC amount cannot be negative: {amount}")]
+    NegativeAmount { amount: Usdc },
+    #[error("USDC amount overflow during scaling: {amount}")]
+    ArithmeticOverflow { amount: Usdc },
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
     #[error("U256 to u128 conversion error: {0}")]

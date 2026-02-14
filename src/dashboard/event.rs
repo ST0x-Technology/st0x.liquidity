@@ -1,9 +1,8 @@
 //! Reactor that broadcasts aggregate events to WebSocket dashboard clients.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use async_trait::async_trait;
 use chrono::Utc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::warn;
 

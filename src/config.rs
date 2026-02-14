@@ -354,7 +354,7 @@ impl Ctx {
         self.rebalancing.as_ref()
     }
 
-    pub const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
+    pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
         OrderPollerCtx {
             polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
             max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),

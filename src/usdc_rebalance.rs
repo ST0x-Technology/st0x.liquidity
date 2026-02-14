@@ -62,6 +62,8 @@ use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced};
@@ -79,13 +81,13 @@ impl UsdcRebalanceId {
     }
 }
 
-impl std::fmt::Display for UsdcRebalanceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for UsdcRebalanceId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::str::FromStr for UsdcRebalanceId {
+impl FromStr for UsdcRebalanceId {
     type Err = std::convert::Infallible;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {

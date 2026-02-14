@@ -1,9 +1,8 @@
 //! Reactor that dispatches InventorySnapshot events to InventoryView.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use chrono::Utc;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -52,14 +51,12 @@ impl Reactor<InventorySnapshot> for InventorySnapshotReactor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
+    use alloy::primitives::Address;
     use chrono::Utc;
     use rust_decimal::Decimal;
+    use std::collections::BTreeMap;
 
     use st0x_execution::{FractionalShares, Symbol};
-
-    use alloy::primitives::Address;
 
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};

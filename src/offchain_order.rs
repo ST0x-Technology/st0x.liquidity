@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -555,7 +556,7 @@ impl std::fmt::Display for OffchainOrderId {
     }
 }
 
-impl std::str::FromStr for OffchainOrderId {
+impl FromStr for OffchainOrderId {
     type Err = uuid::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -592,9 +593,10 @@ impl TryFrom<i64> for PriceCents {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
-    use st0x_event_sorcery::{Aggregate, AggregateError};
 
-    use st0x_event_sorcery::{Lifecycle, LifecycleError, test_mem_store};
+    use st0x_event_sorcery::{
+        Aggregate, AggregateError, Lifecycle, LifecycleError, test_mem_store,
+    };
 
     use super::*;
 
@@ -958,5 +960,27 @@ mod tests {
         order.apply(event);
 
         assert!(matches!(order, Lifecycle::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn build_offchain_order_cqrs_wires_store_and_projection() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let order_placer = noop_order_placer();
+
+        let (store, projection) = build_offchain_order_cqrs(&pool, order_placer)
+            .await
+            .expect("build_offchain_order_cqrs should succeed");
+
+        let order_id = OffchainOrderId::new();
+
+        store.send(&order_id, place_command()).await.unwrap();
+
+        let order = projection
+            .load(&order_id)
+            .await
+            .expect("projection load should not fail")
+            .expect("projection should return Some for live order");
+
+        assert!(matches!(order, OffchainOrder::Submitted { .. }));
     }
 }

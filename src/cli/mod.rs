@@ -164,6 +164,21 @@ pub enum Commands {
         address: Option<Address>,
     },
 
+    /// List all whitelisted addresses for Alpaca withdrawals
+    ///
+    /// Shows all whitelist entries with their status, asset, and creation date.
+    AlpacaWhitelistList,
+
+    /// Remove an address from Alpaca withdrawal whitelist
+    ///
+    /// Deletes all whitelist entries matching the given address.
+    /// Use this to revoke withdrawal access from older wallets.
+    AlpacaUnwhitelist {
+        /// Address to remove from whitelist
+        #[arg(short = 'a', long = "address")]
+        address: Address,
+    },
+
     /// List all Alpaca crypto wallet transfers
     ///
     /// Shows all deposits and withdrawals for the Alpaca account.
@@ -374,6 +389,10 @@ enum SimpleCommand {
     AlpacaWhitelist {
         address: Option<Address>,
     },
+    AlpacaWhitelistList,
+    AlpacaUnwhitelist {
+        address: Address,
+    },
     AlpacaTransfers,
     AlpacaConvert {
         direction: ConvertDirection,
@@ -466,6 +485,8 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
         }
         Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
+        Commands::AlpacaWhitelistList => Ok(SimpleCommand::AlpacaWhitelistList),
+        Commands::AlpacaUnwhitelist { address } => Ok(SimpleCommand::AlpacaUnwhitelist { address }),
         Commands::AlpacaTransfers => Ok(SimpleCommand::AlpacaTransfers),
         Commands::AlpacaConvert { direction, amount } => {
             Ok(SimpleCommand::AlpacaConvert { direction, amount })
@@ -556,6 +577,12 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::AlpacaWhitelist { address } => {
             alpaca_wallet::alpaca_whitelist_command(stdout, address, ctx).await
+        }
+        SimpleCommand::AlpacaWhitelistList => {
+            alpaca_wallet::alpaca_whitelist_list_command(stdout, ctx).await
+        }
+        SimpleCommand::AlpacaUnwhitelist { address } => {
+            alpaca_wallet::alpaca_unwhitelist_command(stdout, address, ctx).await
         }
         SimpleCommand::AlpacaWithdraw { amount, to_address } => {
             alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, ctx).await
@@ -652,14 +679,16 @@ mod tests {
     use alloy::sol_types::{SolCall, SolEvent};
     use clap::CommandFactory;
     use httpmock::MockServer;
+    use rain_math_float::Float;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::str::FromStr;
+    use url::Url;
+
     use st0x_execution::{
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
-    use std::str::FromStr;
-    use url::Url;
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -1190,7 +1219,6 @@ mod tests {
         });
 
         fn create_float_from_u256(value: U256, decimals: u8) -> B256 {
-            use rain_math_float::Float;
             let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
             float.get_inner()
         }

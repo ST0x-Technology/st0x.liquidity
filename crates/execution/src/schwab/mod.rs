@@ -80,9 +80,9 @@ pub enum SchwabError {
         body: String,
     },
 
-    /// Broker configuration validation failed during initialization.
-    #[error("Invalid configuration: {0}")]
-    InvalidConfiguration(String),
+    /// Integer conversion failed (e.g. negative to unsigned).
+    #[error("integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
 
     /// Order execution database persistence failed, wraps [`crate::error::PersistenceError`].
     #[error("Execution persistence error: {0}")]

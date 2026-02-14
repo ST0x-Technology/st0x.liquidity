@@ -27,10 +27,10 @@ impl std::fmt::Display for OrderStatus {
 #[derive(Debug, thiserror::Error)]
 pub enum ParseOrderStatusError {
     #[error(
-        "Invalid order status: '{0}'. Expected one of: \
+        "invalid order status: '{status_provided}'. Expected one of: \
          PENDING, SUBMITTED, FILLED, FAILED"
     )]
-    InvalidStatus(String),
+    InvalidStatus { status_provided: String },
 }
 
 impl std::str::FromStr for OrderStatus {
@@ -42,7 +42,9 @@ impl std::str::FromStr for OrderStatus {
             "SUBMITTED" => Ok(Self::Submitted),
             "FILLED" => Ok(Self::Filled),
             "FAILED" => Ok(Self::Failed),
-            _ => Err(ParseOrderStatusError::InvalidStatus(s.to_string())),
+            _ => Err(ParseOrderStatusError::InvalidStatus {
+                status_provided: s.to_string(),
+            }),
         }
     }
 }

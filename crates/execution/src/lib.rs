@@ -446,16 +446,11 @@ impl<'de> Deserialize<'de> for FractionalShares {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidDirectionError(String);
-
-impl std::fmt::Display for InvalidDirectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Invalid direction: {}", self.0)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid direction: {direction_provided}")]
+pub struct InvalidDirectionError {
+    direction_provided: String,
 }
-
-impl std::error::Error for InvalidDirectionError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupportedExecutor {
@@ -487,8 +482,10 @@ impl std::fmt::Display for SupportedExecutor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("Invalid executor: {0}")]
-pub struct InvalidExecutorError(String);
+#[error("invalid executor: {executor_provided}")]
+pub struct InvalidExecutorError {
+    executor_provided: String,
+}
 
 impl std::str::FromStr for SupportedExecutor {
     type Err = InvalidExecutorError;
@@ -499,7 +496,9 @@ impl std::str::FromStr for SupportedExecutor {
             "alpaca-trading-api" => Ok(Self::AlpacaTradingApi),
             "alpaca-broker-api" => Ok(Self::AlpacaBrokerApi),
             "dry-run" => Ok(Self::DryRun),
-            _ => Err(InvalidExecutorError(s.to_string())),
+            _ => Err(InvalidExecutorError {
+                executor_provided: s.to_string(),
+            }),
         }
     }
 }
@@ -532,7 +531,9 @@ impl std::str::FromStr for Direction {
         match s {
             "BUY" => Ok(Self::Buy),
             "SELL" => Ok(Self::Sell),
-            _ => Err(InvalidDirectionError(s.to_string())),
+            _ => Err(InvalidDirectionError {
+                direction_provided: s.to_string(),
+            }),
         }
     }
 }

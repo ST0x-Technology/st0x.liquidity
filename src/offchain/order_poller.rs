@@ -43,9 +43,9 @@ impl From<ExecutionError> for OrderPollingError {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrderPollerCtx {
-    pub polling_interval: Duration,
-    pub max_jitter: Duration,
+pub(crate) struct OrderPollerCtx {
+    pub(crate) polling_interval: Duration,
+    pub(crate) max_jitter: Duration,
 }
 
 impl Default for OrderPollerCtx {
