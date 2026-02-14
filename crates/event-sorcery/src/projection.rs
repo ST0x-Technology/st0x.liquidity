@@ -6,7 +6,8 @@
 //! `ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>`.
 
 use async_trait::async_trait;
-use cqrs_es::persist::{GenericQuery, PersistenceError, ViewContext, ViewRepository};
+use cqrs_es::Aggregate;
+use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use sqlx::sqlite::Sqlite;
@@ -16,8 +17,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::EventSourced;
 use crate::lifecycle::{Lifecycle, LifecycleError};
+use crate::{EventSourced, Reactor};
 
 /// A materialized view table name.
 ///
@@ -134,24 +135,6 @@ pub struct Projection<Entity: EventSourced, Repo = SqliteProjectionRepo<Entity>>
 }
 
 impl<Entity: EventSourced> Projection<Entity> {
-    /// Creates a SQLite-backed projection using
-    /// [`EventSourced::PROJECTION`].
-    ///
-    /// Load a single entity by ID from the materialized view.
-    ///
-    /// Delegates to `ViewRepository::load` (the cqrs-es
-    /// projection path), then unwraps the internal `Lifecycle`
-    /// wrapper. Returns `None` if the entity doesn't exist or
-    /// hasn't been initialized yet.
-    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, LifecycleError<Entity>> {
-        let view_id = id.to_string();
-
-        match self.repo.load(&view_id).await {
-            Ok(Some(lifecycle)) => lifecycle.into_result(),
-            Ok(None) | Err(_) => Ok(None),
-        }
-    }
-
     /// Returns `Err(ProjectionError::NoTable)` if the entity has
     /// no materialized view configured (`PROJECTION = None`).
     pub fn sqlite(pool: SqlitePool) -> Result<Self, ProjectionError> {
@@ -278,6 +261,7 @@ impl<Entity: EventSourced, Repo> Projection<Entity, Repo>
 where
     Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
 {
+    #[cfg(test)]
     pub(crate) fn new(repo: Arc<Repo>) -> Self {
         Self {
             repo,
@@ -287,8 +271,18 @@ where
         }
     }
 
-    pub(crate) fn inner_query(&self) -> GenericQuery<Repo, Lifecycle<Entity>, Lifecycle<Entity>> {
-        GenericQuery::new(Arc::clone(&self.repo))
+    /// Load a single entity by ID from the materialized view.
+    ///
+    /// Delegates to the underlying view repository, then unwraps
+    /// the internal `Lifecycle` wrapper. Returns `None` if the
+    /// entity doesn't exist or hasn't been initialized yet.
+    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, LifecycleError<Entity>> {
+        let view_id = id.to_string();
+
+        match self.repo.load(&view_id).await {
+            Ok(Some(lifecycle)) => lifecycle.into_result(),
+            Ok(None) | Err(_) => Ok(None),
+        }
     }
 }
 
@@ -299,6 +293,32 @@ impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo> {
             pool: self.pool.clone(),
             table_name: self.table_name.clone(),
             _entity: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<Entity, Repo> Reactor<Entity> for Projection<Entity, Repo>
+where
+    Entity: EventSourced + 'static,
+    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync,
+{
+    async fn react(&self, id: &Entity::Id, event: &Entity::Event) {
+        let view_id = id.to_string();
+
+        let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
+            Ok(Some(pair)) => pair,
+            Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
+            Err(error) => {
+                warn!(%view_id, ?error, "Failed to load view for update");
+                return;
+            }
+        };
+
+        lifecycle.apply(event.clone());
+
+        if let Err(error) = self.repo.update_view(lifecycle, context).await {
+            warn!(%view_id, ?error, "Failed to save view update");
         }
     }
 }
@@ -314,7 +334,7 @@ async fn validate_column(
     let column_name = column.0;
 
     let columns: Vec<(String,)> =
-        sqlx::query_as(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        sqlx::query_as(&format!("SELECT name FROM pragma_table_xinfo('{table}')"))
             .fetch_all(pool)
             .await?;
 

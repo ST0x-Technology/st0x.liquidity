@@ -941,6 +941,7 @@ mod tests {
                 broker_timestamp: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(position.net, FractionalShares::new(dec!(0.5)));
@@ -992,6 +993,7 @@ mod tests {
                 broker_timestamp: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(position.net, FractionalShares::new(dec!(-0.5)));
@@ -1040,6 +1042,7 @@ mod tests {
                 failed_at: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(position.net, FractionalShares::new(dec!(1.5)));
@@ -1066,6 +1069,7 @@ mod tests {
                 updated_at: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(position.threshold, new_threshold);
@@ -1312,7 +1316,7 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
         let store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
-            .with_projection(&projection)
+            .with(projection.clone())
             .build(())
             .await
             .unwrap();

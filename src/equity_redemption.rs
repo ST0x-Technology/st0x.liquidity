@@ -670,6 +670,7 @@ mod tests {
                 rejected_at: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         let EquityRedemption::Failed {
@@ -743,7 +744,7 @@ mod tests {
             detected_at: Utc::now(),
         };
 
-        let result = EquityRedemption::evolve(&event, &completed).unwrap();
+        let result = EquityRedemption::evolve(&completed, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -761,7 +762,7 @@ mod tests {
             completed_at: Utc::now(),
         };
 
-        let result = EquityRedemption::evolve(&event, &tokens_sent).unwrap();
+        let result = EquityRedemption::evolve(&tokens_sent, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -781,7 +782,7 @@ mod tests {
             failed_at: Utc::now(),
         };
 
-        let result = EquityRedemption::evolve(&event, &pending).unwrap();
+        let result = EquityRedemption::evolve(&pending, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -800,7 +801,7 @@ mod tests {
             rejected_at: Utc::now(),
         };
 
-        let result = EquityRedemption::evolve(&event, &tokens_sent).unwrap();
+        let result = EquityRedemption::evolve(&tokens_sent, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -822,7 +823,7 @@ mod tests {
             sent_at: Utc::now(),
         };
 
-        let result = EquityRedemption::evolve(&event, &tokens_sent).unwrap();
+        let result = EquityRedemption::evolve(&tokens_sent, &event).unwrap();
         assert_eq!(result, None);
     }
 

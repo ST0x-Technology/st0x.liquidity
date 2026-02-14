@@ -332,7 +332,7 @@ impl Conductor {
 
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with_projection(&*offchain_order_query)
+                .with((*offchain_order_query).clone())
                 .build(order_placer)
                 .await?,
         );
@@ -508,7 +508,7 @@ async fn build_position_cqrs(
     let position_view = Projection::<Position>::sqlite(pool.clone())?;
 
     let store = StoreBuilder::<Position>::new(pool.clone())
-        .with_projection(&position_view)
+        .with(position_view.clone())
         .build(())
         .await?;
 
@@ -526,7 +526,7 @@ async fn build_inventory_snapshot_store(
         Unwired::new(snapshot_reactor);
 
     let (store, (_query, ())) = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-        .wire_reactor(query)
+        .wire(query)
         .build(())
         .await?;
 
@@ -2684,7 +2684,7 @@ mod tests {
         let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with_projection(&position_projection)
+                .with(position_projection.clone())
                 .build(())
                 .await
                 .unwrap(),
@@ -2693,7 +2693,7 @@ mod tests {
         let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with_projection(&offchain_order_projection)
+                .with(offchain_order_projection.clone())
                 .build(order_placer)
                 .await
                 .unwrap(),
@@ -3266,8 +3266,8 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with_projection(&projection)
-                .with_reactor(Arc::clone(&trigger))
+                .with(projection.clone())
+                .with(Arc::clone(&trigger))
                 .build(())
                 .await
                 .unwrap(),
@@ -3347,8 +3347,8 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with_projection(&projection)
-                .with_reactor(Arc::clone(&trigger))
+                .with(projection.clone())
+                .with(Arc::clone(&trigger))
                 .build(())
                 .await
                 .unwrap(),
@@ -3449,8 +3449,8 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
-                .with_projection(&projection)
-                .with_reactor(trigger.clone())
+                .with(projection.clone())
+                .with(trigger.clone())
                 .build(())
                 .await
                 .unwrap(),
@@ -3574,8 +3574,8 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::new(pool.clone())
-                .with_projection(&projection)
-                .with_reactor(trigger)
+                .with(projection.clone())
+                .with(trigger)
                 .build(())
                 .await
                 .unwrap(),

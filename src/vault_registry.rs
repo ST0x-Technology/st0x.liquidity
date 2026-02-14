@@ -454,6 +454,7 @@ mod tests {
                 discovered_at: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(registry.equity_vaults.len(), 1);
@@ -470,6 +471,7 @@ mod tests {
             discovered_at: Utc::now(),
             symbol: test_symbol(),
         }])
+        .unwrap()
         .unwrap();
 
         assert_eq!(registry.equity_vaults.len(), 1);
@@ -499,6 +501,7 @@ mod tests {
                 symbol: Symbol::new("MSFT").unwrap(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(registry.equity_vaults.len(), 2);
@@ -513,6 +516,7 @@ mod tests {
             discovered_at: Utc::now(),
             symbol: test_symbol(),
         }])
+        .unwrap()
         .unwrap();
 
         assert_eq!(registry.token_by_symbol(&test_symbol()), Some(TEST_TOKEN));
@@ -527,6 +531,7 @@ mod tests {
             discovered_at: Utc::now(),
             symbol: test_symbol(),
         }])
+        .unwrap()
         .unwrap();
 
         assert_eq!(
@@ -558,6 +563,7 @@ mod tests {
                 symbol: msft.clone(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(registry.token_by_symbol(&test_symbol()), Some(TEST_TOKEN));
@@ -608,7 +614,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let reactor = EventCounter(counter.clone());
         let observed_store = StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .with_reactor(reactor)
+            .with(reactor)
             .build(())
             .await
             .unwrap();

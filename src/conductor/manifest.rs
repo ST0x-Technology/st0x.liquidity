@@ -108,29 +108,29 @@ impl QueryManifest {
         } = self;
 
         let (position, (rebalancing_trigger, ())) = StoreBuilder::<Position>::new(pool.clone())
-            .with_projection(&position_view)
-            .wire_reactor(rebalancing_trigger)
+            .with(position_view.clone())
+            .wire(rebalancing_trigger)
             .build(())
             .await?;
 
         let (mint, (event_broadcaster, (rebalancing_trigger, ()))) =
             StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-                .wire_reactor(rebalancing_trigger)
-                .wire_reactor(event_broadcaster)
+                .wire(rebalancing_trigger)
+                .wire(event_broadcaster)
                 .build(())
                 .await?;
 
         let (redemption, (event_broadcaster, (rebalancing_trigger, ()))) =
             StoreBuilder::<EquityRedemption>::new(pool.clone())
-                .wire_reactor(rebalancing_trigger)
-                .wire_reactor(event_broadcaster)
+                .wire(rebalancing_trigger)
+                .wire(event_broadcaster)
                 .build(())
                 .await?;
 
         let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) =
             StoreBuilder::<UsdcRebalance>::new(pool)
-                .wire_reactor(rebalancing_trigger)
-                .wire_reactor(event_broadcaster)
+                .wire(rebalancing_trigger)
+                .wire(event_broadcaster)
                 .build(())
                 .await?;
 

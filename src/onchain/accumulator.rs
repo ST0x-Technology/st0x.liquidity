@@ -125,7 +125,7 @@ mod tests {
     ) -> (Store<Position>, Projection<Position>) {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
-            .with_projection(&projection)
+            .with(projection.clone())
             .build(())
             .await
             .unwrap();

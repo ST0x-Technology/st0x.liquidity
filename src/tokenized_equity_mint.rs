@@ -905,7 +905,7 @@ mod tests {
             accepted_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&event, &completed).unwrap();
+        let result = TokenizedEquityMint::evolve(&completed, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -925,7 +925,7 @@ mod tests {
             received_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&event, &requested).unwrap();
+        let result = TokenizedEquityMint::evolve(&requested, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -945,7 +945,7 @@ mod tests {
             completed_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&event, &accepted).unwrap();
+        let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -966,7 +966,7 @@ mod tests {
             rejected_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&event, &accepted).unwrap();
+        let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -984,7 +984,7 @@ mod tests {
             failed_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&event, &requested).unwrap();
+        let result = TokenizedEquityMint::evolve(&requested, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -1004,7 +1004,7 @@ mod tests {
             requested_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&event, &requested).unwrap();
+        let result = TokenizedEquityMint::evolve(&requested, &event).unwrap();
         assert_eq!(result, None);
     }
 }

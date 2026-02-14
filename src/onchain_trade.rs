@@ -522,6 +522,7 @@ mod tests {
                 enriched_at: now,
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert!(trade.is_enriched());

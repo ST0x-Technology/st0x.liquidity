@@ -402,6 +402,7 @@ mod tests {
                 fetched_at: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(snapshot.onchain_equity, balances);
@@ -426,6 +427,7 @@ mod tests {
                 fetched_at: Utc::now(),
             },
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(snapshot.onchain_equity, second_balances);

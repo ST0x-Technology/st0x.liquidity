@@ -22,24 +22,24 @@
 //!
 //! # Examples
 //!
-//! ## Single-entity queries (simple case)
+//! ## Single-entity reactors (simple case)
 //!
 //! ```ignore
-//! // Query only needs wiring to Position entity
+//! // Reactor only needs wiring to Position entity
 //! type ViewDeps = Cons<Position, Nil>;
 //! let view: Unwired<PositionView, ViewDeps> =
 //!     Unwired::new(view);
 //!
-//! // Build and discard -- query deps satisfied after wiring
+//! // Build and discard -- deps satisfied after wiring
 //! let position_store = StoreBuilder::<Position>::new(pool)
 //!     .wire(view)
 //!     .build(());
 //! ```
 //!
-//! ## Multi-entity queries
+//! ## Multi-entity reactors
 //!
 //! ```ignore
-//! // Query requiring wiring to Position, then Mint entities
+//! // Reactor requiring wiring to Position, then Mint entities
 //! type TriggerDeps = Cons<Position, Cons<TokenizedEquityMint, Nil>>;
 //! let trigger: Unwired<Trigger, TriggerDeps> =
 //!     Unwired::new(trigger);
@@ -71,12 +71,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use cqrs_es::Query;
-use cqrs_es::persist::ViewRepository;
 use sqlx::SqlitePool;
 
 use crate::Reactor;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-use crate::projection::Projection;
 use crate::schema_registry::Reconciler;
 use crate::{EventSourced, Store};
 
@@ -117,7 +115,7 @@ pub struct Nil;
 #[must_use = "query must be wired via StoreBuilder, \
               then extracted with into_inner"]
 pub struct Unwired<Processor, Deps> {
-    pub(crate) query: Arc<Processor>,
+    pub(crate) inner: Arc<Processor>,
     pub(crate) _deps: PhantomData<Deps>,
 }
 
@@ -127,9 +125,9 @@ impl<Processor, Deps> Unwired<Processor, Deps> {
     /// The `Deps` type parameter should encode all
     /// [`EventSourced`] entities this query needs to be wired to
     /// before it can be used.
-    pub fn new(query: Processor) -> Self {
+    pub fn new(processor: Processor) -> Self {
         Self {
-            query: Arc::new(query),
+            inner: Arc::new(processor),
             _deps: PhantomData,
         }
     }
@@ -143,7 +141,7 @@ impl<Processor> Unwired<Processor, Nil> {
     /// all required entities have been wired via
     /// [`StoreBuilder::wire`].
     pub fn into_inner(self) -> Arc<Processor> {
-        self.query
+        self.inner
     }
 }
 
@@ -191,29 +189,17 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
         self
     }
 
-    /// Adds a reactor without type-level tracking.
+    /// Adds a reactor or projection without type-level tracking.
     ///
-    /// Like [`with_query`](Self::with_query) but accepts a
-    /// [`Reactor<Entity>`] instead of a raw `Query<Lifecycle<Entity>>`.
+    /// Use this for CLI code where compile-time wiring
+    /// guarantees aren't needed. Production code should use
+    /// [`wire`](StoreBuilder::wire) with [`Unwired`] instead.
     #[must_use]
-    pub fn with_reactor(self, reactor: impl Reactor<Entity> + 'static) -> Self
+    pub fn with(self, reactor: impl Reactor<Entity> + 'static) -> Self
     where
         <Entity::Id as FromStr>::Err: Debug,
     {
         self.with_query(ReactorBridge(reactor))
-    }
-
-    /// Adds a projection without type-level tracking.
-    ///
-    /// Registers the projection's internal `GenericQuery` with the
-    /// CQRS framework so that it receives event updates.
-    #[must_use]
-    pub fn with_projection<Repo>(self, projection: &Projection<Entity, Repo>) -> Self
-    where
-        Entity: 'static,
-        Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync + 'static,
-    {
-        self.with_query(projection.inner_query())
     }
 
     /// Builds the CQRS framework when no queries were wired.
@@ -235,92 +221,40 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
 }
 
 impl<Entity: EventSourced, Wired> StoreBuilder<Entity, Wired> {
-    /// Wires a query processor to this CQRS framework.
+    /// Wires a reactor or projection to this CQRS framework with
+    /// type-level dependency tracking.
     ///
-    /// Consumes the [`Unwired`] and returns a new builder
-    /// with:
-    /// - The query added to the internal processors list
+    /// Consumes the [`Unwired`] processor and returns a new
+    /// builder with:
+    /// - The processor (bridged to cqrs-es `Query`) added to
+    ///   the internal processors list
     /// - An updated `Unwired` (with `Entity` removed from
     ///   dependencies) added to the wired tuple for return at
     ///   build time
     ///
     /// # Type Evolution
     ///
-    /// The input query must have `Entity` as its next dependency:
-    /// `Unwired<Processor, Cons<Entity, Tail>>`. The
-    /// returned query will be
-    /// `Unwired<Processor, Tail>`.
-    pub fn wire<Processor, Tail>(
+    /// The input must have `Entity` as its next dependency:
+    /// `Unwired<R, Cons<Entity, Tail>>`. The returned value
+    /// will be `Unwired<R, Tail>`.
+    pub fn wire<R, Tail>(
         mut self,
-        query: Unwired<Processor, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, WiredOutput<Processor, Tail, Wired>>
+        processor: Unwired<R, Cons<Entity, Tail>>,
+    ) -> StoreBuilder<Entity, WiredOutput<R, Tail, Wired>>
     where
-        Processor: Send + Sync + 'static,
-        Arc<Processor>: Query<Lifecycle<Entity>>,
-    {
-        self.queries.push(Box::new(query.query.clone()));
-
-        StoreBuilder {
-            pool: self.pool,
-            queries: self.queries,
-            wired: (
-                Unwired {
-                    query: query.query,
-                    _deps: PhantomData,
-                },
-                self.wired,
-            ),
-        }
-    }
-
-    /// Wires a reactor to this CQRS framework.
-    ///
-    /// Like [`wire`](Self::wire) but for processors that
-    /// implement [`Reactor<Entity>`] instead of
-    /// `Query<Lifecycle<Entity>>`.
-    pub fn wire_reactor<Processor, Tail>(
-        mut self,
-        query: Unwired<Processor, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, WiredOutput<Processor, Tail, Wired>>
-    where
-        Processor: Send + Sync + 'static,
-        Arc<Processor>: Reactor<Entity>,
+        R: Send + Sync + 'static,
+        Arc<R>: Reactor<Entity>,
         <Entity::Id as FromStr>::Err: Debug + Send + Sync,
     {
         self.queries
-            .push(Box::new(ReactorBridge(query.query.clone())));
+            .push(Box::new(ReactorBridge(processor.inner.clone())));
 
         StoreBuilder {
             pool: self.pool,
             queries: self.queries,
             wired: (
                 Unwired {
-                    query: query.query,
-                    _deps: PhantomData,
-                },
-                self.wired,
-            ),
-        }
-    }
-
-    /// Wires a projection to this CQRS framework with type-level
-    /// tracking.
-    pub fn wire_projection<Repo, Tail>(
-        mut self,
-        projection: &Unwired<Projection<Entity, Repo>, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, WiredOutput<Projection<Entity, Repo>, Tail, Wired>>
-    where
-        Entity: 'static,
-        Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync + 'static,
-    {
-        self.queries.push(Box::new(projection.query.inner_query()));
-
-        StoreBuilder {
-            pool: self.pool,
-            queries: self.queries,
-            wired: (
-                Unwired {
-                    query: Arc::clone(&projection.query),
+                    inner: processor.inner,
                     _deps: PhantomData,
                 },
                 self.wired,
@@ -354,7 +288,7 @@ impl<Entity: EventSourced, Head, Tail> StoreBuilder<Entity, (Head, Tail)> {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use cqrs_es::{DomainEvent, EventEnvelope};
+    use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -451,60 +385,60 @@ mod tests {
         }
     }
 
-    struct MultiEntityQuery {
+    struct MultiEntityReactor {
         name: &'static str,
     }
 
     #[async_trait]
-    impl Query<Lifecycle<AggregateA>> for Arc<MultiEntityQuery> {
-        async fn dispatch(&self, _: &str, _: &[EventEnvelope<Lifecycle<AggregateA>>]) {}
+    impl Reactor<AggregateA> for Arc<MultiEntityReactor> {
+        async fn react(&self, _id: &String, _event: &EventA) {}
     }
 
     #[async_trait]
-    impl Query<Lifecycle<AggregateB>> for Arc<MultiEntityQuery> {
-        async fn dispatch(&self, _: &str, _: &[EventEnvelope<Lifecycle<AggregateB>>]) {}
+    impl Reactor<AggregateB> for Arc<MultiEntityReactor> {
+        async fn react(&self, _id: &String, _event: &EventB) {}
     }
 
-    struct SingleEntityQuery;
+    struct SingleEntityReactor;
 
     #[async_trait]
-    impl Query<Lifecycle<AggregateA>> for Arc<SingleEntityQuery> {
-        async fn dispatch(&self, _: &str, _: &[EventEnvelope<Lifecycle<AggregateA>>]) {}
+    impl Reactor<AggregateA> for Arc<SingleEntityReactor> {
+        async fn react(&self, _id: &String, _event: &EventA) {}
     }
 
     #[test]
-    fn single_entity_query_wiring() {
+    fn single_entity_reactor_wiring() {
         type Deps = Cons<AggregateA, Nil>;
-        let query: Unwired<SingleEntityQuery, Deps> = Unwired::new(SingleEntityQuery);
+        let reactor: Unwired<SingleEntityReactor, Deps> = Unwired::new(SingleEntityReactor);
 
         // Simulate wiring (no actual pool needed for type-level test)
-        let query: Unwired<SingleEntityQuery, Nil> = Unwired {
-            query: query.query,
+        let reactor: Unwired<SingleEntityReactor, Nil> = Unwired {
+            inner: reactor.inner,
             _deps: PhantomData,
         };
 
-        let _arc: Arc<SingleEntityQuery> = query.into_inner();
+        let _arc: Arc<SingleEntityReactor> = reactor.into_inner();
     }
 
     #[test]
-    fn multi_entity_query_wiring_sequence() {
+    fn multi_entity_reactor_wiring_sequence() {
         type Deps = Cons<AggregateA, Cons<AggregateB, Nil>>;
-        let query: Unwired<MultiEntityQuery, Deps> =
-            Unwired::new(MultiEntityQuery { name: "test" });
+        let reactor: Unwired<MultiEntityReactor, Deps> =
+            Unwired::new(MultiEntityReactor { name: "test" });
 
         // After wiring to A, only B remains
-        let query: Unwired<MultiEntityQuery, Cons<AggregateB, Nil>> = Unwired {
-            query: query.query,
+        let reactor: Unwired<MultiEntityReactor, Cons<AggregateB, Nil>> = Unwired {
+            inner: reactor.inner,
             _deps: PhantomData,
         };
 
         // After wiring to B, Nil
-        let query: Unwired<MultiEntityQuery, Nil> = Unwired {
-            query: query.query,
+        let reactor: Unwired<MultiEntityReactor, Nil> = Unwired {
+            inner: reactor.inner,
             _deps: PhantomData,
         };
 
-        let arc = query.into_inner();
+        let arc = reactor.into_inner();
         assert_eq!(arc.name, "test");
     }
 
@@ -516,9 +450,9 @@ mod tests {
         type MultiDeps = Cons<AggregateA, Cons<AggregateB, Nil>>;
         type SingleDeps = Cons<AggregateA, Nil>;
 
-        let multi: Unwired<MultiEntityQuery, MultiDeps> =
-            Unwired::new(MultiEntityQuery { name: "multi" });
-        let single: Unwired<SingleEntityQuery, SingleDeps> = Unwired::new(SingleEntityQuery);
+        let multi: Unwired<MultiEntityReactor, MultiDeps> =
+            Unwired::new(MultiEntityReactor { name: "multi" });
+        let single: Unwired<SingleEntityReactor, SingleDeps> = Unwired::new(SingleEntityReactor);
 
         // Build AggregateA Store
         let (_store_a, (single, (multi, ()))) = StoreBuilder::<AggregateA>::new(pool.clone())
@@ -528,7 +462,7 @@ mod tests {
             .await
             .unwrap();
 
-        let _single_arc: Arc<SingleEntityQuery> = single.into_inner();
+        let _single_arc: Arc<SingleEntityReactor> = single.into_inner();
 
         // Build AggregateB Store
         let (_store_b, (multi, ())) = StoreBuilder::<AggregateB>::new(pool.clone())
@@ -537,6 +471,6 @@ mod tests {
             .await
             .unwrap();
 
-        let _multi_arc: Arc<MultiEntityQuery> = multi.into_inner();
+        let _multi_arc: Arc<MultiEntityReactor> = multi.into_inner();
     }
 }

@@ -149,15 +149,7 @@ pub struct TestStore<Entity: EventSourced> {
     cqrs: CqrsFramework<Lifecycle<Entity>, mem_store::MemStore<Lifecycle<Entity>>>,
 }
 
-impl<Entity: EventSourced> TestStore<Entity>
-where
-    Lifecycle<Entity>: Aggregate<
-            Command = Entity::Command,
-            Event = Entity::Event,
-            Error = LifecycleError<Entity>,
-            Services = Entity::Services,
-        >,
-{
+impl<Entity: EventSourced> TestStore<Entity> {
     /// Create an in-memory TestStore for fast, isolated unit tests.
     ///
     /// Accepts [`Reactor`] impls which are internally bridged to
@@ -324,6 +316,7 @@ mod tests {
             CounterEvent::Incremented,
             CounterEvent::Incremented,
         ])
+        .unwrap()
         .unwrap();
 
         assert_eq!(counter.value, 12);
@@ -376,13 +369,12 @@ mod tests {
 
     #[tokio::test]
     async fn harness_on_failed_lifecycle_returns_error() {
-        // Feed an event that causes Mismatch, then send a command
         let error = TestHarness::<Counter>::with(())
             .given(vec![CounterEvent::Incremented])
             .when(CounterCommand::Increment)
             .await
             .then_expect_error();
 
-        assert!(matches!(error, LifecycleError::Mismatch { .. }));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 }

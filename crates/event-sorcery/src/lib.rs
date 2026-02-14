@@ -94,21 +94,8 @@ use async_trait::async_trait;
 use cqrs_es::EventStore;
 use cqrs_es::persist::PersistedEventStore;
 
-pub use cqrs_es::Aggregate;
 pub use cqrs_es::AggregateError;
 pub use cqrs_es::DomainEvent;
-pub use cqrs_es::persist::ViewRepository;
-
-// Test-only re-exports: let st0x-hedge test code access cqrs-es
-// internals without depending on cqrs-es directly.
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::EventEnvelope;
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::Query;
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::View;
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::test::TestFramework;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlite_es::{SqliteCqrs, SqliteEventRepository};
@@ -200,7 +187,7 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     /// Returns `Some(state)` if this event creates the entity,
     /// `None` if it requires existing state. Returning `None`
     /// causes [`Lifecycle`] to enter a `Failed` state with a
-    /// [`LifecycleError::Mismatch`].
+    /// [`LifecycleError::EventCantOriginate`].
     fn originate(event: &Self::Event) -> Option<Self>;
 
     /// Derive new entity from an event applied to the current one.
