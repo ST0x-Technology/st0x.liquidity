@@ -130,70 +130,80 @@ excellent async ecosystem for handling concurrent trading flows.
 - Generate unique identifiers using transaction hash and log index for trade
   tracking
 
-#### Orchestration Architecture (apalis)
+#### Orchestration Architecture
 
-The system uses [apalis](https://github.com/geofmureithi/apalis) for job
-orchestration - a tower-based job processing framework with SQLite-backed
-persistence, retry/timeout/concurrency middleware, and typed dependency
-injection.
+The system uses a two-layer orchestration model. For crate-level API details,
+code examples, migration ordering, and startup sequence, see
+[docs/conductor.md](docs/conductor.md).
 
-##### Key Concepts
+##### Supervision Layer
 
-- **Job**: A serializable work unit (a Rust struct implementing
-  `serde::Serialize + serde::Deserialize`). Jobs are pushed to a persistent
-  queue and processed by workers. Persistent jobs survive process crashes.
-- **Worker**: A `tower::Service` handler that processes jobs of a specific type.
-  Workers are constructed via `WorkerBuilder` with a middleware stack (retry,
-  timeout, concurrency limits, tracing) and receive dependencies through
-  `Data<T>` injection.
-- **Monitor**: A multi-worker lifecycle coordinator. A single `Monitor` instance
-  registers all workers and manages their collective startup, shutdown, and
-  health. The monitor runs as a single tokio task.
-- **Persistent Job Queue**: A SQLite-backed durable queue (`SqliteStorage<Job>`)
-  that persists pending jobs across restarts. Jobs are enqueued via `.push()`
-  and consumed by workers registered with that storage backend. apalis manages
-  its own tables (`Jobs`, `Workers`) via `SqliteStorage::setup()`.
+The outermost layer supervises anything that runs indefinitely. If a task
+crashes, the supervisor restarts it with exponential backoff. These are the
+"eyes" of the system:
+
+| Task                   | Purpose                                              |
+| ---------------------- | ---------------------------------------------------- |
+| DEX WebSocket listener | Stream consumer - pushes `ProcessOnchainEvent` jobs  |
+| Job worker pool        | Runs all job workers; restarts from persistent queue |
+
+The DEX WebSocket listener is a **stream producer** - it connects to an Ethereum
+node, filters for Clear/TakeOrder events, and pushes jobs to the persistent
+queue. It lives in the supervisor layer because it has no natural completion
+point and must be restarted if the connection drops.
+
+The job worker pool is itself a supervised task. If it crashes, the supervisor
+restarts it and workers resume from the persistent queue (no jobs are lost
+because they're in SQLite).
+
+##### Job Layer
+
+The work layer processes typed jobs that have a beginning and an end. Each job
+type gets its own storage, handler, and concurrency limit. These are the "hands"
+of the system.
+
+The bridge between the layers is simple: supervised tasks push jobs to the
+persistent queue.
 
 ##### Job Taxonomy
 
-Jobs fall into three categories based on how they're triggered:
+Jobs fall into two categories based on how they're triggered:
 
-1. **Persistent jobs** (event-driven): Pushed to the queue by other components
-   (WebSocket listener, CQRS query processors, other job handlers). Survive
-   crashes. Examples: `ProcessOnchainEvent`, `PlaceOffchainOrder`,
-   `ExecuteRebalancing`, `EnrichOnchainTrade`.
+1. **Persistent jobs** (event-driven): Pushed to the queue by supervised tasks,
+   CQRS query processors, or other job handlers. Survive crashes. Examples:
+   `ProcessOnchainEvent`, `PlaceOffchainOrder`, `ExecuteRebalancing`,
+   `EnrichOnchainTrade`.
 
-2. **Cron jobs** (time-driven): Scheduled at fixed intervals via `apalis-cron`.
-   Examples: `PollOrderStatus`, `CheckAccumulatedPositions`, `PollInventory`,
+2. **Cron jobs** (time-driven): Scheduled at fixed intervals. Examples:
+   `PollOrderStatus`, `CheckAccumulatedPositions`, `PollInventory`,
    `ExecutorMaintenance`, `ComputeAnalytics` (future).
-
-3. **Stream-driven** (external source): The DEX WebSocket listener remains a raw
-   `tokio::spawn` task since it's a stream producer, not a job consumer. It
-   pushes `ProcessOnchainEvent` jobs to the persistent queue as blockchain
-   events arrive.
 
 ##### Dependency Injection Layers
 
-Dependency injection operates at two distinct layers, each with its own scope
-and purpose:
+Dependency injection operates at three distinct layers, each with its own
+lifetime and scope:
 
-- **apalis `Data<T>`** (orchestration layer): Injects dependencies into **job
-  handlers**. This is where a handler receives the tools it needs to do its
-  work: CQRS framework instances (`Cqrs<A>`), persistent job queues (to push
-  downstream jobs), and view repositories (to read projections). Configured via
-  `.data(x)` on the `WorkerBuilder`.
+- **Supervision layer**: Dependencies are plain struct fields on each supervised
+  task, set at construction time before the supervisor starts. The WebSocket
+  listener holds a queue handle to push jobs; the job worker pool holds all
+  registered workers. No runtime DI framework - just Rust struct construction.
 
-- **CQRS `Aggregate::Services`** (domain layer): Injects dependencies into
+- **Orchestration layer**: Injects dependencies into **job handlers**. This is
+  where a handler receives the tools it needs to do its work: CQRS framework
+  instances (`Cqrs<A>`), persistent job queues (to push downstream jobs), and
+  view repositories (to read projections).
+
+- **Domain layer (CQRS `Aggregate::Services`)**: Injects dependencies into
   **aggregate command handlers**. This is where an aggregate's `handle()` method
   receives the external capabilities it needs to process a command: broker APIs,
   blockchain providers, tokenization services. Configured once when constructing
   the `CqrsFramework` (see `docs/cqrs.md`).
 
-The layers are hierarchical, not interchangeable. A job handler receives a
-`Cqrs<Position>` instance via `Data<T>`, then calls `cqrs.execute(command)`. The
-CQRS framework internally passes the aggregate's `Services` into `handle()`. The
-job handler never touches `Services` directly - it operates through the CQRS
-command interface.
+The layers are strictly hierarchical. The supervisor owns the worker pool, the
+worker pool owns the workers, workers receive CQRS framework instances, and the
+CQRS framework internally passes `Services` into aggregate `handle()`. Each
+layer only talks to the one directly below it - a job handler never touches
+`Services` directly, and the supervisor never touches job-layer DI.
 
 <!-- DIAGRAM CANDIDATES - pick the best, delete the rest -->
 
@@ -2889,10 +2899,11 @@ proper tracking of asset movements that required manual resolution.
 
 ### Job Processing Flows
 
-This section describes how apalis jobs orchestrate the system's event
-processing, replacing the previous conductor-based `tokio::spawn` tasks. Each
-job is a serializable struct pushed to a persistent SQLite queue and processed
-by a dedicated worker with typed `Data<T>` dependencies.
+This section describes how jobs orchestrate the system's event processing,
+replacing the previous conductor-based `tokio::spawn` tasks. The DEX WebSocket
+listener runs as a supervised task that pushes jobs to the persistent queue.
+Each job is a serializable struct processed by a dedicated worker (see
+[docs/conductor.md](docs/conductor.md) for implementation details).
 
 #### Job Types
 
@@ -3054,18 +3065,19 @@ Which jobs write to which aggregates, and which jobs read from their views:
 
 #### Market Hours Handling
 
-The apalis `Monitor` coordinates market-hours lifecycle for all workers. The DEX
-WebSocket listener runs 24/7 (crypto markets never close), but broker-facing
-workers respect market hours:
+The supervisor runs 24/7 - both the DEX WebSocket listener and the job worker
+pool are always supervised. Market hours filtering happens as middleware on the
+relevant workers, not at the supervisor level.
 
-- **Always active**: ProcessOnchainEvent, EnrichOnchainTrade, PollInventory
+- **Always active**: ProcessOnchainEvent, EnrichOnchainTrade, PollInventory (and
+  the DEX WebSocket listener in the supervisor layer)
 - **Market hours only**: PlaceOffchainOrder, PollOrderStatus,
   CheckAccumulatedPositions, ExecuteRebalancing, ExecutorMaintenance
 
-Market hours filtering is implemented as tower middleware on the relevant
-workers, rejecting jobs outside trading hours (jobs remain in the queue and are
-retried when markets reopen). The Monitor's graceful shutdown ensures in-flight
-jobs complete before the process exits.
+Jobs pushed outside trading hours remain in the persistent queue. The market
+hours middleware rejects them on dequeue, and they are retried when markets
+reopen. Graceful shutdown propagates from the supervisor through the worker
+pool, ensuring in-flight jobs complete before the process exits.
 
 #### Future Consideration: Reorg Handling
 
