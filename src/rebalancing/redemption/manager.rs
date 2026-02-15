@@ -6,11 +6,10 @@
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
-use std::sync::Arc;
-use tracing::{error, info, instrument, warn};
-
 use st0x_event_sorcery::Store;
 use st0x_execution::{FractionalShares, Symbol};
+use std::sync::Arc;
+use tracing::{error, info, instrument, warn};
 
 use super::service::RedemptionService;
 use super::{Redeem, RedemptionError};
@@ -222,7 +221,6 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlx::SqlitePool;
-
     use st0x_event_sorcery::test_store;
 
     use super::*;

@@ -216,6 +216,8 @@ where
             .get_receipt()
             .await?;
 
+        ensure_receipt_success(&receipt)?;
+
         info!(tx_hash = %receipt.transaction_hash, "deposit3 confirmed");
         Ok(receipt.transaction_hash)
     }
@@ -265,6 +267,8 @@ where
             .with_required_confirmations(self.required_confirmations)
             .get_receipt()
             .await?;
+
+        ensure_receipt_success(&receipt)?;
 
         Ok(receipt.transaction_hash)
     }

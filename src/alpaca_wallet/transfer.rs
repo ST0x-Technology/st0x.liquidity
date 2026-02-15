@@ -335,7 +335,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let err = initiate_withdrawal(
+        let error = initiate_withdrawal(
             &client,
             Decimal::ZERO,
             "USDC",
@@ -344,7 +344,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(
-            err,
+            error,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::ZERO
         ));
     }
@@ -359,7 +359,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let err = initiate_withdrawal(
+        let error = initiate_withdrawal(
             &client,
             Decimal::new(-100, 0),
             "USDC",
@@ -368,7 +368,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(
-            err,
+            error,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::new(-100, 0)
         ));
     }

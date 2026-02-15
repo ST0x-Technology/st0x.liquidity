@@ -134,42 +134,6 @@ where
     result
 }
 
-async fn run_until_market_close<E>(
-    conductor: &mut Conductor,
-    timeout: Duration,
-    executor: E,
-    ctx: Ctx,
-    pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    tokio::select! {
-        result = conductor.wait_for_completion() => {
-            handle_conductor_completion(conductor, result)
-        }
-        () = tokio::time::sleep(timeout) => {
-            handle_market_close(conductor, executor, ctx, pool, event_sender).await
-        }
-    }
-}
-
-fn handle_conductor_completion(
-    conductor: &mut Conductor,
-    result: anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    info!("Conductor completed");
-    conductor.abort_all();
-    result?;
-    info!(
-        "Conductor completed successfully, \
-         continuing to next market session"
-    );
-    Ok(())
-}
-
 async fn handle_market_close<E>(
     conductor: &mut Conductor,
     executor: E,
@@ -1214,10 +1178,7 @@ async fn process_queued_trade<E: Executor>(
 
     mark_event_processed(pool, event_id)
         .await
-        .map_err(|error| {
-            error!("Failed to mark event {event_id} as processed: {error}");
-            EventProcessingError::Queue(error)
-        })?;
+        .inspect_err(|error| error!("Failed to mark event {event_id} as processed: {error}"))?;
 
     info!(
         "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",
@@ -1286,10 +1247,10 @@ async fn execute_fail_offchain_order_position(
             symbol = %execution.symbol,
             "Position::FailOffChainOrder succeeded"
         ),
-        Err(e) => error!(
+        Err(error) => error!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "Position::FailOffChainOrder failed: {e}"
+            "Position::FailOffChainOrder failed: {error}"
         ),
     }
 }

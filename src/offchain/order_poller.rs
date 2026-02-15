@@ -38,8 +38,8 @@ pub(crate) enum OrderPollingError {
 }
 
 impl From<ExecutionError> for OrderPollingError {
-    fn from(err: ExecutionError) -> Self {
-        Self::Executor(Box::new(err))
+    fn from(error: ExecutionError) -> Self {
+        Self::Executor(Box::new(error))
     }
 }
 

@@ -260,10 +260,10 @@ mod tests {
         let max = Usdc(Decimal::MAX);
         let one = Usdc(Decimal::ONE);
 
-        let err = (max + one).unwrap_err();
-        assert_eq!(err.operation, "+");
-        assert_eq!(err.lhs, max);
-        assert_eq!(err.rhs, one);
+        let error = (max + one).unwrap_err();
+        assert_eq!(error.operation, "+");
+        assert_eq!(error.lhs, max);
+        assert_eq!(error.rhs, one);
     }
 
     #[test]
@@ -271,10 +271,10 @@ mod tests {
         let min = Usdc(Decimal::MIN);
         let one = Usdc(Decimal::ONE);
 
-        let err = (min - one).unwrap_err();
-        assert_eq!(err.operation, "-");
-        assert_eq!(err.lhs, min);
-        assert_eq!(err.rhs, one);
+        let error = (min - one).unwrap_err();
+        assert_eq!(error.operation, "-");
+        assert_eq!(error.lhs, min);
+        assert_eq!(error.rhs, one);
     }
 
     #[test]
@@ -304,11 +304,11 @@ mod tests {
         let max = Usdc(Decimal::MAX);
         let two = Decimal::TWO;
 
-        let err = (max * two).unwrap_err();
+        let error = (max * two).unwrap_err();
 
-        assert_eq!(err.operation, "*");
-        assert_eq!(err.lhs, max);
-        assert_eq!(err.rhs, Usdc(two));
+        assert_eq!(error.operation, "*");
+        assert_eq!(error.lhs, max);
+        assert_eq!(error.rhs, Usdc(two));
     }
 
     #[test]

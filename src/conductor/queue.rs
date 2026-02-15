@@ -77,7 +77,7 @@ async fn log_unprocessed_event_count(pool: &SqlitePool) {
             info!("Found {count} unprocessed events from previous sessions to process");
         }
         Ok(_) => info!("No unprocessed events found, starting fresh"),
-        Err(e) => error!("Failed to count unprocessed events: {e}"),
+        Err(error) => error!("Failed to count unprocessed events: {error}"),
     }
 }
 
@@ -211,10 +211,9 @@ where
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position_cqrs, &trade).await;
 
-    mark_event_processed(pool, event_id).await.map_err(|e| {
-        error!("Failed to mark event {event_id} as processed: {e}");
-        EventProcessingError::Queue(e)
-    })?;
+    mark_event_processed(pool, event_id)
+        .await
+        .inspect_err(|error| error!("Failed to mark event {event_id} as processed: {error}"))?;
 
     info!(
         "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",

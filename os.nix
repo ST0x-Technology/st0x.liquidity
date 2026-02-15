@@ -181,8 +181,6 @@ in {
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
-  systemd.services = lib.mapAttrs mkService enabledServices;
-
   environment.systemPackages = with pkgs; [
     bat
     curl
