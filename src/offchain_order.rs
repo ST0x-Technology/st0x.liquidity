@@ -569,7 +569,10 @@ impl OffchainOrderId {
 pub(crate) enum OffchainOrderError {
     #[error("Cannot place order: order has already been placed")]
     AlreadyPlaced,
-    #[error("Cannot confirm submission: order has not been submitted to broker yet")]
+    #[error(
+        "Cannot update or complete fill: order has not been \
+         submitted to broker yet"
+    )]
     NotSubmitted,
     #[error("Cannot update order: order has already been completed (filled or failed)")]
     AlreadyCompleted,
