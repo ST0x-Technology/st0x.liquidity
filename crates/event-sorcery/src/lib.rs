@@ -310,12 +310,12 @@ pub async fn load_aggregate<Entity: EventSourced>(
 /// one place so implementors see a single meaningful name
 /// instead of a long bound list.
 pub trait DomainError:
-    std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
+    std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
 }
 
 impl<T> DomainError for T where
-    T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
+    T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
 }
 

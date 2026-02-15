@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
-use st0x_event_sorcery::{Column, Projection, SendError, Store};
+use st0x_event_sorcery::{Column, Projection, ProjectionError, SendError, Store};
 use st0x_execution::{
     ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
@@ -30,7 +30,7 @@ pub(crate) enum OrderPollingError {
     #[error("Onchain error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Projection query error: {0}")]
-    Projection(#[from] st0x_event_sorcery::ProjectionError),
+    OffchainOrderProjection(#[from] ProjectionError<OffchainOrder>),
     #[error("Offchain order aggregate error: {0}")]
     OffchainOrderAggregate(#[from] SendError<OffchainOrder>),
     #[error("Position aggregate error: {0}")]

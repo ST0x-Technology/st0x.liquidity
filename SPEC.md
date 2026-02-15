@@ -1026,13 +1026,14 @@ ergonomic interface than cqrs-es's `Aggregate` directly:
 ```rust
 #[async_trait]
 trait EventSourced {
-    type Id: Display;
+    type Id: Display + FromStr + Send + Sync;
     type Event: DomainEvent + Eq;
     type Command: Send + Sync;
     type Error: DomainError;
     type Services: Send + Sync;
 
     const AGGREGATE_TYPE: &'static str;
+    const PROJECTION: Option<Table>;
     const SCHEMA_VERSION: u64;
 
     // Event-side: reconstruct state from event log
@@ -1083,7 +1084,7 @@ enum Lifecycle<Entity: EventSourced> {
     Live(Entity),
     Failed {
         error: LifecycleError<Entity>,
-        last_valid_state: Option<Box<Entity>>,
+        last_valid_entity: Option<Box<Entity>>,
     },
 }
 ```
@@ -2884,37 +2885,41 @@ After migration:
 
 #### Aggregate Testing
 
-Use `Lifecycle::default()` with `Aggregate::handle()` for command tests and
-`Aggregate::apply()` for setting up prior state:
+Use `TestHarness` for BDD-style command testing and `replay` for reconstructing
+state from events. Both operate at the `EventSourced` level, hiding
+`Lifecycle`/`Aggregate` internals:
 
 ```rust
 #[tokio::test]
 async fn test_position_accumulates_fills() {
-    let mut aggregate = Lifecycle::<Position>::default();
-    // Given: apply prior events
-    aggregate.apply(PositionEvent::OnChainOrderFilled { /* ... */ });
-    // When: execute command
-    let events = aggregate
-        .handle(PositionCommand::AcknowledgeOnChainFill { /* ... */ }, &())
+    let events = TestHarness::<Position>::with(())
+        .given(vec![
+            PositionEvent::Initialized { /* ... */ },
+            PositionEvent::OnChainOrderFilled { /* ... */ },
+        ])
+        .when(PositionCommand::AcknowledgeOnChainFill { /* ... */ })
         .await
-        .unwrap();
-    // Then: verify events
-    assert!(matches!(events[0], PositionEvent::OnChainOrderFilled { .. }));
+        .then_expect_events(&[
+            PositionEvent::OnChainOrderFilled { /* ... */ },
+        ]);
 }
 ```
 
-#### View Testing
+#### State Reconstruction Testing
+
+Use `replay` to reconstruct entity state from a sequence of events:
 
 ```rust
 #[test]
-fn test_view_updates_from_events() {
-    let event = PositionEvent::OnChainOrderFilled { /* ... */ };
-    let envelope = EventEnvelope { /* ... */ };
+fn test_replay_builds_position_state() {
+    let position = replay::<Position>(vec![
+        PositionEvent::Initialized { /* ... */ },
+        PositionEvent::OnChainOrderFilled { /* ... */ },
+    ])
+    .unwrap()
+    .expect("should produce a live position");
 
-    let mut view = Lifecycle::<Position>::default();
-    view.update(&envelope);
-
-    // Assert view state matches expected
+    assert_eq!(position.net, FractionalShares::new(dec!(1.5)));
 }
 ```
 

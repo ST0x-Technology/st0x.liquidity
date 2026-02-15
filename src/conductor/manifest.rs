@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Cons, Nil, Projection, Store, StoreBuilder, Unwired};
+use st0x_event_sorcery::{Cons, Nil, Projection, ProjectionError, Store, StoreBuilder, Unwired};
 
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::EquityRedemption;
@@ -70,7 +70,7 @@ impl QueryManifest {
         inventory: Arc<RwLock<InventoryView>>,
         operation_sender: mpsc::Sender<TriggeredOperation>,
         event_sender: broadcast::Sender<ServerMessage>,
-    ) -> Result<Self, st0x_event_sorcery::ProjectionError> {
+    ) -> Result<Self, ProjectionError<Position>> {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,
             pool.clone(),
@@ -145,5 +145,58 @@ impl QueryManifest {
             },
             WiredQueries { position_view },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::Address;
+    use rust_decimal_macros::dec;
+    use tokio::sync::{RwLock, broadcast, mpsc};
+
+    use super::*;
+    use crate::inventory::{ImbalanceThreshold, InventoryView};
+    use crate::test_utils::setup_test_db;
+
+    fn test_trigger_config() -> RebalancingTriggerConfig {
+        RebalancingTriggerConfig {
+            equity_threshold: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc_threshold: ImbalanceThreshold {
+                target: dec!(0.6),
+                deviation: dec!(0.15),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_produces_working_stores() {
+        let pool = setup_test_db().await;
+        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+        let (event_sender, _event_receiver) = broadcast::channel(10);
+
+        let manifest = QueryManifest::new(
+            test_trigger_config(),
+            pool.clone(),
+            Address::ZERO,
+            Address::ZERO,
+            Arc::new(RwLock::new(InventoryView::default())),
+            operation_sender,
+            event_sender,
+        )
+        .unwrap();
+
+        let (_frameworks, queries) = manifest.wire(pool).await.unwrap();
+
+        // Verify stores are usable by checking that loading a
+        // nonexistent position returns None
+        let result = queries
+            .position_view
+            .load(&st0x_execution::Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 }

@@ -51,7 +51,7 @@ impl std::fmt::Display for Column {
 
 /// Errors from [`Projection`] query operations.
 #[derive(Debug, thiserror::Error)]
-pub enum ProjectionError {
+pub enum ProjectionError<Entity: EventSourced> {
     #[error("entity has no materialized view (PROJECTION = None)")]
     NoTable,
     #[error(
@@ -63,7 +63,7 @@ pub enum ProjectionError {
     ColumnNotFound { column: Column, table: String },
     #[error(
         "generated column '{column}' has all NULL values in \
-         table '{table}' ({row_count} rows) — likely stale \
+         table '{table}' ({row_count} rows) - likely stale \
          JSON path in migration"
     )]
     StaleColumn {
@@ -73,6 +73,16 @@ pub enum ProjectionError {
     },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    #[error(transparent)]
+    Lifecycle(Box<LifecycleError<Entity>>),
+}
+
+impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Entity> {
+    fn from(error: LifecycleError<Entity>) -> Self {
+        Self::Lifecycle(Box::new(error))
+    }
 }
 
 /// SQLite view repository that hides [`Lifecycle`] from
@@ -83,7 +93,7 @@ pub enum ProjectionError {
 /// leaking the `pub(crate)` `Lifecycle` type to external
 /// consumers. This wraps the underlying repository so that
 /// `Projection<Position>` expands to
-/// `Projection<Position, SqliteProjectionRepo<Position>>` — no
+/// `Projection<Position, SqliteProjectionRepo<Position>>` - no
 /// `Lifecycle` visible.
 pub struct SqliteProjectionRepo<Entity: EventSourced> {
     inner: SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
@@ -137,7 +147,7 @@ pub struct Projection<Entity: EventSourced, Repo = SqliteProjectionRepo<Entity>>
 impl<Entity: EventSourced> Projection<Entity> {
     /// Returns `Err(ProjectionError::NoTable)` if the entity has
     /// no materialized view configured (`PROJECTION = None`).
-    pub fn sqlite(pool: SqlitePool) -> Result<Self, ProjectionError> {
+    pub fn sqlite(pool: SqlitePool) -> Result<Self, ProjectionError<Entity>> {
         let Table(table) = Entity::PROJECTION.ok_or(ProjectionError::NoTable)?;
         let repo = Arc::new(SqliteProjectionRepo {
             inner: SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
@@ -158,7 +168,7 @@ impl<Entity: EventSourced> Projection<Entity> {
     ///
     /// Returns every entity in `Live` state, skipping
     /// non-live aggregates with a warning.
-    pub async fn load_all(&self) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError>
+    pub async fn load_all(&self) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError<Entity>>
     where
         <Entity::Id as FromStr>::Err: Debug,
     {
@@ -190,7 +200,7 @@ impl<Entity: EventSourced> Projection<Entity> {
         &self,
         column: Column,
         value: &V,
-    ) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError>
+    ) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError<Entity>>
     where
         for<'q> &'q V: sqlx::Encode<'q, Sqlite>,
         V: sqlx::Type<Sqlite> + Send + Sync,
@@ -212,7 +222,7 @@ impl<Entity: EventSourced> Projection<Entity> {
         Ok(Self::parse_rows(rows))
     }
 
-    fn sqlite_backing(&self) -> Result<(&SqlitePool, &str), ProjectionError> {
+    fn sqlite_backing(&self) -> Result<(&SqlitePool, &str), ProjectionError<Entity>> {
         let pool = self.pool.as_ref().ok_or(ProjectionError::NotSqliteBacked)?;
 
         let table = self
@@ -257,8 +267,8 @@ impl<Entity: EventSourced> Projection<Entity> {
 }
 
 // TODO: Projection's Repo parameter ideally encodes a
-// higher-kinded type — `Repo<Lifecycle<Entity>, Lifecycle<Entity>>`
-// — so the struct definition captures the relationship between
+// higher-kinded type - `Repo<Lifecycle<Entity>, Lifecycle<Entity>>`
+// - so the struct definition captures the relationship between
 // Repo and Entity without naming Lifecycle in bounds. Rust lacks
 // native HKT support, but GAT-based workarounds (e.g., a
 // `RepoFamily` trait with `type Repo<V, A>`) can emulate this.
@@ -284,12 +294,13 @@ where
     /// Delegates to the underlying view repository, then unwraps
     /// the internal `Lifecycle` wrapper. Returns `None` if the
     /// entity doesn't exist or hasn't been initialized yet.
-    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, LifecycleError<Entity>> {
+    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, ProjectionError<Entity>> {
         let view_id = id.to_string();
 
         match self.repo.load(&view_id).await {
-            Ok(Some(lifecycle)) => lifecycle.into_result(),
-            Ok(None) | Err(_) => Ok(None),
+            Ok(Some(lifecycle)) => Ok(lifecycle.into_result()?),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error)?,
         }
     }
 }
@@ -335,11 +346,11 @@ where
 /// Validates that a column exists in the table schema and returns
 /// an error if all values are NULL (indicates a stale generated
 /// column).
-async fn validate_column(
+async fn validate_column<Entity: EventSourced>(
     pool: &SqlitePool,
     table: &str,
     column: &Column,
-) -> Result<(), ProjectionError> {
+) -> Result<(), ProjectionError<Entity>> {
     let column_name = column.0;
 
     let columns: Vec<(String,)> =
@@ -536,6 +547,10 @@ mod tests {
 
         let result = projection.load(&"id-1".to_string()).await;
 
-        assert_eq!(result.unwrap_err(), error);
+        assert!(matches!(
+            result.unwrap_err(),
+            ProjectionError::Lifecycle(boxed)
+                if matches!(*boxed, LifecycleError::EventCantOriginate { .. })
+        ));
     }
 }

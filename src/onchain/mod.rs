@@ -18,7 +18,9 @@ use st0x_execution::{
     InvalidSharesError, PersistenceError, SharesConversionError,
 };
 
-use crate::position::PositionError;
+use st0x_event_sorcery::ProjectionError;
+
+use crate::position::{Position, PositionError};
 use crate::queue::EventQueueError;
 
 pub(crate) mod accumulator;
@@ -125,8 +127,8 @@ pub(crate) enum OnChainError {
     Json(#[from] serde_json::Error),
     #[error("UUID parse error: {0}")]
     Uuid(#[from] uuid::Error),
-    #[error("Projection query error: {0}")]
-    Projection(#[from] st0x_event_sorcery::ProjectionError),
+    #[error("Position projection error: {0}")]
+    PositionProjection(#[from] ProjectionError<Position>),
 }
 
 impl From<sqlx::Error> for OnChainError {

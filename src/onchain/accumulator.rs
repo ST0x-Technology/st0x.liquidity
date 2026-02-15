@@ -5,7 +5,7 @@ use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, S
 use st0x_event_sorcery::Projection;
 
 use crate::onchain::OnChainError;
-use crate::position::{Position, load_position};
+use crate::position::Position;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionCtx {
@@ -22,11 +22,11 @@ pub(crate) struct ExecutionCtx {
 /// pending executions — `is_ready_for_execution` returns `None` if one
 /// is already in flight.
 pub(crate) async fn check_execution_readiness(
-    position_query: &Projection<Position>,
+    position_projection: &Projection<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
-    let Some(position) = load_position(position_query, symbol).await? else {
+    let Some(position) = position_projection.load(symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };
@@ -63,15 +63,15 @@ pub(crate) async fn check_execution_readiness(
 /// against its configured threshold. Returns execution parameters for
 /// positions that are ready.
 #[tracing::instrument(
-    skip(position_query),
+    skip(position_projection),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
 pub(crate) async fn check_all_positions(
-    position_query: &Projection<Position>,
+    position_projection: &Projection<Position>,
     executor_type: SupportedExecutor,
 ) -> Result<Vec<ExecutionCtx>, OnChainError> {
-    let all_positions = position_query.load_all().await?;
+    let all_positions = position_projection.load_all().await?;
 
     let mut ready = Vec::new();
 

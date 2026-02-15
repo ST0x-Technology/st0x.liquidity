@@ -17,20 +17,10 @@ use st0x_execution::{
     Symbol,
 };
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, LifecycleError, Projection, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
-
-pub(crate) async fn load_position(
-    query: &Projection<Position>,
-    symbol: &Symbol,
-) -> Result<Option<Position>, PositionError> {
-    query
-        .load(symbol)
-        .await
-        .map_err(|error| PositionError::Lifecycle(Box::new(error)))
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Position {
@@ -440,8 +430,6 @@ pub(crate) enum PositionError {
     Arithmetic(#[from] ArithmeticError<FractionalShares>),
     #[error("Arithmetic error calculating threshold: {0}")]
     ThresholdCalculation(#[from] ArithmeticError<Usdc>),
-    #[error("Lifecycle error: {0}")]
-    Lifecycle(Box<LifecycleError<Position>>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -727,13 +715,10 @@ mod tests {
             .await
             .then_expect_error();
 
-        assert_eq!(
+        assert!(matches!(
             error,
-            LifecycleError::Apply(PositionError::ThresholdNotMet {
-                net_position: FractionalShares::new(dec!(0.5)),
-                threshold,
-            })
-        );
+            LifecycleError::Apply(PositionError::ThresholdNotMet { .. })
+        ));
     }
 
     #[tokio::test]
@@ -781,10 +766,10 @@ mod tests {
             .await
             .then_expect_error();
 
-        assert_eq!(
+        assert!(matches!(
             error,
-            LifecycleError::Apply(PositionError::PendingExecution { offchain_order_id })
-        );
+            LifecycleError::Apply(PositionError::PendingExecution { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1300,7 +1285,8 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
-        let result = load_position(&projection, &Symbol::new("AAPL").unwrap())
+        let result = projection
+            .load(&Symbol::new("AAPL").unwrap())
             .await
             .unwrap();
 
@@ -1342,7 +1328,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = load_position(&projection, &symbol).await.unwrap();
+        let result = projection.load(&symbol).await.unwrap();
 
         let position = result.expect("Should return Some for live lifecycle");
         assert_eq!(position.symbol, symbol);

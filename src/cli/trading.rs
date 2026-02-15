@@ -295,10 +295,10 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let position_query = Projection::<Position>::sqlite(pool.clone())?;
+    let position_projection = Projection::<Position>::sqlite(pool.clone())?;
     let position_store: Arc<Store<Position>> = Arc::new(
         StoreBuilder::new(pool.clone())
-            .with(position_query.clone())
+            .with(position_projection.clone())
             .build(())
             .await?,
     );
@@ -310,7 +310,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let base_symbol = onchain_trade.symbol.base();
 
     let Some(params) =
-        check_execution_readiness(&position_query, base_symbol, executor_type).await?
+        check_execution_readiness(&position_projection, base_symbol, executor_type).await?
     else {
         writeln!(
             stdout,

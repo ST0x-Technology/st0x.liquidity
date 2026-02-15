@@ -255,6 +255,46 @@ mod tests {
     use super::*;
     use st0x_event_sorcery::{TestHarness, replay};
 
+    #[test]
+    fn inventory_snapshot_id_roundtrips_through_display_and_parse() {
+        let id = InventorySnapshotId {
+            orderbook: Address::repeat_byte(0xAB),
+            owner: Address::repeat_byte(0xCD),
+        };
+
+        let parsed: InventorySnapshotId = id.to_string().parse().unwrap();
+
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn inventory_snapshot_id_missing_delimiter() {
+        let error = "0xdeadbeef".parse::<InventorySnapshotId>().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseInventorySnapshotIdError::MissingDelimiter { .. }
+        ));
+    }
+
+    #[test]
+    fn inventory_snapshot_id_invalid_orderbook() {
+        let error = "not_hex:0xCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCd"
+            .parse::<InventorySnapshotId>()
+            .unwrap_err();
+
+        assert!(matches!(error, ParseInventorySnapshotIdError::Orderbook(_)));
+    }
+
+    #[test]
+    fn inventory_snapshot_id_invalid_owner() {
+        let error = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb:not_hex"
+            .parse::<InventorySnapshotId>()
+            .unwrap_err();
+
+        assert!(matches!(error, ParseInventorySnapshotIdError::Owner(_)));
+    }
+
     fn test_symbol(s: &str) -> Symbol {
         Symbol::new(s).unwrap()
     }

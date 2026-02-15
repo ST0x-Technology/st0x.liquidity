@@ -37,9 +37,9 @@ type TakeStream =
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
     pub(crate) position: Arc<Store<Position>>,
-    pub(crate) position_query: Arc<Projection<Position>>,
+    pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
-    pub(crate) offchain_order_query: Arc<Projection<OffchainOrder>>,
+    pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
     pub(crate) vault_registry: Store<VaultRegistry>,
     pub(crate) snapshot: Store<InventorySnapshot>,
 }
@@ -189,7 +189,7 @@ where
         let order_poller = spawn_order_poller(
             &self.common.ctx,
             self.common.executor.clone(),
-            (*self.common.frameworks.offchain_order_query).clone(),
+            (*self.common.frameworks.offchain_order_projection).clone(),
             self.common.frameworks.offchain_order.clone(),
             self.common.frameworks.position.clone(),
         );
@@ -203,14 +203,14 @@ where
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
             self.common.frameworks.position.clone(),
-            self.common.frameworks.position_query.clone(),
+            self.common.frameworks.position_projection.clone(),
             self.common.frameworks.offchain_order.clone(),
             self.common.execution_threshold,
         );
         let trade_cqrs = super::TradeProcessingCqrs {
             onchain_trade: self.common.frameworks.onchain_trade,
             position: self.common.frameworks.position,
-            position_query: self.common.frameworks.position_query,
+            position_projection: self.common.frameworks.position_projection,
             offchain_order: self.common.frameworks.offchain_order,
             execution_threshold: self.common.execution_threshold,
         };

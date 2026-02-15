@@ -42,7 +42,7 @@ use crate::{EventSourced, Reactor};
 ///
 /// Failed { .. } ---- any event ------> Failed { AlreadyFailed }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 // Override serde's inferred bounds. Without this, serde derives
 // `Entity: Serialize + Deserialize` bounds, but Entity's serde
 // impls are already guaranteed by the EventSourced supertrait.
@@ -86,7 +86,7 @@ impl<Entity: EventSourced> Default for Lifecycle<Entity> {
 /// handling and debugging.
 ///
 /// [`Apply`]: LifecycleError::Apply
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 // Same override as Lifecycle above -- serde would infer
 // `Entity::Error: Serialize + Deserialize` bounds that are
 // already guaranteed by EventSourced's DomainError supertrait.
@@ -408,7 +408,7 @@ mod tests {
 
         lifecycle.apply(CounterEvent::Created { initial: 10 });
 
-        assert_eq!(lifecycle, Lifecycle::Live(Counter { value: 10 }));
+        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 10 })));
     }
 
     #[test]
@@ -432,7 +432,7 @@ mod tests {
 
         lifecycle.apply(CounterEvent::Incremented);
 
-        assert_eq!(lifecycle, Lifecycle::Live(Counter { value: 6 }));
+        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 6 })));
     }
 
     #[test]
@@ -520,7 +520,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error, LifecycleError::Apply(CounterError));
+        assert!(matches!(error, LifecycleError::Apply(CounterError)));
     }
 
     #[tokio::test]
@@ -538,7 +538,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error, stored_error);
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[test]
@@ -553,6 +553,6 @@ mod tests {
 
         lifecycle.update(&envelope);
 
-        assert_eq!(lifecycle, Lifecycle::Live(Counter { value: 7 }));
+        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 7 })));
     }
 }
