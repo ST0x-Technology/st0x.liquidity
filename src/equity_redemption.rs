@@ -45,10 +45,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::Symbol;
 use std::str::FromStr;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_execution::Symbol;
 
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
@@ -93,6 +93,9 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to send tokens when redemption is already in progress
     #[error("Already started")]
     AlreadyStarted,
+    /// Attempted to detect a redemption that was already detected
+    #[error("Already detected")]
+    AlreadyDetected,
     /// Attempted to modify a completed redemption operation
     #[error("Already completed")]
     AlreadyCompleted,
@@ -323,8 +326,9 @@ impl EventSourced for EquityRedemption {
                     tokenization_request_id,
                     detected_at: Utc::now(),
                 }]),
+                Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                _ => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
             FailDetection { reason } => match self {
@@ -332,10 +336,9 @@ impl EventSourced for EquityRedemption {
                     reason,
                     failed_at: Utc::now(),
                 }]),
+                Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Pending { .. } | Self::Completed { .. } => {
-                    Err(EquityRedemptionError::AlreadyCompleted)
-                }
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
             Complete => match self {

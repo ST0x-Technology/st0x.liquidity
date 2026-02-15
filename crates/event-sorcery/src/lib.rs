@@ -82,6 +82,18 @@ mod schema_registry;
 mod testing;
 mod wire;
 
+use async_trait::async_trait;
+pub use cqrs_es::AggregateError;
+pub use cqrs_es::DomainEvent;
+use cqrs_es::EventStore;
+use cqrs_es::persist::PersistedEventStore;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use sqlite_es::{SqliteCqrs, SqliteEventRepository};
+use sqlx::SqlitePool;
+use std::fmt::{Debug, Display};
+use std::str::FromStr;
+
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, SqliteProjectionRepo, Table};
@@ -89,19 +101,6 @@ pub use schema_registry::{Reconciler, SchemaRegistry};
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{TestHarness, TestResult, TestStore, replay, test_store};
 pub use wire::{Cons, Nil, StoreBuilder, Unwired};
-
-use async_trait::async_trait;
-use cqrs_es::EventStore;
-use cqrs_es::persist::PersistedEventStore;
-
-pub use cqrs_es::AggregateError;
-pub use cqrs_es::DomainEvent;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use sqlite_es::{SqliteCqrs, SqliteEventRepository};
-use sqlx::SqlitePool;
-use std::fmt::{Debug, Display};
-use std::str::FromStr;
 
 /// The core abstraction for event-sourced domain entities.
 ///

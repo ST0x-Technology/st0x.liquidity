@@ -5,10 +5,9 @@
 //! for in-memory command dispatch with state inspection. All operate
 //! at the EventSourced level, hiding Lifecycle/Aggregate internals.
 
+use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 use std::fmt::Debug;
 use std::str::FromStr;
-
-use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 
 use crate::Reactor;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};

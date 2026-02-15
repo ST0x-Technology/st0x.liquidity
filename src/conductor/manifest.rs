@@ -16,7 +16,6 @@
 //! 5. Extract and return it in [`WiredQueries`]
 
 use alloy::primitives::Address;
-
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};

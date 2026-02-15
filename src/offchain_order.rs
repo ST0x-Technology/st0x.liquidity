@@ -4,18 +4,16 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
 use sqlx::SqlitePool;
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, Store, StoreBuilder, Table};
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Positive,
     SupportedExecutor, Symbol,
 };
-
-use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, Store, StoreBuilder, Table};
 
 /// Constructs the offchain order CQRS framework with its view
 /// query. Used by CLI code.

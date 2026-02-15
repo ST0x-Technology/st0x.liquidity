@@ -7,11 +7,10 @@ use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
+use st0x_event_sorcery::{Column, Projection, SendError, Store};
 use st0x_execution::{
     ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
-
-use st0x_event_sorcery::{Column, Projection, SendError, Store};
 
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, PriceCents};
 use crate::onchain::OnChainError;
