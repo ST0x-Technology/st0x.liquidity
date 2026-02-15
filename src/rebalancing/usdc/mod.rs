@@ -16,7 +16,7 @@ use alloy::primitives::ruint::FromUintError;
 
 use st0x_bridge::cctp::CctpError;
 use st0x_event_sorcery::SendError;
-use st0x_execution::AlpacaBrokerApiError;
+use st0x_execution::{AlpacaBrokerApiError, InvalidSharesError};
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::onchain::raindex::RaindexError;
@@ -47,6 +47,8 @@ pub(crate) enum UsdcRebalanceManagerError {
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
     #[error("U256 to u128 conversion error: {0}")]
     U256ToU128(#[from] FromUintError<u128>),
+    #[error("Invalid shares: {0}")]
+    InvalidShares(#[from] InvalidSharesError),
     #[error("Conversion order {order_id} filled but filled_quantity is missing")]
     MissingFilledQuantity { order_id: uuid::Uuid },
 }

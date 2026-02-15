@@ -4,20 +4,21 @@
 //! via its Services pattern (vault withdraw, token send, polling).
 
 use alloy::primitives::{Address, TxHash, U256};
+use alloy::providers::Provider;
 use async_trait::async_trait;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 use st0x_event_sorcery::Store;
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::service::RedemptionService;
 use super::{Redeem, RedemptionError};
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
+use crate::equity_redemption::{
+    DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
+};
+use crate::tokenization::{AlpacaTokenizationError, TokenizationRequestStatus};
 use crate::tokenized_equity_mint::TokenizationRequestId;
-
-use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::vault_registry::{VaultRegistry, VaultRegistryProjection};
 
 pub(crate) struct RedemptionManager<P>
 where
@@ -25,9 +26,6 @@ where
 {
     service: Arc<RedemptionService<P>>,
     cqrs: Arc<Store<EquityRedemption>>,
-    vault_registry_projection: Arc<VaultRegistryProjection>,
-    orderbook: Address,
-    owner: Address,
 }
 
 impl<P> RedemptionManager<P>
@@ -37,20 +35,15 @@ where
     pub(crate) fn new(
         service: Arc<RedemptionService<P>>,
         cqrs: Arc<Store<EquityRedemption>>,
-        vault_registry_projection: Arc<VaultRegistryProjection>,
-        orderbook: Address,
-        owner: Address,
     ) -> Self {
-        Self {
-            service,
-            cqrs,
-            vault_registry_projection,
-            orderbook,
-            owner,
-        }
+        Self { service, cqrs }
     }
 
     /// Executes the Redeem command and extracts the redemption tx hash.
+    ///
+    /// The aggregate atomically:
+    /// 1. Withdraws tokens from vault (emits VaultWithdrawn)
+    /// 2. Sends tokens to Alpaca (emits TokensSent or SendFailed)
     async fn execute_redeem(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -71,74 +64,100 @@ where
             )
             .await?;
 
-        let state = self
-            .cqrs
-            .load(aggregate_id)
-            .await?
-            .ok_or(RedemptionError::AggregateNotFound)?;
+        let entity =
+            self.cqrs
+                .load(aggregate_id)
+                .await?
+                .ok_or(RedemptionError::EntityNotFound {
+                    aggregate_id: aggregate_id.clone(),
+                })?;
 
-        match state {
+        match entity {
             EquityRedemption::TokensSent { redemption_tx, .. } => Ok(redemption_tx),
-            EquityRedemption::Failed { reason, .. } => Err(RedemptionError::SendFailed { reason }),
-            other => {
-                error!(?other, "Unexpected aggregate state after Redeem command");
-                Err(RedemptionError::UnexpectedState)
+            entity @ EquityRedemption::Failed { .. } => Err(RedemptionError::SendFailed { entity }),
+            entity => {
+                error!(?entity, "Unexpected entity after Redeem command");
+                Err(RedemptionError::UnexpectedEntity { entity })
             }
         }
     }
 
-    /// Executes Detect command (polls for detection internally).
-    async fn execute_detect(
+    /// Polls for redemption detection and records it.
+    async fn poll_detection(
         &self,
         aggregate_id: &RedemptionAggregateId,
+        tx_hash: &TxHash,
     ) -> Result<TokenizationRequestId, RedemptionError> {
+        let detected = match self.service.alpaca().poll_for_redemption(tx_hash).await {
+            Ok(req) => req,
+            Err(error) => {
+                warn!(%error, "Polling for redemption detection failed");
+                let failure = match &error {
+                    AlpacaTokenizationError::PollTimeout { .. } => DetectionFailure::Timeout,
+                    other => DetectionFailure::ApiError {
+                        status_code: other.status_code().map(|status| status.as_u16()),
+                    },
+                };
+                self.cqrs
+                    .send(
+                        aggregate_id,
+                        EquityRedemptionCommand::FailDetection { failure },
+                    )
+                    .await?;
+                return Err(error.into());
+            }
+        };
+
         self.cqrs
-            .send(aggregate_id, EquityRedemptionCommand::Detect)
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::Detect {
+                    tokenization_request_id: detected.id.clone(),
+                },
+            )
             .await?;
 
-        let state = self
-            .cqrs
-            .load(aggregate_id)
-            .await?
-            .ok_or(RedemptionError::AggregateNotFound)?;
-
-        match state {
-            EquityRedemption::Pending {
-                tokenization_request_id,
-                ..
-            } => Ok(tokenization_request_id),
-            EquityRedemption::Failed { reason, .. } => Err(RedemptionError::DetectionFailed),
-            other => {
-                error!(?other, "Unexpected aggregate state after Detect command");
-                Err(RedemptionError::UnexpectedState)
-            }
-        }
+        Ok(detected.id)
     }
 
-    /// Executes AwaitCompletion command (polls for completion internally).
-    async fn execute_await_completion(
+    /// Polls for completion and finalizes the redemption.
+    async fn poll_completion(
         &self,
         aggregate_id: &RedemptionAggregateId,
+        request_id: &TokenizationRequestId,
     ) -> Result<(), RedemptionError> {
-        self.cqrs
-            .send(aggregate_id, EquityRedemptionCommand::AwaitCompletion)
-            .await?;
+        let completed = match self
+            .service
+            .alpaca()
+            .poll_redemption_until_complete(request_id)
+            .await
+        {
+            Ok(req) => req,
+            Err(error) => {
+                warn!(%error, "Polling for completion failed");
+                self.cqrs
+                    .send(aggregate_id, EquityRedemptionCommand::RejectRedemption)
+                    .await?;
+                return Err(error.into());
+            }
+        };
 
-        let state = self
-            .cqrs
-            .load(aggregate_id)
-            .await?
-            .ok_or(RedemptionError::AggregateNotFound)?;
-
-        match state {
-            EquityRedemption::Completed { .. } => Ok(()),
-            EquityRedemption::Failed { .. } => Err(RedemptionError::Rejected),
-            other => {
-                error!(
-                    ?other,
-                    "Unexpected aggregate state after AwaitCompletion command"
-                );
-                Err(RedemptionError::UnexpectedState)
+        match completed.status {
+            TokenizationRequestStatus::Completed => {
+                self.cqrs
+                    .send(aggregate_id, EquityRedemptionCommand::Complete)
+                    .await?;
+                Ok(())
+            }
+            TokenizationRequestStatus::Rejected => {
+                self.cqrs
+                    .send(aggregate_id, EquityRedemptionCommand::RejectRedemption)
+                    .await?;
+                Err(RedemptionError::Rejected)
+            }
+            TokenizationRequestStatus::Pending => {
+                warn!("poll_redemption_until_complete returned Pending status");
+                Err(RedemptionError::UnexpectedPendingStatus)
             }
         }
     }
@@ -160,10 +179,10 @@ where
             .await?;
 
         info!(%redemption_tx, "Tokens sent, polling for detection");
-        let request_id = self.execute_detect(aggregate_id).await?;
+        let request_id = self.poll_detection(aggregate_id, &redemption_tx).await?;
 
         info!(%request_id, "Redemption detected, awaiting completion");
-        self.execute_await_completion(aggregate_id).await?;
+        self.poll_completion(aggregate_id, &request_id).await?;
 
         info!("Redemption workflow completed successfully");
         Ok(())

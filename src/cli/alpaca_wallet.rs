@@ -8,7 +8,7 @@ use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 
-use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor};
+use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor, Positive};
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
@@ -164,7 +164,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     );
 
     let usdc_asset = TokenSymbol::new("USDC");
-    let amount_decimal: Decimal = amount.into();
+    let positive_amount = Positive::new(amount)?;
 
     writeln!(stdout, "   Initiating withdrawal...")?;
     let transfer = alpaca_wallet
@@ -498,7 +498,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
-    use crate::rebalancing::trigger::UsdcRebalancingConfig;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -567,7 +567,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc: UsdcRebalancingConfig::Disabled,
+                usdc: UsdcRebalancing::Disabled,
                 alpaca_broker_auth: AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),

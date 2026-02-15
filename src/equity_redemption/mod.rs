@@ -41,6 +41,10 @@
 //! - Failed state preserves context depending on when failure occurred
 //! - All state transitions are captured as events for complete audit trail
 
+#[cfg(test)]
+pub(crate) mod mock;
+mod redeemer;
+
 use std::sync::Arc;
 
 use alloy::primitives::{Address, TxHash, U256};
@@ -88,12 +92,9 @@ impl FromStr for RedemptionAggregateId {
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum EquityRedemptionError {
-    /// Vault operation failed
-    #[error("Vault error: {0}")]
-    Vault(#[from] RaindexError),
-    /// Tokenizer operation failed
-    #[error("Tokenizer error: {0}")]
-    Tokenizer(#[from] TokenizerError),
+    /// Service operation failed
+    #[error(transparent)]
+    Redeem(#[from] RedeemError),
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
@@ -103,6 +104,9 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to reject before redemption was detected as pending
     #[error("Cannot reject: not in pending state")]
     NotPendingForRejection,
+    /// Attempted to transition before the aggregate was initialized
+    #[error("Not started")]
+    NotStarted,
     /// Attempted to send tokens when redemption is already in progress
     #[error("Already started")]
     AlreadyStarted,
@@ -128,12 +132,16 @@ pub(crate) enum EquityRedemptionCommand {
         token: Address,
         amount: U256,
     },
-    /// Polls Alpaca until they detect the token transfer.
-    /// Emits Detected on success, DetectionFailed on timeout/error.
-    Detect,
-    /// Polls Alpaca until the redemption reaches a terminal state.
-    /// Emits Completed or RedemptionRejected based on result.
-    AwaitCompletion,
+    /// Alpaca detected the token transfer.
+    Detect {
+        tokenization_request_id: TokenizationRequestId,
+    },
+    /// Detection polling failed or timed out.
+    FailDetection { failure: DetectionFailure },
+    /// Redemption completed successfully.
+    Complete,
+    /// Alpaca rejected the redemption.
+    RejectRedemption,
 }
 
 /// Reason for detection failure when polling Alpaca for redemption detection.
@@ -302,32 +310,150 @@ impl EventSourced for EquityRedemption {
 
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use EquityRedemptionEvent::*;
+
         Ok(match event {
             VaultWithdrawn { .. } => None,
 
-            SendFailed { reason, failed_at } => entity.try_apply_send_failed(reason, *failed_at),
+            TransferFailed { tx_hash, failed_at } => {
+                let Self::VaultWithdrawn {
+                    symbol,
+                    quantity,
+                    vault_withdraw_tx,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    vault_withdraw_tx: Some(*vault_withdraw_tx),
+                    redemption_tx: *tx_hash,
+                    tokenization_request_id: None,
+                    failed_at: *failed_at,
+                })
+            }
 
             TokensSent {
                 redemption_wallet,
                 redemption_tx,
                 sent_at,
-            } => entity.try_apply_tokens_sent(*redemption_wallet, *redemption_tx, *sent_at),
+            } => {
+                let Self::VaultWithdrawn {
+                    symbol,
+                    quantity,
+                    token,
+                    vault_withdraw_tx,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::TokensSent {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    token: *token,
+                    vault_withdraw_tx: *vault_withdraw_tx,
+                    redemption_wallet: *redemption_wallet,
+                    redemption_tx: *redemption_tx,
+                    sent_at: *sent_at,
+                })
+            }
 
             Detected {
                 tokenization_request_id,
                 detected_at,
-            } => entity.try_apply_detected(tokenization_request_id, *detected_at),
+            } => {
+                let Self::TokensSent {
+                    symbol,
+                    quantity,
+                    redemption_tx,
+                    sent_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
 
-            DetectionFailed { reason, failed_at } => {
-                entity.try_apply_detection_failed(reason, *failed_at)
+                Some(Self::Pending {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    redemption_tx: *redemption_tx,
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    sent_at: *sent_at,
+                    detected_at: *detected_at,
+                })
             }
 
-            Completed { completed_at } => entity.try_apply_completed(*completed_at),
+            DetectionFailed {
+                failure: _,
+                failed_at,
+            } => {
+                let Self::TokensSent {
+                    symbol,
+                    quantity,
+                    vault_withdraw_tx,
+                    redemption_tx,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
 
-            RedemptionRejected {
-                reason,
-                rejected_at,
-            } => entity.try_apply_redemption_rejected(reason, *rejected_at),
+                Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    vault_withdraw_tx: Some(*vault_withdraw_tx),
+                    redemption_tx: Some(*redemption_tx),
+                    tokenization_request_id: None,
+                    failed_at: *failed_at,
+                })
+            }
+
+            Completed { completed_at } => {
+                let Self::Pending {
+                    symbol,
+                    quantity,
+                    redemption_tx,
+                    tokenization_request_id,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Completed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    redemption_tx: *redemption_tx,
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    completed_at: *completed_at,
+                })
+            }
+
+            RedemptionRejected { rejected_at } => {
+                let Self::Pending {
+                    symbol,
+                    quantity,
+                    redemption_tx,
+                    tokenization_request_id,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    vault_withdraw_tx: None,
+                    redemption_tx: Some(*redemption_tx),
+                    tokenization_request_id: Some(tokenization_request_id.clone()),
+                    failed_at: *rejected_at,
+                })
+            }
         })
     }
 
@@ -370,15 +496,17 @@ impl EventSourced for EquityRedemption {
                         };
                         Ok(vec![
                             vault_withdrawn,
-                            SendFailed {
-                                reason: e.to_string(),
+                            TransferFailed {
+                                tx_hash,
                                 failed_at: now,
                             },
                         ])
                     }
                 }
             }
-            Detect { .. } | AwaitCompletion => Err(EquityRedemptionError::NotStarted),
+            Detect { .. } | FailDetection { .. } | Complete | RejectRedemption => {
+                Err(EquityRedemptionError::NotStarted)
+            }
         }
     }
 
@@ -409,9 +537,9 @@ impl EventSourced for EquityRedemption {
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
-            FailDetection { reason } => match self {
+            FailDetection { failure } => match self {
                 Self::TokensSent { .. } => Ok(vec![DetectionFailed {
-                    reason,
+                    failure,
                     failed_at: Utc::now(),
                 }]),
                 Self::VaultWithdrawn { .. } => Err(EquityRedemptionError::TokensNotSent),
@@ -431,164 +559,17 @@ impl EventSourced for EquityRedemption {
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             },
 
-            RejectRedemption { reason } => match self {
+            RejectRedemption => match self {
                 Self::VaultWithdrawn { .. } | Self::TokensSent { .. } => {
                     Err(EquityRedemptionError::NotPendingForRejection)
                 }
                 Self::Pending { .. } => Ok(vec![RedemptionRejected {
-                    reason,
                     rejected_at: Utc::now(),
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             },
         }
-    }
-}
-
-impl EquityRedemption {
-    fn try_apply_tokens_sent(
-        &self,
-        redemption_wallet: Address,
-        redemption_tx: TxHash,
-        sent_at: DateTime<Utc>,
-    ) -> Option<Self> {
-        let Self::VaultWithdrawn {
-            symbol,
-            quantity,
-            token,
-            vault_withdraw_tx,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::TokensSent {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            token: *token,
-            vault_withdraw_tx: *vault_withdraw_tx,
-            redemption_wallet,
-            redemption_tx,
-            sent_at,
-        })
-    }
-
-    fn try_apply_send_failed(
-        &self,
-        tx_hash: Option<TxHash>,
-        failed_at: DateTime<Utc>,
-    ) -> Option<Self> {
-        let Self::VaultWithdrawn {
-            symbol,
-            quantity,
-            vault_withdraw_tx,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            vault_withdraw_tx: Some(*vault_withdraw_tx),
-            redemption_tx: tx_hash,
-            tokenization_request_id: None,
-            failed_at,
-        })
-    }
-
-    fn try_apply_detected(
-        &self,
-        tokenization_request_id: &TokenizationRequestId,
-        detected_at: DateTime<Utc>,
-    ) -> Option<Self> {
-        let Self::TokensSent {
-            symbol,
-            quantity,
-            redemption_tx,
-            sent_at,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Pending {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            redemption_tx: *redemption_tx,
-            tokenization_request_id: tokenization_request_id.clone(),
-            sent_at: *sent_at,
-            detected_at,
-        })
-    }
-
-    fn try_apply_completed(&self, completed_at: DateTime<Utc>) -> Option<Self> {
-        let Self::Pending {
-            symbol,
-            quantity,
-            redemption_tx,
-            tokenization_request_id,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Completed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            redemption_tx: *redemption_tx,
-            tokenization_request_id: tokenization_request_id.clone(),
-            completed_at,
-        })
-    }
-
-    fn try_apply_detection_failed(&self, reason: &str, failed_at: DateTime<Utc>) -> Option<Self> {
-        let Self::TokensSent {
-            symbol,
-            quantity,
-            vault_withdraw_tx,
-            redemption_tx,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            vault_withdraw_tx: Some(*vault_withdraw_tx),
-            redemption_tx: Some(*redemption_tx),
-            tokenization_request_id: None,
-            failed_at,
-        })
-    }
-
-    fn try_apply_redemption_rejected(&self, rejected_at: DateTime<Utc>) -> Option<Self> {
-        let Self::Pending {
-            symbol,
-            quantity,
-            redemption_tx,
-            tokenization_request_id,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            vault_withdraw_tx: None,
-            redemption_tx: Some(*redemption_tx),
-            tokenization_request_id: Some(tokenization_request_id.clone()),
-            failed_at: rejected_at,
-        })
     }
 }
 

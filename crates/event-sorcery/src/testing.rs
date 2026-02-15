@@ -132,8 +132,8 @@ pub fn test_store<Entity: EventSourced>(
     services: Entity::Services,
 ) -> Store<Entity> {
     #[allow(clippy::disallowed_methods)]
-    let cqrs = sqlite_es::sqlite_cqrs(pool, vec![], services);
-    Store::new(cqrs)
+    let cqrs = sqlite_es::sqlite_cqrs(pool.clone(), vec![], services);
+    Store::new(cqrs, pool)
 }
 
 /// In-memory event store for unit tests.

@@ -14,29 +14,12 @@ use thiserror::Error;
 use st0x_event_sorcery::SendError;
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::onchain::raindex::RaindexError;
-use crate::tokenization::AlpacaTokenizationError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
-    #[error("Tokenizer error: {0}")]
-    Tokenizer(#[from] TokenizerError),
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<TokenizedEquityMint>>),
-    #[error("Vault deposit error: {0}")]
-    Raindex(#[from] RaindexError),
-    #[error("Vault not found for symbol {0}")]
-    VaultNotFound(Symbol),
-
-    #[error("Mint request was rejected by Alpaca")]
-    Rejected,
-    #[error("Missing tx_hash in completed Alpaca response")]
-    MissingTxHash,
-    #[error("U256 parse error: {0}")]
-    U256Parse(#[from] alloy::primitives::ruint::ParseError),
-    #[error("Decimal overflow when scaling {0} to 18 decimals")]
-    DecimalOverflow(FractionalShares),
 }
 
 impl From<SendError<TokenizedEquityMint>> for MintError {
@@ -123,11 +106,6 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(AggregateError::UserError(
-                TokenizedEquityMintError::AlreadyFailed
-            ))
-        ));
+        assert!(matches!(result, Err(MintError::Aggregate(_))));
     }
 }

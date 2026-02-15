@@ -242,7 +242,8 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
 pub struct Store<Entity: EventSourced> {
-    inner: SqliteCqrs<Lifecycle<Entity>>,
+    cqrs: SqliteCqrs<Lifecycle<Entity>>,
+    event_store: PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>,
 }
 
 impl<Entity: EventSourced> Store<Entity> {
@@ -251,8 +252,10 @@ impl<Entity: EventSourced> Store<Entity> {
     /// Prefer using `StoreBuilder::build()` which handles wiring
     /// and reconciliation. This constructor exists for cases
     /// where direct construction is needed (e.g., tests).
-    pub(crate) fn new(inner: SqliteCqrs<Lifecycle<Entity>>) -> Self {
-        Self { inner }
+    pub(crate) fn new(cqrs: SqliteCqrs<Lifecycle<Entity>>, pool: SqlitePool) -> Self {
+        let repo = SqliteEventRepository::new(pool);
+        let event_store = PersistedEventStore::new_event_store(repo);
+        Self { cqrs, event_store }
     }
 
     /// Send a command to the entity identified by `id`.
@@ -267,38 +270,36 @@ impl<Entity: EventSourced> Store<Entity> {
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        self.inner.execute(&id.to_string(), command).await
+        self.cqrs.execute(&id.to_string(), command).await
+    }
+
+    /// Load an entity's current state directly from the event store.
+    ///
+    /// Replays events to reconstruct aggregate state. No query
+    /// processors are dispatched.
+    ///
+    /// Returns:
+    /// - `Ok(Some(entity))` if the entity is live
+    /// - `Ok(None)` if the entity has not been initialized
+    /// - `Err` if the entity is in a failed lifecycle state or on infrastructure error
+    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, SendError<Entity>> {
+        let context = self.event_store.load_aggregate(&id.to_string()).await?;
+
+        Ok(context.aggregate.into_result()?)
     }
 }
 
-/// Error returned by [`Store::send`].
+/// Error returned by [`Store::send`] and [`Store::load`].
 ///
 /// Wraps the cqrs-es `AggregateError` containing a
 /// `LifecycleError` so that consumers don't import from cqrs-es
 /// or lifecycle directly.
 pub type SendError<Entity> = AggregateError<LifecycleError<Entity>>;
 
-/// Load an entity's current state directly from the event store.
-///
-/// Bypasses the CQRS framework -- no query processors are
-/// dispatched. Use this when you need to read aggregate state
-/// outside of a command flow (e.g., loading `VaultRegistry` to
-/// look up a token address).
-///
-/// Returns `Some(entity)` if live, `None` if uninitialized or
-/// failed.
-pub async fn load_aggregate<Entity: EventSourced>(
-    pool: SqlitePool,
-    id: &Entity::Id,
-) -> Result<Option<Entity>, AggregateError<LifecycleError<Entity>>> {
-    let repo = SqliteEventRepository::new(pool);
-    let store =
-        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_event_store(repo);
-
-    let aggregate_id = id.to_string();
-    let context = store.load_aggregate(&aggregate_id).await?;
-
-    Ok(context.aggregate.into_result().unwrap_or(None))
+impl<Entity: EventSourced> From<LifecycleError<Entity>> for SendError<Entity> {
+    fn from(error: LifecycleError<Entity>) -> Self {
+        AggregateError::UserError(error)
+    }
 }
 
 /// Bounds required for domain error types used with

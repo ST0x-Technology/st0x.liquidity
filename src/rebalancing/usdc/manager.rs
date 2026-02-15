@@ -15,7 +15,7 @@ use uuid::Uuid;
 use st0x_bridge::cctp::{AttestationResponse, CctpBridge};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
 use st0x_event_sorcery::Store;
-use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
+use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Positive};
 
 use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{

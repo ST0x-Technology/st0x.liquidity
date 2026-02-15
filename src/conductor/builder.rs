@@ -40,7 +40,7 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
-    pub(crate) vault_registry: Store<VaultRegistry>,
+    pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
     pub(crate) vault_registry_projection: Arc<Projection<VaultRegistry>>,
     pub(crate) snapshot: Store<InventorySnapshot>,
 }
@@ -170,11 +170,13 @@ where
                 let raindex_service = Arc::new(RaindexService::new(
                     self.common.provider.clone(),
                     self.common.ctx.evm.orderbook,
+                    self.common.frameworks.vault_registry_projection.clone(),
+                    order_owner,
                 ));
                 Some(spawn_inventory_poller(
-                    self.common.pool.clone(),
                     raindex_service,
                     self.common.executor.clone(),
+                    self.common.frameworks.vault_registry.clone(),
                     self.common.ctx.evm.orderbook,
                     order_owner,
                     self.common.frameworks.snapshot,

@@ -6,7 +6,6 @@ use st0x_event_sorcery::Projection;
 
 use crate::onchain::OnChainError;
 use crate::position::Position;
-use crate::threshold::ExecutionThreshold;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionCtx {

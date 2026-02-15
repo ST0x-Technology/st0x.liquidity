@@ -4,12 +4,10 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
-use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +17,7 @@ use url::Url;
 
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
-use st0x_event_sorcery::{AggregateError, LifecycleError, Reactor, load_aggregate};
+use st0x_event_sorcery::{AggregateError, LifecycleError, Reactor, Store};
 
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
@@ -59,7 +57,7 @@ pub enum RebalancingCtxError {
 /// USDC rebalancing configuration with explicit enable/disable.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
-pub(crate) enum UsdcRebalancingConfig {
+pub(crate) enum UsdcRebalancing {
     Enabled { target: Decimal, deviation: Decimal },
     Disabled,
 }
@@ -75,7 +73,7 @@ pub(crate) struct RebalancingSecrets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancingConfig,
+    pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
 }
@@ -85,7 +83,7 @@ pub(crate) struct RebalancingConfig {
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancingConfig,
+    pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
@@ -141,7 +139,7 @@ impl std::fmt::Debug for RebalancingCtx {
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancingConfig,
+    pub(crate) usdc: UsdcRebalancing,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -167,7 +165,7 @@ pub(crate) enum TriggeredOperation {
 /// Trigger that monitors inventory and sends rebalancing operations.
 pub(crate) struct RebalancingTrigger {
     config: RebalancingTriggerConfig,
-    pool: SqlitePool,
+    vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<RwLock<InventoryView>>,
@@ -179,7 +177,7 @@ pub(crate) struct RebalancingTrigger {
 impl RebalancingTrigger {
     pub(crate) fn new(
         config: RebalancingTriggerConfig,
-        pool: SqlitePool,
+        vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         order_owner: Address,
         inventory: Arc<RwLock<InventoryView>>,
@@ -187,7 +185,7 @@ impl RebalancingTrigger {
     ) -> Self {
         Self {
             config,
-            pool,
+            vault_registry,
             orderbook,
             order_owner,
             inventory,
@@ -321,7 +319,9 @@ impl RebalancingTrigger {
             owner: self.order_owner,
         };
 
-        let registry = load_aggregate::<VaultRegistry>(self.pool.clone(), &vault_registry_id)
+        let registry = self
+            .vault_registry
+            .load(&vault_registry_id)
             .await?
             .ok_or(TokenAddressError::Uninitialized)?;
 
@@ -330,7 +330,7 @@ impl RebalancingTrigger {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
-        let UsdcRebalancingConfig::Enabled { target, deviation } = self.config.usdc else {
+        let UsdcRebalancing::Enabled { target, deviation } = self.config.usdc else {
             return;
         };
 
@@ -410,13 +410,17 @@ impl RebalancingTrigger {
     fn is_terminal_mint_event(event: &TokenizedEquityMintEvent) -> bool {
         use TokenizedEquityMintEvent::*;
 
-        matches!(
-            event,
+        match event {
             MintCompleted { .. }
-                | MintRejected { .. }
-                | MintAcceptanceFailed { .. }
-                | VaultDepositFailed { .. }
-        )
+            | MintRejected { .. }
+            | MintAcceptanceFailed { .. }
+            | RaindexDepositFailed { .. } => true,
+
+            MintRequested { .. }
+            | MintAccepted { .. }
+            | TokensReceived { .. }
+            | VaultDeposited { .. } => false,
+        }
     }
 
     async fn apply_mint_event_to_inventory(
@@ -460,13 +464,14 @@ impl RebalancingTrigger {
     fn is_terminal_redemption_event(event: &EquityRedemptionEvent) -> bool {
         use EquityRedemptionEvent::*;
 
-        matches!(
-            event,
+        match event {
             Completed { .. }
-                | SendFailed { .. }
-                | DetectionFailed { .. }
-                | RedemptionRejected { .. }
-        )
+            | TransferFailed { .. }
+            | DetectionFailed { .. }
+            | RedemptionRejected { .. } => true,
+
+            VaultWithdrawn { .. } | TokensSent { .. } | Detected { .. } => false,
+        }
     }
 
     async fn apply_redemption_event_to_inventory(
@@ -564,7 +569,8 @@ mod tests {
     use tokio::sync::mpsc;
     use uuid::uuid;
 
-    use st0x_event_sorcery::TestStore;
+    use sqlx::SqlitePool;
+    use st0x_event_sorcery::{TestStore, test_store};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -581,7 +587,7 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: UsdcRebalancingConfig::Enabled {
+            usdc: UsdcRebalancing::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
@@ -596,7 +602,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                pool,
+                Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -722,7 +728,7 @@ mod tests {
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let store = st0x_event_sorcery::test_store::<VaultRegistry>(pool.clone(), ());
+        let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -754,7 +760,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                pool,
+                Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -777,7 +783,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                pool,
+                Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -801,10 +807,11 @@ mod tests {
 
     #[tokio::test]
     async fn load_token_address_returns_address_for_known_symbol() {
-        let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        seed_vault_registry(&trigger.pool, &symbol).await;
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
         let result = trigger.load_token_address(&symbol).await.unwrap();
         assert_eq!(result, Some(TEST_TOKEN));
@@ -812,11 +819,12 @@ mod tests {
 
     #[tokio::test]
     async fn load_token_address_returns_none_for_unknown_symbol() {
-        let (trigger, _receiver) = make_trigger().await;
         let known = Symbol::new("AAPL").unwrap();
         let unknown = Symbol::new("MSFT").unwrap();
+        let inventory = InventoryView::default().with_equity(known.clone());
 
-        seed_vault_registry(&trigger.pool, &known).await;
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &known).await;
 
         let result = trigger.load_token_address(&unknown).await.unwrap();
         assert_eq!(result, None);
@@ -843,7 +851,7 @@ mod tests {
 
         let trigger = RebalancingTrigger::new(
             test_config(),
-            pool,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
@@ -1624,7 +1632,7 @@ mod tests {
         assert_eq!(config.equity_threshold.target, dec!(0.5));
         assert_eq!(config.equity_threshold.deviation, dec!(0.2));
 
-        let UsdcRebalancingConfig::Enabled { target, deviation } = config.usdc else {
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
             panic!("expected enabled");
         };
         assert_eq!(target, dec!(0.5));
@@ -1703,7 +1711,7 @@ mod tests {
         assert_eq!(ctx.equity_threshold.target, dec!(0.6));
         assert_eq!(ctx.equity_threshold.deviation, dec!(0.1));
 
-        let UsdcRebalancingConfig::Enabled { target, deviation } = ctx.usdc else {
+        let UsdcRebalancing::Enabled { target, deviation } = ctx.usdc else {
             panic!("expected enabled");
         };
         assert_eq!(target, dec!(0.4));
@@ -1778,7 +1786,7 @@ mod tests {
 
         let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
 
-        assert!(matches!(config.usdc, UsdcRebalancingConfig::Disabled));
+        assert!(matches!(config.usdc, UsdcRebalancing::Disabled));
     }
 
     /// Spy reactor that records all dispatched events for verification.
@@ -2127,7 +2135,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
-            pool,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             Address::ZERO,
             Address::ZERO,
             inventory,
@@ -2298,7 +2306,7 @@ mod tests {
     /// When inventory polling starts:
     /// 1. Onchain equity is polled first
     /// 2. Trigger fires with onchain=X, offchain=0 (not yet polled)
-    /// 3. Ratio = X/(X+0) = 100% → detects "TooMuchOnchain" → Redemption
+    /// 3. Ratio = X/(X+0) = 100% -> detects "TooMuchOnchain" -> Redemption
     ///
     /// This is WRONG because offchain hasn't been polled yet, not because
     /// there's actually no offchain inventory.
@@ -2320,7 +2328,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
@@ -2358,7 +2366,7 @@ mod tests {
         // CURRENT BUG: A Redemption is incorrectly triggered because:
         // - Onchain: 100 shares
         // - Offchain: 0 shares (not polled yet, treated as "no holdings")
-        // - Ratio: 100% onchain → "TooMuchOnchain" → Redemption
+        // - Ratio: 100% onchain -> "TooMuchOnchain" -> Redemption
         let triggered = receiver.try_recv();
 
         assert!(
@@ -2380,7 +2388,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
@@ -2465,7 +2473,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
@@ -2524,7 +2532,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),

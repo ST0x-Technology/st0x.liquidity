@@ -27,6 +27,8 @@ pub(crate) mod accumulator;
 pub(crate) mod backfill;
 mod clear;
 pub(crate) mod io;
+#[cfg(test)]
+pub(crate) mod mock;
 pub(crate) mod pyth;
 pub(crate) mod raindex;
 mod take_order;

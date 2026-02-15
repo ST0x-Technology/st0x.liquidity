@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{trace, warn};
+use tracing::warn;
 
 use st0x_event_sorcery::Reactor;
 
@@ -92,14 +92,16 @@ mod tests {
     use std::collections::BTreeMap;
     use tokio::sync::mpsc;
 
+    use st0x_event_sorcery::{Store, test_store};
     use st0x_execution::{FractionalShares, Symbol};
 
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::{Imbalance, ImbalanceThreshold};
-    use crate::rebalancing::trigger::UsdcRebalancingConfig;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
     use crate::threshold::Usdc;
+    use crate::vault_registry::VaultRegistry;
 
     fn test_symbol() -> Symbol {
         Symbol::new("AAPL").unwrap()
@@ -122,18 +124,20 @@ mod tests {
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(16);
 
+        let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc: UsdcRebalancingConfig::Enabled {
+                usdc: UsdcRebalancing::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
             },
-            pool.clone(),
+            vault_registry,
             Address::ZERO,
             Address::ZERO,
             inventory,
@@ -453,7 +457,12 @@ mod tests {
     async fn onchain_cash_snapshot_triggers_usdc_check(pool: SqlitePool) {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory), Some(trigger));
+
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
         // First apply offchain to initialize that venue (with 0 balance)
         let offchain_event = InventorySnapshotEvent::OffchainCash {
@@ -461,9 +470,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(offchain_event)])
-            .await;
+        query.react(&id, &offchain_event).await;
 
         // No trigger yet - only one venue has data
         assert!(receiver.try_recv().is_err());
@@ -474,9 +481,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(onchain_event)])
-            .await;
+        query.react(&id, &onchain_event).await;
 
         let operation = receiver
             .try_recv()
@@ -492,7 +497,12 @@ mod tests {
     async fn offchain_cash_snapshot_triggers_usdc_check(pool: SqlitePool) {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory), Some(trigger));
+
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
         // First apply onchain to initialize that venue (with 0 balance)
         let onchain_event = InventorySnapshotEvent::OnchainCash {
@@ -500,9 +510,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(onchain_event)])
-            .await;
+        query.react(&id, &onchain_event).await;
 
         // No trigger yet - only one venue has data
         assert!(receiver.try_recv().is_err());
@@ -513,9 +521,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(offchain_event)])
-            .await;
+        query.react(&id, &offchain_event).await;
 
         let operation = receiver
             .try_recv()
@@ -531,21 +537,26 @@ mod tests {
     async fn snapshot_without_trigger_still_updates_inventory(pool: SqlitePool) {
         let _ = pool;
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory), None);
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory), None);
+
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
         // Apply both onchain and offchain snapshots for complete picture
-        let events = vec![
-            create_event_envelope(InventorySnapshotEvent::OnchainCash {
-                usdc_balance: Usdc(Decimal::from(100_000)),
-                fetched_at: Utc::now(),
-            }),
-            create_event_envelope(InventorySnapshotEvent::OffchainCash {
-                cash_balance_cents: 0,
-                fetched_at: Utc::now(),
-            }),
-        ];
+        let onchain_event = InventorySnapshotEvent::OnchainCash {
+            usdc_balance: Usdc(Decimal::from(100_000)),
+            fetched_at: Utc::now(),
+        };
 
-        query.dispatch("test-id", &events).await;
+        let offchain_event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 0,
+            fetched_at: Utc::now(),
+        };
+
+        query.react(&id, &onchain_event).await;
+        query.react(&id, &offchain_event).await;
 
         let imbalance = inventory
             .read()
@@ -565,7 +576,12 @@ mod tests {
     #[tokio::test]
     async fn dispatch_logs_warning_when_snapshot_event_application_fails() {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory), None);
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory), None);
+
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
         // OnchainEquity with a symbol not registered in the view triggers
         // update_equity -> auto-registers, so that path succeeds. But
@@ -586,9 +602,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(event)])
-            .await;
+        query.react(&id, &event).await;
 
         assert!(
             !logs_contain("Failed to apply inventory snapshot event"),
@@ -603,7 +617,12 @@ mod tests {
             InventoryView::default().with_equity(aapl.clone()),
         ));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory), Some(trigger));
+
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
         // First apply offchain to initialize that venue (with 0 balance)
         let mut offchain_positions = BTreeMap::new();
@@ -614,9 +633,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(offchain_event)])
-            .await;
+        query.react(&id, &offchain_event).await;
 
         // Now apply onchain snapshot with 100 shares
         let mut balances = BTreeMap::new();
@@ -627,9 +644,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(onchain_event)])
-            .await;
+        query.react(&id, &onchain_event).await;
 
         // Equity trigger needs VaultRegistry to resolve token address.
         // With Address::ZERO orderbook/owner and no registry events,
@@ -661,7 +676,12 @@ mod tests {
             InventoryView::default().with_equity(aapl.clone()),
         ));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory), Some(trigger));
+
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
         // First apply onchain to initialize that venue (with 0 balance)
         let mut onchain_balances = BTreeMap::new();
@@ -672,9 +692,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(onchain_event)])
-            .await;
+        query.react(&id, &onchain_event).await;
 
         // Now apply offchain snapshot with 200 shares
         let mut positions = BTreeMap::new();
@@ -685,9 +703,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(offchain_event)])
-            .await;
+        query.react(&id, &offchain_event).await;
 
         let imbalance = inventory
             .read()
@@ -713,7 +729,12 @@ mod tests {
     async fn trigger_receives_correct_usdc_amount(pool: SqlitePool) {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
-        let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
+        let query = InventorySnapshotReactor::new(Arc::clone(&inventory), Some(trigger));
+
+        let id = InventorySnapshotId {
+            orderbook: Address::ZERO,
+            owner: Address::ZERO,
+        };
 
         // First apply offchain to initialize that venue (with 0 balance)
         let offchain_event = InventorySnapshotEvent::OffchainCash {
@@ -721,9 +742,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(offchain_event)])
-            .await;
+        query.react(&id, &offchain_event).await;
 
         // No trigger yet - only one venue has data
         assert!(receiver.try_recv().is_err());
@@ -734,9 +753,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch("test-id", &[create_event_envelope(onchain_event)])
-            .await;
+        query.react(&id, &onchain_event).await;
 
         // 200k onchain, 0 offchain. Target 50/50 -> excess = 100k onchain
         let operation = receiver

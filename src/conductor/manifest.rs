@@ -24,13 +24,13 @@ use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Cons, Nil, Projection, ProjectionError, Store, StoreBuilder, Unwired};
 
 use crate::dashboard::EventBroadcaster;
-use crate::equity_redemption::EquityRedemption;
+use crate::equity_redemption::{EquityRedemption, RedemptionServices};
 use crate::inventory::InventoryView;
 use crate::position::Position;
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
-use crate::tokenized_equity_mint::MintServices;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::tokenized_equity_mint::{MintServices, TokenizedEquityMint};
 use crate::usdc_rebalance::UsdcRebalance;
+use crate::vault_registry::VaultRegistry;
 
 type RebalancingTriggerDeps =
     Cons<Position, Cons<TokenizedEquityMint, Cons<EquityRedemption, Cons<UsdcRebalance, Nil>>>>;
@@ -66,6 +66,7 @@ impl QueryManifest {
     pub(super) fn new(
         config: RebalancingTriggerConfig,
         pool: SqlitePool,
+        vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         market_maker_wallet: Address,
         inventory: Arc<RwLock<InventoryView>>,
@@ -74,7 +75,7 @@ impl QueryManifest {
     ) -> Result<Self, ProjectionError<Position>> {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,
-            pool.clone(),
+            vault_registry,
             orderbook,
             market_maker_wallet,
             inventory,
@@ -100,6 +101,8 @@ impl QueryManifest {
     pub(super) async fn wire(
         self,
         pool: SqlitePool,
+        mint_services: MintServices,
+        redeemer: RedemptionServices,
     ) -> anyhow::Result<(BuiltFrameworks, WiredQueries)> {
         let Self {
             rebalancing_trigger,
@@ -117,14 +120,14 @@ impl QueryManifest {
             StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
-                .build(())
+                .build(mint_services)
                 .await?;
 
         let (redemption, (event_broadcaster, (rebalancing_trigger, ()))) =
             StoreBuilder::<EquityRedemption>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
-                .build(())
+                .build(redeemer)
                 .await?;
 
         let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) =
@@ -156,16 +159,20 @@ mod tests {
     use tokio::sync::{RwLock, broadcast, mpsc};
 
     use super::*;
+    use crate::equity_redemption::mock::mock_redeemer_services;
     use crate::inventory::{ImbalanceThreshold, InventoryView};
+    use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::test_utils::setup_test_db;
+    use crate::tokenization::mock::MockTokenizer;
 
     fn test_trigger_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancing::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
@@ -178,9 +185,12 @@ mod tests {
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
+        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+
         let manifest = QueryManifest::new(
             test_trigger_config(),
             pool.clone(),
+            vault_registry,
             Address::ZERO,
             Address::ZERO,
             Arc::new(RwLock::new(InventoryView::default())),
@@ -189,7 +199,13 @@ mod tests {
         )
         .unwrap();
 
-        let (_frameworks, queries) = manifest.wire(pool).await.unwrap();
+        let mint_services = MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            raindex: Arc::new(MockRaindex::new()),
+        };
+        let redeemer = mock_redeemer_services();
+
+        let (_frameworks, queries) = manifest.wire(pool, mint_services, redeemer).await.unwrap();
 
         // Verify stores are usable by checking that loading a
         // nonexistent position returns None

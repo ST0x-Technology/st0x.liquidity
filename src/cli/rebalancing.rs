@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_event_sorcery::StoreBuilder;
+use st0x_event_sorcery::{Projection, StoreBuilder};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
     TimeInForce,
@@ -19,21 +19,21 @@ use super::TransferDirection;
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
-use crate::equity_redemption::{EquityRedemption, Redeemer, RedemptionAggregateId};
+use crate::equity_redemption::{Redeemer, RedemptionAggregateId};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
+use crate::rebalancing::redemption::service::RedemptionService;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
-use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
+use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::threshold::Usdc;
-use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
 use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
 use crate::usdc_rebalance::UsdcRebalanceId;
-use crate::vault_registry::VaultRegistryProjection;
+use crate::vault_registry::VaultRegistry;
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
@@ -74,26 +74,35 @@ pub(super) async fn transfer_equity_command<W: Write>(
         rebalancing_config.redemption_wallet,
     ));
 
-    let ctx = TransferContext {
-        config,
-        pool,
-        rebalancing_config,
-        base_provider,
-        tokenization_service,
-    };
-
     match direction {
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
 
-            let mint_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
-            let mint_manager = MintManager::new(tokenization_service, mint_store);
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+            let wallet = signer.address();
+
+            let vault_registry_projection =
+                Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+            let raindex = Arc::new(RaindexService::new(
+                base_provider,
+                ctx.evm.orderbook,
+                vault_registry_projection.clone(),
+                wallet,
+            ));
+
+            let mint_store = Arc::new(
+                StoreBuilder::new(pool.clone())
+                    .build(MintServices {
+                        tokenizer: tokenization_service.clone(),
+                        raindex: raindex.clone(),
+                    })
+                    .await?,
+            );
+
+            let mint_manager = MintManager::new(mint_store);
 
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
-
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let wallet = signer.address();
 
             writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
@@ -115,31 +124,25 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
             let owner = signer.address();
-            let vault = Arc::new(RaindexService::new(base_provider, config.evm.orderbook));
-
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
-
-            let redemption_service: Arc<dyn Redeemer> = Arc::new(RedemptionService::new(
-                vault,
-                tokenization_service,
-                vault_registry_projection.clone(),
-                config.evm.orderbook,
+            let raindex = Arc::new(RaindexService::new(
+                base_provider,
+                ctx.evm.orderbook,
+                vault_registry_projection,
                 owner,
             ));
 
+            let redemption_service =
+                Arc::new(RedemptionService::new(raindex, tokenization_service));
+
             let redemption_store = Arc::new(
                 StoreBuilder::new(pool.clone())
-                    .build(redemption_service)
+                    .build(redemption_service.clone() as Arc<dyn Redeemer>)
                     .await?,
             );
 
-            let redemption_manager = RedemptionManager::new(
-                redemption_store,
-                vault_registry_projection,
-                config.evm.orderbook,
-                owner,
-            );
+            let redemption_manager = RedemptionManager::new(redemption_service, redemption_store);
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
@@ -231,9 +234,12 @@ where
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
     })?);
+    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
     let vault_service = Arc::new(RaindexService::new(
         base_provider_with_wallet,
         ctx.evm.orderbook,
+        vault_registry_projection,
+        owner,
     ));
     let usdc_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
 

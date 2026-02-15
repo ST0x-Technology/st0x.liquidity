@@ -536,7 +536,7 @@ impl InventoryView {
             // wallet awaiting retry or manual recovery.
             TokenizedEquityMintEvent::MintRequested { .. }
             | TokenizedEquityMintEvent::MintRejected { .. }
-            | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+            | TokenizedEquityMintEvent::VaultDeposited { .. }
             | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => Ok(Self {
                 last_updated: now,
                 ..self
@@ -559,7 +559,7 @@ impl InventoryView {
                 now,
             ),
 
-            TokenizedEquityMintEvent::Completed { completed_at, .. } => self.update_equity(
+            TokenizedEquityMintEvent::MintCompleted { completed_at, .. } => self.update_equity(
                 symbol,
                 |inventory| Ok(inventory.with_last_rebalancing(*completed_at)),
                 now,

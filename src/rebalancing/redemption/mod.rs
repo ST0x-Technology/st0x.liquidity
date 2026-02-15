@@ -6,6 +6,7 @@
 pub(crate) mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
+pub(crate) mod service;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
@@ -21,12 +22,22 @@ use crate::tokenization::AlpacaTokenizationError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] SendError<EquityRedemption>),
-    #[error("Vault operation error: {0}")]
+    #[error(transparent)]
+    Send(#[from] SendError<EquityRedemption>),
+    #[error(transparent)]
     Raindex(#[from] RaindexError),
+    #[error(transparent)]
+    Alpaca(#[from] AlpacaTokenizationError),
     #[error("Token {token} not found in vault registry")]
     VaultNotFound { token: Address },
+    #[error("Entity not found after command: {aggregate_id}")]
+    EntityNotFound { aggregate_id: RedemptionAggregateId },
+    #[error("Token send to Alpaca failed: {entity:?}")]
+    SendFailed { entity: EquityRedemption },
+    #[error("Unexpected entity: {entity:?}")]
+    UnexpectedEntity { entity: EquityRedemption },
+    #[error("Unexpected tokenization status: still pending after polling")]
+    UnexpectedPendingStatus,
     #[error("Redemption was rejected by Alpaca")]
     Rejected,
 }

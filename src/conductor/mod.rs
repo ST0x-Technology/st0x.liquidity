@@ -6,7 +6,6 @@
 mod builder;
 mod manifest;
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
@@ -21,18 +20,19 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
-use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecutor};
+use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
 use st0x_event_sorcery::{Cons, Nil, Projection, SendError, Store, StoreBuilder, Unwired};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
-use crate::equity_redemption::{EquityRedemption, Redeemer};
+use crate::equity_redemption::{EquityRedemption, RedemptionServices};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
 };
@@ -52,13 +52,16 @@ use crate::position::{Position, PositionCommand, TradeId};
 use crate::queue::{
     EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
 };
-use crate::rebalancing::redemption::RedemptionService;
+use crate::rebalancing::redemption::service::RedemptionService;
 use crate::rebalancing::{
-    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig, RedemptionDependencies,
-    build_rebalancing_queries, spawn_rebalancer,
+    RebalancerAddresses, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig,
+    RedemptionDependencies, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
+use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
+use crate::tokenization::alpaca::AlpacaTokenizationService;
+use crate::tokenized_equity_mint::MintServices;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 
 use self::manifest::QueryManifest;
@@ -122,100 +125,13 @@ where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    let (mut conductor, shared) = start_infrastructure(
-        &ctx,
-        &pool,
-        executor.clone(),
-        executor_maintenance,
-        event_sender,
-    )
-    .await?;
-
-    loop {
-        if try_start_trading(&mut conductor, &ctx, &pool, &executor, &shared).await {
-            break;
-        }
-    }
+    let mut conductor =
+        Conductor::start(&ctx, &pool, executor, executor_maintenance, event_sender).await?;
 
     info!("Conductor running");
     let result = conductor.wait_for_completion().await;
     conductor.abort_all();
     result
-}
-
-async fn try_start_trading<E>(
-    conductor: &mut Conductor,
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    executor: &E,
-    shared: &SharedState,
-) -> bool
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    const RETRY_DELAY_SECS: u64 = 10;
-
-    match start_trading_tasks(ctx, pool, executor.clone(), shared).await {
-        Ok(tasks) => {
-            conductor.trading_tasks = Some(tasks);
-            true
-        }
-        Err(e) => {
-            error!("Failed to start trading tasks: {e}, retrying in {RETRY_DELAY_SECS} seconds");
-            tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
-            conductor.executor_maintenance = executor.run_executor_maintenance().await;
-            false
-        }
-    }
-}
-
-async fn start_conductor<E>(
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    executor_maintenance: Option<JoinHandle<()>>,
-    event_sender: &broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<Conductor>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    let conductor = Conductor::start(
-        ctx,
-        pool,
-        executor.clone(),
-        executor_maintenance,
-        event_sender.clone(),
-    )
-    .await?;
-
-    info!("Market opened, conductor running");
-    Ok(conductor)
-}
-
-async fn retry_after_failure<E>(
-    executor: E,
-    ctx: Ctx,
-    pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
-    error: anyhow::Error,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    error!("Failed to start conductor: {error}, retrying in {RERUN_DELAY_SECS} seconds");
-    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-
-    let new_maintenance = executor.run_executor_maintenance().await;
-    Box::pin(run_market_hours_loop(
-        executor,
-        ctx,
-        pool,
-        new_maintenance,
-        event_sender,
-    ))
-    .await
 }
 
 async fn run_until_market_close<E>(
@@ -321,6 +237,16 @@ impl Conductor {
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
+        let vault_registry_projection =
+            Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+
+        let vault_registry = Arc::new(
+            StoreBuilder::<VaultRegistry>::new(pool.clone())
+                .with((*vault_registry_projection).clone())
+                .build(())
+                .await?,
+        );
+
         let (position, position_projection, rebalancer) =
             if let Some(rebalancing_ctx) = ctx.rebalancing_ctx() {
                 let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
@@ -335,6 +261,7 @@ impl Conductor {
                         event_sender,
                         &provider,
                         market_maker_wallet,
+                        vault_registry.clone(),
                     )
                     .await?;
 
@@ -355,10 +282,6 @@ impl Conductor {
                 .await?,
         );
 
-        let vault_registry = StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
-            .await?;
-
         let snapshot = build_inventory_snapshot_store(pool, inventory.clone()).await?;
 
         let frameworks = CqrsFrameworks {
@@ -368,6 +291,7 @@ impl Conductor {
             offchain_order,
             offchain_order_projection,
             vault_registry,
+            vault_registry_projection,
             snapshot,
         };
 
@@ -447,6 +371,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
     market_maker_wallet: Address,
+    vault_registry: Arc<Store<VaultRegistry>>,
 ) -> anyhow::Result<(
     Arc<Store<Position>>,
     Arc<Projection<Position>>,
@@ -457,12 +382,41 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
+    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+
+    let raindex_service = Arc::new(RaindexService::new(
+        provider.clone(),
+        ctx.evm.orderbook,
+        vault_registry_projection,
+        market_maker_wallet,
+    ));
+
+    let tokenization = Arc::new(AlpacaTokenizationService::new(
+        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
+        rebalancing_ctx.alpaca_account_id,
+        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
+        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        provider.clone(),
+        rebalancing_ctx.redemption_wallet,
+    ));
+
+    let redeemer: RedemptionServices = Arc::new(RedemptionService::new(
+        raindex_service.clone(),
+        tokenization.clone(),
+    ));
+
+    let mint_services = MintServices {
+        tokenizer: tokenization,
+        raindex: raindex_service.clone(),
+    };
+
     let manifest = QueryManifest::new(
         RebalancingTriggerConfig {
             equity: rebalancing_ctx.equity_threshold,
             usdc: rebalancing_ctx.usdc.clone(),
         },
         pool.clone(),
+        vault_registry,
         ctx.evm.orderbook,
         market_maker_wallet,
         inventory.clone(),
@@ -470,46 +424,27 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         event_sender,
     )?;
 
-    let (built, wired) = manifest.wire(pool.clone()).await?;
+    let (built, wired) = manifest.wire(pool.clone(), mint_services, redeemer).await?;
 
     let frameworks = RebalancingCqrsFrameworks {
         mint: Arc::new(built.mint),
         usdc: Arc::new(built.usdc),
     };
 
-    // Create services needed for redemption CQRS
-    let broker_auth = &rebalancing_ctx.alpaca_broker_auth;
-    let vault_service = Arc::new(RaindexService::new(provider.clone(), ctx.evm.orderbook));
-    let tokenization_service = Arc::new(AlpacaTokenizationService::new(
-        broker_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_account_id,
-        broker_auth.api_key.clone(),
-        broker_auth.api_secret.clone(),
-        provider.clone(),
-        rebalancing_ctx.redemption_wallet,
-    ));
-
-    let redemption_service = Arc::new(RedemptionService::new(
-        vault_service.clone(),
-        tokenization_service.clone(),
-        vault_registry_query.clone(),
-        ctx.evm.orderbook,
-        market_maker_wallet,
-    ));
-
     let redemption_deps = RedemptionDependencies {
-        vault_service,
-        tokenization_service,
-        vault_registry_query,
-        service: redemption_service,
+        raindex_service: raindex_service.clone(),
         cqrs: Arc::new(built.redemption),
+        projection: Arc::new(Projection::<EquityRedemption>::sqlite(pool.clone())?),
+    };
+
+    let addresses = RebalancerAddresses {
+        market_maker_wallet,
     };
 
     let handle = spawn_rebalancer(
         rebalancing_ctx,
         provider.clone(),
-        ctx.evm.orderbook,
-        market_maker_wallet,
+        addresses,
         operation_receiver,
         frameworks,
         redemption_deps,
@@ -595,7 +530,7 @@ async fn build_inventory_snapshot_store(
     pool: &SqlitePool,
     inventory: Arc<RwLock<InventoryView>>,
 ) -> anyhow::Result<Store<InventorySnapshot>> {
-    let snapshot_reactor = InventorySnapshotReactor::new(inventory);
+    let snapshot_reactor = InventorySnapshotReactor::new(inventory, None);
 
     let query: Unwired<InventorySnapshotReactor, Cons<InventorySnapshot, Nil>> =
         Unwired::new(snapshot_reactor);
@@ -679,7 +614,7 @@ fn spawn_queue_processor<P, E>(
     cache: &SymbolCache,
     provider: P,
     cqrs: TradeProcessingCqrs,
-    vault_registry: Store<VaultRegistry>,
+    vault_registry: Arc<Store<VaultRegistry>>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -743,9 +678,9 @@ where
 }
 
 fn spawn_inventory_poller<P, E>(
-    pool: SqlitePool,
     raindex_service: Arc<RaindexService<P>>,
     executor: E,
+    vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
     snapshot: Store<InventorySnapshot>,
@@ -759,7 +694,7 @@ where
     let service = InventoryPollingService::new(
         raindex_service,
         executor,
-        pool,
+        vault_registry,
         orderbook,
         order_owner,
         snapshot,
@@ -920,17 +855,15 @@ async fn run_queue_processor<P, E>(
 
     log_unprocessed_count(pool).await;
 
-    let executor_type = executor.to_supported_executor();
-
     let queue_context = QueueProcessingCtx {
         cache,
         feed_id_cache: &feed_id_cache,
         vault_registry,
+        executor,
     };
 
     loop {
-        let delay =
-            process_queue_step(executor_type, ctx, pool, &provider, cqrs, &queue_context).await;
+        let delay = process_queue_step(ctx, pool, &provider, cqrs, &queue_context).await;
         sleep(delay).await;
     }
 }
@@ -945,15 +878,14 @@ async fn log_unprocessed_count(pool: &SqlitePool) {
     }
 }
 
-async fn process_queue_step<P: Provider + Clone>(
-    executor_type: SupportedExecutor,
+async fn process_queue_step<P: Provider + Clone, E: Executor>(
     ctx: &Ctx,
     pool: &SqlitePool,
     provider: &P,
     cqrs: &TradeProcessingCqrs,
-    queue_context: &QueueProcessingCtx<'_>,
+    queue_context: &QueueProcessingCtx<'_, E>,
 ) -> Duration {
-    match process_next_queued_event(executor_type, ctx, pool, provider, cqrs, queue_context).await {
+    match process_next_queued_event(ctx, pool, provider, cqrs, queue_context).await {
         Ok(Some(offchain_order_id)) => {
             info!(%offchain_order_id, "Offchain order placed successfully");
             std::time::Duration::ZERO
@@ -967,20 +899,20 @@ async fn process_queue_step<P: Provider + Clone>(
 }
 
 /// Context for queue event processing containing caches and CQRS components.
-struct QueueProcessingCtx<'a> {
+struct QueueProcessingCtx<'a, E> {
     cache: &'a SymbolCache,
     feed_id_cache: &'a FeedIdCache,
     vault_registry: &'a Store<VaultRegistry>,
+    executor: &'a E,
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn process_next_queued_event<P: Provider + Clone>(
-    executor_type: SupportedExecutor,
+async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
     ctx: &Ctx,
     pool: &SqlitePool,
     provider: &P,
     cqrs: &TradeProcessingCqrs,
-    queue_context: &QueueProcessingCtx<'_>,
+    queue_context: &QueueProcessingCtx<'_, E>,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
@@ -1021,7 +953,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     };
 
     process_valid_trade(
-        executor_type,
+        queue_context.executor,
         pool,
         &queued_event,
         event_id,
@@ -1144,12 +1076,12 @@ async fn convert_event_to_trade<P: Provider + Clone>(
 }
 
 #[tracing::instrument(
-    skip(pool, queued_event, trade, cqrs, vault_discovery_ctx),
+    skip(executor, pool, queued_event, trade, cqrs, vault_discovery_ctx),
     fields(event_id, symbol = %trade.symbol),
     level = tracing::Level::INFO
 )]
-async fn process_valid_trade(
-    executor_type: SupportedExecutor,
+async fn process_valid_trade<E: Executor>(
+    executor: &E,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
@@ -1181,7 +1113,7 @@ async fn process_valid_trade(
         trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
     );
 
-    process_queued_trade(executor_type, pool, queued_event, event_id, trade, cqrs).await
+    process_queued_trade(executor, pool, queued_event, event_id, trade, cqrs).await
 }
 
 async fn execute_witness_trade(
@@ -1269,8 +1201,8 @@ async fn execute_acknowledge_fill(
     }
 }
 
-async fn process_queued_trade(
-    executor_type: SupportedExecutor,
+async fn process_queued_trade<E: Executor>(
+    executor: &E,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
@@ -1296,17 +1228,23 @@ async fn process_queued_trade(
 
     let base_symbol = trade.symbol.base();
 
-    let Some(execution) =
-        check_execution_readiness(&cqrs.position_projection, base_symbol, executor_type).await?
+    let executor_type = executor.to_supported_executor();
+
+    let Some(execution) = check_execution_readiness(
+        executor,
+        &cqrs.position_projection,
+        base_symbol,
+        executor_type,
+    )
+    .await?
     else {
         return Ok(None);
     };
 
-    place_offchain_order(pool, &execution, cqrs).await
+    place_offchain_order(&execution, cqrs).await
 }
 
 async fn place_offchain_order(
-    pool: &SqlitePool,
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
@@ -1618,7 +1556,7 @@ mod tests {
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
-    use crate::rebalancing::trigger::UsdcRebalancingConfig;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -2867,7 +2805,7 @@ mod tests {
 
         let vault_registry_projection =
             Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone()).unwrap());
-        let vault_registry = st0x_event_sorcery::test_store(pool.clone(), ());
+        let vault_registry = Arc::new(st0x_event_sorcery::test_store(pool.clone(), ()));
         let snapshot = st0x_event_sorcery::test_store(pool.clone(), ());
 
         let offchain_order_projection = Arc::new(offchain_order_projection);
@@ -3427,7 +3365,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancingConfig::Enabled {
+                usdc: UsdcRebalancing::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3511,7 +3449,7 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: threshold,
-                usdc: UsdcRebalancingConfig::Enabled {
+                usdc: UsdcRebalancing::Enabled {
                     target: threshold.target,
                     deviation: threshold.deviation,
                 },
@@ -3613,7 +3551,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancingConfig::Enabled {
+                usdc: UsdcRebalancing::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3738,7 +3676,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancingConfig::Enabled {
+                usdc: UsdcRebalancing::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },

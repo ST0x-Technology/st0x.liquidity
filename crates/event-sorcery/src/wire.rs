@@ -215,8 +215,8 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
             .await?;
 
         #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
-        Ok(Store::new(cqrs))
+        let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
+        Ok(Store::new(cqrs, self.pool))
     }
 }
 
@@ -280,8 +280,8 @@ impl<Entity: EventSourced, Head, Tail> StoreBuilder<Entity, (Head, Tail)> {
             .await?;
 
         #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
-        Ok((Store::new(cqrs), self.wired))
+        let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
+        Ok((Store::new(cqrs, self.pool), self.wired))
     }
 }
 

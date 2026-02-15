@@ -9,14 +9,13 @@
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use futures_util::future::try_join_all;
-use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
 use st0x_execution::{Executor, InventoryResult};
 
-use st0x_event_sorcery::{SendError, Store, load_aggregate};
+use st0x_event_sorcery::{SendError, Store};
 
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
@@ -49,7 +48,7 @@ where
 {
     raindex_service: Arc<RaindexService<P>>,
     executor: E,
-    pool: SqlitePool,
+    vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
     snapshot: Store<InventorySnapshot>,
@@ -63,7 +62,7 @@ where
     pub(crate) fn new(
         raindex_service: Arc<RaindexService<P>>,
         executor: E,
-        pool: SqlitePool,
+        vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         order_owner: Address,
         snapshot: Store<InventorySnapshot>,
@@ -71,7 +70,7 @@ where
         Self {
             raindex_service,
             executor,
-            pool,
+            vault_registry,
             orderbook,
             order_owner,
             snapshot,
@@ -123,7 +122,7 @@ where
             owner: self.order_owner,
         };
 
-        Ok(load_aggregate::<VaultRegistry>(self.pool.clone(), &vault_registry_id).await?)
+        Ok(self.vault_registry.load(&vault_registry_id).await?)
     }
 
     async fn poll_onchain_equity(
@@ -249,7 +248,7 @@ mod tests {
     use cqrs_es::persist::GenericQuery;
     use rust_decimal::Decimal;
     use sqlite_es::SqliteViewRepository;
-    use sqlx::Row;
+    use sqlx::{Row, SqlitePool};
 
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
@@ -332,7 +331,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -379,7 +378,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -422,7 +421,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -455,7 +454,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -510,7 +509,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -557,7 +556,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -598,7 +597,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -691,7 +690,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -740,7 +739,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -790,7 +789,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -838,7 +837,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),
@@ -869,7 +868,7 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            pool.clone(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
             test_store(pool.clone(), ()),

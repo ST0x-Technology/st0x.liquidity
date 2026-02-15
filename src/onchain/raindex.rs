@@ -18,16 +18,16 @@ use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
+use st0x_event_sorcery::ProjectionError;
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::bindings::{IERC20, IOrderBookV5};
 use crate::error_decoding::handle_contract_error;
-use crate::lifecycle::Lifecycle;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::threshold::Usdc;
-use crate::vault_registry::{VaultRegistry, VaultRegistryProjection};
+use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProjection};
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
@@ -51,11 +51,9 @@ pub(crate) enum RaindexError {
     #[error("Amount cannot be zero")]
     ZeroAmount,
     #[error("Vault registry not found for aggregate {0}")]
-    RegistryNotFound(String),
-    #[error("Vault registry not initialized")]
-    RegistryNotInitialized,
-    #[error("Vault registry in failed state")]
-    RegistryFailed,
+    RegistryNotFound(VaultRegistryId),
+    #[error(transparent)]
+    Projection(#[from] ProjectionError<VaultRegistry>),
     #[error("Vault not found for token {0}")]
     VaultNotFound(Address),
     #[error("Token not found for symbol {0}")]
@@ -122,16 +120,15 @@ where
     }
 
     async fn load_registry(&self) -> Result<VaultRegistry, RaindexError> {
-        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook_address, self.owner);
-        let Some(lifecycle) = self.vault_registry_projection.load(&aggregate_id).await else {
-            return Err(RaindexError::RegistryNotFound(aggregate_id));
+        let aggregate_id = VaultRegistryId {
+            orderbook: self.orderbook_address,
+            owner: self.owner,
         };
 
-        match lifecycle {
-            Lifecycle::Uninitialized => Err(RaindexError::RegistryNotInitialized),
-            Lifecycle::Live(registry) => Ok(registry),
-            Lifecycle::Failed { .. } => Err(RaindexError::RegistryFailed),
-        }
+        self.vault_registry_projection
+            .load(&aggregate_id)
+            .await?
+            .ok_or(RaindexError::RegistryNotFound(aggregate_id))
     }
 
     /// Deposits tokens to a Rain OrderBook vault.

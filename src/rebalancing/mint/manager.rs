@@ -4,52 +4,26 @@
 //! and vault deposits internally via its Services. Implements the `Mint` trait for
 //! integration with the rebalancing trigger system.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::Address;
 use async_trait::async_trait;
-use rust_decimal::Decimal;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use st0x_event_sorcery::Store;
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Mint, MintError};
-use crate::onchain::raindex::Raindex;
-use crate::tokenization::{TokenizationRequest, TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
-use crate::vault_registry::VaultRegistryProjection;
-
-/// Our tokenized equity tokens use 18 decimals.
-const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 pub(crate) struct MintManager {
-    tokenizer: Arc<dyn Tokenizer>,
     cqrs: Arc<Store<TokenizedEquityMint>>,
-    vault: Arc<dyn Raindex>,
-    vault_registry_projection: Arc<VaultRegistryProjection>,
-    orderbook: Address,
-    owner: Address,
 }
 
 impl MintManager {
-    pub(crate) fn new(
-        tokenizer: Arc<dyn Tokenizer>,
-        vault: Arc<dyn Raindex>,
-        vault_registry_projection: Arc<VaultRegistryProjection>,
-        orderbook: Address,
-        owner: Address,
-        cqrs: Arc<Store<TokenizedEquityMint>>,
-    ) -> Self {
-        Self {
-            tokenizer,
-            cqrs,
-            vault,
-            vault_registry_projection,
-            orderbook,
-            owner,
-        }
+    pub(crate) fn new(cqrs: Arc<Store<TokenizedEquityMint>>) -> Self {
+        Self { cqrs }
     }
 
     #[instrument(skip(self), fields(%symbol, ?quantity, %wallet))]
@@ -65,8 +39,9 @@ impl MintManager {
         self.cqrs
             .send(
                 issuer_request_id,
-                TokenizedEquityMintCommand::RequestMint {
-                    symbol: symbol.clone(),
+                TokenizedEquityMintCommand::Mint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    symbol,
                     quantity: quantity.inner(),
                     wallet,
                 },
@@ -76,140 +51,12 @@ impl MintManager {
         debug!("Executing deposit command");
 
         self.cqrs
-            .send(
-                issuer_request_id,
-                TokenizedEquityMintCommand::AcknowledgeAcceptance {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: alpaca_request.id.clone(),
-                },
-            )
+            .send(issuer_request_id, TokenizedEquityMintCommand::Deposit)
             .await?;
 
-        info!(tokenization_request_id = %alpaca_request.id, "Mint request accepted, polling for completion");
-
-        let completed_request = match self
-            .tokenizer
-            .poll_mint_until_complete(&alpaca_request.id)
-            .await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("Polling failed: {e}");
-                self.fail_acceptance(issuer_request_id, format!("Polling failed: {e}"))
-                    .await?;
-                return Err(MintError::Tokenizer(e));
-            }
-        };
-
-        self.handle_completed_request(issuer_request_id, &symbol, completed_request)
-            .await
-    }
-
-    #[instrument(skip(self))]
-    async fn reject_mint(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        reason: String,
-    ) -> Result<(), MintError> {
-        self.cqrs
-            .send(
-                issuer_request_id,
-                TokenizedEquityMintCommand::RejectMint { reason },
-            )
-            .await?;
+        info!("Mint workflow completed successfully");
         Ok(())
     }
-
-    #[instrument(skip(self))]
-    async fn fail_acceptance(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        reason: String,
-    ) -> Result<(), MintError> {
-        self.cqrs
-            .send(
-                issuer_request_id,
-                TokenizedEquityMintCommand::FailAcceptance { reason },
-            )
-            .await?;
-        Ok(())
-    }
-
-    #[instrument(skip(self, completed_request), fields(status = ?completed_request.status))]
-    async fn handle_completed_request(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        symbol: &Symbol,
-        completed_request: TokenizationRequest,
-    ) -> Result<(), MintError> {
-        match completed_request.status {
-            TokenizationRequestStatus::Completed => {
-                let tx_hash = completed_request.tx_hash.ok_or(MintError::MissingTxHash)?;
-                let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity)?;
-
-                self.cqrs
-                    .send(
-                        issuer_request_id,
-                        TokenizedEquityMintCommand::ReceiveTokens {
-                            tx_hash,
-                            receipt_id: ReceiptId(U256::ZERO),
-                            shares_minted,
-                        },
-                    )
-                    .await?;
-
-                let (token, vault_id) = self
-                    .load_vault_info(symbol)
-                    .await
-                    .ok_or_else(|| MintError::VaultNotFound(symbol.clone()))?;
-
-                info!(?vault_id, %token, %shares_minted, "Depositing tokens to vault");
-
-                let vault_deposit_tx_hash = self
-                    .vault
-                    .deposit(token, vault_id, shares_minted, TOKENIZED_EQUITY_DECIMALS)
-                    .await?;
-
-                self.cqrs
-                    .send(
-                        issuer_request_id,
-                        TokenizedEquityMintCommand::DepositToVault {
-                            vault_deposit_tx_hash,
-                        },
-                    )
-                    .await?;
-
-                self.cqrs
-                    .send(issuer_request_id, TokenizedEquityMintCommand::Finalize)
-                    .await?;
-
-                info!(%vault_deposit_tx_hash, "Mint workflow completed successfully");
-                Ok(())
-            }
-            TokenizationRequestStatus::Rejected => {
-                self.fail_acceptance(
-                    issuer_request_id,
-                    "Mint request rejected by Alpaca".to_string(),
-                )
-                .await?;
-                Err(MintError::Rejected)
-            }
-            TokenizationRequestStatus::Pending => {
-                unreachable!("poll_mint_until_complete should not return Pending status")
-            }
-        }
-    }
-}
-
-fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintError> {
-    let decimal = value.inner();
-    let scale_factor = Decimal::from(10u64.pow(18));
-    let scaled = decimal
-        .checked_mul(scale_factor)
-        .ok_or(MintError::DecimalOverflow(value))?;
-    let truncated = scaled.trunc();
-
-    Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
 }
 
 #[async_trait]

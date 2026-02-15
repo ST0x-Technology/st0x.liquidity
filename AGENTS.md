@@ -550,6 +550,10 @@ is the source of truth for terminology and naming conventions.
     4. Never use `.to_string()`, `.map_err(|e| Foo(e.to_string()))`, or similar
        patterns
     5. If an error needs context, use a struct variant with fields + `#[source]`
+  - **FORBIDDEN: `.map_err` for error conversion**: Always use `#[from]` on
+    error variants and `?` for conversion. `.map_err` is verbose boilerplate
+    that `#[from]` eliminates. If you need to log the error before converting,
+    use `.inspect_err(|error| error!(?error, "context"))` chained before `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly

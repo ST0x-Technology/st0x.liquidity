@@ -6,6 +6,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
+use st0x_event_sorcery::Projection;
 use std::io::Write;
 use std::sync::Arc;
 use thiserror::Error;
@@ -113,24 +114,18 @@ pub(super) async fn vault_deposit_command<
         approve_receipt.transaction_hash
     )?;
 
-    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-        VaultRegistryAggregate,
-        VaultRegistryAggregate,
-    >::new(
-        pool.clone(), "vault_registry_view".to_string()
-    ));
-    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
         base_provider_with_wallet,
         ctx.evm.orderbook,
-        vault_registry_query,
+        vault_registry_projection,
         sender_address,
     );
 
     writeln!(stdout, "   Depositing to vault...")?;
     let deposit_tx = raindex_service
-        .deposit(token, VaultId(vault_id), amount_u256, decimals)
+        .deposit(token, RaindexVaultId(vault_id), amount_u256, decimals)
         .await?;
     writeln!(stdout, "   Deposit tx: {deposit_tx}")?;
 
@@ -169,21 +164,15 @@ pub(super) async fn vault_withdraw_command<
         .wallet(base_wallet)
         .connect_provider(base_provider);
 
-    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-        VaultRegistryAggregate,
-        VaultRegistryAggregate,
-    >::new(
-        pool.clone(), "vault_registry_view".to_string()
-    ));
-    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
         base_provider_with_wallet,
         ctx.evm.orderbook,
-        vault_registry_query,
+        vault_registry_projection,
         sender_address,
     );
-    let vault_id = VaultId(rebalancing_config.usdc_vault_id);
+    let vault_id = RaindexVaultId(rebalancing_config.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;

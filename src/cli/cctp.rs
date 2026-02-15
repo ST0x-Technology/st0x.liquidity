@@ -270,7 +270,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
-    use crate::rebalancing::trigger::UsdcRebalancingConfig;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_rebalancing() -> Ctx {
@@ -305,7 +305,7 @@ mod tests {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
             },
-            usdc: UsdcRebalancingConfig::Disabled,
+            usdc: UsdcRebalancing::Disabled,
             alpaca_broker_auth: AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),

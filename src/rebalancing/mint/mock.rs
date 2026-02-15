@@ -5,10 +5,13 @@ use async_trait::async_trait;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use st0x_event_sorcery::{AggregateError, LifecycleError};
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Mint, MintError};
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
+use crate::tokenized_equity_mint::{
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintError,
+};
 
 /// Parameters captured from the last `execute_mint` call.
 #[derive(Debug, Clone)]
@@ -77,9 +80,10 @@ impl Mint for MockMint {
         });
 
         if self.should_fail.load(Ordering::SeqCst) {
-            return Err(AggregateError::UserError(
+            let lifecycle_error = LifecycleError::<TokenizedEquityMint>::Apply(
                 TokenizedEquityMintError::AlreadyFailed,
-            ));
+            );
+            return Err(AggregateError::UserError(lifecycle_error).into());
         }
 
         Ok(())
@@ -166,12 +170,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(AggregateError::UserError(
-                TokenizedEquityMintError::AlreadyFailed
-            ))
-        ));
+        assert!(matches!(result, Err(MintError::Aggregate(_))));
     }
 
     #[tokio::test]
