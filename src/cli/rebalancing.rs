@@ -16,14 +16,11 @@ use st0x_execution::{
 };
 
 use super::TransferDirection;
-use crate::alpaca_tokenization::{
-    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
-};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
 use crate::equity_redemption::{EquityRedemption, Redeemer, RedemptionAggregateId};
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
@@ -36,7 +33,7 @@ use crate::tokenization::{
 };
 use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
 use crate::usdc_rebalance::UsdcRebalanceId;
-use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
+use crate::vault_registry::VaultRegistryProjection;
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
@@ -118,15 +115,15 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
             let owner = signer.address();
-            let vault = Arc::new(VaultService::new(base_provider, config.evm.orderbook));
+            let vault = Arc::new(RaindexService::new(base_provider, config.evm.orderbook));
 
-            let vault_registry_query =
+            let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
             let redemption_service: Arc<dyn Redeemer> = Arc::new(RedemptionService::new(
                 vault,
                 tokenization_service,
-                vault_registry_query.clone(),
+                vault_registry_projection.clone(),
                 config.evm.orderbook,
                 owner,
             ));
@@ -139,7 +136,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
             let redemption_manager = RedemptionManager::new(
                 redemption_store,
-                vault_registry_query,
+                vault_registry_projection,
                 config.evm.orderbook,
                 owner,
             );
@@ -234,7 +231,7 @@ where
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
     })?);
-    let vault_service = Arc::new(VaultService::new(
+    let vault_service = Arc::new(RaindexService::new(
         base_provider_with_wallet,
         ctx.evm.orderbook,
     ));
@@ -247,7 +244,7 @@ where
         vault_service,
         usdc_store,
         owner,
-        VaultId(rebalancing_config.usdc_vault_id),
+        RaindexVaultId(rebalancing_config.usdc_vault_id),
     );
 
     let rebalance_id = UsdcRebalanceId::new(format!("cli-usdc-{}", uuid::Uuid::new_v4()));

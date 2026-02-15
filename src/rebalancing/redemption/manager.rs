@@ -16,8 +16,8 @@ use super::{Redeem, RedemptionError};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
-use crate::onchain::vault::{VaultId, VaultService};
-use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
+use crate::vault_registry::{VaultRegistry, VaultRegistryProjection};
 
 pub(crate) struct RedemptionManager<P>
 where
@@ -25,7 +25,7 @@ where
 {
     service: Arc<RedemptionService<P>>,
     cqrs: Arc<Store<EquityRedemption>>,
-    vault_registry_query: Arc<VaultRegistryQuery>,
+    vault_registry_projection: Arc<VaultRegistryProjection>,
     orderbook: Address,
     owner: Address,
 }
@@ -37,14 +37,14 @@ where
     pub(crate) fn new(
         service: Arc<RedemptionService<P>>,
         cqrs: Arc<Store<EquityRedemption>>,
-        vault_registry_query: Arc<VaultRegistryQuery>,
+        vault_registry_projection: Arc<VaultRegistryProjection>,
         orderbook: Address,
         owner: Address,
     ) -> Self {
         Self {
             service,
             cqrs,
-            vault_registry_query,
+            vault_registry_projection,
             orderbook,
             owner,
         }
@@ -79,9 +79,7 @@ where
 
         match state {
             EquityRedemption::TokensSent { redemption_tx, .. } => Ok(redemption_tx),
-            EquityRedemption::Failed { reason, .. } => {
-                Err(RedemptionError::SendFailed { reason })
-            }
+            EquityRedemption::Failed { reason, .. } => Err(RedemptionError::SendFailed { reason }),
             other => {
                 error!(?other, "Unexpected aggregate state after Redeem command");
                 Err(RedemptionError::UnexpectedState)
@@ -95,10 +93,7 @@ where
         aggregate_id: &RedemptionAggregateId,
     ) -> Result<TokenizationRequestId, RedemptionError> {
         self.cqrs
-            .send(
-                aggregate_id,
-                EquityRedemptionCommand::Detect,
-            )
+            .send(aggregate_id, EquityRedemptionCommand::Detect)
             .await?;
 
         let state = self
@@ -112,9 +107,7 @@ where
                 tokenization_request_id,
                 ..
             } => Ok(tokenization_request_id),
-            EquityRedemption::Failed { reason, .. } => {
-                Err(RedemptionError::DetectionFailed)
-            }
+            EquityRedemption::Failed { reason, .. } => Err(RedemptionError::DetectionFailed),
             other => {
                 error!(?other, "Unexpected aggregate state after Detect command");
                 Err(RedemptionError::UnexpectedState)
@@ -128,10 +121,7 @@ where
         aggregate_id: &RedemptionAggregateId,
     ) -> Result<(), RedemptionError> {
         self.cqrs
-            .send(
-                aggregate_id,
-                EquityRedemptionCommand::AwaitCompletion,
-            )
+            .send(aggregate_id, EquityRedemptionCommand::AwaitCompletion)
             .await?;
 
         let state = self
@@ -221,9 +211,9 @@ mod tests {
     use crate::conductor::wire::test_cqrs;
     use crate::equity_redemption::RedemptionServices;
     use crate::equity_redemption::mock::MockRedeemer;
-    use crate::onchain::vault::{VaultId, VaultService};
+    use crate::onchain::raindex::{RaindexService, RaindexVaultId};
     use crate::rebalancing::redemption::service::TOKENIZED_EQUITY_DECIMALS;
-    use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryCommand};
+    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     const TEST_ORDERBOOK: Address = address!("0x1111111111111111111111111111111111111111");
     const TEST_OWNER: Address = address!("0x2222222222222222222222222222222222222222");
@@ -240,15 +230,13 @@ mod tests {
     /// Returns the query for loading data after commands are executed.
     fn create_vault_registry_cqrs(
         pool: &SqlitePool,
-    ) -> (SqliteCqrs<VaultRegistryAggregate>, Arc<VaultRegistryQuery>) {
-        let view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
+    ) -> (SqliteCqrs<VaultRegistry>, Arc<VaultRegistryProjection>) {
+        let view_repo = Arc::new(SqliteViewRepository::<VaultRegistry, VaultRegistry>::new(
+            pool.clone(),
+            "vault_registry_view".to_string(),
         ));
         let query = Arc::new(GenericQuery::new(view_repo.clone()));
-        let cqrs = test_cqrs::<VaultRegistryAggregate>(
+        let cqrs = test_cqrs::<VaultRegistry>(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),
@@ -282,7 +270,7 @@ mod tests {
         pool: &SqlitePool,
         token: Address,
         vault_id: B256,
-    ) -> Arc<VaultRegistryQuery> {
+    ) -> Arc<VaultRegistryProjection> {
         seed_vault_registry_with_params(pool, TEST_ORDERBOOK, TEST_OWNER, token, vault_id).await
     }
 
@@ -292,7 +280,7 @@ mod tests {
         owner: Address,
         token: Address,
         vault_id: B256,
-    ) -> Arc<VaultRegistryQuery> {
+    ) -> Arc<VaultRegistryProjection> {
         let (cqrs, query) = create_vault_registry_cqrs(pool);
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
 
@@ -314,10 +302,10 @@ mod tests {
     #[tokio::test]
     async fn load_vault_id_returns_none_when_registry_empty() {
         let pool = crate::test_utils::setup_test_db().await;
-        let (_cqrs, vault_registry_query) = create_vault_registry_cqrs(&pool);
+        let (_cqrs, vault_registry_projection) = create_vault_registry_cqrs(&pool);
 
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
-        let result = vault_registry_query.load(&aggregate_id).await;
+        let result = vault_registry_projection.load(&aggregate_id).await;
 
         assert!(result.is_none(), "Expected None for empty registry");
     }
@@ -329,10 +317,10 @@ mod tests {
         let expected_vault_id =
             b256!("0xabcdef0000000000000000000000000000000000000000000000000000000001");
 
-        let vault_registry_query = seed_vault_registry(&pool, token, expected_vault_id).await;
+        let vault_registry_projection = seed_vault_registry(&pool, token, expected_vault_id).await;
 
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
-        let lifecycle = vault_registry_query.load(&aggregate_id).await.unwrap();
+        let lifecycle = vault_registry_projection.load(&aggregate_id).await.unwrap();
 
         let Lifecycle::Live(registry) = lifecycle else {
             panic!("Expected Live registry");
@@ -352,10 +340,11 @@ mod tests {
         let unknown_token = address!("0xabcdef0123456789abcdef0123456789abcdef01");
         let vault_id = b256!("0xabcdef0000000000000000000000000000000000000000000000000000000001");
 
-        let vault_registry_query = seed_vault_registry(&pool, registered_token, vault_id).await;
+        let vault_registry_projection =
+            seed_vault_registry(&pool, registered_token, vault_id).await;
 
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
-        let lifecycle = vault_registry_query.load(&aggregate_id).await.unwrap();
+        let lifecycle = vault_registry_projection.load(&aggregate_id).await.unwrap();
 
         let Lifecycle::Live(registry) = lifecycle else {
             panic!("Expected Live registry");
@@ -408,7 +397,7 @@ mod tests {
     // --- Test infrastructure for vault integration tests ---
 
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
-    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+    const TEST_VAULT_ID: RaindexVaultId = RaindexVaultId(b256!(
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
@@ -486,14 +475,14 @@ mod tests {
         async fn deposit_tokens_to_vault(
             &self,
             amount: U256,
-            vault_registry_query: Arc<VaultRegistryQuery>,
+            vault_registry_projection: Arc<VaultRegistryProjection>,
         ) {
             let token = TestERC20::new(self.token_address, &self.provider);
             let owner = self.signer.address();
             let raindex_service = RaindexService::new(
                 self.provider.clone(),
                 self.orderbook_address,
-                vault_registry_query,
+                vault_registry_projection,
                 owner,
             )
             .with_required_confirmations(1);
@@ -528,7 +517,7 @@ mod tests {
         let local_evm = LocalEvmWithVault::new().await;
 
         // Create vault registry query first so we can use it for both deposit and redemption
-        let vault_registry_query = seed_vault_registry_with_params(
+        let vault_registry_projection = seed_vault_registry_with_params(
             &pool,
             local_evm.orderbook_address,
             local_evm.signer.address(),
@@ -539,13 +528,13 @@ mod tests {
 
         let deposit_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
         local_evm
-            .deposit_tokens_to_vault(deposit_amount, vault_registry_query)
+            .deposit_tokens_to_vault(deposit_amount, vault_registry_projection)
             .await;
 
         let redemption_service = Arc::new(RedemptionService::new(
             vault_service,
             tokenization_service,
-            vault_registry_query.clone(),
+            vault_registry_projection.clone(),
             local_evm.orderbook_address,
             local_evm.signer.address(),
         ));
@@ -603,13 +592,14 @@ mod tests {
                 }]));
         });
 
-        let mock_redeemer: RedemptionServices = Arc::new(MockRedeemer::with_redemption_tx(redemption_tx));
+        let mock_redeemer: RedemptionServices =
+            Arc::new(MockRedeemer::with_redemption_tx(redemption_tx));
         let cqrs = create_test_store_instance(mock_redeemer).await;
 
         let manager = RedemptionManager::new(
             redemption_service,
             cqrs,
-            vault_registry_query,
+            vault_registry_projection,
             local_evm.orderbook_address,
             local_evm.signer.address(),
         );

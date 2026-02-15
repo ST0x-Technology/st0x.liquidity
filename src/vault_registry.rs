@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use st0x_execution::Symbol;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Projection, Table};
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -115,7 +115,7 @@ pub(crate) struct VaultRegistry {
     pub(crate) last_updated: DateTime<Utc>,
 }
 
-pub(crate) type VaultRegistryQuery = SqliteQuery<VaultRegistry, Never>;
+pub(crate) type VaultRegistryProjection = Projection<VaultRegistry>;
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

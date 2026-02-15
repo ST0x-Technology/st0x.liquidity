@@ -4,19 +4,22 @@
 //! and vault deposits internally via its Services. Implements the `Mint` trait for
 //! integration with the rebalancing trigger system.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use st0x_event_sorcery::Store;
 
 use super::{Mint, MintError};
+use crate::onchain::raindex::Raindex;
+use crate::tokenization::{TokenizationRequest, TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
+use crate::vault_registry::VaultRegistryProjection;
 
 /// Our tokenized equity tokens use 18 decimals.
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
@@ -24,8 +27,8 @@ const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 pub(crate) struct MintManager {
     tokenizer: Arc<dyn Tokenizer>,
     cqrs: Arc<Store<TokenizedEquityMint>>,
-    vault: Arc<dyn Vault>,
-    vault_registry_query: Arc<VaultRegistryQuery>,
+    vault: Arc<dyn Raindex>,
+    vault_registry_projection: Arc<VaultRegistryProjection>,
     orderbook: Address,
     owner: Address,
 }
@@ -33,8 +36,8 @@ pub(crate) struct MintManager {
 impl MintManager {
     pub(crate) fn new(
         tokenizer: Arc<dyn Tokenizer>,
-        vault: Arc<dyn Vault>,
-        vault_registry_query: Arc<VaultRegistryQuery>,
+        vault: Arc<dyn Raindex>,
+        vault_registry_projection: Arc<VaultRegistryProjection>,
         orderbook: Address,
         owner: Address,
         cqrs: Arc<Store<TokenizedEquityMint>>,
@@ -43,7 +46,7 @@ impl MintManager {
             tokenizer,
             cqrs,
             vault,
-            vault_registry_query,
+            vault_registry_projection,
             orderbook,
             owner,
         }
@@ -227,38 +230,34 @@ impl Mint for MintManager {
 mod tests {
     use alloy::network::{Ethereum, EthereumWallet};
     use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::b256;
     use alloy::primitives::{B256, TxHash, U256, address, b256};
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
     };
     use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::persist::GenericQuery;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
+    use serde_json::json;
 
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{Projection, test_store};
 
     use super::*;
     use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
-    use crate::conductor::wire::test_cqrs;
-    use crate::onchain::raindex::VaultId;
-    use crate::onchain::vault::VaultService;
-    use crate::test_utils::{create_test_vault_service, create_vault_registry_query, setup_test_db};
-    use crate::tokenization::Tokenizer;
+    use crate::onchain::raindex::{RaindexService, RaindexVaultId};
+    use crate::test_utils::{
+        create_test_vault_service, create_vault_registry_projection, setup_test_db,
+    };
     use crate::tokenization::alpaca::tests::{
         create_test_service_with_provider, tokenization_mint_path, tokenization_requests_path,
     };
     use crate::tokenization::mock::MockTokenizer;
     use crate::tokenized_equity_mint::MintServices;
-    use crate::vault_registry::{
-        VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
-    };
-    use serde_json::json;
+    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryProjection};
 
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
-    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+    const TEST_VAULT_ID: RaindexVaultId = RaindexVaultId(b256!(
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
@@ -340,14 +339,14 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault_registry_projection = create_vault_registry_projection(&pool);
         let vault =
             create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(
             service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
+            vault as Arc<dyn Raindex>,
+            vault_registry_projection,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
             cqrs,
@@ -402,14 +401,14 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault_registry_projection = create_vault_registry_projection(&pool);
         let vault =
             create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(
             service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
+            vault as Arc<dyn Raindex>,
+            vault_registry_projection,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
             cqrs,
@@ -473,14 +472,14 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault_registry_projection = create_vault_registry_projection(&pool);
         let vault =
             create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(
             service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
+            vault as Arc<dyn Raindex>,
+            vault_registry_projection,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
             cqrs,
@@ -521,14 +520,14 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault_registry_projection = create_vault_registry_projection(&pool);
         let vault =
             create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(
             service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
+            vault as Arc<dyn Raindex>,
+            vault_registry_projection,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
             cqrs,
@@ -635,20 +634,10 @@ mod tests {
 
     fn create_vault_registry_cqrs(
         pool: &sqlx::SqlitePool,
-    ) -> (SqliteCqrs<VaultRegistryAggregate>, Arc<VaultRegistryQuery>) {
-        let view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        let query = Arc::new(GenericQuery::new(view_repo.clone()));
-        let cqrs = test_cqrs::<VaultRegistryAggregate>(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(view_repo))],
-            (),
-        );
-        (cqrs, query)
+    ) -> (Store<VaultRegistry>, Arc<VaultRegistryProjection>) {
+        let query = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone()).unwrap());
+        let store = test_store(pool.clone(), ());
+        (store, query)
     }
 
     async fn seed_vault_registry(
@@ -658,7 +647,7 @@ mod tests {
         token: Address,
         vault_id: B256,
         symbol: Symbol,
-    ) -> Arc<VaultRegistryQuery> {
+    ) -> Arc<VaultRegistryProjection> {
         let (cqrs, query) = create_vault_registry_cqrs(pool);
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
 
@@ -684,7 +673,7 @@ mod tests {
         let local_evm = LocalEvmWithVault::new().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
-        let vault_registry_query = seed_vault_registry(
+        let vault_registry_projection = seed_vault_registry(
             &pool,
             local_evm.orderbook_address,
             local_evm.signer.address(),
@@ -699,11 +688,11 @@ mod tests {
             local_evm.provider.clone(),
             local_evm.signer.address(),
         ));
-        let vault: Arc<dyn Vault> = Arc::new(
-            VaultService::new(
+        let vault: Arc<dyn Raindex> = Arc::new(
+            RaindexService::new(
                 local_evm.provider.clone(),
                 local_evm.orderbook_address,
-                vault_registry_query.clone(),
+                vault_registry_projection.clone(),
                 local_evm.signer.address(),
             )
             .with_required_confirmations(1),
@@ -712,7 +701,7 @@ mod tests {
         let manager = MintManager::new(
             tokenizer,
             vault,
-            vault_registry_query,
+            vault_registry_projection,
             local_evm.orderbook_address,
             local_evm.signer.address(),
             cqrs,

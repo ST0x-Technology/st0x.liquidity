@@ -109,7 +109,6 @@ impl RebalancingCtx {
     ) -> Result<Self, RebalancingCtxError> {
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
 
-
         Ok(Self {
             equity_threshold: config.equity_threshold,
             usdc: config.usdc,

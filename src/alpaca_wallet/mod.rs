@@ -274,7 +274,6 @@ mod tests {
         let asset = TokenSymbol::new("USDC");
         let amount = Positive::new(Usdc(dec!(100))).unwrap();
 
-
         assert!(matches!(
             service
                 .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)

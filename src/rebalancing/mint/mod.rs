@@ -14,8 +14,8 @@ use thiserror::Error;
 use st0x_event_sorcery::SendError;
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::onchain::vault::VaultError;
+use crate::onchain::raindex::RaindexError;
+use crate::tokenization::AlpacaTokenizationError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 #[derive(Debug, Error)]
@@ -25,7 +25,7 @@ pub(crate) enum MintError {
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<TokenizedEquityMint>>),
     #[error("Vault deposit error: {0}")]
-    Vault(#[from] VaultError),
+    Raindex(#[from] RaindexError),
     #[error("Vault not found for symbol {0}")]
     VaultNotFound(Symbol),
 

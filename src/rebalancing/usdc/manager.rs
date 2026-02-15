@@ -1,7 +1,7 @@
 //! UsdcRebalanceManager orchestrates the USDC rebalancing workflow.
 //!
 //! Coordinates between `AlpacaBrokerApi`, `AlpacaWalletService`,
-//! `CctpBridge`, `VaultService`, and the `UsdcRebalance` aggregate to
+//! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
 
 use alloy::primitives::{Address, TxHash, U256};
@@ -21,7 +21,7 @@ use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -39,13 +39,13 @@ where
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-    vault: Arc<VaultService<BP>>,
+    vault: Arc<RaindexService<BP>>,
     cqrs: Arc<Store<UsdcRebalance>>,
     /// Market maker's (our) wallet address
     /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
     market_maker_wallet: Address,
     /// Vault ID for Rain OrderBook deposits
-    vault_id: VaultId,
+    vault_id: RaindexVaultId,
 }
 
 use alloy::network::{Ethereum, EthereumWallet};
@@ -75,10 +75,10 @@ where
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-        vault: Arc<VaultService<BP>>,
+        vault: Arc<RaindexService<BP>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
     ) -> Self {
         Self {
             alpaca_broker,
@@ -903,13 +903,13 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
-    use crate::onchain::vault::VaultService;
+    use crate::onchain::raindex::RaindexService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
-    use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
+    use crate::vault_registry::{VaultRegistry, VaultRegistryProjection};
 
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
-    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+    const TEST_VAULT_ID: RaindexVaultId = RaindexVaultId(b256!(
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
@@ -1068,7 +1068,7 @@ mod tests {
         signer: &PrivateKeySigner,
     ) -> (
         CctpBridge<TestProvider, TestProvider>,
-        VaultService<TestProvider>,
+        RaindexService<TestProvider>,
     ) {
         let owner = signer.address();
 
@@ -1084,17 +1084,21 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
 
         let vault_registry_view_repo =
-            Arc::new(SqliteViewRepository::<
-                VaultRegistryAggregate,
-                VaultRegistryAggregate,
-            >::new(pool, "vault_registry_view".to_string()));
+            Arc::new(SqliteViewRepository::<VaultRegistry, VaultRegistry>::new(
+                pool,
+                "vault_registry_view".to_string(),
+            ));
 
-        let vault_registry_query: Arc<VaultRegistryQuery> =
+        let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-        let vault_service =
-            VaultService::new(provider, ORDERBOOK_ADDRESS, vault_registry_query, owner)
-                .with_required_confirmations(1);
+        let vault_service = RaindexService::new(
+            provider,
+            ORDERBOOK_ADDRESS,
+            vault_registry_projection,
+            owner,
+        )
+        .with_required_confirmations(1);
 
         (cctp_bridge, vault_service)
     }

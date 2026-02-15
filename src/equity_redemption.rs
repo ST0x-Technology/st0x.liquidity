@@ -305,9 +305,7 @@ impl EventSourced for EquityRedemption {
         Ok(match event {
             VaultWithdrawn { .. } => None,
 
-            SendFailed { reason, failed_at } => {
-                entity.try_apply_send_failed(reason, *failed_at)
-            }
+            SendFailed { reason, failed_at } => entity.try_apply_send_failed(reason, *failed_at),
 
             TokensSent {
                 redemption_wallet,
@@ -380,9 +378,7 @@ impl EventSourced for EquityRedemption {
                     }
                 }
             }
-            Detect { .. } | AwaitCompletion => {
-                Err(EquityRedemptionError::NotStarted)
-            }
+            Detect { .. } | AwaitCompletion => Err(EquityRedemptionError::NotStarted),
         }
     }
 
@@ -573,10 +569,7 @@ impl EquityRedemption {
         })
     }
 
-    fn try_apply_redemption_rejected(
-        &self,
-        rejected_at: DateTime<Utc>,
-    ) -> Option<Self> {
+    fn try_apply_redemption_rejected(&self, rejected_at: DateTime<Utc>) -> Option<Self> {
         let Self::Pending {
             symbol,
             quantity,
@@ -678,7 +671,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn complete_from_pending_produces_completed() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![vault_withdrawn_event(), tokens_sent_event(), detected_event()])
+            .given(vec![
+                vault_withdrawn_event(),
+                tokens_sent_event(),
+                detected_event(),
+            ])
             .when(EquityRedemptionCommand::Complete)
             .await
             .events();
@@ -777,7 +774,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reject_redemption_from_pending_state() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![vault_withdrawn_event(), tokens_sent_event(), detected_event()])
+            .given(vec![
+                vault_withdrawn_event(),
+                tokens_sent_event(),
+                detected_event(),
+            ])
             .when(EquityRedemptionCommand::RejectRedemption {
                 reason: "Insufficient balance".to_string(),
             })

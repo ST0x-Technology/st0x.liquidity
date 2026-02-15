@@ -19,7 +19,7 @@ use st0x_event_sorcery::SendError;
 use st0x_execution::AlpacaBrokerApiError;
 
 use crate::alpaca_wallet::AlpacaWalletError;
-use crate::onchain::vault::VaultError;
+use crate::onchain::raindex::RaindexError;
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::UsdcRebalanceId;
 

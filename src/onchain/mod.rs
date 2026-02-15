@@ -28,9 +28,9 @@ pub(crate) mod backfill;
 mod clear;
 pub(crate) mod io;
 pub(crate) mod pyth;
+pub(crate) mod raindex;
 mod take_order;
 pub(crate) mod trade;
-pub(crate) mod vault;
 
 pub(crate) use trade::OnchainTrade;
 pub(crate) use trade::TradeValidationError;

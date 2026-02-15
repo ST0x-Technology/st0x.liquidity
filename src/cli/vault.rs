@@ -4,9 +4,7 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::persist::GenericQuery;
 use rust_decimal::Decimal;
-use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
@@ -15,9 +13,9 @@ use thiserror::Error;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
-use crate::onchain::raindex::{RaindexService, VaultId};
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::threshold::Usdc;
-use crate::vault_registry::VaultRegistryAggregate;
+use crate::vault_registry::VaultRegistry;
 
 pub(super) struct Deposit {
     pub(super) amount: Decimal,

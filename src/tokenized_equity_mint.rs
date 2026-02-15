@@ -204,9 +204,7 @@ impl DomainEvent for TokenizedEquityMintEvent {
                 "TokenizedEquityMintEvent::MintAcceptanceFailed".to_string()
             }
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
-            Self::VaultDeposited { .. } => {
-                "TokenizedEquityMintEvent::VaultDeposited".to_string()
-            }
+            Self::VaultDeposited { .. } => "TokenizedEquityMintEvent::VaultDeposited".to_string(),
             Self::RaindexDepositFailed { .. } => {
                 "TokenizedEquityMintEvent::RaindexDepositFailed".to_string()
             }
@@ -578,10 +576,7 @@ impl TokenizedEquityMint {
         })
     }
 
-    fn try_apply_vault_deposit_failed(
-        &self,
-        failed_at: DateTime<Utc>,
-    ) -> Option<Self> {
+    fn try_apply_vault_deposit_failed(&self, failed_at: DateTime<Utc>) -> Option<Self> {
         let Self::TokensReceived {
             symbol,
             quantity,

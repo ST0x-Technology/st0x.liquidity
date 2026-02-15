@@ -21,7 +21,7 @@ use st0x_event_sorcery::{SendError, Store, load_aggregate};
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
-use crate::onchain::vault::{VaultError, VaultId, VaultService};
+use crate::onchain::raindex::{RaindexError, RaindexService, RaindexVaultId};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Error type for inventory polling operations.
@@ -34,7 +34,7 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
     SnapshotAggregate(#[from] SendError<InventorySnapshot>),
     #[error(transparent)]
-    VaultRegistryAggregate(#[from] SendError<VaultRegistry>),
+    VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("vault balance mismatch: expected {expected:?}, got {actual:?}")]
     VaultBalanceMismatch {
         expected: Vec<Address>,
@@ -140,7 +140,11 @@ where
 
         let balance_futures = registry.equity_vaults.values().map(|vault| async {
             self.raindex_service
-                .get_equity_balance(self.order_owner, vault.token, VaultId(vault.vault_id))
+                .get_equity_balance(
+                    self.order_owner,
+                    vault.token,
+                    RaindexVaultId(vault.vault_id),
+                )
                 .await
                 .map(|balance| (vault.token, vault.symbol.clone(), balance))
         });
@@ -183,7 +187,7 @@ where
 
         let usdc_balance = self
             .raindex_service
-            .get_usdc_balance(self.order_owner, VaultId(usdc_vault.vault_id))
+            .get_usdc_balance(self.order_owner, RaindexVaultId(usdc_vault.vault_id))
             .await?;
 
         self.snapshot
@@ -254,7 +258,7 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery};
+    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryProjection};
 
     /// A Float (bytes32) representing zero balance, used as mock vaultBalance2 response.
     const ZERO_FLOAT_HEX: &str =
@@ -285,19 +289,18 @@ mod tests {
         pool: &sqlx::SqlitePool,
         provider: impl Provider + Clone,
     ) -> Arc<RaindexService<impl Provider + Clone>> {
-        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        let vault_registry_query: Arc<VaultRegistryQuery> =
+        let vault_registry_view_repo =
+            Arc::new(SqliteViewRepository::<VaultRegistry, VaultRegistry>::new(
+                pool.clone(),
+                "vault_registry_view".to_string(),
+            ));
+        let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(GenericQuery::new(vault_registry_view_repo));
 
         Arc::new(RaindexService::new(
             provider,
             Address::ZERO,
-            vault_registry_query,
+            vault_registry_projection,
             Address::ZERO,
         ))
     }

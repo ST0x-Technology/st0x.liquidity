@@ -27,14 +27,14 @@ use crate::error_decoding::handle_contract_error;
 use crate::lifecycle::Lifecycle;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::threshold::Usdc;
-use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
+use crate::vault_registry::{VaultRegistry, VaultRegistryProjection};
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
 
 /// Vault identifier for Rain OrderBook vaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VaultId(pub(crate) B256);
+pub(crate) struct RaindexVaultId(pub(crate) B256);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RaindexError {
@@ -69,7 +69,7 @@ pub(crate) enum RaindexError {
 /// # Example
 ///
 /// ```ignore
-/// let service = RaindexService::new(provider, orderbook_address, vault_registry_query, owner);
+/// let service = RaindexService::new(provider, orderbook_address, vault_registry_projection, owner);
 ///
 /// // Lookup vault ID for a token
 /// let vault_id = service.lookup_vault_id(token_address).await?;
@@ -88,7 +88,7 @@ where
     provider: P,
     orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
     orderbook_address: Address,
-    vault_registry_query: Arc<VaultRegistryQuery>,
+    vault_registry_projection: Arc<VaultRegistryProjection>,
     owner: Address,
     required_confirmations: u64,
 }
@@ -100,14 +100,14 @@ where
     pub(crate) fn new(
         provider: P,
         orderbook: Address,
-        vault_registry_query: Arc<VaultRegistryQuery>,
+        vault_registry_projection: Arc<VaultRegistryProjection>,
         owner: Address,
     ) -> Self {
         Self {
             orderbook: IOrderBookV5::new(orderbook, provider.clone()),
             provider,
             orderbook_address: orderbook,
-            vault_registry_query,
+            vault_registry_projection,
             owner,
             required_confirmations: REQUIRED_CONFIRMATIONS,
         }
@@ -123,7 +123,7 @@ where
 
     async fn load_registry(&self) -> Result<VaultRegistry, RaindexError> {
         let aggregate_id = VaultRegistry::aggregate_id(self.orderbook_address, self.owner);
-        let Some(lifecycle) = self.vault_registry_query.load(&aggregate_id).await else {
+        let Some(lifecycle) = self.vault_registry_projection.load(&aggregate_id).await else {
             return Err(RaindexError::RegistryNotFound(aggregate_id));
         };
 
@@ -151,7 +151,7 @@ where
     pub(crate) async fn deposit(
         &self,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
@@ -195,7 +195,7 @@ where
     async fn deposit3_to_vault(
         &self,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
@@ -240,7 +240,7 @@ where
     pub(crate) async fn withdraw(
         &self,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
@@ -282,7 +282,7 @@ where
     /// * `amount` - Amount of USDC to deposit (in USDC's base units, 6 decimals)
     pub(crate) async fn deposit_usdc(
         &self,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         amount: U256,
     ) -> Result<TxHash, RaindexError> {
         self.deposit(USDC_BASE, vault_id, amount, USDC_DECIMALS)
@@ -299,7 +299,7 @@ where
     /// * `target_amount` - Target amount of USDC to withdraw (in USDC's base units, 6 decimals)
     pub(crate) async fn withdraw_usdc(
         &self,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         target_amount: U256,
     ) -> Result<TxHash, RaindexError> {
         self.withdraw(USDC_BASE, vault_id, target_amount, USDC_DECIMALS)
@@ -311,7 +311,7 @@ where
         &self,
         owner: Address,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
     ) -> Result<FractionalShares, RaindexError> {
         let decimal = self.get_vault_balance(owner, token, vault_id).await?;
         Ok(FractionalShares::new(decimal))
@@ -321,7 +321,7 @@ where
     pub(crate) async fn get_usdc_balance(
         &self,
         owner: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
     ) -> Result<Usdc, RaindexError> {
         let decimal = self.get_vault_balance(owner, USDC_BASE, vault_id).await?;
         Ok(Usdc(decimal))
@@ -331,7 +331,7 @@ where
         &self,
         owner: Address,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
     ) -> Result<Decimal, RaindexError> {
         let balance_float = self
             .orderbook
@@ -347,7 +347,7 @@ where
 ///
 /// Uses format_with_scientific(false) to avoid scientific notation
 /// (e.g. "1e20") that Decimal::from_str cannot parse.
-fn float_to_decimal(float: B256) -> Result<Decimal, VaultError> {
+fn float_to_decimal(float: B256) -> Result<Decimal, RaindexError> {
     let float = Float::from_raw(float);
     let formatted = float.format_with_scientific(false)?;
     Ok(formatted.parse::<Decimal>()?)
@@ -360,16 +360,19 @@ fn float_to_decimal(float: B256) -> Result<Decimal, VaultError> {
 #[async_trait]
 pub(crate) trait Raindex: Send + Sync {
     /// Looks up the vault ID for a given token from the vault registry.
-    async fn lookup_vault_id(&self, token: Address) -> Result<VaultId, RaindexError>;
+    async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError>;
 
     /// Looks up the token address and vault ID for a given symbol from the vault registry.
-    async fn lookup_vault_info(&self, symbol: &Symbol) -> Result<(Address, VaultId), RaindexError>;
+    async fn lookup_vault_info(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<(Address, RaindexVaultId), RaindexError>;
 
     /// Deposits tokens to a Rain OrderBook vault.
     async fn deposit(
         &self,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
@@ -378,7 +381,7 @@ pub(crate) trait Raindex: Send + Sync {
     async fn withdraw(
         &self,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
@@ -389,15 +392,18 @@ impl<P> Raindex for RaindexService<P>
 where
     P: Provider + Clone + Send + Sync,
 {
-    async fn lookup_vault_id(&self, token: Address) -> Result<VaultId, RaindexError> {
+    async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError> {
         let registry = self.load_registry().await?;
         registry
             .vault_id_by_token(token)
-            .map(VaultId)
+            .map(RaindexVaultId)
             .ok_or(RaindexError::VaultNotFound(token))
     }
 
-    async fn lookup_vault_info(&self, symbol: &Symbol) -> Result<(Address, VaultId), RaindexError> {
+    async fn lookup_vault_info(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<(Address, RaindexVaultId), RaindexError> {
         let registry = self.load_registry().await?;
         let token = registry
             .token_by_symbol(symbol)
@@ -405,13 +411,13 @@ where
         let vault_id = registry
             .vault_id_by_token(token)
             .ok_or(RaindexError::VaultNotFound(token))?;
-        Ok((token, VaultId(vault_id)))
+        Ok((token, RaindexVaultId(vault_id)))
     }
 
     async fn deposit(
         &self,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
@@ -421,7 +427,7 @@ where
     async fn withdraw(
         &self,
         token: Address,
-        vault_id: VaultId,
+        vault_id: RaindexVaultId,
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
@@ -467,7 +473,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
-    use crate::vault_registry::VaultRegistryAggregate;
+    use crate::vault_registry::VaultRegistry;
 
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
@@ -607,7 +613,7 @@ mod tests {
     }
 
     const TEST_TOKEN_DECIMALS: u8 = 18;
-    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+    const TEST_VAULT_ID: RaindexVaultId = RaindexVaultId(b256!(
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
@@ -618,15 +624,20 @@ mod tests {
     ) -> RaindexService<LocalEvmProvider> {
         let pool = crate::test_utils::setup_test_db().await;
         let vault_registry_view_repo =
-            Arc::new(SqliteViewRepository::<
-                VaultRegistryAggregate,
-                VaultRegistryAggregate,
-            >::new(pool, "vault_registry_view".to_string()));
-        let vault_registry_query: Arc<VaultRegistryQuery> =
+            Arc::new(SqliteViewRepository::<VaultRegistry, VaultRegistry>::new(
+                pool,
+                "vault_registry_view".to_string(),
+            ));
+        let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-        RaindexService::new(provider, orderbook_address, vault_registry_query, owner)
-            .with_required_confirmations(1)
+        RaindexService::new(
+            provider,
+            orderbook_address,
+            vault_registry_projection,
+            owner,
+        )
+        .with_required_confirmations(1)
     }
 
     #[tokio::test]
@@ -1038,6 +1049,7 @@ mod tests {
             let roundtripped_str = roundtripped.format_with_scientific(false).unwrap();
             prop_assert_eq!(original_str, roundtripped_str);
         }
+    }
 
     #[tokio::test]
     async fn deposit_with_production_amount_succeeds() {

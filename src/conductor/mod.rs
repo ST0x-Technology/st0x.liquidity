@@ -44,9 +44,8 @@ use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::raindex::{Raindex, RaindexService};
+use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
@@ -390,6 +389,7 @@ impl Conductor {
 
         Ok(builder.spawn())
     }
+}
 
 impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
@@ -479,7 +479,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     // Create services needed for redemption CQRS
     let broker_auth = &rebalancing_ctx.alpaca_broker_auth;
-    let vault_service = Arc::new(VaultService::new(provider.clone(), ctx.evm.orderbook));
+    let vault_service = Arc::new(RaindexService::new(provider.clone(), ctx.evm.orderbook));
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         broker_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_account_id,
@@ -1032,7 +1032,6 @@ async fn process_next_queued_event<P: Provider + Clone>(
     .await
 }
 
-
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
@@ -1316,10 +1315,7 @@ async fn place_offchain_order(
     execute_place_offchain_order(execution, cqrs, offchain_order_id).await;
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
-    let aggregate = cqrs
-        .offchain_order
-        .load(&offchain_order_id)
-        .await;
+    let aggregate = cqrs.offchain_order.load(&offchain_order_id).await;
 
     if let Ok(Some(OffchainOrder::Failed { error, .. })) = aggregate {
         warn!(
@@ -1454,8 +1450,7 @@ where
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let ready_positions =
-        check_all_positions(executor, position_projection, executor_type).await?;
+    let ready_positions = check_all_positions(executor, position_projection, executor_type).await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1623,8 +1618,8 @@ mod tests {
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
-    use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
+    use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
