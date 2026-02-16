@@ -270,9 +270,7 @@ impl DomainEvent for TokenizedEquityMintEvent {
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
             Self::TokensWrapped { .. } => "TokenizedEquityMintEvent::TokensWrapped".to_string(),
             Self::WrappingFailed { .. } => "TokenizedEquityMintEvent::WrappingFailed".to_string(),
-            Self::VaultDeposited { .. } => {
-                "TokenizedEquityMintEvent::VaultDeposited".to_string()
-            }
+            Self::VaultDeposited { .. } => "TokenizedEquityMintEvent::VaultDeposited".to_string(),
             Self::VaultDepositFailed { .. } => {
                 "TokenizedEquityMintEvent::VaultDepositFailed".to_string()
             }
@@ -566,7 +564,6 @@ impl EventSourced for TokenizedEquityMint {
             }
 
             MintCompleted { completed_at } => entity.try_apply_completed(*completed_at),
-            }
         })
     }
 
@@ -605,9 +602,9 @@ impl EventSourced for TokenizedEquityMint {
                     reason,
                     rejected_at: Utc::now(),
                 }]),
-                Self::Completed { .. } | Self::VaultDeposited { .. } | Self::TokensWrapped { .. } => {
-                    Err(TokenizedEquityMintError::AlreadyCompleted)
-                }
+                Self::Completed { .. }
+                | Self::VaultDeposited { .. }
+                | Self::TokensWrapped { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
@@ -649,9 +646,10 @@ impl EventSourced for TokenizedEquityMint {
                     received_at: Utc::now(),
                 }]),
                 Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
-                Self::Completed { .. } | Self::TokensReceived { .. } | Self::TokensWrapped { .. } | Self::VaultDeposited { .. } => {
-                    Err(TokenizedEquityMintError::AlreadyCompleted)
-                }
+                Self::Completed { .. }
+                | Self::TokensReceived { .. }
+                | Self::TokensWrapped { .. }
+                | Self::VaultDeposited { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
 
@@ -667,9 +665,9 @@ impl EventSourced for TokenizedEquityMint {
                 Self::MintRequested { .. } | Self::MintAccepted { .. } => {
                     Err(TokenizedEquityMintError::TokensNotReceivedForWrap)
                 }
-                Self::Completed { .. } | Self::TokensWrapped { .. } | Self::VaultDeposited { .. } => {
-                    Err(TokenizedEquityMintError::AlreadyCompleted)
-                }
+                Self::Completed { .. }
+                | Self::TokensWrapped { .. }
+                | Self::VaultDeposited { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
 
@@ -680,9 +678,9 @@ impl EventSourced for TokenizedEquityMint {
                     vault_deposit_tx_hash,
                     deposited_at: Utc::now(),
                 }]),
-                Self::MintRequested { .. } | Self::MintAccepted { .. } | Self::TokensReceived { .. } => {
-                    Err(TokenizedEquityMintError::TokensNotWrapped)
-                }
+                Self::MintRequested { .. }
+                | Self::MintAccepted { .. }
+                | Self::TokensReceived { .. } => Err(TokenizedEquityMintError::TokensNotWrapped),
                 Self::Completed { .. } | Self::VaultDeposited { .. } => {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
@@ -693,7 +691,10 @@ impl EventSourced for TokenizedEquityMint {
                 Self::VaultDeposited { .. } => Ok(vec![MintCompleted {
                     completed_at: Utc::now(),
                 }]),
-                Self::MintRequested { .. } | Self::MintAccepted { .. } | Self::TokensReceived { .. } | Self::TokensWrapped { .. } => {
+                Self::MintRequested { .. }
+                | Self::MintAccepted { .. }
+                | Self::TokensReceived { .. }
+                | Self::TokensWrapped { .. } => {
                     Err(TokenizedEquityMintError::VaultDepositNotComplete)
                 }
                 Self::Completed { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),

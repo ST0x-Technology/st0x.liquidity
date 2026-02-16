@@ -249,7 +249,9 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    };
     use crate::{Direction, FractionalShares, Positive};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =

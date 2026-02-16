@@ -232,10 +232,11 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use std::collections::HashMap;
     use st0x_execution::{
         AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
     };
+    use std::collections::HashMap;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     use st0x_event_sorcery::{Projection, test_store};

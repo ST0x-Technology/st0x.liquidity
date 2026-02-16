@@ -8,7 +8,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountResponse, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+use super::auth::{AccountResponse, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use super::executor::AssetResponse;
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
 use crate::Symbol;

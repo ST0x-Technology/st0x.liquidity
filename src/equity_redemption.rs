@@ -219,9 +219,7 @@ impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::VaultWithdrawn { .. } => "EquityRedemptionEvent::VaultWithdrawn".to_string(),
-            Self::TokensUnwrapped { .. } => {
-                "EquityRedemptionEvent::TokensUnwrapped".to_string()
-            }
+            Self::TokensUnwrapped { .. } => "EquityRedemptionEvent::TokensUnwrapped".to_string(),
             Self::TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
             Self::TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
             Self::DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
@@ -613,9 +611,7 @@ impl EventSourced for EquityRedemption {
             | Detect { .. }
             | FailDetection { .. }
             | Complete
-            | RejectRedemption { .. } => {
-                Err(EquityRedemptionError::NotStarted)
-            }
+            | RejectRedemption { .. } => Err(EquityRedemptionError::NotStarted),
         }
     }
 

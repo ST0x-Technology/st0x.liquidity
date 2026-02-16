@@ -85,7 +85,9 @@ mod tests {
 
     use super::*;
     use crate::alpaca_broker_api::TimeInForce;
-    use crate::alpaca_broker_api::auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));

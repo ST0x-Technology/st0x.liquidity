@@ -375,7 +375,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let handle = spawn_rebalancer(
         rebalancing_ctx,
         provider.clone(),
-        addresses,
+        market_maker_wallet,
         operation_receiver,
         frameworks,
         raindex_service.clone(),
