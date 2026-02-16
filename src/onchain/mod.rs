@@ -48,11 +48,11 @@ pub(crate) struct EvmSecrets {
 }
 
 #[derive(Clone)]
-pub(crate) struct EvmCtx {
-    pub(crate) ws_rpc_url: Url,
-    pub(crate) orderbook: Address,
-    pub(crate) order_owner: Option<Address>,
-    pub(crate) deployment_block: u64,
+pub struct EvmCtx {
+    pub ws_rpc_url: Url,
+    pub orderbook: Address,
+    pub order_owner: Option<Address>,
+    pub deployment_block: u64,
 }
 
 impl std::fmt::Debug for EvmCtx {

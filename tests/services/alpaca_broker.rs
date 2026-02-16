@@ -64,9 +64,11 @@ impl AlpacaBrokerMock {
     }
 
     /// Mocks a successful equity order placement returning `order_id` with
-    /// status "new".
-    pub fn mock_place_equity_order(&self, order_id: &str) {
+    /// status "new". The response includes the given `symbol` and `side`.
+    pub fn mock_place_equity_order(&self, order_id: &str, symbol: &str, side: &str) {
         let order_id = order_id.to_string();
+        let symbol = symbol.to_string();
+        let side = side.to_string();
 
         self.server.mock(|when, then| {
             when.method(POST)
@@ -75,9 +77,9 @@ impl AlpacaBrokerMock {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "id": order_id,
-                    "symbol": "AAPL",
+                    "symbol": symbol,
                     "qty": "100",
-                    "side": "buy",
+                    "side": side,
                     "status": "new",
                     "filled_avg_price": null
                 }));

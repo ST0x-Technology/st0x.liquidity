@@ -21,12 +21,15 @@ use st0x_execution::{
 };
 
 use crate::offchain::order_poller::OrderPollerCtx;
-use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
+use crate::onchain::{EvmConfig, EvmSecrets};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
 };
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
-use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
+use crate::threshold::{InvalidThresholdError, Usdc};
+
+pub use crate::onchain::EvmCtx;
+pub use crate::threshold::ExecutionThreshold;
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -95,16 +98,16 @@ enum BrokerSecrets {
 /// encrypted secrets, and derived runtime state.
 #[derive(Clone)]
 pub struct Ctx {
-    pub(crate) database_url: String,
+    pub database_url: String,
     pub log_level: LogLevel,
-    pub(crate) server_port: u16,
-    pub(crate) evm: EvmCtx,
-    pub(crate) order_polling_interval: u64,
-    pub(crate) order_polling_max_jitter: u64,
-    pub(crate) broker: BrokerCtx,
+    pub server_port: u16,
+    pub evm: EvmCtx,
+    pub order_polling_interval: u64,
+    pub order_polling_max_jitter: u64,
+    pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    pub(crate) rebalancing: Option<RebalancingCtx>,
-    pub(crate) execution_threshold: ExecutionThreshold,
+    pub rebalancing: Option<RebalancingCtx>,
+    pub execution_threshold: ExecutionThreshold,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -126,7 +129,7 @@ impl BrokerCtx {
         }
     }
 
-    fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
+    pub fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
             Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(
                 Positive::<FractionalShares>::ONE,
@@ -438,8 +441,6 @@ pub(crate) mod tests {
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
-    use crate::onchain::EvmCtx;
-    use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 

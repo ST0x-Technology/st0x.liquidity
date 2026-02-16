@@ -68,7 +68,7 @@ pub(crate) struct RebalancingConfig {
 /// Runtime configuration for rebalancing operations.
 /// Constructed from `RebalancingConfig` + `RebalancingSecrets` + broker's `AlpacaBrokerApiCtx`.
 #[derive(Clone)]
-pub(crate) struct RebalancingCtx {
+pub struct RebalancingCtx {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
     /// Issuer's wallet for tokenized equity redemptions.
