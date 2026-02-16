@@ -222,57 +222,6 @@ where
         Ok(receipt.transaction_hash)
     }
 
-    /// Withdraws tokens from a Rain OrderBook vault.
-    ///
-    /// # Parameters
-    ///
-    /// * `token` - ERC20 token address to withdraw
-    /// * `vault_id` - Source vault identifier
-    /// * `target_amount` - Target amount of tokens to withdraw (in token's base units)
-    /// * `decimals` - Token decimals for float conversion
-    ///
-    /// # Errors
-    ///
-    /// Returns `RaindexError::ZeroAmount` if target_amount is zero.
-    /// Returns `RaindexError::Float` if amount cannot be converted to float format.
-    /// Returns `RaindexError::Transaction` or `RaindexError::Contract` for blockchain errors.
-    pub(crate) async fn withdraw(
-        &self,
-        token: Address,
-        vault_id: RaindexVaultId,
-        target_amount: U256,
-        decimals: u8,
-    ) -> Result<TxHash, RaindexError> {
-        if target_amount.is_zero() {
-            return Err(RaindexError::ZeroAmount);
-        }
-
-        let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
-
-        let tasks = Vec::new();
-
-        let pending = match self
-            .orderbook
-            .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(error) => return Err(handle_contract_error(error).await),
-        };
-
-        // Wait for confirmations to ensure state propagates across load-balanced
-        // RPC nodes before subsequent operations that depend on the withdrawal
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
-            .await?;
-
-        ensure_receipt_success(&receipt)?;
-
-        Ok(receipt.transaction_hash)
-    }
-
     /// Deposits USDC to a Rain OrderBook vault on Base.
     ///
     /// Convenience method that calls `deposit` with the Base USDC address and decimals.

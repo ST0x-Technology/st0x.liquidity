@@ -77,6 +77,7 @@
 
 mod lifecycle;
 mod projection;
+mod reactor;
 mod schema_registry;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;

@@ -25,7 +25,7 @@ use st0x_event_sorcery::{Projection, Store, StoreBuilder, Unwired, deps};
 
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::{EquityRedemption, RedemptionServices};
-use crate::inventory::InventoryView;
+use crate::inventory::{InventorySnapshot, InventorySnapshotReactor, InventoryView};
 use crate::position::Position;
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
 use crate::tokenized_equity_mint::{MintServices, TokenizedEquityMint};
@@ -49,6 +49,7 @@ type EventBroadcasterDeps = deps![TokenizedEquityMint, EquityRedemption, UsdcReb
 pub(super) struct QueryManifest {
     rebalancing_trigger: Unwired<RebalancingTrigger, RebalancingTriggerDeps>,
     event_broadcaster: Unwired<EventBroadcaster, EventBroadcasterDeps>,
+    inventory: Arc<RwLock<InventoryView>>,
 }
 
 /// All query processors after wiring is complete.
@@ -62,6 +63,7 @@ pub(super) struct BuiltFrameworks {
     pub(super) mint: Store<TokenizedEquityMint>,
     pub(super) redemption: Store<EquityRedemption>,
     pub(super) usdc: Store<UsdcRebalance>,
+    pub(super) snapshot: Store<InventorySnapshot>,
 }
 
 impl QueryManifest {
@@ -79,7 +81,7 @@ impl QueryManifest {
             vault_registry,
             orderbook,
             market_maker_wallet,
-            inventory,
+            inventory.clone(),
             operation_sender,
         );
 
@@ -88,6 +90,7 @@ impl QueryManifest {
         Self {
             rebalancing_trigger: Unwired::new(rebalancing_trigger),
             event_broadcaster: Unwired::new(event_broadcaster),
+            inventory,
         }
     }
 
@@ -105,6 +108,7 @@ impl QueryManifest {
         let Self {
             rebalancing_trigger,
             event_broadcaster,
+            inventory,
         } = self;
 
         let position_view = Projection::<Position>::sqlite(pool.clone())?;
@@ -130,14 +134,24 @@ impl QueryManifest {
                 .await?;
 
         let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) =
-            StoreBuilder::<UsdcRebalance>::new(pool)
+            StoreBuilder::<UsdcRebalance>::new(pool.clone())
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
                 .build(())
                 .await?;
 
-        let _rebalancing_trigger = rebalancing_trigger.into_inner();
+        let rebalancing_trigger = rebalancing_trigger.into_inner();
         let _event_broadcaster = event_broadcaster.into_inner();
+
+        let snapshot_reactor = InventorySnapshotReactor::new(inventory, Some(rebalancing_trigger));
+        let snapshot_unwired: Unwired<InventorySnapshotReactor, deps![InventorySnapshot]> =
+            Unwired::new(snapshot_reactor);
+
+        let (snapshot, (_snapshot_reactor, ())) =
+            StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                .wire(snapshot_unwired)
+                .build(())
+                .await?;
 
         Ok((
             BuiltFrameworks {
@@ -145,6 +159,7 @@ impl QueryManifest {
                 mint,
                 redemption,
                 usdc,
+                snapshot,
             },
             WiredQueries { position_view },
         ))

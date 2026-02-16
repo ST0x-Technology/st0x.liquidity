@@ -718,12 +718,10 @@ pub(crate) mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000000",
         );
 
-        let ctx = Ctx::from_toml(example_config_toml(), &secrets).unwrap();
-
-        let result = ctx.order_owner();
+        let error = Ctx::from_toml(example_config_toml(), &secrets).unwrap_err();
         assert!(
-            matches!(result, Err(CtxError::PrivateKeyDerivation(_))),
-            "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
+            matches!(error, CtxError::Rebalancing(_)),
+            "Expected Rebalancing error for zero private key, got {error:?}"
         );
     }
 

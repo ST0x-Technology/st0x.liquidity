@@ -546,6 +546,12 @@ is the source of truth for terminology and naming conventions.
   better dead code detection by the compiler and tooling. This makes the
   codebase easier to navigate and understand by making the relevance scope
   explicit
+- **Type Aliases**: Only add type aliases when clippy complains about type
+  complexity. Proactive type aliases obscure the actual types, making code
+  harder to understand without providing any additional type safety. If clippy
+  doesn't flag the type as too complex, the full type is clearer than an alias.
+  If you need to actually distinguish between different with the same internal
+  representation, add proper newtypes instead.
 
 ### CRITICAL: Financial Data Integrity
 

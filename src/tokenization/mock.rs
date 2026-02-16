@@ -26,9 +26,27 @@ pub(crate) enum MockCompletionOutcome {
     Rejected,
 }
 
+/// Configurable outcome for mint request.
+#[derive(Clone, Copy)]
+pub(crate) enum MockMintRequestOutcome {
+    Pending,
+    Rejected,
+    ApiError,
+}
+
+/// Configurable outcome for mint completion polling.
+#[derive(Clone, Copy)]
+pub(crate) enum MockMintPollOutcome {
+    Completed,
+    Rejected,
+    PollError,
+}
+
 pub(crate) struct MockTokenizer {
     redemption_wallet: Address,
     redemption_tx: TxHash,
+    mint_request_outcome: MockMintRequestOutcome,
+    mint_poll_outcome: MockMintPollOutcome,
     detection_outcome: Option<MockDetectionOutcome>,
     completion_outcome: Option<MockCompletionOutcome>,
 }
@@ -38,9 +56,21 @@ impl MockTokenizer {
         Self {
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
+            mint_request_outcome: MockMintRequestOutcome::Pending,
+            mint_poll_outcome: MockMintPollOutcome::Completed,
             detection_outcome: None,
             completion_outcome: None,
         }
+    }
+
+    pub(crate) fn with_mint_request_outcome(mut self, outcome: MockMintRequestOutcome) -> Self {
+        self.mint_request_outcome = outcome;
+        self
+    }
+
+    pub(crate) fn with_mint_poll_outcome(mut self, outcome: MockMintPollOutcome) -> Self {
+        self.mint_poll_outcome = outcome;
+        self
     }
 
     pub(crate) fn with_detection_outcome(mut self, outcome: MockDetectionOutcome) -> Self {
@@ -63,16 +93,37 @@ impl Tokenizer for MockTokenizer {
         _wallet: Address,
         _issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(TokenizationRequest::mock(
-            TokenizationRequestStatus::Pending,
-        ))
+        match self.mint_request_outcome {
+            MockMintRequestOutcome::Pending => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
+            )),
+            MockMintRequestOutcome::Rejected => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Rejected,
+            )),
+            MockMintRequestOutcome::ApiError => {
+                Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "mock mint request error".to_string(),
+                }))
+            }
+        }
     }
 
     async fn poll_mint_until_complete(
         &self,
         _id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(TokenizationRequest::mock_completed())
+        match self.mint_poll_outcome {
+            MockMintPollOutcome::Completed => Ok(TokenizationRequest::mock_completed()),
+            MockMintPollOutcome::Rejected => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Rejected,
+            )),
+            MockMintPollOutcome::PollError => Err(TokenizerError::Alpaca(
+                AlpacaTokenizationError::PollTimeout {
+                    elapsed: std::time::Duration::from_secs(60),
+                },
+            )),
+        }
     }
 
     fn redemption_wallet(&self) -> Address {

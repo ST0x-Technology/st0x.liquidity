@@ -9,7 +9,6 @@ mod manifest;
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
@@ -186,9 +185,9 @@ impl Conductor {
                 .await?,
         );
 
-        let (position, position_projection, rebalancer) =
+        let (position, position_projection, snapshot, rebalancer) =
             if let Some(rebalancing_ctx) = ctx.rebalancing_ctx() {
-                let (position, position_projection, rebalancer_handle) =
+                let (position, position_projection, snapshot, rebalancer_handle) =
                     spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
                         pool,
@@ -200,10 +199,16 @@ impl Conductor {
                     )
                     .await?;
 
-                (position, position_projection, Some(rebalancer_handle))
+                (
+                    position,
+                    position_projection,
+                    snapshot,
+                    Some(rebalancer_handle),
+                )
             } else {
                 let (position, position_projection) = build_position_cqrs(pool).await?;
-                (position, position_projection, None)
+                let snapshot = build_inventory_snapshot_store(pool, inventory.clone()).await?;
+                (position, position_projection, snapshot, None)
             };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
@@ -216,8 +221,6 @@ impl Conductor {
                 .build(order_placer)
                 .await?,
         );
-
-        let snapshot = build_inventory_snapshot_store(pool, inventory.clone()).await?;
 
         let frameworks = CqrsFrameworks {
             onchain_trade,
@@ -309,12 +312,12 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 ) -> anyhow::Result<(
     Arc<Store<Position>>,
     Arc<Projection<Position>>,
+    Store<InventorySnapshot>,
     JoinHandle<()>,
 )> {
     info!("Initializing rebalancing infrastructure");
 
-    let market_maker_wallet =
-        PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?.address();
+    let market_maker_wallet = rebalancing_ctx.market_maker_wallet;
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -385,6 +388,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     Ok((
         Arc::new(built.position),
         Arc::new(wired.position_view),
+        built.snapshot,
         handle,
     ))
 }

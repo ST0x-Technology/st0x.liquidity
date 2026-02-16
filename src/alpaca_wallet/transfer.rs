@@ -326,51 +326,19 @@ mod tests {
         withdrawal_mock.assert();
     }
 
-    #[tokio::test]
-    async fn test_initiate_withdrawal_zero_amount() {
-        let server = MockServer::start();
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let error = initiate_withdrawal(
-            &client,
-            Decimal::ZERO,
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await
-        .unwrap_err();
+    #[test]
+    fn test_initiate_withdrawal_zero_amount() {
         assert!(matches!(
-            error,
-            AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::ZERO
+            Positive::new(Usdc(Decimal::ZERO)).unwrap_err(),
+            InvalidSharesError::NonPositive(value) if value == Decimal::ZERO
         ));
     }
 
-    #[tokio::test]
-    async fn test_initiate_withdrawal_negative_amount() {
-        let server = MockServer::start();
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let error = initiate_withdrawal(
-            &client,
-            Decimal::new(-100, 0),
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await
-        .unwrap_err();
+    #[test]
+    fn test_initiate_withdrawal_negative_amount() {
         assert!(matches!(
-            error,
-            AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::new(-100, 0)
+            Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err(),
+            InvalidSharesError::NonPositive(value) if value == Decimal::new(-100, 0)
         ));
     }
 
@@ -394,14 +362,13 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let error = initiate_withdrawal(
-            &client,
-            Decimal::new(100, 0),
-            "INVALID",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await
-        .unwrap_err();
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let asset = TokenSymbol::new("INVALID");
+        let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let error = initiate_withdrawal(&client, amount, &asset, &addr)
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -431,7 +398,11 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let error = initiate_withdrawal(&client, Decimal::new(100, 0), "USDC", "invalid_address")
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let asset = TokenSymbol::new("USDC");
+        let addr = address!("0x0000000000000000000000000000000000000000");
+
+        let error = initiate_withdrawal(&client, amount, &asset, &addr)
             .await
             .unwrap_err();
 
@@ -459,14 +430,13 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let error = initiate_withdrawal(
-            &client,
-            Decimal::new(100, 0),
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await
-        .unwrap_err();
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let asset = TokenSymbol::new("USDC");
+        let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let error = initiate_withdrawal(&client, amount, &asset, &addr)
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,

@@ -562,6 +562,7 @@ mod tests {
                 ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 usdc_vault_id: B256::ZERO,
                 redemption_wallet: Address::ZERO,
+                market_maker_wallet: Address::ZERO,
                 alpaca_account_id,
                 equity: ImbalanceThreshold {
                     target: dec!(0.5),

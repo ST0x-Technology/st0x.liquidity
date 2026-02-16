@@ -783,9 +783,10 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::TestHarness;
+    use st0x_event_sorcery::{LifecycleError, TestHarness};
 
     use super::*;
+    use crate::onchain::mock::MockRaindex;
     use crate::onchain::raindex::{Raindex, RaindexError, RaindexVaultId};
 
     #[test]
@@ -1000,6 +1001,150 @@ mod tests {
         ) -> Result<TxHash, RaindexError> {
             unreachable!()
         }
+    }
+
+    use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
+
+    fn mint_services(tokenizer: MockTokenizer) -> MintServices {
+        MintServices {
+            tokenizer: Arc::new(tokenizer),
+            raindex: Arc::new(MockRaindex::new()),
+        }
+    }
+
+    fn mint_command() -> TokenizedEquityMintCommand {
+        TokenizedEquityMintCommand::Mint {
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(10),
+            wallet: Address::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_mint_happy_path_emits_requested_accepted_tokens_received() {
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], TokenizedEquityMintEvent::MintRequested { symbol, .. } if symbol == &Symbol::new("AAPL").unwrap()),
+            "Expected MintRequested, got: {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], TokenizedEquityMintEvent::MintAccepted { .. }),
+            "Expected MintAccepted, got: {:?}",
+            events[1]
+        );
+        assert!(
+            matches!(&events[2], TokenizedEquityMintEvent::TokensReceived { shares_minted, .. } if *shares_minted == U256::from(10_000_000_000_000_000_000_u128)),
+            "Expected TokensReceived, got: {:?}",
+            events[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_mint_immediate_rejection_emits_requested_and_rejected() {
+        let tokenizer =
+            MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::Rejected);
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(tokenizer))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], TokenizedEquityMintEvent::MintRequested { .. }),
+            "Expected MintRequested, got: {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], TokenizedEquityMintEvent::MintRejected { reason, .. } if reason == "Rejected by Alpaca"),
+            "Expected MintRejected, got: {:?}",
+            events[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_mint_api_error_returns_request_failed() {
+        let tokenizer =
+            MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError);
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(tokenizer))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::RequestFailed)
+            ),
+            "Expected RequestFailed, got: {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_mint_poll_failure_emits_acceptance_failed() {
+        let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::PollError);
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(tokenizer))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], TokenizedEquityMintEvent::MintRequested { .. }),
+            "Expected MintRequested, got: {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], TokenizedEquityMintEvent::MintAccepted { .. }),
+            "Expected MintAccepted, got: {:?}",
+            events[1]
+        );
+        assert!(
+            matches!(&events[2], TokenizedEquityMintEvent::MintAcceptanceFailed { reason, .. } if reason.contains("Polling failed")),
+            "Expected MintAcceptanceFailed, got: {:?}",
+            events[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_mint_post_acceptance_rejection_emits_acceptance_failed() {
+        let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected);
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(tokenizer))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], TokenizedEquityMintEvent::MintRequested { .. }),
+            "Expected MintRequested, got: {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], TokenizedEquityMintEvent::MintAccepted { .. }),
+            "Expected MintAccepted, got: {:?}",
+            events[1]
+        );
+        assert!(
+            matches!(
+                &events[2],
+                TokenizedEquityMintEvent::MintAcceptanceFailed { reason, .. }
+                    if reason == "Rejected by Alpaca after acceptance"
+            ),
+            "Expected MintAcceptanceFailed with rejection reason, got: {:?}",
+            events[2]
+        );
     }
 
     fn services_with_failing_lookup() -> MintServices {

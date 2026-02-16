@@ -87,6 +87,8 @@ pub(crate) struct RebalancingCtx {
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
+    /// Derived once from `evm_private_key` during construction.
+    pub(crate) market_maker_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
@@ -107,18 +109,17 @@ impl RebalancingCtx {
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
+        let market_maker_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)?.address();
 
-        if let Ok(signer) = PrivateKeySigner::from_bytes(&secrets.evm_private_key) {
-            let market_maker_wallet = signer.address();
-            if market_maker_wallet == config.redemption_wallet {
-                return Err(RebalancingCtxError::WalletCollision(market_maker_wallet));
-            }
+        if market_maker_wallet == config.redemption_wallet {
+            return Err(RebalancingCtxError::WalletCollision(market_maker_wallet));
         }
 
         Ok(Self {
             equity: config.equity,
             usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
+            market_maker_wallet,
             ethereum_rpc_url: secrets.ethereum_rpc_url,
             evm_private_key: secrets.evm_private_key,
             usdc_vault_id: config.usdc_vault_id,
@@ -134,6 +135,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
+            .field("market_maker_wallet", &self.market_maker_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
@@ -1090,53 +1092,6 @@ mod tests {
         );
     }
 
-    /// Verifies that events arriving without MintRequested (incremental dispatch)
-    /// still update inventory correctly. This is the fix for the double-triggering bug
-    /// where inventory wasn't updated when events arrived in separate batches.
-    #[tokio::test]
-    async fn incremental_dispatch_updates_inventory() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.1),
-        };
-
-        // Start with imbalanced inventory: 30 onchain, 70 offchain.
-        let mut inventory = InventoryView::default().with_equity(symbol.clone());
-        inventory = inventory
-            .apply_position_event(&symbol, &make_onchain_fill(shares(30), Direction::Buy))
-            .unwrap();
-        inventory = inventory
-            .apply_position_event(&symbol, &make_offchain_fill(shares(70), Direction::Buy))
-            .unwrap();
-
-        // Verify initial state has no inflight (check_equity_imbalance returns Some).
-        assert!(
-            inventory
-                .check_equity_imbalance(&symbol, &threshold)
-                .is_some()
-        );
-
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
-
-        // Simulate incremental dispatch: MintAccepted arrives WITHOUT MintRequested.
-        // Before the fix, this would log a warning and skip inventory update.
-        // After the fix, inventory should be updated.
-        let events = vec![make_mint_envelope(make_mint_accepted(&symbol, dec!(30)))];
-        trigger.dispatch("mint-123", &events).await;
-
-        // Verify inventory was updated: offchain should have inflight now.
-        // When inflight exists, check_equity_imbalance returns None.
-        let has_imbalance = {
-            let inventory = trigger.inventory.read().await;
-            inventory.check_equity_imbalance(&symbol, &threshold)
-        };
-        assert!(
-            has_imbalance.is_none(),
-            "Expected inflight to block imbalance detection after MintAccepted dispatch"
-        );
-    }
-
     #[tokio::test]
     async fn mint_completion_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -1187,36 +1142,6 @@ mod tests {
         assert!(RebalancingTrigger::is_terminal_mint_event(
             &make_mint_acceptance_failed()
         ));
-    }
-
-    #[tokio::test]
-    async fn terminal_mint_event_in_isolation_clears_in_progress_flag() {
-        // This test verifies that when MintCompleted arrives in a separate dispatch
-        // (without MintRequested in the same batch), the in_progress flag is still cleared.
-        // This simulates what happens when Finalize command is executed.
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
-
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
-
-        // Mark symbol as in-progress (as if a mint was triggered).
-        {
-            let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
-        }
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
-
-        // Dispatch ONLY MintCompleted - no MintRequested in this batch.
-        // This is what happens when Finalize command produces MintCompleted.
-        let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
-
-        trigger.dispatch("test-aggregate-id", &events).await;
-
-        // The in_progress flag should be cleared even though MintRequested wasn't in this batch.
-        assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
-            "in_progress flag should be cleared when terminal event has symbol"
-        );
     }
 
     #[test]
