@@ -285,7 +285,7 @@ impl EventSourced for EquityRedemption {
     type Services = RedemptionServices;
 
     const AGGREGATE_TYPE: &'static str = "EquityRedemption";
-    const PROJECTION: Option<Table> = None;
+    const PROJECTION: Option<Table> = Some(Table("equity_redemption_view"));
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -714,7 +714,7 @@ pub(crate) mod tests {
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(EquityRedemptionError::TokensNotSent)
+            LifecycleError::Apply(EquityRedemptionError::NotStarted)
         ));
     }
 
@@ -728,7 +728,7 @@ pub(crate) mod tests {
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(EquityRedemptionError::NotPending)
+            LifecycleError::Apply(EquityRedemptionError::NotStarted)
         ));
     }
 
@@ -737,7 +737,7 @@ pub(crate) mod tests {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![vault_withdrawn_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::FailDetection {
-                reason: "Alpaca timeout".to_string(),
+                failure: DetectionFailure::Timeout,
             })
             .await
             .events();
@@ -760,9 +760,7 @@ pub(crate) mod tests {
                 tokens_sent_event(),
                 detected_event(),
             ])
-            .when(EquityRedemptionCommand::RejectRedemption {
-                reason: "Insufficient balance".to_string(),
-            })
+            .when(EquityRedemptionCommand::RejectRedemption)
             .await
             .events();
 
@@ -777,9 +775,7 @@ pub(crate) mod tests {
     async fn cannot_reject_redemption_before_pending() {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![vault_withdrawn_event(), tokens_sent_event()])
-            .when(EquityRedemptionCommand::RejectRedemption {
-                reason: "Cannot reject yet".to_string(),
-            })
+            .when(EquityRedemptionCommand::RejectRedemption)
             .await
             .then_expect_error();
 

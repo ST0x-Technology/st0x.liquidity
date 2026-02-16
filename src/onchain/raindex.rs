@@ -432,7 +432,34 @@ where
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        Self::withdraw(self, token, vault_id, target_amount, decimals).await
+        if target_amount.is_zero() {
+            return Err(RaindexError::ZeroAmount);
+        }
+
+        let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
+
+        let tasks = Vec::new();
+
+        let pending = match self
+            .orderbook
+            .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
+            .send()
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => return Err(handle_contract_error(error).await),
+        };
+
+        // Wait for confirmations to ensure state propagates across load-balanced
+        // RPC nodes before subsequent operations that depend on the withdrawal
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
+
+        ensure_receipt_success(&receipt)?;
+
+        Ok(receipt.transaction_hash)
     }
 }
 
@@ -474,8 +501,6 @@ mod tests {
 
     use super::*;
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
-    use crate::vault_registry::VaultRegistry;
-
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
 
@@ -624,13 +649,8 @@ mod tests {
         owner: Address,
     ) -> RaindexService<LocalEvmProvider> {
         let pool = crate::test_utils::setup_test_db().await;
-        let vault_registry_view_repo =
-            Arc::new(SqliteViewRepository::<VaultRegistry, VaultRegistry>::new(
-                pool,
-                "vault_registry_view".to_string(),
-            ));
         let vault_registry_projection: Arc<VaultRegistryProjection> =
-            Arc::new(GenericQuery::new(vault_registry_view_repo));
+            Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
 
         RaindexService::new(
             provider,

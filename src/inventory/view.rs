@@ -974,6 +974,42 @@ mod tests {
         assert!(inventory.detect_imbalance(&thresh).is_none());
     }
 
+    #[test]
+    fn detect_imbalance_returns_none_when_onchain_not_initialized() {
+        let inventory = Inventory::<FractionalShares> {
+            onchain: None,
+            offchain: Some(venue(50, 0)),
+            last_rebalancing: None,
+        };
+        let thresh = threshold("0.5", "0.2");
+
+        assert!(inventory.detect_imbalance(&thresh).is_none());
+    }
+
+    #[test]
+    fn detect_imbalance_returns_none_when_offchain_not_initialized() {
+        let inventory = Inventory::<FractionalShares> {
+            onchain: Some(venue(50, 0)),
+            offchain: None,
+            last_rebalancing: None,
+        };
+        let thresh = threshold("0.5", "0.2");
+
+        assert!(inventory.detect_imbalance(&thresh).is_none());
+    }
+
+    #[test]
+    fn detect_imbalance_returns_none_when_neither_venue_initialized() {
+        let inventory = Inventory::<FractionalShares> {
+            onchain: None,
+            offchain: None,
+            last_rebalancing: None,
+        };
+        let thresh = threshold("0.5", "0.2");
+
+        assert!(inventory.detect_imbalance(&thresh).is_none());
+    }
+
     fn usdc_venue(available: i64, inflight: i64) -> VenueBalance<Usdc> {
         VenueBalance::new(
             Usdc(Decimal::from(available)),
@@ -1190,24 +1226,16 @@ mod tests {
         }
     }
 
-    fn make_mint_accepted(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_mint_accepted() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
-            symbol: symbol.clone(),
-            quantity,
             issuer_request_id: IssuerRequestId::new("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
     }
 
-    fn make_tokens_received(
-        symbol: &Symbol,
-        quantity: Decimal,
-        shares_minted: U256,
-    ) -> TokenizedEquityMintEvent {
+    fn make_tokens_received(shares_minted: U256) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::TokensReceived {
-            symbol: symbol.clone(),
-            quantity,
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted,
@@ -1215,36 +1243,28 @@ mod tests {
         }
     }
 
-    fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::Completed {
-            symbol: symbol.clone(),
-            quantity,
+    fn make_mint_completed() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintCompleted {
             completed_at: Utc::now(),
         }
     }
 
-    fn make_mint_rejected(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_mint_rejected() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRejected {
-            symbol: symbol.clone(),
-            quantity,
-            status_code: None,
+            reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         }
     }
 
-    fn make_mint_acceptance_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
-            symbol: symbol.clone(),
-            quantity,
-            last_status: TokenizationRequestStatus::Pending,
+            reason: "test acceptance failure".to_string(),
             failed_at: Utc::now(),
         }
     }
 
-    fn make_deposited_into_raindex(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::DepositedIntoRaindex {
-            symbol: symbol.clone(),
-            quantity,
+    fn make_vault_deposited() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::VaultDeposited {
             vault_deposit_tx_hash: TxHash::random(),
             deposited_at: Utc::now(),
         }
@@ -1284,7 +1304,7 @@ mod tests {
     fn apply_mint_accepted_moves_offchain_to_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
-        let event = make_mint_accepted(&symbol, dec!(30));
+        let event = make_mint_accepted();
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
@@ -1307,11 +1327,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // Start with 30 shares inflight offchain (simulating post-MintAccepted state)
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 70, 30))]);
-        let event = make_tokens_received(
-            &symbol,
-            dec!(30),
-            U256::from(30_000_000_000_000_000_000_u128),
-        );
+        let event = make_tokens_received(U256::from(30_000_000_000_000_000_000_u128));
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
@@ -1333,7 +1349,7 @@ mod tests {
     fn apply_mint_completed_updates_last_rebalancing() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_mint_completed(&symbol, dec!(30));
+        let event = make_mint_completed();
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(0), Utc::now())
@@ -1347,7 +1363,7 @@ mod tests {
     fn apply_mint_rejected_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
-        let event = make_mint_rejected(&symbol, dec!(30));
+        let event = make_mint_rejected();
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
@@ -1370,7 +1386,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: 130 onchain (100 original + 30 minted), 70 offchain
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_deposited_into_raindex(&symbol, dec!(30));
+        let event = make_vault_deposited();
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
@@ -1419,7 +1435,7 @@ mod tests {
     fn apply_mint_acceptance_failed_cancels_inflight_back_to_available() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 70, 30))]);
-        let event = make_mint_acceptance_failed(&symbol, dec!(30));
+        let event = make_mint_acceptance_failed();
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
@@ -1466,12 +1482,7 @@ mod tests {
 
         // MintAccepted: Move 30 from offchain available to inflight
         let view = view
-            .apply_mint_event(
-                &symbol,
-                &make_mint_accepted(&symbol, dec!(30)),
-                quantity,
-                Utc::now(),
-            )
+            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1488,11 +1499,7 @@ mod tests {
         let view = view
             .apply_mint_event(
                 &symbol,
-                &make_tokens_received(
-                    &symbol,
-                    dec!(30),
-                    U256::from(30_000_000_000_000_000_000_u128),
-                ),
+                &make_tokens_received(U256::from(30_000_000_000_000_000_000_u128)),
                 quantity,
                 Utc::now(),
             )
@@ -1510,12 +1517,7 @@ mod tests {
 
         // MintCompleted: Update last_rebalancing
         let view = view
-            .apply_mint_event(
-                &symbol,
-                &make_mint_completed(&symbol, dec!(30)),
-                shares(0),
-                Utc::now(),
-            )
+            .apply_mint_event(&symbol, &make_mint_completed(), shares(0), Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert!(inventory.last_rebalancing.is_some());
@@ -1538,12 +1540,7 @@ mod tests {
             .unwrap();
 
         let view = view
-            .apply_mint_event(
-                &symbol,
-                &make_mint_accepted(&symbol, dec!(30)),
-                quantity,
-                Utc::now(),
-            )
+            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert!(inventory.has_inflight());
@@ -1551,7 +1548,7 @@ mod tests {
         let view = view
             .apply_mint_event(
                 &symbol,
-                &make_mint_acceptance_failed(&symbol, dec!(30)),
+                &make_mint_acceptance_failed(),
                 quantity,
                 Utc::now(),
             )
@@ -1585,22 +1582,13 @@ mod tests {
             .unwrap();
 
         let view = view
-            .apply_mint_event(
-                &symbol,
-                &make_mint_accepted(&symbol, dec!(30)),
-                quantity,
-                Utc::now(),
-            )
+            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
 
         let view = view
             .apply_mint_event(
                 &symbol,
-                &make_tokens_received(
-                    &symbol,
-                    dec!(30),
-                    U256::from(30_000_000_000_000_000_000_u128),
-                ),
+                &make_tokens_received(U256::from(30_000_000_000_000_000_000_u128)),
                 quantity,
                 Utc::now(),
             )

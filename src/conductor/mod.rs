@@ -28,11 +28,11 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
-use st0x_event_sorcery::{Cons, Nil, Projection, SendError, Store, StoreBuilder, Unwired};
+use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder, Unwired, deps};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
-use crate::equity_redemption::{EquityRedemption, RedemptionServices};
+use crate::equity_redemption::RedemptionServices;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
 };
@@ -55,7 +55,7 @@ use crate::queue::{
 use crate::rebalancing::redemption::service::RedemptionService;
 use crate::rebalancing::{
     RebalancerAddresses, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig,
-    RedemptionDependencies, spawn_rebalancer,
+    RedemptionCqrs, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -134,33 +134,8 @@ where
     result
 }
 
-async fn handle_market_close<E>(
-    conductor: &mut Conductor,
-    executor: E,
-    ctx: Ctx,
-    pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    info!("Market closed, shutting down trading tasks");
-    conductor.abort_trading_tasks();
-    let next_maintenance = conductor.executor_maintenance.take();
-    info!("Trading tasks shutdown, DEX events buffering");
-    Box::pin(run_market_hours_loop(
-        executor,
-        ctx,
-        pool,
-        next_maintenance,
-        event_sender,
-    ))
-    .await
-}
-
 /// Context for vault discovery operations during trade processing.
-struct VaultDiscoveryCtx<'a> {
+pub(super) struct VaultDiscoveryCtx<'a> {
     vault_registry: &'a Store<VaultRegistry>,
     orderbook: Address,
     order_owner: Address,
@@ -213,9 +188,6 @@ impl Conductor {
 
         let (position, position_projection, rebalancer) =
             if let Some(rebalancing_ctx) = ctx.rebalancing_ctx() {
-                let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-                let market_maker_wallet = signer.address();
-
                 let (position, position_projection, rebalancer_handle) =
                     spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
@@ -224,7 +196,6 @@ impl Conductor {
                         &inventory,
                         event_sender,
                         &provider,
-                        market_maker_wallet,
                         vault_registry.clone(),
                     )
                     .await?;
@@ -334,7 +305,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     inventory: &Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
-    market_maker_wallet: Address,
     vault_registry: Arc<Store<VaultRegistry>>,
 ) -> anyhow::Result<(
     Arc<Store<Position>>,
@@ -342,6 +312,9 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     JoinHandle<()>,
 )> {
     info!("Initializing rebalancing infrastructure");
+
+    let market_maker_wallet =
+        PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?.address();
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -379,26 +352,19 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
             equity: rebalancing_ctx.equity_threshold,
             usdc: rebalancing_ctx.usdc.clone(),
         },
-        pool.clone(),
         vault_registry,
         ctx.evm.orderbook,
         market_maker_wallet,
         inventory.clone(),
         operation_sender,
         event_sender,
-    )?;
+    );
 
     let (built, wired) = manifest.wire(pool.clone(), mint_services, redeemer).await?;
 
     let frameworks = RebalancingCqrsFrameworks {
         mint: Arc::new(built.mint),
         usdc: Arc::new(built.usdc),
-    };
-
-    let redemption_deps = RedemptionDependencies {
-        raindex_service: raindex_service.clone(),
-        cqrs: Arc::new(built.redemption),
-        projection: Arc::new(Projection::<EquityRedemption>::sqlite(pool.clone())?),
     };
 
     let addresses = RebalancerAddresses {
@@ -411,7 +377,10 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         addresses,
         operation_receiver,
         frameworks,
-        redemption_deps,
+        raindex_service.clone(),
+        RedemptionCqrs {
+            cqrs: Arc::new(built.redemption),
+        },
     )
     .await?;
 
@@ -1372,8 +1341,6 @@ where
             "Executing accumulated position"
         );
 
-        // TODO: add broker rejection handling (load_offchain_order_failure +
-        // execute_fail_offchain_order_position) like in place_offchain_order
         let command = PositionCommand::PlaceOffChainOrder {
             offchain_order_id,
             shares: execution.shares,
@@ -1413,6 +1380,24 @@ where
                 symbol = %execution.symbol,
                 "OffchainOrder::Place failed: {error}"
             ),
+        }
+
+        if let Ok(Some(OffchainOrder::Failed { error, .. })) =
+            offchain_order.load(&offchain_order_id).await
+        {
+            warn!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                %error,
+                "Broker rejected order, clearing position pending state"
+            );
+            execute_fail_offchain_order_position(
+                position,
+                offchain_order_id,
+                &execution,
+                error,
+            )
+            .await;
         }
     }
 
@@ -1591,23 +1576,18 @@ mod tests {
 
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
+        let executor = MockExecutor::new();
         let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
+            executor: &executor,
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        let result = process_next_queued_event(
-            &MockExecutor::new(),
-            &config,
-            &pool,
-            &provider,
-            &cqrs,
-            &queue_context,
-        )
-        .await;
+        let result =
+            process_next_queued_event(&config, &pool, &provider, &cqrs, &queue_context).await;
 
         assert_eq!(result.unwrap(), None);
 
@@ -1648,24 +1628,19 @@ mod tests {
 
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
+        let executor = MockExecutor::new();
         let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
+            executor: &executor,
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        process_next_queued_event(
-            &MockExecutor::new(),
-            &config,
-            &pool,
-            &provider,
-            &cqrs,
-            &queue_context,
-        )
-        .await
-        .unwrap();
+        process_next_queued_event(&config, &pool, &provider, &cqrs, &queue_context)
+            .await
+            .unwrap();
 
         assert!(logs_contain("Event filtered out"));
     }
@@ -1703,24 +1678,19 @@ mod tests {
 
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
+        let executor = MockExecutor::new();
         let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
+            executor: &executor,
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        process_next_queued_event(
-            &MockExecutor::new(),
-            &config,
-            &pool,
-            &provider,
-            &cqrs,
-            &queue_context,
-        )
-        .await
-        .unwrap();
+        process_next_queued_event(&config, &pool, &provider, &cqrs, &queue_context)
+            .await
+            .unwrap();
 
         assert!(logs_contain("ClearV3"));
     }
@@ -1739,7 +1709,7 @@ mod tests {
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
 
-        let conductor = ConductorBuilder::new(
+        let mut conductor = ConductorBuilder::new(
             config,
             pool,
             cache,
@@ -1752,7 +1722,7 @@ mod tests {
         .with_dex_event_streams(clear_stream, take_stream)
         .spawn();
 
-        conductor.abort_all_tasks();
+        conductor.abort_all();
     }
 
     #[tokio::test]
@@ -1804,7 +1774,7 @@ mod tests {
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
 
-        let conductor = ConductorBuilder::new(
+        let mut conductor = ConductorBuilder::new(
             config,
             pool,
             cache,
@@ -1823,7 +1793,7 @@ mod tests {
         assert!(!tasks.position_checker.is_finished());
         assert!(!tasks.queue_processor.is_finished());
 
-        conductor.abort_all_tasks();
+        conductor.abort_all();
     }
 
     #[tokio::test]
@@ -1840,7 +1810,7 @@ mod tests {
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
 
-        let conductor = ConductorBuilder::new(
+        let mut conductor = ConductorBuilder::new(
             config,
             pool,
             cache,
@@ -1855,7 +1825,7 @@ mod tests {
 
         assert!(conductor.rebalancer.is_none());
 
-        conductor.abort_all_tasks();
+        conductor.abort_all();
     }
 
     #[tokio::test]
@@ -1878,7 +1848,7 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(
+        let mut conductor = ConductorBuilder::new(
             config,
             pool,
             cache,
@@ -1894,7 +1864,7 @@ mod tests {
 
         assert!(conductor.rebalancer.is_some());
 
-        conductor.abort_all_tasks();
+        conductor.abort_all();
     }
 
     #[tokio::test]
@@ -1917,7 +1887,7 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(
+        let mut conductor = ConductorBuilder::new(
             config,
             pool,
             cache,
@@ -1934,7 +1904,7 @@ mod tests {
         let rebalancer_handle = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_handle.is_finished());
 
-        conductor.abort_all_tasks();
+        conductor.abort_all();
     }
 
     #[tokio::test]
@@ -1981,18 +1951,19 @@ mod tests {
         assert!(conductor.trading_tasks.is_none());
 
         // Clean up remaining infrastructure tasks
-        abort_all_conductor_tasks(conductor);
+        conductor.abort_all();
     }
 
     #[tokio::test]
     async fn test_conductor_trading_tasks_aborted_on_abort_trading_tasks() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -2031,7 +2002,7 @@ mod tests {
         assert!(event_processor.is_finished());
         assert!(conductor.trading_tasks.is_none());
 
-        abort_all_conductor_tasks(conductor);
+        conductor.abort_all();
     }
 
     #[tokio::test]

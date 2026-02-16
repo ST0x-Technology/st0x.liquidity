@@ -298,7 +298,7 @@ pub type SendError<Entity> = AggregateError<LifecycleError<Entity>>;
 
 impl<Entity: EventSourced> From<LifecycleError<Entity>> for SendError<Entity> {
     fn from(error: LifecycleError<Entity>) -> Self {
-        AggregateError::UserError(error)
+        Self::UserError(error)
     }
 }
 

@@ -18,7 +18,7 @@ use st0x_event_sorcery::SendError;
 
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::onchain::raindex::RaindexError;
-use crate::tokenization::AlpacaTokenizationError;
+use crate::tokenization::{AlpacaTokenizationError, TokenizerError};
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
@@ -28,8 +28,8 @@ pub(crate) enum RedemptionError {
     Raindex(#[from] RaindexError),
     #[error(transparent)]
     Alpaca(#[from] AlpacaTokenizationError),
-    #[error("Token {token} not found in vault registry")]
-    VaultNotFound { token: Address },
+    #[error(transparent)]
+    Tokenizer(#[from] TokenizerError),
     #[error("Entity not found after command: {aggregate_id}")]
     EntityNotFound { aggregate_id: RedemptionAggregateId },
     #[error("Token send to Alpaca failed: {entity:?}")]

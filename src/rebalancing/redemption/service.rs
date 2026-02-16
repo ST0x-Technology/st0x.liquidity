@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::equity_redemption::{RedeemError, Redeemer};
 use crate::onchain::raindex::{Raindex, RaindexService};
-use crate::tokenization::AlpacaTokenizationService;
+use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
 
 /// Our tokenized equity tokens use 18 decimals.
 pub(super) const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
@@ -79,14 +79,15 @@ where
     ) -> Result<(Address, TxHash), RedeemError> {
         info!(%token, %amount, "Sending tokens for redemption");
 
-        let tx_hash = match self.alpaca.send_for_redemption(token, amount).await {
-            Ok(tx) => tx,
-            Err(error) => {
-                warn!(%error, %token, %amount, "Send for redemption failed");
-                return Err(RedeemError::SendForRedemption);
-            }
-        };
+        let tx_hash =
+            match Tokenizer::send_for_redemption(self.alpaca.as_ref(), token, amount).await {
+                Ok(tx) => tx,
+                Err(error) => {
+                    warn!(%error, %token, %amount, "Send for redemption failed");
+                    return Err(RedeemError::SendForRedemption);
+                }
+            };
 
-        Ok((self.alpaca.redemption_wallet(), tx_hash))
+        Ok((Tokenizer::redemption_wallet(self.alpaca.as_ref()), tx_hash))
     }
 }

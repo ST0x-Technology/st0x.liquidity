@@ -563,17 +563,19 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use sqlx::SqlitePool;
+    use st0x_event_sorcery::{TestStore, test_store};
     use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
     use uuid::uuid;
 
-    use sqlx::SqlitePool;
-    use st0x_event_sorcery::{TestStore, test_store};
-
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
+    use crate::equity_redemption::DetectionFailure;
+    use crate::inventory::{InventorySnapshotEvent, InventorySnapshotId, InventorySnapshotReactor};
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
@@ -602,7 +604,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+                Arc::new(test_store::<VaultRegistry>(pool, ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -760,7 +762,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+                Arc::new(test_store::<VaultRegistry>(pool, ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -998,46 +1000,36 @@ mod tests {
         }
     }
 
-    fn make_mint_accepted(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_mint_accepted() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
-            symbol: symbol.clone(),
-            quantity,
             issuer_request_id: IssuerRequestId::new("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
     }
 
-    fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::Completed {
-            symbol: symbol.clone(),
-            quantity,
+    fn make_mint_completed() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintCompleted {
             completed_at: Utc::now(),
         }
     }
 
-    fn make_mint_rejected(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_mint_rejected() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRejected {
-            symbol: symbol.clone(),
-            quantity,
-            status_code: None,
+            reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         }
     }
 
-    fn make_mint_acceptance_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
-            symbol: symbol.clone(),
-            quantity,
-            last_status: TokenizationRequestStatus::Pending,
+            reason: "test failure".to_string(),
             failed_at: Utc::now(),
         }
     }
 
-    fn make_tokens_received(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_tokens_received() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::TokensReceived {
-            symbol: symbol.clone(),
-            quantity,
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(30_000_000_000_000_000_000_u128),
@@ -1076,11 +1068,7 @@ mod tests {
         // Apply MintAccepted - this moves shares to inflight.
         // Inflight should now block imbalance detection.
         trigger
-            .apply_mint_event_to_inventory(
-                &symbol,
-                &make_mint_accepted(&symbol, dec!(30)),
-                shares(30),
-            )
+            .apply_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30))
             .await;
 
         // With inflight, imbalance detection should not trigger anything.

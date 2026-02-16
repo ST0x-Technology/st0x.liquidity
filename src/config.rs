@@ -929,7 +929,8 @@ pub(crate) mod tests {
             [rebalancing.equity_threshold]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
+            [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#;

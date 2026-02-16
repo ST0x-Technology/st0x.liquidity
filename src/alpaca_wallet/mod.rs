@@ -241,7 +241,7 @@ mod tests {
 
         assert!(matches!(
             service
-                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .initiate_withdrawal(amount, &asset, &to_address)
                 .await
                 .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }
@@ -276,7 +276,7 @@ mod tests {
 
         assert!(matches!(
             service
-                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .initiate_withdrawal(amount, &asset, &to_address)
                 .await
                 .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }

@@ -563,7 +563,7 @@ mod tests {
                 usdc_vault_id: B256::ZERO,
                 redemption_wallet: Address::ZERO,
                 alpaca_account_id,
-                equity: ImbalanceThreshold {
+                equity_threshold: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },

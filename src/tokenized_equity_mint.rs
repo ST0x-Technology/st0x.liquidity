@@ -778,79 +778,15 @@ impl TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{B256, U256};
+    use async_trait::async_trait;
     use rust_decimal_macros::dec;
     use std::sync::Arc;
 
+    use st0x_event_sorcery::TestHarness;
+
     use super::*;
-    use crate::onchain::mock::MockRaindex;
-    use crate::tokenization::mock::MockTokenizer;
-
-    fn mint_requested_event() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintRequested {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            requested_at: Utc::now(),
-        }
-    }
-
-    fn mint_accepted_event() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        }
-    }
-
-    fn tokens_received_event() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::TokensReceived {
-            tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(789)),
-            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-            received_at: Utc::now(),
-        }
-    }
-
-    fn vault_deposited_event() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::VaultDeposited {
-            vault_deposit_tx_hash: TxHash::random(),
-            deposited_at: Utc::now(),
-        }
-    }
-
-    fn mock_mint_services() -> MintServices {
-        MintServices {
-            tokenizer: Arc::new(MockTokenizer::new()),
-            raindex: Arc::new(MockRaindex::new()),
-        }
-    }
-
-    // TODO: update for consolidated commands
-    // The following command-based tests used old granular commands
-    // (RequestMint, AcknowledgeAcceptance, ReceiveTokens, DepositToVault,
-    // Finalize, RejectMint, FailAcceptance) and need to be rewritten to
-    // use the consolidated Mint/Deposit commands with proper mock services.
-    //
-    // Commented out tests:
-    // - request_mint_from_uninitialized_produces_mint_requested
-    // - acknowledge_acceptance_after_request
-    // - receive_tokens_after_acceptance
-    // - deposit_to_vault_after_tokens_received
-    // - finalize_after_vault_deposit
-    // - complete_mint_flow_end_to_end
-    // - cannot_acknowledge_before_request
-    // - cannot_receive_tokens_before_acceptance
-    // - cannot_finalize_before_vault_deposit
-    // - cannot_finalize_before_tokens_received
-    // - reject_mint_from_requested_state
-    // - fail_acceptance_from_accepted_state
-    // - cannot_reject_mint_when_completed
-    // - cannot_reject_mint_when_already_failed
-    // - cannot_reject_mint_before_request
-    // - cannot_fail_acceptance_before_acceptance
-    // - test_cannot_deposit_to_vault_before_tokens_received
-    // - test_cannot_deposit_to_vault_when_already_deposited
-    // - test_cannot_deposit_to_vault_when_failed
+    use crate::onchain::raindex::{Raindex, RaindexError, RaindexVaultId};
 
     #[test]
     fn test_evolve_accepted_rejects_wrong_state() {
@@ -992,5 +928,161 @@ mod tests {
 
         let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
         assert_eq!(result, None);
+    }
+
+    struct FailingLookupRaindex;
+
+    #[async_trait]
+    impl Raindex for FailingLookupRaindex {
+        async fn lookup_vault_id(&self, _token: Address) -> Result<RaindexVaultId, RaindexError> {
+            Err(RaindexError::ZeroAmount)
+        }
+
+        async fn lookup_vault_info(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<(Address, RaindexVaultId), RaindexError> {
+            Err(RaindexError::ZeroAmount)
+        }
+
+        async fn deposit(
+            &self,
+            _token: Address,
+            _vault_id: RaindexVaultId,
+            _amount: U256,
+            _decimals: u8,
+        ) -> Result<TxHash, RaindexError> {
+            unreachable!("deposit should not be called when lookup fails")
+        }
+
+        async fn withdraw(
+            &self,
+            _token: Address,
+            _vault_id: RaindexVaultId,
+            _target_amount: U256,
+            _decimals: u8,
+        ) -> Result<TxHash, RaindexError> {
+            unreachable!()
+        }
+    }
+
+    struct FailingDepositRaindex;
+
+    #[async_trait]
+    impl Raindex for FailingDepositRaindex {
+        async fn lookup_vault_id(&self, _token: Address) -> Result<RaindexVaultId, RaindexError> {
+            Ok(RaindexVaultId(B256::ZERO))
+        }
+
+        async fn lookup_vault_info(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<(Address, RaindexVaultId), RaindexError> {
+            Ok((Address::ZERO, RaindexVaultId(B256::ZERO)))
+        }
+
+        async fn deposit(
+            &self,
+            _token: Address,
+            _vault_id: RaindexVaultId,
+            _amount: U256,
+            _decimals: u8,
+        ) -> Result<TxHash, RaindexError> {
+            Err(RaindexError::ZeroAmount)
+        }
+
+        async fn withdraw(
+            &self,
+            _token: Address,
+            _vault_id: RaindexVaultId,
+            _target_amount: U256,
+            _decimals: u8,
+        ) -> Result<TxHash, RaindexError> {
+            unreachable!()
+        }
+    }
+
+    fn services_with_failing_lookup() -> MintServices {
+        MintServices {
+            tokenizer: Arc::new(crate::tokenization::mock::MockTokenizer::new()),
+            raindex: Arc::new(FailingLookupRaindex),
+        }
+    }
+
+    fn services_with_failing_deposit() -> MintServices {
+        MintServices {
+            tokenizer: Arc::new(crate::tokenization::mock::MockTokenizer::new()),
+            raindex: Arc::new(FailingDepositRaindex),
+        }
+    }
+
+    fn tokens_received_events() -> Vec<TokenizedEquityMintEvent> {
+        vec![
+            TokenizedEquityMintEvent::MintRequested {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: dec!(10),
+                wallet: Address::ZERO,
+                requested_at: Utc::now(),
+            },
+            TokenizedEquityMintEvent::MintAccepted {
+                issuer_request_id: IssuerRequestId("ISS001".to_string()),
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                accepted_at: Utc::now(),
+            },
+            TokenizedEquityMintEvent::TokensReceived {
+                tx_hash: TxHash::random(),
+                receipt_id: ReceiptId(U256::from(1)),
+                shares_minted: U256::from(10_000_000_000_000_000_000_u128),
+                received_at: Utc::now(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn deposit_emits_raindex_deposit_failed_on_vault_lookup_failure() {
+        let events = TestHarness::<TokenizedEquityMint>::with(services_with_failing_lookup())
+            .given(tokens_received_events())
+            .when(TokenizedEquityMintCommand::Deposit)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                &events[0],
+                TokenizedEquityMintEvent::RaindexDepositFailed {
+                    symbol,
+                    quantity,
+                    failed_tx_hash: None,
+                    ..
+                } if symbol == &Symbol::new("AAPL").unwrap() && *quantity == dec!(10)
+            ),
+            "Expected RaindexDepositFailed, got: {:?}",
+            events[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_emits_raindex_deposit_failed_on_deposit_failure() {
+        let events = TestHarness::<TokenizedEquityMint>::with(services_with_failing_deposit())
+            .given(tokens_received_events())
+            .when(TokenizedEquityMintCommand::Deposit)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                &events[0],
+                TokenizedEquityMintEvent::RaindexDepositFailed {
+                    symbol,
+                    quantity,
+                    failed_tx_hash: None,
+                    ..
+                } if symbol == &Symbol::new("AAPL").unwrap() && *quantity == dec!(10)
+            ),
+            "Expected RaindexDepositFailed, got: {:?}",
+            events[0]
+        );
     }
 }

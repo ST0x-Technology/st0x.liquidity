@@ -27,7 +27,7 @@ pub(crate) use mint::manager::MintManager;
 pub(crate) use rebalancer::Rebalancer;
 pub(crate) use redemption::manager::RedemptionManager;
 pub(crate) use spawn::{
-    RebalancerAddresses, RebalancingCqrsFrameworks, RedemptionDependencies, spawn_rebalancer,
+    RebalancerAddresses, RebalancingCqrsFrameworks, RedemptionCqrs, spawn_rebalancer,
 };
 pub(crate) use trigger::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, RebalancingTrigger,

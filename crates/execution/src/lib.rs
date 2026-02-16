@@ -328,6 +328,10 @@ impl FractionalShares {
             return Err(SharesConversionError::Underflow(self.0));
         }
 
+        if scaled != truncated {
+            return Err(SharesConversionError::PrecisionLoss(self.0));
+        }
+
         Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
     }
 }
@@ -340,6 +344,8 @@ pub enum SharesConversionError {
     Underflow(Decimal),
     #[error("overflow when scaling shares to 18 decimals")]
     Overflow,
+    #[error("precision loss when scaling to 18 decimals: {0} has sub-wei digits")]
+    PrecisionLoss(Decimal),
     #[error("failed to parse U256: {0}")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
@@ -789,14 +795,12 @@ mod tests {
     }
 
     #[test]
-    fn to_u256_18_decimals_truncates_sub_wei_digits() {
-        // Values with >18 decimal places are truncated (sub-wei digits are meaningless)
+    fn to_u256_18_decimals_rejects_sub_wei_digits() {
         let shares = FractionalShares::new(dec!(1.1234567890123456789));
-        let result = shares.to_u256_18_decimals().unwrap();
-        assert_eq!(
-            result,
-            U256::from_str("1123456789012345678").unwrap(),
-            "Expected sub-wei digits to be truncated"
+        let error = shares.to_u256_18_decimals().unwrap_err();
+        assert!(
+            matches!(error, SharesConversionError::PrecisionLoss(_)),
+            "Expected PrecisionLoss error, got: {error:?}"
         );
     }
 

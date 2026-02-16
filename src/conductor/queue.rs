@@ -3,56 +3,47 @@
 //! This module handles the continuous processing of queued blockchain events,
 //! converting them to trades and executing the necessary CQRS commands.
 
-use alloy::primitives::Address;
 use alloy::providers::Provider;
-use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
+use st0x_event_sorcery::Store;
+use st0x_execution::Executor;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 
-use st0x_execution::Executor;
-
 use super::{
-    TradeProcessingCqrs, convert_event_to_trade, discover_vaults_for_trade,
-    execute_acknowledge_fill, execute_new_execution_cqrs, execute_witness_trade,
+    EventProcessingError, TradeProcessingCqrs, VaultDiscoveryCtx, convert_event_to_trade,
+    discover_vaults_for_trade, execute_acknowledge_fill, execute_witness_trade,
+    place_offchain_order,
 };
-use crate::config::Config;
-use crate::error::{EventProcessingError, EventQueueError};
-use crate::offchain_order::{OffchainOrder, OffchainOrderId};
+use crate::config::Ctx;
+use crate::offchain_order::OffchainOrderId;
 use crate::onchain::OnchainTrade;
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
-use crate::queue::{QueuedEvent, get_next_unprocessed_event, mark_event_processed};
+use crate::queue::{EventQueueError, QueuedEvent, get_next_unprocessed_event, mark_event_processed};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
-use crate::vault_registry::VaultRegistryAggregate;
-
-/// Context for vault discovery operations during trade processing.
-pub(crate) struct VaultDiscoveryContext<'a> {
-    pub(crate) vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
-    pub(crate) orderbook: Address,
-    pub(crate) order_owner: Address,
-}
+use crate::vault_registry::VaultRegistry;
 
 /// Context for queue event processing containing caches and CQRS components.
 pub(super) struct QueueProcessingContext<'a> {
     pub(super) cache: &'a SymbolCache,
     pub(super) feed_id_cache: &'a FeedIdCache,
-    pub(super) vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    pub(super) vault_registry: &'a Store<VaultRegistry>,
 }
 
 /// Main entry point for queue processing. Runs an infinite loop processing
 /// queued events and executing the appropriate CQRS commands.
 pub(super) async fn run_queue_processor<P, E>(
     executor: &E,
-    config: &Config,
+    config: &Ctx,
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
     cqrs: &TradeProcessingCqrs,
-    vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
+    vault_registry: &Store<VaultRegistry>,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -65,7 +56,7 @@ pub(super) async fn run_queue_processor<P, E>(
     let queue_context = QueueProcessingContext {
         cache,
         feed_id_cache: &feed_id_cache,
-        vault_registry_cqrs,
+        vault_registry,
     };
 
     run_processing_loop(executor, config, pool, &provider, cqrs, &queue_context).await;

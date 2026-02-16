@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Cons, Nil, Projection, ProjectionError, Store, StoreBuilder, Unwired};
+use st0x_event_sorcery::{Projection, Store, StoreBuilder, Unwired, deps};
 
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::{EquityRedemption, RedemptionServices};
@@ -32,11 +32,14 @@ use crate::tokenized_equity_mint::{MintServices, TokenizedEquityMint};
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
 
-type RebalancingTriggerDeps =
-    Cons<Position, Cons<TokenizedEquityMint, Cons<EquityRedemption, Cons<UsdcRebalance, Nil>>>>;
+type RebalancingTriggerDeps = deps![
+    Position,
+    TokenizedEquityMint,
+    EquityRedemption,
+    UsdcRebalance
+];
 
-type EventBroadcasterDeps =
-    Cons<TokenizedEquityMint, Cons<EquityRedemption, Cons<UsdcRebalance, Nil>>>;
+type EventBroadcasterDeps = deps![TokenizedEquityMint, EquityRedemption, UsdcRebalance];
 
 /// All query processors that must be created and wired when
 /// rebalancing is enabled.
@@ -46,7 +49,6 @@ type EventBroadcasterDeps =
 pub(super) struct QueryManifest {
     rebalancing_trigger: Unwired<RebalancingTrigger, RebalancingTriggerDeps>,
     event_broadcaster: Unwired<EventBroadcaster, EventBroadcasterDeps>,
-    position_view: Projection<Position>,
 }
 
 /// All query processors after wiring is complete.
@@ -65,14 +67,13 @@ pub(super) struct BuiltFrameworks {
 impl QueryManifest {
     pub(super) fn new(
         config: RebalancingTriggerConfig,
-        pool: SqlitePool,
         vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         market_maker_wallet: Address,
         inventory: Arc<RwLock<InventoryView>>,
         operation_sender: mpsc::Sender<TriggeredOperation>,
         event_sender: broadcast::Sender<ServerMessage>,
-    ) -> Result<Self, ProjectionError<Position>> {
+    ) -> Self {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,
             vault_registry,
@@ -84,13 +85,10 @@ impl QueryManifest {
 
         let event_broadcaster = EventBroadcaster::new(event_sender);
 
-        let position_view = Projection::<Position>::sqlite(pool)?;
-
-        Ok(Self {
+        Self {
             rebalancing_trigger: Unwired::new(rebalancing_trigger),
             event_broadcaster: Unwired::new(event_broadcaster),
-            position_view,
-        })
+        }
     }
 
     /// Wires all query processors and builds their CQRS frameworks.
@@ -107,8 +105,9 @@ impl QueryManifest {
         let Self {
             rebalancing_trigger,
             event_broadcaster,
-            position_view,
         } = self;
+
+        let position_view = Projection::<Position>::sqlite(pool.clone())?;
 
         let (position, (rebalancing_trigger, ())) = StoreBuilder::<Position>::new(pool.clone())
             .with(position_view.clone())
@@ -156,6 +155,7 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use rust_decimal_macros::dec;
+    use st0x_event_sorcery::test_store;
     use tokio::sync::{RwLock, broadcast, mpsc};
 
     use super::*;
@@ -189,15 +189,13 @@ mod tests {
 
         let manifest = QueryManifest::new(
             test_trigger_config(),
-            pool.clone(),
             vault_registry,
             Address::ZERO,
             Address::ZERO,
             Arc::new(RwLock::new(InventoryView::default())),
             operation_sender,
             event_sender,
-        )
-        .unwrap();
+        );
 
         let mint_services = MintServices {
             tokenizer: Arc::new(MockTokenizer::new()),

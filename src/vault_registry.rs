@@ -74,7 +74,7 @@ impl EventSourced for VaultRegistry {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "VaultRegistry";
-    const PROJECTION: Option<Table> = None;
+    const PROJECTION: Option<Table> = Some(Table("vault_registry_view"));
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -285,7 +285,6 @@ mod tests {
     use st0x_event_sorcery::{Reactor, StoreBuilder, TestHarness, replay};
 
     use super::*;
-    use crate::conductor::wire::test_cqrs;
     use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");

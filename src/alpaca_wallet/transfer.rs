@@ -256,6 +256,7 @@ mod tests {
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_execution::InvalidSharesError;
     use std::str::FromStr;
     use uuid::uuid;
 

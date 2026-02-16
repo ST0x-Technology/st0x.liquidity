@@ -399,7 +399,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_inventory_rounds_sub_cent_market_value() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         // Alpaca's market_value is qty * price, both fractional, so
         // sub-cent precision is normal (e.g. 6.803019322 * 75.21 = 511.6476).
@@ -427,7 +427,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let inventory = fetch_inventory(&client).await.unwrap();
 
         positions_mock.assert();

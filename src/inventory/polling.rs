@@ -245,9 +245,7 @@ mod tests {
     use alloy::primitives::{B256, TxHash, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
-    use cqrs_es::persist::GenericQuery;
     use rust_decimal::Decimal;
-    use sqlite_es::SqliteViewRepository;
     use sqlx::{Row, SqlitePool};
 
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
@@ -285,16 +283,11 @@ mod tests {
     }
 
     fn create_test_raindex_service(
-        pool: &sqlx::SqlitePool,
+        pool: &SqlitePool,
         provider: impl Provider + Clone,
     ) -> Arc<RaindexService<impl Provider + Clone>> {
-        let vault_registry_view_repo =
-            Arc::new(SqliteViewRepository::<VaultRegistry, VaultRegistry>::new(
-                pool.clone(),
-                "vault_registry_view".to_string(),
-            ));
         let vault_registry_projection: Arc<VaultRegistryProjection> =
-            Arc::new(GenericQuery::new(vault_registry_view_repo));
+            Arc::new(VaultRegistryProjection::sqlite(pool.clone()).unwrap());
 
         Arc::new(RaindexService::new(
             provider,

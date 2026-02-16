@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 use serde::Deserialize;
 use tracing::debug;
@@ -29,7 +29,14 @@ where
 pub(super) async fn is_market_open(
     client: &AlpacaBrokerApiClient,
 ) -> Result<bool, AlpacaBrokerApiError> {
-    let now = Utc::now();
+    is_market_open_at(client, Utc::now()).await
+}
+
+/// Returns true if the market is open at the given time.
+async fn is_market_open_at(
+    client: &AlpacaBrokerApiClient,
+    now: DateTime<Utc>,
+) -> Result<bool, AlpacaBrokerApiError> {
     let now_et = now.with_timezone(&New_York);
     let today = now_et.date_naive();
 
@@ -182,5 +189,107 @@ mod tests {
             err.to_string().contains("out of range"),
             "expected out of range error for minute 60, got: {err}"
         );
+    }
+
+    fn mock_trading_day(server: &MockServer, date: &str) {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", date)
+                .query_param("end", date);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "date": date,
+                        "open": "09:30",
+                        "close": "16:00"
+                    }
+                ]));
+        });
+    }
+
+    fn mock_non_trading_day(server: &MockServer, date: &str) {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", date)
+                .query_param("end", date);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+    }
+
+    /// Constructs a UTC timestamp corresponding to a specific ET time on a given date.
+    fn et_time_as_utc(date: &str, hour: u32, min: u32) -> DateTime<Utc> {
+        let naive_date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+        let naive_time = NaiveTime::from_hms_opt(hour, min, 0).unwrap();
+        let naive_dt = naive_date.and_time(naive_time);
+        naive_dt
+            .and_local_timezone(New_York)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn is_market_open_during_trading_hours() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let midday = et_time_as_utc("2025-01-06", 12, 0);
+
+        assert!(is_market_open_at(&client, midday).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_closed_before_open() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let before_open = et_time_as_utc("2025-01-06", 9, 0);
+
+        assert!(!is_market_open_at(&client, before_open).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_closed_at_close_time() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let at_close = et_time_as_utc("2025-01-06", 16, 0);
+
+        assert!(!is_market_open_at(&client, at_close).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_open_at_open_time() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let at_open = et_time_as_utc("2025-01-06", 9, 30);
+
+        assert!(is_market_open_at(&client, at_open).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_closed_on_non_trading_day() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day(&server, "2025-01-04");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let saturday = et_time_as_utc("2025-01-04", 12, 0);
+
+        assert!(!is_market_open_at(&client, saturday).await.unwrap());
     }
 }

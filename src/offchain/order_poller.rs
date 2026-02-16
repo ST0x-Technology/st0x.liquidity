@@ -344,7 +344,6 @@ mod tests {
     use st0x_event_sorcery::test_store;
 
     use super::*;
-    use crate::conductor::wire::test_cqrs;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;

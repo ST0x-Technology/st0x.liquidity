@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use st0x_event_sorcery::Reactor;
 
@@ -47,6 +47,7 @@ impl Reactor<InventorySnapshot> for InventorySnapshotReactor {
             Ok(updated) => {
                 *inventory = updated;
                 drop(inventory);
+                debug!("Applied inventory snapshot event");
                 self.trigger_rebalancing_check(event).await;
             }
             Err(error) => {
@@ -92,7 +93,7 @@ mod tests {
     use std::collections::BTreeMap;
     use tokio::sync::mpsc;
 
-    use st0x_event_sorcery::{Store, test_store};
+    use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
 
     use super::*;

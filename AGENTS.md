@@ -38,18 +38,9 @@ the limit:
 
 ## Ownership Principles
 
-**CRITICAL: Take full ownership. Never deflect responsibility.**
-
-- **Fix all problems immediately** - regardless of who introduced them. Never
-  say "this is a pre-existing issue" as justification for not fixing it.
-- **Meet ALL constraints** - when editing a file with size limits, ensure the
-  ENTIRE file meets the limit, not just your additions.
-- **No warnings or errors pass through** - CI and review catch everything. If
-  you see a warning/error, it's your responsibility to fix it now.
-- **Work until all tasks are complete** - do not stop until every assigned task
-  is done, unless you need input from the user to proceed. If blocked on one
-  task, move to the next. Only stop working when the task list is clear or you
-  genuinely cannot proceed without user input.
+**CRITICAL**: Fix all problems immediately regardless of origin. Meet ALL
+constraints (file size limits apply to entire file). No warnings/errors pass
+through. Work until all tasks complete unless blocked needing user input.
 
 ## Communication
 
@@ -82,22 +73,9 @@ plan the implementation.
 
 ### Handling questions and approach changes
 
-When the user asks a question or challenges your approach:
-
-1. **Answer the question first.** Do not immediately assume the question implies
-   you should change your approach. Provide a clear, direct answer.
-
-2. **If you realize your approach was wrong**, do not silently change it. Ask
-   for confirmation: "I see the issue - [explain]. Should I switch to [new
-   approach] instead?"
-
-3. **If you encounter errors while trying a different approach**, do not
-   silently revert to the previous approach. State what went wrong and ask: "The
-   new approach ran into [problem]. Do you want me to continue debugging it or
-   go back to the original approach?"
-
-4. **Never assume silence or a question means approval to change direction.**
-   Explicit confirmation is required before abandoning one approach for another.
+Answer the question first. Don't silently change approach - ask confirmation. If
+new approach fails, state what went wrong and ask before reverting. Explicit
+confirmation required before changing direction.
 
 ### When issues are pointed out
 

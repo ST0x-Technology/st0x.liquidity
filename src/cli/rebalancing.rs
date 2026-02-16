@@ -29,7 +29,7 @@ use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::threshold::Usdc;
 use crate::tokenization::{
-    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
+    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
 use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
 use crate::usdc_rebalance::UsdcRebalanceId;
@@ -430,14 +430,12 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Sending tokens to redemption wallet...")?;
 
-    let tx_hash = tokenization_service
-        .send_for_redemption(token, amount)
-        .await?;
+    let tx_hash = Tokenizer::send_for_redemption(&tokenization_service, token, amount).await?;
 
     writeln!(stdout, "   Transfer tx: {tx_hash}")?;
     writeln!(stdout, "   Waiting for Alpaca to detect transfer...")?;
 
-    let request = tokenization_service.poll_for_redemption(&tx_hash).await?;
+    let request = Tokenizer::poll_for_redemption(&tokenization_service, &tx_hash).await?;
 
     writeln!(stdout, "   Request ID: {}", request.id.0)?;
     writeln!(stdout, "   Status: {:?}", request.status)?;
@@ -445,9 +443,8 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     if request.status == TokenizationRequestStatus::Pending {
         writeln!(stdout, "   Polling until completion...")?;
 
-        let completed = tokenization_service
-            .poll_redemption_until_complete(&request.id)
-            .await?;
+        let completed =
+            Tokenizer::poll_redemption_until_complete(&tokenization_service, &request.id).await?;
 
         writeln!(stdout, "   Final status: {:?}", completed.status)?;
 

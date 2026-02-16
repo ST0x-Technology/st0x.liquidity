@@ -78,6 +78,20 @@ use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::schema_registry::Reconciler;
 use crate::{EventSourced, Store};
 
+/// Build a type-level dependency list from entity types.
+///
+/// Expands to nested `Cons<..., Nil>`:
+/// ```ignore
+/// deps![A, B, C]  // -> Cons<A, Cons<B, Cons<C, Nil>>>
+/// ```
+#[macro_export]
+macro_rules! deps {
+    () => { $crate::Nil };
+    ($head:ty $(, $tail:ty)* $(,)?) => {
+        $crate::Cons<$head, $crate::deps![$($tail),*]>
+    };
+}
+
 /// Type-level cons cell for building linked lists of entities.
 ///
 /// Forms a compile-time linked list:

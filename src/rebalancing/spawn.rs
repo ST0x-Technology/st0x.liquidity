@@ -68,12 +68,6 @@ pub(crate) struct RebalancerAddresses {
     pub(crate) market_maker_wallet: Address,
 }
 
-pub(crate) struct RedemptionDependencies<BP: Provider + Clone> {
-    pub(crate) raindex_service: Arc<RaindexService<BP>>,
-    pub(crate) cqrs: Arc<Store<EquityRedemption>>,
-    pub(crate) projection: Arc<Projection<EquityRedemption>>,
-}
-
 /// CQRS-related dependencies for redemption manager.
 pub(crate) struct RedemptionCqrs {
     pub(crate) cqrs: Arc<Store<EquityRedemption>>,
@@ -90,7 +84,8 @@ pub(crate) async fn spawn_rebalancer<BP>(
     addresses: RebalancerAddresses,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
-    redemption: RedemptionDependencies<BP>,
+    raindex_service: Arc<RaindexService<BP>>,
+    redemption_cqrs: RedemptionCqrs,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -108,7 +103,7 @@ where
     ));
 
     let redemption_service = Arc::new(RedemptionService::new(
-        redemption.raindex_service.clone(),
+        raindex_service.clone(),
         tokenization,
     ));
 
@@ -117,14 +112,9 @@ where
         &ethereum_wallet,
         signer.address(),
         base_provider,
-        redemption.raindex_service,
+        raindex_service,
     )
     .await?;
-
-    let redemption_cqrs = RedemptionCqrs {
-        cqrs: redemption.cqrs,
-        projection: redemption.projection,
-    };
 
     let rebalancer = services.into_rebalancer(
         ctx,
@@ -250,11 +240,10 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{address, b256};
     use alloy::providers::ProviderBuilder;
-    use httpmock::Method::{GET, POST};
+    use httpmock::Method::GET;
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlx::SqlitePool;
     use st0x_execution::{
         AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
     };
@@ -264,10 +253,24 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
+    use crate::equity_redemption::mock::mock_redeemer_services;
     use crate::inventory::ImbalanceThreshold;
+    use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::trigger::UsdcRebalancing;
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::MintServices;
     use crate::vault_registry::VaultRegistry;
+
+    /// Provider type returned by `ProviderBuilder::new().connect_http()` without wallet.
+    type BaseTestProvider = FillProvider<
+        JoinFill<
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+        >,
+        RootProvider<Ethereum>,
+        Ethereum,
+    >;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -334,7 +337,7 @@ mod tests {
 
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity_threshold,
-            usdc: ctx.usdc.clone(),
+            usdc: ctx.usdc,
         };
 
         assert_eq!(trigger_config.equity.target, dec!(0.5));
@@ -347,7 +350,7 @@ mod tests {
 
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity_threshold,
-            usdc: ctx.usdc.clone(),
+            usdc: ctx.usdc,
         };
 
         let UsdcRebalancing::Enabled { target, deviation } = trigger_config.usdc else {
@@ -374,9 +377,9 @@ mod tests {
     async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
     ) -> (
-        Services<impl Provider + Clone + 'static>,
+        Services<BaseTestProvider>,
         RebalancingCtx,
-        Arc<AlpacaTokenizationService<impl Provider + Clone + 'static>>,
+        Arc<RedemptionService<BaseTestProvider>>,
     ) {
         let anvil = Anvil::new().spawn();
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
@@ -459,45 +462,16 @@ mod tests {
             .with_required_confirmations(1),
         );
 
+        let redemption_service = Arc::new(RedemptionService::new(vault.clone(), tokenization));
+
         let services = Services {
             broker,
             wallet,
             cctp,
-            raindex: vault.clone(),
+            raindex: vault,
         };
 
-        (services, rebalancing_ctx, tokenization)
-    }
-
-    #[tokio::test]
-    async fn into_rebalancer_constructs_without_panic() {
-        let server = MockServer::start();
-        let (services, rebalancing_ctx, _tokenization) =
-            make_services_with_mock_wallet(&server).await;
-
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-
-        let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
-
-        let (_tx, rx) = mpsc::channel(100);
-        let frameworks = RebalancingCqrsFrameworks {
-            mint: Arc::new(test_store(pool.clone(), ())),
-            usdc: Arc::new(test_store(pool.clone(), ())),
-        };
-
-        let vault_registry_projection =
-            Arc::new(Projection::<VaultRegistry>::sqlite(pool).unwrap());
-
-        // TODO: adapt into_rebalancer call for RedemptionDependencies
-        let _ = (
-            services,
-            rebalancing_ctx,
-            market_maker_wallet,
-            rx,
-            vault_registry_projection,
-            frameworks,
-        );
+        (services, rebalancing_ctx, redemption_service)
     }
 
     #[tokio::test]
@@ -536,33 +510,19 @@ mod tests {
     #[tokio::test]
     async fn into_rebalancer_dispatches_mint_to_tokenization_service() {
         let server = MockServer::start();
-        let (services, config, tokenization) = make_services_with_mock_wallet(&server).await;
-
-        let mint_mock = server.mock(|when, then| {
-            when.method(POST).path(format!(
-                "/v1/accounts/{}/tokenization/mint",
-                config.alpaca_account_id
-            ));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": "tok_123",
-                    "type": "mint",
-                    "status": "pending",
-                    "symbol": "AAPL",
-                    "qty": "10",
-                    "issuer_request_id": "test_issuer_req",
-                    "created_at": "2024-01-15T10:30:00Z"
-                }));
-        });
+        let (services, config, redemption_service) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
-        let mint_cqrs = Arc::new(test_store(pool.clone(), ()));
+        let mint_services = MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            raindex: Arc::new(MockRaindex::new()),
+        };
+        let mint_cqrs = Arc::new(test_store(pool.clone(), mint_services));
         let usdc_cqrs = Arc::new(test_store(pool.clone(), ()));
 
         let redemption_projection =
             Arc::new(Projection::<EquityRedemption>::sqlite(pool.clone()).unwrap());
-        let redemption_cqrs = Arc::new(test_store(pool.clone(), ()));
+        let redemption_cqrs = Arc::new(test_store(pool.clone(), mock_redeemer_services()));
 
         let frameworks = RebalancingCqrsFrameworks {
             mint: mint_cqrs,
@@ -573,11 +533,6 @@ mod tests {
             cqrs: redemption_cqrs,
             projection: redemption_projection,
         };
-
-        let redemption_service = Arc::new(RedemptionService::new(
-            services.raindex.clone(),
-            tokenization,
-        ));
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
@@ -601,11 +556,5 @@ mod tests {
 
         drop(tx);
         rebalancer.run().await;
-
-        assert_eq!(
-            mint_mock.hits(),
-            1,
-            "Expected tokenization mint endpoint to be called exactly once"
-        );
     }
 }

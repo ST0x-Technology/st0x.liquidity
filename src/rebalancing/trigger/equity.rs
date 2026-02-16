@@ -6,7 +6,7 @@ use std::sync::Arc;
 use alloy::primitives::Address;
 use st0x_execution::{FractionalShares, Symbol};
 use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tracing::{trace, warn};
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
@@ -98,16 +98,30 @@ pub(super) async fn check_imbalance_and_build_operation(
         return Err(EquityTriggerSkip::NoImbalance);
     };
 
+    let resolve_precision = |result: Result<FractionalShares, AlpacaPrecisionLoss>| match result {
+        Ok(quantity) => quantity,
+        Err(loss) => {
+            warn!(
+                symbol = %loss.symbol,
+                original = %loss.original.inner(),
+                truncated = %loss.truncated.inner(),
+                "Truncated quantity to {} decimal places for Alpaca API",
+                ALPACA_QUANTITY_MAX_DECIMAL_PLACES
+            );
+            loss.truncated
+        }
+    };
+
     match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let quantity = truncate_for_alpaca(symbol, excess);
+            let quantity = resolve_precision(truncate_for_alpaca(symbol, excess));
             Ok(TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
             })
         }
         Imbalance::TooMuchOnchain { excess } => {
-            let quantity = truncate_for_alpaca(symbol, excess);
+            let quantity = resolve_precision(truncate_for_alpaca(symbol, excess));
             Ok(TriggeredOperation::Redemption {
                 symbol: symbol.clone(),
                 quantity,
@@ -117,23 +131,34 @@ pub(super) async fn check_imbalance_and_build_operation(
     }
 }
 
-fn truncate_for_alpaca(symbol: &Symbol, quantity: FractionalShares) -> FractionalShares {
+/// Rounds to the Alpaca API decimal limit. Returns the original value when
+/// no rounding is needed, or `Err(AlpacaPrecisionLoss)` with the rounded
+/// value when sub-nanoshare digits must be dropped.
+fn truncate_for_alpaca(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+) -> Result<FractionalShares, AlpacaPrecisionLoss> {
     let truncated_decimal = quantity
         .inner()
         .trunc_with_scale(ALPACA_QUANTITY_MAX_DECIMAL_PLACES);
     let truncated = FractionalShares::new(truncated_decimal);
 
-    if truncated != quantity {
-        debug!(
-            symbol = %symbol,
-            original = %quantity.inner(),
-            truncated = %truncated_decimal,
-            "Truncated quantity to {} decimal places for Alpaca API",
-            ALPACA_QUANTITY_MAX_DECIMAL_PLACES
-        );
+    if truncated == quantity {
+        return Ok(truncated);
     }
 
-    truncated
+    Err(AlpacaPrecisionLoss {
+        symbol: symbol.clone(),
+        original: quantity,
+        truncated,
+    })
+}
+
+#[derive(Debug)]
+struct AlpacaPrecisionLoss {
+    symbol: Symbol,
+    original: FractionalShares,
+    truncated: FractionalShares,
 }
 
 #[cfg(test)]
@@ -149,6 +174,9 @@ mod tests {
     use super::*;
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
+    use crate::tokenized_equity_mint::{
+        IssuerRequestId, ReceiptId, TokenizationRequestId, TokenizedEquityMintEvent,
+    };
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
@@ -383,8 +411,6 @@ mod tests {
             .apply_mint_event(
                 &symbol,
                 &TokenizedEquityMintEvent::MintAccepted {
-                    symbol: symbol.clone(),
-                    quantity: quantity.inner(),
                     issuer_request_id: IssuerRequestId::new("test"),
                     tokenization_request_id: TokenizationRequestId("test".to_string()),
                     accepted_at: now,
@@ -400,8 +426,6 @@ mod tests {
             .apply_mint_event(
                 &symbol,
                 &TokenizedEquityMintEvent::TokensReceived {
-                    symbol: symbol.clone(),
-                    quantity: quantity.inner(),
                     tx_hash: TxHash::random(),
                     receipt_id: ReceiptId(U256::from(1)),
                     shares_minted: U256::ZERO, // Not used by inventory update
@@ -483,8 +507,6 @@ mod tests {
                 .apply_mint_event(
                     &symbol,
                     &TokenizedEquityMintEvent::MintAccepted {
-                        symbol: symbol.clone(),
-                        quantity: qty1.inner(),
                         issuer_request_id: IssuerRequestId::new("test"),
                         tokenization_request_id: TokenizationRequestId("test1".to_string()),
                         accepted_at: now,
@@ -498,8 +520,6 @@ mod tests {
                 .apply_mint_event(
                     &symbol,
                     &TokenizedEquityMintEvent::TokensReceived {
-                        symbol: symbol.clone(),
-                        quantity: qty1.inner(),
                         tx_hash: TxHash::random(),
                         receipt_id: ReceiptId(U256::from(1)),
                         shares_minted: U256::ZERO,
@@ -554,22 +574,22 @@ mod tests {
         );
     }
 
-    /// Verifies that the truncate_for_alpaca helper works correctly.
     #[test]
-    fn truncate_for_alpaca_truncates_to_9_decimals() {
+    fn truncate_for_alpaca_returns_error_when_precision_lost() {
         let symbol = Symbol::new("TEST").unwrap();
         let original = precise_shares("1.12345678901234567890");
-        let truncated = truncate_for_alpaca(&symbol, original);
+        let loss = truncate_for_alpaca(&symbol, original).unwrap_err();
 
-        assert_eq!(truncated.inner(), dec!(1.123456789));
+        assert_eq!(loss.truncated.inner(), dec!(1.123456789));
+        assert_eq!(loss.original, original);
     }
 
     #[test]
-    fn truncate_for_alpaca_preserves_fewer_decimals() {
+    fn truncate_for_alpaca_returns_ok_when_no_precision_lost() {
         let symbol = Symbol::new("TEST").unwrap();
         let original = precise_shares("1.123");
-        let truncated = truncate_for_alpaca(&symbol, original);
+        let result = truncate_for_alpaca(&symbol, original).unwrap();
 
-        assert_eq!(truncated, original);
+        assert_eq!(result, original);
     }
 }

@@ -242,7 +242,7 @@ mod tests {
         .await;
 
         let params =
-            check_execution_readiness(&executor, &query, &symbol, SupportedExecutor::Schwab)
+            check_execution_readiness(&executor, &query, &symbol, SupportedExecutor::DryRun)
                 .await
                 .unwrap()
                 .expect("should be ready for execution");

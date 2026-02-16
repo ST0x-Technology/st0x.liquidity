@@ -75,143 +75,34 @@ impl Mint for MintManager {
 
 #[cfg(test)]
 mod tests {
-    use alloy::network::{Ethereum, EthereumWallet};
-    use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::b256;
-    use alloy::primitives::{B256, TxHash, U256, address, b256};
-    use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
-    };
-    use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
-    use alloy::signers::local::PrivateKeySigner;
-    use httpmock::prelude::*;
+    use alloy::primitives::address;
     use rust_decimal_macros::dec;
-    use serde_json::json;
+    use std::sync::Arc;
 
-    use st0x_event_sorcery::{Projection, test_store};
+    use st0x_event_sorcery::test_store;
 
     use super::*;
-    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
-    use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-    use crate::test_utils::{
-        create_test_vault_service, create_vault_registry_projection, setup_test_db,
-    };
-    use crate::tokenization::alpaca::tests::{
-        create_test_service_with_provider, tokenization_mint_path, tokenization_requests_path,
-    };
+    use crate::onchain::mock::MockRaindex;
+    use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::tokenized_equity_mint::MintServices;
-    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryProjection};
 
-    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
-    const TEST_VAULT_ID: RaindexVaultId = RaindexVaultId(b256!(
-        "0x0000000000000000000000000000000000000000000000000000000000000001"
-    ));
+    fn mock_mint_services() -> MintServices {
+        MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            raindex: Arc::new(MockRaindex::new()),
+        }
+    }
 
-    async fn create_test_store_instance() -> Arc<Store<TokenizedEquityMint>> {
+    async fn create_test_store() -> Arc<Store<TokenizedEquityMint>> {
         let pool = setup_test_db().await;
-        Arc::new(test_store(pool, ()))
-    }
-
-    fn sample_pending_response(id: &str) -> serde_json::Value {
-        json!({
-            "tokenization_request_id": id,
-            "type": "mint",
-            "status": "pending",
-            "underlying_symbol": "AAPL",
-            "token_symbol": "tAAPL",
-            "qty": "100.0",
-            "issuer": "st0x",
-            "network": "base",
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-            "issuer_request_id": "issuer_123",
-            "created_at": "2024-01-15T10:30:00Z"
-        })
-    }
-
-    fn sample_completed_response(id: &str) -> serde_json::Value {
-        json!({
-            "tokenization_request_id": id,
-            "type": "mint",
-            "status": "completed",
-            "underlying_symbol": "AAPL",
-            "token_symbol": "tAAPL",
-            "qty": "100.0",
-            "issuer": "st0x",
-            "network": "base",
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-            "issuer_request_id": "issuer_123",
-            "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            "created_at": "2024-01-15T10:30:00Z"
-        })
-    }
-
-    #[test]
-    fn fractional_shares_converts_to_u256_18_decimals() {
-        let value = FractionalShares::new(dec!(100.5));
-        assert_eq!(
-            decimal_to_u256_18_decimals(value).unwrap(),
-            U256::from(100_500_000_000_000_000_000_u128)
-        );
-    }
-
-    #[test]
-    fn fractional_shares_converts_whole_number() {
-        let value = FractionalShares::new(dec!(42));
-        assert_eq!(
-            decimal_to_u256_18_decimals(value).unwrap(),
-            U256::from(42_000_000_000_000_000_000_u128)
-        );
-    }
-
-    #[test]
-    fn fractional_shares_converts_zero() {
-        let value = FractionalShares::new(dec!(0));
-        assert_eq!(decimal_to_u256_18_decimals(value).unwrap(), U256::ZERO);
+        Arc::new(test_store(pool, mock_mint_services()))
     }
 
     #[tokio::test]
-    async fn execute_mint_receives_tokens_then_fails_vault_lookup() {
-        let server = MockServer::start();
-        let pool = crate::test_utils::setup_test_db().await;
-        let (_anvil, endpoint, key) = setup_anvil();
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = alloy::network::EthereumWallet::from(signer);
-        let provider = alloy::providers::ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(endpoint.parse().unwrap());
-
-        let service = Arc::new(create_test_service_with_provider(
-            &server,
-            provider.clone(),
-            TEST_REDEMPTION_WALLET,
-        ));
-        let vault_registry_projection = create_vault_registry_projection(&pool);
-        let vault =
-            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
-        let cqrs = create_test_store_instance().await;
-        let manager = MintManager::new(
-            service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Raindex>,
-            vault_registry_projection,
-            TEST_ORDERBOOK,
-            TEST_REDEMPTION_WALLET,
-            cqrs,
-        );
-
-        let mint_mock = server.mock(|when, then| {
-            when.method(POST).path(tokenization_mint_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(sample_pending_response("mint_123"));
-        });
-
-        let poll_mock = server.mock(|when, then| {
-            when.method(GET).path(tokenization_requests_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([sample_completed_response("mint_123")]));
-        });
+    async fn execute_mint_sends_mint_and_deposit_commands() {
+        let store = create_test_store().await;
+        let manager = MintManager::new(store);
 
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(dec!(100.0));

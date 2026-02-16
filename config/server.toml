@@ -17,6 +17,7 @@ usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000ffa
 target = "0.5"
 deviation = "0.2"
 
-[rebalancing.usdc_threshold]
+[rebalancing.usdc]
+mode = "enabled"
 target = "0.5"
 deviation = "0.3"
