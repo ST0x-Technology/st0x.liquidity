@@ -292,7 +292,7 @@ impl Ctx {
         Self::from_toml(&config_str, &secrets_str)
     }
 
-    fn from_toml(config_toml: &str, secrets_toml: &str) -> Result<Self, CtxError> {
+    pub fn from_toml(config_toml: &str, secrets_toml: &str) -> Result<Self, CtxError> {
         let config: Config = toml::from_str(config_toml)?;
         let secrets: Secrets = toml::from_str(secrets_toml)?;
 

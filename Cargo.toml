@@ -89,6 +89,9 @@ name = "st0x-hedge"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 alloy.workspace = true
 anyhow = "1.0.98"
@@ -151,6 +154,7 @@ st0x-execution = { path = "crates/execution", features = ["mock"] }
 tempfile = "3.24.0"
 tracing-test = "0.2.5"
 bon = "3.8.2"
+st0x-hedge = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true
