@@ -75,17 +75,42 @@ impl Mint for MintManager {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::network::{Ethereum, EthereumWallet};
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{B256, TxHash, U256, address, b256};
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    };
+    use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
+    use alloy::signers::local::PrivateKeySigner;
+    use httpmock::prelude::*;
     use rust_decimal_macros::dec;
+    use serde_json::json;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{StoreBuilder, test_store};
 
     use super::*;
+    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
     use crate::onchain::mock::MockRaindex;
+    use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId};
     use crate::test_utils::setup_test_db;
+    use crate::tokenization::Tokenizer;
+    use crate::tokenization::alpaca::tests::{
+        create_test_service_from_mock, setup_anvil, tokenization_mint_path,
+        tokenization_requests_path,
+    };
     use crate::tokenization::mock::MockTokenizer;
     use crate::tokenized_equity_mint::MintServices;
+    use crate::vault_registry::{
+        VaultRegistry, VaultRegistryCommand, VaultRegistryId, VaultRegistryProjection,
+    };
+
+    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
+
+    const TEST_VAULT_ID: RaindexVaultId = RaindexVaultId(b256!(
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    ));
 
     fn mock_mint_services() -> MintServices {
         MintServices {
@@ -205,14 +230,6 @@ mod tests {
         }
     }
 
-    fn create_vault_registry_cqrs(
-        pool: &sqlx::SqlitePool,
-    ) -> (Store<VaultRegistry>, Arc<VaultRegistryProjection>) {
-        let query = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone()).unwrap());
-        let store = test_store(pool.clone(), ());
-        (store, query)
-    }
-
     async fn seed_vault_registry(
         pool: &sqlx::SqlitePool,
         orderbook: Address,
@@ -221,28 +238,34 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) -> Arc<VaultRegistryProjection> {
-        let (cqrs, query) = create_vault_registry_cqrs(pool);
-        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
+        let projection = Arc::new(VaultRegistryProjection::sqlite(pool.clone()).unwrap());
+        let store = StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .with(projection.as_ref().clone())
+            .build(())
+            .await
+            .unwrap();
+        let registry_id = VaultRegistryId { orderbook, owner };
 
-        cqrs.execute(
-            &aggregate_id,
-            VaultRegistryCommand::DiscoverEquityVault {
-                token,
-                vault_id,
-                discovered_in: TxHash::ZERO,
-                symbol,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &registry_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token,
+                    vault_id,
+                    discovered_in: TxHash::ZERO,
+                    symbol,
+                },
+            )
+            .await
+            .unwrap();
 
-        query
+        projection
     }
 
     #[tokio::test]
     async fn execute_mint_full_workflow_with_vault_deposit() {
+        let pool = setup_test_db().await;
         let server = MockServer::start();
-        let pool = crate::test_utils::setup_test_db().await;
         let local_evm = LocalEvmWithVault::new().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
@@ -256,57 +279,82 @@ mod tests {
         )
         .await;
 
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(create_test_service_with_provider(
-            &server,
-            local_evm.provider.clone(),
-            local_evm.signer.address(),
-        ));
-        let vault: Arc<dyn Raindex> = Arc::new(
+        let (_setup_anvil, anvil_endpoint, private_key) = setup_anvil();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            create_test_service_from_mock(
+                &server,
+                &anvil_endpoint,
+                &private_key,
+                local_evm.signer.address(),
+            )
+            .await,
+        );
+        let raindex: Arc<dyn Raindex> = Arc::new(
             RaindexService::new(
                 local_evm.provider.clone(),
                 local_evm.orderbook_address,
-                vault_registry_projection.clone(),
+                vault_registry_projection,
                 local_evm.signer.address(),
             )
             .with_required_confirmations(1),
         );
-        let cqrs = create_test_store_instance().await;
-        let manager = MintManager::new(
-            tokenizer,
-            vault,
-            vault_registry_projection,
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-            cqrs,
-        );
+
+        let services = MintServices { tokenizer, raindex };
+        let store = Arc::new(test_store(pool, services));
+        let manager = MintManager::new(store);
+
+        let wallet = local_evm.signer.address();
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(sample_pending_response("full_flow_test"));
+                .json_body(json!({
+                    "tokenization_request_id": "mint_full_flow",
+                    "type": "mint",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100.0",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": wallet,
+                    "issuer_request_id": "full-flow-001",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
         });
 
         let poll_mock = server.mock(|when, then| {
             when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([sample_completed_response("full_flow_test")]));
+                .json_body(json!([{
+                    "tokenization_request_id": "mint_full_flow",
+                    "type": "mint",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100.0",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": wallet,
+                    "issuer_request_id": "full-flow-001",
+                    "tx_hash": TxHash::ZERO,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]));
         });
 
         let quantity = FractionalShares::new(dec!(100.0));
-        let wallet = local_evm.signer.address();
 
-        let result = manager
+        manager
             .execute_mint_impl(
                 &IssuerRequestId::new("full-flow-001"),
                 symbol,
                 quantity,
                 wallet,
             )
-            .await;
-
-        result.unwrap();
+            .await
+            .unwrap();
 
         mint_mock.assert();
         poll_mock.assert();
