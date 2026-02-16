@@ -44,24 +44,13 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::sync::Arc;
 use tracing::warn;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::onchain::raindex::Raindex;
+use crate::rebalancing::transfer::EquityTransferServices;
 use crate::tokenization::{TokenizationRequestStatus, Tokenizer};
-
-/// Services required by the TokenizedEquityMint aggregate.
-///
-/// Combines `Tokenizer` (for Alpaca mint operations) and `Raindex` (for depositing
-/// to Rain OrderBook) traits.
-#[derive(Clone)]
-pub(crate) struct MintServices {
-    pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    pub(crate) raindex: Arc<dyn Raindex>,
-}
 
 /// Alpaca issuer request identifier returned when a tokenization request is accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -346,7 +335,7 @@ impl EventSourced for TokenizedEquityMint {
     type Event = TokenizedEquityMintEvent;
     type Command = TokenizedEquityMintCommand;
     type Error = TokenizedEquityMintError;
-    type Services = MintServices;
+    type Services = EquityTransferServices;
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
     const PROJECTION: Option<Table> = None;
@@ -1005,8 +994,8 @@ mod tests {
 
     use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
 
-    fn mint_services(tokenizer: MockTokenizer) -> MintServices {
-        MintServices {
+    fn mint_services(tokenizer: MockTokenizer) -> EquityTransferServices {
+        EquityTransferServices {
             tokenizer: Arc::new(tokenizer),
             raindex: Arc::new(MockRaindex::new()),
         }
@@ -1147,15 +1136,15 @@ mod tests {
         );
     }
 
-    fn services_with_failing_lookup() -> MintServices {
-        MintServices {
+    fn services_with_failing_lookup() -> EquityTransferServices {
+        EquityTransferServices {
             tokenizer: Arc::new(crate::tokenization::mock::MockTokenizer::new()),
             raindex: Arc::new(FailingLookupRaindex),
         }
     }
 
-    fn services_with_failing_deposit() -> MintServices {
-        MintServices {
+    fn services_with_failing_deposit() -> EquityTransferServices {
+        EquityTransferServices {
             tokenizer: Arc::new(crate::tokenization::mock::MockTokenizer::new()),
             raindex: Arc::new(FailingDepositRaindex),
         }

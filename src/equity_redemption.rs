@@ -41,27 +41,23 @@
 //! - Failed state preserves context depending on when failure occurred
 //! - All state transitions are captured as events for complete audit trail
 
-#[cfg(test)]
-pub(crate) mod mock;
-mod redeemer;
-
-use std::sync::Arc;
-
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use tracing::{info, warn};
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::Symbol;
 
-pub(crate) use redeemer::{RedeemError, Redeemer};
-
+use crate::rebalancing::transfer::EquityTransferServices;
+use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
-pub(crate) type RedemptionServices = Arc<dyn Redeemer>;
+/// Our tokenized equity tokens use 18 decimals.
+const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// Unique identifier for a redemption aggregate instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,9 +88,18 @@ impl FromStr for RedemptionAggregateId {
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum EquityRedemptionError {
-    /// Service operation failed
-    #[error(transparent)]
-    Redeem(#[from] RedeemError),
+    /// Vault lookup failed for the given token
+    #[error("Token {0} not found in vault registry")]
+    VaultNotFound(Address),
+    /// Vault withdrawal transaction failed
+    #[error("Vault withdraw failed")]
+    VaultWithdrawFailed,
+    /// Sending tokens to Alpaca redemption wallet failed
+    #[error("Send for redemption failed")]
+    SendForRedemptionFailed,
+    /// Transaction failed with a known tx hash
+    #[error("Transaction failed: {tx_hash}")]
+    TransactionFailed { tx_hash: TxHash },
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
@@ -283,7 +288,7 @@ impl EventSourced for EquityRedemption {
     type Event = EquityRedemptionEvent;
     type Command = EquityRedemptionCommand;
     type Error = EquityRedemptionError;
-    type Services = RedemptionServices;
+    type Services = EquityTransferServices;
 
     const AGGREGATE_TYPE: &'static str = "EquityRedemption";
     const PROJECTION: Option<Table> = Some(Table("equity_redemption_view"));
@@ -471,7 +476,28 @@ impl EventSourced for EquityRedemption {
                 token,
                 amount,
             } => {
-                let vault_withdraw_tx = services.withdraw_from_raindex(token, amount).await?;
+                let vault_id = match services.raindex.lookup_vault_id(token).await {
+                    Ok(id) => id,
+                    Err(error) => {
+                        warn!(%error, %token, "Vault lookup failed");
+                        return Err(EquityRedemptionError::VaultNotFound(token));
+                    }
+                };
+
+                info!(?vault_id, %token, %amount, "Withdrawing tokens from vault");
+
+                let vault_withdraw_tx = match services
+                    .raindex
+                    .withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
+                    .await
+                {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        warn!(%error, %token, %amount, "Vault withdrawal failed");
+                        return Err(EquityRedemptionError::VaultWithdrawFailed);
+                    }
+                };
+
                 let now = Utc::now();
                 let vault_withdrawn = VaultWithdrawn {
                     symbol,
@@ -481,24 +507,30 @@ impl EventSourced for EquityRedemption {
                     withdrawn_at: now,
                 };
 
-                match services.send_for_redemption(token, amount).await {
-                    Ok((redemption_wallet, redemption_tx)) => Ok(vec![
-                        vault_withdrawn,
-                        TokensSent {
-                            redemption_wallet,
-                            redemption_tx,
-                            sent_at: now,
-                        },
-                    ]),
-                    Err(e) => {
-                        let tx_hash = match &e {
-                            RedeemError::Transaction { tx_hash, .. } => Some(*tx_hash),
-                            _ => None,
-                        };
+                info!(%token, %amount, "Sending tokens for redemption");
+
+                match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
+                    .await
+                {
+                    Ok(redemption_tx) => {
+                        let redemption_wallet =
+                            Tokenizer::redemption_wallet(services.tokenizer.as_ref());
+
+                        Ok(vec![
+                            vault_withdrawn,
+                            TokensSent {
+                                redemption_wallet,
+                                redemption_tx,
+                                sent_at: now,
+                            },
+                        ])
+                    }
+                    Err(error) => {
+                        warn!(%error, %token, %amount, "Send for redemption failed");
                         Ok(vec![
                             vault_withdrawn,
                             TransferFailed {
-                                tx_hash,
+                                tx_hash: None,
                                 failed_at: now,
                             },
                         ])
@@ -581,11 +613,11 @@ pub(crate) mod tests {
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
 
-    use super::mock::MockRedeemer;
+    use super::mock::mock_equity_transfer_services;
     use super::*;
 
-    fn mock_services() -> RedemptionServices {
-        Arc::new(MockRedeemer::new())
+    fn mock_services() -> EquityTransferServices {
+        mock_equity_transfer_services()
     }
 
     fn vault_withdrawn_event() -> EquityRedemptionEvent {
