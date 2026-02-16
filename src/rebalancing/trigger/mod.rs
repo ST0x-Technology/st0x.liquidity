@@ -116,7 +116,7 @@ pub(crate) struct RebalancingConfig {
 /// Read-only provider access for either chain is available via
 /// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
-pub(crate) struct RebalancingCtx {
+pub struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
