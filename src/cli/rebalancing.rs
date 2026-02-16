@@ -19,20 +19,16 @@ use super::TransferDirection;
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
-use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::rebalancing::transfer::{
-    CrossVenueTransfer, EquityTransfer, EquityTransferServices, HedgingVenue, MarketMakingVenue,
-    MintRequest, RedemptionRequest,
-};
-use crate::rebalancing::usdc::UsdcRebalanceManager;
+use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
+use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
+use crate::rebalancing::usdc::CrossVenueCashTransfer;
 use crate::threshold::Usdc;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
 use crate::tokenized_equity_mint::IssuerRequestId;
-use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistry;
 
 pub(super) async fn transfer_equity_command<W: Write>(
@@ -40,7 +36,6 @@ pub(super) async fn transfer_equity_command<W: Write>(
     direction: TransferDirection,
     symbol: &Symbol,
     quantity: FractionalShares,
-    token_address: Option<Address>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -102,22 +97,21 @@ pub(super) async fn transfer_equity_command<W: Write>(
             );
             let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
 
-            let equity_transfer =
-                EquityTransfer::new(tokenization_service, mint_store, redemption_store);
+            let equity_transfer = CrossVenueEquityTransfer::new(
+                raindex,
+                tokenization_service,
+                wallet,
+                mint_store,
+                redemption_store,
+            );
 
-            let issuer_request_id =
-                IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
-
-            writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
 
             CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
                 &equity_transfer,
-                MintRequest {
-                    issuer_request_id,
+                Equity {
                     symbol: symbol.clone(),
                     quantity,
-                    wallet,
                 },
             )
             .await?;
@@ -126,11 +120,6 @@ pub(super) async fn transfer_equity_command<W: Write>(
         }
 
         TransferDirection::ToAlpaca => {
-            let token = token_address.ok_or_else(|| {
-                anyhow::anyhow!("--token-address is required for to-alpaca direction (redemption)")
-            })?;
-
-            writeln!(stdout, "   Token Address: {token}")?;
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
@@ -156,25 +145,19 @@ pub(super) async fn transfer_equity_command<W: Write>(
             );
             let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
 
-            let equity_transfer =
-                EquityTransfer::new(tokenization_service, mint_store, redemption_store);
-
-            let aggregate_id =
-                RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
-
-            let amount = quantity.to_u256_18_decimals()?;
-
-            writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
-            writeln!(stdout, "   Amount (wei): {amount}")?;
+            let equity_transfer = CrossVenueEquityTransfer::new(
+                raindex,
+                tokenization_service,
+                owner,
+                mint_store,
+                redemption_store,
+            );
 
             CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
                 &equity_transfer,
-                RedemptionRequest {
-                    aggregate_id,
+                Equity {
                     symbol: symbol.clone(),
                     quantity,
-                    token,
-                    amount,
                 },
             )
             .await?;
@@ -266,7 +249,7 @@ where
     ));
     let usdc_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
 
-    let rebalance_manager = UsdcRebalanceManager::new(
+    let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
         alpaca_wallet,
         bridge,
@@ -276,24 +259,23 @@ where
         RaindexVaultId(rebalancing_config.usdc_vault_id),
     );
 
-    let rebalance_id = UsdcRebalanceId::new(format!("cli-usdc-{}", uuid::Uuid::new_v4()));
-    writeln!(
-        stdout,
-        "   Rebalance ID: {} (may take several minutes)",
-        rebalance_id.0
-    )?;
+    writeln!(stdout, "   Transfer may take several minutes...")?;
 
     match direction {
         TransferDirection::ToRaindex => {
-            rebalance_manager
-                .execute_alpaca_to_base(&rebalance_id, amount)
-                .await?;
+            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+                &rebalance_manager,
+                amount,
+            )
+            .await?;
             writeln!(stdout, "USDC transfer to Raindex completed successfully")?;
         }
         TransferDirection::ToAlpaca => {
-            rebalance_manager
-                .execute_base_to_alpaca(&rebalance_id, amount)
-                .await?;
+            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
+                &rebalance_manager,
+                amount,
+            )
+            .await?;
             writeln!(stdout, "USDC transfer to Alpaca completed successfully")?;
         }
     }
@@ -637,7 +619,6 @@ mod tests {
             TransferDirection::ToRaindex,
             &symbol,
             quantity,
-            None,
             &ctx,
             &pool,
         )
@@ -663,7 +644,6 @@ mod tests {
             TransferDirection::ToRaindex,
             &symbol,
             quantity,
-            None,
             &ctx,
             &pool,
         )

@@ -27,7 +27,7 @@ use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{InventorySnapshot, InventorySnapshotReactor, InventoryView};
 use crate::position::Position;
-use crate::rebalancing::transfer::EquityTransferServices;
+use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;

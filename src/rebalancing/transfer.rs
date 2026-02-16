@@ -1,19 +1,11 @@
 //! Cross-venue asset transfer abstraction.
 //!
-//! Provides the [`CrossVenueTransfer`] trait that models directional
-//! asset movement between the market-making venue (Raindex) and the
-//! hedging venue (Alpaca). Venue markers ([`MarketMakingVenue`],
-//! [`HedgingVenue`]) encode transfer direction in the type system.
-//!
-//! [`EquityTransferServices`] bundles the service traits needed by
-//! both equity transfer aggregates (`TokenizedEquityMint` and
-//! `EquityRedemption`).
+//! [`CrossVenueTransfer`] defines the interface for moving assets between
+//! trading venues. Implementations encapsulate the full multi-step lifecycle
+//! (e.g. mint + deposit, or withdraw + redeem). The inventory layer calls
+//! this without knowing the steps involved.
 
 use async_trait::async_trait;
-use std::sync::Arc;
-
-use crate::onchain::raindex::Raindex;
-use crate::tokenization::Tokenizer;
 
 /// Raindex orderbook -- where market-making inventory lives.
 pub(crate) struct MarketMakingVenue;
@@ -31,15 +23,4 @@ pub(crate) trait CrossVenueTransfer<Source, Destination>: Send + Sync {
     type Error;
 
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error>;
-}
-
-/// Services shared by both equity transfer aggregates.
-///
-/// Both `TokenizedEquityMint` (hedging -> market-making) and
-/// `EquityRedemption` (market-making -> hedging) need Raindex for
-/// vault operations and Tokenizer for Alpaca API interactions.
-#[derive(Clone)]
-pub(crate) struct EquityTransferServices {
-    pub(crate) raindex: Arc<dyn Raindex>,
-    pub(crate) tokenizer: Arc<dyn Tokenizer>,
 }

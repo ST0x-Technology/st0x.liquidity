@@ -49,8 +49,8 @@ use tracing::warn;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::rebalancing::transfer::EquityTransferServices;
-use crate::tokenization::{TokenizationRequestStatus, Tokenizer};
+use crate::rebalancing::equity::EquityTransferServices;
+use crate::tokenization::TokenizationRequestStatus;
 
 /// Alpaca issuer request identifier returned when a tokenization request is accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

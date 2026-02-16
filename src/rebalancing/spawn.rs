@@ -16,8 +16,9 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
 
-use super::usdc::UsdcRebalanceManager;
-use super::{MintManager, Rebalancer, RebalancingCtx, RedemptionManager, TriggeredOperation};
+use super::equity::CrossVenueEquityTransfer;
+use super::usdc::CrossVenueCashTransfer;
+use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::equity_redemption::EquityRedemption;
 use crate::onchain::http_client_with_retry;
@@ -53,12 +54,9 @@ type HttpProvider = FillProvider<
     Ethereum,
 >;
 
-/// Type alias for a configured rebalancer with SQLite persistence.
-type ConfiguredRebalancer<BP> =
-    Rebalancer<MintManager, RedemptionManager, UsdcRebalanceManager<BP>>;
-
 pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) mint: Arc<Store<TokenizedEquityMint>>,
+    pub(crate) redemption: Arc<Store<EquityRedemption>>,
     pub(crate) usdc: Arc<Store<UsdcRebalance>>,
 }
 
@@ -79,7 +77,6 @@ pub(crate) async fn spawn_rebalancer<BP>(
     frameworks: RebalancingCqrsFrameworks,
     raindex_service: Arc<RaindexService<BP>>,
     tokenizer: Arc<dyn Tokenizer>,
-    redemption_cqrs: Arc<Store<EquityRedemption>>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -97,13 +94,7 @@ where
     )
     .await?;
 
-    let rebalancer = services.into_rebalancer(
-        ctx,
-        addresses,
-        operation_receiver,
-        frameworks,
-        redemption_cqrs,
-    );
+    let rebalancer = services.into_rebalancer(ctx, addresses, operation_receiver, frameworks);
 
     let handle = tokio::spawn(async move {
         rebalancer.run().await;
@@ -187,16 +178,19 @@ where
         addresses: RebalancerAddresses,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
-        redemption_cqrs: Arc<Store<EquityRedemption>>,
-    ) -> ConfiguredRebalancer<BP>
+    ) -> Rebalancer
     where
         BP: Send + Sync + 'static,
     {
-        let mint_manager = Arc::new(MintManager::new(frameworks.mint));
+        let equity = Arc::new(CrossVenueEquityTransfer::new(
+            self.raindex.clone(),
+            self.tokenizer,
+            addresses.market_maker_wallet,
+            frameworks.mint,
+            frameworks.redemption,
+        ));
 
-        let redemption_manager = Arc::new(RedemptionManager::new(self.tokenizer, redemption_cqrs));
-
-        let usdc_manager = Arc::new(UsdcRebalanceManager::new(
+        let usdc = Arc::new(CrossVenueCashTransfer::new(
             self.broker,
             self.wallet,
             self.cctp,
@@ -207,11 +201,11 @@ where
         ));
 
         Rebalancer::new(
-            mint_manager,
-            redemption_manager,
-            usdc_manager,
+            Arc::clone(&equity) as _,
+            equity as _,
+            Arc::clone(&usdc) as _,
+            usdc as _,
             operation_receiver,
-            ctx.redemption_wallet,
         )
     }
 }
@@ -237,9 +231,8 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
-    use crate::rebalancing::transfer::EquityTransferServices;
+    use crate::rebalancing::equity::EquityTransferServices;
     use crate::rebalancing::trigger::UsdcRebalancing;
-    use crate::tokenization::Tokenizer;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::VaultRegistry;
@@ -506,6 +499,7 @@ mod tests {
 
         let frameworks = RebalancingCqrsFrameworks {
             mint: mint_cqrs,
+            redemption: redemption_cqrs,
             usdc: usdc_cqrs,
         };
 
@@ -518,7 +512,6 @@ mod tests {
             },
             rx,
             frameworks,
-            redemption_cqrs,
         );
 
         tx.send(TriggeredOperation::Mint {

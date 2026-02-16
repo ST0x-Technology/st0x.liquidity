@@ -50,7 +50,7 @@ use crate::position::{Position, PositionCommand, TradeId};
 use crate::queue::{
     EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
 };
-use crate::rebalancing::transfer::EquityTransferServices;
+use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
     RebalancerAddresses, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig,
     spawn_rebalancer,

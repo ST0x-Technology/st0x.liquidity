@@ -52,7 +52,7 @@ use tracing::{info, warn};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::Symbol;
 
-use crate::rebalancing::transfer::EquityTransferServices;
+use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizationRequestId;
 

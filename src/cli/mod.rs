@@ -109,9 +109,6 @@ pub enum Commands {
         /// Number of shares to transfer (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Token contract address (required for to-alpaca direction)
-        #[arg(long = "token-address")]
-        token_address: Option<Address>,
     },
 
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
@@ -377,7 +374,6 @@ enum SimpleCommand {
         direction: TransferDirection,
         symbol: Symbol,
         quantity: FractionalShares,
-        token_address: Option<Address>,
     },
     AlpacaDeposit {
         amount: Usdc,
@@ -473,12 +469,10 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             direction,
             symbol,
             quantity,
-            token_address,
         } => Ok(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
-            token_address,
         }),
         Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
         Commands::AlpacaWithdraw { amount, to_address } => {
@@ -559,18 +553,9 @@ async fn run_simple_command<W: Write>(
             direction,
             symbol,
             quantity,
-            token_address,
         } => {
-            rebalancing::transfer_equity_command(
-                stdout,
-                direction,
-                &symbol,
-                quantity,
-                token_address,
-                ctx,
-                pool,
-            )
-            .await
+            rebalancing::transfer_equity_command(stdout, direction, &symbol, quantity, ctx, pool)
+                .await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command(stdout, amount, ctx).await
@@ -2059,12 +2044,10 @@ mod tests {
             "AAPL",
             "-q",
             "5.0",
-            "--token-address",
-            "0x1234567890123456789012345678901234567890",
         ]);
         assert!(
             result.is_ok(),
-            "transfer-equity to-alpaca with token-address should succeed: {:?}",
+            "transfer-equity to-alpaca should succeed: {:?}",
             result.err()
         );
     }
