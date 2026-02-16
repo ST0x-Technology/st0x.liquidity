@@ -26,8 +26,8 @@ pub(crate) enum RedeemError {
 /// Implementations handle vault withdrawal and token transfer to Alpaca.
 #[async_trait]
 pub(crate) trait Redeemer: Send + Sync {
-    /// Withdraws tokens from the Rain OrderBook vault.
-    async fn withdraw_from_vault(
+    /// Withdraws tokens from the Raindex OrderBook vault.
+    async fn withdraw_from_raindex(
         &self,
         token: Address,
         amount: U256,

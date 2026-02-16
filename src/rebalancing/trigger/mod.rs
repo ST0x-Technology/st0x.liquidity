@@ -585,7 +585,8 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::equity_redemption::DetectionFailure;
-    use crate::inventory::{InventorySnapshotEvent, InventorySnapshotId, InventorySnapshotReactor};
+    use crate::inventory::InventorySnapshotReactor;
+    use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;

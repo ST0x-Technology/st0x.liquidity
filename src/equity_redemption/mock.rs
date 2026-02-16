@@ -7,6 +7,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 
 use super::{RedeemError, Redeemer, RedemptionServices};
+use crate::tokenization::mock::MockTokenizer;
 
 pub(crate) struct MockRedeemer {
     vault_tx: TxHash,
@@ -37,7 +38,7 @@ impl MockRedeemer {
 
 #[async_trait]
 impl Redeemer for MockRedeemer {
-    async fn withdraw_from_vault(
+    async fn withdraw_from_raindex(
         &self,
         _token: Address,
         _amount: U256,
