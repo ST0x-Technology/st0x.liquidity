@@ -101,6 +101,8 @@ Extract hedging logic and create application binary:
 
 **Infrastructure:**
 
+- [ ] [#293 Granular SSH access control: limit root access and per-user deploy keys](https://github.com/ST0x-Technology/st0x.liquidity/issues/293)
+- [ ] [#294 Document secret management setup and opsec](https://github.com/ST0x-Technology/st0x.liquidity/issues/294)
 - [ ] [#286 No TLS configured for dashboard and WebSocket traffic](https://github.com/ST0x-Technology/st0x.liquidity/issues/286)
 - [ ] [#275 Optimise Fireblocks transfers: use vault-to-vault for issuance bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/275)
 - [ ] [#77 Set up Kafka](https://github.com/ST0x-Technology/st0x.liquidity/issues/77) -
