@@ -17,7 +17,10 @@ use crate::config::{BrokerCtx, Ctx};
 
 mod alpaca_wallet;
 pub mod api;
+#[cfg(not(any(test, feature = "test-support")))]
 mod bindings;
+#[cfg(any(test, feature = "test-support"))]
+pub mod bindings;
 pub mod cli;
 mod conductor;
 pub mod config;
@@ -42,6 +45,9 @@ mod vault_registry;
 mod wrapper;
 
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use onchain::USDC_BASE;
 
 #[cfg(test)]
 mod integration_tests;

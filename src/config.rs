@@ -5,6 +5,7 @@
 //! of the application consumes.
 
 use alloy::primitives::{Address, FixedBytes};
+use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -67,7 +68,6 @@ struct Secrets {
 /// Deserialized from the `[broker]` section of the secrets TOML.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
-#[allow(clippy::large_enum_variant)] // isn't relevant for a brief startup step
 enum BrokerSecrets {
     Schwab {
         app_key: String,
@@ -91,16 +91,6 @@ enum BrokerSecrets {
     DryRun,
 }
 
-/// Encodes the two mutually exclusive operating modes at the type level.
-///
-/// `Standalone`: order_owner comes from config, no rebalancing.
-/// `Rebalancing`: order_owner resolved from Fireblocks at runtime.
-#[derive(Clone, Debug)]
-pub(crate) enum TradingMode {
-    Standalone { order_owner: Address },
-    Rebalancing(Box<RebalancingCtx>),
-}
-
 /// Combined runtime context for the server. Assembled from plaintext config,
 /// encrypted secrets, and derived runtime state.
 #[derive(Clone)]
@@ -113,7 +103,7 @@ pub struct Ctx {
     pub(crate) order_polling_max_jitter: u64,
     pub(crate) broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    pub(crate) trading_mode: TradingMode,
+    pub(crate) rebalancing: Option<RebalancingCtx>,
     pub(crate) execution_threshold: ExecutionThreshold,
 }
 
@@ -257,7 +247,7 @@ impl std::fmt::Debug for Ctx {
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
-            .field("trading_mode", &self.trading_mode)
+            .field("rebalancing", &self.rebalancing.is_some())
             .field("execution_threshold", &self.execution_threshold)
             .finish()
     }
@@ -298,17 +288,18 @@ impl From<&LogLevel> for Level {
 }
 
 impl Ctx {
-    pub async fn load_files(config: &Path, secrets: &Path) -> Result<Self, CtxError> {
-        let config_str = tokio::fs::read_to_string(config).await?;
-        let secrets_str = tokio::fs::read_to_string(secrets).await?;
-        Self::from_toml(&config_str, &secrets_str).await
+    pub fn load_files(config: &Path, secrets: &Path) -> Result<Self, CtxError> {
+        let config_str = std::fs::read_to_string(config)?;
+        let secrets_str = std::fs::read_to_string(secrets)?;
+        Self::from_toml(&config_str, &secrets_str)
     }
 
-    async fn from_toml(config_toml: &str, secrets_toml: &str) -> Result<Self, CtxError> {
+    pub fn from_toml(config_toml: &str, secrets_toml: &str) -> Result<Self, CtxError> {
         let config: Config = toml::from_str(config_toml)?;
         let secrets: Secrets = toml::from_str(secrets_toml)?;
 
         let broker = BrokerCtx::from(secrets.broker);
+        let evm = EvmCtx::new(&config.evm, secrets.evm);
         let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
 
         // Execution threshold is determined by broker capabilities:
@@ -318,36 +309,38 @@ impl Ctx {
         // - DryRun uses shares threshold for testing
         let execution_threshold = broker.execution_threshold()?;
 
-        let evm = EvmCtx::new(&config.evm, secrets.evm);
-
-        let trading_mode = match (
-            config.rebalancing,
-            secrets.rebalancing,
-            config.evm.order_owner,
-        ) {
-            (Some(rebalancing_config), Some(rebalancing_secrets), None) => {
+        // Rebalancing requires both config and secrets, plus an AlpacaBrokerApi broker.
+        let rebalancing = match (config.rebalancing, secrets.rebalancing) {
+            (Some(rebalancing_config), Some(rebalancing_secrets)) => {
                 let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &broker else {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
                 };
-                TradingMode::Rebalancing(Box::new(
-                    RebalancingCtx::new(
-                        rebalancing_config,
-                        rebalancing_secrets,
-                        alpaca_auth.clone(),
-                    )
-                    .await?,
-                ))
+                Some(RebalancingCtx::new(
+                    rebalancing_config,
+                    rebalancing_secrets,
+                    alpaca_auth.clone(),
+                )?)
             }
-            (Some(_), Some(_), Some(configured)) => {
-                return Err(CtxError::OrderOwnerConflictsWithFireblocks { configured });
-            }
-            (None, None, Some(order_owner)) => TradingMode::Standalone { order_owner },
-            (None, None, None) => return Err(CtxError::MissingOrderOwner),
-            (Some(_), None, _) => return Err(CtxError::RebalancingSecretsMissing),
-            (None, Some(_), _) => return Err(CtxError::RebalancingConfigMissing),
+            (None, None) => None,
+            (Some(_), None) => return Err(CtxError::RebalancingSecretsMissing),
+            (None, Some(_)) => return Err(CtxError::RebalancingConfigMissing),
         };
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
+
+        if let (Some(rebalancing_ctx), Some(configured_owner)) = (&rebalancing, evm.order_owner) {
+            let derived = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?.address();
+            if derived != configured_owner {
+                return Err(CtxError::OrderOwnerMismatch {
+                    configured: configured_owner,
+                    derived,
+                });
+            }
+        }
+
+        if rebalancing.is_none() && evm.order_owner.is_none() {
+            return Err(CtxError::MissingOrderOwner);
+        }
 
         Ok(Self {
             database_url: config.database_url,
@@ -358,7 +351,7 @@ impl Ctx {
             order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
             broker,
             telemetry,
-            trading_mode,
+            rebalancing,
             execution_threshold,
         })
     }
@@ -367,11 +360,8 @@ impl Ctx {
         configure_sqlite_pool(&self.database_url).await
     }
 
-    pub(crate) fn rebalancing_ctx(&self) -> Result<&RebalancingCtx, CtxError> {
-        match &self.trading_mode {
-            TradingMode::Rebalancing(ctx) => Ok(ctx),
-            TradingMode::Standalone { .. } => Err(CtxError::NotRebalancing),
-        }
+    pub(crate) fn rebalancing_ctx(&self) -> Option<&RebalancingCtx> {
+        self.rebalancing.as_ref()
     }
 
     pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
@@ -381,15 +371,14 @@ impl Ctx {
         }
     }
 
-    /// Returns the wallet address that owns orders on the orderbook.
-    ///
-    /// In `Standalone` mode this is the statically-configured order owner.
-    /// In `Rebalancing` mode this is the Fireblocks wallet address resolved
-    /// during async construction.
-    pub(crate) fn order_owner(&self) -> Address {
-        match &self.trading_mode {
-            TradingMode::Standalone { order_owner } => *order_owner,
-            TradingMode::Rebalancing(ctx) => ctx.base_wallet().address(),
+    pub(crate) fn order_owner(&self) -> Result<Address, CtxError> {
+        match (&self.rebalancing, self.evm.order_owner) {
+            (Some(r), _) => {
+                let signer = PrivateKeySigner::from_bytes(&r.evm_private_key)?;
+                Ok(signer.address())
+            }
+            (None, Some(addr)) => Ok(addr),
+            (None, None) => Err(CtxError::MissingOrderOwner),
         }
     }
 }
@@ -400,6 +389,8 @@ pub enum CtxError {
     Rebalancing(#[from] RebalancingCtxError),
     #[error("ORDER_OWNER required when rebalancing is disabled")]
     MissingOrderOwner,
+    #[error("failed to derive address from EVM_PRIVATE_KEY")]
+    PrivateKeyDerivation(#[from] alloy::signers::k256::ecdsa::Error),
     #[error("failed to read config file")]
     Io(#[from] std::io::Error),
     #[error("failed to parse TOML")]
@@ -408,17 +399,18 @@ pub enum CtxError {
     InvalidThreshold(#[from] InvalidThresholdError),
     #[error(transparent)]
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
-    #[error("operation requires rebalancing mode")]
-    NotRebalancing,
     #[error("rebalancing config present in config but rebalancing secrets missing")]
     RebalancingSecretsMissing,
     #[error("rebalancing secrets present but rebalancing config missing in config")]
     RebalancingConfigMissing,
     #[error(
-        "order_owner {configured} must not be set when Fireblocks \
-         rebalancing is enabled (address is derived from vault)"
+        "order_owner {configured} does not match market maker wallet \
+         {derived} derived from evm_private_key"
     )]
-    OrderOwnerConflictsWithFireblocks { configured: Address },
+    OrderOwnerMismatch {
+        configured: Address,
+        derived: Address,
+    },
 }
 
 #[cfg(test)]
@@ -426,17 +418,15 @@ impl CtxError {
     fn kind(&self) -> &'static str {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
-            Self::NotRebalancing => "operation requires rebalancing mode",
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
+            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
             Self::Io(_) => "failed to read config file",
             Self::Toml(_) => "failed to parse TOML",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",
-            Self::OrderOwnerConflictsWithFireblocks { .. } => {
-                "order_owner conflicts with fireblocks"
-            }
+            Self::OrderOwnerMismatch { .. } => "order_owner mismatch",
         }
     }
 }
@@ -464,6 +454,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
+    use tracing_test::traced_test;
 
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
@@ -481,6 +472,7 @@ pub(crate) mod tests {
             evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
+                order_owner: Some(order_owner),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -494,7 +486,7 @@ pub(crate) mod tests {
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             telemetry: None,
-            trading_mode: TradingMode::Standalone { order_owner },
+            rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
@@ -547,6 +539,14 @@ pub(crate) mod tests {
         include_str!("../example.secrets.toml")
     }
 
+    fn example_secrets_with_private_key(evm_private_key: &str) -> String {
+        example_secrets_toml().replacen(
+            "evm_private_key = \"0x0000000000000000000000000000000000000000000000000000000000000001\"",
+            &format!("evm_private_key = \"{evm_private_key}\""),
+            1,
+        )
+    }
+
     #[test]
     fn test_log_level_from_conversion() {
         let level: Level = LogLevel::Trace.into();
@@ -597,35 +597,29 @@ pub(crate) mod tests {
         let _: MockExecutor = MockExecutorCtx.try_into_executor().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn dry_run_broker_does_not_require_any_credentials() {
-        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml())
-            .await
-            .unwrap();
+    #[test]
+    fn dry_run_broker_does_not_require_any_credentials() {
+        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml()).unwrap();
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
     }
 
-    #[tokio::test]
-    async fn standalone_mode_when_no_rebalancing() {
-        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml())
-            .await
-            .unwrap();
-        assert!(matches!(ctx.trading_mode, TradingMode::Standalone { .. }));
+    #[test]
+    fn rebalancing_absent_means_none() {
+        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml()).unwrap();
+        assert!(ctx.rebalancing.is_none());
     }
 
-    #[tokio::test]
-    async fn defaults_applied_when_optional_fields_omitted() {
-        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml())
-            .await
-            .unwrap();
+    #[test]
+    fn defaults_applied_when_optional_fields_omitted() {
+        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml()).unwrap();
         assert!(matches!(ctx.log_level, LogLevel::Debug));
         assert_eq!(ctx.server_port, 8080);
         assert_eq!(ctx.order_polling_interval, 15);
         assert_eq!(ctx.order_polling_max_jitter, 5);
     }
 
-    #[tokio::test]
-    async fn optional_fields_override_defaults() {
+    #[test]
+    fn optional_fields_override_defaults() {
         let config = r#"
             database_url = ":memory:"
             log_level = "warn"
@@ -638,17 +632,15 @@ pub(crate) mod tests {
             deployment_block = 1
         "#;
 
-        let ctx = Ctx::from_toml(config, dry_run_secrets_toml())
-            .await
-            .unwrap();
+        let ctx = Ctx::from_toml(config, dry_run_secrets_toml()).unwrap();
         assert!(matches!(ctx.log_level, LogLevel::Warn));
         assert_eq!(ctx.server_port, 9090);
         assert_eq!(ctx.order_polling_interval, 30);
         assert_eq!(ctx.order_polling_max_jitter, 10);
     }
 
-    #[tokio::test]
-    async fn rebalancing_with_schwab_fails() {
+    #[test]
+    fn rebalancing_with_schwab_fails() {
         let secrets = r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -659,10 +651,8 @@ pub(crate) mod tests {
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
 
             [rebalancing]
-            base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#;
 
         let config = r#"
@@ -673,12 +663,6 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            fireblocks_vault_account_id = "0"
-            fireblocks_environment = "sandbox"
-
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
 
             [rebalancing.equities]
 
@@ -690,7 +674,7 @@ pub(crate) mod tests {
             mode = "disabled"
         "#;
 
-        let result = Ctx::from_toml(config, secrets).await;
+        let result = Ctx::from_toml(config, secrets);
         assert!(
             matches!(
                 result,
@@ -700,62 +684,84 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn schwab_without_order_owner_fails() {
+    #[test]
+    fn schwab_without_order_owner_fails() {
         let result = Ctx::from_toml(
             minimal_config_toml_without_order_owner(),
             schwab_secrets_toml(),
-        )
-        .await;
+        );
         assert!(
             matches!(result, Err(CtxError::MissingOrderOwner)),
             "Expected MissingOrderOwner error, got {result:?}"
         );
     }
 
-    #[tokio::test]
-    async fn schwab_with_order_owner_succeeds() {
-        let ctx = Ctx::from_toml(minimal_config_toml(), schwab_secrets_toml())
-            .await
-            .unwrap();
+    #[test]
+    fn schwab_with_order_owner_succeeds() {
+        let ctx = Ctx::from_toml(minimal_config_toml(), schwab_secrets_toml()).unwrap();
+        let order_owner = ctx.order_owner().unwrap();
         assert_eq!(
-            ctx.order_owner(),
+            order_owner,
             address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 
-    #[tokio::test]
-    async fn rebalancing_with_missing_secret_file_fails() {
-        let error = Ctx::from_toml(example_config_toml(), example_secrets_toml())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead(_))
-            ),
-            "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
+    #[test]
+    fn rebalancing_derives_order_owner_from_private_key() {
+        let ctx = Ctx::from_toml(example_config_toml(), example_secrets_toml()).unwrap();
+
+        let order_owner = ctx.order_owner().unwrap();
+        assert_eq!(
+            order_owner,
+            address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
         );
     }
 
-    #[tokio::test]
-    async fn rebalancing_with_order_owner_configured_fails() {
+    #[test]
+    fn rebalancing_with_mismatched_order_owner_fails() {
         let config = example_config_toml().replace(
             "deployment_block = 1",
             "order_owner = \"0xcccccccccccccccccccccccccccccccccccccccc\"\ndeployment_block = 1",
         );
 
-        let error = Ctx::from_toml(&config, example_secrets_toml())
-            .await
-            .unwrap_err();
+        let error = Ctx::from_toml(&config, example_secrets_toml()).unwrap_err();
         assert!(
-            matches!(error, CtxError::OrderOwnerConflictsWithFireblocks { .. }),
-            "Expected OrderOwnerConflictsWithFireblocks, got: {error:?}"
+            matches!(error, CtxError::OrderOwnerMismatch { .. }),
+            "Expected OrderOwnerMismatch, got: {error:?}"
         );
     }
 
-    #[tokio::test]
-    async fn telemetry_ctx_assembled_from_config_and_secrets() {
+    #[test]
+    fn rebalancing_with_matching_order_owner_succeeds() {
+        // Private key 0x01 derives to 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+        let config = example_config_toml().replace(
+            "deployment_block = 1",
+            "order_owner = \"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\"\ndeployment_block = 1",
+        );
+
+        let ctx = Ctx::from_toml(&config, example_secrets_toml()).unwrap();
+        let order_owner = ctx.order_owner().unwrap();
+        assert_eq!(
+            order_owner,
+            address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"),
+        );
+    }
+
+    #[test]
+    fn rebalancing_with_invalid_private_key_fails() {
+        let secrets = example_secrets_with_private_key(
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+        );
+
+        let error = Ctx::from_toml(example_config_toml(), &secrets).unwrap_err();
+        assert!(
+            matches!(error, CtxError::Rebalancing(_)),
+            "Expected Rebalancing error for zero private key, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn telemetry_ctx_assembled_from_config_and_secrets() {
         let config = r#"
             database_url = ":memory:"
             [evm]
@@ -775,14 +781,14 @@ pub(crate) mod tests {
             api_key = "test-api-key"
         "#;
 
-        let ctx = Ctx::from_toml(config, secrets).await.unwrap();
+        let ctx = Ctx::from_toml(config, secrets).unwrap();
         let telemetry = ctx.telemetry.as_ref().expect("telemetry should be Some");
         assert_eq!(telemetry.api_key, "test-api-key");
         assert_eq!(telemetry.service_name, "test-service");
     }
 
-    #[tokio::test]
-    async fn telemetry_config_without_secrets_fails() {
+    #[test]
+    fn telemetry_config_without_secrets_fails() {
         let config = r#"
             database_url = ":memory:"
 
@@ -794,7 +800,7 @@ pub(crate) mod tests {
             service_name = "test-service"
         "#;
 
-        let result = Ctx::from_toml(config, dry_run_secrets_toml()).await;
+        let result = Ctx::from_toml(config, dry_run_secrets_toml());
         assert!(
             matches!(
                 result,
@@ -806,8 +812,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn telemetry_secrets_without_config_fails() {
+    #[test]
+    fn telemetry_secrets_without_config_fails() {
         let secrets = r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -817,7 +823,7 @@ pub(crate) mod tests {
             api_key = "test-api-key"
         "#;
 
-        let result = Ctx::from_toml(minimal_config_toml(), secrets).await;
+        let result = Ctx::from_toml(minimal_config_toml(), secrets);
         assert!(
             matches!(
                 result,
@@ -829,8 +835,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rebalancing_ctx_without_secrets_fails() {
+    #[test]
+    fn rebalancing_ctx_without_secrets_fails() {
         let config = r#"
             database_url = ":memory:"
             [evm]
@@ -839,12 +845,6 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            fireblocks_vault_account_id = "0"
-            fireblocks_environment = "sandbox"
-
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
 
             [rebalancing.equities]
 
@@ -866,37 +866,33 @@ pub(crate) mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#;
 
-        let result = Ctx::from_toml(config, secrets).await;
+        let result = Ctx::from_toml(config, secrets);
         assert!(
             matches!(result, Err(CtxError::RebalancingSecretsMissing)),
             "Expected RebalancingSecretsMissing error, got {result:?}"
         );
     }
 
-    #[tokio::test]
-    async fn default_execution_threshold_is_one_share_for_dry_run() {
-        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml())
-            .await
-            .unwrap();
+    #[test]
+    fn default_execution_threshold_is_one_share_for_dry_run() {
+        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml()).unwrap();
         assert_eq!(
             ctx.execution_threshold,
             ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
         );
     }
 
-    #[tokio::test]
-    async fn schwab_executor_uses_shares_threshold() {
-        let ctx = Ctx::from_toml(minimal_config_toml(), schwab_secrets_toml())
-            .await
-            .unwrap();
+    #[test]
+    fn schwab_executor_uses_shares_threshold() {
+        let ctx = Ctx::from_toml(minimal_config_toml(), schwab_secrets_toml()).unwrap();
         assert_eq!(
             ctx.execution_threshold,
             ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
         );
     }
 
-    #[tokio::test]
-    async fn alpaca_trading_api_executor_uses_dollar_threshold() {
+    #[test]
+    fn alpaca_trading_api_executor_uses_dollar_threshold() {
         let secrets = r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -906,15 +902,13 @@ pub(crate) mod tests {
             api_secret = "test-secret"
         "#;
 
-        let ctx = Ctx::from_toml(minimal_config_toml(), secrets)
-            .await
-            .unwrap();
+        let ctx = Ctx::from_toml(minimal_config_toml(), secrets).unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 
-    #[tokio::test]
-    async fn alpaca_broker_api_executor_uses_dollar_threshold() {
+    #[test]
+    fn alpaca_broker_api_executor_uses_dollar_threshold() {
         let secrets = r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -925,9 +919,7 @@ pub(crate) mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#;
 
-        let ctx = Ctx::from_toml(minimal_config_toml(), secrets)
-            .await
-            .unwrap();
+        let ctx = Ctx::from_toml(minimal_config_toml(), secrets).unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
@@ -944,8 +936,9 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), "invalid execution threshold");
     }
 
-    #[tokio::test]
-    async fn rebalancing_with_schwab_logs_error_kind() {
+    #[traced_test]
+    #[test]
+    fn rebalancing_with_schwab_logs_error_kind() {
         let secrets = r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -955,10 +948,8 @@ pub(crate) mod tests {
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
             [rebalancing]
-            base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#;
 
         let config = r#"
@@ -970,11 +961,6 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            fireblocks_vault_account_id = "0"
-            fireblocks_environment = "sandbox"
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
             [rebalancing.equities]
             [rebalancing.equity]
             target = "0.5"
@@ -985,16 +971,33 @@ pub(crate) mod tests {
             deviation = "0.3"
         "#;
 
-        Ctx::from_toml(config, secrets).await.unwrap_err();
+        Ctx::from_toml(config, secrets).unwrap_err();
     }
 
-    #[tokio::test]
-    async fn rebalancing_ctx_returns_err_when_standalone() {
-        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml())
-            .await
-            .unwrap();
-        let error = ctx.rebalancing_ctx().unwrap_err();
-        assert!(matches!(error, CtxError::NotRebalancing));
+    #[test]
+    fn rebalancing_ctx_returns_some_when_present() {
+        let ctx = Ctx::from_toml(example_config_toml(), example_secrets_toml()).unwrap();
+        assert!(
+            ctx.rebalancing_ctx().is_some(),
+            "rebalancing_ctx() should return Some when rebalancing is configured"
+        );
+    }
+
+    #[test]
+    fn rebalancing_ctx_returns_none_when_absent() {
+        let ctx = Ctx::from_toml(minimal_config_toml(), dry_run_secrets_toml()).unwrap();
+        assert!(
+            ctx.rebalancing_ctx().is_none(),
+            "rebalancing_ctx() should return None when rebalancing is not configured"
+        );
+    }
+
+    #[test]
+    fn example_files_load_successfully() {
+        let ctx = Ctx::from_toml(example_config_toml(), example_secrets_toml()).unwrap();
+        assert!(matches!(ctx.broker, BrokerCtx::AlpacaBrokerApi(_)));
+        assert!(ctx.rebalancing.is_some());
+        assert!(ctx.telemetry.is_some());
     }
 
     #[test]
@@ -1003,8 +1006,8 @@ pub(crate) mod tests {
         toml::from_str::<Config>(config_str).unwrap();
     }
 
-    #[tokio::test]
-    async fn unknown_config_fields_rejected() {
+    #[test]
+    fn unknown_config_fields_rejected() {
         let config = r#"
             database_url = ":memory:"
             bogus_field = "should fail"
@@ -1014,17 +1017,15 @@ pub(crate) mod tests {
             deployment_block = 1
         "#;
 
-        let err = Ctx::from_toml(config, dry_run_secrets_toml())
-            .await
-            .unwrap_err();
+        let err = Ctx::from_toml(config, dry_run_secrets_toml()).unwrap_err();
         assert!(
             matches!(err, CtxError::Toml(_)),
             "Expected TOML parse error for unknown field, got {err:?}"
         );
     }
 
-    #[tokio::test]
-    async fn unknown_secrets_fields_rejected() {
+    #[test]
+    fn unknown_secrets_fields_rejected() {
         let secrets = r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -1033,17 +1034,15 @@ pub(crate) mod tests {
             type = "dry-run"
         "#;
 
-        let err = Ctx::from_toml(minimal_config_toml(), secrets)
-            .await
-            .unwrap_err();
+        let err = Ctx::from_toml(minimal_config_toml(), secrets).unwrap_err();
         assert!(
             matches!(err, CtxError::Toml(_)),
             "Expected TOML parse error for unknown field, got {err:?}"
         );
     }
 
-    #[tokio::test]
-    async fn unknown_broker_secrets_fields_rejected() {
+    #[test]
+    fn unknown_broker_secrets_fields_rejected() {
         let secrets = r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -1055,12 +1054,31 @@ pub(crate) mod tests {
             unknown_field = "should fail"
         "#;
 
-        let err = Ctx::from_toml(minimal_config_toml(), secrets)
-            .await
-            .unwrap_err();
+        let err = Ctx::from_toml(minimal_config_toml(), secrets).unwrap_err();
         assert!(
             matches!(err, CtxError::Toml(_)),
             "Expected TOML parse error for unknown broker field, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rebalancing_fails_when_market_maker_wallet_equals_redemption_wallet() {
+        // Private key 0x01 derives to 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+        let config = example_config_toml().replacen(
+            "redemption_wallet = \"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+            "redemption_wallet = \"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\"",
+            1,
+        );
+
+        let error = Ctx::from_toml(&config, example_secrets_toml()).unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::Rebalancing(_)),
+            "Expected Rebalancing error for matching wallets, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("must be different addresses"),
+            "Expected error about different addresses, got: {error}"
         );
     }
 }
