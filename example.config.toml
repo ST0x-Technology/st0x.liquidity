@@ -13,7 +13,7 @@ service_name = "st0x-hedge"
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-[rebalancing.equity_threshold]
+[rebalancing.equity]
 target = "0.5"
 deviation = "0.2"
 

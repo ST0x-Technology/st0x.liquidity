@@ -4,6 +4,7 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -72,7 +73,7 @@ pub(crate) struct RebalancingSecrets {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
@@ -82,7 +83,7 @@ pub(crate) struct RebalancingConfig {
 /// Constructed from `RebalancingConfig` + `RebalancingSecrets` + broker's `AlpacaBrokerApiCtx`.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
-    pub(crate) equity_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
@@ -107,8 +108,15 @@ impl RebalancingCtx {
     ) -> Result<Self, RebalancingCtxError> {
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
 
+        if let Ok(signer) = PrivateKeySigner::from_bytes(&secrets.evm_private_key) {
+            let market_maker_wallet = signer.address();
+            if market_maker_wallet == config.redemption_wallet {
+                return Err(RebalancingCtxError::WalletCollision(market_maker_wallet));
+            }
+        }
+
         Ok(Self {
-            equity_threshold: config.equity_threshold,
+            equity: config.equity,
             usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
             ethereum_rpc_url: secrets.ethereum_rpc_url,
@@ -123,7 +131,7 @@ impl RebalancingCtx {
 impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingCtx")
-            .field("equity_threshold", &self.equity_threshold)
+            .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
@@ -1283,6 +1291,7 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
+            reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         }
     }
@@ -1576,15 +1585,8 @@ mod tests {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [alpaca_broker_auth]
-            api_key = "test_key"
-            api_secret = "test_secret"
-            account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            mode = "sandbox"
-
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
@@ -1617,8 +1619,8 @@ mod tests {
     fn deserialize_config_succeeds() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        assert_eq!(config.equity_threshold.target, dec!(0.5));
-        assert_eq!(config.equity_threshold.deviation, dec!(0.2));
+        assert_eq!(config.equity.target, dec!(0.5));
+        assert_eq!(config.equity.deviation, dec!(0.2));
 
         let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
             panic!("expected enabled");
@@ -1662,8 +1664,8 @@ mod tests {
         let result = RebalancingCtx::new(config, secrets, broker_auth);
 
         assert!(
-            matches!(result, Err(RebalancingCtxError::InvalidAccountId(_))),
-            "Expected InvalidAccountId error, got {result:?}"
+            matches!(result, Err(RebalancingCtxError::Uuid(_))),
+            "Expected Uuid error, got {result:?}"
         );
     }
 
@@ -1673,15 +1675,8 @@ mod tests {
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [alpaca_broker_auth]
-            api_key = "test_key"
-            api_secret = "test_secret"
-            account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            mode = "sandbox"
-
-            [equity_threshold]
+            [equity]
             target = "0.6"
             deviation = "0.1"
 
@@ -1696,8 +1691,8 @@ mod tests {
 
         let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
 
-        assert_eq!(ctx.equity_threshold.target, dec!(0.6));
-        assert_eq!(ctx.equity_threshold.deviation, dec!(0.1));
+        assert_eq!(ctx.equity.target, dec!(0.6));
+        assert_eq!(ctx.equity.deviation, dec!(0.1));
 
         let UsdcRebalancing::Enabled { target, deviation } = ctx.usdc else {
             panic!("expected enabled");
@@ -1710,9 +1705,8 @@ mod tests {
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
@@ -1745,7 +1739,6 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
             [usdc]
             mode = "disabled"
@@ -1753,8 +1746,8 @@ mod tests {
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
         assert!(
-            error.message().contains("equity_threshold"),
-            "Expected missing equity_threshold error, got: {error}"
+            error.message().contains("equity"),
+            "Expected missing equity error, got: {error}"
         );
     }
 
@@ -1764,7 +1757,7 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
@@ -2323,8 +2316,11 @@ mod tests {
             sender,
         ));
 
-        // Create InventorySnapshotQuery that will dispatch events to the trigger
-        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
 
         // Simulate what happens during inventory polling:
         // OnchainEquity event arrives FIRST (offchain not yet polled)
@@ -2336,16 +2332,9 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        let envelope = EventEnvelope {
-            aggregate_id: "test".to_string(),
-            sequence: 1,
-            payload: onchain_event,
-            metadata: HashMap::new(),
-        };
-
-        // Dispatch the onchain event - this should NOT trigger rebalancing
+        // React to the onchain event - this should NOT trigger rebalancing
         // because we don't have offchain data yet
-        query.dispatch("test", &[envelope]).await;
+        reactor.react(&id, &onchain_event).await;
 
         // CORRECT BEHAVIOR: No operation should be triggered because
         // offchain data hasn't arrived yet. The system should wait until
@@ -2383,7 +2372,11 @@ mod tests {
             sender,
         ));
 
-        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
 
         // Apply onchain snapshot (100 shares)
         let mut balances = BTreeMap::new();
@@ -2394,17 +2387,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch(
-                "test",
-                &[EventEnvelope {
-                    aggregate_id: "test".to_string(),
-                    sequence: 1,
-                    payload: onchain_event,
-                    metadata: HashMap::new(),
-                }],
-            )
-            .await;
+        reactor.react(&id, &onchain_event).await;
 
         // No trigger yet - only one venue has data
         assert!(
@@ -2421,17 +2404,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch(
-                "test",
-                &[EventEnvelope {
-                    aggregate_id: "test".to_string(),
-                    sequence: 2,
-                    payload: offchain_event,
-                    metadata: HashMap::new(),
-                }],
-            )
-            .await;
+        reactor.react(&id, &offchain_event).await;
 
         // Now both venues have data: 100 onchain, 0 offchain = 100% ratio
         // With target 50% and deviation 10%, ratio 100% > upper bound 60%
@@ -2468,7 +2441,11 @@ mod tests {
             sender,
         ));
 
-        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
 
         // Apply ONLY onchain data - offchain not yet polled
         let mut balances = BTreeMap::new();
@@ -2479,17 +2456,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        query
-            .dispatch(
-                "test",
-                &[EventEnvelope {
-                    aggregate_id: "test".to_string(),
-                    sequence: 1,
-                    payload: onchain_event,
-                    metadata: HashMap::new(),
-                }],
-            )
-            .await;
+        reactor.react(&id, &onchain_event).await;
 
         // Verify the logs show:
         // 1. The snapshot event was applied
@@ -2527,24 +2494,23 @@ mod tests {
             sender,
         ));
 
-        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
 
         // Apply onchain data first
         let mut balances = BTreeMap::new();
         balances.insert(symbol.clone(), shares(100));
 
-        query
-            .dispatch(
-                "test",
-                &[EventEnvelope {
-                    aggregate_id: "test".to_string(),
-                    sequence: 1,
-                    payload: InventorySnapshotEvent::OnchainEquity {
-                        balances,
-                        fetched_at: Utc::now(),
-                    },
-                    metadata: HashMap::new(),
-                }],
+        reactor
+            .react(
+                &id,
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: Utc::now(),
+                },
             )
             .await;
 
@@ -2552,18 +2518,13 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert(symbol.clone(), shares(0));
 
-        query
-            .dispatch(
-                "test",
-                &[EventEnvelope {
-                    aggregate_id: "test".to_string(),
-                    sequence: 2,
-                    payload: InventorySnapshotEvent::OffchainEquity {
-                        positions,
-                        fetched_at: Utc::now(),
-                    },
-                    metadata: HashMap::new(),
-                }],
+        reactor
+            .react(
+                &id,
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: Utc::now(),
+                },
             )
             .await;
 

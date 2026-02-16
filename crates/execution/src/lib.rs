@@ -657,7 +657,7 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(dec!(1.212))).unwrap();
         let err = shares.to_whole_shares().unwrap_err();
         assert!(
-            matches!(err, InvalidSharesError::Fractional(v) if v == dec!(1.212)),
+            matches!(err, InvalidSharesError::Fractional(value) if value == dec!(1.212)),
             "Expected Fractional error with value 1.212, got: {err:?}"
         );
     }

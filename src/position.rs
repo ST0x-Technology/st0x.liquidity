@@ -576,7 +576,7 @@ mod tests {
 
     use st0x_execution::Positive;
 
-    use st0x_event_sorcery::{LifecycleError, Projection, TestHarness, replay};
+    use st0x_event_sorcery::{LifecycleError, Projection, StoreBuilder, TestHarness, replay};
 
     use super::*;
     use crate::threshold::Usdc;
@@ -1301,7 +1301,7 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
-        let store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
+        let store = StoreBuilder::new(pool.clone())
             .with(projection.clone())
             .build(())
             .await

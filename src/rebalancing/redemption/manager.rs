@@ -135,7 +135,12 @@ where
             Err(error) => {
                 warn!(%error, "Polling for completion failed");
                 self.cqrs
-                    .send(aggregate_id, EquityRedemptionCommand::RejectRedemption)
+                    .send(
+                        aggregate_id,
+                        EquityRedemptionCommand::RejectRedemption {
+                            reason: error.to_string(),
+                        },
+                    )
                     .await?;
                 return Err(error.into());
             }
@@ -150,7 +155,12 @@ where
             }
             TokenizationRequestStatus::Rejected => {
                 self.cqrs
-                    .send(aggregate_id, EquityRedemptionCommand::RejectRedemption)
+                    .send(
+                        aggregate_id,
+                        EquityRedemptionCommand::RejectRedemption {
+                            reason: "Alpaca rejected the redemption request".to_string(),
+                        },
+                    )
                     .await?;
                 Err(RedemptionError::Rejected)
             }
@@ -221,7 +231,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlx::SqlitePool;
-    use st0x_event_sorcery::{Projection, Store, test_store};
+    use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
     use uuid::Uuid;
 
     use super::*;
@@ -251,7 +261,7 @@ mod tests {
         pool: &SqlitePool,
     ) -> (Store<VaultRegistry>, Arc<VaultRegistryProjection>) {
         let query = Arc::new(VaultRegistryProjection::sqlite(pool.clone()).unwrap());
-        let store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
+        let store = StoreBuilder::new(pool.clone())
             .with(query.as_ref().clone())
             .build(())
             .await

@@ -1670,6 +1670,7 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
+            reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         }
     }

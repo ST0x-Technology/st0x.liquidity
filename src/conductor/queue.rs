@@ -38,7 +38,7 @@ pub(super) struct QueueProcessingContext<'a> {
 /// queued events and executing the appropriate CQRS commands.
 pub(super) async fn run_queue_processor<P, E>(
     executor: &E,
-    config: &Ctx,
+    ctx: &Ctx,
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
@@ -59,7 +59,7 @@ pub(super) async fn run_queue_processor<P, E>(
         vault_registry,
     };
 
-    run_processing_loop(executor, config, pool, &provider, cqrs, &queue_context).await;
+    run_processing_loop(executor, ctx, pool, &provider, cqrs, &queue_context).await;
 }
 
 async fn log_unprocessed_event_count(pool: &SqlitePool) {
@@ -74,7 +74,7 @@ async fn log_unprocessed_event_count(pool: &SqlitePool) {
 
 async fn run_processing_loop<P, E>(
     executor: &E,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     provider: &P,
     cqrs: &TradeProcessingCqrs,
@@ -86,7 +86,7 @@ async fn run_processing_loop<P, E>(
 {
     loop {
         let result =
-            process_next_queued_event(executor, config, pool, provider, cqrs, queue_context).await;
+            process_next_queued_event(executor, ctx, pool, provider, cqrs, queue_context).await;
 
         match result {
             Ok(Some(offchain_order_id)) => {
@@ -110,7 +110,7 @@ async fn run_processing_loop<P, E>(
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(super) async fn process_next_queued_event<P, E>(
     executor: &E,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     provider: &P,
     cqrs: &TradeProcessingCqrs,
@@ -128,10 +128,10 @@ where
 
     let event_id = queued_event
         .id
-        .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))?;
+        .ok_or(EventProcessingError::Queue(EventQueueError::MissingQueuedEventId))?;
 
     let onchain_trade = convert_event_to_trade(
-        config,
+        ctx,
         queue_context.cache,
         provider,
         &queued_event,
@@ -159,10 +159,10 @@ where
         trade.amount
     );
 
-    let vault_discovery_context = VaultDiscoveryContext {
-        vault_registry_cqrs: queue_context.vault_registry_cqrs,
-        orderbook: config.evm.orderbook,
-        order_owner: config.order_owner()?,
+    let vault_discovery_context = VaultDiscoveryCtx {
+        vault_registry: queue_context.vault_registry,
+        orderbook: ctx.evm.orderbook,
+        order_owner: ctx.order_owner()?,
     };
     discover_vaults_for_trade(&queued_event, &trade, &vault_discovery_context).await?;
 
@@ -187,20 +187,16 @@ fn event_type_name(event: &TradeEvent) -> &'static str {
 /// 3. Witnesses the trade in the onchain trade aggregate
 /// 4. Checks if execution threshold is met
 /// 5. Places an offchain order if threshold is met
-pub(super) async fn process_queued_trade<E>(
+pub(super) async fn process_queued_trade<E: Executor>(
     executor: &E,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
-) -> Result<Option<OffchainOrderId>, EventProcessingError>
-where
-    E: Executor,
-    EventProcessingError: From<E::Error>,
-{
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
-    execute_acknowledge_fill(&cqrs.position_cqrs, &trade).await;
+    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
     mark_event_processed(pool, event_id)
         .await
@@ -211,108 +207,99 @@ where
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    execute_witness_trade(&cqrs.onchain_trade_cqrs, &trade, queued_event.block_number).await;
+    execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
 
     let base_symbol = trade.symbol.base();
+    let executor_type = executor.to_supported_executor();
 
-    let Some(params) = check_execution_readiness(
+    let Some(execution) = check_execution_readiness(
         executor,
-        &cqrs.position_query,
+        &cqrs.position_projection,
         base_symbol,
-        &cqrs.execution_threshold,
+        executor_type,
     )
     .await?
     else {
         return Ok(None);
     };
 
-    let offchain_order_id = OffchainOrder::aggregate_id();
-    execute_new_execution_cqrs(
-        &cqrs.position_cqrs,
-        &cqrs.offchain_order_cqrs,
-        &cqrs.offchain_order_query,
-        offchain_order_id,
-        &params,
-        &cqrs.execution_threshold,
-    )
-    .await;
-
-    Ok(Some(offchain_order_id))
+    place_offchain_order(&execution, cqrs).await
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, Bytes, TxHash, U256, address};
-    use cqrs_es::persist::GenericQuery;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use sqlite_es::SqliteViewRepository;
+    use st0x_event_sorcery::{Projection, StoreBuilder, test_store};
+    use st0x_execution::{ExecutorOrderId, MarketOrder, MockExecutor, Symbol};
     use std::sync::Arc;
-
-    use st0x_execution::{MockExecutor, Symbol};
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::conductor::wire;
-    use crate::lifecycle::Lifecycle;
     use crate::offchain_order::noop_order_placer;
-    use crate::offchain_order::tests::succeeding_order_placer;
-    use crate::offchain_order::{
-        OffchainOrder, OffchainOrderAggregate, OffchainOrderCqrs, OffchainOrderQuery,
-        OffchainOrderServices,
-    };
-    use crate::onchain_trade::{OnChainTrade, OnChainTradeCqrs};
-    use crate::position::{PositionAggregate, PositionCqrs, PositionQuery};
+    use crate::offchain_order::{OffchainOrder, OrderPlacer};
+    use crate::onchain_trade::OnChainTrade;
+    use crate::position::Position;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
     struct TestCqrsFrameworks {
-        onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
-        position_cqrs: Arc<PositionCqrs>,
-        position_query: Arc<PositionQuery>,
-        offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-        offchain_order_query: Arc<OffchainOrderQuery>,
+        onchain_trade: Arc<Store<OnChainTrade>>,
+        position: Arc<Store<Position>>,
+        position_projection: Arc<Projection<Position>>,
+        offchain_order: Arc<Store<OffchainOrder>>,
+        offchain_order_projection: Arc<Projection<OffchainOrder>>,
     }
 
-    fn create_test_cqrs_frameworks(
+    fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
+        struct TestOrderPlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for TestOrderPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+            }
+        }
+
+        Arc::new(TestOrderPlacer)
+    }
+
+    async fn create_test_cqrs_frameworks(
         pool: &SqlitePool,
-        order_placer: OffchainOrderServices,
+        order_placer: Arc<dyn OrderPlacer>,
     ) -> TestCqrsFrameworks {
-        let onchain_trade_cqrs = Arc::new(wire::test_cqrs::<Lifecycle<OnChainTrade>>(
-            pool.clone(),
-            vec![],
-            (),
-        ));
+        let onchain_trade = Arc::new(test_store::<OnChainTrade>(pool.clone(), ()));
 
-        let position_view_repo = Arc::new(SqliteViewRepository::<
-            PositionAggregate,
-            PositionAggregate,
-        >::new(pool.clone(), "position_view".to_string()));
-        let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
-        let position_cqrs = Arc::new(wire::test_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(position_view_repo))],
-            (),
-        ));
+        let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+        let position = Arc::new(
+            StoreBuilder::<Position>::new(pool.clone())
+                .with(position_projection.clone())
+                .build(())
+                .await
+                .unwrap(),
+        );
+        let position_projection = Arc::new(position_projection);
 
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            OffchainOrderAggregate,
-            OffchainOrderAggregate,
-        >::new(
-            pool.clone(), "offchain_order_view".to_string()
-        ));
-        let offchain_order_query = Arc::new(GenericQuery::new(offchain_order_view_repo.clone()));
-        let offchain_order_cqrs = Arc::new(wire::test_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            order_placer,
-        ));
+        let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
+        let offchain_order = Arc::new(
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .with(offchain_order_projection.clone())
+                .build(order_placer)
+                .await
+                .unwrap(),
+        );
+        let offchain_order_projection = Arc::new(offchain_order_projection);
 
         TestCqrsFrameworks {
-            onchain_trade_cqrs,
-            position_cqrs,
-            position_query,
-            offchain_order_cqrs,
-            offchain_order_query,
+            onchain_trade,
+            position,
+            position_projection,
+            offchain_order,
+            offchain_order_projection,
         }
     }
 
@@ -321,22 +308,20 @@ mod tests {
         threshold: ExecutionThreshold,
     ) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
-            onchain_trade_cqrs: frameworks.onchain_trade_cqrs.clone(),
-            position_cqrs: frameworks.position_cqrs.clone(),
-            position_query: frameworks.position_query.clone(),
-            offchain_order_cqrs: frameworks.offchain_order_cqrs.clone(),
-            offchain_order_query: frameworks.offchain_order_query.clone(),
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
         }
     }
 
     fn test_trade(amount: f64, log_index: u64) -> OnchainTrade {
         OnchainTradeBuilder::default()
-            .with_symbol("AAPL0x")
-            .with_amount(amount)
-            .with_price(150.0)
+            .with_symbol("tAAPL")
+            .with_amount(Decimal::try_from(amount).unwrap())
+            .with_price(Decimal::try_from(150.0).unwrap())
             .with_log_index(log_index)
-            .with_block_timestamp(chrono::Utc::now())
             .build()
     }
 
@@ -401,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn trade_below_threshold_does_not_place_order() {
         let pool = setup_test_db().await;
-        let frameworks = create_test_cqrs_frameworks(&pool, noop_order_placer());
+        let frameworks = create_test_cqrs_frameworks(&pool, noop_order_placer()).await;
         let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_test_event(&pool, 10).await;
@@ -422,11 +407,12 @@ mod tests {
             "0.5 shares should not trigger execution with 1-share threshold"
         );
 
-        let position =
-            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
-                .await
-                .unwrap()
-                .expect("position should exist");
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
 
         assert_eq!(
             position.net.inner(),
@@ -448,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn trade_above_threshold_places_offchain_order() {
         let pool = setup_test_db().await;
-        let frameworks = create_test_cqrs_frameworks(&pool, succeeding_order_placer());
+        let frameworks = create_test_cqrs_frameworks(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_test_event(&pool, 20).await;
@@ -468,11 +454,12 @@ mod tests {
             .unwrap()
             .expect("1.5 shares should trigger execution with 1-share threshold");
 
-        let position =
-            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
-                .await
-                .unwrap()
-                .expect("position should exist");
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
 
         assert_eq!(position.net.inner(), dec!(1.5));
         assert_eq!(
@@ -481,27 +468,23 @@ mod tests {
             "Position should track the pending offchain order"
         );
 
-        let offchain_lifecycle = cqrs
-            .offchain_order_query
-            .load(&offchain_order_id.to_string())
+        let offchain_order = frameworks
+            .offchain_order_projection
+            .load(&offchain_order_id)
             .await
+            .expect("offchain order should not be in failed lifecycle state")
             .expect("offchain order view should exist");
-
-        let offchain_order = match offchain_lifecycle {
-            Lifecycle::Live(order) => order,
-            other => panic!("Expected Live state, got {other:?}"),
-        };
 
         assert!(
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
-            "Offchain order should be Submitted, got: {offchain_order:?}"
+            "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
         );
     }
 
     #[tokio::test]
     async fn multiple_trades_accumulate_then_trigger() {
         let pool = setup_test_db().await;
-        let frameworks = create_test_cqrs_frameworks(&pool, succeeding_order_placer());
+        let frameworks = create_test_cqrs_frameworks(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
 
         // First trade: 0.5 shares - below threshold
@@ -542,11 +525,12 @@ mod tests {
             "Second trade should trigger execution (total 1.2 shares)"
         );
 
-        let position =
-            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
-                .await
-                .unwrap()
-                .expect("position should exist");
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
 
         assert_eq!(
             position.net.inner(),
@@ -558,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn event_marked_processed_even_below_threshold() {
         let pool = setup_test_db().await;
-        let frameworks = create_test_cqrs_frameworks(&pool, noop_order_placer());
+        let frameworks = create_test_cqrs_frameworks(&pool, noop_order_placer()).await;
         let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_test_event(&pool, 40).await;

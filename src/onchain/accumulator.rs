@@ -139,7 +139,7 @@ mod tests {
 
     use sqlx::SqlitePool;
 
-    use st0x_event_sorcery::{Projection, Store};
+    use st0x_event_sorcery::{Projection, Store, StoreBuilder};
     use st0x_execution::MockExecutor;
 
     use super::*;
@@ -151,7 +151,7 @@ mod tests {
         pool: &SqlitePool,
     ) -> (Store<Position>, Projection<Position>) {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-        let position_store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
+        let position_store = StoreBuilder::new(pool.clone())
             .with(projection.clone())
             .build(())
             .await

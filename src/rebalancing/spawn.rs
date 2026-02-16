@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
-use st0x_event_sorcery::{Projection, Store};
+use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
 
 use super::usdc::UsdcRebalanceManager;
@@ -68,12 +68,6 @@ pub(crate) struct RebalancerAddresses {
     pub(crate) market_maker_wallet: Address,
 }
 
-/// CQRS-related dependencies for redemption manager.
-pub(crate) struct RedemptionCqrs {
-    pub(crate) cqrs: Arc<Store<EquityRedemption>>,
-    pub(crate) projection: Arc<Projection<EquityRedemption>>,
-}
-
 /// Spawns the rebalancing infrastructure.
 ///
 /// All CQRS frameworks are created in the conductor and passed here to ensure
@@ -85,7 +79,7 @@ pub(crate) async fn spawn_rebalancer<BP>(
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
     raindex_service: Arc<RaindexService<BP>>,
-    redemption_cqrs: RedemptionCqrs,
+    redemption_cqrs: Arc<Store<EquityRedemption>>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -205,7 +199,7 @@ where
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
         redemption_service: Arc<RedemptionService<BP>>,
-        redemption: RedemptionCqrs,
+        redemption_cqrs: Arc<Store<EquityRedemption>>,
     ) -> ConfiguredRebalancer<BP>
     where
         BP: Send + Sync + 'static,
@@ -213,7 +207,7 @@ where
         let mint_manager = Arc::new(MintManager::new(frameworks.mint));
 
         let redemption_manager =
-            Arc::new(RedemptionManager::new(redemption_service, redemption.cqrs));
+            Arc::new(RedemptionManager::new(redemption_service, redemption_cqrs));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
             self.broker,
@@ -276,7 +270,7 @@ mod tests {
 
     fn make_ctx() -> RebalancingCtx {
         RebalancingCtx {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
@@ -336,7 +330,7 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity: ctx.equity_threshold,
+            equity: ctx.equity,
             usdc: ctx.usdc,
         };
 
@@ -349,7 +343,7 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity: ctx.equity_threshold,
+            equity: ctx.equity,
             usdc: ctx.usdc,
         };
 
@@ -520,18 +514,11 @@ mod tests {
         let mint_cqrs = Arc::new(test_store(pool.clone(), mint_services));
         let usdc_cqrs = Arc::new(test_store(pool.clone(), ()));
 
-        let redemption_projection =
-            Arc::new(Projection::<EquityRedemption>::sqlite(pool.clone()).unwrap());
         let redemption_cqrs = Arc::new(test_store(pool.clone(), mock_redeemer_services()));
 
         let frameworks = RebalancingCqrsFrameworks {
             mint: mint_cqrs,
             usdc: usdc_cqrs,
-        };
-
-        let redemption = RedemptionCqrs {
-            cqrs: redemption_cqrs,
-            projection: redemption_projection,
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
@@ -544,7 +531,7 @@ mod tests {
             rx,
             frameworks,
             redemption_service,
-            redemption,
+            redemption_cqrs,
         );
 
         tx.send(TriggeredOperation::Mint {

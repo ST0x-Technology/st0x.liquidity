@@ -141,7 +141,7 @@ pub(crate) enum EquityRedemptionCommand {
     /// Redemption completed successfully.
     Complete,
     /// Alpaca rejected the redemption.
-    RejectRedemption,
+    RejectRedemption { reason: String },
 }
 
 /// Reason for detection failure when polling Alpaca for redemption detection.
@@ -187,6 +187,7 @@ pub(crate) enum EquityRedemptionEvent {
     /// Alpaca rejected the redemption after detection.
     /// Tokens location unknown after rejection - keep inflight until manually resolved.
     RedemptionRejected {
+        reason: String,
         rejected_at: DateTime<Utc>,
     },
 
@@ -433,7 +434,7 @@ impl EventSourced for EquityRedemption {
                 })
             }
 
-            RedemptionRejected { rejected_at } => {
+            RedemptionRejected { rejected_at, .. } => {
                 let Self::Pending {
                     symbol,
                     quantity,
@@ -504,7 +505,7 @@ impl EventSourced for EquityRedemption {
                     }
                 }
             }
-            Detect { .. } | FailDetection { .. } | Complete | RejectRedemption => {
+            Detect { .. } | FailDetection { .. } | Complete | RejectRedemption { .. } => {
                 Err(EquityRedemptionError::NotStarted)
             }
         }
@@ -559,11 +560,12 @@ impl EventSourced for EquityRedemption {
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             },
 
-            RejectRedemption => match self {
+            RejectRedemption { reason } => match self {
                 Self::VaultWithdrawn { .. } | Self::TokensSent { .. } => {
                     Err(EquityRedemptionError::NotPendingForRejection)
                 }
                 Self::Pending { .. } => Ok(vec![RedemptionRejected {
+                    reason,
                     rejected_at: Utc::now(),
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
@@ -760,7 +762,9 @@ pub(crate) mod tests {
                 tokens_sent_event(),
                 detected_event(),
             ])
-            .when(EquityRedemptionCommand::RejectRedemption)
+            .when(EquityRedemptionCommand::RejectRedemption {
+                reason: "test rejection".to_string(),
+            })
             .await
             .events();
 
@@ -775,7 +779,9 @@ pub(crate) mod tests {
     async fn cannot_reject_redemption_before_pending() {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![vault_withdrawn_event(), tokens_sent_event()])
-            .when(EquityRedemptionCommand::RejectRedemption)
+            .when(EquityRedemptionCommand::RejectRedemption {
+                reason: "test rejection".to_string(),
+            })
             .await
             .then_expect_error();
 
@@ -808,7 +814,7 @@ pub(crate) mod tests {
                 detected_at: Utc::now(),
             },
             EquityRedemptionEvent::RedemptionRejected {
-                reason: "Insufficient balance".to_string(),
+                reason: "test rejection".to_string(),
                 rejected_at: Utc::now(),
             },
         ])
@@ -840,14 +846,14 @@ pub(crate) mod tests {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
             .when(EquityRedemptionCommand::FailDetection {
-                reason: "Cannot fail".to_string(),
+                failure: DetectionFailure::Timeout,
             })
             .await
             .then_expect_error();
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(EquityRedemptionError::TokensNotSent)
+            LifecycleError::Apply(EquityRedemptionError::NotStarted)
         ));
     }
 
@@ -856,14 +862,14 @@ pub(crate) mod tests {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
             .when(EquityRedemptionCommand::RejectRedemption {
-                reason: "Cannot reject".to_string(),
+                reason: "test rejection".to_string(),
             })
             .await
             .then_expect_error();
 
         assert!(matches!(
             error,
-            LifecycleError::Apply(EquityRedemptionError::NotPendingForRejection)
+            LifecycleError::Apply(EquityRedemptionError::NotStarted)
         ));
     }
 
@@ -939,6 +945,7 @@ pub(crate) mod tests {
         };
 
         let event = EquityRedemptionEvent::RedemptionRejected {
+            reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         };
 

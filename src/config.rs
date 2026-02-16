@@ -926,7 +926,7 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
             [rebalancing.usdc]
@@ -1028,21 +1028,21 @@ pub(crate) mod tests {
     #[test]
     fn rebalancing_fails_when_market_maker_wallet_equals_redemption_wallet() {
         // Private key 0x01 derives to 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
-        let toml = example_toml().replacen(
+        let config = example_config_toml().replacen(
             "redemption_wallet = \"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
             "redemption_wallet = \"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\"",
             1,
         );
 
-        let result = Config::load(&toml);
+        let error = Ctx::from_toml(&config, example_secrets_toml()).unwrap_err();
 
-        let Err(ConfigError::Toml(e)) = result else {
-            panic!("Expected Toml error for matching wallets, got {result:?}");
-        };
-        let msg = e.to_string();
         assert!(
-            msg.contains("must be different addresses"),
-            "Expected error about different addresses, got: {msg}"
+            matches!(error, CtxError::Rebalancing(_)),
+            "Expected Rebalancing error for matching wallets, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("must be different addresses"),
+            "Expected error about different addresses, got: {error}"
         );
     }
 }

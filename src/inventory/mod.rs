@@ -7,6 +7,6 @@ mod venue_balance;
 mod view;
 
 pub(crate) use polling::InventoryPollingService;
-pub(crate) use snapshot::InventorySnapshot;
+pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId};
 pub(crate) use snapshot_reactor::InventorySnapshotReactor;
 pub(crate) use view::{Imbalance, ImbalanceThreshold, InventoryView, InventoryViewError};

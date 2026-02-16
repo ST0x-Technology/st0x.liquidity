@@ -857,29 +857,6 @@ pub(crate) mod tests {
         create_test_service(client)
     }
 
-    /// Creates a test service using the given provider.
-    ///
-    /// Use this when you need the service to share a provider type with other
-    /// components (e.g., VaultService) in the same test.
-    pub(crate) fn create_test_service_with_provider<P>(
-        server: &MockServer,
-        provider: P,
-        redemption_wallet: Address,
-    ) -> AlpacaTokenizationService<P>
-    where
-        P: Provider + Clone,
-    {
-        let client = AlpacaTokenizationClient::new_with_base_url(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
-            provider,
-            redemption_wallet,
-        );
-        create_test_service(client)
-    }
-
     fn create_mint_request() -> MintRequest {
         MintRequest {
             underlying_symbol: Symbol::new("AAPL").unwrap(),
