@@ -19,19 +19,19 @@ use super::TransferDirection;
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
-use crate::equity_redemption::{Redeemer, RedemptionAggregateId};
+use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
-use crate::rebalancing::redemption::service::RedemptionService;
+use crate::rebalancing::transfer::EquityTransferServices;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::threshold::Usdc;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
-use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
+use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistry;
 
@@ -92,9 +92,9 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
             let mint_store = Arc::new(
                 StoreBuilder::new(pool.clone())
-                    .build(MintServices {
-                        tokenizer: tokenization_service.clone(),
+                    .build(EquityTransferServices {
                         raindex: raindex.clone(),
+                        tokenizer: tokenization_service.clone(),
                     })
                     .await?,
             );
@@ -133,16 +133,16 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 owner,
             ));
 
-            let redemption_service =
-                Arc::new(RedemptionService::new(raindex, tokenization_service));
-
             let redemption_store = Arc::new(
                 StoreBuilder::new(pool.clone())
-                    .build(redemption_service.clone() as Arc<dyn Redeemer>)
+                    .build(EquityTransferServices {
+                        raindex: raindex.clone(),
+                        tokenizer: tokenization_service.clone(),
+                    })
                     .await?,
             );
 
-            let redemption_manager = RedemptionManager::new(redemption_service, redemption_store);
+            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_store);
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));

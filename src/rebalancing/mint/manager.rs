@@ -94,6 +94,7 @@ mod tests {
     use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
     use crate::onchain::mock::MockRaindex;
     use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId};
+    use crate::rebalancing::transfer::EquityTransferServices;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::Tokenizer;
     use crate::tokenization::alpaca::tests::{
@@ -101,7 +102,6 @@ mod tests {
         tokenization_requests_path,
     };
     use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::MintServices;
     use crate::vault_registry::{
         VaultRegistry, VaultRegistryCommand, VaultRegistryId, VaultRegistryProjection,
     };
@@ -112,8 +112,8 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
-    fn mock_mint_services() -> MintServices {
-        MintServices {
+    fn mock_mint_services() -> EquityTransferServices {
+        EquityTransferServices {
             tokenizer: Arc::new(MockTokenizer::new()),
             raindex: Arc::new(MockRaindex::new()),
         }
@@ -299,7 +299,7 @@ mod tests {
             .with_required_confirmations(1),
         );
 
-        let services = MintServices { tokenizer, raindex };
+        let services = EquityTransferServices { tokenizer, raindex };
         let store = Arc::new(test_store(pool, services));
         let manager = MintManager::new(store);
 

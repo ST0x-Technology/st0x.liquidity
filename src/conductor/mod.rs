@@ -31,7 +31,6 @@ use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder, Unwired, de
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
-use crate::equity_redemption::RedemptionServices;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
 };
@@ -51,7 +50,7 @@ use crate::position::{Position, PositionCommand, TradeId};
 use crate::queue::{
     EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
 };
-use crate::rebalancing::redemption::service::RedemptionService;
+use crate::rebalancing::transfer::EquityTransferServices;
 use crate::rebalancing::{
     RebalancerAddresses, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig,
     spawn_rebalancer,
@@ -60,7 +59,6 @@ use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
-use crate::tokenized_equity_mint::MintServices;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 
 use self::manifest::QueryManifest;
@@ -340,14 +338,11 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         rebalancing_ctx.redemption_wallet,
     ));
 
-    let redeemer: RedemptionServices = Arc::new(RedemptionService::new(
-        raindex_service.clone(),
-        tokenization.clone(),
-    ));
+    let tokenizer: Arc<dyn Tokenizer> = tokenization;
 
-    let mint_services = MintServices {
-        tokenizer: tokenization,
+    let equity_transfer_services = EquityTransferServices {
         raindex: raindex_service.clone(),
+        tokenizer: tokenizer.clone(),
     };
 
     let manifest = QueryManifest::new(
@@ -363,7 +358,9 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         event_sender,
     );
 
-    let (built, wired) = manifest.wire(pool.clone(), mint_services, redeemer).await?;
+    let (built, wired) = manifest
+        .wire(pool.clone(), equity_transfer_services)
+        .await?;
 
     let frameworks = RebalancingCqrsFrameworks {
         mint: Arc::new(built.mint),
@@ -381,6 +378,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         operation_receiver,
         frameworks,
         raindex_service.clone(),
+        tokenizer,
         Arc::new(built.redemption),
     )
     .await?;

@@ -610,14 +610,19 @@ impl EventSourced for EquityRedemption {
 #[cfg(test)]
 pub(crate) mod tests {
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
 
-    use super::mock::mock_equity_transfer_services;
     use super::*;
+    use crate::onchain::mock::MockRaindex;
+    use crate::tokenization::mock::MockTokenizer;
 
     fn mock_services() -> EquityTransferServices {
-        mock_equity_transfer_services()
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+        }
     }
 
     fn vault_withdrawn_event() -> EquityRedemptionEvent {

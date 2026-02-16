@@ -6,7 +6,6 @@
 pub(crate) mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
-pub(crate) mod service;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
