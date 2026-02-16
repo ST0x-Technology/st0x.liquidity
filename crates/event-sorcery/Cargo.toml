@@ -6,7 +6,6 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-anyhow = "1.0.98"
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
@@ -14,10 +13,11 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 tracing.workspace = true
 
 [features]
-test-support = []
+test-support = ["dep:tokio"]
 
 [dev-dependencies]
 tokio.workspace = true

@@ -1301,7 +1301,7 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
-        let store = StoreBuilder::new(pool.clone())
+        let store = StoreBuilder::<Position>::new(pool.clone())
             .with(projection.clone())
             .build(())
             .await

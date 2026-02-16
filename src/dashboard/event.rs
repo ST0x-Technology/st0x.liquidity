@@ -8,16 +8,21 @@ use tracing::warn;
 
 use st0x_dto::{EventStoreEntry, ServerMessage};
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Reactor};
+use st0x_event_sorcery::{DomainEvent, EntityList, EventSourced, Never, Reactor, deps};
 
 use crate::equity_redemption::EquityRedemption;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
+deps!(
+    EventBroadcaster,
+    [TokenizedEquityMint, EquityRedemption, UsdcRebalance,]
+);
+
 /// Reactor that broadcasts events to connected WebSocket clients.
 ///
-/// Implements `Reactor<Entity>` for specific aggregate types to integrate
-/// with the event-sorcery framework.
+/// Implements [`Reactor`] with exhaustive handling for all
+/// broadcast-eligible aggregate types.
 pub(crate) struct EventBroadcaster {
     sender: broadcast::Sender<ServerMessage>,
     sequence: AtomicU64,
@@ -49,35 +54,27 @@ impl EventBroadcaster {
 }
 
 #[async_trait]
-impl Reactor<TokenizedEquityMint> for EventBroadcaster {
-    async fn react(
-        &self,
-        id: &<TokenizedEquityMint as EventSourced>::Id,
-        event: &<TokenizedEquityMint as EventSourced>::Event,
-    ) {
-        self.broadcast_event::<TokenizedEquityMint>(id, event);
-    }
-}
+impl Reactor for EventBroadcaster {
+    type Error = Never;
 
-#[async_trait]
-impl Reactor<EquityRedemption> for EventBroadcaster {
     async fn react(
         &self,
-        id: &<EquityRedemption as EventSourced>::Id,
-        event: &<EquityRedemption as EventSourced>::Event,
-    ) {
-        self.broadcast_event::<EquityRedemption>(id, event);
-    }
-}
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        event
+            .on(|id, event| async move {
+                self.broadcast_event::<TokenizedEquityMint>(&id, &event);
+            })
+            .on(|id, event| async move {
+                self.broadcast_event::<EquityRedemption>(&id, &event);
+            })
+            .on(|id, event| async move {
+                self.broadcast_event::<UsdcRebalance>(&id, &event);
+            })
+            .exhaustive()
+            .await;
 
-#[async_trait]
-impl Reactor<UsdcRebalance> for EventBroadcaster {
-    async fn react(
-        &self,
-        id: &<UsdcRebalance as EventSourced>::Id,
-        event: &<UsdcRebalance as EventSourced>::Event,
-    ) {
-        self.broadcast_event::<UsdcRebalance>(id, event);
+        Ok(())
     }
 }
 
@@ -85,6 +82,8 @@ impl Reactor<UsdcRebalance> for EventBroadcaster {
 mod tests {
     use alloy::primitives::Address;
     use st0x_execution::Symbol;
+
+    use st0x_event_sorcery::ReactorHarness;
 
     use super::*;
     use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
@@ -144,14 +143,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_dispatch_broadcasts_event() {
+    async fn reactor_receive_broadcasts_mint_event() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
 
         let id = IssuerRequestId::new("mint-multi".to_string());
-        let event = make_mint_requested("NVDA", 25);
 
-        Reactor::<TokenizedEquityMint>::react(&broadcaster, &id, &event).await;
+        harness
+            .receive::<TokenizedEquityMint>(id, make_mint_requested("NVDA", 25))
+            .await
+            .unwrap();
 
         let msg = receiver.recv().await.expect("should receive message");
 
@@ -164,13 +165,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_dispatch_works_for_equity_redemption() {
+    async fn reactor_receive_works_for_equity_redemption() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
 
         let id = RedemptionAggregateId::new("redemption-123".to_string());
 
-        Reactor::<EquityRedemption>::react(&broadcaster, &id, &make_redemption_completed()).await;
+        harness
+            .receive::<EquityRedemption>(id, make_redemption_completed())
+            .await
+            .unwrap();
 
         let msg = receiver.recv().await.expect("should receive message");
 
@@ -185,13 +189,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_dispatch_works_for_usdc_rebalance() {
+    async fn reactor_receive_works_for_usdc_rebalance() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
 
         let id = UsdcRebalanceId::new("usdc-456".to_string());
 
-        Reactor::<UsdcRebalance>::react(&broadcaster, &id, &make_usdc_withdrawal_confirmed()).await;
+        harness
+            .receive::<UsdcRebalance>(id, make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
 
         let msg = receiver.recv().await.expect("should receive message");
 

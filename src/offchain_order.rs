@@ -623,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_order_transitions_to_submitted() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -634,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_with_failing_broker_transitions_to_failed() {
-        let store = TestStore::<OffchainOrder>::new(vec![], failing_order_placer());
+        let store = TestStore::<OffchainOrder>::new(failing_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -648,7 +648,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_already_submitted() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -662,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_filled() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -685,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_place_when_failed() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -708,7 +708,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -729,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_updates_shares() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -764,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -784,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_partially_filled() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -814,7 +814,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_uninitialized_order() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         let err = store
@@ -834,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_already_filled() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -865,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -885,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_partially_filled() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -915,7 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fail_already_filled() {
-        let store = TestStore::<OffchainOrder>::new(vec![], noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();

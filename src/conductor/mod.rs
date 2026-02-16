@@ -3500,7 +3500,7 @@ mod tests {
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
-            StoreBuilder::new(pool.clone())
+            StoreBuilder::<Position>::new(pool.clone())
                 .with(projection.clone())
                 .with(trigger.clone())
                 .build(())
@@ -3627,7 +3627,7 @@ mod tests {
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
-            StoreBuilder::new(pool.clone())
+            StoreBuilder::<Position>::new(pool.clone())
                 .with(projection.clone())
                 .with(trigger)
                 .build(())

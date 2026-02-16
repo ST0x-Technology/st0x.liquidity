@@ -6634,7 +6634,6 @@ dependencies = [
 name = "st0x-event-sorcery"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "cqrs-es",
  "serde",

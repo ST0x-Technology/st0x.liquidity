@@ -18,19 +18,15 @@ use url::Url;
 
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
-use st0x_event_sorcery::{AggregateError, LifecycleError, Reactor, Store};
+use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Never, Reactor, Store, deps};
 
 use crate::alpaca_wallet::AlpacaAccountId;
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
-use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
+use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
-use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintEvent,
-};
-use crate::usdc_rebalance::{
-    RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
-};
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Why loading a token address from the vault registry failed.
@@ -206,72 +202,100 @@ impl RebalancingTrigger {
     }
 }
 
-#[async_trait]
-impl Reactor<Position> for RebalancingTrigger {
-    async fn react(&self, symbol: &Symbol, event: &PositionEvent) {
-        self.apply_position_event_and_check(symbol, event).await;
-    }
-}
+deps!(
+    RebalancingTrigger,
+    [
+        Position,
+        TokenizedEquityMint,
+        EquityRedemption,
+        UsdcRebalance
+    ]
+);
 
 #[async_trait]
-impl Reactor<TokenizedEquityMint> for RebalancingTrigger {
-    async fn react(&self, _id: &IssuerRequestId, event: &TokenizedEquityMintEvent) {
-        let Some((symbol, quantity)) = Self::extract_mint_info(event) else {
-            return;
-        };
+impl Reactor for RebalancingTrigger {
+    type Error = Never;
 
-        self.apply_mint_event_to_inventory(&symbol, event, quantity)
+    async fn react(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        event
+            .on(|symbol, event| self.on_position(symbol, event))
+            .on(|_id, event| self.on_mint(event))
+            .on(|_id, event| self.on_redemption(event))
+            .on(|_id, event| self.on_usdc_rebalance(event))
+            .exhaustive()
             .await;
 
-        if Self::is_terminal_mint_event(event) {
-            self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
-
-            // After mint completes, USDC balances may have changed
-            self.check_and_trigger_usdc().await;
-        }
-    }
-}
-
-#[async_trait]
-impl Reactor<EquityRedemption> for RebalancingTrigger {
-    async fn react(&self, _id: &RedemptionAggregateId, event: &EquityRedemptionEvent) {
-        let Some((symbol, quantity)) = Self::extract_redemption_info(event) else {
-            return;
-        };
-
-        self.apply_redemption_event_to_inventory(&symbol, event, quantity)
-            .await;
-
-        if Self::is_terminal_redemption_event(event) {
-            self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
-
-            // After redemption completes, USDC balances may have changed
-            self.check_and_trigger_usdc().await;
-        }
-    }
-}
-
-#[async_trait]
-impl Reactor<UsdcRebalance> for RebalancingTrigger {
-    async fn react(&self, _id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) {
-        if let Some((direction, amount)) = Self::extract_usdc_rebalance_info(event) {
-            self.apply_usdc_rebalance_event_to_inventory(event, &direction, amount)
-                .await;
-        }
-
-        if Self::is_terminal_usdc_rebalance_event(event) {
-            self.clear_usdc_in_progress();
-            debug!("Cleared USDC in-progress flag after rebalance terminal event");
-
-            // After USDC rebalance completes, check if more rebalancing is needed
-            self.check_and_trigger_usdc().await;
-        }
+        Ok(())
     }
 }
 
 impl RebalancingTrigger {
+    async fn on_position(&self, symbol: Symbol, event: PositionEvent) {
+        let mut inventory = self.inventory.write().await;
+
+        let new_inventory = match inventory.clone().apply_position_event(&symbol, &event) {
+            Ok(updated) => updated,
+            Err(error) => {
+                warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
+                return;
+            }
+        };
+
+        *inventory = new_inventory;
+        drop(inventory);
+
+        self.check_and_trigger_equity(&symbol).await;
+    }
+
+    async fn on_mint(&self, event: TokenizedEquityMintEvent) {
+        let Some((symbol, quantity)) = Self::extract_mint_info(&event) else {
+            return;
+        };
+
+        self.apply_mint_event_to_inventory(&symbol, &event, quantity)
+            .await;
+
+        if Self::is_terminal_mint_event(&event) {
+            self.clear_equity_in_progress(&symbol);
+            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+
+            self.check_and_trigger_usdc().await;
+        }
+    }
+
+    async fn on_redemption(&self, event: EquityRedemptionEvent) {
+        let Some((symbol, quantity)) = Self::extract_redemption_info(&event) else {
+            return;
+        };
+
+        self.apply_redemption_event_to_inventory(&symbol, &event, quantity)
+            .await;
+
+        if Self::is_terminal_redemption_event(&event) {
+            self.clear_equity_in_progress(&symbol);
+            debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
+
+            self.check_and_trigger_usdc().await;
+        }
+    }
+
+    async fn on_usdc_rebalance(&self, event: UsdcRebalanceEvent) {
+        if let Some((direction, amount)) = Self::extract_usdc_rebalance_info(&event) {
+            self.apply_usdc_rebalance_event_to_inventory(&event, &direction, amount)
+                .await;
+        }
+
+        if Self::is_terminal_usdc_rebalance_event(&event) {
+            self.clear_usdc_in_progress();
+            debug!("Cleared USDC in-progress flag after rebalance terminal event");
+
+            self.check_and_trigger_usdc().await;
+        }
+    }
+
     /// Checks inventory for equity imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_equity(&self, symbol: &Symbol) {
         let Some(guard) = equity::InProgressGuard::try_claim(
@@ -378,30 +402,6 @@ impl RebalancingTrigger {
     /// Clears the in-progress flag for USDC rebalancing.
     pub(crate) fn clear_usdc_in_progress(&self) {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
-    }
-
-    async fn apply_position_event_and_check(&self, symbol: &Symbol, event: &PositionEvent) {
-        if let Err(error) = self.apply_position_event_to_inventory(symbol, event).await {
-            warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
-            return;
-        }
-
-        self.check_and_trigger_equity(symbol).await;
-    }
-
-    async fn apply_position_event_to_inventory(
-        &self,
-        symbol: &Symbol,
-        event: &PositionEvent,
-    ) -> Result<(), InventoryViewError> {
-        let mut inventory = self.inventory.write().await;
-
-        let new_inventory = inventory.clone().apply_position_event(symbol, event)?;
-
-        *inventory = new_inventory;
-        drop(inventory);
-
-        Ok(())
     }
 
     fn extract_mint_info(event: &TokenizedEquityMintEvent) -> Option<(Symbol, FractionalShares)> {
@@ -574,7 +574,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
-    use st0x_event_sorcery::{TestStore, test_store};
+    use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
     use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce};
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -589,8 +589,8 @@ mod tests {
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
-    use crate::tokenized_equity_mint::{ReceiptId, TokenizationRequestId};
-    use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand};
+    use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
     use crate::vault_registry::VaultRegistryCommand;
 
     fn test_config() -> RebalancingTriggerConfig {
@@ -876,16 +876,12 @@ mod tests {
         // 20% < 30% -> should trigger Mint (too much offchain).
         for _ in 0..20 {
             let event = make_onchain_fill(shares(1), Direction::Buy);
-            trigger
-                .apply_position_event_and_check(&symbol, &event)
-                .await;
+            trigger.on_position(symbol.clone(), event).await;
         }
 
         for _ in 0..80 {
             let event = make_offchain_fill(shares(1), Direction::Buy);
-            trigger
-                .apply_position_event_and_check(&symbol, &event)
-                .await;
+            trigger.on_position(symbol.clone(), event).await;
         }
 
         // Drain any intermediate triggers and do a final check.
@@ -894,9 +890,7 @@ mod tests {
 
         // One more event to trigger the check after the imbalance is built up.
         let event = make_onchain_fill(shares(1), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         let triggered = receiver.try_recv();
         assert!(
@@ -914,18 +908,14 @@ mod tests {
 
         // Apply onchain buy - should add to onchain available.
         let event = make_onchain_fill(shares(50), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // Apply offchain buy - should add to offchain available.
         let event = make_offchain_fill(shares(50), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // Now inventory has 50 onchain, 50 offchain = balanced at 50%.
-        // Drain any previous triggered operations (from apply_position_event_and_check).
+        // Drain any previous triggered operations (from on_position).
         while receiver.try_recv().is_ok() {}
 
         trigger.check_and_trigger_equity(&symbol).await;
@@ -956,9 +946,7 @@ mod tests {
         // Apply a small buy that maintains balance (5 shares onchain).
         // After: 55 onchain, 50 offchain = 52.4% ratio, within 30-70% bounds.
         let event = make_onchain_fill(shares(5), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // No operation should be triggered.
         assert!(
@@ -989,9 +977,7 @@ mod tests {
 
         // Apply a small event that triggers the imbalance check.
         let event = make_onchain_fill(shares(1), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // Mint should be triggered because too much offchain.
         let triggered = receiver.try_recv();
@@ -1710,23 +1696,33 @@ mod tests {
         }
     }
 
+    deps!(EventCapturingReactor, [UsdcRebalance]);
+
     #[async_trait]
-    impl Reactor<UsdcRebalance> for EventCapturingReactor {
-        async fn react(&self, _id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) {
+    impl Reactor for EventCapturingReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
             self.captured_events.lock().await.push(event.clone());
 
-            let is_terminal = RebalancingTrigger::is_terminal_usdc_rebalance_event(event);
+            let is_terminal = RebalancingTrigger::is_terminal_usdc_rebalance_event(&event);
             self.terminal_detection_results
                 .lock()
                 .await
                 .push(is_terminal);
+
+            Ok(())
         }
     }
 
     #[tokio::test]
     async fn terminal_detection_identifies_deposit_confirmed_alone_for_base_to_alpaca() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId::new("base-to-alpaca-001");
         let tx_hash =
@@ -1813,7 +1809,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_deposit_confirmed_alone_for_alpaca_to_base() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId::new("alpaca-to-base-001");
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
@@ -1897,7 +1893,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_withdrawal_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId::new("withdrawal-failed-test");
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
@@ -1938,7 +1934,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_bridging_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId::new("bridging-failed-test");
         let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(uuid::Uuid::new_v4());
@@ -1994,7 +1990,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_conversion_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId::new("conversion-failed-test");
 
@@ -2058,27 +2054,31 @@ mod tests {
             fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("test-clear-001".to_string());
 
-        Reactor::<UsdcRebalance>::react(
-            trigger.as_ref(),
-            &id,
-            &UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000)),
-                withdrawal_ref: TransferRef::OnchainTx(tx_hash),
-                initiated_at: chrono::Utc::now(),
-            },
-        )
-        .await;
+        let trigger_harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        Reactor::<UsdcRebalance>::react(
-            trigger.as_ref(),
-            &id,
-            &UsdcRebalanceEvent::DepositConfirmed {
-                direction: RebalanceDirection::AlpacaToBase,
-                deposit_confirmed_at: chrono::Utc::now(),
-            },
-        )
-        .await;
+        trigger_harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000)),
+                    withdrawal_ref: TransferRef::OnchainTx(tx_hash),
+                    initiated_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger_harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
 
         // Verify in_progress flag was cleared (AlpacaToBase deposit is terminal)
         assert!(
@@ -2090,7 +2090,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_conversion_confirmed_alone_for_base_to_alpaca() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = TestStore::<UsdcRebalance>::new(vec![Box::new(Arc::clone(&spy))], ());
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId::new("conversion-base-to-alpaca-001");
         let tx_hash =
@@ -2241,7 +2241,10 @@ mod tests {
             sender,
         ));
 
-        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -2259,7 +2262,10 @@ mod tests {
 
         // React to the onchain event - this should NOT trigger rebalancing
         // because we don't have offchain data yet
-        reactor.react(&id, &onchain_event).await;
+        harness
+            .receive(id.clone(), onchain_event.clone())
+            .await
+            .unwrap();
 
         // CORRECT BEHAVIOR: No operation should be triggered because
         // offchain data hasn't arrived yet. The system should wait until
@@ -2297,7 +2303,10 @@ mod tests {
             sender,
         ));
 
-        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -2312,7 +2321,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        reactor.react(&id, &onchain_event).await;
+        harness.receive(id.clone(), onchain_event).await.unwrap();
 
         // No trigger yet - only one venue has data
         assert!(
@@ -2329,7 +2338,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        reactor.react(&id, &offchain_event).await;
+        harness.receive(id.clone(), offchain_event).await.unwrap();
 
         // Now both venues have data: 100 onchain, 0 offchain = 100% ratio
         // With target 50% and deviation 10%, ratio 100% > upper bound 60%
@@ -2366,7 +2375,10 @@ mod tests {
             sender,
         ));
 
-        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -2381,7 +2393,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        reactor.react(&id, &onchain_event).await;
+        harness.receive(id.clone(), onchain_event).await.unwrap();
 
         // Verify the logs show:
         // 1. The snapshot event was applied
@@ -2419,7 +2431,10 @@ mod tests {
             sender,
         ));
 
-        let reactor = InventorySnapshotReactor::new(inventory.clone(), Some(trigger.clone()));
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -2429,29 +2444,31 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(symbol.clone(), shares(100));
 
-        reactor
-            .react(
-                &id,
-                &InventorySnapshotEvent::OnchainEquity {
+        harness
+            .receive(
+                id.clone(),
+                InventorySnapshotEvent::OnchainEquity {
                     balances,
                     fetched_at: Utc::now(),
                 },
             )
-            .await;
+            .await
+            .unwrap();
 
         // Now apply offchain data - both venues now have data
         let mut positions = BTreeMap::new();
         positions.insert(symbol.clone(), shares(0));
 
-        reactor
-            .react(
-                &id,
-                &InventorySnapshotEvent::OffchainEquity {
+        harness
+            .receive(
+                id.clone(),
+                InventorySnapshotEvent::OffchainEquity {
                     positions,
                     fetched_at: Utc::now(),
                 },
             )
-            .await;
+            .await
+            .unwrap();
 
         // Verify the trigger fired after both venues have data
         assert!(

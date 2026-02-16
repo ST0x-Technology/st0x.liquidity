@@ -1,108 +1,76 @@
-//! Event reactor traits for responding to entity events.
+//! Event reactor trait for multi-entity event handling.
 //!
-//! Two traits serve complementary roles:
+//! [`Reactor`] defines a multi-entity event handler whose event
+//! type is computed from its dependency list. Reactors handle
+//! events via the [`.on()`](crate::OneOf::on) /
+//! [`.exhaustive()`](crate::Fold::exhaustive) chain, which
+//! guarantees at compile time that every entity is handled.
 //!
-//! - [`ReactsTo<Entity>`] — per-entity event handler. This is what
-//!   the wiring infrastructure ([`StoreBuilder`](crate::StoreBuilder),
-//!   [`ReactorBridge`](crate::lifecycle::ReactorBridge)) uses to
-//!   dispatch events to reactors. Single-entity processors like
-//!   [`Projection`](crate::Projection) implement this directly.
-//!
-//! - [`Reactor`] — multi-entity reactor with a discriminated union
-//!   event type. Reactors that handle events from multiple entities
-//!   implement this trait once with an exhaustive `match`, then
-//!   implement [`ReactsTo<Entity>`] per entity to bridge into the
-//!   union type. The `Entities` associated type is a type-level
-//!   list (built with [`deps!`](crate::deps)) for compile-time
-//!   dependency tracking via [`Unwired`](crate::Unwired).
+//! Dependency lists are declared via [`deps!`] in the
+//! [`dependency`](crate::dependency) module.
 
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::EventSourced;
+use crate::dependency::{Dependent, EntityList};
 
-/// Per-entity event handler.
+/// Event reactor with exhaustive compile-time checked handling.
 ///
-/// The foundational trait for reacting to events from a single
-/// entity type. Used by the wiring infrastructure to bridge
-/// reactors to cqrs-es queries.
+/// The event type is computed from [`Dependent::Dependencies`]
+/// -- no manual enum definition or `From` impls needed. Use the
+/// [`.on()`](crate::OneOf::on) /
+/// [`.exhaustive()`](crate::Fold::exhaustive) chain in the
+/// `react` implementation to handle each entity.
 ///
-/// Single-entity processors (like [`Projection`](crate::Projection))
-/// implement this directly. Multi-entity reactors implement it
-/// per entity, delegating to their [`Reactor::react`] method.
-#[async_trait]
-pub trait ReactsTo<Entity: EventSourced>: Send + Sync {
-    async fn react(&self, id: &Entity::Id, event: &Entity::Event);
-}
-
-/// Multi-entity reactor with exhaustive event handling.
-///
-/// Each reactor defines its own `Event` enum covering all entities
-/// it reacts to, with an exhaustive `match` in [`react`](Self::react).
-/// Adding a new variant forces handling it — the compiler won't
-/// let you forget.
-///
-/// The `Entities` associated type is a type-level list (built with
-/// [`deps!`](crate::deps)) that mirrors the entity variants in the
-/// event enum. The wiring infrastructure uses it for compile-time
-/// dependency tracking via [`Unwired`](crate::Unwired).
-///
-/// # Implementing
-///
-/// 1. Define an event enum with a variant per entity
-/// 2. Implement `Reactor` with exhaustive match
-/// 3. Implement [`ReactsTo<Entity>`] per entity, wrapping into
-///    the enum and calling [`Reactor::react`]
+/// Each `.on()` handler returns a future, which is boxed
+/// internally for type erasure. Call `.exhaustive().await` to
+/// run the matched handler.
 ///
 /// ```ignore
-/// pub(crate) enum TriggerEvent {
-///     Position(Symbol, PositionEvent),
-///     Mint(IssuerRequestId, TokenizedEquityMintEvent),
-/// }
+/// deps!(RebalancingTrigger, [Position, TokenizedEquityMint]);
 ///
 /// #[async_trait]
 /// impl Reactor for RebalancingTrigger {
-///     type Entities = deps![Position, TokenizedEquityMint];
-///     type Event = TriggerEvent;
+///     type Error = TriggerError;
 ///
-///     async fn react(&self, event: TriggerEvent) {
-///         match event {
-///             TriggerEvent::Position(symbol, event) => { .. }
-///             TriggerEvent::Mint(id, event) => { .. }
-///         }
-///     }
-/// }
-///
-/// #[async_trait]
-/// impl ReactsTo<Position> for RebalancingTrigger {
-///     async fn react(&self, id: &Symbol, event: &PositionEvent) {
-///         Reactor::react(self, TriggerEvent::Position(
-///             id.clone(), event.clone(),
-///         )).await;
+///     async fn react(
+///         &self,
+///         event: <Self::Dependencies as EntityList>::Event,
+///     ) -> Result<(), Self::Error> {
+///         event
+///             .on(|symbol, event| async move {
+///                 self.on_position(symbol, event).await
+///             })
+///             .on(|id, event| async move {
+///                 self.on_mint(id, event).await
+///             })
+///             .exhaustive()
+///             .await;
+///         Ok(())
 ///     }
 /// }
 /// ```
 #[async_trait]
-pub trait Reactor: Send + Sync {
-    /// Type-level list of entities this reactor handles.
-    type Entities;
+pub trait Reactor: Dependent {
+    /// Error type for reactor failures.
+    type Error: std::error::Error + Send + Sync;
 
-    /// Discriminated union of all (id, event) pairs.
-    type Event: Send;
-
-    /// Handle a single event from any of the supported entities.
-    async fn react(&self, event: Self::Event);
+    /// Handle a single event from any supported entity.
+    async fn react(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error>;
 }
 
-/// Enables sharing a single reactor's per-entity handler
-/// across multiple CQRS frameworks via `Arc`.
+/// Enables sharing a reactor via `Arc`.
 #[async_trait]
-impl<R, Entity> ReactsTo<Entity> for Arc<R>
-where
-    R: ReactsTo<Entity>,
-    Entity: EventSourced,
-{
-    async fn react(&self, id: &Entity::Id, event: &Entity::Event) {
-        R::react(self, id, event).await;
+impl<R: Reactor> Reactor for Arc<R> {
+    type Error = R::Error;
+
+    async fn react(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        R::react(self, event).await
     }
 }

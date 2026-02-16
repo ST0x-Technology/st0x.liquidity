@@ -73,64 +73,42 @@ use std::sync::Arc;
 use cqrs_es::Query;
 use sqlx::SqlitePool;
 
-use crate::Reactor;
+use crate::dependency::{Cons, InjectAtDepth, Nil, Successor, Zero};
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-use crate::schema_registry::Reconciler;
+use crate::reactor::Reactor;
+use crate::schema_registry::{ReconcileError, Reconciler};
 use crate::{EventSourced, Store};
-
-/// Build a type-level dependency list from entity types.
-///
-/// Expands to nested `Cons<..., Nil>`:
-/// ```ignore
-/// deps![A, B, C]  // -> Cons<A, Cons<B, Cons<C, Nil>>>
-/// ```
-#[macro_export]
-macro_rules! deps {
-    () => { $crate::Nil };
-    ($head:ty $(, $tail:ty)* $(,)?) => {
-        $crate::Cons<$head, $crate::deps![$($tail),*]>
-    };
-}
-
-/// Type-level cons cell for building linked lists of entities.
-///
-/// Forms a compile-time linked list:
-/// `Cons<Position, Cons<TokenizedEquityMint, Nil>>`.
-pub struct Cons<Head, Tail>(PhantomData<(Head, Tail)>);
-
-/// Type-level empty list (nil).
-///
-/// Terminal element for type-level lists. When an [`Unwired`]
-/// reaches this state, [`into_inner`](Unwired::into_inner)
-/// becomes available.
-pub struct Nil;
 
 /// A query processor with compile-time wiring dependencies.
 ///
 /// Wraps an `Arc<Processor>` and tracks which entities it still
-/// needs to be wired to via the `Deps` phantom type. The inner
-/// Arc is only extractable via [`into_inner`](Self::into_inner)
-/// when `Deps = Nil`.
+/// needs to be wired to via the `Deps` phantom type. `Depth`
+/// tracks how many entities have been wired so far, enabling
+/// correct event injection into the computed union type.
+///
+/// The inner Arc is only extractable via
+/// [`into_inner`](Self::into_inner) when `Deps = Nil`.
 ///
 /// # Type Parameter Evolution
 ///
-/// Each call to [`StoreBuilder::wire`] consumes this and returns a
-/// new instance with the head entity removed from `Deps`:
+/// Each call to [`StoreBuilder::wire`] consumes this and returns
+/// a new instance with the head entity removed from `Deps` and
+/// `Depth` incremented:
 ///
 /// ```text
-/// Unwired<Processor, Cons<A, Cons<B, Nil>>>
+/// Unwired<R, Cons<A, Cons<B, Nil>>, Zero>
 ///     --wire to A-->
-/// Unwired<Processor, Cons<B, Nil>>
+/// Unwired<R, Cons<B, Nil>, Successor<Zero>>
 ///     --wire to B-->
-/// Unwired<Processor, Nil>
+/// Unwired<R, Nil, Successor<Successor<Zero>>>
 ///     --into_inner-->
-/// Arc<Processor>
+/// Arc<R>
 /// ```
 #[must_use = "query must be wired via StoreBuilder, \
               then extracted with into_inner"]
-pub struct Unwired<Processor, Deps> {
+pub struct Unwired<Processor, Deps, Depth = Zero> {
     pub(crate) inner: Arc<Processor>,
-    pub(crate) _deps: PhantomData<Deps>,
+    _phantom: PhantomData<(Deps, Depth)>,
 }
 
 impl<Processor, Deps> Unwired<Processor, Deps> {
@@ -142,12 +120,12 @@ impl<Processor, Deps> Unwired<Processor, Deps> {
     pub fn new(processor: Processor) -> Self {
         Self {
             inner: Arc::new(processor),
-            _deps: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<Processor> Unwired<Processor, Nil> {
+impl<Processor, Depth> Unwired<Processor, Nil, Depth> {
     /// Extracts the inner Arc. Only available when all
     /// dependencies are satisfied.
     ///
@@ -162,7 +140,7 @@ impl<Processor> Unwired<Processor, Nil> {
 /// The wired-output accumulator: a cons-cell pairing a
 /// partially-wired processor with the previously accumulated
 /// wired results.
-type WiredOutput<Processor, Tail, Rest> = (Unwired<Processor, Tail>, Rest);
+type WiredOutput<Processor, Tail, Depth, Rest> = (Unwired<Processor, Tail, Depth>, Rest);
 
 /// Builder for a single CQRS framework with type-tracked query
 /// wiring.
@@ -203,17 +181,25 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
         self
     }
 
-    /// Adds a reactor or projection without type-level tracking.
+    /// Adds a single-entity reactor without type-level tracking.
     ///
-    /// Use this for CLI code where compile-time wiring
-    /// guarantees aren't needed. Production code should use
-    /// [`wire`](StoreBuilder::wire) with [`Unwired`] instead.
+    /// Convenience for CLI and test code. The reactor must list
+    /// this `Entity` as first in its `Entities` list. For
+    /// multi-entity reactors with proper dependency tracking,
+    /// use [`wire`](StoreBuilder::wire) with [`Unwired`].
     #[must_use]
-    pub fn with(self, reactor: impl Reactor<Entity> + 'static) -> Self
+    pub fn with<R>(self, reactor: R) -> Self
     where
+        R: Reactor + 'static,
+        R::Dependencies: InjectAtDepth<Zero, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+        Entity::Id: Clone,
+        Entity::Event: Clone,
         <Entity::Id as FromStr>::Err: Debug,
     {
-        self.with_query(ReactorBridge(reactor))
+        self.with_query(ReactorBridge {
+            reactor: Arc::new(reactor),
+            _depth: PhantomData::<Zero>,
+        })
     }
 
     /// Builds the CQRS framework when no queries were wired.
@@ -223,7 +209,7 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
     /// changed.
     ///
     /// Returns a [`Store`] for type-safe command dispatch.
-    pub async fn build(self, services: Entity::Services) -> Result<Store<Entity>, anyhow::Error> {
+    pub async fn build(self, services: Entity::Services) -> Result<Store<Entity>, ReconcileError> {
         Reconciler::new(self.pool.clone())
             .reconcile::<Entity>()
             .await?;
@@ -243,25 +229,30 @@ impl<Entity: EventSourced, Wired> StoreBuilder<Entity, Wired> {
     /// - The processor (bridged to cqrs-es `Query`) added to
     ///   the internal processors list
     /// - An updated `Unwired` (with `Entity` removed from
-    ///   dependencies) added to the wired tuple for return at
-    ///   build time
+    ///   dependencies and `Depth` incremented) added to the
+    ///   wired tuple for return at build time
     ///
     /// # Type Evolution
     ///
     /// The input must have `Entity` as its next dependency:
-    /// `Unwired<R, Cons<Entity, Tail>>`. The returned value
-    /// will be `Unwired<R, Tail>`.
-    pub fn wire<R, Tail>(
+    /// `Unwired<R, Cons<Entity, Tail>, Depth>`. The returned
+    /// value will be `Unwired<R, Tail, Successor<Depth>>`.
+    pub fn wire<R, Tail, Depth>(
         mut self,
-        processor: Unwired<R, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, WiredOutput<R, Tail, Wired>>
+        processor: Unwired<R, Cons<Entity, Tail>, Depth>,
+    ) -> StoreBuilder<Entity, WiredOutput<R, Tail, Successor<Depth>, Wired>>
     where
-        R: Send + Sync + 'static,
-        Arc<R>: Reactor<Entity>,
+        R: Reactor + 'static,
+        R::Dependencies: InjectAtDepth<Depth, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+        Entity::Id: Clone,
+        Entity::Event: Clone,
+        Depth: Send + Sync + 'static,
         <Entity::Id as FromStr>::Err: Debug + Send + Sync,
     {
-        self.queries
-            .push(Box::new(ReactorBridge(processor.inner.clone())));
+        self.queries.push(Box::new(ReactorBridge {
+            reactor: processor.inner.clone(),
+            _depth: PhantomData::<Depth>,
+        }));
 
         StoreBuilder {
             pool: self.pool,
@@ -269,7 +260,7 @@ impl<Entity: EventSourced, Wired> StoreBuilder<Entity, Wired> {
             wired: (
                 Unwired {
                     inner: processor.inner,
-                    _deps: PhantomData,
+                    _phantom: PhantomData,
                 },
                 self.wired,
             ),
@@ -288,7 +279,7 @@ impl<Entity: EventSourced, Head, Tail> StoreBuilder<Entity, (Head, Tail)> {
     pub async fn build(
         self,
         services: Entity::Services,
-    ) -> Result<(Store<Entity>, (Head, Tail)), anyhow::Error> {
+    ) -> Result<(Store<Entity>, (Head, Tail)), ReconcileError> {
         Reconciler::new(self.pool.clone())
             .reconcile::<Entity>()
             .await?;
@@ -307,6 +298,8 @@ mod tests {
 
     use super::*;
     use crate::Table;
+    use crate::dependency::{Dependent, EntityList};
+    use crate::deps;
     use crate::lifecycle::Never;
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -403,53 +396,61 @@ mod tests {
         name: &'static str,
     }
 
-    #[async_trait]
-    impl Reactor<AggregateA> for Arc<MultiEntityReactor> {
-        async fn react(&self, _id: &String, _event: &EventA) {}
+    impl Dependent for MultiEntityReactor {
+        type Dependencies = Cons<AggregateA, Cons<AggregateB, Nil>>;
     }
 
     #[async_trait]
-    impl Reactor<AggregateB> for Arc<MultiEntityReactor> {
-        async fn react(&self, _id: &String, _event: &EventB) {}
+    impl Reactor for MultiEntityReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            event
+                .on(|_id, _event| async {})
+                .on(|_id, _event| async {})
+                .exhaustive()
+                .await;
+            Ok(())
+        }
     }
 
     struct SingleEntityReactor;
 
+    impl Dependent for SingleEntityReactor {
+        type Dependencies = Cons<AggregateA, Nil>;
+    }
+
     #[async_trait]
-    impl Reactor<AggregateA> for Arc<SingleEntityReactor> {
-        async fn react(&self, _id: &String, _event: &EventA) {}
+    impl Reactor for SingleEntityReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, _event) = event.into_inner();
+            Ok(())
+        }
     }
 
     #[test]
-    fn single_entity_reactor_wiring() {
-        type Deps = Cons<AggregateA, Nil>;
-        let reactor: Unwired<SingleEntityReactor, Deps> = Unwired::new(SingleEntityReactor);
-
-        // Simulate wiring (no actual pool needed for type-level test)
-        let reactor: Unwired<SingleEntityReactor, Nil> = Unwired {
-            inner: reactor.inner,
-            _deps: PhantomData,
+    fn single_entity_reactor_into_inner() {
+        let reactor: Unwired<SingleEntityReactor, Nil, Successor<Zero>> = Unwired {
+            inner: Arc::new(SingleEntityReactor),
+            _phantom: PhantomData,
         };
 
         let _arc: Arc<SingleEntityReactor> = reactor.into_inner();
     }
 
     #[test]
-    fn multi_entity_reactor_wiring_sequence() {
-        type Deps = Cons<AggregateA, Cons<AggregateB, Nil>>;
-        let reactor: Unwired<MultiEntityReactor, Deps> =
-            Unwired::new(MultiEntityReactor { name: "test" });
-
-        // After wiring to A, only B remains
-        let reactor: Unwired<MultiEntityReactor, Cons<AggregateB, Nil>> = Unwired {
-            inner: reactor.inner,
-            _deps: PhantomData,
-        };
-
-        // After wiring to B, Nil
-        let reactor: Unwired<MultiEntityReactor, Nil> = Unwired {
-            inner: reactor.inner,
-            _deps: PhantomData,
+    fn multi_entity_reactor_into_inner() {
+        let reactor: Unwired<MultiEntityReactor, Nil, Successor<Successor<Zero>>> = Unwired {
+            inner: Arc::new(MultiEntityReactor { name: "test" }),
+            _phantom: PhantomData,
         };
 
         let arc = reactor.into_inner();
@@ -461,14 +462,11 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
 
-        type MultiDeps = Cons<AggregateA, Cons<AggregateB, Nil>>;
-        type SingleDeps = Cons<AggregateA, Nil>;
-
-        let multi: Unwired<MultiEntityReactor, MultiDeps> =
+        let multi: Unwired<MultiEntityReactor, deps![AggregateA, AggregateB]> =
             Unwired::new(MultiEntityReactor { name: "multi" });
-        let single: Unwired<SingleEntityReactor, SingleDeps> = Unwired::new(SingleEntityReactor);
+        let single: Unwired<SingleEntityReactor, deps![AggregateA]> =
+            Unwired::new(SingleEntityReactor);
 
-        // Build AggregateA Store
         let (_store_a, (single, (multi, ()))) = StoreBuilder::<AggregateA>::new(pool.clone())
             .wire(multi)
             .wire(single)
@@ -478,7 +476,6 @@ mod tests {
 
         let _single_arc: Arc<SingleEntityReactor> = single.into_inner();
 
-        // Build AggregateB Store
         let (_store_b, (multi, ())) = StoreBuilder::<AggregateB>::new(pool.clone())
             .wire(multi)
             .build(())

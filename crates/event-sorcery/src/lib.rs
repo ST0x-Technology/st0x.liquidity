@@ -75,6 +75,7 @@
 //! immediately obvious whether code belongs to this crate or
 //! to cqrs-es.
 
+pub(crate) mod dependency;
 mod lifecycle;
 mod projection;
 mod reactor;
@@ -95,13 +96,19 @@ use sqlx::SqlitePool;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 
+#[doc(hidden)]
+pub use dependency::{Cons, Nil};
+pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, SqliteProjectionRepo, Table};
-pub use schema_registry::{Reconciler, SchemaRegistry};
+pub use reactor::Reactor;
+pub use schema_registry::{ReconcileError, Reconciler, SchemaRegistry};
 #[cfg(any(test, feature = "test-support"))]
-pub use testing::{TestHarness, TestResult, TestStore, replay, test_store};
-pub use wire::{Cons, Nil, StoreBuilder, Unwired};
+pub use testing::{
+    ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
+};
+pub use wire::{StoreBuilder, Unwired};
 
 /// The core abstraction for event-sourced domain entities.
 ///
@@ -319,18 +326,4 @@ pub trait DomainError:
 impl<T> DomainError for T where
     T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
-}
-
-/// Event reactor for a specific entity type.
-///
-/// Replaces `cqrs_es::Query<Lifecycle<E>>` with a cleaner
-/// interface: typed IDs instead of `&str`, one event at a time
-/// instead of an array of envelopes, and no Lifecycle leak.
-///
-/// Internally bridged to `Query<Lifecycle<E>>` via
-/// [`ReactorBridge`](lifecycle::ReactorBridge) so that
-/// cqrs-es continues to work unmodified.
-#[async_trait]
-pub trait Reactor<Entity: EventSourced>: Send + Sync {
-    async fn react(&self, id: &Entity::Id, event: &Entity::Event);
 }

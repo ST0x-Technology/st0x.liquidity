@@ -669,7 +669,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn complete_redemption_flow_end_to_end() {
-        let store = TestStore::<EquityRedemption>::new(vec![], mock_services());
+        let store = TestStore::<EquityRedemption>::new(mock_services());
         let id = RedemptionAggregateId::new("end-to-end");
 
         store
@@ -988,7 +988,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn redeem_when_already_started_returns_already_started() {
-        let store = TestStore::<EquityRedemption>::new(vec![], mock_services());
+        let store = TestStore::<EquityRedemption>::new(mock_services());
         let id = RedemptionAggregateId::new("redemption-1");
 
         store
@@ -1025,7 +1025,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn redeem_when_pending_returns_already_started() {
-        let store = TestStore::<EquityRedemption>::new(vec![], mock_services());
+        let store = TestStore::<EquityRedemption>::new(mock_services());
         let id = RedemptionAggregateId::new("redemption-1");
 
         store

@@ -17,8 +17,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::lifecycle::{Lifecycle, LifecycleError};
-use crate::{EventSourced, Reactor};
+use crate::EventSourced;
+use crate::dependency::{Cons, Dependent, EntityList, Nil};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::reactor::Reactor;
 
 /// A materialized view table name.
 ///
@@ -316,14 +318,29 @@ impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo> {
     }
 }
 
-#[async_trait]
 #[allow(private_bounds)]
-impl<Entity, Repo> Reactor<Entity> for Projection<Entity, Repo>
+impl<Entity, Repo> Dependent for Projection<Entity, Repo>
 where
     Entity: EventSourced + 'static,
     Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync,
 {
-    async fn react(&self, id: &Entity::Id, event: &Entity::Event) {
+    type Dependencies = Cons<Entity, Nil>;
+}
+
+#[async_trait]
+#[allow(private_bounds)]
+impl<Entity, Repo> Reactor for Projection<Entity, Repo>
+where
+    Entity: EventSourced + 'static,
+    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync,
+{
+    type Error = Never;
+
+    async fn react(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        let (id, event) = event.into_inner();
         let view_id = id.to_string();
 
         let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
@@ -331,7 +348,7 @@ where
             Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
             Err(error) => {
                 warn!(%view_id, ?error, "Failed to load view for update");
-                return;
+                return Ok(());
             }
         };
 
@@ -340,6 +357,8 @@ where
         if let Err(error) = self.repo.update_view(lifecycle, context).await {
             warn!(%view_id, ?error, "Failed to save view update");
         }
+
+        Ok(())
     }
 }
 

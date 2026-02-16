@@ -282,7 +282,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use st0x_event_sorcery::{Reactor, StoreBuilder, TestHarness, replay};
+    use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
 
     use super::*;
     use crate::test_utils::setup_test_db;
@@ -579,10 +579,19 @@ mod tests {
     /// Tracks how many events a reactor receives.
     struct EventCounter(Arc<AtomicUsize>);
 
+    deps!(EventCounter, [VaultRegistry]);
+
     #[async_trait]
-    impl Reactor<VaultRegistry> for EventCounter {
-        async fn react(&self, _id: &VaultRegistryId, _event: &VaultRegistryEvent) {
+    impl Reactor for EventCounter {
+        type Error = st0x_event_sorcery::Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, _event) = event.into_inner();
             self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
