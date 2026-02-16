@@ -4,23 +4,15 @@
 //! Keeping these in a separate crate allows the dashboard to build without waiting
 //! for the full workspace.
 
-use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
+use std::path::Path;
 use ts_rs::TS;
-
-/// Absolute path to the dashboard TypeScript bindings directory.
-///
-/// Resolved from CARGO_MANIFEST_DIR at compile time so it works
-/// regardless of the working directory (e.g. git worktrees).
-fn dashboard_bindings_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api")
-}
 
 /// Messages sent from the server to WebSocket clients.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerMessage {
     Initial(Box<InitialState>),
@@ -29,7 +21,7 @@ pub enum ServerMessage {
 
 /// Full dashboard snapshot sent to the frontend on connection.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct InitialState {
     pub recent_trades: Vec<Trade>,
@@ -59,7 +51,7 @@ impl InitialState {
 
 /// Single event from the event store for live updates.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 pub struct EventStoreEntry {
     pub aggregate_type: String,
     pub aggregate_id: String,
@@ -71,7 +63,7 @@ pub struct EventStoreEntry {
 
 /// Completed trade record.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct Trade {
     pub id: String,
@@ -79,7 +71,7 @@ pub struct Trade {
 
 /// Per-symbol net position.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     pub symbol: String,
@@ -89,7 +81,7 @@ pub struct Position {
 
 /// Per-symbol onchain/offchain/net balances.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolInventory {
     pub symbol: String,
@@ -103,7 +95,7 @@ pub struct SymbolInventory {
 
 /// Onchain and offchain USDC balances.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct UsdcInventory {
     #[ts(type = "string")]
@@ -114,7 +106,7 @@ pub struct UsdcInventory {
 
 /// Full inventory snapshot across all symbols and USDC.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
     pub per_symbol: Vec<SymbolInventory>,
@@ -135,7 +127,7 @@ impl Inventory {
 
 /// Absolute and percentage profit/loss.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 pub struct PnL {
     #[ts(type = "string")]
     pub absolute: Decimal,
@@ -145,7 +137,7 @@ pub struct PnL {
 
 /// Performance metrics for a single time window.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeframeMetrics {
     #[ts(type = "string")]
@@ -189,7 +181,7 @@ impl TimeframeMetrics {
 
 /// Metrics across all tracked timeframes.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 pub struct PerformanceMetrics {
     #[serde(rename = "1h")]
     pub one_hour: TimeframeMetrics,
@@ -217,7 +209,7 @@ impl PerformanceMetrics {
 
 /// Current bid/ask spread for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadSummary {
     pub symbol: String,
@@ -234,7 +226,7 @@ pub struct SpreadSummary {
 
 /// Incremental spread change for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadUpdate {
     pub symbol: String,
@@ -251,7 +243,7 @@ pub struct SpreadUpdate {
 
 /// Active or completed rebalance operation.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceOperation {
     pub id: String,
@@ -259,7 +251,7 @@ pub struct RebalanceOperation {
 
 /// Whether the trading circuit breaker is active.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CircuitBreakerStatus {
     Active,
@@ -267,39 +259,46 @@ pub enum CircuitBreakerStatus {
 
 /// Broker authentication status.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../../dashboard/src/lib/api/")]
+#[ts(export)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AuthStatus {
     NotConfigured,
 }
 
-/// Export all TypeScript bindings to the dashboard directory.
-pub fn export_bindings() -> Result<(), ts_rs::ExportError> {
-    let dir = dashboard_bindings_dir();
-
-    ServerMessage::export_all_to(&dir)?;
-    InitialState::export_all_to(&dir)?;
-    EventStoreEntry::export_all_to(&dir)?;
-    Trade::export_all_to(&dir)?;
-    Position::export_all_to(&dir)?;
-    SymbolInventory::export_all_to(&dir)?;
-    Inventory::export_all_to(&dir)?;
-    UsdcInventory::export_all_to(&dir)?;
-    TimeframeMetrics::export_all_to(&dir)?;
-    PnL::export_all_to(&dir)?;
-    PerformanceMetrics::export_all_to(&dir)?;
-    SpreadSummary::export_all_to(&dir)?;
-    SpreadUpdate::export_all_to(&dir)?;
-    RebalanceOperation::export_all_to(&dir)?;
-    CircuitBreakerStatus::export_all_to(&dir)?;
-    AuthStatus::export_all_to(&dir)?;
+/// Export all TypeScript bindings into `out_dir`.
+///
+/// Each type is written to `out_dir/TypeName.ts`. The caller controls
+/// the output location explicitly -- no `TS_RS_EXPORT_DIR` magic.
+pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
+    ServerMessage::export_all_to(out_dir)?;
+    InitialState::export_all_to(out_dir)?;
+    EventStoreEntry::export_all_to(out_dir)?;
+    Trade::export_all_to(out_dir)?;
+    Position::export_all_to(out_dir)?;
+    SymbolInventory::export_all_to(out_dir)?;
+    Inventory::export_all_to(out_dir)?;
+    UsdcInventory::export_all_to(out_dir)?;
+    TimeframeMetrics::export_all_to(out_dir)?;
+    PnL::export_all_to(out_dir)?;
+    PerformanceMetrics::export_all_to(out_dir)?;
+    SpreadSummary::export_all_to(out_dir)?;
+    SpreadUpdate::export_all_to(out_dir)?;
+    RebalanceOperation::export_all_to(out_dir)?;
+    CircuitBreakerStatus::export_all_to(out_dir)?;
+    AuthStatus::export_all_to(out_dir)?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    fn default_bindings_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api")
+    }
 
     #[test]
     fn initial_state_stub_serializes_correctly() {
@@ -313,31 +312,30 @@ mod tests {
     }
 
     #[derive(TS)]
-    #[ts(export, export_to = "../../dashboard/src/lib/api/")]
+    #[ts(export)]
     struct TestOnlyBinding {
         _canary: bool,
     }
 
     #[test]
     fn export_bindings_generates_files_in_dashboard_directory() {
-        let export_dir = dashboard_bindings_dir();
+        let out_dir = default_bindings_dir();
 
-        export_bindings().unwrap();
+        export_bindings(&out_dir).unwrap();
 
         assert!(
-            export_dir.join("ServerMessage.ts").exists(),
+            out_dir.join("ServerMessage.ts").exists(),
             "ServerMessage.ts should exist in {}/",
-            export_dir.display()
+            out_dir.display()
         );
         assert!(
-            export_dir.join("InitialState.ts").exists(),
+            out_dir.join("InitialState.ts").exists(),
             "InitialState.ts should exist in {}/",
-            export_dir.display()
+            out_dir.display()
         );
 
-        // Export a test-only type and verify it lands in the same directory with correct contents
-        TestOnlyBinding::export_all_to(&export_dir).unwrap();
-        let test_file = export_dir.join("TestOnlyBinding.ts");
+        TestOnlyBinding::export_all_to(&out_dir).unwrap();
+        let test_file = out_dir.join("TestOnlyBinding.ts");
         let contents = std::fs::read_to_string(&test_file).unwrap_or_else(|e| {
             panic!(
                 "test-only binding should be readable at {}: {e}",

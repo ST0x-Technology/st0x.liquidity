@@ -17,7 +17,7 @@ in pkgs.stdenv.mkDerivation {
   dontRunLifecycleScripts = true;
 
   buildPhase = ''
-    TS_RS_EXPORT_DIR=crates/dto/bindings st0x-dto
+    st0x-dto dashboard/src/lib/api
     cd dashboard
     bun run build
   '';
