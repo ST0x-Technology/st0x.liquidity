@@ -471,7 +471,7 @@ impl EventSourced for EquityRedemption {
                 token,
                 amount,
             } => {
-                let vault_withdraw_tx = services.withdraw_from_vault(token, amount).await?;
+                let vault_withdraw_tx = services.withdraw_from_raindex(token, amount).await?;
                 let now = Utc::now();
                 let vault_withdrawn = VaultWithdrawn {
                     symbol,

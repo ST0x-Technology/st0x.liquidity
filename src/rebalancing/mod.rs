@@ -20,6 +20,7 @@ pub(crate) mod mint;
 mod rebalancer;
 pub(crate) mod redemption;
 mod spawn;
+pub(crate) mod transfer;
 pub(crate) mod trigger;
 pub(crate) mod usdc;
 

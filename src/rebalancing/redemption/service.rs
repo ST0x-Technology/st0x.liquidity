@@ -44,7 +44,7 @@ impl<P> Redeemer for RedemptionService<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
-    async fn withdraw_from_vault(
+    async fn withdraw_from_raindex(
         &self,
         token: Address,
         amount: U256,
