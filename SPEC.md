@@ -1534,9 +1534,36 @@ enum SchwabAuthEvent {
 **Note**: Automated rebalancing is **Alpaca-only**. These aggregates are not
 used for Schwab-based operations, which rely on manual rebalancing processes.
 
-Rebalancing manages inventory positions across trading venues (Alpaca brokerage
-vs Raindex orderbook) by coordinating cross-venue asset movements. Three
-aggregates handle the different rebalancing flows for Alpaca operations.
+#### Cross-Venue Asset Transfer Model
+
+The system operates across two trading venues: **Alpaca** (offchain brokerage)
+and **Raindex** (onchain orderbook). Rebalancing is fundamentally about
+transferring assets between these venues to maintain adequate inventory on each
+side. The transfer steps differ by asset type and direction:
+
+**Tokenized equities:**
+
+- **Alpaca -> Raindex** (mint): Tokenize shares via Alpaca ITN (Instant
+  Tokenization Network), then deposit the newly minted tokens (already on Base)
+  into the Raindex vault.
+- **Raindex -> Alpaca** (redeem): Withdraw tokens from the Raindex vault, then
+  redeem via Alpaca ITN for regular shares.
+
+**USD/USDC:**
+
+- **Alpaca -> Raindex**: Convert USD to USDC, withdraw USDC to Ethereum mainnet,
+  bridge to Base via Circle CCTP, deposit to Raindex vault.
+- **Raindex -> Alpaca**: Withdraw USDC from Raindex, bridge to Ethereum mainnet
+  via Circle CCTP, deposit USDC to Alpaca, convert to USD.
+
+The current aggregates (TokenizedEquityMint, EquityRedemption, UsdcRebalance)
+model specific transfer flows. The eventual goal is a unified cross-venue
+transfer abstraction where minting, redemption, and USDC bridging are
+implementation details of directional asset transfers between venues. This
+becomes increasingly important as more steps are added to the process.
+
+Three aggregates currently handle the different rebalancing flows for Alpaca
+operations.
 
 #### TokenizedEquityMint Aggregate
 
