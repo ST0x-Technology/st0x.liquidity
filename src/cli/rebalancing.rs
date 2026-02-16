@@ -22,11 +22,11 @@ use crate::config::{BrokerCtx, Ctx};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::rebalancing::mint::Mint;
-use crate::rebalancing::redemption::Redeem;
-use crate::rebalancing::transfer::EquityTransferServices;
+use crate::rebalancing::transfer::{
+    CrossVenueTransfer, EquityTransfer, EquityTransferServices, HedgingVenue, MarketMakingVenue,
+    MintRequest, RedemptionRequest,
+};
 use crate::rebalancing::usdc::UsdcRebalanceManager;
-use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::threshold::Usdc;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
@@ -90,16 +90,20 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 wallet,
             ));
 
+            let services = EquityTransferServices {
+                raindex: raindex.clone(),
+                tokenizer: tokenization_service.clone(),
+            };
+
             let mint_store = Arc::new(
                 StoreBuilder::new(pool.clone())
-                    .build(EquityTransferServices {
-                        raindex: raindex.clone(),
-                        tokenizer: tokenization_service.clone(),
-                    })
+                    .build(services.clone())
                     .await?,
             );
+            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
 
-            let mint_manager = MintManager::new(mint_store);
+            let equity_transfer =
+                EquityTransfer::new(tokenization_service, mint_store, redemption_store);
 
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
@@ -107,9 +111,16 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
 
-            mint_manager
-                .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
-                .await?;
+            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+                &equity_transfer,
+                MintRequest {
+                    issuer_request_id,
+                    symbol: symbol.clone(),
+                    quantity,
+                    wallet,
+                },
+            )
+            .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
         }
@@ -133,16 +144,20 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 owner,
             ));
 
-            let redemption_store = Arc::new(
+            let services = EquityTransferServices {
+                raindex: raindex.clone(),
+                tokenizer: tokenization_service.clone(),
+            };
+
+            let mint_store = Arc::new(
                 StoreBuilder::new(pool.clone())
-                    .build(EquityTransferServices {
-                        raindex: raindex.clone(),
-                        tokenizer: tokenization_service.clone(),
-                    })
+                    .build(services.clone())
                     .await?,
             );
+            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
 
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_store);
+            let equity_transfer =
+                EquityTransfer::new(tokenization_service, mint_store, redemption_store);
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
@@ -152,9 +167,17 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
             writeln!(stdout, "   Amount (wei): {amount}")?;
 
-            redemption_manager
-                .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-                .await?;
+            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
+                &equity_transfer,
+                RedemptionRequest {
+                    aggregate_id,
+                    symbol: symbol.clone(),
+                    quantity,
+                    token,
+                    amount,
+                },
+            )
+            .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;
         }

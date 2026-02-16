@@ -58,6 +58,7 @@ use crate::rebalancing::{
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
+use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 
@@ -364,6 +365,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let frameworks = RebalancingCqrsFrameworks {
         mint: Arc::new(built.mint),
+        redemption: Arc::new(built.redemption),
         usdc: Arc::new(built.usdc),
     };
 
@@ -379,7 +381,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         frameworks,
         raindex_service.clone(),
         tokenizer,
-        Arc::new(built.redemption),
     )
     .await?;
 
