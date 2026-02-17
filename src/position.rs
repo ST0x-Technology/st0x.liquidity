@@ -19,7 +19,7 @@ use st0x_execution::{
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
-use crate::offchain_order::{OffchainOrderId, PriceCents};
+use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,7 +249,7 @@ impl EventSourced for Position {
                 shares_filled,
                 direction,
                 executor_order_id,
-                price_cents,
+                price,
                 broker_timestamp,
             } => {
                 self.validate_pending_execution(offchain_order_id)?;
@@ -259,7 +259,7 @@ impl EventSourced for Position {
                     shares_filled,
                     direction,
                     executor_order_id,
-                    price_cents,
+                    price,
                     broker_timestamp,
                 }])
             }
@@ -455,7 +455,7 @@ pub(crate) enum PositionCommand {
         shares_filled: Positive<FractionalShares>,
         direction: Direction,
         executor_order_id: ExecutorOrderId,
-        price_cents: PriceCents,
+        price: Dollars,
         broker_timestamp: DateTime<Utc>,
     },
     FailOffChainOrder {
@@ -495,7 +495,7 @@ pub(crate) enum PositionEvent {
         shares_filled: Positive<FractionalShares>,
         direction: Direction,
         executor_order_id: ExecutorOrderId,
-        price_cents: PriceCents,
+        price: Dollars,
         broker_timestamp: DateTime<Utc>,
     },
     OffChainOrderFailed {
@@ -576,7 +576,7 @@ mod tests {
 
     use st0x_execution::Positive;
 
-    use st0x_event_sorcery::{LifecycleError, Projection, TestHarness, replay};
+    use st0x_event_sorcery::{LifecycleError, Projection, StoreBuilder, TestHarness, replay};
 
     use super::*;
     use crate::threshold::Usdc;
@@ -812,7 +812,7 @@ mod tests {
                 shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
                 direction: Direction::Sell,
                 executor_order_id: ExecutorOrderId::new("ORDER123"),
-                price_cents: PriceCents(15050),
+                price: Dollars(dec!(150.50)),
                 broker_timestamp: Utc::now(),
             })
             .await
@@ -922,7 +922,7 @@ mod tests {
                 shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                 direction: Direction::Sell,
                 executor_order_id: ExecutorOrderId::new("ORDER123"),
-                price_cents: PriceCents(15050),
+                price: Dollars(dec!(150.50)),
                 broker_timestamp: Utc::now(),
             },
         ])
@@ -974,7 +974,7 @@ mod tests {
                 shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                 direction: Direction::Buy,
                 executor_order_id: ExecutorOrderId::new("ORDER456"),
-                price_cents: PriceCents(15050),
+                price: Dollars(dec!(150.50)),
                 broker_timestamp: Utc::now(),
             },
         ])
@@ -1135,7 +1135,7 @@ mod tests {
             shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
             direction: Direction::Sell,
             executor_order_id: ExecutorOrderId::new("ORD123"),
-            price_cents: PriceCents(15000),
+            price: Dollars(dec!(150.00)),
             broker_timestamp: timestamp,
         };
 
@@ -1301,7 +1301,7 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
-        let store = st0x_event_sorcery::StoreBuilder::new(pool.clone())
+        let store = StoreBuilder::<Position>::new(pool.clone())
             .with(projection.clone())
             .build(())
             .await

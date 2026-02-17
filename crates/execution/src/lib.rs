@@ -1,7 +1,7 @@
 use alloy::primitives::U256;
 use async_trait::async_trait;
+use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
@@ -41,9 +41,8 @@ pub trait Executor: Send + Sync + 'static {
     where
         Self: Sized;
 
-    /// Wait until market opens (blocks if market closed), then return time until market close
-    /// Implementations without market hours should return a very long duration
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error>;
+    /// Returns true if the market is currently open for trading.
+    async fn is_market_open(&self) -> Result<bool, Self::Error>;
 
     /// Place a market order for the specified symbol and quantity
     /// Returns order placement details including executor-assigned order ID
@@ -55,10 +54,6 @@ pub trait Executor: Send + Sync + 'static {
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error>;
-
-    /// Poll all pending orders for status updates
-    /// More efficient than individual get_order_status calls for multiple orders
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
 
     /// Return the enum variant representing this executor type
     /// Used for database storage and conditional logic
@@ -299,12 +294,6 @@ impl FractionalShares {
         self.0.fract().is_zero()
     }
 
-    /// Creates FractionalShares from an f64 value (typically from database REAL column).
-    pub fn from_f64(value: f64) -> Result<Self, InvalidSharesError> {
-        let decimal = Decimal::try_from(value)?;
-        Ok(Self(decimal))
-    }
-
     /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
     ///
     /// Returns an error for negative values, underflow (values < 1e-18),
@@ -345,7 +334,7 @@ pub enum SharesConversionError {
     Underflow(Decimal),
     #[error("overflow when scaling shares to 18 decimals")]
     Overflow,
-    #[error("shares value {0} has more than 18 decimal places")]
+    #[error("precision loss when scaling to 18 decimals: {0} has sub-wei digits")]
     PrecisionLoss(Decimal),
     #[error("failed to parse U256: {0}")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
@@ -543,7 +532,7 @@ impl std::str::FromStr for Direction {
 pub struct EquityPosition {
     pub symbol: Symbol,
     pub quantity: FractionalShares,
-    pub market_value_cents: Option<i64>,
+    pub market_value: Option<Decimal>,
 }
 
 /// Account state from the broker.
@@ -577,8 +566,8 @@ pub enum ExecutionError {
     Schwab(#[from] schwab::SchwabError),
     #[error("{status:?} order requires order_id")]
     MissingOrderId { status: OrderStatus },
-    #[error("{status:?} order requires price_cents")]
-    MissingPriceCents { status: OrderStatus },
+    #[error("{status:?} order requires price")]
+    MissingPrice { status: OrderStatus },
     #[error("{status:?} order requires executed_at timestamp")]
     MissingExecutedAt { status: OrderStatus },
     #[error("Order not found: {order_id}")]
@@ -593,10 +582,6 @@ pub enum ExecutionError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
-    #[error("Negative shares value: {value}")]
-    NegativeShares { value: f64 },
-    #[error("Price {price} cannot be converted to cents")]
-    PriceConversion { price: f64 },
     #[error("Numeric conversion error: {0}")]
     NumericConversion(#[from] std::num::TryFromIntError),
     #[error("Date/time parse error: {0}")]
@@ -658,7 +643,7 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(dec!(1.212))).unwrap();
         let err = shares.to_whole_shares().unwrap_err();
         assert!(
-            matches!(err, InvalidSharesError::Fractional(v) if v == dec!(1.212)),
+            matches!(err, InvalidSharesError::Fractional(value) if value == dec!(1.212)),
             "Expected Fractional error with value 1.212, got: {err:?}"
         );
     }
@@ -796,6 +781,16 @@ mod tests {
     }
 
     #[test]
+    fn to_u256_18_decimals_rejects_sub_wei_digits() {
+        let shares = FractionalShares::new(dec!(1.1234567890123456789));
+        let error = shares.to_u256_18_decimals().unwrap_err();
+        assert!(
+            matches!(error, SharesConversionError::PrecisionLoss(_)),
+            "Expected PrecisionLoss error, got: {error:?}"
+        );
+    }
+
+    #[test]
     fn to_u256_18_decimals_underflow_returns_error() {
         let shares = FractionalShares::new(dec!(0.0000000000000000001));
         let err = shares.to_u256_18_decimals().unwrap_err();
@@ -909,31 +904,6 @@ mod tests {
             }
         }
 
-        #[test]
-        fn fractional_shares_from_f64_roundtrip_within_precision(
-            mantissa in 1i64..=999_999_999_999i64,
-            scale in 0u32..=6,
-        ) {
-            let decimal = Decimal::new(mantissa, scale);
-            let shares = FractionalShares::new(decimal);
-
-            if let Some(f64_value) = shares.inner().to_f64()
-                && f64_value.is_finite()
-                && f64_value > 0.0
-            {
-                let roundtrip = FractionalShares::from_f64(f64_value).unwrap();
-                let diff = (shares.inner() - roundtrip.inner()).abs();
-                // f64 has ~15-16 significant decimal digits. For large values like
-                // 4322285221.77, some precision loss in lower digits is expected.
-                // Use 1e-6 as tolerance which is realistic for f64 roundtrips.
-                prop_assert!(
-                    diff <= Decimal::new(1, 6),
-                    "Roundtrip diff too large: {} for original {}",
-                    diff,
-                    decimal
-                );
-            }
-        }
     }
 
     #[test]

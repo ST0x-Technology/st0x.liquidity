@@ -15,7 +15,6 @@ use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, Try
 
 use crate::config::{BrokerCtx, Ctx};
 
-mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
@@ -36,6 +35,7 @@ mod rebalancing;
 mod symbol;
 mod telemetry;
 mod threshold;
+mod tokenization;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;

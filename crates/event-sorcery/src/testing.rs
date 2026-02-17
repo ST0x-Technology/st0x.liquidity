@@ -1,16 +1,24 @@
-//! Test infrastructure for EventSourced entities.
+//! Test infrastructure for EventSourced entities and Reactors.
 //!
 //! Provides [`replay`] for reconstructing entity state from events,
-//! [`TestHarness`] for BDD-style command testing, and [`TestStore`]
-//! for in-memory command dispatch with state inspection. All operate
-//! at the EventSourced level, hiding Lifecycle/Aggregate internals.
+//! [`TestHarness`] for BDD-style command testing, [`TestStore`]
+//! for in-memory command dispatch with state inspection,
+//! [`ReactorHarness`] for ergonomic multi-entity reactor testing,
+//! and [`SpyReactor`] for capturing dispatched events.
+//! All operate at the EventSourced/Reactor level, hiding
+//! Lifecycle/Aggregate internals.
 
+use async_trait::async_trait;
 use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-use crate::Reactor;
+use crate::dependency::{HasEntity, InjectAtDepth, Zero};
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
+use crate::reactor::Reactor;
 use crate::{EventSourced, Store};
 
 /// Replay events through EventSourced to reconstruct entity state.
@@ -132,8 +140,153 @@ pub fn test_store<Entity: EventSourced>(
     services: Entity::Services,
 ) -> Store<Entity> {
     #[allow(clippy::disallowed_methods)]
-    let cqrs = sqlite_es::sqlite_cqrs(pool, vec![], services);
-    Store::new(cqrs)
+    let cqrs = sqlite_es::sqlite_cqrs(pool.clone(), vec![], services);
+    Store::new(cqrs, pool)
+}
+
+/// Test wrapper for [`Reactor`] implementations that hides
+/// `OneOf::Here`/`OneOf::There` nesting.
+///
+/// Provides [`receive`](Self::receive) to send entity events to
+/// the reactor using concrete `(Id, Event)` pairs. The correct
+/// `OneOf` variant is constructed automatically via type inference
+/// on the id and event types.
+///
+/// # Example
+///
+/// ```ignore
+/// let (sender, mut receiver) = broadcast::channel(16);
+/// let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+///
+/// // No manual OneOf nesting -- depth inferred from types
+/// harness.receive(mint_id, mint_event).await.unwrap();
+/// harness.receive(redemption_id, redemption_event).await.unwrap();
+///
+/// // Assert on observable side effects
+/// let msg = receiver.recv().await.unwrap();
+/// ```
+pub struct ReactorHarness<R> {
+    reactor: R,
+}
+
+impl<R: Reactor> ReactorHarness<R> {
+    /// Wrap a reactor for ergonomic testing.
+    pub fn new(reactor: R) -> Self {
+        Self { reactor }
+    }
+
+    /// Send an entity event to the reactor.
+    ///
+    /// For single-entity reactors, the entity type is inferred
+    /// automatically. For multi-entity reactors, specify the
+    /// entity type via turbofish:
+    ///
+    /// ```ignore
+    /// harness.receive::<TokenizedEquityMint>(id, event).await?;
+    /// harness.receive::<EquityRedemption>(id, event).await?;
+    /// ```
+    ///
+    /// Requires [`register_entities!`] to be called for the
+    /// reactor's entity list.
+    pub async fn receive<Entity: EventSourced>(
+        &self,
+        id: Entity::Id,
+        event: Entity::Event,
+    ) -> Result<(), R::Error>
+    where
+        R::Dependencies: HasEntity<Entity>,
+    {
+        let injected = <R::Dependencies as HasEntity<Entity>>::inject(id, event);
+        self.reactor.react(injected).await
+    }
+
+    /// Access the inner reactor for inspecting state.
+    pub fn inner(&self) -> &R {
+        &self.reactor
+    }
+}
+
+/// Single-entity spy reactor that captures all dispatched events.
+///
+/// Provides a generic event-capturing reactor so tests don't need
+/// to define their own ad-hoc reactors with `deps!`, `EntityList`,
+/// `into_inner()`, and `Ok(())` boilerplate.
+///
+/// # Example
+///
+/// ```ignore
+/// let spy = SpyReactor::<UsdcRebalance>::new();
+/// let store = TestStore::with_reactor(spy.clone());
+///
+/// store.send(&id, SomeCommand).await.unwrap();
+///
+/// let events = spy.events().await;
+/// assert_eq!(events.len(), 1);
+/// ```
+type EventLog<Entity> = Arc<
+    Mutex<
+        Vec<(
+            <Entity as EventSourced>::Id,
+            <Entity as EventSourced>::Event,
+        )>,
+    >,
+>;
+
+pub struct SpyReactor<Entity: EventSourced> {
+    events: EventLog<Entity>,
+}
+
+impl<Entity: EventSourced> SpyReactor<Entity> {
+    pub fn new() -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Return a snapshot of all captured `(Id, Event)` pairs.
+    pub async fn events(&self) -> Vec<(Entity::Id, Entity::Event)>
+    where
+        Entity::Id: Clone,
+        Entity::Event: Clone,
+    {
+        self.events.lock().await.clone()
+    }
+}
+
+impl<Entity: EventSourced> Default for SpyReactor<Entity> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Entity: EventSourced> Clone for SpyReactor<Entity> {
+    fn clone(&self) -> Self {
+        Self {
+            events: Arc::clone(&self.events),
+        }
+    }
+}
+
+impl<Entity: EventSourced + 'static> crate::Dependent for SpyReactor<Entity> {
+    type Dependencies = crate::deps![Entity];
+}
+
+#[async_trait]
+impl<Entity: EventSourced + 'static> Reactor for SpyReactor<Entity>
+where
+    Entity::Id: Clone,
+    Entity::Event: Clone,
+{
+    type Error = crate::lifecycle::Never;
+
+    async fn react(
+        &self,
+        event: <Self::Dependencies as crate::EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        let (id, event) = event.into_inner();
+        self.events.lock().await.push((id, event));
+        Ok(())
+    }
 }
 
 /// In-memory event store for unit tests.
@@ -150,25 +303,67 @@ pub struct TestStore<Entity: EventSourced> {
 
 impl<Entity: EventSourced> TestStore<Entity> {
     /// Create an in-memory TestStore for fast, isolated unit tests.
-    ///
-    /// Accepts [`Reactor`] impls which are internally bridged to
-    /// cqrs-es queries.
-    pub fn new(reactors: Vec<Box<dyn Reactor<Entity>>>, services: Entity::Services) -> Self
+    pub fn new(services: Entity::Services) -> Self
     where
         Entity: 'static,
         <Entity::Id as FromStr>::Err: Debug,
     {
-        let queries: Vec<Box<dyn Query<Lifecycle<Entity>>>> = reactors
-            .into_iter()
-            .map(|reactor| Box::new(ReactorBridge(reactor)) as Box<dyn Query<Lifecycle<Entity>>>)
-            .collect();
+        Self::build(vec![], services)
+    }
 
+    /// Create an in-memory TestStore with a reactor that receives
+    /// dispatched events.
+    ///
+    /// When `Entity::Services` is `()`, use the single-argument
+    /// overload instead: `TestStore::with_reactor(spy)`.
+    pub fn with_reactor_and<R>(reactor: Arc<R>, services: Entity::Services) -> Self
+    where
+        Entity: 'static,
+        Entity::Id: Clone,
+        Entity::Event: Clone,
+        <Entity::Id as FromStr>::Err: Debug + Send + Sync,
+        R: Reactor + 'static,
+        R::Dependencies: InjectAtDepth<Zero, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+    {
+        let query: Box<dyn Query<Lifecycle<Entity>>> = Box::new(ReactorBridge {
+            reactor,
+            _depth: PhantomData::<Zero>,
+        });
+        Self::build(vec![query], services)
+    }
+
+    fn build(queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>, services: Entity::Services) -> Self
+    where
+        Entity: 'static,
+        <Entity::Id as FromStr>::Err: Debug,
+    {
         let mem_store = mem_store::MemStore::default();
         #[allow(clippy::disallowed_methods)]
         let cqrs = CqrsFramework::new(mem_store.clone(), queries, services);
         Self { mem_store, cqrs }
     }
+}
 
+impl<Entity: EventSourced> TestStore<Entity>
+where
+    Entity::Services: Default,
+{
+    /// Create an in-memory TestStore with a reactor, using
+    /// `Default` services (typically `()`).
+    pub fn with_reactor<R>(reactor: Arc<R>) -> Self
+    where
+        Entity: 'static,
+        Entity::Id: Clone,
+        Entity::Event: Clone,
+        <Entity::Id as FromStr>::Err: Debug + Send + Sync,
+        R: Reactor + 'static,
+        R::Dependencies: InjectAtDepth<Zero, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+    {
+        Self::with_reactor_and(reactor, Entity::Services::default())
+    }
+}
+
+impl<Entity: EventSourced> TestStore<Entity> {
     /// Send a command to the entity identified by `id`.
     pub async fn send(
         &self,
@@ -209,6 +404,9 @@ mod tests {
 
     use super::*;
     use crate::Table;
+
+    // Required for ReactorHarness::receive to resolve HasEntity<Counter>.
+    crate::register_entities!(Counter);
 
     /// Minimal counter entity for testing replay and harness.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,5 +573,93 @@ mod tests {
             .then_expect_error();
 
         assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_store_send_and_load() {
+        let store = TestStore::<Counter>::new(());
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 5 })
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(entity.value, 5);
+    }
+
+    #[tokio::test]
+    async fn test_store_load_nonexistent_returns_none() {
+        let store = TestStore::<Counter>::new(());
+
+        let result = store.load(&"nonexistent".to_string()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_multiple_commands() {
+        let store = TestStore::<Counter>::new(());
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 0 })
+            .await
+            .unwrap();
+        store.send(&id, CounterCommand::Increment).await.unwrap();
+        store.send(&id, CounterCommand::Increment).await.unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(entity.value, 2);
+    }
+
+    #[tokio::test]
+    async fn spy_reactor_captures_events() {
+        let spy = SpyReactor::<Counter>::new();
+        let store = TestStore::<Counter>::with_reactor(Arc::new(spy.clone()));
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 42 })
+            .await
+            .unwrap();
+
+        let captured = spy.events().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "counter-1");
+        assert_eq!(captured[0].1, CounterEvent::Created { initial: 42 });
+    }
+
+    #[tokio::test]
+    async fn spy_reactor_captures_multiple_events() {
+        let spy = SpyReactor::<Counter>::new();
+        let store = TestStore::<Counter>::with_reactor(Arc::new(spy.clone()));
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 0 })
+            .await
+            .unwrap();
+        store.send(&id, CounterCommand::Increment).await.unwrap();
+
+        let captured = spy.events().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].1, CounterEvent::Incremented);
+    }
+
+    #[tokio::test]
+    async fn reactor_harness_dispatches_to_spy() {
+        let spy = SpyReactor::<Counter>::new();
+        let harness = ReactorHarness::new(spy.clone());
+
+        harness
+            .receive::<Counter>("test-id".to_string(), CounterEvent::Created { initial: 7 })
+            .await
+            .unwrap();
+
+        let captured = spy.events().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "test-id");
+        assert_eq!(captured[0].1, CounterEvent::Created { initial: 7 });
     }
 }

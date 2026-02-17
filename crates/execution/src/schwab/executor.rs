@@ -9,8 +9,7 @@ use crate::schwab::SchwabAuthCtx;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    Direction, ExecutionError, Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState,
-    OrderStatus, OrderUpdate, Positive, Symbol, TryIntoExecutor,
+    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, TryIntoExecutor,
 };
 
 /// Everything the Schwab executor needs to initialize: auth credentials,
@@ -87,48 +86,9 @@ impl Executor for Schwab {
         })
     }
 
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
-        loop {
-            let market_hours = fetch_market_hours(&self.auth, &self.pool, None).await?;
-
-            match market_hours.current_status() {
-                MarketStatus::Open => {
-                    // Market is open, return time until close
-                    if let Some(end_time) = market_hours.end {
-                        let market_close = end_time.with_timezone(&chrono::Utc);
-                        let now = chrono::Utc::now();
-                        if market_close > now {
-                            let duration = (market_close - now)
-                                .to_std()
-                                .unwrap_or(std::time::Duration::from_secs(3600));
-                            return Ok(duration);
-                        }
-                    }
-                    // No end time or already passed, return default timeout
-                    return Ok(std::time::Duration::from_secs(3600));
-                }
-                MarketStatus::Closed => {
-                    // Market is closed, wait until next open
-                    if let Some(start_time) = market_hours.start {
-                        let next_open = start_time.with_timezone(&chrono::Utc);
-                        let now = chrono::Utc::now();
-                        if next_open > now {
-                            let wait_duration = (next_open - now)
-                                .to_std()
-                                .unwrap_or(std::time::Duration::from_secs(3600));
-                            info!(
-                                "Market closed, waiting {} seconds until open",
-                                wait_duration.as_secs()
-                            );
-                            tokio::time::sleep(wait_duration).await;
-                            continue; // Re-check market status
-                        }
-                    }
-                    // No start time or already passed, wait a bit and retry
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                }
-            }
-        }
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        let market_hours = fetch_market_hours(&self.auth, &self.pool, None).await?;
+        Ok(matches!(market_hours.current_status(), MarketStatus::Open))
     }
 
     #[tracing::instrument(skip(self), fields(symbol = %order.symbol, shares = %order.shares, direction = %order.direction), level = tracing::Level::INFO)]
@@ -174,12 +134,13 @@ impl Executor for Schwab {
             crate::schwab::order::Order::get_order_status(order_id, &self.auth, &self.pool).await?;
 
         if order_response.is_filled() {
-            let price_cents = order_response.price_in_cents()?.ok_or_else(|| {
-                ExecutionError::IncompleteOrderResponse {
-                    field: "price".to_string(),
-                    status: OrderStatus::Filled,
-                }
-            })?;
+            let price =
+                order_response
+                    .price()
+                    .ok_or_else(|| ExecutionError::IncompleteOrderResponse {
+                        field: "price".to_string(),
+                        status: OrderStatus::Filled,
+                    })?;
 
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
                 ExecutionError::IncompleteOrderResponse {
@@ -195,7 +156,7 @@ impl Executor for Schwab {
             Ok(OrderState::Filled {
                 executed_at,
                 order_id: order_id.clone(),
-                price_cents,
+                price,
             })
         } else if order_response.is_terminal_failure() {
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
@@ -218,61 +179,6 @@ impl Executor for Schwab {
                 order_id: order_id.clone(),
             })
         }
-    }
-
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
-        info!("Polling pending orders");
-
-        // Query database directly for submitted orders
-        let rows = sqlx::query!(
-            "SELECT * FROM offchain_trades WHERE status = 'SUBMITTED' ORDER BY id ASC"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut updates = Vec::new();
-
-        for row in rows {
-            let Some(order_id_value) = row.order_id else {
-                return Err(ExecutionError::MissingOrderId {
-                    status: OrderStatus::Submitted,
-                });
-            };
-
-            // Get current status from Schwab API
-            match self.get_order_status(&order_id_value).await {
-                Ok(current_state) => {
-                    // Only include orders that have changed status
-                    if !matches!(current_state, OrderState::Submitted { .. }) {
-                        let price_cents = match &current_state {
-                            OrderState::Filled { price_cents, .. } => Some(*price_cents),
-                            _ => None,
-                        };
-
-                        let symbol = Symbol::new(row.symbol)?;
-                        let shares = Positive::new(FractionalShares::from_f64(row.shares)?)?;
-                        let direction: Direction = row.direction.parse()?;
-
-                        updates.push(OrderUpdate {
-                            order_id: order_id_value.clone(),
-                            symbol,
-                            shares,
-                            direction,
-                            status: current_state.status(),
-                            updated_at: chrono::Utc::now(),
-                            price_cents,
-                        });
-                    }
-                }
-                Err(e) => {
-                    // Log error but continue with other orders
-                    info!("Failed to get status for order {}: {}", order_id_value, e);
-                }
-            }
-        }
-
-        info!("Found {} order updates", updates.len());
-        Ok(updates)
     }
 
     fn to_supported_executor(&self) -> crate::SupportedExecutor {
@@ -470,173 +376,6 @@ mod tests {
             Schwab::try_from_ctx(ctx).await.unwrap_err(),
             ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
         ));
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open_with_market_open() {
-        let pool = setup_test_db().await;
-        let server = MockServer::start();
-        let auth = create_test_auth_env_with_server(&server);
-
-        // Store valid tokens
-        let valid_tokens = SchwabTokens {
-            access_token: "valid_access_token".to_string(),
-            access_token_fetched_at: Utc::now() - Duration::minutes(10),
-            refresh_token: "valid_refresh_token".to_string(),
-            refresh_token_fetched_at: Utc::now() - Duration::days(1),
-        };
-        valid_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
-
-        // Get current time in Eastern timezone to ensure date alignment
-        use chrono_tz::America::New_York as Eastern;
-        let now_eastern = Utc::now().with_timezone(&Eastern);
-        let today = now_eastern.format("%Y-%m-%d").to_string();
-
-        // Set market hours to be 2 hours before and 2 hours after current time
-        // This ensures the market appears "open" regardless of when the test runs
-        // Use %:z for RFC3339 compliant timezone (e.g., "-05:00" not "-0500")
-        let start_time = (now_eastern - chrono::Duration::hours(2))
-            .format("%Y-%m-%dT%H:%M:%S%:z")
-            .to_string();
-        let end_time = (now_eastern + chrono::Duration::hours(2))
-            .format("%Y-%m-%dT%H:%M:%S%:z")
-            .to_string();
-
-        let market_hours_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/marketdata/v1/markets/equity")
-                .header("authorization", "Bearer valid_access_token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "equity": {
-                        "EQ": {
-                            "date": today,
-                            "marketType": "EQUITY",
-                            "exchange": "null",
-                            "category": "null",
-                            "product": "EQ",
-                            "productName": "equity",
-                            "isOpen": true,
-                            "sessionHours": {
-                                "regularMarket": [
-                                    {
-                                        "start": start_time,
-                                        "end": end_time
-                                    }
-                                ]
-                            }
-                        }
-                    }
-                }));
-        });
-
-        let broker = Schwab { auth, pool };
-
-        let duration = broker.wait_until_market_open().await.unwrap();
-        // Market is open, returns time until close (should be ~2 hours)
-        assert!(duration.as_secs() > 0);
-        assert!(duration.as_secs() < 7300); // Less than ~2 hours + buffer
-        market_hours_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open_with_market_closed() {
-        let pool = setup_test_db().await;
-        let server = MockServer::start();
-        let auth = create_test_auth_env_with_server(&server);
-
-        // Store valid tokens
-        let valid_tokens = SchwabTokens {
-            access_token: "valid_access_token".to_string(),
-            access_token_fetched_at: Utc::now() - Duration::minutes(10),
-            refresh_token: "valid_refresh_token".to_string(),
-            refresh_token_fetched_at: Utc::now() - Duration::days(1),
-        };
-        valid_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
-
-        // Mock market hours API to return closed market
-        let market_hours_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/marketdata/v1/markets/equity")
-                .header("authorization", "Bearer valid_access_token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "equity": {
-                        "EQ": {
-                            "date": "2025-01-15",
-                            "marketType": "EQUITY",
-                            "exchange": "null",
-                            "category": "null",
-                            "product": "EQ",
-                            "productName": "equity",
-                            "isOpen": false,
-                            "sessionHours": {
-                                "preMarket": [],
-                                "regularMarket": []
-                            }
-                        }
-                    }
-                }));
-        });
-
-        let broker = Schwab { auth, pool };
-        // This test should not complete because the method loops when market is closed
-        // We'll just verify it starts correctly by not panicking immediately
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            broker.wait_until_market_open(),
-        )
-        .await
-        .expect_err("Should timeout since market is closed and method loops");
-
-        market_hours_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open_with_api_error() {
-        let pool = setup_test_db().await;
-        let server = MockServer::start();
-        let auth = create_test_auth_env_with_server(&server);
-
-        // Store valid tokens
-        let valid_tokens = SchwabTokens {
-            access_token: "valid_access_token".to_string(),
-            access_token_fetched_at: Utc::now() - Duration::minutes(10),
-            refresh_token: "valid_refresh_token".to_string(),
-            refresh_token_fetched_at: Utc::now() - Duration::days(1),
-        };
-        valid_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
-
-        // Mock market hours API to return error
-        let market_hours_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/marketdata/v1/markets/equity")
-                .header("authorization", "Bearer valid_access_token");
-            then.status(500)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "error": "Internal Server Error"
-                }));
-        });
-
-        let broker = Schwab { auth, pool };
-
-        assert!(matches!(
-            broker.wait_until_market_open().await.unwrap_err(),
-            ExecutionError::Schwab(_)
-        ));
-        market_hours_mock.assert();
     }
 
     #[tokio::test]

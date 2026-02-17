@@ -35,9 +35,7 @@
 
       deploy = (import ./deploy.nix { inherit deploy-rs self; }).config;
 
-      checks =
-        builtins.mapAttrs (_: deployLib: deployLib.deployChecks self.deploy)
-        deploy-rs.lib;
+      checks.x86_64-linux = deploy-rs.lib.x86_64-linux.deployChecks self.deploy;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -181,10 +179,7 @@
 
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
-          shellHook = ''
-            ${rainix.devShells.${system}.default.shellHook}
-            export TS_RS_EXPORT_DIR="$PWD"
-          '';
+          inherit (rainix.devShells.${system}.default) shellHook;
           DATABASE_URL = "sqlite:liquidity.db";
           buildInputs = with pkgs;
             [

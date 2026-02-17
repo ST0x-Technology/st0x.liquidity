@@ -41,40 +41,10 @@ pub(super) async fn fetch_inventory(
                 );
             })?;
 
-            let market_value_cents = match position.market_value {
-                Some(value) => {
-                    let conversion_error = || {
-                        error!(
-                            symbol = %position.symbol,
-                            market_value = %value,
-                            position = ?position,
-                            "Market value conversion to cents failed"
-                        );
-                        AlpacaBrokerApiError::MarketValueConversion {
-                            symbol: symbol.clone(),
-                            market_value: position.market_value,
-                        }
-                    };
-
-                    let in_cents = value
-                        .checked_mul(Decimal::from(100))
-                        .ok_or_else(conversion_error)?;
-
-                    if !in_cents.fract().is_zero() {
-                        return Err(conversion_error());
-                    }
-
-                    let cents = in_cents.to_i64().ok_or_else(conversion_error)?;
-
-                    Some(cents)
-                }
-                None => None,
-            };
-
             Ok(EquityPosition {
                 symbol,
                 quantity: FractionalShares::new(position.quantity),
-                market_value_cents,
+                market_value: position.market_value,
             })
         })
         .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
@@ -196,7 +166,7 @@ mod tests {
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
         assert_eq!(aapl.quantity, FractionalShares::new(Decimal::new(105, 1)));
-        assert_eq!(aapl.market_value_cents, Some(157_500));
+        assert_eq!(aapl.market_value, Some(Decimal::new(157_500, 2)));
     }
 
     #[tokio::test]
@@ -271,92 +241,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_inventory_returns_error_on_market_value_overflow() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        // i64::MAX is 9_223_372_036_854_775_807, so a value whose cents
-        // representation exceeds that will fail to_i64().
-        // 92233720368547759.00 * 100 = 9223372036854775900 > i64::MAX
-        let positions_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "symbol": "AAPL",
-                        "qty": "10.0",
-                        "market_value": "92233720368547759.00"
-                    }
-                ]));
-        });
-
-        let account_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "cash": "50000.00"
-                }));
-        });
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let error = fetch_inventory(&client).await.unwrap_err();
-
-        positions_mock.assert();
-        account_mock.assert();
-
-        assert!(matches!(
-            error,
-            AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
-        ));
-    }
-
-    #[tokio::test]
-    async fn fetch_inventory_returns_error_on_fractional_cents_in_market_value() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        let positions_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "symbol": "AAPL",
-                        "qty": "10.0",
-                        // 1575.005 * 100 = 157500.5 -> fractional cent
-                        "market_value": "1575.005"
-                    }
-                ]));
-        });
-
-        let account_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "cash": "50000.00"
-                }));
-        });
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let error = fetch_inventory(&client).await.unwrap_err();
-
-        positions_mock.assert();
-        account_mock.assert();
-
-        assert!(matches!(
-            error,
-            AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
-        ));
-    }
-
-    #[tokio::test]
     async fn fetch_inventory_returns_error_on_fractional_cents_in_cash() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
@@ -387,5 +271,48 @@ mod tests {
         account_mock.assert();
 
         assert!(matches!(error, AlpacaBrokerApiError::FractionalCents(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_preserves_sub_cent_market_value_precision() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "RKLB",
+                        "qty": "6.803019322",
+                        "market_value": "511.6476"
+                    }
+                ]));
+        });
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        positions_mock.assert();
+        account_mock.assert();
+
+        let rklb = inventory
+            .positions
+            .iter()
+            .find(|position| position.symbol.to_string() == "RKLB")
+            .unwrap();
+        assert_eq!(rklb.market_value, Some(Decimal::new(5_116_476, 4)),);
     }
 }

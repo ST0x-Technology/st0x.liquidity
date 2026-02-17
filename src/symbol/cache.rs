@@ -94,7 +94,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         assert!(matches!(
             cache.get_io_symbol(provider, &io).await.unwrap_err(),
-            OnChainError::Alloy(crate::onchain::AlloyError::GetSymbol(_))
+            OnChainError::ContractCall(_)
         ));
     }
 }

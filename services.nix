@@ -1,4 +1,3 @@
-# Single source of truth for all st0x services
 {
   server.enabled = true;
   server.bin = "server";

@@ -16,14 +16,15 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
 
-use super::usdc::UsdcRebalanceManager;
-use super::{MintManager, Rebalancer, RebalancingCtx, RedemptionManager, TriggeredOperation};
-use crate::alpaca_tokenization::AlpacaTokenizationService;
+use super::equity::CrossVenueEquityTransfer;
+use super::usdc::CrossVenueCashTransfer;
+use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::equity_redemption::EquityRedemption;
 use crate::onchain::http_client_with_retry;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
+use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -53,24 +54,29 @@ type HttpProvider = FillProvider<
     Ethereum,
 >;
 
-/// Type alias for a configured rebalancer with SQLite persistence.
-type ConfiguredRebalancer<BP> =
-    Rebalancer<MintManager<BP>, RedemptionManager<BP>, UsdcRebalanceManager<BP>>;
-
 pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) mint: Arc<Store<TokenizedEquityMint>>,
     pub(crate) redemption: Arc<Store<EquityRedemption>>,
     pub(crate) usdc: Arc<Store<UsdcRebalance>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RebalancerAddresses {
+    pub(crate) market_maker_wallet: Address,
+}
+
 /// Spawns the rebalancing infrastructure.
+///
+/// All CQRS frameworks are created in the conductor and passed here to ensure
+/// single-instance initialization with all required query processors.
 pub(crate) async fn spawn_rebalancer<BP>(
     ctx: &RebalancingCtx,
     base_provider: BP,
-    orderbook: Address,
-    market_maker_wallet: Address,
+    addresses: RebalancerAddresses,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
+    raindex_service: Arc<RaindexService<BP>>,
+    tokenizer: Arc<dyn Tokenizer>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -83,18 +89,12 @@ where
         &ethereum_wallet,
         signer.address(),
         base_provider,
-        orderbook,
+        raindex_service,
+        tokenizer,
     )
     .await?;
 
-    let rebalancer = services.into_rebalancer(
-        ctx,
-        market_maker_wallet,
-        operation_receiver,
-        frameworks.mint,
-        frameworks.redemption,
-        frameworks.usdc,
-    );
+    let rebalancer = services.into_rebalancer(ctx, addresses, operation_receiver, frameworks);
 
     let handle = tokio::spawn(async move {
         rebalancer.run().await;
@@ -106,7 +106,7 @@ where
 
 /// External service clients for rebalancing operations.
 ///
-/// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
+/// Holds connections to Alpaca APIs, CCTP bridge, and Raindex services.
 ///
 /// Generic over `BP` (Base Provider) to allow reusing the existing WebSocket
 /// connection from the main bot. The Ethereum provider uses a fixed HTTP type
@@ -115,38 +115,35 @@ struct Services<BP>
 where
     BP: Provider + Clone,
 {
-    tokenization: Arc<AlpacaTokenizationService<BP>>,
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
-    vault: Arc<VaultService<BP>>,
+    raindex: Arc<RaindexService<BP>>,
+    tokenizer: Arc<dyn Tokenizer>,
 }
 
 impl<BP> Services<BP>
 where
     BP: Provider + Clone + 'static,
 {
+    /// Creates the services needed for rebalancing.
+    ///
+    /// RaindexService is passed in rather than created here because it's needed
+    /// for CQRS framework initialization in the conductor, which must happen
+    /// before spawn_rebalancer is called.
     async fn new(
         ctx: &RebalancingCtx,
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
-        orderbook: Address,
+        raindex: Arc<RaindexService<BP>>,
+        tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
             .connect_client(http_client_with_retry(ctx.ethereum_rpc_url.clone()));
 
         let broker_auth = &ctx.alpaca_broker_auth;
-
-        let tokenization = Arc::new(AlpacaTokenizationService::new(
-            broker_auth.base_url().to_string(),
-            ctx.alpaca_account_id,
-            broker_auth.api_key.clone(),
-            broker_auth.api_secret.clone(),
-            base_provider.clone(),
-            ctx.redemption_wallet,
-        ));
 
         let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
 
@@ -164,47 +161,51 @@ where
             usdc_ethereum: USDC_ETHEREUM,
             usdc_base: USDC_BASE,
         })?);
-        let vault = Arc::new(VaultService::new(base_provider, orderbook));
 
         Ok(Self {
-            tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            raindex,
+            tokenizer,
         })
     }
 
+    /// Converts Services into a configured Rebalancer.
     fn into_rebalancer(
         self,
         ctx: &RebalancingCtx,
-        market_maker_wallet: Address,
+        addresses: RebalancerAddresses,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        mint_store: Arc<Store<TokenizedEquityMint>>,
-        redemption_store: Arc<Store<EquityRedemption>>,
-        usdc_store: Arc<Store<UsdcRebalance>>,
-    ) -> ConfiguredRebalancer<BP> {
-        let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_store));
+        frameworks: RebalancingCqrsFrameworks,
+    ) -> Rebalancer
+    where
+        BP: Send + Sync + 'static,
+    {
+        let equity = Arc::new(CrossVenueEquityTransfer::new(
+            self.raindex.clone(),
+            self.tokenizer,
+            addresses.market_maker_wallet,
+            frameworks.mint,
+            frameworks.redemption,
+        ));
 
-        let redemption_manager =
-            Arc::new(RedemptionManager::new(self.tokenization, redemption_store));
-
-        let usdc_manager = Arc::new(UsdcRebalanceManager::new(
+        let usdc = Arc::new(CrossVenueCashTransfer::new(
             self.broker,
             self.wallet,
             self.cctp,
-            self.vault,
-            usdc_store,
-            market_maker_wallet,
-            VaultId(ctx.usdc_vault_id),
+            self.raindex,
+            frameworks.usdc,
+            addresses.market_maker_wallet,
+            RaindexVaultId(ctx.usdc_vault_id),
         ));
 
         Rebalancer::new(
-            mint_manager,
-            redemption_manager,
-            usdc_manager,
+            Arc::clone(&equity) as _,
+            equity as _,
+            Arc::clone(&usdc) as _,
+            usdc as _,
             operation_receiver,
-            ctx.redemption_wallet,
         )
     }
 }
@@ -218,33 +219,56 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlx::SqlitePool;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use st0x_execution::{
+        AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
+    };
     use uuid::Uuid;
 
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{Projection, test_store};
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
+    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
+    use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::RebalancingTriggerConfig;
+    use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::trigger::UsdcRebalancing;
+    use crate::tokenization::alpaca::AlpacaTokenizationService;
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_registry::VaultRegistry;
+
+    /// Provider type returned by `ProviderBuilder::new().connect_http()` without wallet.
+    type BaseTestProvider = FillProvider<
+        JoinFill<
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+        >,
+        RootProvider<Ethereum>,
+        Ethereum,
+    >;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_ctx() -> RebalancingCtx {
+        let evm_private_key =
+            b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let market_maker_wallet = PrivateKeySigner::from_bytes(&evm_private_key)
+            .unwrap()
+            .address();
+
         RebalancingCtx {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancing::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
             redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
+            market_maker_wallet,
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
-            evm_private_key: b256!(
-                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-            ),
+            evm_private_key,
             usdc_vault_id: b256!(
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
@@ -275,8 +299,8 @@ mod tests {
 
     #[test]
     fn spawn_rebalancer_error_display_alpaca_wallet() {
-        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::InvalidAmount {
-            amount: dec!(0),
+        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::TransferNotFound {
+            transfer_id: AlpacaTransferId::from(Uuid::nil()),
         });
 
         let display = format!("{err}");
@@ -285,6 +309,35 @@ mod tests {
             display.contains("failed to create Alpaca wallet service"),
             "Expected error message to contain 'failed to create Alpaca wallet service', got: {display}"
         );
+    }
+
+    #[test]
+    fn trigger_config_uses_equity_from_ctx() {
+        let ctx = make_ctx();
+
+        let trigger_config = RebalancingTriggerConfig {
+            equity: ctx.equity,
+            usdc: ctx.usdc,
+        };
+
+        assert_eq!(trigger_config.equity.target, dec!(0.5));
+        assert_eq!(trigger_config.equity.deviation, dec!(0.2));
+    }
+
+    #[test]
+    fn trigger_config_uses_usdc_from_ctx() {
+        let ctx = make_ctx();
+
+        let trigger_config = RebalancingTriggerConfig {
+            equity: ctx.equity,
+            usdc: ctx.usdc,
+        };
+
+        let UsdcRebalancing::Enabled { target, deviation } = trigger_config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.6));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
@@ -303,7 +356,7 @@ mod tests {
 
     async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
-    ) -> (Services<impl Provider + Clone + 'static>, RebalancingCtx) {
+    ) -> (Services<BaseTestProvider>, RebalancingCtx) {
         let anvil = Anvil::new().spawn();
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
@@ -371,44 +424,29 @@ mod tests {
             })
             .unwrap(),
         );
+
+        let vault_registry_projection = Arc::new(
+            Projection::<VaultRegistry>::sqlite(crate::test_utils::setup_test_db().await).unwrap(),
+        );
         let vault = Arc::new(
-            VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
+            RaindexService::new(
+                base_provider,
+                TEST_ORDERBOOK,
+                vault_registry_projection,
+                owner,
+            )
+            .with_required_confirmations(1),
         );
 
         let services = Services {
-            tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            raindex: vault,
+            tokenizer: tokenization,
         };
 
         (services, rebalancing_ctx)
-    }
-
-    #[tokio::test]
-    async fn into_rebalancer_constructs_without_panic() {
-        let server = MockServer::start();
-        let (services, rebalancing_ctx) = make_services_with_mock_wallet(&server).await;
-
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-
-        let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
-
-        let (_tx, rx) = mpsc::channel(100);
-        let mint_store = Arc::new(test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), ()));
-        let usdc_store = Arc::new(test_store(pool, ()));
-
-        let _rebalancer = services.into_rebalancer(
-            &rebalancing_ctx,
-            market_maker_wallet,
-            rx,
-            mint_store,
-            redemption_store,
-            usdc_store,
-        );
     }
 
     #[tokio::test]
@@ -442,5 +480,48 @@ mod tests {
             matches!(spawn_error, SpawnRebalancerError::AlpacaBrokerApi(_)),
             "Expected AlpacaBrokerApi error variant, got: {spawn_error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn into_rebalancer_dispatches_mint_to_tokenization_service() {
+        let server = MockServer::start();
+        let (services, config) = make_services_with_mock_wallet(&server).await;
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let mock_services = EquityTransferServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            raindex: Arc::new(MockRaindex::new()),
+        };
+        let mint_cqrs = Arc::new(test_store(pool.clone(), mock_services.clone()));
+        let usdc_cqrs = Arc::new(test_store(pool.clone(), ()));
+
+        let redemption_cqrs = Arc::new(test_store(pool.clone(), mock_services));
+
+        let frameworks = RebalancingCqrsFrameworks {
+            mint: mint_cqrs,
+            redemption: redemption_cqrs,
+            usdc: usdc_cqrs,
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        let rebalancer = services.into_rebalancer(
+            &config,
+            RebalancerAddresses {
+                market_maker_wallet: Address::random(),
+            },
+            rx,
+            frameworks,
+        );
+
+        tx.send(TriggeredOperation::Mint {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(dec!(10)),
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        rebalancer.run().await;
     }
 }

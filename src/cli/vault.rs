@@ -5,14 +5,26 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
+use sqlx::SqlitePool;
 use std::io::Write;
+use std::sync::Arc;
 use thiserror::Error;
+
+use st0x_event_sorcery::Projection;
 
 use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::threshold::Usdc;
+use crate::vault_registry::VaultRegistry;
+
+pub(super) struct Deposit {
+    pub(super) amount: Decimal,
+    pub(super) token: Address,
+    pub(super) vault_id: B256,
+    pub(super) decimals: u8,
+}
 
 #[derive(Debug, Error)]
 pub enum VaultCliError {
@@ -44,13 +56,17 @@ pub(super) async fn vault_deposit_command<
     BP: Provider + Clone + Send + Sync + 'static,
 >(
     stdout: &mut W,
-    amount: Decimal,
-    token: Address,
-    vault_id: B256,
-    decimals: u8,
+    deposit: Deposit,
     ctx: &Ctx,
+    pool: &SqlitePool,
     base_provider: BP,
 ) -> anyhow::Result<()> {
+    let Deposit {
+        amount,
+        token,
+        vault_id,
+        decimals,
+    } = deposit;
     writeln!(stdout, "Depositing tokens to Raindex vault")?;
     writeln!(stdout, "   Amount: {amount}")?;
     writeln!(stdout, "   Token: {token}")?;
@@ -99,11 +115,18 @@ pub(super) async fn vault_deposit_command<
         approve_receipt.transaction_hash
     )?;
 
-    let vault_service = VaultService::new(base_provider_with_wallet, ctx.evm.orderbook);
+    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+
+    let raindex_service = RaindexService::new(
+        base_provider_with_wallet,
+        ctx.evm.orderbook,
+        vault_registry_projection,
+        sender_address,
+    );
 
     writeln!(stdout, "   Depositing to vault...")?;
-    let deposit_tx = vault_service
-        .deposit(token, VaultId(vault_id), amount_u256, decimals)
+    let deposit_tx = raindex_service
+        .deposit(token, RaindexVaultId(vault_id), amount_u256, decimals)
         .await?;
     writeln!(stdout, "   Deposit tx: {deposit_tx}")?;
 
@@ -119,6 +142,7 @@ pub(super) async fn vault_withdraw_command<
     stdout: &mut W,
     amount: Usdc,
     ctx: &Ctx,
+    pool: &SqlitePool,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
@@ -141,14 +165,21 @@ pub(super) async fn vault_withdraw_command<
         .wallet(base_wallet)
         .connect_provider(base_provider);
 
-    let vault_service = VaultService::new(base_provider_with_wallet, ctx.evm.orderbook);
-    let vault_id = VaultId(rebalancing_config.usdc_vault_id);
+    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+
+    let raindex_service = RaindexService::new(
+        base_provider_with_wallet,
+        ctx.evm.orderbook,
+        vault_registry_projection,
+        sender_address,
+    );
+    let vault_id = RaindexVaultId(rebalancing_config.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
     writeln!(stdout, "   Withdrawing from vault...")?;
-    let withdraw_tx = vault_service.withdraw_usdc(vault_id, amount_u256).await?;
+    let withdraw_tx = raindex_service.withdraw_usdc(vault_id, amount_u256).await?;
     writeln!(stdout, "   Withdraw tx: {withdraw_tx}")?;
 
     writeln!(stdout, "Vault withdrawal completed successfully!")?;
@@ -160,6 +191,7 @@ pub(super) async fn vault_withdraw_command<
 mod tests {
     use alloy::primitives::{address, b256};
     use alloy::providers::mock::Asserter;
+    use rust_decimal_macros::dec;
     use std::str::FromStr;
     use url::Url;
 
@@ -204,13 +236,17 @@ mod tests {
         let amount = Decimal::from_str("100").unwrap();
 
         let mut stdout = Vec::new();
+        let deposit = Deposit {
+            amount,
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            decimals: 6,
+        };
         let result = vault_deposit_command(
             &mut stdout,
-            amount,
-            TEST_TOKEN,
-            TEST_VAULT_ID,
-            6,
+            deposit,
             &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
             provider,
         )
         .await;
@@ -229,10 +265,16 @@ mod tests {
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_command(&mut stdout, amount, &ctx, provider)
-            .await
-            .unwrap_err()
-            .to_string();
+        let result = vault_withdraw_command(
+            &mut stdout,
+            amount,
+            &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
+            provider,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
@@ -243,16 +285,19 @@ mod tests {
     async fn test_vault_deposit_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
-        let amount = Decimal::from_str("500.50").unwrap();
 
         let mut stdout = Vec::new();
+        let deposit = Deposit {
+            amount: dec!(500.50),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            decimals: 6,
+        };
         vault_deposit_command(
             &mut stdout,
-            amount,
-            TEST_TOKEN,
-            TEST_VAULT_ID,
-            6,
+            deposit,
             &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
             provider,
         )
         .await
@@ -272,9 +317,15 @@ mod tests {
         let amount = Usdc(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
-        vault_withdraw_command(&mut stdout, amount, &ctx, provider)
-            .await
-            .unwrap_err();
+        vault_withdraw_command(
+            &mut stdout,
+            amount,
+            &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
+            provider,
+        )
+        .await
+        .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

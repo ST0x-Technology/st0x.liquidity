@@ -34,22 +34,15 @@ the limit:
 
 - **README.md** — if project structure, features, commands, or architecture
   changed
-- **ROADMAP.md** — mark completed issues, link PRs
+- **ROADMAP.md** — mark completed issues, link PRs. When a PR is chained
+  (depends on a parent PR), mark both as done in the roadmap so it's up to date
+  by the time they merge.
 
 ## Ownership Principles
 
-**CRITICAL: Take full ownership. Never deflect responsibility.**
-
-- **Fix all problems immediately** - regardless of who introduced them. Never
-  say "this is a pre-existing issue" as justification for not fixing it.
-- **Meet ALL constraints** - when editing a file with size limits, ensure the
-  ENTIRE file meets the limit, not just your additions.
-- **No warnings or errors pass through** - CI and review catch everything. If
-  you see a warning/error, it's your responsibility to fix it now.
-- **Work until all tasks are complete** - do not stop until every assigned task
-  is done, unless you need input from the user to proceed. If blocked on one
-  task, move to the next. Only stop working when the task list is clear or you
-  genuinely cannot proceed without user input.
+**CRITICAL**: Fix all problems immediately regardless of origin. Meet ALL
+constraints (file size limits apply to entire file). No warnings/errors pass
+through. Work until all tasks complete unless blocked needing user input.
 
 ## Communication
 
@@ -82,22 +75,9 @@ plan the implementation.
 
 ### Handling questions and approach changes
 
-When the user asks a question or challenges your approach:
-
-1. **Answer the question first.** Do not immediately assume the question implies
-   you should change your approach. Provide a clear, direct answer.
-
-2. **If you realize your approach was wrong**, do not silently change it. Ask
-   for confirmation: "I see the issue - [explain]. Should I switch to [new
-   approach] instead?"
-
-3. **If you encounter errors while trying a different approach**, do not
-   silently revert to the previous approach. State what went wrong and ask: "The
-   new approach ran into [problem]. Do you want me to continue debugging it or
-   go back to the original approach?"
-
-4. **Never assume silence or a question means approval to change direction.**
-   Explicit confirmation is required before abandoning one approach for another.
+Answer the question first. Don't silently change approach - ask confirmation. If
+new approach fails, state what went wrong and ask before reverting. Explicit
+confirmation required before changing direction.
 
 ### When issues are pointed out
 
@@ -319,68 +299,16 @@ abstractions.
 For detailed implementation requirements and module organization, see
 @crates/execution/AGENTS.md
 
-### Core Event Processing Flow
+### Core Flow
 
-**Main Event Loop ([`launch` function in `src/lib.rs`])**
-
-- Monitors two concurrent WebSocket event streams: `ClearV2` and `TakeOrderV2`
-  from the Raindex orderbook
-- Uses `tokio::select!` to handle events from either stream without blocking
-- Converts blockchain events to structured `Trade` objects for processing
-
-**Trade Conversion Logic ([`Trade` struct and methods in `src/trade/mod.rs`])**
-
-- Parses onchain events into actionable trade data with strict validation
-- Expects symbol pairs of USDC + tokenized equity with "t" prefix (e.g.,
-  "tAAPL")
-- Determines Schwab trade direction: buying tokenized equity onchain -> selling
-  on Schwab
-- Calculates prices in cents and maintains onchain/offchain trade ratios
-
-**Async Event Processing Architecture**
-
-- Each blockchain event spawns independent async execution flow
-- Handles throughput mismatch: fast onchain events vs slower Schwab API calls
-- No artificial concurrency limits - processes events as they arrive
-- Flow: Parse Event -> SQLite Deduplication Check -> Schwab API Call -> Record
-  Result
-
-### Authentication & API Integration
-
-**Charles Schwab OAuth (`src/schwab.rs`)**
-
-- OAuth 2.0 flow with 30-minute access tokens and 7-day refresh tokens
-- Token storage and retrieval from SQLite database
-- Comprehensive error handling for authentication failures
-
-**Symbol Caching (`crate::symbol::cache::SymbolCache`)**
-
-- Thread-safe caching of ERC20 token symbols using `tokio::sync::RwLock`
-- Prevents repeated RPC calls for the same token addresses
-
-### Database Schema & Idempotency
-
-**Key tables** (see migrations for full schema):
-
-- `onchain_trades`: Immutable blockchain trade records, keyed by
-  `(tx_hash, log_index)`
-- `schwab_executions`: Order execution tracking with status transitions
-- `trade_accumulators`: Unified position tracking per symbol
-- `trade_execution_links`: Many-to-many audit trail between trades and
-  executions
-- `schwab_auth`: OAuth token storage (singleton)
-- `event_queue`: Idempotent event processing queue, keyed by
-  `(tx_hash, log_index)`
-- `symbol_locks`: Per-symbol execution concurrency control
-
-**Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
-tracking (pending -> completed/failed), retry logic with exponential backoff
+The main event loop (`src/lib.rs`) monitors WebSocket streams (`ClearV2`,
+`TakeOrderV2`) from Raindex, converts events to `Trade` objects, and spawns
+async execution flows per event. Idempotency via `(tx_hash, log_index)` keys.
 
 ### Configuration
 
-Configuration is split into plaintext config (`--config`, see
-`example.config.toml`) and encrypted secrets (`--secrets`, see
-`example.secrets.toml`). The reporter binary only takes `--config` (no secrets).
+Plaintext config (`--config`, see `example.config.toml`) and encrypted secrets
+(`--secrets`, see `example.secrets.toml`).
 
 ### Naming Conventions
 
@@ -418,6 +346,14 @@ is the source of truth for terminology and naming conventions.
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `SchwabError`) with proper propagation
+- **CRITICAL: Onchain Transaction Confirmations**: All onchain operations must
+  explicitly wait for the configured number of confirmations before proceeding.
+  Load-balanced RPC providers (like dRPC) may route subsequent requests to
+  different nodes that haven't seen recent transactions yet. Use
+  `REQUIRED_CONFIRMATIONS` from `crate::onchain` and call
+  `.with_required_confirmations(self.required_confirmations).get_receipt()` on
+  all pending transactions. Never use bare `.get_receipt().await` in production
+  code paths.
 - **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
   cqrs-es framework for event sourcing. **NEVER write directly to the `events`
   table**. This is strictly forbidden and violates the CQRS architecture:
@@ -448,6 +384,10 @@ is the source of truth for terminology and naming conventions.
   - **ALLOWED**: Direct construction in test code, CLI code, and migration code
     (different execution contexts with intentionally different query processor
     needs)
+- **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
+  `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
+  `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
+  `OffchainOrder`/`OrderPlacer`
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
@@ -507,8 +447,11 @@ is the source of truth for terminology and naming conventions.
   top-of-module imports. Note that I said top-of-module and not top-of-file,
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
-- **Error Handling**: Avoid `unwrap()` even post-validation since validation
-  logic changes might leave panics in the codebase
+- **Error Handling**: Avoid `unwrap()` and `.expect()` in production code, even
+  post-validation, since validation logic changes might leave panics in the
+  codebase. **Exception**: `.unwrap()` and `.expect()` are fine in test code
+  (`#[cfg(test)]` modules) where panicking on unexpected state is the desired
+  behavior
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
   String values that throw away type information**. This is strictly forbidden
   and violates our error handling principles:
@@ -538,6 +481,10 @@ is the source of truth for terminology and naming conventions.
     4. Never use `.to_string()`, `.map_err(|e| Foo(e.to_string()))`, or similar
        patterns
     5. If an error needs context, use a struct variant with fields + `#[source]`
+  - **FORBIDDEN: `.map_err` for error conversion**: Always use `#[from]` on
+    error variants and `?` for conversion. `.map_err` is verbose boilerplate
+    that `#[from]` eliminates. If you need to log the error before converting,
+    use `.inspect_err(|error| error!(?error, "context"))` chained before `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
@@ -552,6 +499,12 @@ is the source of truth for terminology and naming conventions.
   better dead code detection by the compiler and tooling. This makes the
   codebase easier to navigate and understand by making the relevance scope
   explicit
+- **Type Aliases**: Only add type aliases when clippy complains about type
+  complexity. Proactive type aliases obscure the actual types, making code
+  harder to understand without providing any additional type safety. If clippy
+  doesn't flag the type as too complex, the full type is clearer than an alias.
+  If you need to actually distinguish between different with the same internal
+  representation, add proper newtypes instead.
 
 ### CRITICAL: Financial Data Integrity
 
@@ -816,28 +769,11 @@ multiple outcomes unless genuinely equivalent. Use `assert_eq!` with specific
 values, not `assert!(result.is_some())`. If writing `||` in an assertion, you
 likely don't understand the expected behavior - investigate first.
 
-#### Type modeling examples
+#### Type modeling
 
-**Principle**: Choose the type representation that most accurately models the
-domain. Don't blindly apply patterns - think carefully about whether structs,
-enums, newtypes, or other constructs best represent the concept at hand.
-
-##### Make invalid states unrepresentable:
-
-Instead of multiple optional fields that can contradict each other (e.g.,
-`status: String` + `order_id: Option<String>` + `error_reason: Option<String>`),
-use enum variants where each state carries exactly the data it needs.
-
-##### Use newtypes for domain concepts:
-
-Wrap primitives in newtypes to prevent mixing incompatible values at call sites
-(e.g., `Symbol(String)`, `AccountId(String)`, `Shares(i64)`, `PriceCents(i64)`).
-
-##### The Typestate Pattern:
-
-Encode runtime state in compile-time types to eliminate runtime checks. Use for
-protocol enforcement and builder patterns (e.g., `Connection<Unauthenticated>`
--> `Connection<Authenticated>`).
+Use enums (not optional fields) for mutually exclusive states, newtypes for
+domain concepts (`Symbol`, `Shares`), and typestate for protocol enforcement.
+Make invalid states unrepresentable.
 
 #### Avoid deep nesting
 
@@ -854,13 +790,8 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 #### Struct field access
 
-Avoid creating unnecessary constructors or getters when they don't add logic
-beyond setting/getting field values. Use public fields directly instead.
-
-Use struct literal syntax directly (`SchwabTokens { access_token: "...", ... }`)
-and access fields directly (`tokens.access_token`). Don't create `fn new()`
-constructors or `fn field(&self)` getters unless they add meaningful logic
-beyond setting/getting field values.
+Use struct literal syntax and direct field access. Don't create `fn new()`
+constructors or getters unless they add logic beyond setting/getting values.
 
 #### Prefer destructuring over `.0` access
 

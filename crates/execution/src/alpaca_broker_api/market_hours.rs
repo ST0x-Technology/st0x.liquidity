@@ -1,7 +1,7 @@
-use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
@@ -10,21 +10,11 @@ use super::client::AlpacaBrokerApiClient;
 /// We use regular hours (open/close) because Alpaca only allows extended_hours
 /// with limit orders, not market orders.
 #[derive(Debug, Clone, Deserialize)]
-pub(super) struct CalendarDay {
-    #[serde(deserialize_with = "deserialize_date")]
-    pub date: NaiveDate,
+struct CalendarDay {
     #[serde(deserialize_with = "deserialize_time")]
-    pub open: NaiveTime,
+    open: NaiveTime,
     #[serde(deserialize_with = "deserialize_time")]
-    pub close: NaiveTime,
-}
-
-fn deserialize_date<'de, D>(deserializer: D) -> Result<NaiveDate, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(serde::de::Error::custom)
+    close: NaiveTime,
 }
 
 fn deserialize_time<'de, D>(deserializer: D) -> Result<NaiveTime, D::Error>
@@ -35,120 +25,40 @@ where
     NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom)
 }
 
-enum MarketStatus {
-    NotTradingDay { next_day: CalendarDay },
-    BeforeOpen { today: CalendarDay },
-    AfterClose { next_day: CalendarDay },
-    Open { today: CalendarDay },
+/// Returns true if the market is currently open for trading.
+pub(super) async fn is_market_open(
+    client: &AlpacaBrokerApiClient,
+) -> Result<bool, AlpacaBrokerApiError> {
+    is_market_open_at(client, Utc::now()).await
 }
 
-async fn check_market_status(
+/// Returns true if the market is open at the given time.
+async fn is_market_open_at(
     client: &AlpacaBrokerApiClient,
-    now_et: chrono::DateTime<chrono_tz::Tz>,
-) -> Result<MarketStatus, AlpacaBrokerApiError> {
+    now: DateTime<Utc>,
+) -> Result<bool, AlpacaBrokerApiError> {
+    let now_et = now.with_timezone(&New_York);
     let today = now_et.date_naive();
+
     let calendar = get_calendar(client, today, today).await?;
 
-    if calendar.is_empty() {
-        let next_day = find_next_trading_day(client, today).await?;
-        return Ok(MarketStatus::NotTradingDay { next_day });
-    }
+    let Some(today_calendar) = calendar.into_iter().next() else {
+        debug!("Today is not a trading day");
+        return Ok(false);
+    };
 
-    let today_calendar = calendar
-        .into_iter()
-        .next()
-        .ok_or(AlpacaBrokerApiError::CalendarIterationInvariantViolation)?;
-    let now_et_time = now_et.time();
+    let now_time = now_et.time();
+    let is_open = now_time >= today_calendar.open && now_time < today_calendar.close;
 
-    if now_et_time < today_calendar.open {
-        return Ok(MarketStatus::BeforeOpen {
-            today: today_calendar,
-        });
-    }
-
-    if now_et_time >= today_calendar.close {
-        let tomorrow = today + chrono::Duration::days(1);
-        let next_day = find_next_trading_day(client, tomorrow).await?;
-        return Ok(MarketStatus::AfterClose { next_day });
-    }
-
-    Ok(MarketStatus::Open {
-        today: today_calendar,
-    })
-}
-
-async fn wait_for_next_session(
-    day: &CalendarDay,
-    now: chrono::DateTime<Utc>,
-    reason: &str,
-) -> Result<(), AlpacaBrokerApiError> {
-    let wait_duration = duration_until_session_start(day, now)?;
-    info!(
-        next_trading_day = %day.date,
-        open = %day.open,
-        wait_secs = wait_duration.as_secs(),
-        "{reason}"
+    debug!(
+        open = %today_calendar.open,
+        close = %today_calendar.close,
+        now = %now_time,
+        is_open,
+        "Checked market hours"
     );
-    tokio::time::sleep(wait_duration).await;
-    Ok(())
-}
 
-/// Waits until regular market hours are open and returns the duration until
-/// the market closes.
-///
-/// Regular market hours are 9:30am-4pm ET on trading days. This respects
-/// market holidays and early closures.
-pub(super) async fn wait_until_market_open(
-    client: &AlpacaBrokerApiClient,
-) -> Result<std::time::Duration, AlpacaBrokerApiError> {
-    loop {
-        let now = Utc::now();
-        let now_et = now.with_timezone(&New_York);
-
-        match check_market_status(client, now_et).await? {
-            MarketStatus::NotTradingDay { next_day } => {
-                wait_for_next_session(
-                    &next_day,
-                    now,
-                    "Today is not a trading day, waiting for next session",
-                )
-                .await?;
-            }
-            MarketStatus::BeforeOpen { today } => {
-                wait_for_next_session(&today, now, "Before market open, waiting").await?;
-            }
-            MarketStatus::AfterClose { next_day } => {
-                wait_for_next_session(&next_day, now, "After market close, waiting for next day")
-                    .await?;
-            }
-            MarketStatus::Open { today } => {
-                let duration = duration_until_session_end(&today, now)?;
-                debug!(
-                    close = %today.close,
-                    duration_secs = duration.as_secs(),
-                    "Market is open"
-                );
-                return Ok(duration);
-            }
-        }
-    }
-}
-
-async fn find_next_trading_day(
-    client: &AlpacaBrokerApiClient,
-    from_date: NaiveDate,
-) -> Result<CalendarDay, AlpacaBrokerApiError> {
-    let to_date = from_date + chrono::Duration::days(10);
-
-    let calendar = get_calendar(client, from_date, to_date).await?;
-
-    calendar
-        .into_iter()
-        .next()
-        .ok_or(AlpacaBrokerApiError::NoTradingDaysFound {
-            from: from_date,
-            to: to_date,
-        })
+    Ok(is_open)
 }
 
 async fn get_calendar(
@@ -166,44 +76,6 @@ async fn get_calendar(
     debug!("Fetching market calendar from {}", url);
 
     client.get(&url).await
-}
-
-fn duration_until_session_start(
-    day: &CalendarDay,
-    now: chrono::DateTime<Utc>,
-) -> Result<std::time::Duration, AlpacaBrokerApiError> {
-    let session_start_naive = day.date.and_time(day.open);
-    let session_start_et = New_York
-        .from_local_datetime(&session_start_naive)
-        .single()
-        .ok_or(AlpacaBrokerApiError::AmbiguousDateTime {
-            date: day.date,
-            time: day.open,
-        })?;
-    let session_start_utc = session_start_et.with_timezone(&Utc);
-
-    (session_start_utc - now)
-        .to_std()
-        .map_err(|_| AlpacaBrokerApiError::DurationConversion)
-}
-
-fn duration_until_session_end(
-    day: &CalendarDay,
-    now: chrono::DateTime<Utc>,
-) -> Result<std::time::Duration, AlpacaBrokerApiError> {
-    let session_end_naive = day.date.and_time(day.close);
-    let session_end_et = New_York
-        .from_local_datetime(&session_end_naive)
-        .single()
-        .ok_or(AlpacaBrokerApiError::AmbiguousDateTime {
-            date: day.date,
-            time: day.close,
-        })?;
-    let session_end_utc = session_end_et.with_timezone(&Utc);
-
-    (session_end_utc - now)
-        .to_std()
-        .map_err(|_| AlpacaBrokerApiError::DurationConversion)
 }
 
 #[cfg(test)]
@@ -226,92 +98,8 @@ mod tests {
         }
     }
 
-    fn calendar_day(date: &str, open: (u32, u32), close: (u32, u32)) -> CalendarDay {
-        CalendarDay {
-            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
-            open: NaiveTime::from_hms_opt(open.0, open.1, 0).unwrap(),
-            close: NaiveTime::from_hms_opt(close.0, close.1, 0).unwrap(),
-        }
-    }
-
     #[tokio::test]
-    async fn test_find_next_trading_day() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/calendar")
-                .query_param("start", "2025-01-04")
-                .query_param("end", "2025-01-14");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "date": "2025-01-06",
-                        "open": "09:30",
-                        "close": "16:00"
-                    }
-                ]));
-        });
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let from_date = NaiveDate::from_ymd_opt(2025, 1, 4).unwrap();
-        let next_day = find_next_trading_day(&client, from_date).await.unwrap();
-
-        mock.assert();
-        assert_eq!(next_day.date, NaiveDate::from_ymd_opt(2025, 1, 6).unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_find_next_trading_day_no_days_found() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path("/v1/calendar");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let from_date = NaiveDate::from_ymd_opt(2025, 1, 4).unwrap();
-        let error = find_next_trading_day(&client, from_date).await.unwrap_err();
-
-        mock.assert();
-        assert!(matches!(
-            error,
-            AlpacaBrokerApiError::NoTradingDaysFound { .. }
-        ));
-    }
-
-    #[test]
-    fn test_duration_until_session_end() {
-        let day = calendar_day("2025-01-06", (9, 30), (16, 0));
-
-        // 2pm ET = 7pm UTC on Jan 6, 2025
-        // Market closes at 4pm ET = 9pm UTC on Jan 6, 2025
-        // Duration should be 2 hours
-        let now = Utc.with_ymd_and_hms(2025, 1, 6, 19, 0, 0).unwrap();
-        let duration = duration_until_session_end(&day, now).unwrap();
-        assert_eq!(duration.as_secs(), 2 * 3600);
-    }
-
-    #[test]
-    fn test_duration_until_session_start() {
-        let day = calendar_day("2025-01-06", (9, 30), (16, 0));
-
-        // 9am ET = 2pm UTC on Jan 6, 2025
-        // Market opens at 9:30am ET = 2:30pm UTC on Jan 6, 2025
-        // Duration should be 30 minutes
-        let now = Utc.with_ymd_and_hms(2025, 1, 6, 14, 0, 0).unwrap();
-        let duration = duration_until_session_start(&day, now).unwrap();
-        assert_eq!(duration.as_secs(), 30 * 60);
-    }
-
-    #[tokio::test]
-    async fn test_get_calendar_with_naivedate() {
+    async fn test_get_calendar_returns_market_hours() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -337,7 +125,6 @@ mod tests {
 
         mock.assert();
         assert_eq!(calendar.len(), 1);
-        assert_eq!(calendar[0].date, date);
         assert_eq!(calendar[0].open, NaiveTime::from_hms_opt(9, 30, 0).unwrap());
         assert_eq!(
             calendar[0].close,
@@ -355,7 +142,6 @@ mod tests {
 
         let day: CalendarDay = serde_json::from_str(json).unwrap();
 
-        assert_eq!(day.date, NaiveDate::from_ymd_opt(2025, 1, 6).unwrap());
         assert_eq!(day.open, NaiveTime::from_hms_opt(9, 30, 0).unwrap());
         assert_eq!(day.close, NaiveTime::from_hms_opt(16, 0, 0).unwrap());
     }
@@ -403,5 +189,107 @@ mod tests {
             err.to_string().contains("out of range"),
             "expected out of range error for minute 60, got: {err}"
         );
+    }
+
+    fn mock_trading_day(server: &MockServer, date: &str) {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", date)
+                .query_param("end", date);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "date": date,
+                        "open": "09:30",
+                        "close": "16:00"
+                    }
+                ]));
+        });
+    }
+
+    fn mock_non_trading_day(server: &MockServer, date: &str) {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", date)
+                .query_param("end", date);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+    }
+
+    /// Constructs a UTC timestamp corresponding to a specific ET time on a given date.
+    fn et_time_as_utc(date: &str, hour: u32, min: u32) -> DateTime<Utc> {
+        let naive_date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+        let naive_time = NaiveTime::from_hms_opt(hour, min, 0).unwrap();
+        let naive_dt = naive_date.and_time(naive_time);
+        naive_dt
+            .and_local_timezone(New_York)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn is_market_open_during_trading_hours() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let midday = et_time_as_utc("2025-01-06", 12, 0);
+
+        assert!(is_market_open_at(&client, midday).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_closed_before_open() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let before_open = et_time_as_utc("2025-01-06", 9, 0);
+
+        assert!(!is_market_open_at(&client, before_open).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_closed_at_close_time() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let at_close = et_time_as_utc("2025-01-06", 16, 0);
+
+        assert!(!is_market_open_at(&client, at_close).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_open_at_open_time() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let at_open = et_time_as_utc("2025-01-06", 9, 30);
+
+        assert!(is_market_open_at(&client, at_open).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_market_closed_on_non_trading_day() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day(&server, "2025-01-04");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let saturday = et_time_as_utc("2025-01-04", 12, 0);
+
+        assert!(!is_market_open_at(&client, saturday).await.unwrap());
     }
 }

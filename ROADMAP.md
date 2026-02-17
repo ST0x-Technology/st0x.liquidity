@@ -4,6 +4,9 @@
 
 ### Live testing of auto-rebalancing on the Alpaca instance
 
+- [x] PR:
+      [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
+
 - [ ] [#263 Check offchain inventory before placing counter trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/263)
 - [ ] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
 - [ ] [#105 Run the Alpaca instance without whole share accumulation](https://github.com/ST0x-Technology/st0x.liquidity/issues/105)
@@ -11,19 +14,28 @@
 - [ ] [#282 USDC inventory not updated from Position events (Buy/Sell trades)](https://github.com/ST0x-Technology/st0x.liquidity/issues/282)
 - [ ] [#283 USDC rebalancing trigger doesn't fire after USDC inventory changes](https://github.com/ST0x-Technology/st0x.liquidity/issues/283)
 - [ ] [#284 Equity mint completion trusts Alpaca API without onchain verification](https://github.com/ST0x-Technology/st0x.liquidity/issues/284)
-- [ ] [#276 EquityPosition market_value_cents truncates sub-cent precision](https://github.com/ST0x-Technology/st0x.liquidity/issues/276)
+- [x] [#276 EquityPosition market_value_cents truncates sub-cent precision](https://github.com/ST0x-Technology/st0x.liquidity/issues/276)
+  - PR:
+    [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
 - [ ] [#277 No automatic retry after offchain order failure](https://github.com/ST0x-Technology/st0x.liquidity/issues/277)
 
 **CQRS/ES Phase 3 - Complete Migration:**
 
 All auto-rebalancing logic uses ES/CQRS. Time to disable legacy:
 
-- [ ] [#235 Add feature flag to disable legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/issues/235)
-- [ ] [#131 Add monitoring and validation tooling for dual-write period](https://github.com/ST0x-Technology/st0x.liquidity/issues/131)
+- [x] PR:
+      [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
+- [x] [#235 Add feature flag to disable legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/issues/235)
+  - Superseded: legacy removed entirely in #273
+- [x] [#131 Add monitoring and validation tooling for dual-write period](https://github.com/ST0x-Technology/st0x.liquidity/issues/131)
+  - Superseded: dual-write removed entirely in #273
 - [ ] [#141 Implement MetricsPnL view](https://github.com/ST0x-Technology/st0x.liquidity/issues/141)
-- [ ] [#142 Cutover reads from old tables to views](https://github.com/ST0x-Technology/st0x.liquidity/issues/142)
-- [ ] [#143 Remove dual-write to old tables](https://github.com/ST0x-Technology/st0x.liquidity/issues/143)
-- [ ] [#144 Drop old CRUD tables](https://github.com/ST0x-Technology/st0x.liquidity/issues/144)
+- [x] [#142 Cutover reads from old tables to views](https://github.com/ST0x-Technology/st0x.liquidity/issues/142)
+  - Superseded: legacy tables removed in #273
+- [x] [#143 Remove dual-write to old tables](https://github.com/ST0x-Technology/st0x.liquidity/issues/143)
+  - Superseded: dual-write removed in #273
+- [x] [#144 Drop old CRUD tables](https://github.com/ST0x-Technology/st0x.liquidity/issues/144)
+  - Superseded: legacy tables removed in #273
 
 ---
 
@@ -65,7 +77,9 @@ boundaries, and reduced coupling. Sequenced around CQRS/ES migration.
 
 **Prerequisites:**
 
-- [ ] [#267 Use cqrs-es Services to make OffchainOrder aggregate self-contained](https://github.com/ST0x-Technology/st0x.liquidity/issues/267)
+- [x] [#267 Use cqrs-es Services to make OffchainOrder aggregate self-contained](https://github.com/ST0x-Technology/st0x.liquidity/issues/267)
+  - PR:
+    [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
 
 **Phase 2: Integration Layer Extraction**
 
@@ -92,6 +106,7 @@ Extract hedging logic and create application binary:
 
 ## Backlog: Testing
 
+- [ ] [#292 Work Plan: E2E Test Infrastructure while liquidity bot stabilizes](https://github.com/ST0x-Technology/st0x.liquidity/issues/292)
 - [ ] [#285 Integration test plan](https://github.com/ST0x-Technology/st0x.liquidity/issues/285)
 - [ ] [#264 Set up end-to-end testing infrastructure](https://github.com/ST0x-Technology/st0x.liquidity/issues/264)
 
@@ -101,6 +116,10 @@ Extract hedging logic and create application binary:
 
 **Infrastructure:**
 
+- [ ] [#296 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/issues/296)
+- [ ] [#293 Granular SSH access control: limit root access and per-user deploy keys](https://github.com/ST0x-Technology/st0x.liquidity/issues/293)
+- [ ] [#294 Document secret management setup and opsec](https://github.com/ST0x-Technology/st0x.liquidity/issues/294)
+- [ ] [#35 Document the bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/35)
 - [ ] [#286 No TLS configured for dashboard and WebSocket traffic](https://github.com/ST0x-Technology/st0x.liquidity/issues/286)
 - [ ] [#275 Optimise Fireblocks transfers: use vault-to-vault for issuance bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/275)
 - [ ] [#77 Set up Kafka](https://github.com/ST0x-Technology/st0x.liquidity/issues/77) -
@@ -127,9 +146,12 @@ Extract hedging logic and create application binary:
 
 **Code Quality:**
 
+- [ ] [#287 Replace all floating point calculations with fixed point calculations](https://github.com/ST0x-Technology/st0x.liquidity/issues/287)
 - [ ] [#54 Create BrokerAuthProvider trait to abstract authentication across codebase](https://github.com/ST0x-Technology/st0x.liquidity/issues/54) -
       Authentication abstraction
-- [ ] [#247 Financial calculations use f64 instead of fixed-precision types](https://github.com/ST0x-Technology/st0x.liquidity/issues/247)
+- [x] [#247 Financial calculations use f64 instead of fixed-precision types](https://github.com/ST0x-Technology/st0x.liquidity/issues/247)
+  - PR:
+    [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
 
 **Data Quality:**
 

@@ -1,196 +1,112 @@
-//! Operation executor that dispatches triggered rebalancing operations to
-//! managers.
+//! Operation executor that routes triggered rebalancing operations to
+//! cross-venue transfer implementations.
 
-use alloy::primitives::{Address, U256};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use uuid::Uuid;
 
-use st0x_execution::{FractionalShares, Symbol};
-
-use super::mint::Mint;
-use super::redemption::Redeem;
+use super::equity::{Equity, MintError, RedemptionError};
+use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use super::trigger::TriggeredOperation;
-use super::usdc::UsdcRebalance;
-use crate::equity_redemption::RedemptionAggregateId;
-use crate::tokenized_equity_mint::IssuerRequestId;
-use crate::usdc_rebalance::UsdcRebalanceId;
+use super::usdc::UsdcTransferError;
+use crate::threshold::Usdc;
 
-/// Receives triggered rebalancing operations and dispatches them to managers.
-pub(crate) struct Rebalancer<M, R, U>
-where
-    M: Mint,
-    R: Redeem,
-    U: UsdcRebalance,
-{
-    mint_manager: Arc<M>,
-    redemption_manager: Arc<R>,
-    usdc_manager: Arc<U>,
+/// Type-erased equity transfer (hedging -> market-making).
+type EquityToMarketMaking =
+    dyn CrossVenueTransfer<HedgingVenue, MarketMakingVenue, Asset = Equity, Error = MintError>;
+
+/// Type-erased equity transfer (market-making -> hedging).
+type EquityToHedging = dyn CrossVenueTransfer<MarketMakingVenue, HedgingVenue, Asset = Equity, Error = RedemptionError>;
+
+/// Type-erased USDC transfer (hedging -> market-making).
+type UsdcToMarketMaking = dyn CrossVenueTransfer<HedgingVenue, MarketMakingVenue, Asset = Usdc, Error = UsdcTransferError>;
+
+/// Type-erased USDC transfer (market-making -> hedging).
+type UsdcToHedging = dyn CrossVenueTransfer<MarketMakingVenue, HedgingVenue, Asset = Usdc, Error = UsdcTransferError>;
+
+/// Receives triggered rebalancing operations and routes them to the
+/// appropriate cross-venue transfer implementation.
+pub(crate) struct Rebalancer {
+    equity_to_mm: Arc<EquityToMarketMaking>,
+    equity_to_hedging: Arc<EquityToHedging>,
+    usdc_to_mm: Arc<UsdcToMarketMaking>,
+    usdc_to_hedging: Arc<UsdcToHedging>,
     receiver: mpsc::Receiver<TriggeredOperation>,
-    wallet: Address,
 }
 
-impl<M, R, U> Rebalancer<M, R, U>
-where
-    M: Mint,
-    R: Redeem,
-    U: UsdcRebalance,
-{
+impl Rebalancer {
     pub(crate) fn new(
-        mint_manager: Arc<M>,
-        redemption_manager: Arc<R>,
-        usdc_manager: Arc<U>,
+        equity_to_mm: Arc<EquityToMarketMaking>,
+        equity_to_hedging: Arc<EquityToHedging>,
+        usdc_to_mm: Arc<UsdcToMarketMaking>,
+        usdc_to_hedging: Arc<UsdcToHedging>,
         receiver: mpsc::Receiver<TriggeredOperation>,
-        wallet: Address,
     ) -> Self {
         Self {
-            mint_manager,
-            redemption_manager,
-            usdc_manager,
+            equity_to_mm,
+            equity_to_hedging,
+            usdc_to_mm,
+            usdc_to_hedging,
             receiver,
-            wallet,
         }
     }
 
-    /// Runs the rebalancer loop, receiving operations and dispatching them.
+    /// Runs the rebalancer loop, receiving and executing operations.
     /// Returns when the sender channel is closed.
     pub(crate) async fn run(mut self) {
         info!("Rebalancer started");
 
         while let Some(operation) = self.receiver.recv().await {
-            self.dispatch(operation).await;
+            self.execute(operation).await;
         }
 
         info!("Rebalancer stopped (channel closed)");
     }
 
-    async fn dispatch(&self, operation: TriggeredOperation) {
+    async fn execute(&self, operation: TriggeredOperation) {
         match operation {
             TriggeredOperation::Mint { symbol, quantity } => {
-                self.execute_mint(symbol, quantity).await;
+                self.equity_to_mm
+                    .transfer(Equity { symbol, quantity })
+                    .await
+                    .inspect_err(|error| {
+                        error!(?error, "Equity transfer to market-making venue failed");
+                    })
+                    .ok();
             }
 
             TriggeredOperation::Redemption {
-                symbol,
-                quantity,
-                token,
+                symbol, quantity, ..
             } => {
-                self.execute_redemption(symbol, quantity, token).await;
+                self.equity_to_hedging
+                    .transfer(Equity { symbol, quantity })
+                    .await
+                    .inspect_err(|error| {
+                        error!(?error, "Equity transfer to hedging venue failed");
+                    })
+                    .ok();
             }
 
             TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                self.execute_usdc_alpaca_to_base(amount).await;
+                self.usdc_to_mm
+                    .transfer(amount)
+                    .await
+                    .inspect_err(|error| {
+                        error!(?error, "USDC transfer to market-making venue failed");
+                    })
+                    .ok();
             }
 
             TriggeredOperation::UsdcBaseToAlpaca { amount } => {
-                self.execute_usdc_base_to_alpaca(amount).await;
+                self.usdc_to_hedging
+                    .transfer(amount)
+                    .await
+                    .inspect_err(|error| {
+                        error!(?error, "USDC transfer to hedging venue failed");
+                    })
+                    .ok();
             }
         }
-    }
-
-    async fn execute_mint(&self, symbol: Symbol, quantity: FractionalShares) {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
-
-        info!(
-            %symbol,
-            ?quantity,
-            id = %issuer_request_id.0,
-            "Executing mint operation"
-        );
-
-        match self
-            .mint_manager
-            .execute_mint(&issuer_request_id, symbol.clone(), quantity, self.wallet)
-            .await
-        {
-            Ok(()) => {
-                info!(%symbol, "Mint operation completed successfully");
-            }
-            Err(error) => {
-                error!(%symbol, error = %error, "Mint operation failed");
-            }
-        }
-    }
-
-    async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
-        let amount = match quantity.to_u256_18_decimals() {
-            Ok(amount) => amount,
-            Err(error) => {
-                error!(
-                    %symbol,
-                    ?quantity,
-                    error = %error,
-                    "Redemption operation failed: share conversion error"
-                );
-                return;
-            }
-        };
-
-        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
-
-        log_redemption_start(&symbol, quantity, token, amount, &aggregate_id);
-
-        let result = self
-            .redemption_manager
-            .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-            .await;
-
-        log_redemption_result(&symbol, result);
-    }
-
-    async fn execute_usdc_alpaca_to_base(&self, amount: crate::threshold::Usdc) {
-        let id = UsdcRebalanceId::new(Uuid::new_v4().to_string());
-
-        info!(?amount, id = %id.0, "Executing USDC Alpaca to Base rebalance");
-
-        match self.usdc_manager.execute_alpaca_to_base(&id, amount).await {
-            Ok(()) => {
-                info!("USDC Alpaca to Base rebalance completed successfully");
-            }
-            Err(error) => {
-                error!(error = %error, "USDC Alpaca to Base rebalance failed");
-            }
-        }
-    }
-
-    async fn execute_usdc_base_to_alpaca(&self, amount: crate::threshold::Usdc) {
-        let id = UsdcRebalanceId::new(Uuid::new_v4().to_string());
-
-        info!(?amount, id = %id.0, "Executing USDC Base to Alpaca rebalance");
-
-        match self.usdc_manager.execute_base_to_alpaca(&id, amount).await {
-            Ok(()) => {
-                info!("USDC Base to Alpaca rebalance completed successfully");
-            }
-            Err(error) => {
-                error!(error = %error, "USDC Base to Alpaca rebalance failed");
-            }
-        }
-    }
-}
-
-fn log_redemption_start(
-    symbol: &Symbol,
-    quantity: FractionalShares,
-    token: Address,
-    amount: U256,
-    aggregate_id: &RedemptionAggregateId,
-) {
-    info!(
-        %symbol,
-        ?quantity,
-        %token,
-        %amount,
-        aggregate_id = %aggregate_id.0,
-        "Executing redemption operation"
-    );
-}
-
-fn log_redemption_result<E: std::fmt::Display>(symbol: &Symbol, result: Result<(), E>) {
-    match result {
-        Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
-        Err(error) => error!(%symbol, error = %error, "Redemption operation failed"),
     }
 }
 
@@ -199,244 +115,126 @@ mod tests {
     use alloy::primitives::address;
     use rust_decimal_macros::dec;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
+
+    use st0x_execution::{FractionalShares, Symbol};
 
     use super::*;
-    use crate::rebalancing::mint::mock::MockMint;
-    use crate::rebalancing::redemption::mock::MockRedeem;
+    use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
-    use crate::threshold::Usdc;
 
-    #[tokio::test]
-    async fn dispatch_mint_calls_mint_manager() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
+    async fn execute(
+        operations: Vec<TriggeredOperation>,
+    ) -> (Arc<MockCrossVenueEquityTransfer>, Arc<MockUsdcRebalance>) {
+        let equity = Arc::new(MockCrossVenueEquityTransfer::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let (tx, rx) = mpsc::channel(10);
+        let (sender, receiver) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            rx,
-            Address::ZERO,
+            Arc::clone(&equity) as Arc<EquityToMarketMaking>,
+            Arc::clone(&equity) as Arc<EquityToHedging>,
+            Arc::clone(&usdc) as Arc<UsdcToMarketMaking>,
+            Arc::clone(&usdc) as Arc<UsdcToHedging>,
+            receiver,
         );
 
-        tx.send(TriggeredOperation::Mint {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(100)),
-        })
-        .await
-        .unwrap();
+        for operation in operations {
+            sender.send(operation).await.unwrap();
+        }
 
-        drop(tx);
+        drop(sender);
         rebalancer.run().await;
 
-        assert_eq!(mint.calls(), 1);
-        assert_eq!(redeem.calls(), 0);
+        (equity, usdc)
+    }
+
+    #[tokio::test]
+    async fn execute_mint_calls_equity_to_market_making() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::Mint {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(dec!(10)),
+        }])
+        .await;
+
+        assert_eq!(equity.mint_calls(), 1);
+        assert_eq!(equity.redeem_calls(), 0);
         assert_eq!(usdc.alpaca_to_base_calls(), 0);
         assert_eq!(usdc.base_to_alpaca_calls(), 0);
     }
 
     #[tokio::test]
-    async fn dispatch_redemption_calls_redemption_manager() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let (tx, rx) = mpsc::channel(10);
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::Redemption {
+    async fn execute_redemption_calls_equity_to_hedging() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(dec!(50)),
             token: address!("0x1234567890123456789012345678901234567890"),
-        })
-        .await
-        .unwrap();
+        }])
+        .await;
 
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(mint.calls(), 0);
-        assert_eq!(redeem.calls(), 1);
+        assert_eq!(equity.mint_calls(), 0);
+        assert_eq!(equity.redeem_calls(), 1);
         assert_eq!(usdc.alpaca_to_base_calls(), 0);
         assert_eq!(usdc.base_to_alpaca_calls(), 0);
     }
 
     #[tokio::test]
-    async fn dispatch_usdc_alpaca_to_base_calls_usdc_manager() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let (tx, rx) = mpsc::channel(10);
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::UsdcAlpacaToBase {
+    async fn execute_usdc_alpaca_to_base_calls_usdc_to_market_making() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::UsdcAlpacaToBase {
             amount: Usdc(dec!(1000)),
-        })
-        .await
-        .unwrap();
+        }])
+        .await;
 
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(mint.calls(), 0);
-        assert_eq!(redeem.calls(), 0);
+        assert_eq!(equity.mint_calls(), 0);
+        assert_eq!(equity.redeem_calls(), 0);
         assert_eq!(usdc.alpaca_to_base_calls(), 1);
         assert_eq!(usdc.base_to_alpaca_calls(), 0);
     }
 
     #[tokio::test]
-    async fn dispatch_usdc_base_to_alpaca_calls_usdc_manager() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let (tx, rx) = mpsc::channel(10);
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::UsdcBaseToAlpaca {
+    async fn execute_usdc_base_to_alpaca_calls_usdc_to_hedging() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::UsdcBaseToAlpaca {
             amount: Usdc(dec!(2000)),
-        })
-        .await
-        .unwrap();
+        }])
+        .await;
 
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(mint.calls(), 0);
-        assert_eq!(redeem.calls(), 0);
+        assert_eq!(equity.mint_calls(), 0);
+        assert_eq!(equity.redeem_calls(), 0);
         assert_eq!(usdc.alpaca_to_base_calls(), 0);
         assert_eq!(usdc.base_to_alpaca_calls(), 1);
     }
 
     #[tokio::test]
     async fn run_processes_multiple_operations() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let (tx, rx) = mpsc::channel(10);
+        let (equity, usdc) = execute(vec![
+            TriggeredOperation::Mint {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(10)),
+            },
+            TriggeredOperation::Mint {
+                symbol: Symbol::new("TSLA").unwrap(),
+                quantity: FractionalShares::new(dec!(20)),
+            },
+            TriggeredOperation::Redemption {
+                symbol: Symbol::new("GOOG").unwrap(),
+                quantity: FractionalShares::new(dec!(5)),
+                token: address!("0x1234567890123456789012345678901234567890"),
+            },
+            TriggeredOperation::UsdcAlpacaToBase {
+                amount: Usdc(dec!(500)),
+            },
+            TriggeredOperation::UsdcBaseToAlpaca {
+                amount: Usdc(dec!(300)),
+            },
+        ])
+        .await;
 
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::Mint {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(10)),
-        })
-        .await
-        .unwrap();
-
-        tx.send(TriggeredOperation::Mint {
-            symbol: Symbol::new("TSLA").unwrap(),
-            quantity: FractionalShares::new(dec!(20)),
-        })
-        .await
-        .unwrap();
-
-        tx.send(TriggeredOperation::Redemption {
-            symbol: Symbol::new("GOOG").unwrap(),
-            quantity: FractionalShares::new(dec!(5)),
-            token: address!("0x1234567890123456789012345678901234567890"),
-        })
-        .await
-        .unwrap();
-
-        tx.send(TriggeredOperation::UsdcAlpacaToBase {
-            amount: Usdc(dec!(500)),
-        })
-        .await
-        .unwrap();
-
-        tx.send(TriggeredOperation::UsdcBaseToAlpaca {
-            amount: Usdc(dec!(300)),
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(mint.calls(), 2);
-        assert_eq!(redeem.calls(), 1);
+        assert_eq!(equity.mint_calls(), 2);
+        assert_eq!(equity.redeem_calls(), 1);
         assert_eq!(usdc.alpaca_to_base_calls(), 1);
         assert_eq!(usdc.base_to_alpaca_calls(), 1);
     }
 
     #[tokio::test]
     async fn run_terminates_when_channel_closes() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let (tx, rx) = mpsc::channel(10);
-
-        let rebalancer = Rebalancer::new(mint, redeem, usdc, rx, Address::ZERO);
-
-        drop(tx);
-        rebalancer.run().await;
-    }
-
-    #[tokio::test]
-    async fn redemption_with_negative_shares_logs_error_and_continues() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let (tx, rx) = mpsc::channel(10);
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::Redemption {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(-10)),
-            token: address!("0x1234567890123456789012345678901234567890"),
-        })
-        .await
-        .unwrap();
-
-        tx.send(TriggeredOperation::Mint {
-            symbol: Symbol::new("TSLA").unwrap(),
-            quantity: FractionalShares::new(dec!(50)),
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        rebalancer.run().await;
-
-        // Redemption with negative shares should not call the manager
-        assert_eq!(redeem.calls(), 0);
-        // But the subsequent mint should still be processed
-        assert_eq!(mint.calls(), 1);
+        execute(vec![]).await;
     }
 }

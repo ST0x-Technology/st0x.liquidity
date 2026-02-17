@@ -12,7 +12,7 @@ use st0x_execution::{
     ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
 
-use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, PriceCents};
+use crate::offchain_order::{Dollars, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
 use crate::onchain::OnChainError;
 use crate::position::{Position, PositionCommand};
 
@@ -38,8 +38,8 @@ pub(crate) enum OrderPollingError {
 }
 
 impl From<ExecutionError> for OrderPollingError {
-    fn from(err: ExecutionError) -> Self {
-        Self::Executor(Box::new(err))
+    fn from(error: ExecutionError) -> Self {
+        Self::Executor(Box::new(error))
     }
 }
 
@@ -163,14 +163,14 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         match &order_state {
             OrderState::Filled {
-                price_cents,
+                price,
                 order_id,
                 executed_at,
             } => {
                 self.handle_filled_order(
                     offchain_order_id,
                     order,
-                    PriceCents(*price_cents),
+                    Dollars(*price),
                     &ExecutorOrderId::new(&order_id),
                     *executed_at,
                 )
@@ -198,7 +198,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         &self,
         offchain_order_id: OffchainOrderId,
         order: &OffchainOrder,
-        price_cents: PriceCents,
+        price: Dollars,
         executor_order_id: &ExecutorOrderId,
         broker_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), OrderPollingError> {
@@ -206,18 +206,18 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         info!(
             %offchain_order_id,
-            price_cents = price_cents.0,
+            ?price,
             %symbol,
             "Order filled, executing CQRS commands"
         );
 
-        self.complete_offchain_order_fill(offchain_order_id, price_cents)
+        self.complete_offchain_order_fill(offchain_order_id, price)
             .await?;
 
         self.complete_position_order(
             offchain_order_id,
             order,
-            price_cents,
+            price,
             executor_order_id,
             broker_timestamp,
         )
@@ -227,12 +227,12 @@ impl<E: Executor> OrderStatusPoller<E> {
     async fn complete_offchain_order_fill(
         &self,
         offchain_order_id: OffchainOrderId,
-        price_cents: PriceCents,
+        price: Dollars,
     ) -> Result<(), OrderPollingError> {
         self.offchain_order
             .send(
                 &offchain_order_id,
-                OffchainOrderCommand::CompleteFill { price_cents },
+                OffchainOrderCommand::CompleteFill { price },
             )
             .await?;
         Ok(())
@@ -242,7 +242,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         &self,
         offchain_order_id: OffchainOrderId,
         order: &OffchainOrder,
-        price_cents: PriceCents,
+        price: Dollars,
         executor_order_id: &ExecutorOrderId,
         broker_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), OrderPollingError> {
@@ -255,7 +255,7 @@ impl<E: Executor> OrderStatusPoller<E> {
                     shares_filled: order.shares(),
                     direction: order.direction(),
                     executor_order_id: executor_order_id.clone(),
-                    price_cents,
+                    price,
                     broker_timestamp,
                 },
             )
@@ -493,7 +493,7 @@ mod tests {
             .handle_filled_order(
                 offchain_order_id,
                 &order,
-                PriceCents(15025),
+                Dollars(dec!(150.25)),
                 &ExecutorOrderId::new("ORD123"),
                 Utc::now(),
             )

@@ -27,10 +27,12 @@ pub(crate) mod accumulator;
 pub(crate) mod backfill;
 mod clear;
 pub(crate) mod io;
+#[cfg(test)]
+pub(crate) mod mock;
 pub(crate) mod pyth;
+pub(crate) mod raindex;
 mod take_order;
 pub(crate) mod trade;
-pub(crate) mod vault;
 
 pub(crate) use trade::OnchainTrade;
 pub(crate) use trade::TradeValidationError;
@@ -79,16 +81,6 @@ impl EvmCtx {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AlloyError {
-    #[error("Failed to get symbol: {0}")]
-    GetSymbol(#[from] alloy::contract::Error),
-    #[error("Sol type error: {0}")]
-    SolType(#[from] alloy::sol_types::Error),
-    #[error("RPC transport error: {0}")]
-    RpcTransport(#[from] RpcError<TransportErrorKind>),
-}
-
 /// Unified error type for onchain trade processing with clear domain boundaries.
 /// Provides error mapping between layers while maintaining separation of concerns.
 #[derive(Debug, thiserror::Error)]
@@ -97,8 +89,16 @@ pub(crate) enum OnChainError {
     Validation(#[from] TradeValidationError),
     #[error("Database persistence error: {0}")]
     Persistence(#[from] PersistenceError),
-    #[error("Alloy error: {0}")]
-    Alloy(#[from] AlloyError),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Contract call error: {0}")]
+    ContractCall(#[from] alloy::contract::Error),
+    #[error("Sol type error: {0}")]
+    SolType(#[from] alloy::sol_types::Error),
+    #[error("RPC transport error: {0}")]
+    RpcTransport(#[from] RpcError<TransportErrorKind>),
+    #[error("Invalid IO index: {0}")]
+    InvalidIndex(#[from] FromUintError<usize>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     #[error("Event queue error: {0}")]
@@ -129,36 +129,8 @@ pub(crate) enum OnChainError {
     Uuid(#[from] uuid::Error),
     #[error("Position projection error: {0}")]
     PositionProjection(#[from] ProjectionError<Position>),
-}
-
-impl From<sqlx::Error> for OnChainError {
-    fn from(err: sqlx::Error) -> Self {
-        Self::Persistence(PersistenceError::Database(err))
-    }
-}
-
-impl From<alloy::contract::Error> for OnChainError {
-    fn from(err: alloy::contract::Error) -> Self {
-        Self::Alloy(AlloyError::GetSymbol(err))
-    }
-}
-
-impl From<FromUintError<usize>> for OnChainError {
-    fn from(err: FromUintError<usize>) -> Self {
-        Self::Validation(TradeValidationError::InvalidIndex(err))
-    }
-}
-
-impl From<alloy::sol_types::Error> for OnChainError {
-    fn from(err: alloy::sol_types::Error) -> Self {
-        Self::Alloy(AlloyError::SolType(err))
-    }
-}
-
-impl From<RpcError<TransportErrorKind>> for OnChainError {
-    fn from(err: RpcError<TransportErrorKind>) -> Self {
-        Self::Alloy(AlloyError::RpcTransport(err))
-    }
+    #[error("Market hours check failed")]
+    MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");

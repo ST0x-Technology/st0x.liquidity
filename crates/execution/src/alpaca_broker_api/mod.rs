@@ -1,4 +1,3 @@
-use chrono::{NaiveDate, NaiveTime};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::fmt;
@@ -103,16 +102,8 @@ pub enum AlpacaBrokerApiError {
         body: String,
     },
 
-    #[error(
-        "Duration conversion failed: chrono duration cannot be converted to std::time::Duration"
-    )]
-    DurationConversion,
-
     #[error("Invalid order ID: {0}")]
     InvalidOrderId(#[from] uuid::Error),
-
-    #[error("Price {0} cannot be converted to cents")]
-    PriceConversion(f64),
 
     #[error("Filled order {order_id} is missing required field: {field}")]
     IncompleteFilledOrder { order_id: String, field: String },
@@ -122,12 +113,6 @@ pub enum AlpacaBrokerApiError {
         account_id: Uuid,
         status: AccountStatus,
     },
-
-    #[error("Ambiguous datetime when constructing calendar time: {date} {time}")]
-    AmbiguousDateTime { date: NaiveDate, time: NaiveTime },
-
-    #[error("No trading days found between {from} and {to}")]
-    NoTradingDaysFound { from: NaiveDate, to: NaiveDate },
 
     #[error("Crypto order {order_id} failed: {reason:?}")]
     CryptoOrderFailed {
@@ -152,13 +137,4 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Invalid symbol in position: {0}")]
     InvalidSymbol(#[from] crate::EmptySymbolError),
-
-    #[error(
-        "Market value conversion failed for symbol \
-         {symbol}: {market_value:?}"
-    )]
-    MarketValueConversion {
-        symbol: Symbol,
-        market_value: Option<Decimal>,
-    },
 }

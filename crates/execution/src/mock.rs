@@ -1,14 +1,15 @@
 use async_trait::async_trait;
+use rust_decimal_macros::dec;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement, OrderState,
-    OrderUpdate, SupportedExecutor, TryIntoExecutor,
+    SupportedExecutor, TryIntoExecutor,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -22,6 +23,7 @@ pub struct MockExecutor {
     should_fail: bool,
     failure_message: String,
     inventory_result: InventoryResult,
+    market_open: bool,
 }
 
 impl MockExecutor {
@@ -31,6 +33,7 @@ impl MockExecutor {
             should_fail: false,
             failure_message: String::new(),
             inventory_result: InventoryResult::Unimplemented,
+            market_open: true,
         }
     }
 
@@ -40,6 +43,7 @@ impl MockExecutor {
             should_fail: true,
             failure_message: message.into(),
             inventory_result: InventoryResult::Unimplemented,
+            market_open: true,
         }
     }
 
@@ -47,6 +51,13 @@ impl MockExecutor {
     #[must_use]
     pub fn with_inventory(mut self, inventory: Inventory) -> Self {
         self.inventory_result = InventoryResult::Fetched(inventory);
+        self
+    }
+
+    /// Configures whether the market is considered open.
+    #[must_use]
+    pub fn with_market_open(mut self, open: bool) -> Self {
+        self.market_open = open;
         self
     }
 
@@ -73,11 +84,8 @@ impl Executor for MockExecutor {
         Ok(Self::new())
     }
 
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
-        info!("[TEST] Market hours check - market is always open in test mode");
-        // Test executor should never block on market hours, so return Duration::MAX
-        // to signal no time limit
-        Ok(std::time::Duration::MAX)
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        Ok(self.market_open)
     }
 
     #[tracing::instrument(skip(self), fields(symbol = %order.symbol, shares = %order.shares, direction = %order.direction), level = tracing::Level::INFO)]
@@ -121,21 +129,8 @@ impl Executor for MockExecutor {
         Ok(OrderState::Filled {
             executed_at: chrono::Utc::now(),
             order_id: order_id.clone(),
-            price_cents: 10000, // $100.00 mock price
+            price: dec!(100.00),
         })
-    }
-
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
-        if self.should_fail {
-            return Err(ExecutionError::MockFailure {
-                message: self.failure_message.clone(),
-            });
-        }
-
-        warn!("[TEST] Polling pending orders - no pending orders in test mode");
-
-        // Return empty list since test orders are immediately "filled"
-        Ok(Vec::new())
     }
 
     fn to_supported_executor(&self) -> SupportedExecutor {
@@ -185,26 +180,6 @@ mod tests {
         let executor = MockExecutor::try_from_ctx(MockExecutorCtx).await.unwrap();
         assert!(!executor.should_fail);
         assert_eq!(executor.failure_message, "");
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open_always_returns_none() {
-        let executor = MockExecutor::new();
-
-        assert_eq!(
-            executor.wait_until_market_open().await.unwrap(),
-            std::time::Duration::MAX
-        );
-    }
-
-    #[tokio::test]
-    async fn test_failure_executor_wait_until_market_open() {
-        let executor = MockExecutor::with_failure("Test failure");
-
-        assert_eq!(
-            executor.wait_until_market_open().await.unwrap(),
-            std::time::Duration::MAX
-        );
     }
 
     #[tokio::test]
@@ -258,23 +233,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poll_pending_orders_success() {
-        let executor = MockExecutor::new();
-
-        assert!(executor.poll_pending_orders().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_poll_pending_orders_failure() {
-        let executor = MockExecutor::with_failure("Connection timeout");
-
-        assert!(matches!(
-            executor.poll_pending_orders().await.unwrap_err(),
-            ExecutionError::MockFailure { message } if message == "Connection timeout"
-        ));
-    }
-
-    #[tokio::test]
     async fn test_get_order_status_success() {
         let executor = MockExecutor::new();
 
@@ -313,7 +271,7 @@ mod tests {
             positions: vec![crate::EquityPosition {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(Decimal::from(100)),
-                market_value_cents: Some(1_500_000),
+                market_value: Some(Decimal::new(1_500_000, 2)),
             }],
             cash_balance_cents: 5_000_000,
         };

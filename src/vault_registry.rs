@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use st0x_execution::Symbol;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Projection, Table};
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -74,7 +74,7 @@ impl EventSourced for VaultRegistry {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "VaultRegistry";
-    const PROJECTION: Option<Table> = None;
+    const PROJECTION: Option<Table> = Some(Table("vault_registry_view"));
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -115,6 +115,8 @@ pub(crate) struct VaultRegistry {
     pub(crate) last_updated: DateTime<Utc>,
 }
 
+pub(crate) type VaultRegistryProjection = Projection<VaultRegistry>;
+
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DiscoveredEquityVault {
@@ -139,6 +141,10 @@ impl VaultRegistry {
             .values()
             .find(|vault| vault.symbol == *symbol)
             .map(|vault| vault.token)
+    }
+
+    pub(crate) fn vault_id_by_token(&self, token: Address) -> Option<B256> {
+        self.equity_vaults.get(&token).map(|v| v.vault_id)
     }
 
     fn empty(timestamp: DateTime<Utc>) -> Self {
@@ -276,7 +282,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use st0x_event_sorcery::{Reactor, StoreBuilder, TestHarness, replay};
+    use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
 
     use super::*;
     use crate::test_utils::setup_test_db;
@@ -573,10 +579,19 @@ mod tests {
     /// Tracks how many events a reactor receives.
     struct EventCounter(Arc<AtomicUsize>);
 
+    deps!(EventCounter, [VaultRegistry]);
+
     #[async_trait]
-    impl Reactor<VaultRegistry> for EventCounter {
-        async fn react(&self, _id: &VaultRegistryId, _event: &VaultRegistryEvent) {
+    impl Reactor for EventCounter {
+        type Error = st0x_event_sorcery::Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, _event) = event.into_inner();
             self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 

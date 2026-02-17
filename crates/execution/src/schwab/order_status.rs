@@ -1,7 +1,5 @@
-use num_traits::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::ExecutionError;
 
 /// Deserialize orderId from Schwab API as int64 and convert to string for database compatibility.
 ///
@@ -46,8 +44,10 @@ pub(crate) struct OrderStatusResponse {
     #[serde(default, deserialize_with = "deserialize_order_id")]
     pub order_id: Option<String>,
     pub status: Option<OrderStatus>,
-    pub filled_quantity: Option<f64>,
-    pub remaining_quantity: Option<f64>,
+    #[serde(default, with = "rust_decimal::serde::float_option")]
+    pub filled_quantity: Option<Decimal>,
+    #[serde(default, with = "rust_decimal::serde::float_option")]
+    pub remaining_quantity: Option<Decimal>,
     pub entered_time: Option<String>,
     pub close_time: Option<String>,
     #[serde(rename = "orderActivityCollection")]
@@ -63,44 +63,36 @@ pub(crate) struct OrderActivity {
 }
 
 /// Execution leg details from Schwab API
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecutionLeg {
-    pub quantity: f64,
-    pub price: f64,
+    #[serde(with = "rust_decimal::serde::float")]
+    pub quantity: Decimal,
+    #[serde(with = "rust_decimal::serde::float")]
+    pub price: Decimal,
 }
 
 impl OrderStatusResponse {
-    /// Calculate weighted average fill price from orderActivityCollection
-    pub(crate) fn calculate_weighted_average_price(&self) -> Option<f64> {
+    /// Weighted average fill price from execution legs.
+    pub(crate) fn price(&self) -> Option<Decimal> {
         let activities = self.order_activity_collection.as_ref()?;
 
         let (total_value, total_quantity) = activities
             .iter()
             .filter_map(|activity| activity.execution_legs.as_ref())
             .flat_map(|legs| legs.iter())
-            .map(|leg| (leg.price * leg.quantity, leg.quantity))
-            .fold((0.0, 0.0), |(acc_value, acc_qty), (value, qty)| {
-                (acc_value + value, acc_qty + qty)
-            });
+            .fold(
+                (Decimal::ZERO, Decimal::ZERO),
+                |(acc_value, acc_qty), leg| {
+                    (acc_value + leg.price * leg.quantity, acc_qty + leg.quantity)
+                },
+            );
 
-        if total_quantity > 0.0 {
+        if total_quantity > Decimal::ZERO {
             Some(total_value / total_quantity)
         } else {
             None
         }
-    }
-
-    /// Convert price to cents for database storage
-    pub(crate) fn price_in_cents(&self) -> Result<Option<u64>, ExecutionError> {
-        self.calculate_weighted_average_price()
-            .map(|price| {
-                (price * 100.0)
-                    .round()
-                    .to_u64()
-                    .ok_or(ExecutionError::PriceConversion { price })
-            })
-            .transpose()
     }
 
     /// Check if order is completely filled
@@ -141,6 +133,8 @@ impl OrderStatusResponse {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
+
     use super::*;
 
     #[test]
@@ -178,8 +172,8 @@ mod tests {
 
         assert_eq!(response.order_id, Some("1004055538123".to_string()));
         assert_eq!(response.status, Some(OrderStatus::Filled));
-        assert!((response.filled_quantity.unwrap() - 100.0).abs() < f64::EPSILON);
-        assert!(response.remaining_quantity.unwrap().abs() < f64::EPSILON);
+        assert_eq!(response.filled_quantity.unwrap(), dec!(100.0));
+        assert_eq!(response.remaining_quantity.unwrap(), dec!(0.0));
         assert_eq!(
             response.order_activity_collection.as_ref().unwrap().len(),
             1
@@ -191,20 +185,20 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(100.0),
-            remaining_quantity: Some(0.0),
+            filled_quantity: Some(dec!(100.0)),
+            remaining_quantity: Some(dec!(0.0)),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:00Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![ExecutionLeg {
-                    quantity: 100.0,
-                    price: 150.25,
+                    quantity: dec!(100.0),
+                    price: dec!(150.25),
                 }]),
             }]),
         };
 
-        assert_eq!(response.calculate_weighted_average_price(), Some(150.25));
+        assert_eq!(response.price(), Some(dec!(150.25)));
     }
 
     #[test]
@@ -212,26 +206,26 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(200.0),
-            remaining_quantity: Some(0.0),
+            filled_quantity: Some(dec!(200.0)),
+            remaining_quantity: Some(dec!(0.0)),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:10Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![
                     ExecutionLeg {
-                        quantity: 100.0,
-                        price: 150.00,
+                        quantity: dec!(100.0),
+                        price: dec!(150.00),
                     },
                     ExecutionLeg {
-                        quantity: 100.0,
-                        price: 151.00,
+                        quantity: dec!(100.0),
+                        price: dec!(151.00),
                     },
                 ]),
             }]),
         };
 
-        assert_eq!(response.calculate_weighted_average_price(), Some(150.5));
+        assert_eq!(response.price(), Some(dec!(150.5)));
     }
 
     #[test]
@@ -239,26 +233,26 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(300.0),
-            remaining_quantity: Some(0.0),
+            filled_quantity: Some(dec!(300.0)),
+            remaining_quantity: Some(dec!(0.0)),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:10Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![
                     ExecutionLeg {
-                        quantity: 200.0,
-                        price: 150.00,
+                        quantity: dec!(200.0),
+                        price: dec!(150.00),
                     },
                     ExecutionLeg {
-                        quantity: 100.0,
-                        price: 153.00,
+                        quantity: dec!(100.0),
+                        price: dec!(153.00),
                     },
                 ]),
             }]),
         };
 
-        assert_eq!(response.calculate_weighted_average_price(), Some(151.0));
+        assert_eq!(response.price(), Some(dec!(151.0)));
     }
 
     #[test]
@@ -266,71 +260,35 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Working),
-            filled_quantity: Some(0.0),
-            remaining_quantity: Some(100.0),
+            filled_quantity: Some(dec!(0.0)),
+            remaining_quantity: Some(dec!(100.0)),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: None,
             order_activity_collection: Some(vec![]),
         };
 
-        assert_eq!(response.calculate_weighted_average_price(), None);
+        assert_eq!(response.price(), None);
     }
 
     #[test]
-    fn test_price_in_cents_conversion() {
+    fn test_price_preserves_sub_cent_precision() {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(100.0),
-            remaining_quantity: Some(0.0),
+            filled_quantity: Some(dec!(100.0)),
+            remaining_quantity: Some(dec!(0.0)),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:00Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![ExecutionLeg {
-                    quantity: 100.0,
-                    price: 150.25,
+                    quantity: dec!(100.0),
+                    price: dec!(150.254),
                 }]),
             }]),
         };
 
-        assert_eq!(response.price_in_cents().unwrap(), Some(15025));
-    }
-
-    #[test]
-    fn test_price_in_cents_no_executions() {
-        let response = OrderStatusResponse {
-            order_id: Some("1004055538123".to_string()),
-            status: Some(OrderStatus::Working),
-            filled_quantity: Some(0.0),
-            remaining_quantity: Some(100.0),
-            entered_time: Some("2023-10-15T10:25:00Z".to_string()),
-            close_time: None,
-            order_activity_collection: Some(vec![]),
-        };
-
-        assert_eq!(response.price_in_cents().unwrap(), None);
-    }
-
-    #[test]
-    fn test_price_in_cents_rounding() {
-        let response = OrderStatusResponse {
-            order_id: Some("1004055538123".to_string()),
-            status: Some(OrderStatus::Filled),
-            filled_quantity: Some(100.0),
-            remaining_quantity: Some(0.0),
-            entered_time: Some("2023-10-15T10:25:00Z".to_string()),
-            close_time: Some("2023-10-15T10:30:00Z".to_string()),
-            order_activity_collection: Some(vec![OrderActivity {
-                activity_type: Some("EXECUTION".to_string()),
-                execution_legs: Some(vec![ExecutionLeg {
-                    quantity: 100.0,
-                    price: 150.254,
-                }]),
-            }]),
-        };
-
-        assert_eq!(response.price_in_cents().unwrap(), Some(15025));
+        assert_eq!(response.price(), Some(dec!(150.254)));
     }
 
     #[test]
@@ -338,8 +296,8 @@ mod tests {
         let mut response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(100.0),
-            remaining_quantity: Some(0.0),
+            filled_quantity: Some(dec!(100.0)),
+            remaining_quantity: Some(dec!(0.0)),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:00Z".to_string()),
             order_activity_collection: Some(vec![]),
@@ -372,8 +330,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(0.0),
-                remaining_quantity: Some(100.0),
+                filled_quantity: Some(dec!(0.0)),
+                remaining_quantity: Some(dec!(100.0)),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: None,
                 order_activity_collection: Some(vec![]),
@@ -393,8 +351,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(100.0),
-                remaining_quantity: Some(0.0),
+                filled_quantity: Some(dec!(100.0)),
+                remaining_quantity: Some(dec!(0.0)),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: Some("2023-10-15T10:30:00Z".to_string()),
                 order_activity_collection: Some(vec![]),
@@ -418,8 +376,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(0.0),
-                remaining_quantity: Some(100.0),
+                filled_quantity: Some(dec!(0.0)),
+                remaining_quantity: Some(dec!(100.0)),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: Some("2023-10-15T10:30:00Z".to_string()),
                 order_activity_collection: Some(vec![]),
@@ -441,8 +399,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(0.0),
-                remaining_quantity: Some(100.0),
+                filled_quantity: Some(dec!(0.0)),
+                remaining_quantity: Some(dec!(100.0)),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: None,
                 order_activity_collection: Some(vec![]),
@@ -488,17 +446,15 @@ mod tests {
 
         assert_eq!(response.order_id, Some("1004055538999".to_string()));
         assert_eq!(response.status, Some(OrderStatus::Filled));
-        assert!((response.filled_quantity.unwrap() - 200.0).abs() < f64::EPSILON);
-        assert!(response.remaining_quantity.unwrap().abs() < f64::EPSILON);
+        assert_eq!(response.filled_quantity.unwrap(), dec!(200.0));
+        assert_eq!(response.remaining_quantity.unwrap(), dec!(0.0));
         assert_eq!(
             response.order_activity_collection.as_ref().unwrap().len(),
             1
         );
 
         // Test weighted average: (150 * 100.25 + 50 * 100.75) / 200 = (15037.5 + 5037.5) / 200 = 100.375
-        let avg_price = response.calculate_weighted_average_price().unwrap();
-        assert!((avg_price - 100.375).abs() < f64::EPSILON);
-        assert_eq!(response.price_in_cents().unwrap(), Some(10038)); // Rounded
+        assert_eq!(response.price(), Some(dec!(100.375)));
     }
 
     #[test]
@@ -506,21 +462,20 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Working),
-            filled_quantity: Some(0.0),
-            remaining_quantity: Some(100.0),
+            filled_quantity: Some(dec!(0.0)),
+            remaining_quantity: Some(dec!(100.0)),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: None,
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![ExecutionLeg {
-                    quantity: 0.0,
-                    price: 150.25,
+                    quantity: dec!(0.0),
+                    price: dec!(150.25),
                 }]),
             }]),
         };
 
-        assert_eq!(response.calculate_weighted_average_price(), None);
-        assert_eq!(response.price_in_cents().unwrap(), None);
+        assert_eq!(response.price(), None);
     }
 
     #[test]
@@ -582,8 +537,8 @@ mod tests {
         // Verify the parsed values
         assert_eq!(parsed.order_id, Some("1004055538153".to_string()));
         assert_eq!(parsed.status, Some(OrderStatus::Filled));
-        assert!((parsed.filled_quantity.unwrap() - 1.0).abs() < f64::EPSILON);
-        assert!(parsed.remaining_quantity.unwrap().abs() < f64::EPSILON);
+        assert_eq!(parsed.filled_quantity.unwrap(), dec!(1.0));
+        assert_eq!(parsed.remaining_quantity.unwrap(), dec!(0.0));
         assert_eq!(
             parsed.entered_time,
             Some("2025-08-29T17:15:17+0000".to_string())
@@ -594,13 +549,7 @@ mod tests {
         );
 
         // Verify price extraction from orderActivityCollection
-        let avg_price = parsed.calculate_weighted_average_price();
-        assert!(avg_price.is_some());
-        assert!((avg_price.unwrap() - 22.7299).abs() < f64::EPSILON);
-
-        // Verify price in cents conversion
-        let price_cents = parsed.price_in_cents().unwrap();
-        assert_eq!(price_cents, Some(2273)); // 22.7299 * 100 rounded = 2273 cents
+        assert_eq!(parsed.price(), Some(dec!(22.7299)));
     }
 
     #[test]
@@ -681,8 +630,8 @@ mod tests {
 
         assert_eq!(parsed.order_id, Some("1004055538123".to_string()));
         assert_eq!(parsed.status, None);
-        assert_eq!(parsed.filled_quantity, Some(0.0));
-        assert_eq!(parsed.remaining_quantity, Some(100.0));
+        assert_eq!(parsed.filled_quantity, Some(dec!(0.0)));
+        assert_eq!(parsed.remaining_quantity, Some(dec!(100.0)));
     }
 
     #[test]
@@ -707,11 +656,9 @@ mod tests {
             .expect("Should parse response with orderActivityCollection");
 
         assert_eq!(parsed.status, Some(OrderStatus::Filled));
-        assert!((parsed.filled_quantity.unwrap() - 2.0).abs() < f64::EPSILON);
-        assert!(parsed.remaining_quantity.unwrap().abs() < f64::EPSILON);
+        assert_eq!(parsed.filled_quantity.unwrap(), dec!(2.0));
+        assert_eq!(parsed.remaining_quantity.unwrap(), dec!(0.0));
 
-        let avg_price = parsed.calculate_weighted_average_price();
-        assert!(avg_price.is_some());
-        assert!((avg_price.unwrap() - 101.0).abs() < f64::EPSILON);
+        assert_eq!(parsed.price(), Some(dec!(101.0)));
     }
 }
