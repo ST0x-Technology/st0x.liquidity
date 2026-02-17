@@ -390,7 +390,6 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
     /// `TakeOrderV3` event through the full `OnchainTrade` pipeline.
     ///
     /// Equity tokens are deployed on first use per symbol and reused for subsequent calls.
-    /// For Buy direction, only `price = 1` is supported (Rain expression ioRatio limitation).
     #[builder]
     async fn take_order(
         &mut self,
@@ -423,14 +422,17 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
         };
 
         // Expression: maxAmount (output in base units) and ioRatio (as Float)
-        // Sell: maxAmount = shares in 18-dec, ioRatio = price
-        // Buy: maxAmount = USDC in 6-dec, ioRatio = 1/price (only price=1 supported)
+        // Sell: output = equity, input = USDC, ioRatio = price (USDC per equity)
+        // Buy:  output = USDC, input = equity, ioRatio = 1/price (equity per USDC)
+        // Rain's parser supports decimal literals (e.g. "0.01"), so we compute
+        // the reciprocal price as a decimal string.
         let (max_amount_base, io_ratio_str) = if is_sell {
             let base: U256 = parse_units(&amount_str, 18).unwrap().into();
             (base, price.to_string())
         } else {
             let base: U256 = parse_units(&usdc_total_str, 6).unwrap().into();
-            (base, "1".to_string())
+            let reciprocal = 1.0 / f64::from(price);
+            (base, format!("{reciprocal}"))
         };
         let expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
 
@@ -1178,7 +1180,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .symbol(TEST_AAPL)
         .amount(0.5)
         .direction(Direction::Buy)
-        .price(1)
+        .price(AAPL_PRICE)
         .call()
         .await;
     let t1_agg = t1.aggregate_id();
@@ -1192,7 +1194,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .accumulated_long(FractionalShares::new(dec!(0.5)))
         .accumulated_short(FractionalShares::ZERO)
         .pending(None)
-        .last_price_usdc(dec!(1))
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
         .call()
         .await;
 
@@ -1202,7 +1204,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .symbol(TEST_AAPL)
         .amount(0.7)
         .direction(Direction::Buy)
-        .price(1)
+        .price(AAPL_PRICE)
         .call()
         .await;
     let t2_agg = t2.aggregate_id();
@@ -1219,7 +1221,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .accumulated_long(FractionalShares::new(dec!(1.2)))
         .accumulated_short(FractionalShares::ZERO)
         .pending(Some(order_id))
-        .last_price_usdc(dec!(1))
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
         .call()
         .await;
 
@@ -1240,16 +1242,16 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     ];
     let events = assert_events(&pool, &expected).await;
 
-    // Verify financial values in OnChainOrderFilled events (Buy direction, price=1)
+    // Verify financial values in OnChainOrderFilled events (Buy direction)
     let t1_filled = &events[1].payload["OnChainOrderFilled"];
     assert_eq!(t1_filled["amount"].as_str().unwrap(), "0.5");
     assert_eq!(t1_filled["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(t1_filled["price_usdc"].as_str().unwrap(), "1");
+    assert_eq!(t1_filled["price_usdc"].as_str().unwrap(), "100");
 
     let t2_filled = &events[3].payload["OnChainOrderFilled"];
     assert_eq!(t2_filled["amount"].as_str().unwrap(), "0.7");
     assert_eq!(t2_filled["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(t2_filled["price_usdc"].as_str().unwrap(), "1");
+    assert_eq!(t2_filled["price_usdc"].as_str().unwrap(), "100");
 
     // Hedge direction should be Sell (opposite of onchain Buy), shares = abs(net)
     assert_eq!(
@@ -1271,7 +1273,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .accumulated_long(FractionalShares::new(dec!(1.2)))
         .accumulated_short(FractionalShares::ZERO)
         .pending(None)
-        .last_price_usdc(dec!(1))
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
         .call()
         .await;
 
@@ -1711,7 +1713,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .symbol(TEST_AAPL)
         .amount(0.8)
         .direction(Direction::Buy)
-        .price(1)
+        .price(AAPL_PRICE)
         .call()
         .await;
     let t1_agg = t1.aggregate_id();
@@ -1724,7 +1726,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .accumulated_long(FractionalShares::new(dec!(0.8)))
         .accumulated_short(FractionalShares::ZERO)
         .pending(None)
-        .last_price_usdc(dec!(1))
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
         .call()
         .await;
 
