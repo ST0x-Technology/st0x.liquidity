@@ -34,12 +34,6 @@ pub enum AlpacaTradingApiError {
     DecimalParse(#[from] rust_decimal::Error),
     #[error("Num parse error: {0}")]
     NumParse(#[from] num_decimal::ParseNumError),
-    #[error("Parse error: {0}")]
-    ParseFloat(#[from] std::num::ParseFloatError),
-    #[error("Parse error: {0}")]
-    ParseInt(#[from] std::num::ParseIntError),
-    #[error("Price {0} cannot be converted to cents")]
-    PriceConversion(f64),
     #[error("Notional orders not supported")]
     NotionalOrdersNotSupported,
     #[error("Filled order {order_id} is missing required field: {field}")]

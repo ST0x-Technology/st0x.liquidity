@@ -1,5 +1,3 @@
-use crate::{FractionalShares, Positive};
-
 /// Database persistence and data corruption errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -9,10 +7,6 @@ pub enum PersistenceError {
     InvalidDirection(#[from] crate::InvalidDirectionError),
     #[error("Invalid trade status in database: {status_provided}")]
     InvalidTradeStatus { status_provided: String },
-    #[error("Invalid share quantity in database: {0}")]
-    InvalidShareQuantity(f64),
-    #[error("Share quantity {0} cannot be converted to f64")]
-    ShareQuantityConversionFailed(Positive<FractionalShares>),
     #[error("Invalid price cents in database: {0}")]
     InvalidPriceCents(i64),
     #[error("Execution missing ID after database save")]
@@ -25,6 +19,10 @@ pub enum PersistenceError {
     ExecutionNotFound(i64),
     #[error("Execution error: {0}")]
     Execution(#[source] Box<crate::ExecutionError>),
+    #[error("Invalid shares in database: {0}")]
+    InvalidShares(#[from] crate::InvalidSharesError),
+    #[error("Decimal parse error: {0}")]
+    DecimalParse(#[from] rust_decimal::Error),
 }
 
 impl From<crate::ExecutionError> for PersistenceError {

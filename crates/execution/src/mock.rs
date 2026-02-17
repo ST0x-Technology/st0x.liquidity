@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use rust_decimal_macros::dec;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -128,7 +129,7 @@ impl Executor for MockExecutor {
         Ok(OrderState::Filled {
             executed_at: chrono::Utc::now(),
             order_id: order_id.clone(),
-            price_cents: 10000, // $100.00 mock price
+            price: dec!(100.00),
         })
     }
 

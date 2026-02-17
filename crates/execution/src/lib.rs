@@ -1,7 +1,6 @@
 use alloy::primitives::U256;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
@@ -298,12 +297,6 @@ impl FractionalShares {
         self.0.fract().is_zero()
     }
 
-    /// Creates FractionalShares from an f64 value (typically from database REAL column).
-    pub fn from_f64(value: f64) -> Result<Self, InvalidSharesError> {
-        let decimal = Decimal::try_from(value)?;
-        Ok(Self(decimal))
-    }
-
     /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
     ///
     /// Returns an error for negative values, underflow (values < 1e-18),
@@ -576,8 +569,8 @@ pub enum ExecutionError {
     Schwab(#[from] schwab::SchwabError),
     #[error("{status:?} order requires order_id")]
     MissingOrderId { status: OrderStatus },
-    #[error("{status:?} order requires price_cents")]
-    MissingPriceCents { status: OrderStatus },
+    #[error("{status:?} order requires price")]
+    MissingPrice { status: OrderStatus },
     #[error("{status:?} order requires executed_at timestamp")]
     MissingExecutedAt { status: OrderStatus },
     #[error("Order not found: {order_id}")]
@@ -592,10 +585,6 @@ pub enum ExecutionError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
-    #[error("Negative shares value: {value}")]
-    NegativeShares { value: f64 },
-    #[error("Price {price} cannot be converted to cents")]
-    PriceConversion { price: f64 },
     #[error("Numeric conversion error: {0}")]
     NumericConversion(#[from] std::num::TryFromIntError),
     #[error("Date/time parse error: {0}")]
@@ -918,31 +907,6 @@ mod tests {
             }
         }
 
-        #[test]
-        fn fractional_shares_from_f64_roundtrip_within_precision(
-            mantissa in 1i64..=999_999_999_999i64,
-            scale in 0u32..=6,
-        ) {
-            let decimal = Decimal::new(mantissa, scale);
-            let shares = FractionalShares::new(decimal);
-
-            if let Some(f64_value) = shares.inner().to_f64()
-                && f64_value.is_finite()
-                && f64_value > 0.0
-            {
-                let roundtrip = FractionalShares::from_f64(f64_value).unwrap();
-                let diff = (shares.inner() - roundtrip.inner()).abs();
-                // f64 has ~15-16 significant decimal digits. For large values like
-                // 4322285221.77, some precision loss in lower digits is expected.
-                // Use 1e-6 as tolerance which is realistic for f64 roundtrips.
-                prop_assert!(
-                    diff <= Decimal::new(1, 6),
-                    "Roundtrip diff too large: {} for original {}",
-                    diff,
-                    decimal
-                );
-            }
-        }
     }
 
     #[test]

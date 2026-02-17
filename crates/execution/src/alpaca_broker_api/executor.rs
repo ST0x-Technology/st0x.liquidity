@@ -142,7 +142,7 @@ impl Executor for AlpacaBrokerApi {
                 order_id: order_id.clone(),
             }),
             OrderStatus::Filled => {
-                let price_cents = order_update.price_cents.ok_or_else(|| {
+                let price = order_update.price.ok_or_else(|| {
                     AlpacaBrokerApiError::IncompleteFilledOrder {
                         order_id: order_id.clone(),
                         field: "price".to_string(),
@@ -152,7 +152,7 @@ impl Executor for AlpacaBrokerApi {
                 Ok(OrderState::Filled {
                     executed_at: order_update.updated_at,
                     order_id: order_id.clone(),
-                    price_cents,
+                    price,
                 })
             }
             OrderStatus::Failed => Ok(OrderState::Failed {

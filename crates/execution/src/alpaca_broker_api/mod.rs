@@ -105,9 +105,6 @@ pub enum AlpacaBrokerApiError {
     #[error("Invalid order ID: {0}")]
     InvalidOrderId(#[from] uuid::Error),
 
-    #[error("Price {0} cannot be converted to cents")]
-    PriceConversion(f64),
-
     #[error("Filled order {order_id} is missing required field: {field}")]
     IncompleteFilledOrder { order_id: String, field: String },
 

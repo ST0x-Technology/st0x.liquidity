@@ -135,12 +135,13 @@ impl Executor for Schwab {
             crate::schwab::order::Order::get_order_status(order_id, &self.auth, &self.pool).await?;
 
         if order_response.is_filled() {
-            let price_cents = order_response.price_in_cents()?.ok_or_else(|| {
-                ExecutionError::IncompleteOrderResponse {
-                    field: "price".to_string(),
-                    status: OrderStatus::Filled,
-                }
-            })?;
+            let price =
+                order_response
+                    .price()
+                    .ok_or_else(|| ExecutionError::IncompleteOrderResponse {
+                        field: "price".to_string(),
+                        status: OrderStatus::Filled,
+                    })?;
 
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
                 ExecutionError::IncompleteOrderResponse {
@@ -156,7 +157,7 @@ impl Executor for Schwab {
             Ok(OrderState::Filled {
                 executed_at,
                 order_id: order_id.clone(),
-                price_cents,
+                price,
             })
         } else if order_response.is_terminal_failure() {
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
@@ -205,13 +206,15 @@ impl Executor for Schwab {
                 Ok(current_state) => {
                     // Only include orders that have changed status
                     if !matches!(current_state, OrderState::Submitted { .. }) {
-                        let price_cents = match &current_state {
-                            OrderState::Filled { price_cents, .. } => Some(*price_cents),
+                        let price = match &current_state {
+                            OrderState::Filled { price, .. } => Some(*price),
                             _ => None,
                         };
 
                         let symbol = Symbol::new(row.symbol)?;
-                        let shares = Positive::new(FractionalShares::from_f64(row.shares)?)?;
+                        let shares_decimal: rust_decimal::Decimal =
+                            row.shares.to_string().parse()?;
+                        let shares = Positive::new(FractionalShares::new(shares_decimal))?;
                         let direction: Direction = row.direction.parse()?;
 
                         updates.push(OrderUpdate {
@@ -221,7 +224,7 @@ impl Executor for Schwab {
                             direction,
                             status: current_state.status(),
                             updated_at: chrono::Utc::now(),
-                            price_cents,
+                            price,
                         });
                     }
                 }

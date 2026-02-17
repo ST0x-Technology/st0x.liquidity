@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 
 use crate::{Direction, FractionalShares, Positive, Symbol};
 
@@ -27,7 +28,7 @@ pub struct OrderUpdate<OrderId> {
     pub direction: Direction,
     pub status: OrderStatus,
     pub updated_at: DateTime<Utc>,
-    pub price_cents: Option<u64>,
+    pub price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
