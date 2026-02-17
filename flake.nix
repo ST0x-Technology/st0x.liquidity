@@ -79,9 +79,9 @@
             additionalBuildInputs = rainix.sol-build-inputs.${system};
             body = ''
               set -euxo pipefail
-
               (cd lib/rain.orderbook/ && forge build)
               (cd lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
+              (cd lib/rain.orderbook/lib/rain.interpreter/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
             '';
