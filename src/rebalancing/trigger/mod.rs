@@ -30,7 +30,6 @@ use crate::tokenized_equity_mint::{
 use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
 };
-use crate::vault::WrappedTokenRegistry;
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapper::Wrapper;
 use crate::wrapper::{EquityTokenAddresses, UnderlyingPerWrapped};
@@ -525,7 +524,10 @@ impl RebalancingTrigger {
             | DetectionFailed { .. }
             | RedemptionRejected { .. } => true,
 
-            VaultWithdrawn { .. } | TokensSent { .. } | Detected { .. } => false,
+            VaultWithdrawn { .. }
+            | TokensUnwrapped { .. }
+            | TokensSent { .. }
+            | Detected { .. } => false,
         }
     }
 

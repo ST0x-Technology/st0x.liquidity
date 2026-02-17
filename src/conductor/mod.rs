@@ -51,8 +51,7 @@ use crate::queue::{
 };
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
-    RebalancerAddresses, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig,
-    spawn_rebalancer,
+    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -366,10 +365,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         mint: Arc::new(built.mint),
         redemption: Arc::new(built.redemption),
         usdc: Arc::new(built.usdc),
-    };
-
-    let addresses = RebalancerAddresses {
-        market_maker_wallet,
     };
 
     let handle = spawn_rebalancer(

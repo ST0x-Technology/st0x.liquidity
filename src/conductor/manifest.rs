@@ -76,6 +76,7 @@ impl QueryManifest {
         inventory: Arc<RwLock<InventoryView>>,
         operation_sender: mpsc::Sender<TriggeredOperation>,
         event_sender: broadcast::Sender<ServerMessage>,
+        wrapper: Arc<dyn crate::wrapper::Wrapper>,
     ) -> Self {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,

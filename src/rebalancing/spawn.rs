@@ -27,8 +27,7 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::VaultRegistryQuery;
-use crate::wrapper::{Wrapper, WrapperService};
+use crate::wrapper::WrapperService;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -64,12 +63,6 @@ pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) usdc: Arc<Store<UsdcRebalance>>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct RebalancerAddresses {
-    pub(crate) market_maker_wallet: Address,
-    pub(crate) orderbook: Address,
-}
-
 /// Spawns the rebalancing infrastructure.
 ///
 /// All CQRS frameworks are created in the conductor and passed here to ensure
@@ -99,7 +92,8 @@ where
     )
     .await?;
 
-    let rebalancer = services.into_rebalancer(ctx, addresses, operation_receiver, frameworks);
+    let rebalancer =
+        services.into_rebalancer(ctx, market_maker_wallet, operation_receiver, frameworks);
 
     let handle = tokio::spawn(async move {
         rebalancer.run().await;
@@ -188,7 +182,7 @@ where
     fn into_rebalancer(
         self,
         ctx: &RebalancingCtx,
-        addresses: RebalancerAddresses,
+        market_maker_wallet: Address,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
     ) -> Rebalancer
@@ -198,7 +192,7 @@ where
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
-            addresses.market_maker_wallet,
+            market_maker_wallet,
             frameworks.mint,
             frameworks.redemption,
         ));
@@ -209,7 +203,7 @@ where
             self.cctp,
             self.raindex,
             frameworks.usdc,
-            addresses.market_maker_wallet,
+            market_maker_wallet,
             RaindexVaultId(ctx.usdc_vault_id),
         ));
 
@@ -236,7 +230,6 @@ mod tests {
         AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
     };
     use std::collections::HashMap;
-    use std::collections::HashMap;
     use uuid::Uuid;
 
     use st0x_event_sorcery::{Projection, test_store};
@@ -250,7 +243,6 @@ mod tests {
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
-    use crate::vault::WrappedTokenRegistry;
     use crate::vault_registry::VaultRegistry;
 
     /// Provider type returned by `ProviderBuilder::new().connect_http()` without wallet.
@@ -529,15 +521,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let rebalancer = services.into_rebalancer(
-            &config,
-            RebalancerAddresses {
-                market_maker_wallet: Address::random(),
-                orderbook: TEST_ORDERBOOK,
-            },
-            rx,
-            frameworks,
-        );
+        let rebalancer = services.into_rebalancer(&config, Address::random(), rx, frameworks);
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
