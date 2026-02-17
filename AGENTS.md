@@ -297,68 +297,16 @@ abstractions.
 For detailed implementation requirements and module organization, see
 @crates/execution/AGENTS.md
 
-### Core Event Processing Flow
+### Core Flow
 
-**Main Event Loop ([`launch` function in `src/lib.rs`])**
-
-- Monitors two concurrent WebSocket event streams: `ClearV2` and `TakeOrderV2`
-  from the Raindex orderbook
-- Uses `tokio::select!` to handle events from either stream without blocking
-- Converts blockchain events to structured `Trade` objects for processing
-
-**Trade Conversion Logic ([`Trade` struct and methods in `src/trade/mod.rs`])**
-
-- Parses onchain events into actionable trade data with strict validation
-- Expects symbol pairs of USDC + tokenized equity with "t" prefix (e.g.,
-  "tAAPL")
-- Determines Schwab trade direction: buying tokenized equity onchain -> selling
-  on Schwab
-- Calculates prices in cents and maintains onchain/offchain trade ratios
-
-**Async Event Processing Architecture**
-
-- Each blockchain event spawns independent async execution flow
-- Handles throughput mismatch: fast onchain events vs slower Schwab API calls
-- No artificial concurrency limits - processes events as they arrive
-- Flow: Parse Event -> SQLite Deduplication Check -> Schwab API Call -> Record
-  Result
-
-### Authentication & API Integration
-
-**Charles Schwab OAuth (`src/schwab.rs`)**
-
-- OAuth 2.0 flow with 30-minute access tokens and 7-day refresh tokens
-- Token storage and retrieval from SQLite database
-- Comprehensive error handling for authentication failures
-
-**Symbol Caching (`crate::symbol::cache::SymbolCache`)**
-
-- Thread-safe caching of ERC20 token symbols using `tokio::sync::RwLock`
-- Prevents repeated RPC calls for the same token addresses
-
-### Database Schema & Idempotency
-
-**Key tables** (see migrations for full schema):
-
-- `onchain_trades`: Immutable blockchain trade records, keyed by
-  `(tx_hash, log_index)`
-- `schwab_executions`: Order execution tracking with status transitions
-- `trade_accumulators`: Unified position tracking per symbol
-- `trade_execution_links`: Many-to-many audit trail between trades and
-  executions
-- `schwab_auth`: OAuth token storage (singleton)
-- `event_queue`: Idempotent event processing queue, keyed by
-  `(tx_hash, log_index)`
-- `symbol_locks`: Per-symbol execution concurrency control
-
-**Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
-tracking (pending -> completed/failed), retry logic with exponential backoff
+The main event loop (`src/lib.rs`) monitors WebSocket streams (`ClearV2`,
+`TakeOrderV2`) from Raindex, converts events to `Trade` objects, and spawns
+async execution flows per event. Idempotency via `(tx_hash, log_index)` keys.
 
 ### Configuration
 
-Configuration is split into plaintext config (`--config`, see
-`example.config.toml`) and encrypted secrets (`--secrets`, see
-`example.secrets.toml`). The reporter binary only takes `--config` (no secrets).
+Plaintext config (`--config`, see `example.config.toml`) and encrypted secrets
+(`--secrets`, see `example.secrets.toml`).
 
 ### Naming Conventions
 
@@ -816,28 +764,11 @@ multiple outcomes unless genuinely equivalent. Use `assert_eq!` with specific
 values, not `assert!(result.is_some())`. If writing `||` in an assertion, you
 likely don't understand the expected behavior - investigate first.
 
-#### Type modeling examples
+#### Type modeling
 
-**Principle**: Choose the type representation that most accurately models the
-domain. Don't blindly apply patterns - think carefully about whether structs,
-enums, newtypes, or other constructs best represent the concept at hand.
-
-##### Make invalid states unrepresentable:
-
-Instead of multiple optional fields that can contradict each other (e.g.,
-`status: String` + `order_id: Option<String>` + `error_reason: Option<String>`),
-use enum variants where each state carries exactly the data it needs.
-
-##### Use newtypes for domain concepts:
-
-Wrap primitives in newtypes to prevent mixing incompatible values at call sites
-(e.g., `Symbol(String)`, `AccountId(String)`, `Shares(i64)`, `PriceCents(i64)`).
-
-##### The Typestate Pattern:
-
-Encode runtime state in compile-time types to eliminate runtime checks. Use for
-protocol enforcement and builder patterns (e.g., `Connection<Unauthenticated>`
--> `Connection<Authenticated>`).
+Use enums (not optional fields) for mutually exclusive states, newtypes for
+domain concepts (`Symbol`, `Shares`), and typestate for protocol enforcement.
+Make invalid states unrepresentable.
 
 #### Avoid deep nesting
 
@@ -854,13 +785,8 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 #### Struct field access
 
-Avoid creating unnecessary constructors or getters when they don't add logic
-beyond setting/getting field values. Use public fields directly instead.
-
-Use struct literal syntax directly (`SchwabTokens { access_token: "...", ... }`)
-and access fields directly (`tokens.access_token`). Don't create `fn new()`
-constructors or `fn field(&self)` getters unless they add meaningful logic
-beyond setting/getting field values.
+Use struct literal syntax and direct field access. Don't create `fn new()`
+constructors or getters unless they add logic beyond setting/getting values.
 
 #### Prefer destructuring over `.0` access
 
