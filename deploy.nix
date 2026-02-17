@@ -15,19 +15,19 @@ let
     (builtins.filter (n: !services.${n}.enabled)
       (builtins.attrNames services)));
 
-  # Decrypts config and restarts service atomically
+  # Decrypts secrets and restarts service atomically
   mkServiceProfile = name:
     let
       markerFile = "/run/st0x/${name}.ready";
-      configFile = ./config/${name}.toml.age;
-      decrypted = "/run/agenix/${name}.toml";
+      secretsFile = ./secret/${name}.toml.age;
+      decryptedSecrets = "/run/agenix/${name}.toml";
     in activate.custom st0xPackage (builtins.concatStringsSep " && " [
       "systemctl stop ${name} || true"
       "rm -f ${markerFile}"
       "mkdir -p /run/agenix /run/st0x"
-      "${rage} -d -i ${hostKey} ${configFile} > ${decrypted}"
-      "chown root:st0x ${decrypted}"
-      "chmod 0640 ${decrypted}"
+      "${rage} -d -i ${hostKey} ${secretsFile} > ${decryptedSecrets}"
+      "chown root:st0x ${decryptedSecrets}"
+      "chmod 0640 ${decryptedSecrets}"
       "touch ${markerFile}"
       "systemctl restart ${name}"
     ]);

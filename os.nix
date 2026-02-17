@@ -7,7 +7,9 @@ let
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
 
   mkService = name: cfg:
-    let path = "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
+    let
+      path = "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
+      configFile = ./config/${name}.toml;
     in {
       description = "st0x ${cfg.bin} (${name})";
 
@@ -31,7 +33,9 @@ let
         SupplementaryGroups = [ "st0x" ];
         ExecStart = builtins.concatStringsSep " " [
           path
-          "--config-file"
+          "--config"
+          "${configFile}"
+          "--secrets"
           "/run/agenix/${name}.toml"
         ];
         Restart = "always";
