@@ -7,39 +7,36 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
-use cqrs_es::{CqrsFramework, EventStore};
 use rust_decimal::Decimal;
-use st0x_execution::Symbol;
+use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
+
+use st0x_event_sorcery::Store;
 
 use super::{Mint, MintError};
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::lifecycle::{Lifecycle, Never};
-use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 
-pub(crate) struct MintManager<P, ES>
+pub(crate) struct MintManager<P>
 where
     P: Provider + Clone,
-    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
     service: Arc<AlpacaTokenizationService<P>>,
-    cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
+    cqrs: Arc<Store<TokenizedEquityMint>>,
 }
 
-impl<P, ES> MintManager<P, ES>
+impl<P> MintManager<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
     pub(crate) fn new(
         service: Arc<AlpacaTokenizationService<P>>,
-        cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
+        cqrs: Arc<Store<TokenizedEquityMint>>,
     ) -> Self {
         Self { service, cqrs }
     }
@@ -67,8 +64,8 @@ where
         info!(%symbol, ?quantity, %wallet, "Starting mint workflow");
 
         self.cqrs
-            .execute(
-                &issuer_request_id.0,
+            .send(
+                issuer_request_id,
                 TokenizedEquityMintCommand::RequestMint {
                     symbol: symbol.clone(),
                     quantity: quantity.inner(),
@@ -93,8 +90,8 @@ where
             .ok_or(MintError::MissingIssuerRequestId)?;
 
         self.cqrs
-            .execute(
-                &issuer_request_id.0,
+            .send(
+                issuer_request_id,
                 TokenizedEquityMintCommand::AcknowledgeAcceptance {
                     issuer_request_id: alpaca_issuer_request_id,
                     tokenization_request_id: alpaca_request.id.clone(),
@@ -129,8 +126,8 @@ where
         reason: String,
     ) -> Result<(), MintError> {
         self.cqrs
-            .execute(
-                &issuer_request_id.0,
+            .send(
+                issuer_request_id,
                 TokenizedEquityMintCommand::RejectMint { reason },
             )
             .await?;
@@ -144,8 +141,8 @@ where
         reason: String,
     ) -> Result<(), MintError> {
         self.cqrs
-            .execute(
-                &issuer_request_id.0,
+            .send(
+                issuer_request_id,
                 TokenizedEquityMintCommand::FailAcceptance { reason },
             )
             .await?;
@@ -164,8 +161,8 @@ where
                 let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity)?;
 
                 self.cqrs
-                    .execute(
-                        &issuer_request_id.0,
+                    .send(
+                        issuer_request_id,
                         TokenizedEquityMintCommand::ReceiveTokens {
                             tx_hash,
                             receipt_id: ReceiptId(U256::ZERO),
@@ -175,7 +172,7 @@ where
                     .await?;
 
                 self.cqrs
-                    .execute(&issuer_request_id.0, TokenizedEquityMintCommand::Finalize)
+                    .send(issuer_request_id, TokenizedEquityMintCommand::Finalize)
                     .await?;
 
                 info!("Mint workflow completed successfully");
@@ -212,11 +209,9 @@ fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintErro
 }
 
 #[async_trait]
-impl<P, ES> Mint for MintManager<P, ES>
+impl<P> Mint for MintManager<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>> + Send + Sync,
-    ES::AC: Send,
 {
     async fn execute_mint(
         &self,
@@ -233,26 +228,22 @@ where
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{U256, address};
-    use cqrs_es::CqrsFramework;
-    use cqrs_es::mem_store::MemStore;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+
+    use st0x_event_sorcery::test_store;
 
     use super::*;
     use crate::alpaca_tokenization::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
         tokenization_requests_path,
     };
+    use crate::test_utils::setup_test_db;
 
-    type TestCqrs = CqrsFramework<
-        Lifecycle<TokenizedEquityMint, Never>,
-        MemStore<Lifecycle<TokenizedEquityMint, Never>>,
-    >;
-
-    fn create_test_cqrs() -> Arc<TestCqrs> {
-        let store = MemStore::default();
-        Arc::new(CqrsFramework::new(store, vec![], ()))
+    async fn create_test_store_instance() -> Arc<Store<TokenizedEquityMint>> {
+        let pool = setup_test_db().await;
+        Arc::new(test_store(pool, ()))
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {
@@ -319,7 +310,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
@@ -356,7 +347,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
@@ -407,7 +398,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
@@ -436,7 +427,7 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {

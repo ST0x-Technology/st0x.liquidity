@@ -9,12 +9,10 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+
+use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Positive};
 use std::ops::{Add, Mul, Sub};
 use std::str::FromStr;
-
-use st0x_execution::{FractionalShares, Positive};
-
-use crate::shares::{ArithmeticError, HasZero};
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -73,8 +71,7 @@ impl Usdc {
             .checked_mul(USDC_DECIMAL_SCALE)
             .ok_or(UsdcConversionError::Overflow)?;
 
-        U256::from_str_radix(&scaled.trunc().to_string(), 10)
-            .map_err(UsdcConversionError::ParseError)
+        Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
     }
 }
 
@@ -240,20 +237,20 @@ mod tests {
 
     #[test]
     fn usdc_add_succeeds() {
-        let a = Usdc(Decimal::ONE);
-        let b = Usdc(Decimal::TWO);
+        let smaller = Usdc(Decimal::ONE);
+        let larger = Usdc(Decimal::TWO);
 
-        let result = (a + b).unwrap();
+        let result = (smaller + larger).unwrap();
 
         assert_eq!(result.0, Decimal::from(3));
     }
 
     #[test]
     fn usdc_sub_succeeds() {
-        let a = Usdc(Decimal::from(5));
-        let b = Usdc(Decimal::TWO);
+        let larger = Usdc(Decimal::from(5));
+        let smaller = Usdc(Decimal::TWO);
 
-        let result = (a - b).unwrap();
+        let result = (larger - smaller).unwrap();
 
         assert_eq!(result.0, Decimal::from(3));
     }

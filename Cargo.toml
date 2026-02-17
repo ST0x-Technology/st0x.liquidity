@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "crates/dto", "crates/execution", "crates/bridge"]
+members = [
+  ".",
+  "crates/dto",
+  "crates/event-sorcery",
+  "crates/execution",
+  "crates/bridge",
+]
 resolver = "2"
 
 [workspace.package]
@@ -14,7 +20,7 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
-enum_glob_use = "deny"
+enum_glob_use = "allow"
 
 # `priority = -1` allow for allowing lints enabled by a group to be re-disabled
 pedantic = { level = "deny", priority = -1 }
@@ -87,8 +93,8 @@ edition = "2024"
 alloy.workspace = true
 anyhow = "1.0.98"
 async-trait.workspace = true
-cqrs-es.workspace = true
 sqlite-es.workspace = true
+st0x-event-sorcery = { path = "crates/event-sorcery" }
 st0x-dto = { path = "crates/dto" }
 st0x-bridge = { path = "crates/bridge", features = ["cctp"] }
 st0x-execution = { path = "crates/execution" }
@@ -138,6 +144,9 @@ serial_test.workspace = true
 proptest.workspace = true
 temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"
+st0x-event-sorcery = { path = "crates/event-sorcery", features = [
+  "test-support",
+] }
 st0x-execution = { path = "crates/execution", features = ["mock"] }
 tempfile = "3.24.0"
 tracing-test = "0.2.5"

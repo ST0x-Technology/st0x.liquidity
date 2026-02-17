@@ -7,34 +7,25 @@ use alloy::providers::fillers::{
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::Query;
-use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use st0x_dto::ServerMessage;
+use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
+use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
 
 use super::usdc::UsdcRebalanceManager;
-use super::{
-    MintManager, Rebalancer, RebalancingCtx, RebalancingTrigger, RedemptionManager,
-    TriggeredOperation,
-};
-use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-
+use super::{MintManager, Rebalancer, RebalancingCtx, RedemptionManager, TriggeredOperation};
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
-use crate::dashboard::EventBroadcaster;
-use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
-use crate::lifecycle::{Lifecycle, Never};
+use crate::equity_redemption::EquityRedemption;
 use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
-use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
+use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::usdc_rebalance::UsdcRebalance;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -46,7 +37,7 @@ pub(crate) enum SpawnRebalancerError {
     #[error("failed to create Alpaca broker API: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
-    Cctp(#[from] st0x_bridge::cctp::CctpError),
+    Cctp(#[from] CctpError),
 }
 
 /// Provider type returned by `ProviderBuilder::connect_http` with wallet.
@@ -63,16 +54,13 @@ type HttpProvider = FillProvider<
 >;
 
 /// Type alias for a configured rebalancer with SQLite persistence.
-type ConfiguredRebalancer<BP> = Rebalancer<
-    MintManager<BP, MintEventStore>,
-    RedemptionManager<BP, RedemptionEventStore>,
-    UsdcRebalanceManager<BP, UsdcEventStore>,
->;
+type ConfiguredRebalancer<BP> =
+    Rebalancer<MintManager<BP>, RedemptionManager<BP>, UsdcRebalanceManager<BP>>;
 
 pub(crate) struct RebalancingCqrsFrameworks {
-    pub(crate) mint: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
-    pub(crate) redemption: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
-    pub(crate) usdc: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
+    pub(crate) mint: Arc<Store<TokenizedEquityMint>>,
+    pub(crate) redemption: Arc<Store<EquityRedemption>>,
+    pub(crate) usdc: Arc<Store<UsdcRebalance>>,
 }
 
 /// Spawns the rebalancing infrastructure.
@@ -192,21 +180,21 @@ where
         ctx: &RebalancingCtx,
         market_maker_wallet: Address,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
-        redemption_cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
-        usdc_cqrs: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
+        mint_store: Arc<Store<TokenizedEquityMint>>,
+        redemption_store: Arc<Store<EquityRedemption>>,
+        usdc_store: Arc<Store<UsdcRebalance>>,
     ) -> ConfiguredRebalancer<BP> {
-        let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
+        let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_store));
 
         let redemption_manager =
-            Arc::new(RedemptionManager::new(self.tokenization, redemption_cqrs));
+            Arc::new(RedemptionManager::new(self.tokenization, redemption_store));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
             self.broker,
             self.wallet,
             self.cctp,
             self.vault,
-            usdc_cqrs,
+            usdc_store,
             market_maker_wallet,
             VaultId(ctx.usdc_vault_id),
         ));
@@ -221,24 +209,6 @@ where
     }
 }
 
-pub(crate) fn build_rebalancing_queries<A>(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<A, Never>>>>
-where
-    Lifecycle<A, Never>: cqrs_es::Aggregate,
-    RebalancingTrigger: Query<Lifecycle<A, Never>>,
-    EventBroadcaster: Query<Lifecycle<A, Never>>,
-{
-    let mut queries: Vec<Box<dyn Query<Lifecycle<A, Never>>>> = vec![Box::new(trigger)];
-
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
-
-    queries
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::Anvil;
@@ -248,11 +218,11 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
-    use st0x_execution::alpaca_broker_api::TimeInForce;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use uuid::Uuid;
+
+    use st0x_event_sorcery::test_store;
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
@@ -285,7 +255,7 @@ mod tests {
                 account_id: Uuid::nil().to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
-                time_in_force: TimeInForce::Day,
+                time_in_force: TimeInForce::default(),
             },
         }
     }
@@ -374,7 +344,7 @@ mod tests {
             account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
+            time_in_force: TimeInForce::default(),
         };
         let broker = Arc::new(
             AlpacaBrokerApi::try_from_ctx(broker_auth)
@@ -427,17 +397,17 @@ mod tests {
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
 
         let (_tx, rx) = mpsc::channel(100);
-        let mint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let redemption_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let usdc_cqrs = Arc::new(sqlite_cqrs(pool, vec![], ()));
+        let mint_store = Arc::new(test_store(pool.clone(), ()));
+        let redemption_store = Arc::new(test_store(pool.clone(), ()));
+        let usdc_store = Arc::new(test_store(pool, ()));
 
         let _rebalancer = services.into_rebalancer(
             &rebalancing_ctx,
             market_maker_wallet,
             rx,
-            mint_cqrs,
-            redemption_cqrs,
-            usdc_cqrs,
+            mint_store,
+            redemption_store,
+            usdc_store,
         );
     }
 
@@ -460,7 +430,7 @@ mod tests {
             account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
+            time_in_force: TimeInForce::default(),
         };
 
         // Verify the error can be converted to SpawnRebalancerError

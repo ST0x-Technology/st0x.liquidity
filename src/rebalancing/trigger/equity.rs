@@ -37,7 +37,7 @@ impl InProgressGuard {
     ) -> Option<Self> {
         {
             let mut guard = match in_progress.write() {
-                Ok(g) => g,
+                Ok(guard) => guard,
                 Err(poison) => poison.into_inner(),
             };
 
@@ -66,7 +66,7 @@ impl Drop for InProgressGuard {
     fn drop(&mut self) {
         if !self.defused {
             let mut guard = match self.in_progress.write() {
-                Ok(g) => g,
+                Ok(guard) => guard,
                 Err(poison) => poison.into_inner(),
             };
             guard.remove(&self.symbol);
@@ -109,12 +109,12 @@ mod tests {
     use alloy::primitives::{TxHash, address};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use st0x_execution::Direction;
+
+    use st0x_execution::{Direction, ExecutorOrderId, FractionalShares, Positive};
 
     use super::*;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
-    use crate::shares::FractionalShares;
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
@@ -136,10 +136,10 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
-            shares_filled,
+            offchain_order_id: OffchainOrderId::new(),
+            shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
-            broker_order_id: BrokerOrderId("ORD1".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD1"),
             price_cents: PriceCents(15000),
             broker_timestamp: chrono::Utc::now(),
         }

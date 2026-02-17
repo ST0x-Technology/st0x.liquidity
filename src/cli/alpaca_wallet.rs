@@ -473,8 +473,8 @@ pub(super) async fn alpaca_convert_command<W: Write>(
                 let usd_amount = price_decimal * qty;
                 writeln!(stdout, "   USD Amount: ${usd_amount}")?;
             }
-            Err(e) => {
-                writeln!(stdout, "   USD Amount: (conversion error: {e})")?;
+            Err(error) => {
+                writeln!(stdout, "   USD Amount: (conversion error: {error})")?;
             }
         }
     }
@@ -528,7 +528,7 @@ mod tests {
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
+            time_in_force: TimeInForce::default(),
         });
         ctx
     }
@@ -553,7 +553,7 @@ mod tests {
                 account_id: alpaca_account_id.to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
-                time_in_force: TimeInForce::Day,
+                time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
             rebalancing: Some(RebalancingCtx {
@@ -576,7 +576,7 @@ mod tests {
                     account_id: alpaca_account_id.to_string(),
                     mode: Some(AlpacaBrokerApiMode::Sandbox),
                     asset_cache_ttl: std::time::Duration::from_secs(3600),
-                    time_in_force: TimeInForce::Day,
+                    time_in_force: TimeInForce::default(),
                 },
             }),
             execution_threshold: ExecutionThreshold::whole_share(),
@@ -758,85 +758,6 @@ mod tests {
         assert!(
             output.contains("500.50 USDC"),
             "Expected amount in output, got: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_whitelist_list_requires_alpaca_broker() {
-        let ctx = create_ctx_without_alpaca();
-
-        let mut stdout = Vec::new();
-        let err_msg = alpaca_whitelist_list_command(&mut stdout, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err_msg.contains("requires Alpaca Broker API configuration"),
-            "Expected Alpaca Broker API error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_whitelist_list_requires_rebalancing_config() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
-
-        let mut stdout = Vec::new();
-        let err_msg = alpaca_whitelist_list_command(&mut stdout, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err_msg.contains("requires rebalancing configuration"),
-            "Expected rebalancing config error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_unwhitelist_requires_alpaca_broker() {
-        let ctx = create_ctx_without_alpaca();
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let mut stdout = Vec::new();
-        let err_msg = alpaca_unwhitelist_command(&mut stdout, address, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err_msg.contains("requires Alpaca Broker API configuration"),
-            "Expected Alpaca Broker API error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_unwhitelist_requires_rebalancing_config() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let mut stdout = Vec::new();
-        let err_msg = alpaca_unwhitelist_command(&mut stdout, address, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err_msg.contains("requires rebalancing configuration"),
-            "Expected rebalancing config error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_unwhitelist_writes_address_to_stdout() {
-        let ctx = create_full_alpaca_ctx();
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let mut stdout = Vec::new();
-        alpaca_unwhitelist_command(&mut stdout, address, &ctx)
-            .await
-            .unwrap_err();
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains(&address.to_string()),
-            "Expected address in output, got: {output}"
         );
     }
 

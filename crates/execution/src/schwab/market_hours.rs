@@ -4,6 +4,8 @@ use chrono_tz::{Tz, US::Eastern};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use std::fmt::Write;
+use thiserror::Error;
 use tracing::debug;
 
 use super::{SchwabAuthCtx, SchwabError, SchwabTokens};
@@ -16,15 +18,23 @@ pub enum MarketSession {
     AfterHours,
 }
 
-impl std::str::FromStr for MarketSession {
-    type Err = String;
+#[derive(Debug, PartialEq, Eq, Error)]
+#[error("invalid market session: {session_provided}")]
+pub struct ParseMarketSessionError {
+    session_provided: String,
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+impl std::str::FromStr for MarketSession {
+    type Err = ParseMarketSessionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
             "PRE_MARKET" => Ok(Self::PreMarket),
             "REGULAR" => Ok(Self::Regular),
             "AFTER_HOURS" => Ok(Self::AfterHours),
-            _ => Err(format!("Invalid market session: {s}")),
+            _ => Err(ParseMarketSessionError {
+                session_provided: value.to_string(),
+            }),
         }
     }
 }
@@ -147,7 +157,6 @@ pub(crate) async fn fetch_market_hours(
     let mut url = format!("{}marketdata/v1/markets/equity", ctx.base_url()?);
 
     if let Some(date_param) = date {
-        use std::fmt::Write;
         write!(url, "?date={date_param}").map_err(|e| SchwabError::RequestFailed {
             action: "format URL".to_string(),
             status: reqwest::StatusCode::OK,
@@ -471,7 +480,9 @@ mod tests {
 
         assert_eq!(
             "INVALID".parse::<MarketSession>().unwrap_err(),
-            "Invalid market session: INVALID"
+            ParseMarketSessionError {
+                session_provided: "INVALID".to_string(),
+            }
         );
     }
 

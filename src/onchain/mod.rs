@@ -9,24 +9,24 @@ use alloy::transports::layers::RetryBackoffLayer;
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
 use serde::Deserialize;
+use std::num::TryFromIntError;
+use url::Url;
+
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::{
     EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
-    InvalidSharesError, PersistenceError,
+    InvalidSharesError, PersistenceError, SharesConversionError,
 };
-use std::num::{ParseFloatError, TryFromIntError};
-use url::Url;
 
-use crate::dual_write::DualWriteError;
-use crate::position::PositionError;
+use st0x_event_sorcery::ProjectionError;
+
+use crate::position::{Position, PositionError};
 use crate::queue::EventQueueError;
-use crate::shares::SharesConversionError;
 
 pub(crate) mod accumulator;
 pub(crate) mod backfill;
 mod clear;
 pub(crate) mod io;
-pub(crate) mod position_calculator;
 pub(crate) mod pyth;
 mod take_order;
 pub(crate) mod trade;
@@ -117,12 +117,18 @@ pub(crate) enum OnChainError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
-    #[error("Dual write error: {0}")]
-    DualWrite(#[from] DualWriteError),
     #[error("Position error: {0}")]
     Position(#[from] PositionError),
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] SharesConversionError),
+    #[error("Decimal parse error: {0}")]
+    DecimalParse(#[from] rust_decimal::Error),
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("UUID parse error: {0}")]
+    Uuid(#[from] uuid::Error),
+    #[error("Position projection error: {0}")]
+    PositionProjection(#[from] ProjectionError<Position>),
 }
 
 impl From<sqlx::Error> for OnChainError {
@@ -134,12 +140,6 @@ impl From<sqlx::Error> for OnChainError {
 impl From<alloy::contract::Error> for OnChainError {
     fn from(err: alloy::contract::Error) -> Self {
         Self::Alloy(AlloyError::GetSymbol(err))
-    }
-}
-
-impl From<ParseFloatError> for OnChainError {
-    fn from(err: ParseFloatError) -> Self {
-        Self::Validation(TradeValidationError::U256ToF64(err))
     }
 }
 

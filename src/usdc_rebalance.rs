@@ -61,19 +61,15 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use sqlite_es::SqliteEventRepository;
+use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::alpaca_wallet::AlpacaTransferId;
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::threshold::Usdc;
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
-/// SQLite-backed event store for UsdcRebalance aggregates.
-pub(crate) type UsdcEventStore =
-    PersistedEventStore<SqliteEventRepository, Lifecycle<UsdcRebalance, Never>>;
+use crate::alpaca_wallet::AlpacaTransferId;
+use crate::threshold::Usdc;
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +78,20 @@ pub(crate) struct UsdcRebalanceId(pub(crate) String);
 impl UsdcRebalanceId {
     pub(crate) fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+}
+
+impl Display for UsdcRebalanceId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for UsdcRebalanceId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -100,7 +110,7 @@ pub(crate) enum RebalanceDirection {
 }
 
 /// Errors that can occur during USDC rebalance operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum UsdcRebalanceError {
     /// Attempted to initiate when already in progress
     #[error("Rebalancing has already been initiated")]
@@ -150,9 +160,6 @@ pub(crate) enum UsdcRebalanceError {
     /// Command not valid for current state
     #[error("Command {command} not valid for state {state}")]
     InvalidCommand { command: String, state: String },
-    /// Lifecycle state error
-    #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
 }
 
 /// Commands for the USDC rebalance aggregate.
@@ -232,7 +239,7 @@ pub(crate) enum UsdcRebalanceCommand {
 ///
 /// Events represent immutable facts that have occurred and are persisted to the event store.
 /// Each event carries only the data relevant to that state transition.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum UsdcRebalanceEvent {
     /// Conversion operation started (USD<->USDC). Records direction, amount, and order ID.
     ConversionInitiated {
@@ -478,1068 +485,809 @@ pub(crate) enum UsdcRebalance {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<UsdcRebalance, Never> {
-    type Command = UsdcRebalanceCommand;
+impl EventSourced for UsdcRebalance {
+    type Id = UsdcRebalanceId;
     type Event = UsdcRebalanceEvent;
+    type Command = UsdcRebalanceCommand;
     type Error = UsdcRebalanceError;
     type Services = ();
 
-    fn aggregate_type() -> String {
-        "UsdcRebalance".to_string()
-    }
+    const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
+    const PROJECTION: Option<Table> = None;
+    const SCHEMA_VERSION: u64 = 1;
 
-    fn apply(&mut self, event: Self::Event) {
-        *self = self
-            .clone()
-            .transition(&event, UsdcRebalance::apply_transition)
-            .or_initialize(&event, UsdcRebalance::from_event);
-    }
-
-    async fn handle(
-        &self,
-        command: Self::Command,
-        _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match &command {
-            UsdcRebalanceCommand::InitiateConversion {
-                direction,
-                amount,
-                order_id,
-            } => self.handle_initiate_conversion(direction, *amount, *order_id),
-
-            UsdcRebalanceCommand::ConfirmConversion { filled_amount } => {
-                self.handle_confirm_conversion(*filled_amount)
-            }
-
-            UsdcRebalanceCommand::FailConversion { reason } => self.handle_fail_conversion(reason),
-
-            UsdcRebalanceCommand::InitiatePostDepositConversion { order_id, amount } => {
-                self.handle_initiate_post_deposit_conversion(*order_id, *amount)
-            }
-
-            UsdcRebalanceCommand::Initiate {
-                direction,
-                amount,
-                withdrawal,
-            } => self.handle_initiate(direction, *amount, withdrawal),
-
-            UsdcRebalanceCommand::ConfirmWithdrawal => self.handle_confirm_withdrawal(),
-
-            UsdcRebalanceCommand::FailWithdrawal { reason } => self.handle_fail_withdrawal(reason),
-
-            UsdcRebalanceCommand::InitiateBridging { burn_tx } => {
-                self.handle_initiate_bridging(burn_tx)
-            }
-
-            UsdcRebalanceCommand::ReceiveAttestation {
-                attestation,
-                cctp_nonce,
-            } => self.handle_receive_attestation(attestation, *cctp_nonce),
-
-            UsdcRebalanceCommand::ConfirmBridging {
-                mint_tx,
-                amount_received,
-                fee_collected,
-            } => self.handle_confirm_bridging(mint_tx, *amount_received, *fee_collected),
-
-            UsdcRebalanceCommand::FailBridging { reason } => self.handle_fail_bridging(reason),
-
-            UsdcRebalanceCommand::InitiateDeposit { deposit } => {
-                self.handle_initiate_deposit(deposit)
-            }
-
-            UsdcRebalanceCommand::ConfirmDeposit => self.handle_confirm_deposit(),
-
-            UsdcRebalanceCommand::FailDeposit { reason } => self.handle_fail_deposit(reason),
-        }
-    }
-}
-
-impl Lifecycle<UsdcRebalance, Never> {
-    fn handle_initiate_conversion(
-        &self,
-        direction: &RebalanceDirection,
-        amount: Usdc,
-        order_id: Uuid,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized) => {
-                Ok(vec![UsdcRebalanceEvent::ConversionInitiated {
-                    direction: direction.clone(),
-                    amount,
-                    order_id,
-                    initiated_at: Utc::now(),
-                }])
-            }
-            Ok(_) => Err(UsdcRebalanceError::AlreadyInitiated),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_confirm_conversion(
-        &self,
-        filled_amount: Usdc,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Ok(UsdcRebalance::Converting { direction, .. }) => {
-                Ok(vec![UsdcRebalanceEvent::ConversionConfirmed {
-                    direction: direction.clone(),
-                    filled_amount,
-                    converted_at: Utc::now(),
-                }])
-            }
-            Ok(
-                UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
-            ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
-            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
-        }
-    }
-
-    fn handle_fail_conversion(
-        &self,
-        reason: &str,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Ok(UsdcRebalance::Converting { .. }) => {
-                Ok(vec![UsdcRebalanceEvent::ConversionFailed {
-                    reason: reason.to_string(),
-                    failed_at: Utc::now(),
-                }])
-            }
-            Ok(
-                UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
-            ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
-            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
-        }
-    }
-
-    fn handle_initiate_post_deposit_conversion(
-        &self,
-        order_id: Uuid,
-        command_amount: Usdc,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Ok(UsdcRebalance::DepositConfirmed {
-                direction, amount, ..
-            }) => {
-                if *direction != RebalanceDirection::BaseToAlpaca {
-                    return Err(UsdcRebalanceError::WrongDirectionForPostDepositConversion);
-                }
-
-                if command_amount != *amount {
-                    return Err(UsdcRebalanceError::ConversionAmountMismatch {
-                        expected: *amount,
-                        provided: command_amount,
-                    });
-                }
-
-                Ok(vec![UsdcRebalanceEvent::ConversionInitiated {
-                    direction: direction.clone(),
-                    amount: *amount,
-                    order_id,
-                    initiated_at: Utc::now(),
-                }])
-            }
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
-            _ => Err(UsdcRebalanceError::DepositNotConfirmed),
-        }
-    }
-
-    fn handle_initiate(
-        &self,
-        direction: &RebalanceDirection,
-        amount: Usdc,
-        withdrawal: &TransferRef,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized) => Ok(vec![UsdcRebalanceEvent::Initiated {
-                direction: direction.clone(),
-                amount,
-                withdrawal_ref: withdrawal.clone(),
-                initiated_at: Utc::now(),
-            }]),
-            Ok(UsdcRebalance::ConversionComplete {
-                direction: conv_direction,
-                filled_amount: conv_filled_amount,
-                ..
-            }) => {
-                if direction != conv_direction {
-                    return Err(UsdcRebalanceError::InvalidCommand {
-                        command: "Initiate".to_string(),
-                        state: "ConversionComplete with different direction".to_string(),
-                    });
-                }
-
-                // Compare against filled_amount (actual USDC from conversion), not requested amount
-                if amount != *conv_filled_amount {
-                    return Err(UsdcRebalanceError::InvalidCommand {
-                        command: "Initiate".to_string(),
-                        state: format!(
-                            "ConversionComplete with amount mismatch: expected {}, got {}",
-                            conv_filled_amount.0, amount.0
-                        ),
-                    });
-                }
-
-                Ok(vec![UsdcRebalanceEvent::Initiated {
-                    direction: direction.clone(),
-                    amount: *conv_filled_amount,
-                    withdrawal_ref: withdrawal.clone(),
-                    initiated_at: Utc::now(),
-                }])
-            }
-            Ok(_) => Err(UsdcRebalanceError::AlreadyInitiated),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_confirm_withdrawal(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Ok(UsdcRebalance::Withdrawing { .. }) => {
-                Ok(vec![UsdcRebalanceEvent::WithdrawalConfirmed {
-                    confirmed_at: Utc::now(),
-                }])
-            }
-            Ok(
-                UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. }
-                | UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. }
-                | UsdcRebalance::Bridged { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. }
-                | UsdcRebalance::DepositConfirmed { .. }
-                | UsdcRebalance::DepositFailed { .. },
-            ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
-            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
-        }
-    }
-
-    fn handle_fail_withdrawal(
-        &self,
-        reason: &str,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Ok(UsdcRebalance::Withdrawing { .. }) => {
-                Ok(vec![UsdcRebalanceEvent::WithdrawalFailed {
-                    reason: reason.to_string(),
-                    failed_at: Utc::now(),
-                }])
-            }
-            Ok(
-                UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. }
-                | UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. }
-                | UsdcRebalance::Bridged { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. }
-                | UsdcRebalance::DepositConfirmed { .. }
-                | UsdcRebalance::DepositFailed { .. },
-            ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
-            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
-        }
-    }
-
-    fn handle_initiate_bridging(
-        &self,
-        burn_tx: &TxHash,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. }
-                | UsdcRebalance::Withdrawing { .. }
-                | UsdcRebalance::WithdrawalFailed { .. },
-            ) => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
-
-            Ok(UsdcRebalance::WithdrawalComplete { .. }) => {
-                Ok(vec![UsdcRebalanceEvent::BridgingInitiated {
-                    burn_tx_hash: *burn_tx,
-                    burned_at: Utc::now(),
-                }])
-            }
-
-            Ok(
-                UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. }
-                | UsdcRebalance::Bridged { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. }
-                | UsdcRebalance::DepositConfirmed { .. }
-                | UsdcRebalance::DepositFailed { .. },
-            ) => Err(UsdcRebalanceError::InvalidCommand {
-                command: "InitiateBridging".to_string(),
-                state: "Bridging".to_string(),
-            }),
-
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_receive_attestation(
-        &self,
-        attestation: &[u8],
-        cctp_nonce: u64,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. }
-                | UsdcRebalance::Withdrawing { .. }
-                | UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. },
-            ) => Err(UsdcRebalanceError::BridgingNotInitiated),
-
-            Ok(UsdcRebalance::Bridging { .. }) => {
-                Ok(vec![UsdcRebalanceEvent::BridgeAttestationReceived {
-                    attestation: attestation.to_vec(),
-                    cctp_nonce,
-                    attested_at: Utc::now(),
-                }])
-            }
-
-            Ok(UsdcRebalance::Attested { .. }) => Err(UsdcRebalanceError::InvalidCommand {
-                command: "ReceiveAttestation".to_string(),
-                state: "Attested".to_string(),
-            }),
-
-            Ok(
-                UsdcRebalance::Bridged { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. }
-                | UsdcRebalance::DepositConfirmed { .. }
-                | UsdcRebalance::DepositFailed { .. },
-            ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
-
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_confirm_bridging(
-        &self,
-        mint_tx: &TxHash,
-        amount_received: Usdc,
-        fee_collected: Usdc,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. }
-                | UsdcRebalance::Withdrawing { .. }
-                | UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. }
-                | UsdcRebalance::Bridging { .. },
-            ) => Err(UsdcRebalanceError::AttestationNotReceived),
-
-            Ok(UsdcRebalance::Attested { .. }) => Ok(vec![UsdcRebalanceEvent::Bridged {
-                mint_tx_hash: *mint_tx,
-                amount_received,
-                fee_collected,
-                minted_at: Utc::now(),
-            }]),
-
-            Ok(
-                UsdcRebalance::Bridged { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. }
-                | UsdcRebalance::DepositConfirmed { .. }
-                | UsdcRebalance::DepositFailed { .. },
-            ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
-
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_fail_bridging(
-        &self,
-        reason: &str,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. }
-                | UsdcRebalance::Withdrawing { .. }
-                | UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. },
-            ) => Err(UsdcRebalanceError::BridgingNotInitiated),
-
-            Ok(UsdcRebalance::Bridging { burn_tx_hash, .. }) => {
-                Ok(vec![UsdcRebalanceEvent::BridgingFailed {
-                    burn_tx_hash: Some(*burn_tx_hash),
-                    cctp_nonce: None,
-                    reason: reason.to_string(),
-                    failed_at: Utc::now(),
-                }])
-            }
-
-            Ok(UsdcRebalance::Attested {
-                burn_tx_hash,
-                cctp_nonce,
-                ..
-            }) => Ok(vec![UsdcRebalanceEvent::BridgingFailed {
-                burn_tx_hash: Some(*burn_tx_hash),
-                cctp_nonce: Some(*cctp_nonce),
-                reason: reason.to_string(),
-                failed_at: Utc::now(),
-            }]),
-
-            Ok(
-                UsdcRebalance::Bridged { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. }
-                | UsdcRebalance::DepositConfirmed { .. }
-                | UsdcRebalance::DepositFailed { .. },
-            ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
-
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_initiate_deposit(
-        &self,
-        deposit: &TransferRef,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. }
-                | UsdcRebalance::Withdrawing { .. }
-                | UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. }
-                | UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. }
-                | UsdcRebalance::BridgingFailed { .. },
-            ) => Err(UsdcRebalanceError::BridgingNotCompleted),
-
-            Ok(UsdcRebalance::Bridged { .. }) => Ok(vec![UsdcRebalanceEvent::DepositInitiated {
-                deposit_ref: deposit.clone(),
-                deposit_initiated_at: Utc::now(),
-            }]),
-
-            Ok(
-                UsdcRebalance::DepositInitiated { .. }
-                | UsdcRebalance::DepositConfirmed { .. }
-                | UsdcRebalance::DepositFailed { .. },
-            ) => Err(UsdcRebalanceError::InvalidCommand {
-                command: "InitiateDeposit".to_string(),
-                state: format!("{:?}", self.live()),
-            }),
-
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_confirm_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. }
-                | UsdcRebalance::Withdrawing { .. }
-                | UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. }
-                | UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::Bridged { .. },
-            ) => Err(UsdcRebalanceError::DepositNotInitiated),
-
-            Ok(UsdcRebalance::DepositInitiated { direction, .. }) => {
-                Ok(vec![UsdcRebalanceEvent::DepositConfirmed {
-                    direction: direction.clone(),
-                    deposit_confirmed_at: Utc::now(),
-                }])
-            }
-
-            Ok(UsdcRebalance::DepositConfirmed { .. } | UsdcRebalance::DepositFailed { .. }) => {
-                Err(UsdcRebalanceError::InvalidCommand {
-                    command: "ConfirmDeposit".to_string(),
-                    state: format!("{:?}", self.live()),
-                })
-            }
-
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_fail_deposit(
-        &self,
-        reason: &str,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. }
-                | UsdcRebalance::Withdrawing { .. }
-                | UsdcRebalance::WithdrawalComplete { .. }
-                | UsdcRebalance::WithdrawalFailed { .. }
-                | UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. }
-                | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::Bridged { .. },
-            ) => Err(UsdcRebalanceError::DepositNotInitiated),
-
-            Ok(UsdcRebalance::DepositInitiated { deposit_ref, .. }) => {
-                Ok(vec![UsdcRebalanceEvent::DepositFailed {
-                    deposit_ref: Some(deposit_ref.clone()),
-                    reason: reason.to_string(),
-                    failed_at: Utc::now(),
-                }])
-            }
-
-            Ok(UsdcRebalance::DepositConfirmed { .. } | UsdcRebalance::DepositFailed { .. }) => {
-                Err(UsdcRebalanceError::InvalidCommand {
-                    command: "FailDeposit".to_string(),
-                    state: format!("{:?}", self.live()),
-                })
-            }
-
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-impl UsdcRebalance {
-    /// Apply a transition event to an existing rebalance state.
-    pub(crate) fn apply_transition(
-        event: &UsdcRebalanceEvent,
-        current: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
+    fn originate(event: &Self::Event) -> Option<Self> {
+        use UsdcRebalanceEvent::*;
         match event {
-            UsdcRebalanceEvent::ConversionConfirmed {
-                filled_amount,
-                converted_at,
-                ..
-            } => current.apply_conversion_confirmed(*filled_amount, *converted_at),
-            UsdcRebalanceEvent::ConversionFailed { reason, failed_at } => {
-                current.apply_conversion_failed(reason, *failed_at)
-            }
-            UsdcRebalanceEvent::Initiated {
-                withdrawal_ref,
-                initiated_at,
-                ..
-            } => current.apply_initiated(withdrawal_ref, *initiated_at),
-            UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at } => {
-                current.apply_withdrawal_confirmed(*confirmed_at)
-            }
-            UsdcRebalanceEvent::WithdrawalFailed { reason, failed_at } => {
-                current.apply_withdrawal_failed(reason, *failed_at)
-            }
-            UsdcRebalanceEvent::BridgingInitiated {
-                burn_tx_hash,
-                burned_at,
-            } => current.apply_bridging_initiated(*burn_tx_hash, *burned_at),
-            UsdcRebalanceEvent::BridgeAttestationReceived {
-                attestation,
-                cctp_nonce,
-                attested_at,
-            } => current.apply_attestation_received(attestation, *cctp_nonce, *attested_at),
-            UsdcRebalanceEvent::Bridged {
-                mint_tx_hash,
-                amount_received,
-                fee_collected,
-                minted_at,
-            } => current.apply_bridged(*mint_tx_hash, *amount_received, *fee_collected, *minted_at),
-            UsdcRebalanceEvent::BridgingFailed {
-                burn_tx_hash,
-                cctp_nonce,
-                reason,
-                failed_at,
-            } => current.apply_bridging_failed(*burn_tx_hash, *cctp_nonce, reason, *failed_at),
-            UsdcRebalanceEvent::DepositInitiated {
-                deposit_ref,
-                deposit_initiated_at,
-            } => current.apply_deposit_initiated(deposit_ref, *deposit_initiated_at),
-            UsdcRebalanceEvent::DepositConfirmed {
-                direction,
-                deposit_confirmed_at,
-            } => current.apply_deposit_confirmed(direction, *deposit_confirmed_at),
-            UsdcRebalanceEvent::DepositFailed {
-                deposit_ref,
-                reason,
-                failed_at,
-            } => current.apply_deposit_failed(deposit_ref.as_ref(), reason, *failed_at),
-            UsdcRebalanceEvent::ConversionInitiated {
+            ConversionInitiated {
                 direction,
                 amount,
                 order_id,
                 initiated_at,
-            } => current.apply_conversion_initiated(direction, *amount, *order_id, *initiated_at),
-        }
-    }
-
-    fn apply_conversion_initiated(
-        &self,
-        direction: &RebalanceDirection,
-        amount: Usdc,
-        order_id: Uuid,
-        initiated_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::DepositConfirmed { .. } = self else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "ConversionInitiated".to_string(),
-            });
-        };
-
-        Ok(Self::Converting {
-            direction: direction.clone(),
-            amount,
-            order_id,
-            initiated_at,
-        })
-    }
-
-    fn apply_conversion_confirmed(
-        &self,
-        filled_amount: Usdc,
-        converted_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Converting {
-            direction,
-            amount,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "ConversionConfirmed".to_string(),
-            });
-        };
-
-        Ok(Self::ConversionComplete {
-            direction: direction.clone(),
-            amount: *amount,
-            filled_amount,
-            initiated_at: *initiated_at,
-            converted_at,
-        })
-    }
-
-    fn apply_conversion_failed(
-        &self,
-        reason: &str,
-        failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Converting {
-            direction,
-            amount,
-            order_id,
-            initiated_at,
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "ConversionFailed".to_string(),
-            });
-        };
-
-        Ok(Self::ConversionFailed {
-            direction: direction.clone(),
-            amount: *amount,
-            order_id: *order_id,
-            reason: reason.to_string(),
-            initiated_at: *initiated_at,
-            failed_at,
-        })
-    }
-
-    fn apply_initiated(
-        &self,
-        withdrawal_ref: &TransferRef,
-        initiated_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::ConversionComplete {
-            direction,
-            filled_amount,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "Initiated".to_string(),
-            });
-        };
-
-        // Use filled_amount (actual USDC from conversion), not original requested amount
-        Ok(Self::Withdrawing {
-            direction: direction.clone(),
-            amount: *filled_amount,
-            withdrawal_ref: withdrawal_ref.clone(),
-            initiated_at,
-        })
-    }
-
-    fn apply_withdrawal_confirmed(
-        &self,
-        confirmed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Withdrawing {
-            direction,
-            amount,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "WithdrawalConfirmed".to_string(),
-            });
-        };
-
-        Ok(Self::WithdrawalComplete {
-            direction: direction.clone(),
-            amount: *amount,
-            initiated_at: *initiated_at,
-            confirmed_at,
-        })
-    }
-
-    fn apply_withdrawal_failed(
-        &self,
-        reason: &str,
-        failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Withdrawing {
-            direction,
-            amount,
-            withdrawal_ref,
-            initiated_at,
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "WithdrawalFailed".to_string(),
-            });
-        };
-
-        Ok(Self::WithdrawalFailed {
-            direction: direction.clone(),
-            amount: *amount,
-            withdrawal_ref: withdrawal_ref.clone(),
-            reason: reason.to_string(),
-            initiated_at: *initiated_at,
-            failed_at,
-        })
-    }
-
-    fn apply_bridging_initiated(
-        &self,
-        burn_tx_hash: TxHash,
-        burned_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::WithdrawalComplete {
-            direction,
-            amount,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "BridgingInitiated".to_string(),
-            });
-        };
-
-        Ok(Self::Bridging {
-            direction: direction.clone(),
-            amount: *amount,
-            burn_tx_hash,
-            initiated_at: *initiated_at,
-            burned_at,
-        })
-    }
-
-    fn apply_attestation_received(
-        &self,
-        attestation: &[u8],
-        cctp_nonce: u64,
-        attested_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Bridging {
-            direction,
-            amount,
-            burn_tx_hash,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "BridgeAttestationReceived".to_string(),
-            });
-        };
-
-        Ok(Self::Attested {
-            direction: direction.clone(),
-            amount: *amount,
-            burn_tx_hash: *burn_tx_hash,
-            cctp_nonce,
-            attestation: attestation.to_vec(),
-            initiated_at: *initiated_at,
-            attested_at,
-        })
-    }
-
-    fn apply_bridged(
-        &self,
-        mint_tx_hash: TxHash,
-        amount_received: Usdc,
-        fee_collected: Usdc,
-        minted_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Attested {
-            direction,
-            amount,
-            burn_tx_hash,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "Bridged".to_string(),
-            });
-        };
-
-        Ok(Self::Bridged {
-            direction: direction.clone(),
-            amount: *amount,
-            amount_received,
-            fee_collected,
-            burn_tx_hash: *burn_tx_hash,
-            mint_tx_hash,
-            initiated_at: *initiated_at,
-            minted_at,
-        })
-    }
-
-    fn apply_bridging_failed(
-        &self,
-        burn_tx_hash: Option<TxHash>,
-        cctp_nonce: Option<u64>,
-        reason: &str,
-        failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let (Self::Bridging {
-            direction,
-            amount,
-            initiated_at,
-            ..
-        }
-        | Self::Attested {
-            direction,
-            amount,
-            initiated_at,
-            ..
-        }) = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "BridgingFailed".to_string(),
-            });
-        };
-
-        Ok(Self::BridgingFailed {
-            direction: direction.clone(),
-            amount: *amount,
-            burn_tx_hash,
-            cctp_nonce,
-            reason: reason.to_string(),
-            initiated_at: *initiated_at,
-            failed_at,
-        })
-    }
-
-    fn apply_deposit_initiated(
-        &self,
-        deposit_ref: &TransferRef,
-        deposit_initiated_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::Bridged {
-            direction,
-            amount,
-            burn_tx_hash,
-            mint_tx_hash,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "DepositInitiated".to_string(),
-            });
-        };
-
-        Ok(Self::DepositInitiated {
-            direction: direction.clone(),
-            amount: *amount,
-            burn_tx_hash: *burn_tx_hash,
-            mint_tx_hash: *mint_tx_hash,
-            deposit_ref: deposit_ref.clone(),
-            initiated_at: *initiated_at,
-            deposit_initiated_at,
-        })
-    }
-
-    fn apply_deposit_confirmed(
-        &self,
-        event_direction: &RebalanceDirection,
-        deposit_confirmed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::DepositInitiated {
-            direction,
-            amount,
-            burn_tx_hash,
-            mint_tx_hash,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "DepositConfirmed".to_string(),
-            });
-        };
-
-        debug_assert_eq!(
-            direction, event_direction,
-            "Event direction must match state direction"
-        );
-
-        Ok(Self::DepositConfirmed {
-            direction: direction.clone(),
-            amount: *amount,
-            burn_tx_hash: *burn_tx_hash,
-            mint_tx_hash: *mint_tx_hash,
-            initiated_at: *initiated_at,
-            deposit_confirmed_at,
-        })
-    }
-
-    fn apply_deposit_failed(
-        &self,
-        deposit_ref: Option<&TransferRef>,
-        reason: &str,
-        failed_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::DepositInitiated {
-            direction,
-            amount,
-            burn_tx_hash,
-            mint_tx_hash,
-            initiated_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: "DepositFailed".to_string(),
-            });
-        };
-
-        Ok(Self::DepositFailed {
-            direction: direction.clone(),
-            amount: *amount,
-            burn_tx_hash: *burn_tx_hash,
-            mint_tx_hash: *mint_tx_hash,
-            deposit_ref: deposit_ref.cloned(),
-            reason: reason.to_string(),
-            initiated_at: *initiated_at,
-            failed_at,
-        })
-    }
-
-    /// Create initial state from an initialization event.
-    pub(crate) fn from_event(event: &UsdcRebalanceEvent) -> Result<Self, LifecycleError<Never>> {
-        match event {
-            UsdcRebalanceEvent::ConversionInitiated {
-                direction,
-                amount,
-                order_id,
-                initiated_at,
-            } => Ok(Self::Converting {
+            } => Some(Self::Converting {
                 direction: direction.clone(),
                 amount: *amount,
                 order_id: *order_id,
                 initiated_at: *initiated_at,
             }),
 
-            UsdcRebalanceEvent::Initiated {
+            Initiated {
                 direction,
                 amount,
                 withdrawal_ref,
                 initiated_at,
-            } => Ok(Self::Withdrawing {
+            } => Some(Self::Withdrawing {
                 direction: direction.clone(),
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 initiated_at: *initiated_at,
             }),
 
-            _ => Err(LifecycleError::Mismatch {
-                state: "Uninitialized".into(),
-                event: event.event_type(),
-            }),
+            _ => None,
+        }
+    }
+
+    // All logic is a single pattern match mapping (event, state) -> next_state.
+    // Extracting arms into helpers would only add indirection without
+    // improving readability.
+    #[expect(clippy::too_many_lines)]
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
+        use UsdcRebalanceEvent::*;
+
+        let next = match (event, entity) {
+            (
+                ConversionInitiated {
+                    direction,
+                    amount,
+                    order_id,
+                    initiated_at,
+                },
+                Self::DepositConfirmed { .. },
+            ) => Self::Converting {
+                direction: direction.clone(),
+                amount: *amount,
+                order_id: *order_id,
+                initiated_at: *initiated_at,
+            },
+
+            (
+                ConversionConfirmed {
+                    filled_amount,
+                    converted_at,
+                    ..
+                },
+                Self::Converting {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::ConversionComplete {
+                direction: direction.clone(),
+                amount: *amount,
+                filled_amount: *filled_amount,
+                initiated_at: *initiated_at,
+                converted_at: *converted_at,
+            },
+
+            (
+                ConversionFailed { reason, failed_at },
+                Self::Converting {
+                    direction,
+                    amount,
+                    order_id,
+                    initiated_at,
+                },
+            ) => Self::ConversionFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                order_id: *order_id,
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            (
+                Initiated {
+                    withdrawal_ref,
+                    initiated_at,
+                    ..
+                },
+                Self::ConversionComplete {
+                    direction,
+                    filled_amount,
+                    ..
+                },
+            ) => Self::Withdrawing {
+                direction: direction.clone(),
+                amount: *filled_amount,
+                withdrawal_ref: withdrawal_ref.clone(),
+                initiated_at: *initiated_at,
+            },
+
+            (
+                WithdrawalConfirmed { confirmed_at },
+                Self::Withdrawing {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::WithdrawalComplete {
+                direction: direction.clone(),
+                amount: *amount,
+                initiated_at: *initiated_at,
+                confirmed_at: *confirmed_at,
+            },
+
+            (
+                WithdrawalFailed { reason, failed_at },
+                Self::Withdrawing {
+                    direction,
+                    amount,
+                    withdrawal_ref,
+                    initiated_at,
+                },
+            ) => Self::WithdrawalFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                withdrawal_ref: withdrawal_ref.clone(),
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            (
+                BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at,
+                },
+                Self::WithdrawalComplete {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::Bridging {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                initiated_at: *initiated_at,
+                burned_at: *burned_at,
+            },
+
+            (
+                BridgeAttestationReceived {
+                    attestation,
+                    cctp_nonce,
+                    attested_at,
+                },
+                Self::Bridging {
+                    direction,
+                    amount,
+                    burn_tx_hash,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::Attested {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                cctp_nonce: *cctp_nonce,
+                attestation: attestation.clone(),
+                initiated_at: *initiated_at,
+                attested_at: *attested_at,
+            },
+
+            (
+                Bridged {
+                    mint_tx_hash,
+                    amount_received,
+                    fee_collected,
+                    minted_at,
+                },
+                Self::Attested {
+                    direction,
+                    amount,
+                    burn_tx_hash,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::Bridged {
+                direction: direction.clone(),
+                amount: *amount,
+                amount_received: *amount_received,
+                fee_collected: *fee_collected,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                minted_at: *minted_at,
+            },
+
+            (
+                BridgingFailed {
+                    burn_tx_hash,
+                    cctp_nonce,
+                    reason,
+                    failed_at,
+                },
+                Self::Bridging {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                }
+                | Self::Attested {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::BridgingFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                cctp_nonce: *cctp_nonce,
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            (
+                DepositInitiated {
+                    deposit_ref,
+                    deposit_initiated_at,
+                },
+                Self::Bridged {
+                    direction,
+                    amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::DepositInitiated {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                deposit_ref: deposit_ref.clone(),
+                initiated_at: *initiated_at,
+                deposit_initiated_at: *deposit_initiated_at,
+            },
+
+            (
+                DepositConfirmed {
+                    deposit_confirmed_at,
+                    ..
+                },
+                Self::DepositInitiated {
+                    direction,
+                    amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::DepositConfirmed {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                deposit_confirmed_at: *deposit_confirmed_at,
+            },
+
+            (
+                DepositFailed {
+                    deposit_ref,
+                    reason,
+                    failed_at,
+                },
+                Self::DepositInitiated {
+                    direction,
+                    amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::DepositFailed {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                deposit_ref: deposit_ref.clone(),
+                reason: reason.to_string(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            _ => return Ok(None),
+        };
+
+        Ok(Some(next))
+    }
+
+    async fn initialize(
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        use UsdcRebalanceCommand::*;
+        use UsdcRebalanceEvent::*;
+
+        match command {
+            InitiateConversion {
+                direction,
+                amount,
+                order_id,
+            } => Ok(vec![ConversionInitiated {
+                direction,
+                amount,
+                order_id,
+                initiated_at: Utc::now(),
+            }]),
+
+            Initiate {
+                direction,
+                amount,
+                withdrawal,
+            } => Ok(vec![Initiated {
+                direction,
+                amount,
+                withdrawal_ref: withdrawal,
+                initiated_at: Utc::now(),
+            }]),
+
+            ConfirmConversion { .. } | FailConversion { .. } => {
+                Err(UsdcRebalanceError::ConversionNotInitiated)
+            }
+
+            InitiatePostDepositConversion { .. } => Err(UsdcRebalanceError::DepositNotConfirmed),
+
+            ConfirmWithdrawal | FailWithdrawal { .. } => {
+                Err(UsdcRebalanceError::WithdrawalNotInitiated)
+            }
+
+            InitiateBridging { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+
+            ReceiveAttestation { .. } | FailBridging { .. } => {
+                Err(UsdcRebalanceError::BridgingNotInitiated)
+            }
+
+            ConfirmBridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
+
+            InitiateDeposit { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
+
+            ConfirmDeposit | FailDeposit { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+        }
+    }
+
+    async fn transition(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        use UsdcRebalanceCommand::*;
+        match command {
+            InitiateConversion { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
+            ConfirmConversion { filled_amount } => {
+                self.transition_confirm_conversion(filled_amount)
+            }
+            FailConversion { reason } => self.transition_fail_conversion(reason),
+            InitiatePostDepositConversion { order_id, amount } => {
+                self.transition_post_deposit_conversion(order_id, amount)
+            }
+            Initiate {
+                direction,
+                amount,
+                withdrawal,
+            } => self.transition_initiate_withdrawal(direction, amount, withdrawal),
+            ConfirmWithdrawal => self.transition_confirm_withdrawal(),
+            FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
+            InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
+            ReceiveAttestation {
+                attestation,
+                cctp_nonce,
+            } => self.transition_receive_attestation(attestation, cctp_nonce),
+            ConfirmBridging {
+                mint_tx,
+                amount_received,
+                fee_collected,
+            } => self.transition_confirm_bridging(mint_tx, amount_received, fee_collected),
+            FailBridging { reason } => self.transition_fail_bridging(reason),
+            InitiateDeposit { deposit } => self.transition_initiate_deposit(deposit),
+            ConfirmDeposit => self.transition_confirm_deposit(),
+            FailDeposit { reason } => self.transition_fail_deposit(reason),
         }
     }
 }
 
-impl View<Self> for Lifecycle<UsdcRebalance, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, UsdcRebalance::apply_transition)
-            .or_initialize(&event.payload, UsdcRebalance::from_event);
+/// Transition handlers for each command, grouped by rebalance phase.
+///
+/// Extracted from the `transition` match to satisfy the
+/// `too_many_lines` lint while keeping each handler self-contained.
+impl UsdcRebalance {
+    fn transition_confirm_conversion(
+        &self,
+        filled_amount: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { direction, .. } => Ok(vec![ConversionConfirmed {
+                direction: direction.clone(),
+                filled_amount,
+                converted_at: Utc::now(),
+            }]),
+            Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
+                Err(UsdcRebalanceError::ConversionAlreadyCompleted)
+            }
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
+        }
+    }
+
+    fn transition_fail_conversion(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. } => Ok(vec![ConversionFailed {
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
+                Err(UsdcRebalanceError::ConversionAlreadyCompleted)
+            }
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
+        }
+    }
+
+    fn transition_post_deposit_conversion(
+        &self,
+        order_id: Uuid,
+        command_amount: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        let Self::DepositConfirmed {
+            direction, amount, ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::DepositNotConfirmed);
+        };
+        if *direction != RebalanceDirection::BaseToAlpaca {
+            return Err(UsdcRebalanceError::WrongDirectionForPostDepositConversion);
+        }
+        if command_amount != *amount {
+            return Err(UsdcRebalanceError::ConversionAmountMismatch {
+                expected: *amount,
+                provided: command_amount,
+            });
+        }
+        Ok(vec![ConversionInitiated {
+            direction: direction.clone(),
+            amount: *amount,
+            order_id,
+            initiated_at: Utc::now(),
+        }])
+    }
+
+    fn transition_initiate_withdrawal(
+        &self,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        withdrawal: TransferRef,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        let Self::ConversionComplete {
+            direction: conv_direction,
+            filled_amount: conv_filled_amount,
+            ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::AlreadyInitiated);
+        };
+        if direction != *conv_direction {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "Initiate".to_string(),
+                state: "ConversionComplete with different \
+                        direction"
+                    .to_string(),
+            });
+        }
+        if amount != *conv_filled_amount {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "Initiate".to_string(),
+                state: format!(
+                    "ConversionComplete with amount \
+                     mismatch: expected {}, got {}",
+                    conv_filled_amount.0, amount.0
+                ),
+            });
+        }
+        Ok(vec![Initiated {
+            direction,
+            amount: *conv_filled_amount,
+            withdrawal_ref: withdrawal,
+            initiated_at: Utc::now(),
+        }])
+    }
+
+    fn transition_confirm_withdrawal(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Withdrawing { .. } => Ok(vec![WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            }]),
+            Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
+        }
+    }
+
+    fn transition_fail_withdrawal(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Withdrawing { .. } => Ok(vec![WithdrawalFailed {
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
+        }
+    }
+
+    fn transition_initiate_bridging(
+        &self,
+        burn_tx: TxHash,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            Self::WithdrawalComplete { .. } => Ok(vec![BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            }]),
+            Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "InitiateBridging".to_string(),
+                state: "Bridging".to_string(),
+            }),
+        }
+    }
+
+    fn transition_receive_attestation(
+        &self,
+        attestation: Vec<u8>,
+        cctp_nonce: u64,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
+            Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
+                attestation,
+                cctp_nonce,
+                attested_at: Utc::now(),
+            }]),
+            Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "ReceiveAttestation".to_string(),
+                state: "Attested".to_string(),
+            }),
+            Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    fn transition_confirm_bridging(
+        &self,
+        mint_tx: TxHash,
+        amount_received: Usdc,
+        fee_collected: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
+            Self::Attested { .. } => Ok(vec![Bridged {
+                mint_tx_hash: mint_tx,
+                amount_received,
+                fee_collected,
+                minted_at: Utc::now(),
+            }]),
+            Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    fn transition_fail_bridging(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
+            Self::Bridging { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
+                burn_tx_hash: Some(*burn_tx_hash),
+                cctp_nonce: None,
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::Attested {
+                burn_tx_hash,
+                cctp_nonce,
+                ..
+            } => Ok(vec![BridgingFailed {
+                burn_tx_hash: Some(*burn_tx_hash),
+                cctp_nonce: Some(*cctp_nonce),
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    fn transition_initiate_deposit(
+        &self,
+        deposit: TransferRef,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
+            Self::Bridged { .. } => Ok(vec![DepositInitiated {
+                deposit_ref: deposit,
+                deposit_initiated_at: Utc::now(),
+            }]),
+            Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "InitiateDeposit".to_string(),
+                state: format!("{self:?}"),
+            }),
+        }
+    }
+
+    fn transition_confirm_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. }
+            | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
+                direction: direction.clone(),
+                deposit_confirmed_at: Utc::now(),
+            }]),
+            Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
+                Err(UsdcRebalanceError::InvalidCommand {
+                    command: "ConfirmDeposit".to_string(),
+                    state: format!("{self:?}"),
+                })
+            }
+        }
+    }
+
+    fn transition_fail_deposit(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. }
+            | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            Self::DepositInitiated { deposit_ref, .. } => Ok(vec![DepositFailed {
+                deposit_ref: Some(deposit_ref.clone()),
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
+                Err(UsdcRebalanceError::InvalidCommand {
+                    command: "FailDeposit".to_string(),
+                    state: format!("{self:?}"),
+                })
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::primitives::fixed_bytes;
     use rust_decimal_macros::dec;
-    use std::collections::HashMap;
     use uuid::Uuid;
+
+    use st0x_event_sorcery::{LifecycleError, TestHarness, replay};
+
+    use super::*;
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
-                    withdrawal: TransferRef::AlpacaId(transfer_id),
-                },
-                &(),
-            )
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], UsdcRebalanceEvent::Initiated { .. }));
 
         let UsdcRebalanceEvent::Initiated {
             direction,
@@ -1558,24 +1306,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_base_to_alpaca() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(500.50)),
-                    withdrawal: TransferRef::OnchainTx(tx_hash),
-                },
-                &(),
-            )
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc(dec!(500.50)),
+                withdrawal: TransferRef::OnchainTx(tx_hash),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], UsdcRebalanceEvent::Initiated { .. }));
 
         let UsdcRebalanceEvent::Initiated {
             direction,
@@ -1594,440 +1338,244 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let event = UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        };
-        aggregate.apply(event);
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(500.00)),
-                    withdrawal: TransferRef::AlpacaId(transfer_id),
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc(dec!(500.00)),
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::AlreadyInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::AlreadyInitiated)
         ));
     }
 
     #[test]
-    fn test_view_tracks_initiation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        let event = UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        assert!(matches!(view, Lifecycle::Uninitialized));
-
-        view.update(&envelope);
-
-        let Lifecycle::Live(UsdcRebalance::Withdrawing {
-            direction,
-            amount,
-            withdrawal_ref,
-            initiated_at: view_initiated_at,
-        }) = view
-        else {
-            panic!("Expected Live(Withdrawing) variant");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(withdrawal_ref, TransferRef::AlpacaId(transfer_id));
-        assert_eq!(view_initiated_at, initiated_at);
-    }
-
-    #[test]
-    fn test_from_event_rejects_non_init_events() {
-        let event = UsdcRebalanceEvent::WithdrawalConfirmed {
+    fn non_init_event_on_uninitialized_produces_failed_state() {
+        let error = replay::<UsdcRebalance>(vec![UsdcRebalanceEvent::WithdrawalConfirmed {
             confirmed_at: Utc::now(),
-        };
+        }])
+        .unwrap_err();
 
-        let result = UsdcRebalance::from_event(&event);
-
-        assert!(matches!(result, Err(LifecycleError::Mismatch { .. })));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[test]
-    fn test_apply_transition_rejects_initiated_event() {
-        let current = UsdcRebalance::Withdrawing {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            initiated_at: Utc::now(),
-        };
+    fn initiated_event_on_withdrawing_produces_failed_state() {
+        let error = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc(dec!(500.00)),
+                withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                )),
+                initiated_at: Utc::now(),
+            },
+        ])
+        .unwrap_err();
 
-        let event = UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::BaseToAlpaca,
-            amount: Usdc(dec!(500.00)),
-            withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
-                "0x0000000000000000000000000000000000000000000000000000000000000001"
-            )),
-            initiated_at: Utc::now(),
-        };
-
-        let result = UsdcRebalance::apply_transition(&event, &current);
-
-        assert!(matches!(result, Err(LifecycleError::Mismatch { .. })));
+        assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
     }
 
     #[tokio::test]
     async fn test_confirm_withdrawal() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
             UsdcRebalanceEvent::WithdrawalConfirmed { .. }
         ));
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::WithdrawalComplete {
-            direction,
-            amount,
-            initiated_at: state_initiated_at,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected WithdrawalComplete state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_withdrawal_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        let result = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_withdrawal_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalAlreadyCompleted)
         ));
     }
 
     #[tokio::test]
     async fn test_fail_withdrawal_after_initiation() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailWithdrawal {
-                    reason: "Insufficient funds".to_string(),
-                },
-                &(),
-            )
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::FailWithdrawal {
+                reason: "Insufficient funds".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::WithdrawalFailed { reason, .. } = &events[0] else {
             panic!("Expected WithdrawalFailed event");
         };
         assert_eq!(reason, "Insufficient funds");
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::WithdrawalFailed {
-            direction,
-            amount,
-            reason: state_reason,
-            withdrawal_ref,
-            initiated_at: state_initiated_at,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected WithdrawalFailed state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(state_reason, "Insufficient funds");
-        assert_eq!(withdrawal_ref, TransferRef::AlpacaId(transfer_id));
-        assert_eq!(state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_fail_withdrawal_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailWithdrawal {
-                    reason: "Test failure".to_string(),
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::FailWithdrawal {
+                reason: "Test failure".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_fail_already_confirmed_withdrawal() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailWithdrawal {
-                    reason: "Late failure".to_string(),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailWithdrawal {
+                reason: "Late failure".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalAlreadyCompleted)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_fail_already_failed_withdrawal() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalFailed {
-            reason: "First failure".to_string(),
-            failed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailWithdrawal {
-                    reason: "Second failure".to_string(),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalFailed {
+                    reason: "First failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailWithdrawal {
+                reason: "Second failure".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalAlreadyCompleted)
         ));
-    }
-
-    #[test]
-    fn test_view_tracks_withdrawal_confirmation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let confirmed_at = Utc::now();
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
-            metadata: HashMap::new(),
-        });
-
-        let Lifecycle::Live(UsdcRebalance::WithdrawalComplete {
-            direction,
-            amount,
-            initiated_at: view_initiated_at,
-            confirmed_at: view_confirmed_at,
-        }) = view
-        else {
-            panic!("Expected WithdrawalComplete state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(view_initiated_at, initiated_at);
-        assert_eq!(view_confirmed_at, confirmed_at);
-    }
-
-    #[test]
-    fn test_view_tracks_withdrawal_failure() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let failed_at = Utc::now();
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::WithdrawalFailed {
-                reason: "Network error".to_string(),
-                failed_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        let Lifecycle::Live(UsdcRebalance::WithdrawalFailed {
-            direction,
-            amount,
-            withdrawal_ref,
-            reason,
-            initiated_at: view_initiated_at,
-            failed_at: view_failed_at,
-        }) = view
-        else {
-            panic!("Expected WithdrawalFailed state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(withdrawal_ref, TransferRef::AlpacaId(transfer_id));
-        assert_eq!(reason, "Network error");
-        assert_eq!(view_initiated_at, initiated_at);
-        assert_eq!(view_failed_at, failed_at);
     }
 
     #[tokio::test]
     async fn test_initiate_bridging_after_withdrawal_confirmed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let confirmed_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_tx_hash,
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_tx_hash,
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgingInitiated {
@@ -2039,243 +1587,146 @@ mod tests {
         };
 
         assert_eq!(*event_tx_hash, burn_tx_hash);
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::Bridging {
-            direction,
-            amount,
-            burn_tx_hash: state_tx_hash,
-            initiated_at: state_initiated_at,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected Bridging state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(state_tx_hash, burn_tx_hash);
-        assert_eq!(state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_before_withdrawal() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_tx_hash,
-                },
-                &(),
-            )
-            .await;
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_tx_hash,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalNotConfirmed
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotConfirmed)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_while_withdrawing() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_tx_hash,
-                },
-                &(),
-            )
-            .await;
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_tx_hash,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalNotConfirmed
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotConfirmed)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_after_withdrawal_failed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalFailed {
-            reason: "Test failure".to_string(),
-            failed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_tx_hash,
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalFailed {
+                    reason: "Test failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_tx_hash,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WithdrawalNotConfirmed
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotConfirmed)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_initiate_bridging_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
 
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_tx_hash,
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_tx_hash,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::InvalidCommand { .. }
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
         ));
-    }
-
-    #[test]
-    fn test_view_tracks_bridging_initiation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let confirmed_at = Utc::now();
-        let burned_at = Utc::now();
-        let burn_tx_hash =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 3,
-            payload: UsdcRebalanceEvent::BridgingInitiated {
-                burn_tx_hash,
-                burned_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        let Lifecycle::Live(UsdcRebalance::Bridging {
-            direction,
-            amount,
-            burn_tx_hash: view_tx_hash,
-            initiated_at: view_initiated_at,
-            burned_at: view_burned_at,
-        }) = view
-        else {
-            panic!("Expected Bridging state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(view_tx_hash, burn_tx_hash);
-        assert_eq!(view_initiated_at, initiated_at);
-        assert_eq!(view_burned_at, burned_at);
     }
 
     #[tokio::test]
     async fn test_receive_attestation_after_bridging_initiated() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
-
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
         let attestation = vec![0x01, 0x02, 0x03, 0x04];
 
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: attestation.clone(),
-                    cctp_nonce,
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: attestation.clone(),
+                cctp_nonce: 12345,
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgeAttestationReceived {
@@ -2287,310 +1738,184 @@ mod tests {
         };
 
         assert_eq!(*event_attestation, attestation);
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::Attested {
-            direction,
-            amount,
-            burn_tx_hash: state_tx_hash,
-            cctp_nonce: state_nonce,
-            attestation: state_attestation,
-            initiated_at: state_initiated_at,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected Attested state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(state_tx_hash, burn_tx_hash);
-        assert_eq!(state_nonce, cctp_nonce);
-        assert_eq!(state_attestation, attestation);
-        assert_eq!(state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_before_bridging() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01, 0x02],
+                cctp_nonce: 12345,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_while_withdrawing() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01, 0x02],
+                cctp_nonce: 12345,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_after_withdrawal_complete() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01, 0x02],
+                cctp_nonce: 12345,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_after_withdrawal_failed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalFailed {
-            reason: "Test failure".to_string(),
-            failed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalFailed {
+                    reason: "Test failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01, 0x02],
+                cctp_nonce: 12345,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
 
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: vec![0x03, 0x04],
-                    cctp_nonce: 99999,
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x03, 0x04],
+                cctp_nonce: 99999,
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::InvalidCommand { .. }
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
         ));
-    }
-
-    #[test]
-    fn test_view_tracks_attestation_receipt() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let confirmed_at = Utc::now();
-        let burned_at = Utc::now();
-        let attested_at = Utc::now();
-        let burn_tx_hash =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
-        let attestation = vec![0x01, 0x02, 0x03, 0x04];
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 3,
-            payload: UsdcRebalanceEvent::BridgingInitiated {
-                burn_tx_hash,
-                burned_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 4,
-            payload: UsdcRebalanceEvent::BridgeAttestationReceived {
-                attestation: attestation.clone(),
-                cctp_nonce,
-                attested_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        let Lifecycle::Live(UsdcRebalance::Attested {
-            direction,
-            amount,
-            burn_tx_hash: view_tx_hash,
-            cctp_nonce: view_nonce,
-            attestation: view_attestation,
-            initiated_at: view_initiated_at,
-            attested_at: view_attested_at,
-        }) = view
-        else {
-            panic!("Expected Attested state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(view_tx_hash, burn_tx_hash);
-        assert_eq!(view_nonce, cctp_nonce);
-        assert_eq!(view_attestation, attestation);
-        assert_eq!(view_initiated_at, initiated_at);
-        assert_eq!(view_attested_at, attested_at);
     }
 
     #[tokio::test]
     async fn test_confirm_bridging() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
-
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        let attestation = vec![0x01, 0x02, 0x03, 0x04];
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: attestation.clone(),
-            cctp_nonce,
-            attested_at: Utc::now(),
-        });
-
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx: mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02, 0x03, 0x04],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: mint_tx_hash,
+                amount_received: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::Bridged {
@@ -2602,104 +1927,73 @@ mod tests {
         };
 
         assert_eq!(*event_mint_tx, mint_tx_hash);
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::Bridged {
-            direction,
-            amount,
-            burn_tx_hash: state_burn_tx,
-            mint_tx_hash: state_mint_tx,
-            initiated_at: state_initiated_at,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected Bridged state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
-        assert_eq!(*state_burn_tx, burn_tx_hash);
-        assert_eq!(*state_mint_tx, mint_tx_hash);
-        assert_eq!(*state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_bridging_before_attestation() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx: mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: mint_tx_hash,
+                amount_received: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::AttestationNotReceived
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::AttestationNotReceived)
         ));
     }
 
     #[tokio::test]
     async fn test_fail_bridging_after_initiated() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailBridging {
-                    reason: "CCTP timeout".to_string(),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "CCTP timeout".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgingFailed {
@@ -2713,75 +2007,43 @@ mod tests {
         };
 
         assert_eq!(*event_burn_tx, Some(burn_tx_hash));
-        // cctp_nonce is None when failing from Bridging state (nonce not yet known)
         assert_eq!(*event_nonce, None);
         assert_eq!(reason, "CCTP timeout");
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::BridgingFailed {
-            direction,
-            amount,
-            burn_tx_hash: state_burn_tx,
-            cctp_nonce: state_nonce,
-            reason: state_reason,
-            initiated_at: state_initiated_at,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected BridgingFailed state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
-        assert_eq!(*state_burn_tx, Some(burn_tx_hash));
-        // cctp_nonce is None when failing from Bridging state (nonce not yet known)
-        assert_eq!(*state_nonce, None);
-        assert_eq!(state_reason, "CCTP timeout");
-        assert_eq!(*state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_fail_bridging_after_attestation_received() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce,
-            attested_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailBridging {
-                    reason: "Mint transaction failed".to_string(),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce,
+                    attested_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "Mint transaction failed".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgingFailed {
@@ -2795,65 +2057,37 @@ mod tests {
         };
 
         assert_eq!(*event_burn_tx, Some(burn_tx_hash));
-        // cctp_nonce is Some when failing from Attested state (nonce known from attestation)
         assert_eq!(*event_nonce, Some(cctp_nonce));
         assert_eq!(reason, "Mint transaction failed");
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::BridgingFailed {
-            direction,
-            amount,
-            burn_tx_hash: state_burn_tx,
-            cctp_nonce: state_nonce,
-            reason: state_reason,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected BridgingFailed state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
-        assert_eq!(*state_burn_tx, Some(burn_tx_hash));
-        // cctp_nonce is Some when failing from Attested state (nonce known from attestation)
-        assert_eq!(*state_nonce, Some(cctp_nonce));
-        assert_eq!(state_reason, "Mint transaction failed");
     }
 
     #[tokio::test]
     async fn test_bridging_failed_preserves_burn_data_when_available() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0xabababababababababababababababababababababababababababababababab");
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailBridging {
-                    reason: "Attestation service down".to_string(),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "Attestation service down".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         let UsdcRebalanceEvent::BridgingFailed {
             burn_tx_hash: event_burn_tx,
@@ -2869,7 +2103,6 @@ mod tests {
             Some(burn_tx_hash),
             "Burn tx hash should be preserved in failure event"
         );
-        // cctp_nonce is None when failing from Bridging state (not yet known)
         assert_eq!(
             *event_nonce, None,
             "CCTP nonce should be None when failing from Bridging state"
@@ -2878,374 +2111,185 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_bridging_after_already_completed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
 
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx: fixed_bytes!(
-                        "0x2222222222222222222222222222222222222222222222222222222222222222"
-                    ),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
                     amount_received: Usdc(dec!(99.99)),
                     fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+            ])
+            .when(UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: fixed_bytes!(
+                    "0x2222222222222222222222222222222222222222222222222222222222222222"
+                ),
+                amount_received: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyCompleted)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_fail_bridging_after_already_completed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
 
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailBridging {
-                    reason: "Late failure".to_string(),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "Late failure".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyCompleted)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_fail_bridging_after_already_failed() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingFailed {
-            burn_tx_hash: Some(burn_tx_hash),
-            cctp_nonce: None, // nonce unknown when failing from Bridging state
-            reason: "First failure".to_string(),
-            failed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailBridging {
-                    reason: "Second failure".to_string(),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: Some(burn_tx_hash),
+                    cctp_nonce: None,
+                    reason: "First failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "Second failure".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyCompleted)
         ));
-    }
-
-    #[test]
-    fn test_view_tracks_bridging_completion() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let confirmed_at = Utc::now();
-        let burned_at = Utc::now();
-        let attested_at = Utc::now();
-        let minted_at = Utc::now();
-        let burn_tx_hash =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let mint_tx_hash =
-            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        let cctp_nonce = 12345u64;
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 3,
-            payload: UsdcRebalanceEvent::BridgingInitiated {
-                burn_tx_hash,
-                burned_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 4,
-            payload: UsdcRebalanceEvent::BridgeAttestationReceived {
-                attestation: vec![0x01, 0x02],
-                cctp_nonce,
-                attested_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 5,
-            payload: UsdcRebalanceEvent::Bridged {
-                mint_tx_hash,
-                amount_received: Usdc(dec!(99.99)),
-                fee_collected: Usdc(dec!(0.01)),
-                minted_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        let UsdcRebalance::Bridged {
-            direction,
-            amount,
-            burn_tx_hash: view_burn_tx,
-            mint_tx_hash: view_mint_tx,
-            initiated_at: view_initiated_at,
-            minted_at: view_minted_at,
-            ..
-        } = view.live().unwrap()
-        else {
-            panic!("Expected Bridged state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
-        assert_eq!(*view_burn_tx, burn_tx_hash);
-        assert_eq!(*view_mint_tx, mint_tx_hash);
-        assert_eq!(*view_initiated_at, initiated_at);
-        assert_eq!(*view_minted_at, minted_at);
-    }
-
-    #[test]
-    fn test_view_tracks_bridging_failure() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let confirmed_at = Utc::now();
-        let burned_at = Utc::now();
-        let failed_at = Utc::now();
-        let burn_tx_hash =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 3,
-            payload: UsdcRebalanceEvent::BridgingInitiated {
-                burn_tx_hash,
-                burned_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 4,
-            payload: UsdcRebalanceEvent::BridgingFailed {
-                burn_tx_hash: Some(burn_tx_hash),
-                cctp_nonce: None, // nonce unknown when failing from Bridging state
-                reason: "CCTP service unavailable".to_string(),
-                failed_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        let UsdcRebalance::BridgingFailed {
-            direction,
-            amount,
-            burn_tx_hash: view_burn_tx,
-            cctp_nonce: view_nonce,
-            reason,
-            initiated_at: view_initiated_at,
-            failed_at: view_failed_at,
-        } = view.live().unwrap()
-        else {
-            panic!("Expected BridgingFailed state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
-        assert_eq!(*view_burn_tx, Some(burn_tx_hash));
-        // nonce unknown when failing from Bridging state
-        assert_eq!(*view_nonce, None);
-        assert_eq!(reason, "CCTP service unavailable");
-        assert_eq!(*view_initiated_at, initiated_at);
-        assert_eq!(*view_failed_at, failed_at);
     }
 
     #[tokio::test]
     async fn test_initiate_deposit_with_alpaca_transfer() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
+        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-
-        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateDeposit {
-                    deposit: deposit_ref.clone(),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateDeposit {
+                deposit: deposit_ref.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::DepositInitiated {
@@ -3257,83 +2301,52 @@ mod tests {
         };
 
         assert_eq!(*event_deposit_ref, deposit_ref);
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::DepositInitiated {
-            direction,
-            amount,
-            burn_tx_hash: state_burn_tx,
-            mint_tx_hash: state_mint_tx,
-            deposit_ref: state_deposit_ref,
-            initiated_at: state_initiated_at,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected DepositInitiated state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
-        assert_eq!(*state_burn_tx, burn_tx_hash);
-        assert_eq!(*state_mint_tx, mint_tx_hash);
-        assert_eq!(*state_deposit_ref, deposit_ref);
-        assert_eq!(*state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_initiate_deposit_with_onchain_tx() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::BaseToAlpaca,
-            amount: Usdc(dec!(500.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-
         let deposit_tx_hash =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let deposit_ref = TransferRef::OnchainTx(deposit_tx_hash);
 
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateDeposit {
-                    deposit: deposit_ref.clone(),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc(dec!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateDeposit {
+                deposit: deposit_ref.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::DepositInitiated {
@@ -3345,255 +2358,194 @@ mod tests {
         };
 
         assert_eq!(*event_deposit_ref, deposit_ref);
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::DepositInitiated {
-            direction,
-            amount,
-            deposit_ref: state_deposit_ref,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected DepositInitiated state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
-        assert_eq!(*amount, Usdc(dec!(500.00)));
-        assert_eq!(*state_deposit_ref, deposit_ref);
     }
 
     #[tokio::test]
     async fn test_cannot_deposit_before_bridging_complete() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
         let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateDeposit {
-                    deposit: TransferRef::AlpacaId(deposit_transfer_id),
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::AlpacaId(deposit_transfer_id),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::BridgingNotCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingNotCompleted)
         ));
     }
 
     #[tokio::test]
     async fn test_confirm_deposit() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
+        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-
-        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
-
-        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref,
-            deposit_initiated_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref,
+                    deposit_initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmDeposit)
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
             UsdcRebalanceEvent::DepositConfirmed { .. }
         ));
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::DepositConfirmed {
-            direction,
-            amount,
-            burn_tx_hash: state_burn_tx,
-            mint_tx_hash: state_mint_tx,
-            initiated_at: state_initiated_at,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected DepositConfirmed state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
-        assert_eq!(*state_burn_tx, burn_tx_hash);
-        assert_eq!(*state_mint_tx, mint_tx_hash);
-        assert_eq!(*state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_deposit_before_initiating() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::DepositNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_fail_deposit_after_initiated() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::BaseToAlpaca,
-            amount: Usdc(dec!(500.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at,
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
+        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-
-        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
-
-        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: deposit_ref.clone(),
-            deposit_initiated_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailDeposit {
-                    reason: "Test failure reason".to_string(),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc(dec!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: deposit_ref.clone(),
+                    deposit_initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailDeposit {
+                reason: "Test failure reason".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::DepositFailed {
@@ -3605,85 +2557,58 @@ mod tests {
             panic!("Expected DepositFailed event");
         };
 
-        assert_eq!(*event_deposit_ref, Some(deposit_ref.clone()));
+        assert_eq!(*event_deposit_ref, Some(deposit_ref));
         assert_eq!(reason, "Test failure reason");
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::DepositFailed {
-            direction,
-            amount,
-            deposit_ref: state_deposit_ref,
-            reason: state_reason,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected DepositFailed state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
-        assert_eq!(*amount, Usdc(dec!(500.00)));
-        assert_eq!(*state_deposit_ref, Some(deposit_ref));
-        assert_eq!(state_reason, "Test failure reason");
     }
 
     #[tokio::test]
     async fn test_deposit_failed_preserves_deposit_ref_when_available() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash,
-            burned_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01, 0x02],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-
         let onchain_tx =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let deposit_ref = TransferRef::OnchainTx(onchain_tx);
 
-        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: deposit_ref.clone(),
-            deposit_initiated_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailDeposit {
-                    reason: "Onchain deposit failed".to_string(),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: deposit_ref.clone(),
+                    deposit_initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailDeposit {
+                reason: "Onchain deposit failed".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::DepositFailed {
@@ -3694,450 +2619,423 @@ mod tests {
             panic!("Expected DepositFailed event");
         };
 
-        assert_eq!(*event_deposit_ref, Some(deposit_ref.clone()));
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::DepositFailed {
-            deposit_ref: state_deposit_ref,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected DepositFailed state");
-        };
-
-        assert_eq!(*state_deposit_ref, Some(deposit_ref));
+        assert_eq!(*event_deposit_ref, Some(deposit_ref));
     }
 
     #[tokio::test]
     async fn test_complete_alpaca_to_base_full_flow() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let initiated_at = Utc::now();
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(10000.00)),
-                    withdrawal: TransferRef::AlpacaId(transfer_id),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_tx_hash,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let attestation = vec![0xAB, 0xCD, 0xEF];
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: attestation.clone(),
-                    cctp_nonce: 12345,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx: mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
         let deposit_tx =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateDeposit {
-                    deposit: TransferRef::OnchainTx(deposit_tx),
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(10000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0xAB, 0xCD, 0xEF],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::OnchainTx(deposit_tx),
+                    deposit_initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmDeposit)
             .await
-            .unwrap();
+            .events();
 
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::DepositConfirmed {
-            direction,
-            amount,
-            burn_tx_hash: final_burn_tx,
-            mint_tx_hash: final_mint_tx,
-            initiated_at: final_initiated_at,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected DepositConfirmed state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(10000.00)));
-        assert_eq!(*final_burn_tx, burn_tx_hash);
-        assert_eq!(*final_mint_tx, mint_tx_hash);
-        assert!(*final_initiated_at >= initiated_at);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            UsdcRebalanceEvent::DepositConfirmed { .. }
+        ));
     }
 
     #[tokio::test]
     async fn test_complete_base_to_alpaca_full_flow() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let withdrawal_tx =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
-        let initiated_at = Utc::now();
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(5000.00)),
-                    withdrawal: TransferRef::OnchainTx(withdrawal_tx),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
         let burn_tx_hash =
             fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_tx_hash,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let attestation = vec![0x11, 0x22, 0x33, 0x44];
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation,
-                    cctp_nonce: 67890,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
         let mint_tx_hash =
             fixed_bytes!("0x5555555555555555555555555555555555555555555555555555555555555555");
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx: mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
         let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateDeposit {
-                    deposit: TransferRef::AlpacaId(deposit_transfer_id),
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc(dec!(5000.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(withdrawal_tx),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
-            .await
-            .unwrap();
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let UsdcRebalance::DepositConfirmed {
-            direction,
-            amount,
-            burn_tx_hash: final_burn_tx,
-            mint_tx_hash: final_mint_tx,
-            initiated_at: final_initiated_at,
-            ..
-        } = aggregate.live().unwrap()
-        else {
-            panic!("Expected DepositConfirmed state");
-        };
-
-        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
-        assert_eq!(*amount, Usdc(dec!(5000.00)));
-        assert_eq!(*final_burn_tx, burn_tx_hash);
-        assert_eq!(*final_mint_tx, mint_tx_hash);
-        assert!(*final_initiated_at >= initiated_at);
-    }
-
-    #[tokio::test]
-    async fn test_withdrawal_failed_rejects_commands() {
-        let burn_tx =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
-        agg.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(100.00)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            initiated_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::WithdrawalFailed {
-            reason: "Test failure".to_string(),
-            failed_at: Utc::now(),
-        });
-
-        assert!(
-            agg.handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
-                .await
-                .is_err()
-        );
-        assert!(
-            agg.handle(UsdcRebalanceCommand::InitiateBridging { burn_tx }, &())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_bridging_failed_rejects_commands() {
-        let burn_tx =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let mint_tx =
-            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
-        agg.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(100.00)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            initiated_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: burn_tx,
-            burned_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::BridgingFailed {
-            burn_tx_hash: Some(burn_tx),
-            cctp_nonce: None, // nonce unknown when failing from Bridging state
-            reason: "Bridge failed".to_string(),
-            failed_at: Utc::now(),
-        });
-
-        assert!(
-            agg.handle(
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
                 },
-                &()
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            agg.handle(
-                UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx,
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x11, 0x22, 0x33, 0x44],
+                    cctp_nonce: 67890,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash,
                     amount_received: Usdc(dec!(99.99)),
                     fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::AlpacaId(deposit_transfer_id),
+                    deposit_initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmDeposit)
             .await
-            .is_err()
-        );
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            UsdcRebalanceEvent::DepositConfirmed { .. }
+        ));
     }
 
     #[tokio::test]
-    async fn test_deposit_failed_rejects_commands() {
-        let burn_tx =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let mint_tx =
-            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
-        agg.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(100.00)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            initiated_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: burn_tx,
-            burned_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash: mint_tx,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: TransferRef::OnchainTx(mint_tx),
-            deposit_initiated_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::DepositFailed {
-            deposit_ref: Some(TransferRef::OnchainTx(mint_tx)),
-            reason: "Deposit failed".to_string(),
-            failed_at: Utc::now(),
-        });
-
-        assert!(
-            agg.handle(UsdcRebalanceCommand::ConfirmDeposit, &())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_deposit_confirmed_rejects_commands() {
-        let burn_tx =
-            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let mint_tx =
-            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-
-        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
-        agg.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(100.00)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            initiated_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: burn_tx,
-            burned_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash: mint_tx,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: TransferRef::OnchainTx(mint_tx),
-            deposit_initiated_at: Utc::now(),
-        });
-        agg.apply(UsdcRebalanceEvent::DepositConfirmed {
-            direction: RebalanceDirection::AlpacaToBase,
-            deposit_confirmed_at: Utc::now(),
-        });
-
-        assert!(
-            agg.handle(
-                UsdcRebalanceCommand::Initiate {
+    async fn test_withdrawal_failed_rejects_confirm_withdrawal() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(100.00)),
-                    withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
                 },
-                &()
-            )
+                UsdcRebalanceEvent::WithdrawalFailed {
+                    reason: "Test failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
-            .is_err()
-        );
-        assert!(
-            agg.handle(UsdcRebalanceCommand::ConfirmDeposit, &())
-                .await
-                .is_err()
-        );
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalAlreadyCompleted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_withdrawal_failed_rejects_initiate_bridging() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(100.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalFailed {
+                    reason: "Test failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotConfirmed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_bridging_failed_rejects_receive_attestation() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(100.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: Some(burn_tx),
+                    cctp_nonce: None,
+                    reason: "Bridge failed".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01],
+                cctp_nonce: 12345,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyCompleted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_bridging_failed_rejects_confirm_bridging() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(100.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: Some(burn_tx),
+                    cctp_nonce: None,
+                    reason: "Bridge failed".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                amount_received: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyCompleted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_deposit_failed_rejects_confirm_deposit() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(100.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::OnchainTx(mint_tx),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: Some(TransferRef::OnchainTx(mint_tx)),
+                    reason: "Deposit failed".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_deposit_confirmed_rejects_initiate() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(100.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::OnchainTx(mint_tx),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(100.00)),
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::AlreadyInitiated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_deposit_confirmed_rejects_confirm_deposit() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(100.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::OnchainTx(mint_tx),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
     }
 
     #[tokio::test]
     async fn test_initiate_conversion_from_uninitialized() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
 
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateConversion {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
-                    order_id,
-                },
-                &(),
-            )
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                order_id,
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::ConversionInitiated {
@@ -4157,464 +3055,236 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_conversion_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
 
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiateConversion {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(500.00)),
-                    order_id: Uuid::new_v4(),
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                order_id,
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(500.00)),
+                order_id: Uuid::new_v4(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::AlreadyInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::AlreadyInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_confirm_conversion_from_converting_state() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
-        let initiated_at = Utc::now();
+        let filled_amount = Usdc(dec!(998));
 
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at,
-        });
-
-        let filled_amount = Usdc(dec!(998)); // ~0.2% slippage
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmConversion { filled_amount },
-                &(),
-            )
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                order_id,
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ConfirmConversion { filled_amount })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
             UsdcRebalanceEvent::ConversionConfirmed { .. }
         ));
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::ConversionComplete {
-            direction,
-            amount,
-            filled_amount: state_filled,
-            initiated_at: state_initiated_at,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected ConversionComplete state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(state_filled, filled_amount);
-        assert_eq!(state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_conversion_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmConversion {
-                    filled_amount: Usdc(dec!(998)),
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::ConfirmConversion {
+                filled_amount: Usdc(dec!(998)),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::ConversionNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::ConversionNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_conversion_twice() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
 
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
-            direction: RebalanceDirection::AlpacaToBase,
-            filled_amount: Usdc(dec!(998)),
-            converted_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmConversion {
-                    filled_amount: Usdc(dec!(998)),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    order_id,
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount: Usdc(dec!(998)),
+                    converted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmConversion {
+                filled_amount: Usdc(dec!(998)),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::ConversionAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::ConversionAlreadyCompleted)
         ));
     }
 
     #[tokio::test]
     async fn test_fail_conversion_from_converting_state() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
-        let initiated_at = Utc::now();
 
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at,
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailConversion {
-                    reason: "Order rejected".to_string(),
-                },
-                &(),
-            )
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                order_id,
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::FailConversion {
+                reason: "Order rejected".to_string(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::ConversionFailed { reason, .. } = &events[0] else {
             panic!("Expected ConversionFailed event");
         };
         assert_eq!(reason, "Order rejected");
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::ConversionFailed {
-            direction,
-            amount,
-            order_id: state_order_id,
-            reason: state_reason,
-            initiated_at: state_initiated_at,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected ConversionFailed state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(state_order_id, order_id);
-        assert_eq!(state_reason, "Order rejected");
-        assert_eq!(state_initiated_at, initiated_at);
     }
 
     #[tokio::test]
     async fn test_cannot_fail_conversion_before_initiating() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailConversion {
-                    reason: "Test failure".to_string(),
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::FailConversion {
+                reason: "Test failure".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::ConversionNotInitiated
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::ConversionNotInitiated)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_fail_already_completed_conversion() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
 
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
-            direction: RebalanceDirection::AlpacaToBase,
-            filled_amount: Usdc(dec!(998)),
-            converted_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::FailConversion {
-                    reason: "Late failure".to_string(),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    order_id,
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount: Usdc(dec!(998)),
+                    converted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailConversion {
+                reason: "Late failure".to_string(),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::ConversionAlreadyCompleted
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::ConversionAlreadyCompleted)
         ));
     }
 
     #[tokio::test]
     async fn test_initiate_withdrawal_after_conversion_complete() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let filled_amount = Usdc(dec!(998)); // ~0.2% slippage
+        let filled_amount = Usdc(dec!(998));
 
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
-            direction: RebalanceDirection::AlpacaToBase,
-            filled_amount,
-            converted_at: Utc::now(),
-        });
-
-        // Initiate must use filled_amount, not requested amount
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::Initiate {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: filled_amount,
-                    withdrawal: TransferRef::AlpacaId(transfer_id),
+                    amount: Usdc(dec!(1000.00)),
+                    order_id,
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount,
+                    converted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: filled_amount,
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], UsdcRebalanceEvent::Initiated { .. }));
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::Withdrawing {
-            direction,
-            amount,
-            withdrawal_ref,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected Withdrawing state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, filled_amount);
-        assert_eq!(withdrawal_ref, TransferRef::AlpacaId(transfer_id));
     }
 
     #[tokio::test]
     async fn test_initiate_with_mismatched_amount_from_conversion_complete_fails() {
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let filled_amount = Usdc(dec!(998));
 
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
-            direction: RebalanceDirection::AlpacaToBase,
-            filled_amount,
-            converted_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::Initiate {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(999.00)), // Different amount than conversion
-                    withdrawal: TransferRef::AlpacaId(transfer_id),
+                    amount: Usdc(dec!(1000.00)),
+                    order_id,
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount,
+                    converted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(999.00)),
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            })
+            .await
+            .then_expect_error();
 
         assert!(
             matches!(
-                &result,
-                Err(UsdcRebalanceError::InvalidCommand { command, state })
+                &error,
+                LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { command, state })
                     if command == "Initiate" && state.contains("amount mismatch")
             ),
-            "Expected InvalidCommand error with amount mismatch, got: {result:?}"
+            "Expected InvalidCommand error with amount mismatch, got: {error:?}"
         );
-    }
-
-    #[test]
-    fn test_view_tracks_conversion_initiation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let order_id = Uuid::new_v4();
-        let initiated_at = Utc::now();
-
-        let event = UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        assert!(matches!(view, Lifecycle::Uninitialized));
-
-        view.update(&envelope);
-
-        let Lifecycle::Live(UsdcRebalance::Converting {
-            direction,
-            amount,
-            order_id: view_order_id,
-            initiated_at: view_initiated_at,
-        }) = view
-        else {
-            panic!("Expected Live(Converting) variant");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(view_order_id, order_id);
-        assert_eq!(view_initiated_at, initiated_at);
-    }
-
-    #[test]
-    fn test_view_tracks_conversion_confirmation() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let order_id = Uuid::new_v4();
-        let initiated_at = Utc::now();
-        let converted_at = Utc::now();
-        let filled_amount = Usdc(dec!(998));
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::ConversionInitiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                order_id,
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::ConversionConfirmed {
-                direction: RebalanceDirection::AlpacaToBase,
-                filled_amount,
-                converted_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        let Lifecycle::Live(UsdcRebalance::ConversionComplete {
-            direction,
-            amount,
-            filled_amount: view_filled_amount,
-            initiated_at: view_initiated_at,
-            converted_at: view_converted_at,
-        }) = view
-        else {
-            panic!("Expected ConversionComplete state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(view_filled_amount, filled_amount);
-        assert_eq!(view_initiated_at, initiated_at);
-        assert_eq!(view_converted_at, converted_at);
-    }
-
-    #[test]
-    fn test_view_tracks_conversion_failure() {
-        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
-        let order_id = Uuid::new_v4();
-        let initiated_at = Utc::now();
-        let failed_at = Utc::now();
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 1,
-            payload: UsdcRebalanceEvent::ConversionInitiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
-                order_id,
-                initiated_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        view.update(&EventEnvelope {
-            aggregate_id: "rebalance-123".to_string(),
-            sequence: 2,
-            payload: UsdcRebalanceEvent::ConversionFailed {
-                reason: "Order canceled".to_string(),
-                failed_at,
-            },
-            metadata: HashMap::new(),
-        });
-
-        let Lifecycle::Live(UsdcRebalance::ConversionFailed {
-            direction,
-            amount,
-            order_id: view_order_id,
-            reason,
-            initiated_at: view_initiated_at,
-            failed_at: view_failed_at,
-        }) = view
-        else {
-            panic!("Expected ConversionFailed state");
-        };
-
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
-        assert_eq!(view_order_id, order_id);
-        assert_eq!(reason, "Order canceled");
-        assert_eq!(view_initiated_at, initiated_at);
-        assert_eq!(view_failed_at, failed_at);
     }
 
     #[tokio::test]
@@ -4625,51 +3295,47 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let order_id = Uuid::new_v4();
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::BaseToAlpaca,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::OnchainTx(burn_tx),
-            initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: burn_tx,
-            burned_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash: mint_tx,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            deposit_initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
-            direction: RebalanceDirection::BaseToAlpaca,
-            deposit_confirmed_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiatePostDepositConversion {
-                    order_id,
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    deposit_confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id,
+                amount: Usdc(dec!(1000.00)),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::ConversionInitiated {
@@ -4694,74 +3360,68 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: burn_tx,
-            burned_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash: mint_tx,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: TransferRef::OnchainTx(mint_tx),
-            deposit_initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
-            direction: RebalanceDirection::AlpacaToBase,
-            deposit_confirmed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiatePostDepositConversion {
-                    order_id: Uuid::new_v4(),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::OnchainTx(mint_tx),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: Uuid::new_v4(),
+                amount: Usdc(dec!(1000.00)),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::WrongDirectionForPostDepositConversion
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WrongDirectionForPostDepositConversion)
         ));
     }
 
     #[tokio::test]
     async fn test_cannot_initiate_post_deposit_conversion_before_deposit_confirmed() {
-        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiatePostDepositConversion {
-                    order_id: Uuid::new_v4(),
-                    amount: Usdc(dec!(1000.00)),
-                },
-                &(),
-            )
-            .await;
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: Uuid::new_v4(),
+                amount: Usdc(dec!(1000.00)),
+            })
+            .await
+            .then_expect_error();
 
         assert!(matches!(
-            result.unwrap_err(),
-            UsdcRebalanceError::DepositNotConfirmed
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositNotConfirmed)
         ));
     }
 
@@ -4772,59 +3432,55 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::BaseToAlpaca,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::OnchainTx(burn_tx),
-            initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: burn_tx,
-            burned_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash: mint_tx,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            deposit_initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
-            direction: RebalanceDirection::BaseToAlpaca,
-            deposit_confirmed_at: Utc::now(),
-        });
-
-        let result = aggregate
-            .handle(
-                UsdcRebalanceCommand::InitiatePostDepositConversion {
-                    order_id: Uuid::new_v4(),
-                    amount: Usdc(dec!(500.00)),
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
-            .await;
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    deposit_confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: Uuid::new_v4(),
+                amount: Usdc(dec!(500.00)),
+            })
+            .await
+            .then_expect_error();
 
-        let err = result.unwrap_err();
         assert!(
             matches!(
-                &err,
-                UsdcRebalanceError::ConversionAmountMismatch { expected, provided }
+                &error,
+                LifecycleError::Apply(UsdcRebalanceError::ConversionAmountMismatch { expected, provided })
                     if *expected == Usdc(dec!(1000.00)) && *provided == Usdc(dec!(500.00))
             ),
-            "Expected ConversionAmountMismatch with expected=1000 and provided=500, got: {err:?}"
+            "Expected ConversionAmountMismatch with expected=1000 and provided=500, got: {error:?}"
         );
     }
 
@@ -4836,103 +3492,90 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let order_id = Uuid::new_v4();
 
-        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-
-        aggregate.apply(UsdcRebalanceEvent::Initiated {
-            direction: RebalanceDirection::BaseToAlpaca,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::OnchainTx(burn_tx),
-            initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: burn_tx,
-            burned_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
-            attestation: vec![0x01],
-            cctp_nonce: 12345,
-            attested_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::Bridged {
-            mint_tx_hash: mint_tx,
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
-            minted_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
-            deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            deposit_initiated_at: Utc::now(),
-        });
-        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
-            direction: RebalanceDirection::BaseToAlpaca,
-            deposit_confirmed_at: Utc::now(),
-        });
-
-        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::BaseToAlpaca,
-            amount: Usdc(dec!(1000.00)),
-            order_id,
-            initiated_at: Utc::now(),
-        });
-
-        let events = aggregate
-            .handle(
-                UsdcRebalanceCommand::ConfirmConversion {
-                    filled_amount: Usdc(dec!(998)),
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                    initiated_at: Utc::now(),
                 },
-                &(),
-            )
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    deposit_confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc(dec!(1000.00)),
+                    order_id,
+                    initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmConversion {
+                filled_amount: Usdc(dec!(998)),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
             UsdcRebalanceEvent::ConversionConfirmed { .. }
         ));
-
-        aggregate.apply(events.into_iter().next().unwrap());
-
-        let Lifecycle::Live(UsdcRebalance::ConversionComplete { direction, .. }) = aggregate else {
-            panic!("Expected ConversionComplete state");
-        };
-        assert_eq!(direction, RebalanceDirection::BaseToAlpaca);
     }
 
     #[test]
-    fn test_from_event_rejects_conversion_confirmed_as_init() {
-        let event = UsdcRebalanceEvent::ConversionConfirmed {
+    fn conversion_confirmed_on_uninitialized_produces_failed_state() {
+        let error = replay::<UsdcRebalance>(vec![UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::BaseToAlpaca,
             filled_amount: Usdc(dec!(998)),
             converted_at: Utc::now(),
-        };
+        }])
+        .unwrap_err();
 
-        let result = UsdcRebalance::from_event(&event);
-
-        assert!(matches!(result, Err(LifecycleError::Mismatch { .. })));
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
     }
 
     #[test]
-    fn test_apply_transition_rejects_conversion_initiated_from_non_deposit_confirmed() {
-        let current = UsdcRebalance::Withdrawing {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            initiated_at: Utc::now(),
-        };
+    fn conversion_initiated_on_withdrawing_produces_failed_state() {
+        let error = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                order_id: Uuid::new_v4(),
+                initiated_at: Utc::now(),
+            },
+        ])
+        .unwrap_err();
 
-        let event = UsdcRebalanceEvent::ConversionInitiated {
-            direction: RebalanceDirection::AlpacaToBase,
-            amount: Usdc(dec!(1000.00)),
-            order_id: Uuid::new_v4(),
-            initiated_at: Utc::now(),
-        };
-
-        let result = UsdcRebalance::apply_transition(&event, &current);
-
-        assert!(matches!(result, Err(LifecycleError::Mismatch { .. })));
+        assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
     }
 }

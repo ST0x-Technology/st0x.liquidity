@@ -4,21 +4,22 @@
 //! utilities for the vault registry.
 
 use alloy::primitives::ruint::FromUintError;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, FractionalShares, Positive};
-use std::num::ParseFloatError;
 use tracing::{error, warn};
 
-use super::OnChainError;
+use st0x_execution::{Direction, FractionalShares};
+
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::EvmCtx;
+use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
@@ -39,7 +40,8 @@ pub(crate) struct VaultInfo {
 /// Extracts vault information from an OrderV4 for both input and output at the
 /// specified indices.
 ///
-/// Returns `(input_vault, output_vault)` if both indices are valid, or None if either is out of bounds.
+/// Returns `(input_vault, output_vault)` if both indices
+/// are valid, or `None` if either is out of bounds.
 pub(crate) fn extract_vault_info(
     order: &OrderV4,
     input_index: usize,
@@ -69,8 +71,9 @@ pub(crate) struct OwnedVaultInfo {
 
 /// Extracts all vault information from a ClearV3 event.
 ///
-/// Returns vaults from both alice and bob orders. Each order contributes two vaults
-/// (input and output) as determined by the clear config indices.
+/// Returns vaults from both alice and bob orders. Each
+/// order contributes two vaults (input and output) as
+/// determined by the clear config indices.
 pub(crate) fn extract_vaults_from_clear(event: &ClearV3) -> Vec<OwnedVaultInfo> {
     let participants = [
         (
@@ -133,155 +136,24 @@ pub(crate) fn extract_owned_vaults(
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnchainTrade {
     pub(crate) id: Option<i64>,
-    pub(crate) tx_hash: B256,
+    pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedEquitySymbol,
     pub(crate) equity_token: Address,
-    pub(crate) amount: f64,
+    pub(crate) amount: FractionalShares,
     pub(crate) direction: Direction,
     pub(crate) price: Usdc,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
     pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) gas_used: Option<u64>,
     pub(crate) effective_gas_price: Option<u128>,
-    pub(crate) pyth_price: Option<f64>,
-    pub(crate) pyth_confidence: Option<f64>,
+    pub(crate) pyth_price: Option<Decimal>,
+    pub(crate) pyth_confidence: Option<Decimal>,
     pub(crate) pyth_exponent: Option<i32>,
     pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
 }
 
 impl OnchainTrade {
-    pub async fn save_within_transaction(
-        &self,
-        sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    ) -> Result<i64, OnChainError> {
-        let tx_hash_str = self.tx_hash.to_string();
-        let log_index_i64 = i64::try_from(self.log_index)?;
-
-        let direction_str = self.direction.as_str();
-        let symbol_str = self.symbol.to_string();
-        let block_timestamp_naive = self.block_timestamp.map(|dt| dt.naive_utc());
-
-        let gas_used_i64 = self.gas_used.and_then(|g| i64::try_from(g).ok());
-        let effective_gas_price_i64 = self.effective_gas_price.and_then(|p| i64::try_from(p).ok());
-
-        let result = sqlx::query!(
-            r#"
-            INSERT INTO onchain_trades (
-                tx_hash,
-                log_index,
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
-                gas_used,
-                effective_gas_price,
-                pyth_price,
-                pyth_confidence,
-                pyth_exponent,
-                pyth_publish_time
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            "#,
-            tx_hash_str,
-            log_index_i64,
-            symbol_str,
-            self.amount,
-            direction_str,
-            self.price,
-            block_timestamp_naive,
-            gas_used_i64,
-            effective_gas_price_i64,
-            self.pyth_price,
-            self.pyth_confidence,
-            self.pyth_exponent,
-            self.pyth_publish_time
-        )
-        .execute(&mut **sql_tx)
-        .await?;
-
-        Ok(result.last_insert_rowid())
-    }
-
-    #[cfg(test)]
-    pub async fn find_by_tx_hash_and_log_index(
-        pool: &sqlx::SqlitePool,
-        tx_hash: B256,
-        log_index: u64,
-    ) -> Result<Self, OnChainError> {
-        let tx_hash_str = tx_hash.to_string();
-        let log_index_i64 = i64::try_from(log_index).expect("test log_index should fit in i64");
-
-        let row = sqlx::query!(
-            "
-            SELECT
-                id,
-                tx_hash,
-                log_index,
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                created_at,
-                block_timestamp,
-                gas_used,
-                effective_gas_price,
-                pyth_price,
-                pyth_confidence,
-                pyth_exponent,
-                pyth_publish_time
-            FROM onchain_trades
-            WHERE tx_hash = ?1 AND log_index = ?2
-            ",
-            tx_hash_str,
-            log_index_i64
-        )
-        .fetch_one(pool)
-        .await?;
-
-        let tx_hash = row
-            .tx_hash
-            .parse()
-            .expect("test db should have valid tx_hash");
-
-        let direction = row.direction.parse()?;
-
-        Ok(Self {
-            id: Some(row.id),
-            tx_hash,
-            log_index: u64::try_from(row.log_index)
-                .expect("test db log_index should be non-negative"),
-            symbol: row.symbol.parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: row.amount,
-            direction,
-            price: Usdc::new(row.price_usdc).expect("db price_usdc should be non-negative"),
-            block_timestamp: row
-                .block_timestamp
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            created_at: row
-                .created_at
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            gas_used: row.gas_used.and_then(|g| u64::try_from(g).ok()),
-            effective_gas_price: row.effective_gas_price.and_then(|p| u128::try_from(p).ok()),
-            pyth_price: row.pyth_price,
-            pyth_confidence: row.pyth_confidence,
-            pyth_exponent: row.pyth_exponent.and_then(|exp| i32::try_from(exp).ok()),
-            pyth_publish_time: row
-                .pyth_publish_time
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-        })
-    }
-
-    #[cfg(test)]
-    pub async fn db_count(pool: &sqlx::SqlitePool) -> Result<i64, sqlx::Error> {
-        let row = sqlx::query!("SELECT COUNT(*) as count FROM onchain_trades")
-            .fetch_one(pool)
-            .await?;
-        Ok(row.count)
-    }
-
     /// Core parsing logic for converting blockchain events to trades
     pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
         cache: &SymbolCache,
@@ -311,10 +183,10 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        let onchain_input_amount = float_to_f64(fill.input_amount)?;
+        let onchain_input_amount = float_to_decimal(fill.input_amount)?;
         let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
 
-        let onchain_output_amount = float_to_f64(fill.output_amount)?;
+        let onchain_output_amount = float_to_decimal(fill.output_amount)?;
         let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -325,15 +197,15 @@ impl OnchainTrade {
             onchain_output_amount,
         )?;
 
-        if trade_details.equity_amount().value() == 0.0 {
+        if trade_details.equity_amount().inner().is_zero() {
             return Ok(None);
         }
 
         // Calculate price per share in USDC (always USDC amount / equity amount)
         let price_per_share_usdc =
-            trade_details.usdc_amount().value() / trade_details.equity_amount().value();
+            trade_details.usdc_amount().value() / trade_details.equity_amount().inner();
 
-        if price_per_share_usdc.is_nan() || price_per_share_usdc <= 0.0 {
+        if price_per_share_usdc <= Decimal::ZERO {
             return Ok(None);
         }
 
@@ -354,8 +226,8 @@ impl OnchainTrade {
         .await
         {
             Ok(pricing) => Some(pricing),
-            Err(e) => {
-                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {e}");
+            Err(error) => {
+                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {error}");
                 None
             }
         };
@@ -368,20 +240,20 @@ impl OnchainTrade {
             log_index,
             symbol: tokenized_symbol,
             equity_token,
-            amount: trade_details.equity_amount().value(),
+            amount: trade_details.equity_amount(),
             direction: trade_details.direction(),
             price,
-            #[allow(clippy::cast_possible_wrap)]
-            block_timestamp: log
-                .block_timestamp
-                .and_then(|ts| DateTime::from_timestamp(ts as i64, 0)),
+            block_timestamp: log.block_timestamp.and_then(|timestamp_secs| {
+                let secs: i64 = timestamp_secs.try_into().ok()?;
+                DateTime::from_timestamp(secs, 0)
+            }),
             created_at: None,
             gas_used,
             effective_gas_price,
-            pyth_price: pyth_pricing.as_ref().map(|p| p.price),
-            pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
-            pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
-            pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
+            pyth_price: pyth_pricing.as_ref().map(|pricing| pricing.price),
+            pyth_confidence: pyth_pricing.as_ref().map(|pricing| pricing.confidence),
+            pyth_exponent: pyth_pricing.as_ref().map(|pricing| pricing.exponent),
+            pyth_publish_time: pyth_pricing.as_ref().map(|pricing| pricing.publish_time),
         };
 
         Ok(Some(trade))
@@ -390,10 +262,10 @@ impl OnchainTrade {
     /// Attempts to create an OnchainTrade from a transaction hash by looking up
     /// the transaction receipt and parsing relevant orderbook events.
     pub async fn try_from_tx_hash<P: Provider>(
-        tx_hash: B256,
+        tx_hash: TxHash,
         provider: P,
         cache: &SymbolCache,
-        evm_ctx: &EvmCtx,
+        ctx: &EvmCtx,
         feed_id_cache: &FeedIdCache,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
@@ -411,7 +283,7 @@ impl OnchainTrade {
             .filter(|log| {
                 (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
                     || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
-                    && log.address() == evm_ctx.orderbook
+                    && log.address() == ctx.orderbook
             })
             .collect();
 
@@ -427,7 +299,7 @@ impl OnchainTrade {
                 log,
                 &provider,
                 cache,
-                evm_ctx,
+                ctx,
                 feed_id_cache,
                 order_owner,
             )
@@ -449,75 +321,11 @@ pub(crate) struct OrderFill {
     pub output_amount: B256,
 }
 
-/// Business logic validation errors for trade processing rules.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum TradeValidationError {
-    #[error("No transaction hash found in log")]
-    NoTxHash,
-    #[error("No log index found in log")]
-    NoLogIndex,
-    #[error("No block number found in log")]
-    NoBlockNumber,
-    #[error("Integer conversion error: {0}")]
-    IntConversion(#[from] std::num::TryFromIntError),
-    #[error("Invalid IO index: {0}")]
-    InvalidIndex(#[from] FromUintError<usize>),
-    #[error("No input found at index: {0}")]
-    NoInputAtIndex(usize),
-    #[error("No output found at index: {0}")]
-    NoOutputAtIndex(usize),
-    #[error(
-        "Expected IO to contain USDC and one tokenized equity \
-         (t prefix, 0x or s1 suffix) but got {0} and {1}"
-    )]
-    InvalidSymbolConfiguration(String, String),
-    #[error(
-        "Could not fully allocate execution shares for \
-         symbol {symbol}. Remaining: {remaining_shares}"
-    )]
-    InsufficientTradeAllocation {
-        symbol: String,
-        remaining_shares: f64,
-    },
-    #[error("Failed to convert U256 to f64: {0}")]
-    U256ToF64(#[from] ParseFloatError),
-    #[error("Transaction not found: {0}")]
-    TransactionNotFound(B256),
-    #[error(
-        "Node provider issue: tx receipt missing or has no logs. \
-        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
-    )]
-    NodeReceiptMissing {
-        block_number: u64,
-        tx_hash: B256,
-        clear_log_index: u64,
-    },
-    #[error(
-        "Unexpected: tx receipt has ClearV3 but no AfterClearV2 (should be impossible). \
-        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
-    )]
-    AfterClearMissingFromReceipt {
-        block_number: u64,
-        tx_hash: B256,
-        clear_log_index: u64,
-    },
-    #[error("Negative shares amount: {0}")]
-    NegativeShares(f64),
-    #[error("Share quantity {0} cannot be converted to f64")]
-    ShareConversionFailed(Positive<FractionalShares>),
-    #[error("Negative USDC amount: {0}")]
-    NegativeUsdc(f64),
-    #[error(
-        "Symbol '{0}' is not a tokenized equity (must start with 't' or end with '0x' or 's1')"
-    )]
-    NotTokenizedEquity(String),
-}
-
 async fn try_convert_log_to_onchain_trade<P: Provider>(
     log: &Log,
     provider: P,
     cache: &SymbolCache,
-    evm_ctx: &EvmCtx,
+    ctx: &EvmCtx,
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -534,7 +342,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 
     if let Ok(clear_event) = log.log_decode::<ClearV3>() {
         return OnchainTrade::try_from_clear_v3(
-            evm_ctx,
+            ctx,
             cache,
             &provider,
             clear_event.data().clone(),
@@ -560,14 +368,67 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     Ok(None)
 }
 
-/// Converts a Float (bytes32) amount to f64.
+/// Converts a Float (bytes32) amount to Decimal.
 ///
-/// Uses the rain-math-float library's format() method to convert the Float to a string,
-/// then parses it to f64. Float.format() handles the proper formatting internally.
-fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
+/// Uses the rain-math-float library's format() method to convert the Float to
+/// a string, then parses it to Decimal for precision-safe arithmetic.
+fn float_to_decimal(float: B256) -> Result<Decimal, OnChainError> {
     let float = Float::from_raw(float);
-    let formatted = float.format()?;
-    Ok(formatted.parse::<f64>()?)
+    let formatted = float.format_with_scientific(false)?;
+    Ok(formatted.parse::<Decimal>()?)
+}
+
+/// Business logic validation errors for trade processing rules.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TradeValidationError {
+    #[error("No transaction hash found in log")]
+    NoTxHash,
+    #[error("No log index found in log")]
+    NoLogIndex,
+    #[error("No block number found in log")]
+    NoBlockNumber,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
+    #[error("Invalid IO index: {0}")]
+    InvalidIndex(#[from] FromUintError<usize>),
+    #[error("No input found at index: {0}")]
+    NoInputAtIndex(usize),
+    #[error("No output found at index: {0}")]
+    NoOutputAtIndex(usize),
+    #[error(
+        "Expected IO to contain USDC and one tokenized \
+         equity (t prefix) but got {0} and {1}"
+    )]
+    InvalidSymbolConfiguration(String, String),
+    #[error("Transaction not found: {0}")]
+    TransactionNotFound(TxHash),
+    #[error(
+        "Node provider issue: tx receipt missing or has no logs. \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    NodeReceiptMissing {
+        block_number: u64,
+        tx_hash: TxHash,
+        clear_log_index: u64,
+    },
+    #[error(
+        "Unexpected: tx receipt has ClearV3 but no AfterClearV2 (should be impossible). \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    AfterClearMissingFromReceipt {
+        block_number: u64,
+        tx_hash: TxHash,
+        clear_log_index: u64,
+    },
+    #[error("Negative shares amount: {0}")]
+    NegativeShares(Decimal),
+    #[error("Negative USDC amount: {0}")]
+    NegativeUsdc(Decimal),
+    #[error(
+        "symbol '{symbol_provided}' is not a tokenized equity \
+         (must have 't' prefix, e.g. tAAPL, tSPYM)"
+    )]
+    NotTokenizedEquity { symbol_provided: String },
 }
 
 #[cfg(test)]
@@ -575,60 +436,12 @@ mod tests {
     use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::bindings::IOrderBookV5;
     use crate::onchain::EvmCtx;
     use crate::symbol::cache::SymbolCache;
-    use crate::test_utils::setup_test_db;
-
-    #[tokio::test]
-    async fn test_onchain_trade_save_within_transaction_and_find() {
-        let pool = setup_test_db().await;
-
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            ),
-            log_index: 42,
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: 10.0,
-            direction: Direction::Sell,
-            price: Usdc::new(150.25).unwrap(),
-            block_timestamp: DateTime::from_timestamp(1_672_531_200, 0), // Jan 1, 2023 00:00:00 UTC
-            created_at: None,
-            gas_used: Some(21000),
-            effective_gas_price: Some(2_000_000_000), // 2 gwei
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        let id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
-        sql_tx.commit().await.unwrap();
-        assert!(id > 0);
-
-        let found =
-            OnchainTrade::find_by_tx_hash_and_log_index(&pool, trade.tx_hash, trade.log_index)
-                .await
-                .unwrap();
-
-        assert_eq!(found.tx_hash, trade.tx_hash);
-        assert_eq!(found.log_index, trade.log_index);
-        assert_eq!(found.symbol, trade.symbol);
-        assert!((found.amount - trade.amount).abs() < f64::EPSILON);
-        assert_eq!(found.direction, trade.direction);
-        assert_eq!(found.price, trade.price);
-        assert_eq!(found.block_timestamp, trade.block_timestamp);
-        assert_eq!(found.gas_used, trade.gas_used);
-        assert_eq!(found.effective_gas_price, trade.effective_gas_price);
-        assert!(found.id.is_some());
-        assert!(found.created_at.is_some());
-    }
 
     #[test]
     fn test_float_constants_from_v5_interface() {
@@ -641,7 +454,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x01, // coefficient = 1
         ]);
-        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_one).unwrap() - dec!(1.0)).abs() < dec!(0.000001));
 
         // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
         let float_half = B256::from([
@@ -650,7 +463,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x05, // coefficient = 5
         ]);
-        assert!((float_to_f64(float_half).unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_half).unwrap() - dec!(0.5)).abs() < dec!(0.000001));
 
         // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
         let float_two = B256::from([
@@ -659,24 +472,24 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x02, // coefficient = 2
         ]);
-        assert!((float_to_f64(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_two).unwrap() - dec!(2.0)).abs() < dec!(0.000001));
     }
 
-    /// Test with real production event data from tx 0xf05d240c99c7c3f8d4562130f655d2b571b1b82643b621987bed3d8aabab304d
-    /// The trade was for 2 shares of tSPLG at ~$80/share.
+    /// Test with real production event data from tx
+    /// 0xf05d...304d (2 shares of tSPLG at ~$80/share).
     ///
     /// TakeOrderV3 event field semantics (counterintuitive naming):
     /// - event.input = amount the order GAVE = 2 tSPLG shares
     /// - event.output = amount the order RECEIVED = ~160 USDC
     #[test]
-    fn test_float_to_f64_production_event_data() {
+    fn test_float_to_decimal_production_event_data() {
         // event.input Float: 2 shares the order gave
         // Raw bytes: ffffffee00000000000000000000000000000000000000001bc16d674ec80000
         let event_input_float =
             fixed_bytes!("ffffffee00000000000000000000000000000000000000001bc16d674ec80000");
-        let shares_amount = float_to_f64(event_input_float).unwrap();
+        let shares_amount = float_to_decimal(event_input_float).unwrap();
         assert!(
-            (shares_amount - 2.0).abs() < f64::EPSILON,
+            (shares_amount - dec!(2.0)).abs() < dec!(0.000001),
             "Expected 2.0 shares but got {shares_amount}"
         );
 
@@ -684,9 +497,9 @@ mod tests {
         // Raw bytes: ffffffe500000000000000000000000000000002057d2cd516a29b6174400000
         let event_output_float =
             fixed_bytes!("ffffffe500000000000000000000000000000002057d2cd516a29b6174400000");
-        let usdc_amount = float_to_f64(event_output_float).unwrap();
+        let usdc_amount = float_to_decimal(event_output_float).unwrap();
         assert!(
-            (usdc_amount - 160.155_077_52).abs() < 0.00001,
+            (usdc_amount - dec!(160.155_077_52)).abs() < dec!(0.00001),
             "Expected ~160.15 USDC but got {usdc_amount}"
         );
 
@@ -699,202 +512,80 @@ mod tests {
     }
 
     #[test]
-    fn test_float_to_f64_edge_cases() {
+    fn test_float_to_decimal_edge_cases() {
         let float_zero = Float::from_fixed_decimal(uint!(0_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_f64(float_zero).unwrap() - 0.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_zero).unwrap() - dec!(0.0)).abs() < dec!(0.000001));
 
         let float_one = Float::from_fixed_decimal(uint!(1_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_one).unwrap() - dec!(1.0)).abs() < dec!(0.000001));
 
         let float_nine = Float::from_fixed_decimal(uint!(9_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_nine).unwrap();
-        assert!((result - 9.0).abs() < f64::EPSILON);
+        let result = float_to_decimal(float_nine).unwrap();
+        assert!((result - dec!(9.0)).abs() < dec!(0.000001));
 
         let float_hundred = Float::from_fixed_decimal(uint!(100_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_hundred).unwrap();
-        assert!((result - 100.0).abs() < f64::EPSILON);
+        let result = float_to_decimal(float_hundred).unwrap();
+        assert!((result - dec!(100.0)).abs() < dec!(0.000001));
 
         let float_half = Float::from_fixed_decimal(uint!(5_U256), 1)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_half).unwrap();
-        assert!((result - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_invalid_formats() {
-        let pool = setup_test_db().await;
-
-        // Attempt to insert invalid tx_hash format - should fail due to constraint
-        let insert_result = sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
-             VALUES ('invalid_hash', 1, 'TEST', 1.0, 'BUY', 1.0)"
-        )
-        .execute(&pool)
-        .await;
-
-        let err = insert_result.unwrap_err();
-        assert!(
-            matches!(err, sqlx::Error::Database(_)),
-            "Expected database constraint error, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_invalid_direction() {
-        let pool = setup_test_db().await;
-
-        let insert_result = sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
-             VALUES ('0x1234567890123456789012345678901234567890123456789012345678901234', 1, 'TEST', 1.0, 'INVALID', 1.0)"
-        )
-        .execute(&pool)
-        .await;
-
-        let err = insert_result.unwrap_err();
-        assert!(
-            matches!(err, sqlx::Error::Database(_)),
-            "Expected database constraint error for invalid direction, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_save_within_transaction_constraint_violation() {
-        let pool = setup_test_db().await;
-
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            log_index: 100,
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: 10.0,
-            direction: Direction::Buy,
-            price: Usdc::new(150.0).unwrap(),
-            block_timestamp: DateTime::from_timestamp(1_672_531_800, 0), // Jan 1, 2023 00:10:00 UTC
-            created_at: None,
-            gas_used: Some(50000), // Complex contract interaction
-            effective_gas_price: Some(1_500_000_000), // 1.5 gwei in wei
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        // Insert first trade
-        let mut sql_tx1 = pool.begin().await.unwrap();
-        trade.save_within_transaction(&mut sql_tx1).await.unwrap();
-        sql_tx1.commit().await.unwrap();
-
-        // Try to insert duplicate trade (same tx_hash and log_index)
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let err = trade
-            .save_within_transaction(&mut sql_tx2)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, OnChainError::Persistence(_)),
-            "Expected persistence error for duplicate trade, got: {err:?}"
-        );
-        sql_tx2.rollback().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_save_within_transaction_large_log_index_wrapping() {
-        let pool = setup_test_db().await;
-
-        // Test that extremely large log_index values are handled consistently
-        // u64::MAX will wrap to -1 when cast to i64
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x2222222222222222222222222222222222222222222222222222222222222222"
-            ),
-            log_index: u64::MAX, // Will become -1 when cast to i64
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: 10.0,
-            direction: Direction::Buy,
-            price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
-            created_at: None,
-            gas_used: None,
-            effective_gas_price: None,
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-
-        let err = trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, OnChainError::IntConversion(_)),
-            "Expected integer conversion error for u64::MAX log_index, got: {err:?}"
-        );
-        sql_tx.rollback().await.unwrap();
+        let result = float_to_decimal(float_half).unwrap();
+        assert!((result - dec!(0.5)).abs() < dec!(0.000001));
     }
 
     #[test]
-    fn test_float_to_f64_precision_loss() {
+    fn test_float_to_decimal_precision_loss() {
         // Test with very large coefficient
         let large_coeff = 1_000_000_000_000_000_i128;
         let float_large = Float::from_fixed_decimal_lossy(U256::from(large_coeff), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_large).unwrap();
-        assert!(result.is_finite());
-        assert!((result - 1_000_000_000_000_000.0).abs() < 1.0);
+        let result = float_to_decimal(float_large).unwrap();
+        assert!((result - dec!(1_000_000_000_000_000.0)).abs() < dec!(1.0));
 
         // Test with very small value (high negative exponent)
+        // 1e-50 exceeds Decimal's 28-digit precision, so it truncates to zero
         let float_small = Float::from_fixed_decimal_lossy(uint!(1_U256), 50)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_small).unwrap();
-        assert!(result.is_finite());
-        // 1 × 10^-50 is extremely small
-        assert!(result > 0.0 && result < 1e-40);
+        let result = float_to_decimal(float_small).unwrap();
+        assert_eq!(result, dec!(0.0));
     }
 
     #[test]
-    fn test_float_to_f64_formatting_edge_cases() {
+    fn test_float_to_decimal_formatting_edge_cases() {
         let float_amount = Float::from_fixed_decimal(uint!(123_456_U256), 6)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
-        assert!((result - 0.123_456).abs() < f64::EPSILON);
+        let result = float_to_decimal(float_amount).unwrap();
+        assert!((result - dec!(0.123_456)).abs() < dec!(0.000001));
 
         let float_amount = Float::from_fixed_decimal(uint!(5_U256), 10)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
-        assert!((result - 5e-10).abs() < 1e-15);
+        let result = float_to_decimal(float_amount).unwrap();
+        assert!((result - dec!(0.0000000005)).abs() < dec!(0.000000000000001));
 
         let float_amount = Float::from_fixed_decimal(uint!(12_345_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
-        assert!((result - 12_345.0).abs() < f64::EPSILON);
+        let result = float_to_decimal(float_amount).unwrap();
+        assert!((result - dec!(12_345.0)).abs() < dec!(0.000001));
 
         let float_amount = Float::from_fixed_decimal(uint!(5000_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
-        assert!((result - 5000.0).abs() < f64::EPSILON);
+        let result = float_to_decimal(float_amount).unwrap();
+        assert!((result - dec!(5000.0)).abs() < dec!(0.000001));
     }
 
     #[tokio::test]
@@ -905,7 +596,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
-        let evm_ctx = EvmCtx {
+        let ctx = EvmCtx {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             order_owner: Some(Address::ZERO),
@@ -920,7 +611,7 @@ mod tests {
             tx_hash,
             provider,
             &cache,
-            &evm_ctx,
+            &ctx,
             &feed_id_cache,
             Address::ZERO,
         )
@@ -930,65 +621,6 @@ mod tests {
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::TransactionNotFound(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_database_error() {
-        let pool = setup_test_db().await;
-
-        // Close the pool to simulate database connection error
-        pool.close().await;
-
-        // Expected database connection error
-        OnchainTrade::find_by_tx_hash_and_log_index(
-            &pool,
-            fixed_bytes!("0x5555555555555555555555555555555555555555555555555555555555555555"),
-            1,
-        )
-        .await
-        .unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn test_db_count_with_data() {
-        let pool = setup_test_db().await;
-
-        // Insert test data
-        for i in 0..5 {
-            let mut tx_hash_bytes = [0u8; 32];
-            tx_hash_bytes[0..31].copy_from_slice(&[
-                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
-                0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56,
-                0x78, 0x90, 0x12,
-            ]);
-            tx_hash_bytes[31] = i;
-
-            let trade = OnchainTrade {
-                id: None,
-                tx_hash: B256::from(tx_hash_bytes),
-                log_index: u64::from(i),
-                symbol: TokenizedEquitySymbol::parse(&format!("TEST{i}0x")).unwrap(),
-                equity_token: Address::ZERO,
-                amount: 10.0,
-                direction: Direction::Buy,
-                price: Usdc::new(150.0).unwrap(),
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            };
-
-            let mut sql_tx = pool.begin().await.unwrap();
-            trade.save_within_transaction(&mut sql_tx).await.unwrap();
-            sql_tx.commit().await.unwrap();
-        }
-
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 5);
     }
 
     fn make_io(token: Address, vault_id: B256) -> IOrderBookV5::IOV2 {

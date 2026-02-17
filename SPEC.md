@@ -1018,49 +1018,96 @@ they serve different purposes in different bounded contexts.
 
 ### Aggregate Design
 
-#### Lifecycle Wrapper Pattern
+#### EventSourced Trait
 
-All event-sourced aggregates use the `Lifecycle<T, E>` wrapper which handles
-infrastructure concerns while keeping business logic clean:
+Domain types implement the `EventSourced` trait, which provides a safer, more
+ergonomic interface than cqrs-es's `Aggregate` directly:
 
 ```rust
-enum Lifecycle<T, E> {
-    Uninitialized,     // No events applied yet (default state)
-    Live(T),           // Normal operational state
-    Failed {           // Error state (no panics in financial apps)
-        error: LifecycleError<E>,
-        last_valid_state: Option<Box<T>>,
+#[async_trait]
+trait EventSourced {
+    type Id: Display + FromStr + Send + Sync;
+    type Event: DomainEvent + Eq;
+    type Command: Send + Sync;
+    type Error: DomainError;
+    type Services: Send + Sync;
+
+    const AGGREGATE_TYPE: &'static str;
+    const PROJECTION: Option<Table>;
+    const SCHEMA_VERSION: u64;
+
+    // Event-side: reconstruct state from event log
+    fn originate(event: &Self::Event) -> Option<Self>;
+    fn evolve(entity: &Self, event: &Self::Event)
+        -> Result<Option<Self>, Self::Error>;
+
+    // Command-side: process commands to produce events
+    async fn initialize(
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error>;
+    async fn transition(
+        &self,
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error>;
+}
+```
+
+##### Why This Exists
+
+cqrs-es's `Aggregate` trait has sharp edges that have caused production bugs:
+
+- **Infallible `apply`**: Financial applications cannot panic on arithmetic
+  overflow, but `Aggregate::apply` returns nothing
+- **Stringly-typed IDs**: `cqrs.execute("some-id", cmd)` takes `&str`, making it
+  trivial to pass the wrong ID
+- **No schema versioning**: Stale snapshots and views cause silent corruption
+- **Flat command handling**: A single `handle` receives all commands regardless
+  of lifecycle state
+
+`EventSourced` fixes these by splitting command handling into `initialize` (no
+`&self`, impossible to reference nonexistent state) and `transition` (receives
+`&self` as the domain type, not `Lifecycle`). Event application is split into
+`originate` (genesis events) and `evolve` (subsequent events with fallible
+return).
+
+##### Lifecycle Wrapper (Implementation Detail)
+
+`Lifecycle<Entity>` bridges `EventSourced` to cqrs-es via a blanket `Aggregate`
+impl. It is an implementation detail -- domain modules never interact with
+`Lifecycle` directly:
+
+```rust
+enum Lifecycle<Entity: EventSourced> {
+    Uninitialized,
+    Live(Entity),
+    Failed {
+        error: LifecycleError<Entity>,
+        last_valid_entity: Option<Box<Entity>>,
     },
 }
 ```
 
-##### Why This Pattern Exists
+- `Uninitialized` -> `Live`: via `originate`
+- `Live` -> `Live`: via `evolve`
+- Any -> `Failed`: on domain errors (no panics in financial apps)
 
-- `Aggregate::apply` and `View::update` are infallible (no `Result` return)
-- Financial applications cannot panic on arithmetic overflow
-- Events might arrive before genesis (replay ordering, bugs)
-- Transitions might fail (overflow, invalid state combinations)
+The error type is derived from `EventSourced::Error`, not a separate type
+parameter. Use `Never` (uninhabited type) for aggregates with infallible
+operations.
 
-##### Usage in `apply()` method
+##### Store (Type-Safe Command Dispatch)
+
+`Store<Entity>` wraps `SqliteCqrs<Lifecycle<Entity>>` and enforces typed IDs:
 
 ```rust
-fn apply(&mut self, event: Self::Event) {
-    *self = self
-        .clone()
-        .transition(&event, MyEntity::apply_transition)
-        .or_initialize(&event, MyEntity::from_event);
-}
+let positions: Store<Position> = /* built by CqrsBuilder */;
+positions.send(&symbol, PositionCommand::AcknowledgeFill { .. }).await?;
 ```
 
-- `transition()` applies events to an existing entity
-- `or_initialize()` handles genesis events if entity doesn't exist yet
-- Failures transition to `Failed` instead of panicking
-
-##### Error Type Parameter
-
-- Use `Never` (uninhabited type) for aggregates with no fallible operations
-- Use domain-specific error types (e.g., `ArithmeticError`) when transitions can
-  fail
+This prevents the class of bugs where string aggregate IDs are mixed up between
+different entity types.
 
 #### OnChainTrade Aggregate
 
@@ -1070,7 +1117,7 @@ affecting position calculations.
 
 **Aggregate ID**: `"{tx_hash}:{log_index}"` (e.g., "0x123...abc:5")
 
-**Type**: `Lifecycle<OnChainTrade, Never>` (transitions never fail)
+**Type**: `OnChainTrade` (implements `EventSourced` with `Error = Never`)
 
 ##### State
 
@@ -1156,7 +1203,7 @@ fractional shares and coordinating offchain hedging when thresholds are reached.
 
 **Aggregate ID**: `symbol` (e.g., "AAPL")
 
-**Type**: `Lifecycle<Position, ArithmeticError>` (arithmetic can overflow)
+**Type**: `Position` (implements `EventSourced` with `Error = ArithmeticError`)
 
 ##### State
 
@@ -1187,10 +1234,6 @@ struct TradeId {
 }
 
 enum PositionCommand {
-    Initialize {
-        symbol: Symbol,
-        threshold: ExecutionThreshold,
-    },
     AcknowledgeOnChainFill {
         trade_id: TradeId,
         amount: FractionalShares,
@@ -1203,6 +1246,7 @@ enum PositionCommand {
         shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
+        threshold: ExecutionThreshold,
     },
     CompleteOffChainOrder {
         execution_id: ExecutionId,
@@ -1215,9 +1259,6 @@ enum PositionCommand {
     FailOffChainOrder {
         execution_id: ExecutionId,
         error: String,
-    },
-    UpdateThreshold {
-        threshold: ExecutionThreshold,
     },
 }
 ```
@@ -1233,11 +1274,6 @@ enum PositionEvent {
         accumulated_short: FractionalShares,
         threshold: ExecutionThreshold,
         migrated_at: DateTime<Utc>,
-    },
-    Initialized {
-        symbol: Symbol,
-        threshold: ExecutionThreshold,
-        initialized_at: DateTime<Utc>,
     },
     OnChainOrderFilled {
         trade_id: TradeId,
@@ -1268,11 +1304,6 @@ enum PositionEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
-    ThresholdUpdated {
-        old_threshold: ExecutionThreshold,
-        new_threshold: ExecutionThreshold,
-        updated_at: DateTime<Utc>,
-    },
 }
 
 enum TriggerReason {
@@ -1291,7 +1322,8 @@ enum TriggerReason {
 
 **Business Rules** (enforced in `handle()`):
 
-- Threshold must be configured before processing any fills (Initialize command)
+- `AcknowledgeOnChainFill` serves as the genesis event (initializes the
+  aggregate on first fill)
 - Can only place offchain order when threshold is met:
   - **Shares threshold**: `|net_position| >= threshold` (e.g., 1.0 shares for
     Schwab)
@@ -1301,8 +1333,7 @@ enum TriggerReason {
   net = sell, negative net = buy)
 - Cannot have multiple pending executions for same symbol
 - OnChain fills are always applied (blockchain facts are immutable)
-- Threshold can be updated at any time, emits ThresholdUpdated event for audit
-  trail
+- Threshold is passed as a parameter to commands that need it
 
 #### OffchainOrder Aggregate
 
@@ -1311,7 +1342,7 @@ submission, filling, and settlement.
 
 **Aggregate ID**: `execution_id` (integer from schwab_executions table)
 
-**Type**: `Lifecycle<OffchainOrder, Never>` (transitions never fail)
+**Type**: `OffchainOrder` (implements `EventSourced` with `Error = Never`)
 
 ##### States
 
@@ -1737,15 +1768,10 @@ orderbook vaults via Circle CCTP bridge.
 
 **Aggregate ID**: Random UUID generated when rebalancing is initiated
 
-**Lifecycle Pattern**: This aggregate uses the `Lifecycle<T, E>` wrapper pattern
-(see `src/lifecycle.rs`). The `Lifecycle` wrapper provides:
-
-- `Uninitialized` - No events applied yet (default state)
-- `Live(UsdcRebalance)` - Normal operational state
-- `Failed { error, last_valid_state }` - Error state for recovery
-
-The inner `UsdcRebalance` enum contains only business states - the
-`Uninitialized` state is provided by the wrapper, not the inner type.
+**Type**: `UsdcRebalance` (implements `EventSourced` with `Error = Never`). The
+inner `UsdcRebalance` enum contains only business states -- the `Uninitialized`
+state is provided by the `Lifecycle` wrapper, which is an implementation detail
+(see EventSourced Trait section).
 
 ##### Supporting Types
 
@@ -1766,7 +1792,7 @@ enum TransferRef {
 }
 ```
 
-**States** (wrapped by `Lifecycle<UsdcRebalance, Never>`):
+**States**:
 
 ```rust
 enum UsdcRebalance {
@@ -2210,21 +2236,16 @@ symbol and position status.
 
 ##### View State
 
-```rust
-enum PositionView {
-    Unavailable,
-    Position {
-        symbol: Symbol,
-        net: FractionalShares,
-        accumulated_long: FractionalShares,
-        accumulated_short: FractionalShares,
-        pending_execution_id: Option<ExecutionId>,
-        last_updated: DateTime<Utc>,
-    },
-}
-```
+The position view type is `Lifecycle<Position>` -- the `Lifecycle` wrapper
+implements `View<Self>` via a blanket impl for any `EventSourced` type, so the
+view is the aggregate's current state serialized to the `position_view` table.
+This avoids a separate view type and keeps the read model exactly in sync with
+the aggregate state.
 
-**Projection Logic**: Updates on `PositionEvent::*`
+The view is materialized via a `SqliteQuery<Position>` (alias for
+`GenericQuery<SqliteViewRepository<...>>`) registered as a query processor on
+the position `Store`. Loading position state for reads goes through
+`GenericQuery::load()` rather than replaying events.
 
 #### OffchainTradeView
 
@@ -2750,7 +2771,6 @@ enum OnChainTradeEvent {
 
 enum PositionEvent {
     // Normal events (future system)
-    Initialized { /* ... */ },
     OnChainOrderFilled { /* ... */ },
     OffChainOrderPlaced { /* ... */ },
     OffChainOrderFilled { /* ... */ },
@@ -2865,30 +2885,41 @@ After migration:
 
 #### Aggregate Testing
 
-Use Given-When-Then pattern from `cqrs-es::test::TestFramework`:
+Use `TestHarness` for BDD-style command testing and `replay` for reconstructing
+state from events. Both operate at the `EventSourced` level, hiding
+`Lifecycle`/`Aggregate` internals:
 
 ```rust
-#[test]
-fn test_position_accumulates_fills() {
-    PositionTestFramework::with(())
-        .given(vec![/* previous events */])
+#[tokio::test]
+async fn test_position_accumulates_fills() {
+    let events = TestHarness::<Position>::with(())
+        .given(vec![
+            PositionEvent::Initialized { /* ... */ },
+            PositionEvent::OnChainOrderFilled { /* ... */ },
+        ])
         .when(PositionCommand::AcknowledgeOnChainFill { /* ... */ })
-        .then_expect_events(vec![PositionEvent::OnChainOrderFilled { /* ... */ }]);
+        .await
+        .then_expect_events(&[
+            PositionEvent::OnChainOrderFilled { /* ... */ },
+        ]);
 }
 ```
 
-#### View Testing
+#### State Reconstruction Testing
+
+Use `replay` to reconstruct entity state from a sequence of events:
 
 ```rust
 #[test]
-fn test_view_updates_from_events() {
-    let event = PositionEvent::OnChainOrderFilled { /* ... */ };
-    let envelope = EventEnvelope { /* ... */ };
+fn test_replay_builds_position_state() {
+    let position = replay::<Position>(vec![
+        PositionEvent::Initialized { /* ... */ },
+        PositionEvent::OnChainOrderFilled { /* ... */ },
+    ])
+    .unwrap()
+    .expect("should produce a live position");
 
-    let mut view = PositionView::default();
-    view.update(&envelope);
-
-    // Assert view state matches expected
+    assert_eq!(position.net, FractionalShares::new(dec!(1.5)));
 }
 ```
 
@@ -2917,7 +2948,7 @@ src/                              - Main st0x-hedge library crate
   bin/
     server.rs                     - Main arbitrage bot server
     cli.rs                        - CLI for manual operations
-    reporter.rs                   - P&L reporter binary
+    reporter.rs                   - P&L reporter binary (deprecated)
   position.rs                     - Position aggregate (commands, events, state in one file)
   onchain_trade.rs                - OnChainTrade aggregate
   offchain_order.rs               - OffchainOrder aggregate

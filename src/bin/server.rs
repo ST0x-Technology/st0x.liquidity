@@ -13,8 +13,8 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_guard = if let Some(ref telemetry) = ctx.telemetry {
         match telemetry.setup(log_level) {
             Ok(guard) => Some(guard),
-            Err(e) => {
-                eprintln!("Failed to setup telemetry: {e}");
+            Err(error) => {
+                eprintln!("Failed to setup telemetry: {error}");
                 setup_tracing(&ctx.log_level);
                 None
             }

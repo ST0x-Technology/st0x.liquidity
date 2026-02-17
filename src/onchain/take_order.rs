@@ -51,6 +51,14 @@ impl OnchainTrade {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{B256, TxHash, U256, address, fixed_bytes, uint};
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::sol_types::SolCall;
+    use rain_math_float::Float;
+    use rust_decimal_macros::dec;
+
+    use st0x_execution::FractionalShares;
+
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
@@ -58,10 +66,6 @@ mod tests {
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
-    use alloy::primitives::{B256, U256, address, fixed_bytes, uint};
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
-    use alloy::sol_types::SolCall;
-    use rain_math_float::Float;
 
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV5::OrderV4,
@@ -91,7 +95,7 @@ mod tests {
         }
     }
 
-    fn mocked_receipt_hex(tx_hash: B256) -> serde_json::Value {
+    fn mocked_receipt_hex(tx_hash: TxHash) -> serde_json::Value {
         serde_json::json!({
             "transactionHash": tx_hash,
             "transactionIndex": "0x1",
@@ -128,10 +132,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        // Mock decimals() then symbol() calls for output token (tAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -149,8 +153,8 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(
             trade.tx_hash,
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
@@ -193,10 +197,10 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
-        // Swapped indices: input from validInputs[1]=AAPL0x, output from validOutputs[0]=USDC
-        // Order receives 5 AAPL0x and gives 50 USDC
+        // Swapped indices: input from validInputs[1]=tAAPL, output from validOutputs[0]=USDC
+        // Order receives 5 tAAPL and gives 50 USDC
         // event.input = what order gave = 50 USDC
-        // event.output = what order received = 5 AAPL0x
+        // event.output = what order received = 5 tAAPL
         let take_event = TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
@@ -224,10 +228,10 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        // Mock decimals() then symbol() calls in the order they're called for input token (tAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
@@ -250,8 +254,8 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 5.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(5)));
     }
 
     #[tokio::test]
@@ -295,10 +299,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        // Mock decimals() then symbol() calls for output token (tAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -316,10 +320,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
-        assert!((trade.amount - 15.0).abs() < f64::EPSILON);
+        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(trade.amount, FractionalShares::new(dec!(15)));
         // Price should be 200 USDC / 15 shares = 13.333... USDC per share
-        assert!((trade.price.value() - 13.333_333_333_333_334).abs() < 0.001);
+        assert_eq!(trade.price.value(), dec!(200) / dec!(15));
     }
 
     #[tokio::test]
@@ -356,10 +360,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        // Mock decimals() then symbol() calls for output token (tAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -386,7 +390,7 @@ mod tests {
         let target_order_owner = order.owner;
 
         // Helper to create Float for testing using from_fixed_decimal_lossy
-        fn create_float(value: u64, decimals: u8) -> alloy::primitives::B256 {
+        fn create_float(value: u64, decimals: u8) -> B256 {
             let u256_value = U256::from(value);
             let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()

@@ -20,7 +20,7 @@ use st0x_execution::{
     FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
 };
 
-use crate::offchain::order_poller::OrderPollerConfig;
+use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
@@ -354,8 +354,8 @@ impl Ctx {
         self.rebalancing.as_ref()
     }
 
-    pub const fn get_order_poller_config(&self) -> OrderPollerConfig {
-        OrderPollerConfig {
+    pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
+        OrderPollerCtx {
             polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
             max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
         }
@@ -388,8 +388,6 @@ pub enum CtxError {
     #[error(transparent)]
     InvalidThreshold(#[from] InvalidThresholdError),
     #[error(transparent)]
-    InvalidShares(#[from] st0x_execution::InvalidSharesError),
-    #[error(transparent)]
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
     #[error("rebalancing config present in config but rebalancing secrets missing")]
     RebalancingSecretsMissing,
@@ -407,7 +405,6 @@ impl CtxError {
             Self::Io(_) => "failed to read config file",
             Self::Toml(_) => "failed to parse TOML",
             Self::InvalidThreshold(_) => "invalid execution threshold",
-            Self::InvalidShares(_) => "invalid shares value",
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",
@@ -440,8 +437,7 @@ pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use tracing_test::traced_test;
 
-    use st0x_execution::TryIntoExecutor;
-    use st0x_execution::{MockExecutor, MockExecutorCtx};
+    use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
     use crate::onchain::EvmCtx;

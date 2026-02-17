@@ -125,8 +125,8 @@ impl<'de> serde::Deserialize<'de> for Network {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        Ok(Self::new(s))
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::new(raw))
     }
 }
 
@@ -158,8 +158,8 @@ fn deserialize_decimal_from_string<'de, D>(deserializer: D) -> Result<Decimal, D
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    s.parse::<Decimal>().map_err(serde::de::Error::custom)
+    let raw = String::deserialize(deserializer)?;
+    raw.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
 fn validate_amount(amount: Decimal) -> Result<(), AlpacaWalletError> {
@@ -214,7 +214,7 @@ pub(super) async fn get_transfer_status(
 
     transfers
         .into_iter()
-        .find(|t| t.id == *transfer_id)
+        .find(|transfer| transfer.id == *transfer_id)
         .ok_or_else(|| AlpacaWalletError::TransferNotFound {
             transfer_id: *transfer_id,
         })
@@ -247,7 +247,7 @@ pub(super) async fn find_transfer_by_tx_hash(
 
     Ok(transfers
         .into_iter()
-        .find(|t| t.tx.as_ref() == Some(tx_hash)))
+        .find(|transfer| transfer.tx.as_ref() == Some(tx_hash)))
 }
 
 #[cfg(test)]

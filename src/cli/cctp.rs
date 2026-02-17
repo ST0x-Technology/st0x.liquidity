@@ -5,14 +5,17 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
+use std::io::Write;
+
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
-use std::io::Write;
 
 use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM, http_client_with_retry};
+use crate::onchain::http_client_with_retry;
+use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
+use crate::rebalancing::RebalancingCtx;
 use crate::threshold::Usdc;
 
 impl CctpChain {
@@ -80,20 +83,16 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
     writeln!(stdout, "   Wallet: {wallet}")?;
 
-    let cctp_bridge = build_cctp_bridge(
-        rebalancing.ethereum_rpc_url.clone(),
-        base_provider,
-        signer.clone(),
-    )?;
+    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer.clone())?;
 
     let direction = from.to_bridge_direction();
 
     writeln!(stdout, "\n1. Burning USDC on {from:?}...")?;
-    let burn = Bridge::burn(&cctp_bridge, direction, amount_u256, wallet).await?;
+    let burn = cctp_bridge.burn(direction, amount_u256, wallet).await?;
     writeln!(stdout, "   Burn tx: {}, Amount: {}", burn.tx, burn.amount)?;
 
     writeln!(stdout, "\n2. Polling for attestation...")?;
-    let response = Bridge::poll_attestation(&cctp_bridge, direction, burn.tx).await?;
+    let response = cctp_bridge.poll_attestation(direction, burn.tx).await?;
     writeln!(
         stdout,
         "   Attestation received ({} bytes)",
@@ -101,7 +100,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
 
     writeln!(stdout, "\n3. Minting USDC on {dest:?}...")?;
-    let mint_receipt = Bridge::mint(&cctp_bridge, direction, &response).await?;
+    let mint_receipt = cctp_bridge.mint(direction, &response).await?;
     writeln!(
         stdout,
         "Bridge complete! Mint tx: {}\n  Amount received: {} (fee: {})",
@@ -111,16 +110,17 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     Ok(())
 }
 
-fn build_cctp_bridge<BP: Provider + Clone>(
-    ethereum_rpc_url: url::Url,
+fn build_cctp_bridge<BP: Provider + Clone + 'static>(
+    rebalancing: &RebalancingCtx,
     base_provider: BP,
     signer: PrivateKeySigner,
-) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, CctpError> {
+) -> Result<CctpBridge<impl Provider + Clone + 'static, impl Provider + Clone + 'static>, CctpError>
+{
     let owner = signer.address();
 
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_client(http_client_with_retry(ethereum_rpc_url));
+        .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
     let base_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
@@ -159,10 +159,10 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     writeln!(stdout, "   Destination chain: {dest_chain:?}")?;
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
-    let cctp_bridge =
-        build_cctp_bridge(rebalancing.ethereum_rpc_url.clone(), base_provider, signer)?;
+    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer)?;
 
-    let response = Bridge::poll_attestation(&cctp_bridge, direction, burn_tx).await?;
+    // Use the V2 API which returns both message and attestation from tx hash
+    let response = cctp_bridge.poll_attestation(direction, burn_tx).await?;
 
     writeln!(
         stdout,
@@ -171,7 +171,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     )?;
 
     writeln!(stdout, "   Calling receiveMessage on {dest_chain:?}...")?;
-    let mint_receipt = Bridge::mint(&cctp_bridge, direction, &response).await?;
+    let mint_receipt = cctp_bridge.mint(direction, &response).await?;
     writeln!(
         stdout,
         "CCTP transfer recovered! Mint tx: {}\n  Amount received: {} (fee: {})",
@@ -314,7 +314,7 @@ mod tests {
                 account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
-                time_in_force: TimeInForce::Day,
+                time_in_force: TimeInForce::default(),
             },
         });
         ctx

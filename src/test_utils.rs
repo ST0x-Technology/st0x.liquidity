@@ -1,19 +1,18 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
-use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
-use crate::offchain::execution::OffchainExecution;
-use crate::onchain::OnchainTrade;
-use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
-use alloy::primitives::{B256, LogData, address, bytes, fixed_bytes};
+use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_execution::{OrderState, SchwabTokens};
 
+use st0x_execution::{Direction, FractionalShares, SchwabTokens};
+
+use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+use crate::onchain::OnchainTrade;
+use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important -- only that the
@@ -85,8 +84,9 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
     pool
 }
 
-/// Centralized test token setup to eliminate duplication across test files.
-/// Creates and stores test tokens in the database for Schwab API authentication.
+/// Centralized test token setup to eliminate duplication
+/// across test files. Creates and stores test tokens in
+/// the database for Schwab API authentication.
 pub(crate) async fn setup_test_tokens(pool: &SqlitePool, auth: &SchwabAuth) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
@@ -118,12 +118,12 @@ impl OnchainTradeBuilder {
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
                 log_index: 1,
-                symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+                symbol: "tAAPL".parse::<TokenizedEquitySymbol>().unwrap(),
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                amount: 1.0,
+                amount: FractionalShares::new(Decimal::ONE),
                 direction: Direction::Buy,
-                price: Usdc::new(150.0).unwrap(),
-                block_timestamp: None,
+                price: Usdc::new(Decimal::new(150, 0)).unwrap(),
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: None,
                 effective_gas_price: None,
@@ -142,26 +142,20 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_equity_token(mut self, token: alloy::primitives::Address) -> Self {
+    pub(crate) fn with_equity_token(mut self, token: Address) -> Self {
         self.trade.equity_token = token;
         self
     }
 
     #[must_use]
-    pub(crate) fn with_amount(mut self, amount: f64) -> Self {
-        self.trade.amount = amount;
+    pub(crate) fn with_amount(mut self, amount: Decimal) -> Self {
+        self.trade.amount = FractionalShares::new(amount);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_price(mut self, price: f64) -> Self {
+    pub(crate) fn with_price(mut self, price: Decimal) -> Self {
         self.trade.price = Usdc::new(price).unwrap();
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_tx_hash(mut self, hash: B256) -> Self {
-        self.trade.tx_hash = hash;
         self
     }
 
@@ -173,36 +167,5 @@ impl OnchainTradeBuilder {
 
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
-    }
-}
-
-/// Builder for creating OffchainExecution test instances with sensible defaults.
-/// Reduces duplication in test data setup.
-pub(crate) struct OffchainExecutionBuilder {
-    execution: OffchainExecution,
-}
-
-impl Default for OffchainExecutionBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OffchainExecutionBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            execution: OffchainExecution {
-                id: None,
-                symbol: Symbol::new("AAPL").unwrap(),
-                shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
-                direction: Direction::Buy,
-                executor: SupportedExecutor::Schwab,
-                state: OrderState::Pending,
-            },
-        }
-    }
-
-    pub(crate) fn build(self) -> OffchainExecution {
-        self.execution
     }
 }

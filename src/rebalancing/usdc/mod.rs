@@ -10,17 +10,18 @@ pub(crate) mod mock;
 pub(crate) use manager::UsdcRebalanceManager;
 
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
 use thiserror::Error;
 
 use alloy::primitives::ruint::FromUintError;
 
+use st0x_bridge::cctp::CctpError;
+use st0x_event_sorcery::SendError;
+use st0x_execution::AlpacaBrokerApiError;
+
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::onchain::vault::VaultError;
 use crate::threshold::Usdc;
-use crate::usdc_rebalance::{UsdcRebalanceError, UsdcRebalanceId};
-use st0x_bridge::cctp::CctpError;
-use st0x_execution::AlpacaBrokerApiError;
+use crate::usdc_rebalance::UsdcRebalanceId;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcRebalanceManagerError {
@@ -33,15 +34,15 @@ pub(crate) enum UsdcRebalanceManagerError {
     #[error("Vault error: {0}")]
     Vault(#[from] VaultError),
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<UsdcRebalanceError>),
+    Aggregate(#[from] SendError<crate::usdc_rebalance::UsdcRebalance>),
     #[error("Withdrawal failed with terminal status: {status}")]
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]
     DepositFailed { status: String },
-    #[error("Invalid amount: {0}")]
-    InvalidAmount(String),
-    #[error("Arithmetic overflow: {0}")]
-    ArithmeticOverflow(String),
+    #[error("USDC amount cannot be negative: {amount}")]
+    NegativeAmount { amount: Usdc },
+    #[error("USDC amount overflow during scaling: {amount}")]
+    ArithmeticOverflow { amount: Usdc },
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
     #[error("U256 to u128 conversion error: {0}")]

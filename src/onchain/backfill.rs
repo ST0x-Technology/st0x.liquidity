@@ -214,15 +214,15 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
             match event_data {
                 EventData::ClearV3(event) => match enqueue(pool, &*event, &log).await {
                     Ok(()) => Some(()),
-                    Err(e) => {
-                        warn!("Failed to enqueue ClearV3 event during backfill: {e}");
+                    Err(error) => {
+                        warn!("Failed to enqueue ClearV3 event during backfill: {error}");
                         None
                     }
                 },
                 EventData::TakeOrderV3(event) => match enqueue(pool, &*event, &log).await {
                     Ok(()) => Some(()),
-                    Err(e) => {
-                        warn!("Failed to enqueue TakeOrderV3 event during backfill: {e}");
+                    Err(error) => {
+                        warn!("Failed to enqueue TakeOrderV3 event during backfill: {error}");
                         None
                     }
                 },
@@ -254,7 +254,7 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{
-        Address, B256, FixedBytes, IntoLogData, U256, address, fixed_bytes, uint,
+        Address, B256, FixedBytes, IntoLogData, TxHash, U256, address, fixed_bytes, uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
@@ -476,7 +476,7 @@ mod tests {
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"MSFT0x".to_string(),
+            &"tMSFT".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -693,13 +693,13 @@ mod tests {
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"MSFT0x".to_string(),
+            &"tMSFT".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"MSFT0x".to_string(),
+            &"tMSFT".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -718,11 +718,9 @@ mod tests {
         assert_eq!(first_event.block_number, 50);
 
         // Mark as processed and get the second event
-        let mut sql_tx = pool.begin().await.unwrap();
-        mark_event_processed(&mut sql_tx, first_event.id.unwrap())
+        mark_event_processed(&pool, first_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
 
         let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(second_event.tx_hash, tx_hash2);
@@ -970,7 +968,7 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    fn create_clear_log(orderbook: Address, order: &IOrderBookV5::OrderV4, tx_hash: B256) -> Log {
+    fn create_clear_log(orderbook: Address, order: &IOrderBookV5::OrderV4, tx_hash: TxHash) -> Log {
         let clear_config = IOrderBookV5::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
@@ -1002,7 +1000,7 @@ mod tests {
         }
     }
 
-    fn create_after_clear_log(orderbook: Address, tx_hash: B256) -> Log {
+    fn create_after_clear_log(orderbook: Address, tx_hash: TxHash) -> Log {
         let after_clear_event = IOrderBookV5::AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: IOrderBookV5::ClearStateChangeV2 {
@@ -1078,14 +1076,14 @@ mod tests {
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
         asserter.push_success(&serde_json::json!([after_clear_log]));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"AAPL0x".to_string(),
+            &"tAAPL".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1101,11 +1099,9 @@ mod tests {
         assert_eq!(first_event.tx_hash, tx_hash1);
         assert_eq!(first_event.block_number, 50);
 
-        let mut sql_tx = pool.begin().await.unwrap();
-        mark_event_processed(&mut sql_tx, first_event.id.unwrap())
+        mark_event_processed(&pool, first_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
 
         let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(second_event.tx_hash, tx_hash2);

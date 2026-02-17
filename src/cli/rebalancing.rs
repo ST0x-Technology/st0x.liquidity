@@ -4,17 +4,15 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::CqrsFramework;
-use cqrs_es::persist::PersistedEventStore;
-use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+use st0x_event_sorcery::StoreBuilder;
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, Symbol, TimeInForce,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
+    TimeInForce,
 };
 
 use super::TransferDirection;
@@ -31,7 +29,6 @@ use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RedemptionManager};
-use crate::shares::FractionalShares;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
@@ -79,10 +76,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
 
-            let mint_store =
-                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-            let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
-            let mint_manager = MintManager::new(tokenization_service, mint_cqrs);
+            let mint_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
+            let mint_manager = MintManager::new(tokenization_service, mint_store);
 
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
@@ -108,10 +103,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Token Address: {token}")?;
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
-            let redemption_store =
-                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-            let redemption_cqrs = Arc::new(CqrsFramework::new(redemption_store, vec![], ()));
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_cqrs);
+            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
+            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_store);
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
@@ -182,7 +175,7 @@ where
         account_id: rebalancing_config.alpaca_account_id.to_string(),
         mode: Some(broker_mode),
         asset_cache_ttl: std::time::Duration::from_secs(3600),
-        time_in_force: TimeInForce::Day,
+        time_in_force: TimeInForce::default(),
     };
 
     let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
@@ -207,16 +200,14 @@ where
         base_provider_with_wallet,
         ctx.evm.orderbook,
     ));
-    let event_store =
-        PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-    let cqrs = Arc::new(CqrsFramework::new(event_store, vec![], ()));
+    let usdc_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
 
     let rebalance_manager = UsdcRebalanceManager::new(
         alpaca_broker,
         alpaca_wallet,
         bridge,
         vault_service,
-        cqrs,
+        usdc_store,
         owner,
         VaultId(rebalancing_config.usdc_vault_id),
     );
@@ -319,7 +310,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Polling for tokens to arrive on Base...")?;
 
-    let poll_interval = Duration::from_secs(5);
+    let poll_interval = std::time::Duration::from_secs(5);
     let max_attempts = 60; // 5 minutes max
 
     for attempt in 1..=max_attempts {
@@ -477,9 +468,10 @@ fn format_tokenization_request<W: Write>(
     stdout: &mut W,
     request: &TokenizationRequest,
 ) -> io::Result<()> {
-    let type_str = request
-        .r#type
-        .map_or_else(|| "unknown".to_string(), |t| t.to_string());
+    let type_str = request.r#type.map_or_else(
+        || "unknown".to_string(),
+        |transfer_type| transfer_type.to_string(),
+    );
 
     let status_str = match request.status {
         TokenizationRequestStatus::Pending => "⏳ pending",
@@ -555,7 +547,7 @@ mod tests {
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
+            time_in_force: TimeInForce::default(),
         });
         ctx
     }
@@ -701,7 +693,7 @@ mod tests {
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
+            time_in_force: TimeInForce::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
@@ -725,7 +717,7 @@ mod tests {
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Production),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
+            time_in_force: TimeInForce::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {

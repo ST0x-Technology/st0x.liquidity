@@ -169,9 +169,11 @@ impl Order {
                     parse_error = %parse_error,
                     "Failed to parse Schwab order status response"
                 );
-                Err(SchwabError::InvalidConfiguration(format!(
-                    "Failed to parse order status response: {parse_error}"
-                )))
+                Err(SchwabError::ApiResponseParse {
+                    action: "order status check".to_string(),
+                    response_text,
+                    parse_error: parse_error.to_string(),
+                })
             }
         }
     }
@@ -1134,7 +1136,7 @@ mod tests {
         account_mock.assert();
         order_status_mock.assert();
 
-        assert!(matches!(error, SchwabError::InvalidConfiguration(_)));
+        assert!(matches!(error, SchwabError::ApiResponseParse { .. }));
     }
 
     #[tokio::test]

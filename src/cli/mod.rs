@@ -7,18 +7,20 @@ mod rebalancing;
 mod trading;
 mod vault;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_execution::{Direction, Symbol, TimeInForce};
 use std::io::Write;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
+use st0x_execution::{Direction, FractionalShares, Symbol};
+
 use crate::config::{Ctx, Env};
-use crate::shares::FractionalShares;
+use crate::offchain_order::OrderPlacer;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 
@@ -52,7 +54,7 @@ pub enum CctpChain {
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("Invalid quantity: {value}. Quantity must be greater than zero")]
-    InvalidQuantity { value: f64 },
+    InvalidQuantity { value: u64 },
 }
 
 #[derive(Debug, Parser)]
@@ -71,30 +73,24 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to buy
+        /// Number of shares to buy (whole shares only)
         #[arg(short = 'q', long = "quantity")]
-        quantity: f64,
-        /// Time-in-force for the order (Alpaca Broker API only)
-        #[arg(long = "time-in-force")]
-        time_in_force: Option<TimeInForce>,
+        quantity: u64,
     },
     /// Sell shares of a stock
     Sell {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to sell
+        /// Number of shares to sell (whole shares only)
         #[arg(short = 'q', long = "quantity")]
-        quantity: f64,
-        /// Time-in-force for the order (Alpaca Broker API only)
-        #[arg(long = "time-in-force")]
-        time_in_force: Option<TimeInForce>,
+        quantity: u64,
     },
     /// Process a transaction hash to execute opposite-side trade
     ProcessTx {
         /// Transaction hash (0x prefixed, 64 hex characters)
         #[arg(long = "tx-hash")]
-        tx_hash: B256,
+        tx_hash: TxHash,
     },
     /// Perform Charles Schwab OAuth authentication flow
     Auth,
@@ -134,7 +130,8 @@ pub enum Commands {
     /// Deposit USDC directly to Alpaca from Ethereum (bypasses vault/CCTP)
     ///
     /// This is a simplified command for testing Alpaca integration.
-    /// It sends USDC from your Ethereum wallet directly to Alpaca's deposit address.
+    /// It sends USDC from your Ethereum wallet directly
+    /// to Alpaca's deposit address.
     AlpacaDeposit {
         /// Amount of USDC to deposit
         #[arg(short = 'a', long = "amount")]
@@ -242,7 +239,7 @@ pub enum Commands {
     CctpRecover {
         /// Transaction hash of the burn transaction on the source chain
         #[arg(long = "burn-tx")]
-        burn_tx: B256,
+        burn_tx: TxHash,
         /// Source chain where the burn occurred
         #[arg(long = "source-chain")]
         source_chain: CctpChain,
@@ -352,40 +349,28 @@ pub async fn run_command(ctx: Ctx, command: Commands) -> anyhow::Result<()> {
 
 async fn execute_order<W: Write>(
     symbol: Symbol,
-    quantity: f64,
+    quantity: u64,
     direction: Direction,
-    time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    if !quantity.is_finite() || quantity <= 0.0 {
+    if quantity == 0 {
         return Err(CliError::InvalidQuantity { value: quantity }.into());
     }
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
-    trading::execute_order_with_writers(
-        symbol,
-        quantity,
-        direction,
-        time_in_force,
-        ctx,
-        pool,
-        stdout,
-    )
-    .await
+    trading::execute_order_with_writers(symbol, quantity, direction, ctx, pool, stdout).await
 }
 
 /// Commands that don't require a WebSocket provider.
 enum SimpleCommand {
     Buy {
         symbol: Symbol,
-        quantity: f64,
-        time_in_force: Option<TimeInForce>,
+        quantity: u64,
     },
     Sell {
         symbol: Symbol,
-        quantity: f64,
-        time_in_force: Option<TimeInForce>,
+        quantity: u64,
     },
     Auth,
     TransferEquity {
@@ -421,7 +406,7 @@ enum SimpleCommand {
 /// Commands that require a WebSocket provider.
 enum ProviderCommand {
     ProcessTx {
-        tx_hash: B256,
+        tx_hash: TxHash,
     },
     TransferUsdc {
         direction: TransferDirection,
@@ -442,7 +427,7 @@ enum ProviderCommand {
         from: CctpChain,
     },
     CctpRecover {
-        burn_tx: B256,
+        burn_tx: TxHash,
         source_chain: CctpChain,
     },
     ResetAllowance {
@@ -469,7 +454,10 @@ async fn run_command_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     match classify_command(command) {
         Ok(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
-        Err(provider_cmd) => run_provider_command(provider_cmd, &ctx, pool, stdout).await?,
+        Err(provider_cmd) => {
+            let order_placer = trading::create_order_placer(&ctx, pool);
+            run_provider_command(provider_cmd, &ctx, pool, stdout, order_placer).await?;
+        }
     }
 
     info!("CLI operation completed successfully");
@@ -478,24 +466,8 @@ async fn run_command_with_writers<W: Write>(
 
 fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
-        Commands::Buy {
-            symbol,
-            quantity,
-            time_in_force,
-        } => Ok(SimpleCommand::Buy {
-            symbol,
-            quantity,
-            time_in_force,
-        }),
-        Commands::Sell {
-            symbol,
-            quantity,
-            time_in_force,
-        } => Ok(SimpleCommand::Sell {
-            symbol,
-            quantity,
-            time_in_force,
-        }),
+        Commands::Buy { symbol, quantity } => Ok(SimpleCommand::Buy { symbol, quantity }),
+        Commands::Sell { symbol, quantity } => Ok(SimpleCommand::Sell { symbol, quantity }),
         Commands::Auth => Ok(SimpleCommand::Auth),
         Commands::TransferEquity {
             direction,
@@ -576,37 +548,11 @@ async fn run_simple_command<W: Write>(
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     match command {
-        SimpleCommand::Buy {
-            symbol,
-            quantity,
-            time_in_force,
-        } => {
-            execute_order(
-                symbol,
-                quantity,
-                Direction::Buy,
-                time_in_force,
-                ctx,
-                pool,
-                stdout,
-            )
-            .await
+        SimpleCommand::Buy { symbol, quantity } => {
+            execute_order(symbol, quantity, Direction::Buy, ctx, pool, stdout).await
         }
-        SimpleCommand::Sell {
-            symbol,
-            quantity,
-            time_in_force,
-        } => {
-            execute_order(
-                symbol,
-                quantity,
-                Direction::Sell,
-                time_in_force,
-                ctx,
-                pool,
-                stdout,
-            )
-            .await
+        SimpleCommand::Sell { symbol, quantity } => {
+            execute_order(symbol, quantity, Direction::Sell, ctx, pool, stdout).await
         }
         SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
         SimpleCommand::TransferEquity {
@@ -658,6 +604,7 @@ async fn run_provider_command<W: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
+    order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     let provider = ProviderBuilder::new()
         .connect_ws(WsConnect::new(ctx.evm.ws_rpc_url.as_str()))
@@ -667,7 +614,16 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::ProcessTx { tx_hash } => {
             info!("Processing transaction: tx_hash={tx_hash}");
             let cache = SymbolCache::default();
-            trading::process_tx_with_provider(tx_hash, ctx, pool, stdout, &provider, &cache).await
+            trading::process_tx_with_provider(
+                tx_hash,
+                ctx,
+                pool,
+                stdout,
+                &provider,
+                &cache,
+                order_placer,
+            )
+            .await
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool, provider).await
@@ -723,23 +679,29 @@ mod tests {
     use alloy::sol_types::{SolCall, SolEvent};
     use clap::CommandFactory;
     use httpmock::MockServer;
+    use rain_math_float::Float;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::str::FromStr;
+    use url::Url;
+
     use st0x_execution::{
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
-    use std::str::FromStr;
-    use url::Url;
+
+    use st0x_event_sorcery::{Column, Projection};
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{BrokerCtx, LogLevel, SchwabAuth};
-    use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
+    use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
-    use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
+
+    const STATUS: Column = Column("status");
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -780,9 +742,8 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -824,9 +785,8 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("TSLA").unwrap(),
-            50.0,
+            50,
             Direction::Sell,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -869,9 +829,8 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -901,9 +860,8 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -971,9 +929,8 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1025,9 +982,8 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1066,9 +1022,8 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1114,9 +1069,8 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1179,79 +1133,10 @@ mod tests {
 
     #[test]
     fn test_cli_error_display_messages() {
-        let quantity_error = CliError::InvalidQuantity { value: 0.0 };
+        let quantity_error = CliError::InvalidQuantity { value: 0 };
         let error_msg = quantity_error.to_string();
         assert!(error_msg.contains("Invalid quantity: 0"));
         assert!(error_msg.contains("greater than zero"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_rejects_nan() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server);
-        let pool = setup_test_db().await;
-
-        let result = execute_order(
-            Symbol::new("AAPL").unwrap(),
-            f64::NAN,
-            Direction::Buy,
-            None,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await;
-
-        assert!(matches!(
-            result.unwrap_err().downcast_ref::<CliError>(),
-            Some(CliError::InvalidQuantity { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_rejects_infinity() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server);
-        let pool = setup_test_db().await;
-
-        let result = execute_order(
-            Symbol::new("AAPL").unwrap(),
-            f64::INFINITY,
-            Direction::Buy,
-            None,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await;
-
-        assert!(matches!(
-            result.unwrap_err().downcast_ref::<CliError>(),
-            Some(CliError::InvalidQuantity { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_rejects_negative_infinity() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server);
-        let pool = setup_test_db().await;
-
-        let result = execute_order(
-            Symbol::new("AAPL").unwrap(),
-            f64::NEG_INFINITY,
-            Direction::Buy,
-            None,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await;
-
-        assert!(matches!(
-            result.unwrap_err().downcast_ref::<CliError>(),
-            Some(CliError::InvalidQuantity { .. })
-        ));
     }
 
     fn create_test_ctx_for_cli(mock_server: &MockServer) -> Ctx {
@@ -1289,7 +1174,7 @@ mod tests {
 
     fn create_mock_blockchain_data(
         orderbook: Address,
-        tx_hash: B256,
+        tx_hash: TxHash,
         alice_output_shares: &str,
         bob_output_usdc: u64,
     ) -> MockBlockchainData {
@@ -1337,8 +1222,7 @@ mod tests {
             }]
         });
 
-        fn create_float_from_u256(value: U256, decimals: u8) -> alloy::primitives::B256 {
-            use rain_math_float::Float;
+        fn create_float_from_u256(value: U256, decimals: u8) -> B256 {
             let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
             float.get_inner()
         }
@@ -1464,68 +1348,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn test_time_in_force_cli_option() {
-        let cmd = Cli::command();
-
-        cmd.clone()
-            .try_get_matches_from(vec![
-                "cli",
-                "buy",
-                "-s",
-                "AAPL",
-                "-q",
-                "100",
-                "--time-in-force",
-                "day",
-            ])
-            .unwrap();
-
-        cmd.clone()
-            .try_get_matches_from(vec![
-                "cli",
-                "buy",
-                "-s",
-                "AAPL",
-                "-q",
-                "100",
-                "--time-in-force",
-                "market-on-close",
-            ])
-            .unwrap();
-
-        cmd.clone()
-            .try_get_matches_from(vec![
-                "cli",
-                "sell",
-                "-s",
-                "TSLA",
-                "-q",
-                "50",
-                "--time-in-force",
-                "market-on-close",
-            ])
-            .unwrap();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["cli", "buy", "-s", "AAPL", "-q", "100"])
-            .unwrap();
-
-        let err = cmd
-            .try_get_matches_from(vec![
-                "cli",
-                "buy",
-                "-s",
-                "AAPL",
-                "-q",
-                "100",
-                "--time-in-force",
-                "invalid",
-            ])
-            .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-    }
-
     #[tokio::test]
     async fn test_integration_buy_command_end_to_end() {
         let server = MockServer::start();
@@ -1558,8 +1380,7 @@ mod tests {
 
         let buy_command = Commands::Buy {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: 100.0,
-            time_in_force: None,
+            quantity: 100,
         };
 
         let result = run_command_with_writers(ctx, buy_command, &pool, &mut stdout).await;
@@ -1607,8 +1428,7 @@ mod tests {
 
         let sell_command = Commands::Sell {
             symbol: Symbol::new("TSLA").unwrap(),
-            quantity: 50.0,
-            time_in_force: None,
+            quantity: 50,
         };
 
         let result = run_command_with_writers(ctx, sell_command, &pool, &mut stdout).await;
@@ -1657,9 +1477,8 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1732,9 +1551,8 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1767,9 +1585,8 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1804,9 +1621,8 @@ mod tests {
 
         let result2 = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout2,
@@ -1840,9 +1656,8 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1873,10 +1688,18 @@ mod tests {
         asserter.push_success(&json!(null));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
+        let order_placer = trading::create_order_placer(&ctx, &pool);
 
-        let result =
-            trading::process_tx_with_provider(tx_hash, &ctx, &pool, &mut stdout, &provider, &cache)
-                .await;
+        let result = trading::process_tx_with_provider(
+            tx_hash,
+            &ctx,
+            &pool,
+            &mut stdout,
+            &provider,
+            &cache,
+            order_placer,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -1923,9 +1746,8 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("INVALID").unwrap(),
-            999_999.0,
+            999_999,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1969,14 +1791,22 @@ mod tests {
 
         let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
 
-        let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "AAPL0x");
+        let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "tAAPL");
         let cache = SymbolCache::default();
+        let order_placer = trading::create_order_placer(&ctx, &pool);
 
         let mut stdout = Vec::new();
 
-        let result =
-            trading::process_tx_with_provider(tx_hash, &ctx, &pool, &mut stdout, &provider, &cache)
-                .await;
+        let result = trading::process_tx_with_provider(
+            tx_hash,
+            &ctx,
+            &pool,
+            &mut stdout,
+            &provider,
+            &cache,
+            order_placer,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -1984,39 +1814,24 @@ mod tests {
             result.as_ref().err()
         );
 
-        let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
+            .unwrap()
+            .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
-        assert_eq!(trade.symbol.to_string(), "AAPL0x");
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
-
-        let executions = find_executions_by_symbol_status_and_broker(
-            &pool,
-            Some(Symbol::new("AAPL").unwrap()),
-            OrderStatus::Submitted,
-            None,
-        )
-        .await
-        .unwrap();
         assert_eq!(executions.len(), 1);
+
+        let (order_id, order) = &executions[0];
         assert_eq!(
-            executions[0].shares,
+            order.shares(),
             Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
         );
-        assert_eq!(executions[0].direction, Direction::Buy);
-
-        let execution_id = executions[0].id.unwrap();
-        let row = sqlx::query!(
-            "SELECT order_id FROM offchain_trades WHERE id = ?1",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        assert_eq!(order.direction(), Direction::Buy);
         assert!(
-            row.order_id.is_some(),
-            "Order ID should be stored for polling"
+            order.executor_order_id().is_some(),
+            "Executor order ID should be set after submission"
         );
+        assert!(!order_id.to_string().is_empty());
 
         account_mock.assert();
         order_mock.assert();
@@ -2078,11 +1893,12 @@ mod tests {
         ));
         asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"TSLA0x".to_string(),
+            &"tTSLA".to_string(),
         ));
 
         let provider1 = ProviderBuilder::new().connect_mocked_client(asserter1);
         let cache1 = SymbolCache::default();
+        let order_placer = trading::create_order_placer(&ctx, &pool);
 
         let mut stdout1 = Vec::new();
 
@@ -2093,6 +1909,7 @@ mod tests {
             &mut stdout1,
             &provider1,
             &cache1,
+            order_placer.clone(),
         )
         .await;
         assert!(
@@ -2101,11 +1918,17 @@ mod tests {
             result1.as_ref().err()
         );
 
-        let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
+            .unwrap()
+            .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
-        assert_eq!(trade.symbol.to_string(), "TSLA0x");
-        assert!((trade.amount - 5.0).abs() < f64::EPSILON);
+        assert_eq!(executions.len(), 1);
+        let order = &executions[0].1;
+        assert_eq!(
+            order.shares(),
+            Positive::new(FractionalShares::new(dec!(5))).unwrap()
+        );
 
         let stdout_str1 = String::from_utf8(stdout1).unwrap();
         assert!(stdout_str1.contains("Processing trade with TradeAccumulator"));
@@ -2120,7 +1943,7 @@ mod tests {
         ));
         asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"TSLA0x".to_string(),
+            &"tTSLA".to_string(),
         ));
 
         let provider2 = ProviderBuilder::new().connect_mocked_client(asserter2);
@@ -2135,6 +1958,7 @@ mod tests {
             &mut stdout2,
             &provider2,
             &cache2,
+            order_placer,
         )
         .await;
         assert!(
@@ -2142,8 +1966,13 @@ mod tests {
             "Second process_tx should succeed with graceful duplicate handling"
         );
 
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 1, "Only one trade should exist in database");
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events WHERE aggregate_type = 'Position'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "Only one position aggregate should exist");
 
         let stdout_str2 = String::from_utf8(stdout2).unwrap();
         assert!(stdout_str2.contains("Processing trade with TradeAccumulator"));

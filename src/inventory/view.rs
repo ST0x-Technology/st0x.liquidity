@@ -6,15 +6,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
+
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::EquityRedemptionEvent;
 use crate::position::PositionEvent;
-use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
-use st0x_execution::{Direction, Symbol};
 
 /// Error type for inventory view operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -357,9 +357,10 @@ impl InventoryView {
     fn update_equity(
         self,
         symbol: &Symbol,
-        f: impl FnOnce(
+        update: impl FnOnce(
             Inventory<FractionalShares>,
-        ) -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
+        )
+            -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         let inventory = self
@@ -367,7 +368,7 @@ impl InventoryView {
             .get(symbol)
             .ok_or_else(|| InventoryViewError::UnknownSymbol(symbol.clone()))?;
 
-        let updated = f(inventory.clone())?;
+        let updated = update(inventory.clone())?;
 
         let mut equities = self.equities;
         equities.insert(symbol.clone(), updated);
@@ -381,10 +382,10 @@ impl InventoryView {
 
     fn update_usdc(
         self,
-        f: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
+        update: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let updated = f(self.usdc)?;
+        let updated = update(self.usdc)?;
 
         Ok(Self {
             usdc: updated,
@@ -425,7 +426,7 @@ impl InventoryView {
                 direction,
                 ..
             } => {
-                let shares = *shares_filled;
+                let shares = shares_filled.inner();
                 self.update_equity(
                     symbol,
                     |inv| match direction {
@@ -437,7 +438,6 @@ impl InventoryView {
             }
 
             PositionEvent::Initialized { .. }
-            | PositionEvent::Migrated { .. }
             | PositionEvent::OffChainOrderPlaced { .. }
             | PositionEvent::OffChainOrderFailed { .. }
             | PositionEvent::ThresholdUpdated { .. } => Ok(Self {
@@ -714,9 +714,11 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
+    use st0x_execution::{ExecutorOrderId, Positive};
+
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -913,10 +915,10 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
-            shares_filled,
+            offchain_order_id: OffchainOrderId::new(),
+            shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
             broker_timestamp: Utc::now(),
         }

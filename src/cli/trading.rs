@@ -1,27 +1,60 @@
 //! Trading order execution and transaction processing CLI commands.
 
-use alloy::primitives::B256;
+use alloy::primitives::TxHash;
 use alloy::providers::Provider;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sqlite_es::sqlite_cqrs;
+
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
 
 use st0x_execution::{
-    Direction, Executor, FractionalShares, MarketOrder, MockExecutorCtx, OrderPlacement,
-    OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutorCtx,
+    OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
+
+use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
-use crate::dual_write::DualWriteContext;
-use crate::onchain::OnChainError;
+use crate::offchain_order::{
+    OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
+};
+use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::{OnchainTrade, accumulator};
+use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
+use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
+
+/// OrderPlacer for the CLI that delegates to the broker-specific executor
+/// constructed from config. Handles Schwab auth, symbol mapping, etc.
+struct CliOrderPlacer {
+    ctx: Ctx,
+    pool: SqlitePool,
+}
+
+#[async_trait]
+impl OrderPlacer for CliOrderPlacer {
+    async fn place_market_order(
+        &self,
+        order: MarketOrder,
+    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+        let placement =
+            execute_broker_order(&self.ctx, &self.pool, order, &mut std::io::sink()).await?;
+        Ok(ExecutorOrderId::new(&placement.order_id))
+    }
+}
+
+pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> Arc<dyn OrderPlacer> {
+    Arc::new(CliOrderPlacer {
+        ctx: ctx.clone(),
+        pool: pool.clone(),
+    })
+}
 
 pub(super) async fn order_status_command<W: Write>(
     stdout: &mut W,
@@ -106,22 +139,21 @@ async fn get_broker_order_status<W: Write>(
 
 pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
-    quantity: f64,
+    quantity: u64,
     direction: Direction,
-    time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: Positive::new(FractionalShares::new(Decimal::try_from(quantity)?))?,
+        shares: Positive::new(FractionalShares::new(Decimal::from(quantity)))?,
         direction,
     };
 
     info!("Created order: symbol={symbol}, direction={direction:?}, quantity={quantity}");
 
-    match execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await {
+    match execute_broker_order(ctx, pool, market_order, stdout).await {
         Ok(placement) => {
             info!(
                 symbol = %symbol,
@@ -135,16 +167,16 @@ pub(super) async fn execute_order_with_writers<W: Write>(
             writeln!(stdout, "   Action: {direction:?}")?;
             writeln!(stdout, "   Quantity: {quantity}")?;
         }
-        Err(e) => {
+        Err(error) => {
             error!(
                 symbol = %symbol,
                 direction = ?direction,
                 quantity = quantity,
-                error = ?e,
+                error = ?error,
                 "Failed to place order"
             );
-            writeln!(stdout, "❌ Failed to place order: {e}")?;
-            return Err(e);
+            writeln!(stdout, "❌ Failed to place order: {error}")?;
+            return Err(error);
         }
     }
 
@@ -152,12 +184,13 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 }
 
 pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
-    tx_hash: B256,
+    tx_hash: TxHash,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
     provider: &P,
     cache: &SymbolCache,
+    order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     let evm = &ctx.evm;
     let feed_id_cache = FeedIdCache::new();
@@ -167,7 +200,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
         .await
     {
         Ok(Some(onchain_trade)) => {
-            process_found_trade(onchain_trade, ctx, pool, stdout).await?;
+            process_found_trade(onchain_trade, ctx, pool, stdout, order_placer).await?;
         }
         Ok(None) => {
             writeln!(
@@ -179,18 +212,16 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
                 "   This transaction may not contain orderbook events matching the configured order hash."
             )?;
         }
-        Err(OnChainError::Validation(
-            crate::onchain::TradeValidationError::TransactionNotFound(hash),
-        )) => {
+        Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(hash))) => {
             writeln!(stdout, "❌ Transaction not found: {hash}")?;
             writeln!(
                 stdout,
                 "   Please verify the transaction hash and ensure the RPC endpoint is correct."
             )?;
         }
-        Err(e) => {
-            writeln!(stdout, "❌ Error processing transaction: {e}")?;
-            return Err(e.into());
+        Err(error) => {
+            writeln!(stdout, "❌ Error processing transaction: {error}")?;
+            return Err(error.into());
         }
     }
 
@@ -201,7 +232,6 @@ pub(super) async fn execute_broker_order<W: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
     market_order: MarketOrder,
-    time_in_force: Option<TimeInForce>,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &ctx.broker {
@@ -231,11 +261,7 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
-            let mut auth_config = alpaca_auth.clone();
-            if let Some(tif) = time_in_force {
-                auth_config.time_in_force = tif;
-            }
-            let broker = auth_config.try_into_executor().await?;
+            let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -263,105 +289,154 @@ pub(super) async fn process_found_trade<W: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
+    order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     display_trade_details(&onchain_trade, stdout)?;
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let dual_write_context = DualWriteContext::with_threshold(
-        pool.clone(),
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-        ctx.execution_threshold,
+    let position_projection = Projection::<Position>::sqlite(pool.clone())?;
+    let position_store: Arc<Store<Position>> = Arc::new(
+        StoreBuilder::new(pool.clone())
+            .with(position_projection.clone())
+            .build(())
+            .await?,
     );
+    let (offchain_order_store, _) = build_offchain_order_cqrs(pool, order_placer).await?;
 
-    update_position_aggregate(&dual_write_context, &onchain_trade, ctx.execution_threshold).await;
+    update_position_aggregate(&position_store, &onchain_trade, ctx.execution_threshold).await;
 
-    let mut sql_tx = pool.begin().await?;
-    let execution = accumulator::process_onchain_trade(
-        &mut sql_tx,
-        &dual_write_context,
-        onchain_trade,
-        ctx.broker.to_supported_executor(),
-    )
-    .await?;
-    sql_tx.commit().await?;
+    let executor_type = ctx.broker.to_supported_executor();
+    let base_symbol = onchain_trade.symbol.base();
 
-    if let Some(execution) = execution.execution {
-        let execution_id = execution
-            .id
-            .ok_or_else(|| anyhow::anyhow!("OffchainExecution missing ID after accumulation"))?;
+    let Some(params) =
+        check_execution_readiness(&position_projection, base_symbol, executor_type).await?
+    else {
         writeln!(
             stdout,
-            "✅ Trade triggered execution for {:?} (ID: {execution_id})",
-            ctx.broker.to_supported_executor()
-        )?;
-
-        let market_order = MarketOrder {
-            symbol: execution.symbol,
-            shares: execution.shares,
-            direction: execution.direction,
-        };
-
-        let placement = execute_broker_order(ctx, pool, market_order, None, stdout).await?;
-
-        let submitted_state = OrderState::Submitted {
-            order_id: placement.order_id.clone(),
-        };
-
-        let mut sql_tx = pool.begin().await?;
-        submitted_state
-            .store_update(&mut sql_tx, execution_id)
-            .await?;
-        sql_tx.commit().await?;
-        writeln!(stdout, "🎯 Trade processing completed!")?;
-    } else {
-        writeln!(
-            stdout,
-            "📊 Trade accumulated but did not trigger execution yet."
+            "Trade accumulated but did not trigger execution yet."
         )?;
         writeln!(
             stdout,
             "   (Waiting to accumulate enough shares for a whole share execution)"
         )?;
+        return Ok(());
+    };
+
+    let offchain_order_id = OffchainOrderId::new();
+
+    writeln!(
+        stdout,
+        "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
+    )?;
+
+    if let Err(error) = position_store
+        .send(
+            &params.symbol,
+            PositionCommand::PlaceOffChainOrder {
+                offchain_order_id,
+                shares: params.shares,
+                direction: params.direction,
+                executor: params.executor,
+                threshold: ctx.execution_threshold,
+            },
+        )
+        .await
+    {
+        error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {error}");
     }
+
+    if let Err(error) = offchain_order_store
+        .send(
+            &offchain_order_id,
+            OffchainOrderCommand::Place {
+                symbol: params.symbol.clone(),
+                shares: params.shares,
+                direction: params.direction,
+                executor: params.executor,
+            },
+        )
+        .await
+    {
+        error!(%offchain_order_id, "Failed to execute OffchainOrder::Place: {error}");
+    }
+
+    writeln!(stdout, "Trade processing completed!")?;
 
     Ok(())
 }
 
 async fn update_position_aggregate(
-    dual_write_context: &DualWriteContext,
+    position_store: &Store<Position>,
     onchain_trade: &OnchainTrade,
     execution_threshold: ExecutionThreshold,
 ) {
-    if let Err(e) = crate::dual_write::initialize_position(
-        dual_write_context,
-        onchain_trade.symbol.base(),
+    let base_symbol = onchain_trade.symbol.base();
+
+    acknowledge_fill(
+        position_store,
+        base_symbol,
+        onchain_trade,
         execution_threshold,
     )
-    .await
-    {
+    .await;
+}
+
+fn extract_fill_params(
+    onchain_trade: &OnchainTrade,
+) -> Option<(FractionalShares, Decimal, DateTime<Utc>)> {
+    let Some(block_timestamp) = onchain_trade.block_timestamp else {
         error!(
-            symbol = %onchain_trade.symbol.base(),
-            execution_threshold = ?execution_threshold,
             tx_hash = %onchain_trade.tx_hash,
             log_index = onchain_trade.log_index,
-            error = ?e,
-            "Failed to initialize position aggregate"
+            "Missing block timestamp, cannot acknowledge onchain fill"
         );
-    }
+        return None;
+    };
 
-    if let Err(e) =
-        crate::dual_write::acknowledge_onchain_fill(dual_write_context, onchain_trade).await
+    let amount = onchain_trade.amount;
+    let price_usdc = onchain_trade.price.value();
+
+    Some((amount, price_usdc, block_timestamp))
+}
+
+async fn acknowledge_fill(
+    position_store: &Store<Position>,
+    symbol: &Symbol,
+    onchain_trade: &OnchainTrade,
+    execution_threshold: ExecutionThreshold,
+) {
+    let base_symbol = onchain_trade.symbol.base();
+
+    let Some((amount, price_usdc, block_timestamp)) = extract_fill_params(onchain_trade) else {
+        return;
+    };
+
+    if let Err(error) = position_store
+        .send(
+            symbol,
+            PositionCommand::AcknowledgeOnChainFill {
+                symbol: base_symbol.clone(),
+                threshold: execution_threshold,
+                trade_id: TradeId {
+                    tx_hash: onchain_trade.tx_hash,
+                    log_index: onchain_trade.log_index,
+                },
+                amount,
+                direction: onchain_trade.direction,
+                price_usdc,
+                block_timestamp,
+            },
+        )
+        .await
     {
         error!(
-            symbol = %onchain_trade.symbol.base(),
+            symbol = %base_symbol,
             execution_threshold = ?execution_threshold,
             tx_hash = %onchain_trade.tx_hash,
             log_index = onchain_trade.log_index,
             block_timestamp = ?onchain_trade.block_timestamp,
-            error = ?e,
+            %error,
             "Failed to acknowledge onchain fill in position aggregate"
         );
     }
@@ -470,9 +545,8 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -495,9 +569,8 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("TSLA").unwrap(),
-            50.0,
+            50,
             Direction::Sell,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -537,9 +610,8 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -560,9 +632,8 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -604,9 +675,8 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100.0,
+            100,
             Direction::Buy,
-            None,
             &ctx,
             &pool,
             &mut stdout_buffer,

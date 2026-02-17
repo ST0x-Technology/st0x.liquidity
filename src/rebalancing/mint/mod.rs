@@ -9,13 +9,13 @@ pub(crate) mod mock;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
-use st0x_execution::Symbol;
 use thiserror::Error;
 
+use st0x_event_sorcery::SendError;
+use st0x_execution::{FractionalShares, Symbol};
+
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::shares::FractionalShares;
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
+use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
@@ -23,7 +23,7 @@ pub(crate) enum MintError {
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
+    Aggregate(Box<SendError<TokenizedEquityMint>>),
 
     #[error("Mint request was rejected by Alpaca")]
     Rejected,
@@ -42,6 +42,12 @@ pub(crate) enum MintError {
 
     #[error("Decimal overflow when scaling {0} to 18 decimals")]
     DecimalOverflow(FractionalShares),
+}
+
+impl From<SendError<TokenizedEquityMint>> for MintError {
+    fn from(error: SendError<TokenizedEquityMint>) -> Self {
+        Self::Aggregate(Box::new(error))
+    }
 }
 
 /// Trait for executing mint operations.

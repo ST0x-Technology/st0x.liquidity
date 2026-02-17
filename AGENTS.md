@@ -11,6 +11,31 @@ the limit:
 - **Remove redundancy** - if a guideline duplicates another, keep one reference
 - **Shorten explanations** - preserve the rule, reduce the elaboration
 
+## Documentation
+
+**Before doing any work**, read these documents:
+
+1. **[SPEC.md](SPEC.md)** — the north star. Describes what this service should
+   be. All new features must be spec'ed here first. If your change contradicts
+   the spec, either update the spec first (with user approval) or change your
+   approach. Implementation is downstream from the spec.
+2. **[docs/domain.md](docs/domain.md)** — naming conventions and domain
+   terminology. All code must use the names defined here. If a name isn't in
+   this doc, check existing code for precedent before inventing one.
+
+**Read when relevant** to your task:
+
+- [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
+  `::random()`, mocks, encoding, compile-time macros
+- [docs/cqrs.md](docs/cqrs.md) - Event sourcing with st0x-event-sorcery
+  (EventSourced trait, Store, Projection, testing, cqrs-es internals)
+
+**Update at the end:**
+
+- **README.md** — if project structure, features, commands, or architecture
+  changed
+- **ROADMAP.md** — mark completed issues, link PRs
+
 ## Ownership Principles
 
 **CRITICAL: Take full ownership. Never deflect responsibility.**
@@ -44,8 +69,8 @@ The project uses a strict document hierarchy:
 4. **Tests** - Downstream from plan. Written before implementation (TDD).
 5. **Implementation** - Makes the tests pass.
 
-**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → plan
-the implementation.
+**Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
+plan the implementation.
 
 ## Plan & Review
 
@@ -228,13 +253,6 @@ resolution and feature selection.
 
 ### Updating ROADMAP.md
 
-**CRITICAL: Timing** - Mark issues as done and link PRs on the **development
-branch** at any point before the PR is merged. The master roadmap is updated
-when the PR merges, so forgetting before merge means the issue won't show as
-done on master. It's fine to mark an issue done "too early" (e.g., before
-implementation is complete, when creating a draft PR) - it's much worse to
-forget. A plan/feature is not considered complete until the roadmap is updated.
-
 After completing work or creating new issues, update ROADMAP.md:
 
 **Section ordering (newest first):**
@@ -259,11 +277,6 @@ above older completed sections.
    ```
 3. Move completed items from "Current Development Focus" to the appropriate
    "Completed" section (or create a new one if it represents a milestone)
-
-**CRITICAL: Mark issues as `[x]` on the branch that completes the work.** The
-roadmap is checked into the repo — if you leave an issue as `[ ]` and merge the
-PR that completes it, master will show the issue as incomplete. Always mark the
-issue done in the same branch/PR that implements it.
 
 **When creating new issues:**
 
@@ -308,13 +321,60 @@ For detailed implementation requirements and module organization, see
 
 ### Core Event Processing Flow
 
-- Main event loop (`launch` in `src/lib.rs`): monitors `ClearV2` and
-  `TakeOrderV2` WebSocket streams via `tokio::select!`
-- Trade conversion (`src/trade/mod.rs`): parses onchain events, expects USDC +
-  "0x"-suffixed tokenized equity pairs, determines hedge direction
-- Each event spawns independent async task: Parse -> Deduplicate -> Execute ->
-  Record
-- Idempotency via `(tx_hash, log_index)` unique key with status tracking
+**Main Event Loop ([`launch` function in `src/lib.rs`])**
+
+- Monitors two concurrent WebSocket event streams: `ClearV2` and `TakeOrderV2`
+  from the Raindex orderbook
+- Uses `tokio::select!` to handle events from either stream without blocking
+- Converts blockchain events to structured `Trade` objects for processing
+
+**Trade Conversion Logic ([`Trade` struct and methods in `src/trade/mod.rs`])**
+
+- Parses onchain events into actionable trade data with strict validation
+- Expects symbol pairs of USDC + tokenized equity with "t" prefix (e.g.,
+  "tAAPL")
+- Determines Schwab trade direction: buying tokenized equity onchain -> selling
+  on Schwab
+- Calculates prices in cents and maintains onchain/offchain trade ratios
+
+**Async Event Processing Architecture**
+
+- Each blockchain event spawns independent async execution flow
+- Handles throughput mismatch: fast onchain events vs slower Schwab API calls
+- No artificial concurrency limits - processes events as they arrive
+- Flow: Parse Event -> SQLite Deduplication Check -> Schwab API Call -> Record
+  Result
+
+### Authentication & API Integration
+
+**Charles Schwab OAuth (`src/schwab.rs`)**
+
+- OAuth 2.0 flow with 30-minute access tokens and 7-day refresh tokens
+- Token storage and retrieval from SQLite database
+- Comprehensive error handling for authentication failures
+
+**Symbol Caching (`crate::symbol::cache::SymbolCache`)**
+
+- Thread-safe caching of ERC20 token symbols using `tokio::sync::RwLock`
+- Prevents repeated RPC calls for the same token addresses
+
+### Database Schema & Idempotency
+
+**Key tables** (see migrations for full schema):
+
+- `onchain_trades`: Immutable blockchain trade records, keyed by
+  `(tx_hash, log_index)`
+- `schwab_executions`: Order execution tracking with status transitions
+- `trade_accumulators`: Unified position tracking per symbol
+- `trade_execution_links`: Many-to-many audit trail between trades and
+  executions
+- `schwab_auth`: OAuth token storage (singleton)
+- `event_queue`: Idempotent event processing queue, keyed by
+  `(tx_hash, log_index)`
+- `symbol_locks`: Per-symbol execution concurrency control
+
+**Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
+tracking (pending -> completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
@@ -352,8 +412,8 @@ is the source of truth for terminology and naming conventions.
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and
   authentication tokens
-- **Symbol Suffix Convention**: Tokenized equities use "0x" suffix to
-  distinguish from base assets
+- **Symbol Prefix Convention**: Tokenized equities use "t" prefix to distinguish
+  from base assets (e.g., tAAPL, tTSLA, tSPYM)
 - **Price Direction Logic**: Onchain buy = offchain sell (and vice versa) to
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
@@ -434,6 +494,9 @@ is the source of truth for terminology and naming conventions.
   - Groups 2 or 3 may be absent if unused; never add an empty group
   - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
+    **Sole exception**: enum variant imports (`use MyEnum::*` or
+    `use MyEnum::{A, B, C}`) inside function bodies to avoid repetitive
+    qualification. Enum variant imports are never allowed at module level.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
@@ -453,6 +516,13 @@ is the source of truth for terminology and naming conventions.
   - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
   - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
     interpolation
+  - **FORBIDDEN**: Using `format!()` to convert typed values into String fields
+    in error variants (e.g., `format!("{side:?}")`) - store the actual typed
+    value instead
+  - **FORBIDDEN**: Unpacking newtypes into their inner type to store in error
+    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`, not
+    `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
+    representation. Never discard type safety by extracting inner values.
   - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
     preserve all type information
   - **REQUIRED**: Each error variant must preserve the complete error chain with
@@ -522,30 +592,10 @@ Unauthorized access to secrets can lead to:
 - Financial losses
 - Security breaches
 
-#### Files That Require Explicit Permission
-
-The following files MUST NOT be read without explicit user permission:
-
-- `.env` - Environment variables containing API keys, secrets, and credentials
-- `.env.*` - Environment-specific configuration files (`.env.local`,
-  `.env.production`, etc.)
-- `credentials.json` - Credential storage files
-- `*.key`, `*.pem` - Private keys and certificates
-- `*.p12`, `*.pfx` - Certificate bundles
-- Database files containing sensitive data (unless necessary for debugging with
-  permission)
-- Any file that may contain API keys, tokens, passwords, or other secrets
-
-#### Required Practice
-
-**Before reading any file that may contain secrets:**
-
-1. **Ask the user explicitly** for permission to read the file
-2. **Explain why** you need to read it
-3. **Wait for confirmation** before proceeding
-
-**Alternatives**: Ask user to verify env vars are set, request sanitized output,
-check `.env.example` instead of `.env`, or review code that uses configuration.
+**Protected files** (require explicit permission): `.env*`, `credentials.json`,
+`*.key`, `*.pem`, `*.p12`, `*.pfx`, database files with sensitive data. Ask
+permission, explain why, wait for confirmation. Prefer `.env.example` or
+reviewing code that uses configuration instead of reading secrets directly.
 
 ### Testing Strategy
 
@@ -564,6 +614,13 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
   "documenting the gap" or "will fix later". A failing test is the correct way
   to flag broken code - it forces the issue to be addressed. Tests that pass
   while asserting wrong behavior are worse than no tests at all.
+- **CRITICAL: NEVER delete, skip, or bypass existing tests or checks to make a
+  refactor easier.** If a refactor breaks existing tests, you MUST either: (1)
+  adapt the tests to the new design while preserving their coverage, (2) find a
+  design that keeps the tests passing, or (3) stop and ask the user how to
+  proceed. Replacing tests with comments like "these no longer apply" or
+  "validated by other means" is strictly forbidden. Tests are constraints on
+  correctness -- if your change can't satisfy them, the change is wrong.
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
@@ -584,13 +641,9 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
 
 #### Writing Meaningful Tests
 
-Tests should verify our application logic, not just language features. Avoid
-tests that only exercise struct construction or field access without testing any
-business logic.
-
-❌ Bad: Testing struct field assignments (just tests Rust, not our code). ✅
-Good: Testing actual business logic like `config.calculate_next_poll_delay()`
-returning values within expected bounds.
+Tests must verify application logic, not language features. Testing struct field
+assignments is useless; test actual behavior like
+`config.calculate_next_poll_delay()` returning expected values.
 
 ### Workflow Best Practices
 
@@ -603,6 +656,11 @@ returning values within expected bounds.
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
+- **CRITICAL: Do NOT run clippy until ALL substantive work is done.** Clippy is
+  a polish step. Running it while tasks remain open is wasted effort -
+  subsequent code changes will introduce new lint issues. Complete every task on
+  the list first (`cargo check` + `cargo test` passing), then run clippy as a
+  final pass before handing over.
 
 #### CRITICAL: Lint Policy
 
@@ -612,14 +670,24 @@ you MUST fix the underlying code problems, not suppress the warnings.
 
 **Required approach for clippy issues:**
 
-1. **Refactor the code** to address the root cause of the lint violation
-2. **Break down large functions** into smaller, more focused functions
-3. **Improve code structure** to meet clippy's standards
-4. **Use proper error handling** instead of suppressing warnings
+Clippy lint errors are not about the exact specific cosmetic thing -- they are
+often indications of poor design or broader things worth reconsidering. Upon
+encountering a lint violation:
 
-When encountering a clippy issue: understand why it's flagged, refactor to
-address the root cause, and ask permission before suppressing if you believe
-it's incorrect.
+1. **Re-evaluate the design** in the context of what was flagged. If the lint
+   reveals a flaw in the broader design or architecture, fix that
+2. **Refactor the code** to address the root cause of the lint violation
+3. **Break down large functions** into smaller, more focused functions
+4. **Improve code structure** to meet clippy's standards
+5. **Use proper error handling** instead of suppressing warnings
+6. If the violation is intentional and makes perfect sense in context, **stop
+   and request explicit permission** from the user before suppressing
+
+**FORBIDDEN: Obscure workarounds that silence the linter without fixing the
+problem.** Do not restructure code in weird ways, add unnecessary indirection,
+wrap things in newtypes, or use any other trick whose sole purpose is making the
+lint go away. Either fix the underlying design issue the lint is pointing at, or
+request permission to suppress. There is no third option.
 
 **Exception**: Lint suppression inside `sol!` macros is acceptable for issues
 from contract ABI signatures we cannot control.
@@ -660,54 +728,33 @@ that cannot be expressed through code structure alone.
   without access to your internal state. If the code needs explanation, explain
   WHAT it does and WHY - not which task number led to writing it.
 
-#### Good Comment Examples
+#### Examples
 
-```rust
-// If the on-chain order has USDC as input and an 0x tokenized stock as
-// output then it means the order received USDC and gave away an 0x  
-// tokenized stock, i.e. sold, which means that to take the opposite
-// trade in schwab we need to buy and vice versa.
-let (schwab_ticker, schwab_instruction) = 
-    if onchain_input_symbol == "USDC" && onchain_output_symbol.ends_with("0x") {
-        // ... complex mapping logic
-    }
+Good: explaining non-obvious business logic ("USDC input + t-prefix output means
+the order sold tokenized equity, so hedge by buying on Schwab"), test data
+context ("9 shares with 18 decimal places"), or external system constraints
+("ClearV2 doesn't contain amounts, so query AfterClear").
 
-// We need to get the corresponding AfterClear event as ClearV2 doesn't
-// contain the amounts. So we query the same block number, filter out
-// logs with index lower than the ClearV2 log index and with tx hashes
-// that don't match the ClearV2 tx hash.
-let after_clear_logs = provider.get_logs(/* ... */).await?;
+Bad: restating what code does (`// Store test tokens`), redundant with function
+name, test section markers (`// 1. Test token refresh`).
 
-// Test data representing 9 shares with 18 decimal places
-alice_output: U256::from_str("9000000000000000000").unwrap(), // 9 shares (18 dps)
-
-/// Helper that converts a fixed-decimal `U256` amount into an `f64` using
-/// the provided number of decimals.
-///
-/// NOTE: Parsing should never fail but precision may be lost.
-fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
-```
-
-#### Bad Comment Examples
-
-```rust
-// ❌ Redundant - function name says this: spawn_automatic_token_refresh(pool, env);
-// ❌ Obvious from context: // Store test tokens
-// ❌ Test section markers: // 1. Test token refresh integration
-```
-
-#### Comment Maintenance
-
-Use `///` doc comments for public APIs. Remove/update comments when refactoring.
-If a comment is needed to explain what code does, consider refactoring instead.
-Keep comments focused on "why" rather than "what".
+Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 ### Code style
 
 #### ASCII only in code
 
-Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
+Use ASCII characters only in code and comments. For arrows, use `->` not `->`.
 Unicode breaks vim navigation and grep workflows.
+
+#### No single-letter variables or arguments
+
+Single-letter names (`e`, `x`, `n`, `s`, etc.) are **FORBIDDEN** everywhere -
+variables, function arguments, closure parameters, generic type params in
+function signatures. Always use descriptive names. The only exception is
+conventional iterator variables in very short closures where the type makes the
+meaning unambiguous (e.g., `|event| event.payload`), but even then prefer a
+descriptive name.
 
 #### Module Organization
 
@@ -731,15 +778,16 @@ type is a byproduct of the function's implementation.
 #### Line width in docstrings and macros
 
 All doc comments (`//!` and `///`) and long strings inside attribute macros
-(e.g., `#[error(...)]`) must not exceed 80 characters per line. `cargo fmt` does
-not enforce this (without nightly rustfmt), so be careful and check manually.
+(e.g., `#[error(...)]`) must not exceed 100 characters per line. `cargo fmt`
+does not enforce this (without nightly rustfmt), so be careful and check
+manually.
 
 For multi-line `#[error]` strings, use `\` continuation:
 
 ```rust
 #[error(
     "Expected IO to contain USDC and one tokenized equity \
-     (t prefix, 0x or s1 suffix) but got {0} and {1}"
+     (t prefix) but got {0} and {1}"
 )]
 ```
 
@@ -763,33 +811,10 @@ assert!(matches!(error, SomeError::SpecificVariant { .. }));
 
 #### Assertions must be specific
 
-Test assertions must check for the exact expected behavior, not vague
-alternatives. Never use `||` in assertions to accept multiple possible outcomes
-unless those outcomes are genuinely equivalent.
-
-```rust
-// ❌ BAD - Lazy, accepts vaguely similar outcomes
-assert!(
-    output.contains("Failed") || output.contains("❌"),
-    "Output should indicate failure"
-);
-
-// ❌ BAD - Too permissive, doesn't verify actual behavior
-assert!(result.is_some());
-
-// ✅ GOOD - Checks for exact expected output
-assert!(
-    output.contains("❌ Failed to place order"),
-    "Expected failure message, got: {output}"
-);
-
-// ✅ GOOD - Verifies specific value
-assert_eq!(result.unwrap().order_id, "12345");
-```
-
-If you find yourself writing `||` in an assertion, ask: are these outcomes
-actually equivalent? If not, you probably don't understand what the code should
-do, and need to investigate before writing the test.
+Check for exact expected behavior. Never use `||` in assertions to accept
+multiple outcomes unless genuinely equivalent. Use `assert_eq!` with specific
+values, not `assert!(result.is_some())`. If writing `||` in an assertion, you
+likely don't understand the expected behavior - investigate first.
 
 #### Type modeling examples
 
@@ -824,7 +849,7 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 - **Early returns** with `?` and `return Err(...)` instead of nested `if let`
 - **let-else** for guard clauses:
-  `let Some(x) = expr else { return Err(...); };`
+  `let Some(value) = expr else { return Err(...); };`
 - **Pattern matching with guards** instead of nested `if let` chains
 
 #### Struct field access
@@ -836,3 +861,34 @@ Use struct literal syntax directly (`SchwabTokens { access_token: "...", ... }`)
 and access fields directly (`tokens.access_token`). Don't create `fn new()`
 constructors or `fn field(&self)` getters unless they add meaningful logic
 beyond setting/getting field values.
+
+#### Prefer destructuring over `.0` access
+
+For newtypes, prefer `let TypeName(inner) = value` over `value.0`. The
+destructuring pattern names the type explicitly, making the code
+self-documenting:
+
+```rust
+// GOOD: reader sees exactly what type is being unwrapped
+let Table(table) = Entity::PROJECTION.ok_or(ProjectionError::NoTable)?;
+
+// BAD: .0 is opaque — reader must look up what type this is
+let table = entity_projection.0;
+```
+
+#### No one-liner helpers
+
+If a helper function's body is a single expression, it's useless indirection --
+just inline the call. A function that only wraps another function call adds a
+name to learn and a place to jump to without reducing complexity. Helpers earn
+their existence by encapsulating multi-step logic, not by renaming a single
+operation.
+
+#### Don't split simple-but-long pattern matches
+
+A function that consists of a single `match` with many trivial arms (e.g. state
+machine transitions, event mapping) should stay as one function even if it
+exceeds line count lints. Each arm is simple field mapping -- extracting arms
+into helpers adds indirection without improving readability. When
+`too_many_lines` fires on such functions, request permission to suppress the
+lint rather than extracting helpers that exist only to satisfy the line count.

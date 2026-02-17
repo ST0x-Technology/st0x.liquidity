@@ -4,19 +4,17 @@
 //! the task handles; [`run_market_hours_loop`] drives the lifecycle.
 
 mod builder;
+mod manifest;
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use alloy::primitives::Address;
+use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::{AggregateError, Query};
 use futures_util::{Stream, StreamExt};
-use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -26,45 +24,52 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
-use st0x_execution::{
-    AlpacaBrokerApiError, AlpacaTradingApiError, EmptySymbolError, ExecutionError, Executor,
-    MarketOrder, SchwabError, SupportedExecutor, Symbol,
-};
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
+use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecutor};
+
+use st0x_event_sorcery::{Cons, Nil, Projection, SendError, Store, StoreBuilder, Unwired};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
-use crate::dual_write::DualWriteContext;
-use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
+    InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
 };
-use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
-use crate::offchain_order::BrokerOrderId;
-use crate::onchain::USDC_BASE;
-use crate::onchain::accumulator::{
-    CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
+use crate::offchain_order::{
+    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
+use crate::onchain::USDC_BASE;
+use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
-use crate::onchain::{EvmCtx, OnChainError, OnchainTrade, accumulator};
+use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
+use crate::position::{Position, PositionCommand, TradeId};
 use crate::queue::{
     EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
 };
 use crate::rebalancing::{
-    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
-    build_rebalancing_queries, spawn_rebalancer,
+    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
-use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::{
-    VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryError,
-};
+use crate::threshold::ExecutionThreshold;
+use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+
+use self::manifest::QueryManifest;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
+
+/// Bundles CQRS frameworks used throughout the trade processing pipeline.
+struct TradeProcessingCqrs {
+    onchain_trade: Arc<Store<OnChainTrade>>,
+    position: Arc<Store<Position>>,
+    position_projection: Arc<Projection<Position>>,
+    offchain_order: Arc<Store<OffchainOrder>>,
+    execution_threshold: ExecutionThreshold,
+}
 
 pub(crate) struct Conductor {
     pub(crate) executor_maintenance: Option<JoinHandle<()>>,
@@ -86,26 +91,18 @@ pub(crate) enum EventProcessingError {
     EnqueueClearV3(#[source] EventQueueError),
     #[error("Failed to enqueue TakeOrderV3 event: {0}")]
     EnqueueTakeOrderV3(#[source] EventQueueError),
-    #[error("Database transaction error: {0}")]
-    Transaction(#[from] sqlx::Error),
-    #[error("Execution with ID {0} not found")]
-    ExecutionNotFound(i64),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
-    #[error("Schwab execution error: {0}")]
-    Schwab(#[from] SchwabError),
-    #[error("Alpaca Broker API error: {0}")]
-    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
-    #[error("Alpaca Trading API error: {0}")]
-    AlpacaTradingApi(#[from] AlpacaTradingApiError),
+    #[error("Ctx error: {0}")]
+    Ctx(#[from] CtxError),
+    #[error("Vault registry command failed: {0}")]
+    VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
-    #[error(transparent)]
-    EmptySymbol(#[from] EmptySymbolError),
-    #[error("Config error: {0}")]
-    Config(#[from] CtxError),
-    #[error("Vault registry command failed: {0}")]
-    VaultRegistry(#[from] AggregateError<VaultRegistryError>),
+    #[error("Alpaca trading API error: {0}")]
+    AlpacaTradingApi(#[from] AlpacaTradingApiError),
+    #[error("Alpaca broker API error: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
 }
 
 pub(crate) async fn run_market_hours_loop<E>(
@@ -119,38 +116,27 @@ where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    const RERUN_DELAY_SECS: u64 = 10;
+    let timeout = wait_for_market_open(&executor).await?;
 
+    let mut conductor =
+        match start_conductor(&executor, &ctx, &pool, executor_maintenance, &event_sender).await {
+            Ok(conductor) => conductor,
+            Err(error) => {
+                return retry_after_failure(executor, ctx, pool, event_sender, error).await;
+            }
+        };
+
+    run_until_market_close(&mut conductor, timeout, executor, ctx, pool, event_sender).await
+}
+
+const RERUN_DELAY_SECS: u64 = 10;
+
+async fn wait_for_market_open<E: Executor>(executor: &E) -> anyhow::Result<Duration> {
     let timeout = executor
         .wait_until_market_open()
         .await
-        .map_err(|e| anyhow::anyhow!("Market hours check failed: {e}"))?;
+        .map_err(|error| anyhow::anyhow!("Market hours check failed: {error}"))?;
 
-    log_market_status(timeout);
-
-    let mut conductor = match Conductor::start(
-        &ctx,
-        &pool,
-        executor.clone(),
-        executor_maintenance,
-        event_sender.clone(),
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return retry_after_failure(executor, ctx, pool, e, RERUN_DELAY_SECS, event_sender)
-                .await;
-        }
-    };
-
-    info!("Market opened, conductor running");
-
-    run_conductor_until_market_close(&mut conductor, executor, ctx, pool, timeout, event_sender)
-        .await
-}
-
-fn log_market_status(timeout: Duration) {
     let timeout_minutes = timeout.as_secs() / 60;
     if timeout_minutes < 60 * 24 {
         info!(
@@ -160,22 +146,47 @@ fn log_market_status(timeout: Duration) {
     } else {
         info!("Starting conductor (no market hours restrictions)");
     }
+
+    Ok(timeout)
+}
+
+async fn start_conductor<E>(
+    executor: &E,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    executor_maintenance: Option<JoinHandle<()>>,
+    event_sender: &broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<Conductor>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    let conductor = Conductor::start(
+        ctx,
+        pool,
+        executor.clone(),
+        executor_maintenance,
+        event_sender.clone(),
+    )
+    .await?;
+
+    info!("Market opened, conductor running");
+    Ok(conductor)
 }
 
 async fn retry_after_failure<E>(
     executor: E,
     ctx: Ctx,
     pool: SqlitePool,
-    error: anyhow::Error,
-    delay_secs: u64,
     event_sender: broadcast::Sender<ServerMessage>,
+    error: anyhow::Error,
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    error!("Failed to start conductor: {error}, retrying in {delay_secs} seconds");
-    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+    error!("Failed to start conductor: {error}, retrying in {RERUN_DELAY_SECS} seconds");
+    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
 
     let new_maintenance = executor.run_executor_maintenance().await;
     Box::pin(run_market_hours_loop(
@@ -188,12 +199,12 @@ where
     .await
 }
 
-async fn run_conductor_until_market_close<E>(
+async fn run_until_market_close<E>(
     conductor: &mut Conductor,
+    timeout: Duration,
     executor: E,
     ctx: Ctx,
     pool: SqlitePool,
-    timeout: Duration,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()>
 where
@@ -212,25 +223,15 @@ where
 
 fn handle_conductor_completion(
     conductor: &Conductor,
-    result: Result<(), anyhow::Error>,
+    result: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     info!("Conductor completed");
-    conductor.order_poller.abort();
-    conductor.dex_event_receiver.abort();
-    conductor.event_processor.abort();
-    conductor.position_checker.abort();
-    conductor.queue_processor.abort();
-    if let Some(ref handle) = conductor.executor_maintenance {
-        handle.abort();
-    }
-    if let Some(ref handle) = conductor.rebalancer {
-        handle.abort();
-    }
-    if let Some(ref handle) = conductor.inventory_poller {
-        handle.abort();
-    }
+    conductor.abort_all_tasks();
     result?;
-    info!("Conductor completed successfully, continuing to next market session");
+    info!(
+        "Conductor completed successfully, \
+         continuing to next market session"
+    );
     Ok(())
 }
 
@@ -261,7 +262,7 @@ where
 
 /// Context for vault discovery operations during trade processing.
 struct VaultDiscoveryCtx<'a> {
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    vault_registry: &'a Store<VaultRegistry>,
     orderbook: Address,
     order_owner: Address,
 }
@@ -293,47 +294,62 @@ impl Conductor {
             backfill_events(pool, &provider, &ctx.evm, end_block).await?;
         }
 
-        let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-
-        let dual_write_context = DualWriteContext::with_threshold(
-            pool.clone(),
-            onchain_trade_cqrs,
-            position_cqrs,
-            offchain_order_cqrs,
-            ctx.execution_threshold,
+        let onchain_trade = Arc::new(
+            StoreBuilder::<OnChainTrade>::new(pool.clone())
+                .build(())
+                .await?,
         );
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let snapshot_query = InventorySnapshotQuery::new(inventory.clone());
-        let snapshot_cqrs = sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(snapshot_query) as Box<dyn Query<InventorySnapshotAggregate>>],
-            (),
+        let (position, position_projection, rebalancer) =
+            if let Some(rebalancing_ctx) = ctx.rebalancing_ctx() {
+                let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
+                let market_maker_wallet = signer.address();
+
+                let (position, position_projection, rebalancer_handle) =
+                    spawn_rebalancing_infrastructure(
+                        rebalancing_ctx,
+                        pool,
+                        ctx,
+                        &inventory,
+                        event_sender,
+                        &provider,
+                        market_maker_wallet,
+                    )
+                    .await?;
+
+                (position, position_projection, Some(rebalancer_handle))
+            } else {
+                let (position, position_projection) = build_position_cqrs(pool).await?;
+                (position, position_projection, None)
+            };
+
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let offchain_order_projection =
+            Arc::new(Projection::<OffchainOrder>::sqlite(pool.clone())?);
+
+        let offchain_order = Arc::new(
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .with((*offchain_order_projection).clone())
+                .build(order_placer)
+                .await?,
         );
 
-        let rebalancer = match ctx.rebalancing_ctx() {
-            Some(rebalancing_config) => Some(
-                spawn_rebalancing_infrastructure(
-                    rebalancing_config,
-                    pool,
-                    ctx,
-                    &inventory,
-                    event_sender,
-                    &provider,
-                )
-                .await?,
-            ),
-            None => None,
-        };
+        let vault_registry = StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await?;
+
+        let snapshot = build_inventory_snapshot_store(pool, inventory.clone()).await?;
 
         let frameworks = CqrsFrameworks {
-            dual_write_context,
-            vault_registry_cqrs,
-            snapshot_cqrs,
+            onchain_trade,
+            position,
+            position_projection,
+            offchain_order,
+            offchain_order_projection,
+            vault_registry,
+            snapshot,
         };
 
         let mut builder = ConductorBuilder::new(
@@ -342,6 +358,7 @@ impl Conductor {
             cache,
             provider,
             executor,
+            ctx.execution_threshold,
             frameworks,
         )
         .with_executor_maintenance(executor_maintenance)
@@ -381,11 +398,16 @@ impl Conductor {
         Ok(())
     }
 
+    pub(crate) fn abort_all_tasks(&self) {
+        self.abort_trading_tasks();
+        self.dex_event_receiver.abort();
+        if let Some(ref handle) = self.executor_maintenance {
+            handle.abort();
+        }
+    }
+
     pub(crate) fn abort_trading_tasks(&self) {
-        info!(
-            "Aborting trading tasks \
-             (keeping broker maintenance and DEX event receiver alive)"
-        );
+        info!("Aborting trading tasks (keeping broker maintenance and DEX event receiver alive)");
 
         self.order_poller.abort();
         self.event_processor.abort();
@@ -410,16 +432,18 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     inventory: &Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
-) -> anyhow::Result<JoinHandle<()>> {
+    market_maker_wallet: Address,
+) -> anyhow::Result<(
+    Arc<Store<Position>>,
+    Arc<Projection<Position>>,
+    JoinHandle<()>,
+)> {
     info!("Initializing rebalancing infrastructure");
-
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let market_maker_wallet = signer.address();
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
-    let trigger = Arc::new(RebalancingTrigger::new(
+    let manifest = QueryManifest::new(
         RebalancingTriggerConfig {
             equity_threshold: rebalancing_ctx.equity_threshold,
             usdc_threshold: rebalancing_ctx.usdc_threshold,
@@ -429,32 +453,18 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         market_maker_wallet,
         inventory.clone(),
         operation_sender,
-    ));
+        event_sender,
+    )?;
 
-    let event_broadcast = Some(event_sender);
+    let (built, wired) = manifest.wire(pool.clone()).await?;
 
     let frameworks = RebalancingCqrsFrameworks {
-        mint: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<TokenizedEquityMint>(
-                trigger.clone(),
-                event_broadcast.clone(),
-            ),
-            (),
-        )),
-        redemption: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<EquityRedemption>(trigger.clone(), event_broadcast.clone()),
-            (),
-        )),
-        usdc: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<UsdcRebalance>(trigger, event_broadcast),
-            (),
-        )),
+        mint: Arc::new(built.mint),
+        redemption: Arc::new(built.redemption),
+        usdc: Arc::new(built.usdc),
     };
 
-    Ok(spawn_rebalancer(
+    let handle = spawn_rebalancer(
         rebalancing_ctx,
         provider.clone(),
         ctx.evm.orderbook,
@@ -462,7 +472,13 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         operation_receiver,
         frameworks,
     )
-    .await?)
+    .await?;
+
+    Ok((
+        Arc::new(built.position),
+        Arc::new(wired.position_view),
+        handle,
+    ))
 }
 
 async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: &str) {
@@ -478,27 +494,67 @@ async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: 
 }
 
 fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) {
-    if let Err(e) = result {
-        error!("{task_name} task panicked: {e}");
+    if let Err(error) = result {
+        error!("{task_name} task panicked: {error}");
     }
+}
+
+/// Constructs the position CQRS framework with its view query
+/// (without rebalancing trigger). Used when rebalancing is disabled.
+async fn build_position_cqrs(
+    pool: &SqlitePool,
+) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
+    let position_view = Projection::<Position>::sqlite(pool.clone())?;
+
+    let store = StoreBuilder::<Position>::new(pool.clone())
+        .with(position_view.clone())
+        .build(())
+        .await?;
+
+    Ok((Arc::new(store), Arc::new(position_view)))
+}
+
+/// Constructs the inventory snapshot store with its query.
+async fn build_inventory_snapshot_store(
+    pool: &SqlitePool,
+    inventory: Arc<RwLock<InventoryView>>,
+) -> anyhow::Result<Store<InventorySnapshot>> {
+    let snapshot_reactor = InventorySnapshotReactor::new(inventory);
+
+    let query: Unwired<InventorySnapshotReactor, Cons<InventorySnapshot, Nil>> =
+        Unwired::new(snapshot_reactor);
+
+    let (store, (_query, ())) = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+        .wire(query)
+        .build(())
+        .await?;
+
+    Ok(store)
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     ctx: &Ctx,
-    pool: &SqlitePool,
     executor: E,
-    dual_write_context: DualWriteContext,
+    offchain_order_projection: Projection<OffchainOrder>,
+    offchain_order: Arc<Store<OffchainOrder>>,
+    position: Arc<Store<Position>>,
 ) -> JoinHandle<()> {
-    let poller_config = ctx.get_order_poller_config();
+    let poller_ctx = ctx.get_order_poller_ctx();
     info!(
         "Starting order status poller with interval: {:?}, max jitter: {:?}",
-        poller_config.polling_interval, poller_config.max_jitter
+        poller_ctx.polling_interval, poller_ctx.max_jitter
     );
 
-    let poller = OrderStatusPoller::new(poller_config, pool.clone(), executor, dual_write_context);
+    let poller = OrderStatusPoller::new(
+        poller_ctx,
+        executor,
+        offchain_order_projection,
+        offchain_order,
+        position,
+    );
     tokio::spawn(async move {
-        if let Err(e) = poller.run().await {
-            error!("Order poller failed: {e}");
+        if let Err(error) = poller.run().await {
+            error!("Order poller failed: {error}");
         } else {
             info!("Order poller completed successfully");
         }
@@ -532,8 +588,8 @@ fn spawn_event_processor(
                 "Processing live event: tx_hash={:?}, log_index={:?}",
                 log.transaction_hash, log.log_index
             );
-            if let Err(e) = process_live_event(&pool, event, log).await {
-                error!("Failed to process live event: {e}");
+            if let Err(error) = process_live_event(&pool, event, log).await {
+                error!("Failed to process live event: {error}");
             }
         }
         info!("Event processing loop ended");
@@ -546,8 +602,8 @@ fn spawn_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-    dual_write_context: DualWriteContext,
-    vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
+    cqrs: TradeProcessingCqrs,
+    vault_registry: Store<VaultRegistry>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -566,8 +622,8 @@ where
             &pool_clone,
             &cache_clone,
             provider,
-            &dual_write_context,
-            &vault_registry_cqrs,
+            &cqrs,
+            &vault_registry,
         )
         .await;
     })
@@ -575,8 +631,10 @@ where
 
 fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
-    pool: SqlitePool,
-    dual_write_context: DualWriteContext,
+    position: Arc<Store<Position>>,
+    position_projection: Arc<Projection<Position>>,
+    offchain_order: Arc<Store<OffchainOrder>>,
+    execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -593,10 +651,16 @@ where
         loop {
             interval.tick().await;
             debug!("Running periodic accumulated position check");
-            if let Err(e) =
-                check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context).await
+            if let Err(error) = check_and_execute_accumulated_positions(
+                &executor,
+                &position,
+                &position_projection,
+                &offchain_order,
+                &execution_threshold,
+            )
+            .await
             {
-                error!("Periodic accumulated position check failed: {e}");
+                error!("Periodic accumulated position check failed: {error}");
             }
         }
     })
@@ -608,7 +672,7 @@ fn spawn_inventory_poller<P, E>(
     executor: E,
     orderbook: Address,
     order_owner: Address,
-    snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+    snapshot: Store<InventorySnapshot>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -622,7 +686,7 @@ where
         pool,
         orderbook,
         order_owner,
-        snapshot_cqrs,
+        snapshot,
     );
 
     tokio::spawn(async move {
@@ -663,31 +727,35 @@ async fn receive_blockchain_events<S1, S2>(
             }
         };
 
-        if !handle_event_result(event_result, &event_sender) {
+        if !dispatch_blockchain_event(event_result, &event_sender) {
             break;
         }
     }
 }
 
-fn handle_event_result(
-    result: Result<(TradeEvent, Log), sol_types::Error>,
-    sender: &UnboundedSender<(TradeEvent, Log)>,
+/// Returns `false` if the event loop should stop.
+fn dispatch_blockchain_event(
+    event_result: Result<(TradeEvent, Log), sol_types::Error>,
+    event_sender: &UnboundedSender<(TradeEvent, Log)>,
 ) -> bool {
-    match result {
+    match event_result {
         Ok((event, log)) => {
             trace!(
                 "Received blockchain event: tx_hash={:?}, \
                  log_index={:?}, block_number={:?}",
                 log.transaction_hash, log.log_index, log.block_number
             );
-            if sender.send((event, log)).is_err() {
+            if event_sender.send((event, log)).is_err() {
                 error!("Event receiver dropped, shutting down");
                 return false;
             }
+            true
         }
-        Err(e) => error!("Error in event stream: {e}"),
+        Err(error) => {
+            error!("Error in event stream: {error}");
+            true
+        }
     }
-    true
 }
 
 pub(crate) async fn get_cutoff_block<S1, S2, P>(
@@ -763,8 +831,8 @@ async fn run_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-    dual_write_context: &DualWriteContext,
-    vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
+    cqrs: &TradeProcessingCqrs,
+    vault_registry: &Store<VaultRegistry>,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -774,64 +842,50 @@ async fn run_queue_processor<P, E>(
 
     let feed_id_cache = FeedIdCache::default();
 
-    log_unprocessed_event_count(pool).await;
+    log_unprocessed_count(pool).await;
 
     let executor_type = executor.to_supported_executor();
 
     let queue_context = QueueProcessingCtx {
         cache,
         feed_id_cache: &feed_id_cache,
-        vault_registry_cqrs,
+        vault_registry,
     };
 
     loop {
-        let result = process_next_queued_event(
-            executor_type,
-            ctx,
-            pool,
-            &provider,
-            dual_write_context,
-            &queue_context,
-        )
-        .await;
-
-        handle_queue_processing_result(executor, pool, dual_write_context, result).await;
+        let delay =
+            process_queue_step(executor_type, ctx, pool, &provider, cqrs, &queue_context).await;
+        sleep(delay).await;
     }
 }
 
-async fn log_unprocessed_event_count(pool: &SqlitePool) {
+async fn log_unprocessed_count(pool: &SqlitePool) {
     match crate::queue::count_unprocessed(pool).await {
         Ok(count) if count > 0 => {
             info!("Found {count} unprocessed events from previous sessions to process");
         }
         Ok(_) => info!("No unprocessed events found, starting fresh"),
-        Err(e) => error!("Failed to count unprocessed events: {e}"),
+        Err(error) => error!("Failed to count unprocessed events: {error}"),
     }
 }
 
-async fn handle_queue_processing_result<E>(
-    executor: &E,
+async fn process_queue_step<P: Provider + Clone>(
+    executor_type: SupportedExecutor,
+    ctx: &Ctx,
     pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
-    result: Result<Option<OffchainExecution>, EventProcessingError>,
-) where
-    E: Executor + Clone,
-    EventProcessingError: From<E::Error>,
-{
-    match result {
-        Ok(Some(execution)) => {
-            if let Some(exec_id) = execution.id
-                && let Err(e) =
-                    execute_pending_offchain_execution(executor, pool, dual_write_context, exec_id)
-                        .await
-            {
-                error!("Failed to execute offchain order {exec_id}: {e}");
-            }
+    provider: &P,
+    cqrs: &TradeProcessingCqrs,
+    queue_context: &QueueProcessingCtx<'_>,
+) -> Duration {
+    match process_next_queued_event(executor_type, ctx, pool, provider, cqrs, queue_context).await {
+        Ok(Some(offchain_order_id)) => {
+            info!(%offchain_order_id, "Offchain order placed successfully");
+            std::time::Duration::ZERO
         }
-        Ok(None) => sleep(Duration::from_millis(100)).await,
-        Err(e) => {
-            error!("Error processing queued event: {e}");
-            sleep(Duration::from_millis(500)).await;
+        Ok(None) => std::time::Duration::from_millis(100),
+        Err(error) => {
+            error!("Error processing queued event: {error}");
+            std::time::Duration::from_millis(500)
         }
     }
 }
@@ -840,7 +894,7 @@ async fn handle_queue_processing_result<E>(
 struct QueueProcessingCtx<'a> {
     cache: &'a SymbolCache,
     feed_id_cache: &'a FeedIdCache,
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    vault_registry: &'a Store<VaultRegistry>,
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
@@ -849,16 +903,17 @@ async fn process_next_queued_event<P: Provider + Clone>(
     ctx: &Ctx,
     pool: &SqlitePool,
     provider: &P,
-    dual_write_context: &DualWriteContext,
+    cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingCtx<'_>,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
-        trace!("No unprocessed events in queue");
         return Ok(None);
     };
 
-    let event_id = extract_event_id(&queued_event)?;
+    let event_id = queued_event.id.ok_or(EventProcessingError::Queue(
+        EventQueueError::MissingQueuedEventId,
+    ))?;
 
     let onchain_trade = convert_event_to_trade(
         ctx,
@@ -870,11 +925,21 @@ async fn process_next_queued_event<P: Provider + Clone>(
     .await?;
 
     let Some(trade) = onchain_trade else {
-        return handle_filtered_event(pool, &queued_event, event_id).await;
+        info!(
+            "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
+            match &queued_event.event {
+                TradeEvent::ClearV3(_) => "ClearV3",
+                TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
+            },
+            queued_event.tx_hash,
+            queued_event.log_index
+        );
+        mark_event_processed(pool, event_id).await?;
+        return Ok(None);
     };
 
-    let vault_discovery_context = VaultDiscoveryCtx {
-        vault_registry_cqrs: queue_context.vault_registry_cqrs,
+    let vault_discovery_ctx = VaultDiscoveryCtx {
+        vault_registry: queue_context.vault_registry,
         orderbook: ctx.evm.orderbook,
         order_owner: ctx.order_owner()?,
     };
@@ -885,16 +950,10 @@ async fn process_next_queued_event<P: Provider + Clone>(
         &queued_event,
         event_id,
         trade,
-        dual_write_context,
-        &vault_discovery_context,
+        cqrs,
+        &vault_discovery_ctx,
     )
     .await
-}
-
-fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
-    queued_event
-        .id
-        .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
@@ -928,7 +987,10 @@ async fn discover_vaults_for_trade(
         .into_iter()
         .filter(|vault| vault.owner == context.order_owner);
 
-    let aggregate_id = VaultRegistry::aggregate_id(context.orderbook, context.order_owner);
+    let vault_registry_id = VaultRegistryId {
+        orderbook: context.orderbook,
+        owner: context.order_owner,
+    };
 
     for owned_vault in our_vaults {
         let vault = owned_vault.vault;
@@ -957,8 +1019,8 @@ async fn discover_vaults_for_trade(
         };
 
         context
-            .vault_registry_cqrs
-            .execute(&aggregate_id, command)
+            .vault_registry
+            .send(&vault_registry_id, command)
             .await?;
     }
 
@@ -1005,38 +1067,8 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     Ok(onchain_trade)
 }
 
-#[tracing::instrument(skip(pool, queued_event), fields(event_id), level = tracing::Level::DEBUG)]
-async fn handle_filtered_event(
-    pool: &SqlitePool,
-    queued_event: &QueuedEvent,
-    event_id: i64,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
-    info!(
-        "Event filtered out (no matching owner): \
-         event_type={:?}, tx_hash={:?}, log_index={}",
-        match &queued_event.event {
-            TradeEvent::ClearV3(_) => "ClearV3",
-            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-        },
-        queued_event.tx_hash,
-        queued_event.log_index
-    );
-
-    let mut sql_tx = pool.begin().await.inspect_err(|e| {
-        error!("Failed to begin transaction for filtered event: {e}");
-    })?;
-
-    mark_event_processed(&mut sql_tx, event_id).await?;
-
-    sql_tx.commit().await.inspect_err(|e| {
-        error!("Failed to commit transaction for filtered event: {e}");
-    })?;
-
-    Ok(None)
-}
-
 #[tracing::instrument(
-    skip(pool, queued_event, trade, dual_write_context, vault_discovery_context),
+    skip(pool, queued_event, trade, cqrs, vault_discovery_ctx),
     fields(event_id, symbol = %trade.symbol),
     level = tracing::Level::INFO
 )]
@@ -1046,9 +1078,9 @@ async fn process_valid_trade(
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
-    dual_write_context: &DualWriteContext,
-    vault_discovery_context: &VaultDiscoveryCtx<'_>,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
+    cqrs: &TradeProcessingCqrs,
+    vault_discovery_ctx: &VaultDiscoveryCtx<'_>,
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, \
          tx_hash={:?}, log_index={}, symbol={}, amount={}",
@@ -1062,7 +1094,7 @@ async fn process_valid_trade(
         trade.amount
     );
 
-    discover_vaults_for_trade(queued_event, &trade, vault_discovery_context).await?;
+    discover_vaults_for_trade(queued_event, &trade, vault_discovery_ctx).await?;
 
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
@@ -1073,263 +1105,199 @@ async fn process_valid_trade(
         trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
     );
 
-    process_trade_within_transaction(
-        executor_type,
-        pool,
-        queued_event,
-        event_id,
-        trade,
-        dual_write_context,
-    )
-    .await
+    process_queued_trade(executor_type, pool, queued_event, event_id, trade, cqrs).await
 }
 
 async fn execute_witness_trade(
-    dual_write_context: &DualWriteContext,
+    onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
 ) {
-    match crate::dual_write::witness_trade(dual_write_context, trade, block_number).await {
+    let trade_id = OnChainTradeId {
+        tx_hash: trade.tx_hash,
+        log_index: trade.log_index,
+    };
+
+    let amount = trade.amount.inner();
+    let price_usdc = trade.price.value();
+
+    let Some(block_timestamp) = trade.block_timestamp else {
+        error!(
+            "Missing block_timestamp for OnChainTrade::Witness: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        );
+        return;
+    };
+
+    let command = OnChainTradeCommand::Witness {
+        symbol: trade.symbol.base().clone(),
+        amount,
+        direction: trade.direction,
+        price_usdc,
+        block_number,
+        block_timestamp,
+    };
+
+    match onchain_trade.send(&trade_id, command).await {
         Ok(()) => info!(
-            "Successfully executed OnChainTrade::Witness \
-             command: tx_hash={:?}, log_index={}",
+            "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
         ),
-        Err(e) => error!(
-            "Failed to execute OnChainTrade::Witness \
-             command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+        Err(error) => error!(
+            "Failed to execute OnChainTrade::Witness command: {error}, tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
     }
 }
 
-async fn execute_initialize_position(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
+async fn execute_acknowledge_fill(
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    threshold: ExecutionThreshold,
+) {
     let base_symbol = trade.symbol.base();
 
-    match crate::dual_write::initialize_position(
-        dual_write_context,
-        base_symbol,
-        dual_write_context.execution_threshold(),
-    )
-    .await
-    {
-        Ok(()) => info!(
-            "Successfully initialized Position aggregate for symbol={}",
-            base_symbol
-        ),
-        Err(e) => debug!(
-            "Position initialization skipped (likely already exists): {e}, symbol={}",
-            base_symbol
-        ),
-    }
-}
+    let amount = trade.amount.inner();
+    let price_usdc = trade.price.value();
 
-async fn execute_acknowledge_fill(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
-    match crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
+    let Some(block_timestamp) = trade.block_timestamp else {
+        error!(
+            "Missing block_timestamp for Position::AcknowledgeOnChainFill: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        );
+        return;
+    };
+
+    let command = PositionCommand::AcknowledgeOnChainFill {
+        symbol: base_symbol.clone(),
+        threshold,
+        trade_id: TradeId {
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        },
+        amount: FractionalShares::new(amount),
+        direction: trade.direction,
+        price_usdc,
+        block_timestamp,
+    };
+
+    match position.send(base_symbol, command).await {
         Ok(()) => info!(
-            "Successfully executed Position::AcknowledgeOnChainFill \
-             command: tx_hash={:?}, log_index={}, symbol={}",
+            "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
-        Err(e) => error!(
-            "Failed to execute Position::AcknowledgeOnChainFill \
-             command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+        Err(error) => error!(
+            "Failed to execute Position::AcknowledgeOnChainFill command: {error}, tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
     }
 }
 
-async fn execute_new_execution_dual_write(
-    dual_write_context: &DualWriteContext,
-    execution: &OffchainExecution,
-    base_symbol: &Symbol,
-) {
-    execute_place_offchain_order(dual_write_context, execution, base_symbol).await;
-    execute_place_order(dual_write_context, execution).await;
-}
-
-async fn execute_place_offchain_order(
-    dual_write_context: &DualWriteContext,
-    execution: &OffchainExecution,
-    base_symbol: &Symbol,
-) {
-    match crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
-    {
-        Ok(()) => info!(
-            "Successfully executed Position::PlaceOffChainOrder \
-             command: execution_id={:?}, symbol={}",
-            execution.id, base_symbol
-        ),
-        Err(e) => error!(
-            "Failed to execute Position::PlaceOffChainOrder \
-             command: {e}, execution_id={:?}, symbol={}",
-            execution.id, base_symbol
-        ),
-    }
-}
-
-async fn execute_place_order(dual_write_context: &DualWriteContext, execution: &OffchainExecution) {
-    match crate::dual_write::place_order(dual_write_context, execution).await {
-        Ok(()) => info!(
-            "Successfully executed OffchainOrder::Place \
-             command: execution_id={:?}, symbol={}",
-            execution.id, execution.symbol
-        ),
-        Err(e) => error!(
-            "Failed to execute OffchainOrder::Place \
-             command: {e}, execution_id={:?}, symbol={}",
-            execution.id, execution.symbol
-        ),
-    }
-}
-
-async fn execute_stale_execution_cleanup_dual_write(
-    dual_write_context: &DualWriteContext,
-    cleaned_up_executions: Vec<CleanedUpExecution>,
-) {
-    for cleaned_up in cleaned_up_executions {
-        execute_single_stale_cleanup(dual_write_context, cleaned_up).await;
-    }
-}
-
-async fn execute_single_stale_cleanup(
-    dual_write_context: &DualWriteContext,
-    cleaned_up: CleanedUpExecution,
-) {
-    execute_mark_stale_failed(dual_write_context, &cleaned_up).await;
-    execute_fail_stale_offchain(dual_write_context, &cleaned_up).await;
-}
-
-async fn execute_mark_stale_failed(
-    dual_write_context: &DualWriteContext,
-    cleaned_up: &CleanedUpExecution,
-) {
-    let execution_id = cleaned_up.execution_id;
-
-    match crate::dual_write::mark_failed(
-        dual_write_context,
-        execution_id,
-        cleaned_up.error_reason.clone(),
-    )
-    .await
-    {
-        Ok(()) => info!(
-            "Successfully executed OffchainOrder::MarkFailed \
-             command for stale execution {execution_id}"
-        ),
-        Err(e) => error!(
-            "Failed to execute OffchainOrder::MarkFailed \
-             command for stale execution {execution_id}: {e}"
-        ),
-    }
-}
-
-async fn execute_fail_stale_offchain(
-    dual_write_context: &DualWriteContext,
-    cleaned_up: &CleanedUpExecution,
-) {
-    let execution_id = cleaned_up.execution_id;
-    let symbol = &cleaned_up.symbol;
-
-    match crate::dual_write::fail_offchain_order(
-        dual_write_context,
-        execution_id,
-        symbol,
-        cleaned_up.error_reason.clone(),
-    )
-    .await
-    {
-        Ok(()) => info!(
-            "Successfully executed Position::FailOffChainOrder \
-             command for stale execution {execution_id}, symbol {symbol}"
-        ),
-        Err(e) => error!(
-            "Failed to execute Position::FailOffChainOrder \
-             command for stale execution {execution_id}, symbol {symbol}: {e}"
-        ),
-    }
-}
-
-async fn process_trade_within_transaction(
+async fn process_queued_trade(
     executor_type: SupportedExecutor,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
-    dual_write_context: &DualWriteContext,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
+    cqrs: &TradeProcessingCqrs,
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
-    execute_initialize_position(dual_write_context, &trade).await;
-    execute_acknowledge_fill(dual_write_context, &trade).await;
+    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
-    let mut sql_tx = pool.begin().await.inspect_err(|e| {
-        error!(
-            "Failed to begin transaction \
-             for event processing: {e}"
-        );
-    })?;
-
-    info!(
-        "Started transaction for atomic event processing: \
-         event_id={}, tx_hash={:?}, log_index={}",
-        event_id, queued_event.tx_hash, queued_event.log_index
-    );
-
-    let TradeProcessingResult {
-        execution,
-        cleaned_up_executions,
-    } = accumulator::process_onchain_trade(
-        &mut sql_tx,
-        dual_write_context,
-        trade.clone(),
-        executor_type,
-    )
-    .await
-    .inspect_err(|e| {
-        error!(
-            "Failed to process trade through accumulator: {e}, tx_hash={:?}, log_index={}",
-            queued_event.tx_hash, queued_event.log_index
-        );
-    })?;
-
-    mark_event_processed(&mut sql_tx, event_id)
+    mark_event_processed(pool, event_id)
         .await
-        .map_err(|e| {
-            error!("Failed to mark event {event_id} as processed: {e}");
-            EventProcessingError::Queue(e)
+        .map_err(|error| {
+            error!("Failed to mark event {event_id} as processed: {error}");
+            EventProcessingError::Queue(error)
         })?;
 
-    sql_tx.commit().await.inspect_err(|e| {
-        error!(
-            "Failed to commit transaction for event processing: {e}, event_id={}, tx_hash={:?}",
-            event_id, queued_event.tx_hash
-        );
-    })?;
-
     info!(
-        "Successfully committed atomic event processing: event_id={}, tx_hash={:?}, log_index={}",
+        "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    // Record OnChainTrade event (Position already updated above)
-    execute_witness_trade(dual_write_context, &trade, queued_event.block_number).await;
+    execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
 
-    if let Some(ref exec) = execution {
-        let base_symbol = trade.symbol.base();
-        execute_new_execution_dual_write(dual_write_context, exec, base_symbol).await;
+    let base_symbol = trade.symbol.base();
+
+    let Some(execution) =
+        check_execution_readiness(&cqrs.position_projection, base_symbol, executor_type).await?
+    else {
+        return Ok(None);
+    };
+
+    place_offchain_order(&execution, cqrs).await
+}
+
+async fn place_offchain_order(
+    execution: &ExecutionCtx,
+    cqrs: &TradeProcessingCqrs,
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+    let offchain_order_id = OffchainOrderId::new();
+
+    execute_place_offchain_order(execution, cqrs, offchain_order_id).await;
+    execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
+
+    Ok(Some(offchain_order_id))
+}
+
+async fn execute_place_offchain_order(
+    execution: &ExecutionCtx,
+    cqrs: &TradeProcessingCqrs,
+    offchain_order_id: OffchainOrderId,
+) {
+    let command = PositionCommand::PlaceOffChainOrder {
+        offchain_order_id,
+        shares: execution.shares,
+        direction: execution.direction,
+        executor: execution.executor,
+        threshold: cqrs.execution_threshold,
+    };
+
+    match cqrs.position.send(&execution.symbol, command).await {
+        Ok(()) => info!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            "Position::PlaceOffChainOrder succeeded"
+        ),
+        Err(error) => error!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            "Position::PlaceOffChainOrder failed: {error}"
+        ),
     }
+}
 
-    execute_stale_execution_cleanup_dual_write(dual_write_context, cleaned_up_executions).await;
+async fn execute_create_offchain_order(
+    execution: &ExecutionCtx,
+    cqrs: &TradeProcessingCqrs,
+    offchain_order_id: OffchainOrderId,
+) {
+    let command = OffchainOrderCommand::Place {
+        symbol: execution.symbol.clone(),
+        shares: execution.shares,
+        direction: execution.direction,
+        executor: execution.executor,
+    };
 
-    Ok(execution)
+    match cqrs.offchain_order.send(&offchain_order_id, command).await {
+        Ok(()) => info!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            "OffchainOrder::Place succeeded"
+        ),
+        Err(error) => error!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            "OffchainOrder::Place failed: {error}"
+        ),
+    }
 }
 
 fn reconstruct_log_from_queued_event(
-    evm_ctx: &EvmCtx,
+    ctx: &EvmCtx,
     queued_event: &crate::queue::QueuedEvent,
 ) -> Log {
-    use alloy::primitives::IntoLogData;
-
     let log_data = match &queued_event.event {
         TradeEvent::ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
         TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
@@ -1341,7 +1309,7 @@ fn reconstruct_log_from_queued_event(
 
     Log {
         inner: alloy::primitives::Log {
-            address: evm_ctx.orderbook,
+            address: ctx.orderbook,
             data: log_data,
         },
         block_hash: None,
@@ -1357,130 +1325,85 @@ fn reconstruct_log_from_queued_event(
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
-    pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
+    position: &Store<Position>,
+    position_projection: &Projection<Position>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
+    threshold: &ExecutionThreshold,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let executions =
-        check_all_accumulated_positions(pool, dual_write_context, executor_type).await?;
+    let ready_positions = check_all_positions(position_projection, executor_type).await?;
 
-    if executions.is_empty() {
+    if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
         return Ok(());
     }
 
     info!(
         "Found {} accumulated positions ready for execution",
-        executions.len()
+        ready_positions.len()
     );
 
-    for execution in executions {
-        let Some(execution_id) = execution.id else {
-            error!("Execution returned from check_all_accumulated_positions has None ID");
-            continue;
-        };
+    for execution in ready_positions {
+        let offchain_order_id = OffchainOrderId::new();
 
         info!(
-            "Executing accumulated position for symbol={}, shares={}, direction={:?}, execution_id={}",
-            execution.symbol, execution.shares, execution.direction, execution_id
+            symbol = %execution.symbol,
+            shares = %execution.shares,
+            direction = ?execution.direction,
+            %offchain_order_id,
+            "Executing accumulated position"
         );
 
-        // Emit Placed event BEFORE spawning execution task.
-        // This ensures the OffchainOrder aggregate is initialized before ConfirmSubmission is attempted.
-        execute_new_execution_dual_write(dual_write_context, &execution, &execution.symbol).await;
+        let command = PositionCommand::PlaceOffChainOrder {
+            offchain_order_id,
+            shares: execution.shares,
+            direction: execution.direction,
+            executor: execution.executor,
+            threshold: *threshold,
+        };
 
-        let pool_clone = pool.clone();
-        let executor_clone = executor.clone();
-        let dual_write_clone = dual_write_context.clone();
-        tokio::spawn(async move {
-            if let Err(e) = execute_pending_offchain_execution(
-                &executor_clone,
-                &pool_clone,
-                &dual_write_clone,
-                execution_id,
-            )
-            .await
-            {
-                error!(
-                    "Failed to execute accumulated position for execution_id {}: {e}",
-                    execution_id
-                );
-            } else {
-                info!(
-                    "Successfully executed accumulated position for execution_id {}",
-                    execution_id
-                );
-            }
-        });
+        match position.send(&execution.symbol, command).await {
+            Ok(()) => info!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Position::PlaceOffChainOrder succeeded"
+            ),
+            Err(error) => error!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Position::PlaceOffChainOrder failed: {error}"
+            ),
+        }
+
+        let command = OffchainOrderCommand::Place {
+            symbol: execution.symbol.clone(),
+            shares: execution.shares,
+            direction: execution.direction,
+            executor: execution.executor,
+        };
+
+        match offchain_order.send(&offchain_order_id, command).await {
+            Ok(()) => info!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "OffchainOrder::Place succeeded"
+            ),
+            Err(error) => error!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "OffchainOrder::Place failed: {error}"
+            ),
+        }
     }
 
     Ok(())
 }
 
 /// Maps database symbols to current executor-recognized tickers.
-/// Handles corporate actions like SPLG -> SPYM rename (Oct 31, 2025).
-/// Remove once proper tSPYM tokens are issued onchain.
-fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
-    match symbol.to_string().as_str() {
-        "SPLG" => Symbol::new("SPYM"),
-        _ => Ok(symbol.clone()),
-    }
-}
-
-#[tracing::instrument(skip(executor, pool, dual_write_context), level = tracing::Level::INFO)]
-async fn execute_pending_offchain_execution<E>(
-    executor: &E,
-    pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
-    execution_id: i64,
-) -> Result<(), EventProcessingError>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    let execution = find_execution_by_id(pool, execution_id)
-        .await?
-        .ok_or(EventProcessingError::ExecutionNotFound(execution_id))?;
-
-    info!("Executing offchain order: {execution:?}");
-
-    let market_order = MarketOrder {
-        symbol: to_executor_ticker(&execution.symbol)?,
-        shares: execution.shares,
-        direction: execution.direction,
-    };
-
-    let placement = executor.place_market_order(market_order).await?;
-
-    info!("Order placed with ID: {}", placement.order_id);
-
-    let broker_order_id = BrokerOrderId::new(&placement.order_id);
-
-    if let Err(e) = crate::dual_write::confirm_submission(
-        dual_write_context,
-        execution_id,
-        broker_order_id.clone(),
-    )
-    .await
-    {
-        error!(
-            "Failed to execute OffchainOrder::ConfirmSubmission command: {e}, \
-            execution_id={execution_id}, order_id={broker_order_id:?}"
-        );
-    } else {
-        info!(
-            "Successfully executed OffchainOrder::ConfirmSubmission command: \
-            execution_id={execution_id}, order_id={broker_order_id:?}"
-        );
-    }
-
-    Ok(())
-}
-
 async fn wait_for_first_event_with_timeout<S1, S2>(
     clear_stream: &mut S1,
     take_stream: &mut S2,
@@ -1496,58 +1419,28 @@ where
     let mut events = Vec::new();
 
     loop {
-        tokio::select! {
+        let event_result = tokio::select! {
             Some(result) = clear_stream.next() => {
-                if let Some(first_event) = handle_startup_clear_event(result, &mut events) {
-                    return Some(first_event);
-                }
+                result.map(|(event, log)| (TradeEvent::ClearV3(Box::new(event)), log))
             }
             Some(result) = take_stream.next() => {
-                if let Some(first_event) = handle_startup_take_event(result, &mut events) {
-                    return Some(first_event);
-                }
+                result.map(|(event, log)| (TradeEvent::TakeOrderV3(Box::new(event)), log))
             }
             () = &mut deadline => return None,
-        }
-    }
-}
+        };
 
-fn handle_startup_clear_event(
-    result: Result<(ClearV3, Log), sol_types::Error>,
-    events: &mut Vec<(TradeEvent, Log)>,
-) -> Option<(Vec<(TradeEvent, Log)>, u64)> {
-    match result {
-        Ok((event, log)) => {
-            let Some(block_number) = log.block_number else {
-                error!("ClearV3 event missing block number");
-                return None;
-            };
-            events.push((TradeEvent::ClearV3(Box::new(event)), log));
-            Some((std::mem::take(events), block_number))
-        }
-        Err(e) => {
-            error!("Error in clear event stream during startup: {e}");
-            None
-        }
-    }
-}
-
-fn handle_startup_take_event(
-    result: Result<(TakeOrderV3, Log), sol_types::Error>,
-    events: &mut Vec<(TradeEvent, Log)>,
-) -> Option<(Vec<(TradeEvent, Log)>, u64)> {
-    match result {
-        Ok((event, log)) => {
-            let Some(block_number) = log.block_number else {
-                error!("TakeOrderV3 event missing block number");
-                return None;
-            };
-            events.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
-            Some((std::mem::take(events), block_number))
-        }
-        Err(e) => {
-            error!("Error in take event stream during startup: {e}");
-            None
+        match event_result {
+            Ok((event, log)) => {
+                let Some(block_number) = log.block_number else {
+                    error!("Event missing block number during startup");
+                    continue;
+                };
+                events.push((event, log));
+                return Some((std::mem::take(&mut events), block_number));
+            }
+            Err(error) => {
+                error!("Error in event stream during startup: {error}");
+            }
         }
     }
 }
@@ -1567,14 +1460,14 @@ async fn buffer_live_events<S1, S2>(
                 Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
                     event_buffer.push((TradeEvent::ClearV3(Box::new(event)), log));
                 }
-                Err(e) => error!("Error in clear event stream during backfill: {e}"),
+                Err(error) => error!("Error in clear event stream during backfill: {error}"),
                 _ => {}
             },
             Some(result) = take_stream.next() => match result {
                 Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
                     event_buffer.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
                 }
-                Err(e) => error!("Error in take event stream during backfill: {e}"),
+                Err(error) => error!("Error in take event stream during backfill: {error}"),
                 _ => {}
             },
             else => break,
@@ -1584,49 +1477,42 @@ async fn buffer_live_events<S1, S2>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, IntoLogData, U256, address, bytes, fixed_bytes};
+    use alloy::primitives::{B256, IntoLogData, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
     use futures_util::stream;
     use rust_decimal::Decimal;
-    use sqlite_es::sqlite_cqrs;
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     use st0x_execution::{
-        Direction, FractionalShares, MockExecutorCtx, OrderState, OrderStatus, PersistenceError,
-        Positive, SupportedExecutor, Symbol, TryIntoExecutor,
+        Direction, ExecutorOrderId, MarketOrder, MockExecutorCtx, Positive, Symbol, TryIntoExecutor,
     };
 
     use super::*;
-    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::offchain::execution::{
-        OffchainExecution, find_executions_by_symbol_status_and_broker,
+    use crate::bindings::IOrderBookV5::{
+        ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4,
     };
-    use crate::onchain::io::Usdc;
+    use crate::conductor::builder::CqrsFrameworks;
+    use crate::config::tests::create_test_ctx_with_order_owner;
+    use crate::inventory::ImbalanceThreshold;
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::onchain::trade::OnchainTrade;
+    use crate::position::PositionEvent;
+    use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
+
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
-    use crate::tokenized_symbol;
 
-    fn abort_all_conductor_tasks(conductor: Conductor) {
-        if let Some(handle) = conductor.executor_maintenance {
-            handle.abort();
+    fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
+        TradeProcessingCqrs {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
-
-        if let Some(handle) = conductor.rebalancer {
-            handle.abort();
-        }
-
-        if let Some(handle) = conductor.inventory_poller {
-            handle.abort();
-        }
-
-        conductor.order_poller.abort();
-        conductor.dex_event_receiver.abort();
-        conductor.event_processor.abort();
-        conductor.position_checker.abort();
-        conductor.queue_processor.abort();
     }
 
     #[tokio::test]
@@ -1654,113 +1540,23 @@ mod tests {
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
-
-        let trade_count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(trade_count, 0);
     }
 
     #[tokio::test]
-    async fn test_onchain_trade_duplicate_handling() {
+    async fn test_clear_v2_event_filtering_without_errors() {
         let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
 
-        let existing_trade = OnchainTradeBuilder::new()
-            .with_tx_hash(fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            ))
-            .with_log_index(293)
-            .with_symbol("AAPL0x")
-            .with_amount(5.0)
-            .with_price(20000.0)
-            .build();
-        let mut sql_tx = pool.begin().await.unwrap();
-        existing_trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-        sql_tx.commit().await.unwrap();
-
-        let duplicate_trade = existing_trade.clone();
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let err = duplicate_trade
-            .save_within_transaction(&mut sql_tx2)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                OnChainError::Persistence(PersistenceError::Database(ref db_err))
-                if matches!(db_err, sqlx::Error::Database(_))
-            ),
-            "Expected database constraint violation, got: {err:?}"
-        );
-        sql_tx2.rollback().await.unwrap();
-
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_trade_handling() {
-        let pool = setup_test_db().await;
-
-        let existing_trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            ),
-            log_index: 293,
-            symbol: tokenized_symbol!("AAPL0x"),
-            equity_token: Address::ZERO,
-            amount: 5.0,
-            direction: Direction::Sell,
-            price: Usdc::new(20000.0).unwrap(),
-            block_timestamp: None,
-            created_at: None,
-            gas_used: None,
-            effective_gas_price: None,
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-        let mut sql_tx = pool.begin().await.unwrap();
-        existing_trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-        sql_tx.commit().await.unwrap();
-
-        let duplicate_trade = existing_trade.clone();
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let err = duplicate_trade
-            .save_within_transaction(&mut sql_tx2)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                OnChainError::Persistence(PersistenceError::Database(ref db_err))
-                if matches!(db_err, sqlx::Error::Database(_))
-            ),
-            "Expected database constraint violation, got: {err:?}"
-        );
-        sql_tx2.rollback().await.unwrap();
-
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_complete_event_processing_flow() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-
+        let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
+            alice,
+            bob,
             clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
@@ -1770,61 +1566,406 @@ mod tests {
                 bobBountyVaultId: B256::ZERO,
             },
         };
-        let log = crate::test_utils::get_test_log();
 
+        let log = get_test_log();
         crate::queue::enqueue(&pool, &clear_event, &log)
             .await
             .unwrap();
 
+        let cache = SymbolCache::default();
+        let feed_id_cache = FeedIdCache::default();
+        let queue_context = QueueProcessingCtx {
+            cache: &cache,
+            feed_id_cache: &feed_id_cache,
+            vault_registry: &frameworks.vault_registry,
+        };
+
+        let cqrs = trade_processing_cqrs(&frameworks);
+
+        let result = process_next_queued_event(
+            SupportedExecutor::DryRun,
+            &config,
+            &pool,
+            &provider,
+            &cqrs,
+            &queue_context,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), None);
+
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 0);
+    }
 
-        let queued_event = crate::queue::get_next_unprocessed_event(&pool)
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_logs_info_when_event_is_filtered_out() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice,
+            bob,
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let log = get_test_log();
+        crate::queue::enqueue(&pool, &clear_event, &log)
             .await
-            .unwrap()
             .unwrap();
 
-        if let TradeEvent::ClearV3(boxed_clear_event) = queued_event.event {
-            let cache = SymbolCache::default();
-            let http_provider =
-                ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        let cache = SymbolCache::default();
+        let feed_id_cache = FeedIdCache::default();
+        let queue_context = QueueProcessingCtx {
+            cache: &cache,
+            feed_id_cache: &feed_id_cache,
+            vault_registry: &frameworks.vault_registry,
+        };
 
-            let feed_id_cache = FeedIdCache::default();
-            let order_owner = ctx.order_owner().unwrap();
-            if let Ok(Some(trade)) = OnchainTrade::try_from_clear_v3(
-                &ctx.evm,
-                &cache,
-                &http_provider,
-                *boxed_clear_event,
-                log,
-                &feed_id_cache,
-                order_owner,
-            )
+        let cqrs = trade_processing_cqrs(&frameworks);
+
+        process_next_queued_event(
+            SupportedExecutor::DryRun,
+            &config,
+            &pool,
+            &provider,
+            &cqrs,
+            &queue_context,
+        )
+        .await
+        .unwrap();
+
+        assert!(logs_contain("Event filtered out"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_logs_event_type_when_processing() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice,
+            bob,
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let log = get_test_log();
+        crate::queue::enqueue(&pool, &clear_event, &log)
             .await
-            {
-                let dual_write_context = DualWriteContext::new(pool.clone());
+            .unwrap();
 
-                let mut sql_tx = pool.begin().await.unwrap();
-                let TradeProcessingResult { .. } = accumulator::process_onchain_trade(
-                    &mut sql_tx,
-                    &dual_write_context,
-                    trade,
-                    SupportedExecutor::DryRun,
-                )
-                .await
-                .unwrap();
-                sql_tx.commit().await.unwrap();
+        let cache = SymbolCache::default();
+        let feed_id_cache = FeedIdCache::default();
+        let queue_context = QueueProcessingCtx {
+            cache: &cache,
+            feed_id_cache: &feed_id_cache,
+            vault_registry: &frameworks.vault_registry,
+        };
+
+        let cqrs = trade_processing_cqrs(&frameworks);
+
+        process_next_queued_event(
+            SupportedExecutor::DryRun,
+            &config,
+            &pool,
+            &provider,
+            &cqrs,
+            &queue_context,
+        )
+        .await
+        .unwrap();
+
+        assert!(logs_contain("ClearV3"));
+    }
+
+    #[tokio::test]
+    async fn test_conductor_abort_all() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
+
+        conductor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_individual_abort() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
+
+        conductor.order_poller.abort();
+        conductor.event_processor.abort();
+        conductor.position_checker.abort();
+        conductor.queue_processor.abort();
+        conductor.dex_event_receiver.abort();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_builder_returns_immediately() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
+
+        assert!(!conductor.order_poller.is_finished());
+        assert!(!conductor.event_processor.is_finished());
+        assert!(!conductor.position_checker.is_finished());
+        assert!(!conductor.queue_processor.is_finished());
+
+        conductor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_without_rebalancer() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
+
+        assert!(conductor.rebalancer.is_none());
+
+        conductor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_with_rebalancer() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let fake_rebalancer = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
+        });
+
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(fake_rebalancer)
+        .spawn();
+
+        assert!(conductor.rebalancer.is_some());
+
+        conductor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_rebalancer_aborted_on_abort_all() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let fake_rebalancer = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(fake_rebalancer)
+        .spawn();
+
+        let rebalancer_handle = conductor.rebalancer.as_ref().unwrap();
+        assert!(!rebalancer_handle.is_finished());
+
+        conductor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_rebalancer_aborted_on_abort_trading_tasks() {
+        let pool = setup_test_db().await;
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let fake_rebalancer = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(fake_rebalancer)
+        .spawn();
+
+        conductor.abort_trading_tasks();
+
+        // abort_trading_tasks aborts the rebalancer
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
+
+        // Clean up remaining tasks
+        conductor.dex_event_receiver.abort();
+        if let Some(executor_maintenance) = conductor.executor_maintenance {
+            executor_maintenance.abort();
         }
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
-            .await
-            .unwrap();
-        sql_tx.commit().await.unwrap();
-
-        let remaining_count = crate::queue::count_unprocessed(&pool).await.unwrap();
-        assert_eq!(remaining_count, 0);
+        if let Some(inventory_poller) = conductor.inventory_poller {
+            inventory_poller.abort();
+        }
     }
 
     #[tokio::test]
@@ -1853,11 +1994,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
+        crate::queue::mark_event_processed(&pool, queued_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
 
         crate::queue::enqueue(&pool, &event1, &log1).await.unwrap();
@@ -1873,11 +2012,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next_event.log_index, 2);
-        let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, next_event.id.unwrap())
+        crate::queue::mark_event_processed(&pool, next_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -1919,11 +2056,9 @@ mod tests {
                 .unwrap();
             assert_eq!(event.block_number, expected_block);
             assert_eq!(event.log_index, expected_log_idx);
-            let mut sql_tx = pool.begin().await.unwrap();
-            crate::queue::mark_event_processed(&mut sql_tx, event.id.unwrap())
+            crate::queue::mark_event_processed(&pool, event.id.unwrap())
                 .await
                 .unwrap();
-            sql_tx.commit().await.unwrap();
         }
 
         assert!(
@@ -1971,11 +2106,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut sql_tx = pool.begin().await.unwrap();
-            crate::queue::mark_event_processed(&mut sql_tx, event.id.unwrap())
+            crate::queue::mark_event_processed(&pool, event.id.unwrap())
                 .await
                 .unwrap();
-            sql_tx.commit().await.unwrap();
         }
 
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 3);
@@ -1985,11 +2118,9 @@ mod tests {
             .await
             .unwrap()
         {
-            let mut sql_tx = pool.begin().await.unwrap();
-            crate::queue::mark_event_processed(&mut sql_tx, event.id.unwrap())
+            crate::queue::mark_event_processed(&pool, event.id.unwrap())
                 .await
                 .unwrap();
-            sql_tx.commit().await.unwrap();
             processed_count += 1;
         }
 
@@ -2054,11 +2185,9 @@ mod tests {
         let original_log_data = clear_event.into_log_data();
         assert_eq!(reconstructed_log.inner.data, original_log_data);
 
-        let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
+        crate::queue::mark_event_processed(&pool, queued_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
     }
 
@@ -2226,1126 +2355,6 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[tokio::test]
-    async fn test_clear_v2_event_filtering_without_errors() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let feed_id_cache = FeedIdCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let mut alice_order = get_test_order();
-        let mut bob_order = get_test_order();
-
-        alice_order.owner = address!("0x1111111111111111111111111111111111111111");
-        bob_order.owner = address!("0x2222222222222222222222222222222222222222");
-
-        let clear_event = ClearV3 {
-            sender: address!("0x3333333333333333333333333333333333333333"),
-            alice: alice_order,
-            bob: bob_order,
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-        let log = crate::test_utils::get_test_log();
-
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
-
-        let count = crate::queue::count_unprocessed(&pool).await.unwrap();
-        assert_eq!(count, 1);
-
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
-
-        let queue_context = QueueProcessingCtx {
-            cache: &cache,
-            feed_id_cache: &feed_id_cache,
-            vault_registry_cqrs: &vault_registry_cqrs,
-        };
-
-        let result = process_next_queued_event(
-            SupportedExecutor::DryRun,
-            &ctx,
-            &pool,
-            &provider,
-            &dual_write_context,
-            &queue_context,
-        )
-        .await;
-
-        assert!(result.unwrap().is_none());
-
-        let remaining_count = crate::queue::count_unprocessed(&pool).await.unwrap();
-        assert_eq!(remaining_count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_execute_pending_offchain_execution_not_found() {
-        let pool = setup_test_db().await;
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let error =
-            execute_pending_offchain_execution(&executor, &pool, &dual_write_context, 99999)
-                .await
-                .unwrap_err();
-
-        assert!(matches!(
-            error,
-            EventProcessingError::ExecutionNotFound(99999)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_execute_onchain_trade_dual_write_creates_events() {
-        let pool = setup_test_db().await;
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let mut trade = OnchainTradeBuilder::new()
-            .with_symbol("NVDA0x")
-            .with_amount(5.5)
-            .with_price(450.0)
-            .build();
-        trade.direction = Direction::Buy;
-        trade.block_timestamp = Some(chrono::Utc::now());
-
-        // Test the individual dual-write functions that were split out
-        execute_witness_trade(&dual_write_context, &trade, 12345).await;
-        execute_initialize_position(&dual_write_context, &trade).await;
-        execute_acknowledge_fill(&dual_write_context, &trade).await;
-
-        // Verify OnChainTrade event was created
-        let onchain_trade_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            onchain_trade_events.len(),
-            1,
-            "Expected 1 OnChainTrade event, got {onchain_trade_events:?}"
-        );
-        assert_eq!(onchain_trade_events[0], "OnChainTradeEvent::Filled");
-
-        let position_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'NVDA' \
-            ORDER BY sequence"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            position_events.len(),
-            2,
-            "Expected 2 Position events (Initialized, OnChainOrderFilled), got {position_events:?}"
-        );
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-    }
-
-    #[tokio::test]
-    async fn test_execute_new_execution_dual_write_creates_events() {
-        let pool = setup_test_db().await;
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let symbol = Symbol::new("GOOGL").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
-
-        crate::dual_write::initialize_position(
-            &dual_write_context,
-            &symbol,
-            ExecutionThreshold::whole_share(),
-        )
-        .await
-        .unwrap();
-
-        let mut onchain_trade = OnchainTradeBuilder::new()
-            .with_symbol("GOOGL0x")
-            .with_amount(5.0)
-            .with_price(140.0)
-            .build();
-        onchain_trade.direction = Direction::Buy;
-        onchain_trade.block_timestamp = Some(chrono::Utc::now());
-
-        crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &onchain_trade)
-            .await
-            .unwrap();
-
-        let execution = OffchainExecution {
-            id: Some(42),
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Buy,
-            executor: SupportedExecutor::DryRun,
-            state: OrderState::Pending,
-        };
-
-        execute_new_execution_dual_write(&dual_write_context, &execution, &symbol).await;
-
-        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '42' \
-            ORDER BY sequence"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            offchain_order_events.len(),
-            1,
-            "Expected 1 OffchainOrder event (Placed), got {offchain_order_events:?}"
-        );
-        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
-
-        let position_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'GOOGL' \
-            ORDER BY sequence"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            position_events.len(),
-            3,
-            "Expected 3 Position events (Initialized, OnChainOrderFilled, OffChainOrderPlaced), \
-            got {position_events:?}"
-        );
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
-    }
-
-    #[tokio::test]
-    async fn test_execute_pending_offchain_execution_calls_confirm_submission() {
-        let pool = setup_test_db().await;
-        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let symbol = Symbol::new("AMZN").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        let pending_state = OrderState::Pending;
-        let execution_id = pending_state
-            .store(
-                &mut tx,
-                &symbol,
-                shares,
-                Direction::Buy,
-                SupportedExecutor::DryRun,
-            )
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        let pending_execution = OffchainExecution {
-            id: Some(execution_id),
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Buy,
-            executor: SupportedExecutor::DryRun,
-            state: OrderState::Pending,
-        };
-
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
-            .await
-            .unwrap();
-
-        let aggregate_id = execution_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
-            ORDER BY sequence",
-            aggregate_id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            offchain_order_events.len(),
-            2,
-            "Expected 2 OffchainOrder events (Placed, Submitted), got {offchain_order_events:?}"
-        );
-        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
-        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
-    }
-
-    /// Regression test for the dual-write bug where the legacy `offchain_trades` table
-    /// was not updated from PENDING to SUBMITTED after order placement.
-    ///
-    /// The order poller queries for SUBMITTED orders from the legacy table, but if
-    /// `execute_pending_offchain_execution` doesn't update the legacy table, the order
-    /// will never be polled and will remain stuck in PENDING state indefinitely.
-    ///
-    /// This test verifies that after `execute_pending_offchain_execution`:
-    /// 1. The event store has the Submitted event (dual-write path)
-    /// 2. The legacy `offchain_trades` table has SUBMITTED status with broker order_id
-    #[tokio::test]
-    async fn test_execute_pending_offchain_execution_updates_legacy_table_to_submitted() {
-        let pool = setup_test_db().await;
-        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let symbol = Symbol::new("BMNR").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(1))).unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        let pending_state = OrderState::Pending;
-        let execution_id = pending_state
-            .store(
-                &mut tx,
-                &symbol,
-                shares,
-                Direction::Buy,
-                SupportedExecutor::DryRun,
-            )
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        let legacy_row_before = sqlx::query!(
-            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(legacy_row_before.status, "PENDING");
-        assert!(
-            legacy_row_before.order_id.is_none(),
-            "order_id should be None before execution"
-        );
-
-        let pending_execution = OffchainExecution {
-            id: Some(execution_id),
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Buy,
-            executor: SupportedExecutor::DryRun,
-            state: OrderState::Pending,
-        };
-
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
-            .await
-            .unwrap();
-
-        let aggregate_id = execution_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
-            ORDER BY sequence",
-            aggregate_id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            offchain_order_events.len(),
-            2,
-            "Expected 2 OffchainOrder events (Placed, Submitted), got {offchain_order_events:?}"
-        );
-        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
-        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
-
-        let legacy_row_after = sqlx::query!(
-            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            legacy_row_after.status, "SUBMITTED",
-            "Legacy table should be updated to SUBMITTED status after order placement. \
-            Currently stuck at PENDING which causes the order poller to never find this order."
-        );
-
-        assert!(
-            legacy_row_after.order_id.is_some(),
-            "Legacy table should have broker order_id after order placement. \
-            Without this, the order poller cannot query Schwab for order status."
-        );
-    }
-
-    /// Tests that the order_id stored in the legacy table matches the broker's returned order_id.
-    #[tokio::test]
-    async fn test_execute_pending_offchain_execution_stores_correct_order_id() {
-        let pool = setup_test_db().await;
-        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let symbol = Symbol::new("TSLA").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        let pending_state = OrderState::Pending;
-        let execution_id = pending_state
-            .store(
-                &mut tx,
-                &symbol,
-                shares,
-                Direction::Sell,
-                SupportedExecutor::DryRun,
-            )
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        let pending_execution = OffchainExecution {
-            id: Some(execution_id),
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Sell,
-            executor: SupportedExecutor::DryRun,
-            state: OrderState::Pending,
-        };
-
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
-            .await
-            .unwrap();
-
-        let legacy_row = sqlx::query!(
-            "SELECT order_id FROM offchain_trades WHERE id = ?",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        let order_id = legacy_row
-            .order_id
-            .expect("order_id should be set after execution");
-
-        assert!(!order_id.is_empty(), "order_id should not be empty");
-
-        assert!(
-            order_id.starts_with("TEST_"),
-            "MockBroker order_id should start with 'TEST_', got: {order_id}"
-        );
-    }
-
-    /// Tests that orders updated to SUBMITTED can be found by the order poller's query.
-    /// This verifies the fix enables the order poller to track orders correctly.
-    #[tokio::test]
-    async fn test_order_poller_can_find_orders_after_execution() {
-        let pool = setup_test_db().await;
-        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let symbol = Symbol::new("NVDA").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(3))).unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        let pending_state = OrderState::Pending;
-        let execution_id = pending_state
-            .store(
-                &mut tx,
-                &symbol,
-                shares,
-                Direction::Buy,
-                SupportedExecutor::DryRun,
-            )
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        let pending_execution = OffchainExecution {
-            id: Some(execution_id),
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Buy,
-            executor: SupportedExecutor::DryRun,
-            state: OrderState::Pending,
-        };
-
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        let submitted_before = find_executions_by_symbol_status_and_broker(
-            &pool,
-            Some(symbol.clone()),
-            OrderStatus::Submitted,
-            Some(SupportedExecutor::DryRun),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            submitted_before.is_empty(),
-            "No SUBMITTED orders should exist before execution"
-        );
-
-        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
-            .await
-            .unwrap();
-
-        let submitted_after = find_executions_by_symbol_status_and_broker(
-            &pool,
-            Some(symbol.clone()),
-            OrderStatus::Submitted,
-            Some(SupportedExecutor::DryRun),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            submitted_after.len(),
-            1,
-            "Order poller query should find exactly 1 SUBMITTED order after execution"
-        );
-
-        assert_eq!(submitted_after[0].id, Some(execution_id));
-
-        match &submitted_after[0].state {
-            OrderState::Submitted { order_id } => {
-                assert!(
-                    order_id.starts_with("TEST_"),
-                    "Order should have broker order_id starting with TEST_, got: {order_id}"
-                );
-            }
-            other => panic!("Expected Submitted state, got: {other:?}"),
-        }
-    }
-
-    /// Tests that both legacy table and event store are updated atomically.
-    /// Verifies the dual-write pattern works correctly.
-    #[tokio::test]
-    async fn test_execute_pending_offchain_execution_dual_write_consistency() {
-        let pool = setup_test_db().await;
-        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-
-        let symbol = Symbol::new("GOOGL").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(2))).unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        let pending_state = OrderState::Pending;
-        let execution_id = pending_state
-            .store(
-                &mut tx,
-                &symbol,
-                shares,
-                Direction::Buy,
-                SupportedExecutor::DryRun,
-            )
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        let pending_execution = OffchainExecution {
-            id: Some(execution_id),
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Buy,
-            executor: SupportedExecutor::DryRun,
-            state: OrderState::Pending,
-        };
-
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
-            .await
-            .unwrap();
-
-        let legacy_row = sqlx::query!(
-            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        let legacy_order_id = legacy_row
-            .order_id
-            .expect("Legacy table should have order_id");
-
-        let aggregate_id = execution_id.to_string();
-        let event_payload: String = sqlx::query_scalar!(
-            r#"SELECT payload as "payload!: String" FROM events
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ?
-            AND event_type = 'OffchainOrderEvent::Submitted'"#,
-            aggregate_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert!(
-            event_payload.contains(&legacy_order_id),
-            "Event store order_id should match legacy table order_id. \
-            Legacy: {legacy_order_id}, Event payload: {event_payload}"
-        );
-
-        assert_eq!(legacy_row.status, "SUBMITTED");
-    }
-
-    #[tokio::test]
-    async fn test_conductor_abort_all() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let clear_stream = stream::empty();
-        let take_stream = stream::empty();
-
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = CqrsFrameworks {
-            dual_write_context: DualWriteContext::new(pool.clone()),
-            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-        };
-
-        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
-
-        assert!(!conductor.order_poller.is_finished());
-        assert!(!conductor.event_processor.is_finished());
-        assert!(!conductor.position_checker.is_finished());
-        assert!(!conductor.queue_processor.is_finished());
-
-        abort_all_conductor_tasks(conductor);
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    #[tokio::test]
-    async fn test_conductor_individual_abort() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let clear_stream = stream::empty();
-        let take_stream = stream::empty();
-
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = CqrsFrameworks {
-            dual_write_context: DualWriteContext::new(pool.clone()),
-            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-        };
-
-        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
-
-        let order_handle = conductor.order_poller;
-        let event_handle = conductor.event_processor;
-        let position_handle = conductor.position_checker;
-        let queue_handle = conductor.queue_processor;
-
-        assert!(!order_handle.is_finished());
-        assert!(!event_handle.is_finished());
-        assert!(!position_handle.is_finished());
-        assert!(!queue_handle.is_finished());
-
-        order_handle.abort();
-        event_handle.abort();
-        position_handle.abort();
-        queue_handle.abort();
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        assert!(order_handle.is_finished());
-        assert!(event_handle.is_finished());
-        assert!(position_handle.is_finished());
-        assert!(queue_handle.is_finished());
-    }
-
-    #[tokio::test]
-    async fn test_conductor_builder_returns_immediately() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let clear_stream = stream::empty();
-        let take_stream = stream::empty();
-
-        let start_time = std::time::Instant::now();
-
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = CqrsFrameworks {
-            dual_write_context: DualWriteContext::new(pool.clone()),
-            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-        };
-
-        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
-
-        let elapsed = start_time.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "ConductorBuilder should return quickly, took: {elapsed:?}"
-        );
-
-        abort_all_conductor_tasks(conductor);
-    }
-
-    #[tokio::test]
-    async fn test_conductor_without_rebalancer() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let clear_stream = stream::empty();
-        let take_stream = stream::empty();
-
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = CqrsFrameworks {
-            dual_write_context: DualWriteContext::new(pool.clone()),
-            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-        };
-
-        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
-
-        assert!(conductor.rebalancer.is_none());
-        abort_all_conductor_tasks(conductor);
-    }
-
-    #[tokio::test]
-    async fn test_conductor_with_rebalancer() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let clear_stream = stream::empty();
-        let take_stream = stream::empty();
-
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = CqrsFrameworks {
-            dual_write_context: DualWriteContext::new(pool.clone()),
-            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-        };
-
-        let rebalancer_handle = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            }
-        });
-
-        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .with_rebalancer(rebalancer_handle)
-            .spawn();
-
-        assert!(conductor.rebalancer.is_some());
-        assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
-
-        abort_all_conductor_tasks(conductor);
-    }
-
-    #[tokio::test]
-    async fn test_conductor_rebalancer_aborted_on_abort_all() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let clear_stream = stream::empty();
-        let take_stream = stream::empty();
-
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = CqrsFrameworks {
-            dual_write_context: DualWriteContext::new(pool.clone()),
-            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-        };
-
-        let rebalancer_handle = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            }
-        });
-
-        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .with_rebalancer(rebalancer_handle)
-            .spawn();
-
-        let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
-        assert!(!rebalancer_ref.is_finished());
-
-        abort_all_conductor_tasks(conductor);
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    #[tokio::test]
-    async fn test_conductor_rebalancer_aborted_on_abort_trading_tasks() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let clear_stream = stream::empty();
-        let take_stream = stream::empty();
-
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let frameworks = CqrsFrameworks {
-            dual_write_context: DualWriteContext::new(pool.clone()),
-            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
-        };
-
-        let rebalancer_handle = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            }
-        });
-
-        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .with_rebalancer(rebalancer_handle)
-            .spawn();
-
-        assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
-
-        conductor.abort_trading_tasks();
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
-
-        abort_all_conductor_tasks(conductor);
-    }
-
-    #[test]
-    fn test_to_executor_ticker_splg_maps_to_spym() {
-        let splg = Symbol::new("SPLG").unwrap();
-        assert_eq!(to_executor_ticker(&splg).unwrap().to_string(), "SPYM");
-    }
-
-    #[test]
-    fn test_to_executor_ticker_other_symbols_unchanged() {
-        for ticker in ["AAPL", "NVDA", "MSTR", "IAU", "COIN"] {
-            let symbol = Symbol::new(ticker).unwrap();
-            assert_eq!(to_executor_ticker(&symbol).unwrap().to_string(), ticker);
-        }
-    }
-
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn test_logs_info_when_event_is_filtered_out() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let feed_id_cache = FeedIdCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
-
-        let clear_event = ClearV3 {
-            sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-        let log = crate::test_utils::get_test_log();
-
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
-
-        let queue_context = QueueProcessingCtx {
-            cache: &cache,
-            feed_id_cache: &feed_id_cache,
-            vault_registry_cqrs: &vault_registry_cqrs,
-        };
-
-        let result = process_next_queued_event(
-            SupportedExecutor::DryRun,
-            &ctx,
-            &pool,
-            &provider,
-            &dual_write_context,
-            &queue_context,
-        )
-        .await;
-
-        result.unwrap();
-        assert!(
-            logs_contain("Event filtered out"),
-            "Expected info log when event is filtered"
-        );
-    }
-
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn test_logs_event_type_when_processing() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let cache = SymbolCache::default();
-        let feed_id_cache = FeedIdCache::default();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
-
-        let clear_event = ClearV3 {
-            sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-        let log = crate::test_utils::get_test_log();
-
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
-
-        let queue_context = QueueProcessingCtx {
-            cache: &cache,
-            feed_id_cache: &feed_id_cache,
-            vault_registry_cqrs: &vault_registry_cqrs,
-        };
-
-        process_next_queued_event(
-            SupportedExecutor::DryRun,
-            &ctx,
-            &pool,
-            &provider,
-            &dual_write_context,
-            &queue_context,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            logs_contain("ClearV3"),
-            "Expected log to mention event type"
-        );
-    }
-
-    /// Helper to set up accumulated position state for testing check_and_execute_accumulated_positions.
-    /// Returns the symbol string for use in assertions.
-    async fn setup_accumulated_position_state(
-        pool: &SqlitePool,
-        dual_write_context: &DualWriteContext,
-        symbol: &Symbol,
-    ) -> String {
-        crate::dual_write::initialize_position(
-            dual_write_context,
-            symbol,
-            ExecutionThreshold::whole_share(),
-        )
-        .await
-        .unwrap();
-
-        let mut trade = OnchainTradeBuilder::new()
-            .with_symbol("RKLB0x")
-            .with_amount(1.2)
-            .with_price(15.0)
-            .build();
-        trade.direction = Direction::Sell;
-        trade.block_timestamp = Some(chrono::Utc::now());
-
-        crate::dual_write::acknowledge_onchain_fill(dual_write_context, &trade)
-            .await
-            .unwrap();
-
-        let tx_hash_str = trade.tx_hash.to_string();
-        let log_index_i64 = i64::try_from(trade.log_index).unwrap();
-        let now = chrono::Utc::now();
-
-        sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, \
-             price_usdc, block_timestamp, created_at) VALUES (?, ?, 'RKLB0x', 1.2, 'SELL', 15.0, ?, ?)",
-            tx_hash_str,
-            log_index_i64,
-            now,
-            now
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        let symbol_str = symbol.to_string();
-        sqlx::query!(
-            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short, \
-             pending_execution_id, last_updated) VALUES (?, 0.0, 1.2, NULL, ?)",
-            symbol_str,
-            now
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        symbol_str
-    }
-
-    /// Regression test for #250: check_and_execute_accumulated_positions must emit Placed event
-    /// before spawning execution tasks, otherwise ConfirmSubmission fails on uninitialized aggregate.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn test_accumulated_position_execution_emits_placed_event_before_submission() {
-        let pool = setup_test_db().await;
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let symbol = Symbol::new("RKLB").unwrap();
-
-        let symbol_str =
-            setup_accumulated_position_state(&pool, &dual_write_context, &symbol).await;
-
-        check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context)
-            .await
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let execution_id = sqlx::query!(
-            "SELECT id FROM offchain_trades WHERE symbol = ?",
-            symbol_str
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .id
-        .expect("execution_id should exist");
-
-        let aggregate_id = execution_id.to_string();
-        let events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' \
-             AND aggregate_id = ? ORDER BY sequence",
-            aggregate_id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            events.len(),
-            2,
-            "Expected 2 events (Placed, Submitted), got {events:?}"
-        );
-        assert_eq!(
-            events[0], "OffchainOrderEvent::Placed",
-            "First event should be Placed"
-        );
-        assert_eq!(
-            events[1], "OffchainOrderEvent::Submitted",
-            "Second event should be Submitted"
-        );
-
-        assert!(
-            !logs_contain("operation on uninitialized state"),
-            "Bug: ConfirmSubmission attempted before Placed event"
-        );
-
-        let status: String = sqlx::query_scalar!(
-            "SELECT status FROM offchain_trades WHERE id = ?",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            status, "SUBMITTED",
-            "Legacy table should show SUBMITTED status"
-        );
-    }
-
-    use crate::bindings::IOrderBookV5::TakeOrderConfigV4;
-    use crate::onchain::USDC_BASE;
-    use crate::queue::QueuedEvent;
-
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
     const ORDER_OWNER: Address = address!("0xdddddddddddddddddddddddddddddddddddddddd");
     const OTHER_OWNER: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
@@ -3451,18 +2460,27 @@ mod tests {
     }
 
     fn create_test_trade(symbol: &str) -> OnchainTrade {
-        let tokenized_symbol = format!("{symbol}0x");
+        let tokenized_symbol = format!("t{symbol}");
         OnchainTradeBuilder::default()
             .with_symbol(&tokenized_symbol)
             .with_equity_token(TEST_EQUITY_TOKEN)
             .build()
     }
 
+    fn test_trade_with_amount(amount: Decimal, log_index: u64) -> OnchainTrade {
+        OnchainTradeBuilder::default()
+            .with_symbol("tAAPL")
+            .with_equity_token(TEST_EQUITY_TOKEN)
+            .with_amount(amount)
+            .with_log_index(log_index)
+            .build()
+    }
+
     fn create_vault_discovery_context(
-        vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
+        vault_registry: &Store<VaultRegistry>,
     ) -> VaultDiscoveryCtx<'_> {
         VaultDiscoveryCtx {
-            vault_registry_cqrs,
+            vault_registry,
             orderbook: TEST_ORDERBOOK,
             order_owner: ORDER_OWNER,
         }
@@ -3471,15 +2489,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -3489,7 +2506,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::UsdcVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::UsdcVaultDiscovered"),
             "Expected UsdcVaultDiscovered event, got: {events:?}"
         );
     }
@@ -3497,15 +2514,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_equity_vault() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -3515,7 +2531,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::EquityVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::EquityVaultDiscovered"),
             "Expected EquityVaultDiscovered event, got: {events:?}"
         );
     }
@@ -3523,14 +2539,13 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_from_take_event() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
 
         let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let queued_event = create_queued_take_event(order);
         let trade = create_test_trade("MSFT");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -3540,13 +2555,13 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::UsdcVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::UsdcVaultDiscovered"),
             "Expected UsdcVaultDiscovered event from take order"
         );
         assert!(
             events
                 .iter()
-                .any(|e| e == "VaultRegistryEvent::EquityVaultDiscovered"),
+                .any(|event_name| event_name == "VaultRegistryEvent::EquityVaultDiscovered"),
             "Expected EquityVaultDiscovered event from take order"
         );
     }
@@ -3554,15 +2569,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed even when no vaults match");
@@ -3578,21 +2592,23 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed");
 
-        let expected_aggregate_id =
-            crate::vault_registry::VaultRegistry::aggregate_id(TEST_ORDERBOOK, ORDER_OWNER);
+        let expected_aggregate_id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: ORDER_OWNER,
+        }
+        .to_string();
 
         let aggregate_ids: Vec<String> = sqlx::query_scalar!(
             "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'"
@@ -3611,15 +2627,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("GOOG");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed");
@@ -3641,5 +2656,1109 @@ mod tests {
             "Equity vault should use the trade's symbol (GOOG), got payload: {}",
             equity_event.1
         );
+    }
+
+    fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
+        struct TestOrderPlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for TestOrderPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+            }
+        }
+
+        Arc::new(TestOrderPlacer)
+    }
+
+    async fn create_cqrs_frameworks_with_order_placer(
+        pool: &SqlitePool,
+        order_placer: Arc<dyn OrderPlacer>,
+    ) -> (CqrsFrameworks, Arc<Projection<OffchainOrder>>) {
+        let onchain_trade = Arc::new(st0x_event_sorcery::test_store(pool.clone(), ()));
+
+        let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+        let position = Arc::new(
+            StoreBuilder::<Position>::new(pool.clone())
+                .with(position_projection.clone())
+                .build(())
+                .await
+                .unwrap(),
+        );
+
+        let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
+        let offchain_order = Arc::new(
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .with(offchain_order_projection.clone())
+                .build(order_placer)
+                .await
+                .unwrap(),
+        );
+
+        let vault_registry = st0x_event_sorcery::test_store(pool.clone(), ());
+        let snapshot = st0x_event_sorcery::test_store(pool.clone(), ());
+
+        let offchain_order_projection = Arc::new(offchain_order_projection);
+
+        (
+            CqrsFrameworks {
+                onchain_trade,
+                position,
+                position_projection: Arc::new(position_projection),
+                offchain_order,
+                offchain_order_projection: offchain_order_projection.clone(),
+                vault_registry,
+                snapshot,
+            },
+            offchain_order_projection,
+        )
+    }
+
+    fn trade_processing_cqrs_with_threshold(
+        frameworks: &CqrsFrameworks,
+        threshold: ExecutionThreshold,
+    ) -> TradeProcessingCqrs {
+        TradeProcessingCqrs {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+            execution_threshold: threshold,
+        }
+    }
+
+    /// Enqueues a ClearV3 event into the event_queue and returns the
+    /// queued event with its database-assigned ID.
+    async fn enqueue_and_fetch(pool: &SqlitePool, log_index: u64) -> (QueuedEvent, i64) {
+        let event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let mut log = get_test_log();
+        log.log_index = Some(log_index);
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[31] = u8::try_from(log_index).unwrap_or(0);
+        log.transaction_hash = Some(B256::from(hash_bytes));
+
+        crate::queue::enqueue(pool, &event, &log).await.unwrap();
+
+        let queued = crate::queue::get_next_unprocessed_event(pool)
+            .await
+            .unwrap()
+            .expect("should have unprocessed event");
+
+        let event_id = queued.id.expect("queued event should have id");
+        (queued, event_id)
+    }
+
+    #[tokio::test]
+    async fn trade_below_threshold_does_not_place_order() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 10).await;
+        let trade = test_trade_with_amount(dec!(0.5), 10);
+
+        let result = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "0.5 shares should not trigger execution with 1-share threshold"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(
+            position.net.inner(),
+            dec!(0.5),
+            "Position net should reflect the accumulated trade"
+        );
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "No offchain order should be pending"
+        );
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "Event should be marked as processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn trade_above_threshold_places_offchain_order() {
+        let pool = setup_test_db().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 20).await;
+        let trade = test_trade_with_amount(dec!(1.5), 20);
+
+        let result = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+        )
+        .await;
+
+        let offchain_order_id = result
+            .unwrap()
+            .expect("1.5 shares should trigger execution with 1-share threshold");
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(position.net.inner(), dec!(1.5));
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "Position should track the pending offchain order"
+        );
+
+        let offchain_order = offchain_order_projection
+            .load(&offchain_order_id)
+            .await
+            .expect("offchain order should not be in failed lifecycle state")
+            .expect("offchain order view should exist");
+
+        assert!(
+            matches!(offchain_order, OffchainOrder::Submitted { .. }),
+            "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_trades_accumulate_then_trigger() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 30).await;
+        let trade_1 = test_trade_with_amount(dec!(0.5), 30);
+
+        let result_1 = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_1,
+            event_id_1,
+            trade_1,
+            &cqrs,
+        )
+        .await;
+
+        assert_eq!(
+            result_1.unwrap(),
+            None,
+            "First trade of 0.5 shares should not trigger"
+        );
+
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 31).await;
+        let trade_2 = test_trade_with_amount(dec!(0.7), 31);
+
+        let result_2 = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_2,
+            event_id_2,
+            trade_2,
+            &cqrs,
+        )
+        .await;
+
+        assert!(
+            result_2.unwrap().is_some(),
+            "Accumulated 1.2 shares should trigger execution with 1-share threshold"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(position.net.inner(), dec!(1.2));
+        assert!(position.pending_offchain_order_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_order_blocks_new_execution() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 40).await;
+        let trade_1 = test_trade_with_amount(dec!(1.5), 40);
+
+        let first_order_id = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_1,
+            event_id_1,
+            trade_1,
+            &cqrs,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
+
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 41).await;
+        let trade_2 = test_trade_with_amount(dec!(1.5), 41);
+
+        let result_2 = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_2,
+            event_id_2,
+            trade_2,
+            &cqrs,
+        )
+        .await;
+
+        assert_eq!(
+            result_2.unwrap(),
+            None,
+            "Second trade should not trigger execution while first order is pending"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(
+            position.net.inner(),
+            dec!(3.0),
+            "Both fills should be accumulated"
+        );
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(first_order_id),
+            "Only the first order should be pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_executes_after_order_completion() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        // Process first trade -> places order
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 50).await;
+        let trade_1 = test_trade_with_amount(dec!(1.5), 50);
+
+        let first_order_id = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_1,
+            event_id_1,
+            trade_1,
+            &cqrs,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
+
+        // Process second trade -> blocked by pending order
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 51).await;
+        let trade_2 = test_trade_with_amount(dec!(1.5), 51);
+
+        process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_2,
+            event_id_2,
+            trade_2,
+            &cqrs,
+        )
+        .await
+        .unwrap();
+
+        // Complete the first order via CQRS
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        cqrs.position
+            .send(
+                &symbol,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: first_order_id,
+                    shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+                    direction: st0x_execution::Direction::Sell,
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    price_cents: crate::offchain_order::PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify position is unblocked
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Order should be cleared after completion"
+        );
+
+        // Run the periodic checker - it should find the remaining net and place a new order
+        let executor = st0x_execution::MockExecutor::new();
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            &cqrs.position,
+            &cqrs.position_projection,
+            &cqrs.offchain_order,
+            &cqrs.execution_threshold,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_some(),
+            "Periodic checker should have placed a new order for remaining net position"
+        );
+        assert_ne!(
+            position.pending_offchain_order_id.unwrap(),
+            first_order_id,
+            "New order should have a different ID than the completed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_processes_unprocessed_queue_items() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        // Enqueue an event (simulating events persisted before a crash)
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 60).await;
+        let trade = test_trade_with_amount(dec!(2.0), 60);
+
+        // Simulate restart: process the unprocessed event
+        let result = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+        )
+        .await;
+
+        assert!(
+            result.unwrap().is_some(),
+            "Recovered event should trigger execution"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(position.net.inner(), dec!(2.0));
+        assert!(position.pending_offchain_order_id.is_some());
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "All events should be marked as processed after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_event_queue_prevents_double_processing() {
+        let pool = setup_test_db().await;
+
+        let event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let log = get_test_log();
+
+        // Enqueue same event twice (same tx_hash + log_index -> INSERT OR IGNORE)
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            1,
+            "Duplicate enqueue should result in only 1 row"
+        );
+
+        // Process and mark as processed
+        let queued = crate::queue::get_next_unprocessed_event(&pool)
+            .await
+            .unwrap()
+            .expect("should have one event");
+
+        crate::queue::mark_event_processed(&pool, queued.id.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "No unprocessed events should remain"
+        );
+
+        // Re-enqueue same event after processing
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "Re-enqueue of already processed event should be ignored"
+        );
+    }
+
+    /// Builds an `InventoryView` with an equity imbalance: 20% onchain, 80% offchain.
+    /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
+    fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
+        InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(
+                symbol,
+                &PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(20)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    seen_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap()
+            .apply_position_event(
+                symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(80))).unwrap(),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("ORD1"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn position_events_reach_rebalancing_trigger() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+        let test_token = address!("0x1234567890123456789012345678901234567890");
+
+        // Seed vault registry so the trigger can resolve the token address.
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
+        vault_registry
+            .send(
+                &VaultRegistryId {
+                    orderbook,
+                    owner: order_owner,
+                },
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: test_token,
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    discovered_in: TxHash::ZERO,
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(imbalanced_inventory(&symbol)));
+        let (operation_sender, mut operation_receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            inventory,
+            operation_sender,
+        ));
+
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+        let position_store = Arc::new(
+            StoreBuilder::<Position>::new(pool.clone())
+                .with(projection.clone())
+                .with(Arc::clone(&trigger))
+                .build(())
+                .await
+                .unwrap(),
+        );
+
+        // Acknowledge a fill -> fires position events -> trigger should react.
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 99,
+                    },
+                    amount: FractionalShares::new(dec!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let triggered = operation_receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
+            "Expected Mint operation from trigger on position event, got {triggered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_updated_after_fill_via_cqrs() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+
+        // Seed inventory with 50 offchain shares. CQRS will add 50 onchain.
+        let initial_inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("SEED"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: threshold,
+                usdc_threshold: threshold,
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            Arc::clone(&inventory),
+            operation_sender,
+        ));
+
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+        let position_store = Arc::new(
+            StoreBuilder::<Position>::new(pool.clone())
+                .with(projection.clone())
+                .with(Arc::clone(&trigger))
+                .build(())
+                .await
+                .unwrap(),
+        );
+
+        // Add 50 onchain shares via CQRS -> trigger applies to inventory.
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(50)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 50 onchain / 50 offchain = 50% ratio, within 30%-70% bounds -> balanced.
+        assert!(
+            inventory
+                .read()
+                .await
+                .check_equity_imbalance(&symbol, &threshold)
+                .is_none(),
+            "50/50 inventory should be balanced (no imbalance detected)"
+        );
+    }
+
+    #[tokio::test]
+    async fn balanced_position_event_does_not_trigger_rebalancing() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+
+        // Start balanced: 50 onchain, 50 offchain.
+        let mut initial_inventory = InventoryView::default().with_equity(symbol.clone());
+        initial_inventory = initial_inventory
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(50)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    seen_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        initial_inventory = initial_inventory
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("ORD1"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (operation_sender, mut receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            inventory,
+            operation_sender,
+        ));
+
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+        let position_store = Arc::new(
+            StoreBuilder::new(pool.clone())
+                .with(projection.clone())
+                .with(trigger.clone())
+                .build(())
+                .await
+                .unwrap(),
+        );
+
+        // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 99,
+                    },
+                    amount: FractionalShares::new(dec!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "Balanced position event should not trigger rebalancing"
+        );
+    }
+
+    /// Sets up an initialized position with 65% onchain / 35% offchain inventory
+    /// (within the 30%-70% threshold bounds), a seeded vault registry, and the
+    /// trigger wired into the position store via `build_position_cqrs`.
+    async fn setup_near_upper_threshold_position() -> (
+        Arc<Store<Position>>,
+        mpsc::Receiver<TriggeredOperation>,
+        Symbol,
+    ) {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+        let test_token = address!("0x1234567890123456789012345678901234567890");
+
+        let vault_registry: Store<VaultRegistry> = st0x_event_sorcery::test_store(pool.clone(), ());
+        vault_registry
+            .send(
+                &VaultRegistryId {
+                    orderbook,
+                    owner: order_owner,
+                },
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: test_token,
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    discovered_in: TxHash::ZERO,
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 65 onchain, 35 offchain = 65% < 70% upper bound -> within bounds.
+        let initial_inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(65)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    seen_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap()
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(35))).unwrap(),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("ORD1"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (operation_sender, receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            inventory,
+            operation_sender,
+        ));
+
+        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+        let position_store = Arc::new(
+            StoreBuilder::new(pool.clone())
+                .with(projection.clone())
+                .with(trigger)
+                .build(())
+                .await
+                .unwrap(),
+        );
+
+        (position_store, receiver, symbol)
+    }
+
+    #[tokio::test]
+    async fn position_event_causing_imbalance_triggers_redemption() {
+        let (position_store, mut receiver, symbol) = setup_near_upper_threshold_position().await;
+        let test_token = address!("0x1234567890123456789012345678901234567890");
+
+        // No position commands yet -> no triggers fired.
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "No commands executed yet, channel should be empty"
+        );
+
+        // +20 onchain: 85 onchain, 35 offchain, total=120, target=60, excess=25.
+        // 85/120 = 70.8% > 70% upper bound -> triggers Redemption.
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 99,
+                    },
+                    amount: FractionalShares::new(dec!(20)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let triggered = receiver.try_recv().unwrap();
+        assert_eq!(
+            triggered,
+            TriggeredOperation::Redemption {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(dec!(25)),
+                token: test_token,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_guard_blocks_duplicate_trigger() {
+        let (position_store, mut receiver, symbol) = setup_near_upper_threshold_position().await;
+        let test_token = address!("0x1234567890123456789012345678901234567890");
+
+        // First fill pushes over: 85/120 = 70.8% > 70% -> triggers Redemption(25).
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(dec!(20)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(
+            first,
+            TriggeredOperation::Redemption {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(dec!(25)),
+                token: test_token,
+            }
+        );
+
+        // Second fill while in-progress NOT cleared -> no second trigger.
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 2,
+                    },
+                    amount: FractionalShares::new(dec!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "In-progress guard should block duplicate trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_hydrates_position_view_from_persisted_events() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // First "session": create position store, execute commands.
+        {
+            let (position_store, position_projection) = build_position_cqrs(&pool).await.unwrap();
+
+            position_store
+                .send(
+                    &symbol,
+                    PositionCommand::AcknowledgeOnChainFill {
+                        symbol: symbol.clone(),
+                        threshold: ExecutionThreshold::whole_share(),
+                        trade_id: TradeId {
+                            tx_hash: TxHash::random(),
+                            log_index: 0,
+                        },
+                        amount: FractionalShares::new(dec!(10)),
+                        direction: Direction::Buy,
+                        price_usdc: dec!(150.0),
+                        block_timestamp: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let position = position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("position should exist after first session");
+
+            assert_eq!(position.net, FractionalShares::new(dec!(10)));
+            assert_eq!(position.accumulated_long, FractionalShares::new(dec!(10)));
+        }
+        // position_store dropped here, simulating shutdown.
+
+        // Second "session": create NEW position store against the same pool.
+        {
+            let (_position_store, position_projection) = build_position_cqrs(&pool).await.unwrap();
+
+            let position = position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("position should exist after restart");
+
+            assert_eq!(
+                position.net,
+                FractionalShares::new(dec!(10)),
+                "Net position should survive restart via persisted view"
+            );
+            assert_eq!(
+                position.accumulated_long,
+                FractionalShares::new(dec!(10)),
+                "Accumulated long should survive restart via persisted view"
+            );
+        }
     }
 }

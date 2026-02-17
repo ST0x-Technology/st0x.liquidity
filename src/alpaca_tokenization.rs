@@ -32,7 +32,7 @@ use rain_error_decoding::AbiDecodedErrorType;
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::Symbol;
+use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, warn};
@@ -41,7 +41,6 @@ use crate::alpaca_wallet::{AlpacaAccountId, Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
 use crate::onchain::io::TokenizedEquitySymbol;
-use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
@@ -230,7 +229,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|s| s.parse().map_err(serde::de::Error::custom))
+    opt.map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -243,8 +242,8 @@ where
 
     match opt {
         None => Ok(None),
-        Some(s) if s.is_empty() => Ok(None),
-        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -522,7 +521,7 @@ where
 
         requests
             .into_iter()
-            .find(|r| r.id == *id)
+            .find(|request| request.id == *id)
             .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
     }
 
@@ -546,7 +545,7 @@ where
 
         let pending = match erc20.transfer(self.redemption_wallet, amount).send().await {
             Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
+            Err(error) => return Err(handle_contract_error(error).await),
         };
 
         let receipt = pending.get_receipt().await?;
@@ -577,7 +576,7 @@ where
 
         Ok(requests
             .into_iter()
-            .find(|r| r.tx_hash.as_ref() == Some(tx_hash)))
+            .find(|request| request.tx_hash.as_ref() == Some(tx_hash)))
     }
 
     /// Poll until a tokenization request reaches a terminal state (Completed or Rejected).
@@ -1061,13 +1060,10 @@ pub(crate) mod tests {
 
         let transfer_amount = U256::from(100_000u64);
 
-        assert!(
-            client
-                .send_tokens_for_redemption(token_address, transfer_amount)
-                .await
-                .is_ok(),
-            "expected successful transfer"
-        );
+        client
+            .send_tokens_for_redemption(token_address, transfer_amount)
+            .await
+            .unwrap();
 
         let balance = token
             .balanceOf(TEST_REDEMPTION_WALLET)

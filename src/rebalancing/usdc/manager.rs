@@ -7,42 +7,40 @@
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
-use cqrs_es::{CqrsFramework, EventStore};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
+use st0x_bridge::cctp::{AttestationResponse, CctpBridge};
+use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
+use st0x_event_sorcery::Store;
+use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
+
 use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
-use st0x_bridge::cctp::{AttestationResponse, CctpBridge};
-use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
-use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
 
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
 /// # Type Parameters
 ///
 /// * `BP` - Base provider type
-/// * `ES` - Event store type for the USDC rebalance aggregate
-pub(crate) struct UsdcRebalanceManager<BP, ES>
+pub(crate) struct UsdcRebalanceManager<BP>
 where
     BP: Provider + Clone,
-    ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
     vault: Arc<VaultService<BP>>,
-    cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
+    cqrs: Arc<Store<UsdcRebalance>>,
     /// Market maker's (our) wallet address
     /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
     market_maker_wallet: Address,
@@ -69,17 +67,16 @@ type EthereumHttpProvider = FillProvider<
     Ethereum,
 >;
 
-impl<BP, ES> UsdcRebalanceManager<BP, ES>
+impl<BP> UsdcRebalanceManager<BP>
 where
     BP: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
     pub(crate) fn new(
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
         vault: Arc<VaultService<BP>>,
-        cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
+        cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
         vault_id: VaultId,
     ) -> Self {
@@ -123,8 +120,8 @@ where
 
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
@@ -142,8 +139,8 @@ where
             Err(e) => {
                 warn!("USD to USDC conversion failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailConversion {
                             reason: e.to_string(),
                         },
@@ -159,8 +156,8 @@ where
         let filled_amount = Usdc(filled_qty);
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::ConfirmConversion { filled_amount },
             )
             .await?;
@@ -204,8 +201,8 @@ where
 
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: correlation_id,
                     amount,
@@ -222,8 +219,8 @@ where
             Err(e) => {
                 warn!("USDC to USD conversion failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailConversion {
                             reason: e.to_string(),
                         },
@@ -239,8 +236,8 @@ where
         let filled_usdc = Usdc(filled_amount);
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::ConfirmConversion {
                     filled_amount: filled_usdc,
                 },
@@ -322,8 +319,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
@@ -351,8 +348,8 @@ where
             Err(e) => {
                 warn!("Alpaca withdrawal polling failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailWithdrawal {
                             reason: format!("Polling failed: {e}"),
                         },
@@ -365,8 +362,8 @@ where
         if transfer.status != TransferStatus::Complete {
             let status = format!("{:?}", transfer.status);
             self.cqrs
-                .execute(
-                    &id.0,
+                .send(
+                    id,
                     UsdcRebalanceCommand::FailWithdrawal {
                         reason: format!("Transfer ended in status: {status}"),
                     },
@@ -376,7 +373,7 @@ where
         }
 
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await?;
 
         info!("Alpaca withdrawal confirmed");
@@ -402,8 +399,8 @@ where
             Err(e) => {
                 warn!("CCTP burn failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailBridging {
                             reason: format!("Burn failed: {e}"),
                         },
@@ -414,8 +411,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
                 },
@@ -432,19 +429,17 @@ where
         id: &UsdcRebalanceId,
         burn_receipt: &BurnReceipt,
     ) -> Result<AttestationResponse, UsdcRebalanceManagerError> {
-        let response = match Bridge::poll_attestation(
-            self.cctp_bridge.as_ref(),
-            BridgeDirection::EthereumToBase,
-            burn_receipt.tx,
-        )
-        .await
+        let response = match self
+            .cctp_bridge
+            .poll_attestation(BridgeDirection::EthereumToBase, burn_receipt.tx)
+            .await
         {
             Ok(r) => r,
             Err(e) => {
                 warn!("Attestation polling failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailBridging {
                             reason: format!("Attestation polling failed: {e}"),
                         },
@@ -455,8 +450,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.as_bytes().to_vec(),
                     cctp_nonce: response.nonce(),
@@ -474,19 +469,17 @@ where
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
     ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
-        let mint_receipt = match Bridge::mint(
-            self.cctp_bridge.as_ref(),
-            BridgeDirection::EthereumToBase,
-            &attestation_response,
-        )
-        .await
+        let mint_receipt = match self
+            .cctp_bridge
+            .mint(BridgeDirection::EthereumToBase, &attestation_response)
+            .await
         {
             Ok(receipt) => receipt,
             Err(e) => {
                 warn!("CCTP mint failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailBridging {
                             reason: format!("Mint failed: {e}"),
                         },
@@ -497,8 +490,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
                     amount_received: u256_to_usdc(mint_receipt.amount)?,
@@ -527,8 +520,8 @@ where
             Err(e) => {
                 warn!("Vault deposit failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailDeposit {
                             reason: format!("Vault deposit failed: {e}"),
                         },
@@ -539,8 +532,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(deposit_tx),
                 },
@@ -554,7 +547,7 @@ where
     #[instrument(skip(self), fields(?id))]
     async fn confirm_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcRebalanceManagerError> {
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(id, UsdcRebalanceCommand::ConfirmDeposit)
             .await?;
 
         info!("Vault deposit confirmed");
@@ -625,8 +618,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
@@ -637,7 +630,7 @@ where
 
         // Vault withdrawal function already waits for block inclusion, so confirming immediately
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await?;
 
         info!(%withdraw_tx, "Vault withdrawal completed");
@@ -663,8 +656,8 @@ where
             Err(e) => {
                 warn!("CCTP burn on Base failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailBridging {
                             reason: format!("Burn on Base failed: {e}"),
                         },
@@ -675,8 +668,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
                 },
@@ -693,19 +686,17 @@ where
         id: &UsdcRebalanceId,
         burn_receipt: &BurnReceipt,
     ) -> Result<AttestationResponse, UsdcRebalanceManagerError> {
-        let response = match Bridge::poll_attestation(
-            self.cctp_bridge.as_ref(),
-            BridgeDirection::BaseToEthereum,
-            burn_receipt.tx,
-        )
-        .await
+        let response = match self
+            .cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await
         {
             Ok(r) => r,
             Err(e) => {
                 warn!("Attestation polling failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailBridging {
                             reason: format!("Attestation polling failed: {e}"),
                         },
@@ -716,8 +707,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.as_bytes().to_vec(),
                     cctp_nonce: response.nonce(),
@@ -735,19 +726,17 @@ where
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
     ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
-        let mint_receipt = match Bridge::mint(
-            self.cctp_bridge.as_ref(),
-            BridgeDirection::BaseToEthereum,
-            &attestation_response,
-        )
-        .await
+        let mint_receipt = match self
+            .cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &attestation_response)
+            .await
         {
             Ok(receipt) => receipt,
             Err(e) => {
                 warn!("CCTP mint on Ethereum failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailBridging {
                             reason: format!("Mint on Ethereum failed: {e}"),
                         },
@@ -758,8 +747,8 @@ where
         };
 
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
                     amount_received: u256_to_usdc(mint_receipt.amount)?,
@@ -785,8 +774,8 @@ where
     ) -> Result<(), UsdcRebalanceManagerError> {
         // Record the deposit initiation with the mint tx
         self.cqrs
-            .execute(
-                &id.0,
+            .send(
+                id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(mint_tx),
                 },
@@ -800,8 +789,8 @@ where
             Err(e) => {
                 warn!("Alpaca deposit polling failed: {e}");
                 self.cqrs
-                    .execute(
-                        &id.0,
+                    .send(
+                        id,
                         UsdcRebalanceCommand::FailDeposit {
                             reason: format!("Deposit polling failed: {e}"),
                         },
@@ -814,8 +803,8 @@ where
         if transfer.status != TransferStatus::Complete {
             let status = format!("{:?}", transfer.status);
             self.cqrs
-                .execute(
-                    &id.0,
+                .send(
+                    id,
                     UsdcRebalanceCommand::FailDeposit {
                         reason: format!("Deposit ended in status: {status}"),
                     },
@@ -825,7 +814,7 @@ where
         }
 
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(id, UsdcRebalanceCommand::ConfirmDeposit)
             .await?;
 
         info!("Alpaca deposit confirmed");
@@ -841,22 +830,14 @@ where
 /// or values exceeding U256::MAX).
 fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
     if usdc.0.is_sign_negative() {
-        return Err(UsdcRebalanceManagerError::InvalidAmount(format!(
-            "USDC amount cannot be negative: {}",
-            usdc.0
-        )));
+        return Err(UsdcRebalanceManagerError::NegativeAmount { amount: usdc });
     }
 
     // USDC has 6 decimals
     let scaled = usdc
         .0
         .checked_mul(Decimal::from(1_000_000u64))
-        .ok_or_else(|| {
-            UsdcRebalanceManagerError::ArithmeticOverflow(format!(
-                "USDC amount overflow during scaling: {}",
-                usdc.0
-            ))
-        })?;
+        .ok_or_else(|| UsdcRebalanceManagerError::ArithmeticOverflow { amount: usdc })?;
 
     let integer = scaled.trunc().to_string();
 
@@ -871,11 +852,9 @@ fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcRebalanceManagerError> {
 }
 
 #[async_trait]
-impl<BP, ES> UsdcRebalanceTrait for UsdcRebalanceManager<BP, ES>
+impl<BP> UsdcRebalanceTrait for UsdcRebalanceManager<BP>
 where
     BP: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<UsdcRebalance, Never>> + Send + Sync,
-    ES::AC: Send,
 {
     async fn execute_alpaca_to_base(
         &self,
@@ -904,24 +883,28 @@ mod tests {
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::mem_store::MemStore;
-    use cqrs_es::{AggregateError, CqrsFramework};
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use sqlx::SqlitePool;
 
     use uuid::{Uuid, uuid};
 
-    use st0x_execution::alpaca_broker_api::{CryptoOrderFailureReason, TimeInForce};
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor};
+    use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
+    use st0x_execution::{
+        AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor, TimeInForce,
+    };
+
+    use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
+
+    use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
-    use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
@@ -941,18 +924,17 @@ mod tests {
         Ethereum,
     >;
 
-    type TestCqrs =
-        CqrsFramework<Lifecycle<UsdcRebalance, Never>, MemStore<Lifecycle<UsdcRebalance, Never>>>;
+    async fn create_test_store_instance() -> Arc<Store<UsdcRebalance>> {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
 
-    fn create_test_cqrs() -> Arc<TestCqrs> {
-        let store = MemStore::default();
-        Arc::new(CqrsFramework::new(store, vec![], ()))
+        Arc::new(test_store(pool, ()))
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal -> InitiateBridging ->
     /// ReceiveAttestation -> ConfirmBridging -> InitiateDeposit -> ConfirmDeposit
     async fn advance_to_deposit_confirmed_base_to_alpaca(
-        cqrs: &TestCqrs,
+        cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
@@ -961,8 +943,8 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0xbbbb111111111111111111111111111111111111111111111111111111111111");
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            id,
             UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
@@ -972,16 +954,16 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
+        cqrs.send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+        cqrs.send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
             .await
             .unwrap();
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: 99999,
@@ -990,8 +972,8 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            id,
             UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
                 amount_received: Usdc(dec!(99.99)),
@@ -1001,8 +983,8 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            id,
             UsdcRebalanceCommand::InitiateDeposit {
                 deposit: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
             },
@@ -1010,7 +992,7 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
+        cqrs.send(id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
     }
@@ -1047,7 +1029,7 @@ mod tests {
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
+            time_in_force: TimeInForce::default(),
         };
 
         AlpacaBrokerApi::try_from_ctx(auth)
@@ -1135,7 +1117,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1190,7 +1172,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1252,7 +1234,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1308,12 +1290,10 @@ mod tests {
     #[test]
     fn test_usdc_to_u256_negative_amount() {
         let amount = Usdc(dec!(-100));
+        let error = usdc_to_u256(amount).unwrap_err();
         assert!(
-            matches!(
-                usdc_to_u256(amount),
-                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-100")
-            ),
-            "Expected InvalidAmount error mentioning -100"
+            matches!(error, UsdcRebalanceManagerError::NegativeAmount { amount } if amount == Usdc(dec!(-100))),
+            "Expected NegativeAmount error, got: {error:?}"
         );
     }
 
@@ -1338,7 +1318,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1355,12 +1335,13 @@ mod tests {
         let id = UsdcRebalanceId::new("rebalance-base-001");
         let amount = Usdc(dec!(-500));
 
+        let error = manager
+            .execute_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
         assert!(
-            matches!(
-                manager.execute_base_to_alpaca(&id, amount).await,
-                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-500")
-            ),
-            "Expected InvalidAmount error mentioning -500"
+            matches!(error, UsdcRebalanceManagerError::NegativeAmount { amount } if amount == Usdc(dec!(-500))),
+            "Expected NegativeAmount error, got: {error:?}"
         );
     }
 
@@ -1373,7 +1354,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1394,7 +1375,9 @@ mod tests {
             matches!(
                 manager.execute_base_to_alpaca(&id, amount).await,
                 Err(UsdcRebalanceManagerError::Aggregate(
-                    AggregateError::UserError(UsdcRebalanceError::BridgingNotInitiated)
+                    AggregateError::UserError(LifecycleError::Apply(
+                        UsdcRebalanceError::BridgingNotInitiated
+                    ))
                 ))
             ),
             "Expected Aggregate(UserError(BridgingNotInitiated)) error"
@@ -1475,7 +1458,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1520,7 +1503,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1552,7 +1535,9 @@ mod tests {
             matches!(
                 manager.execute_usdc_to_usd_conversion(&id, amount).await,
                 Err(UsdcRebalanceManagerError::Aggregate(
-                    AggregateError::UserError(UsdcRebalanceError::DepositNotConfirmed)
+                    AggregateError::UserError(LifecycleError::Apply(
+                        UsdcRebalanceError::DepositNotConfirmed
+                    ))
                 ))
             ),
             "Expected DepositNotConfirmed error when aggregate not in correct state"
@@ -1569,7 +1554,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1613,7 +1598,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1665,8 +1650,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let store = MemStore::default();
-        let cqrs = Arc::new(CqrsFramework::new(store, vec![], ()));
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1679,8 +1663,8 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            &id,
             UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
@@ -1690,16 +1674,16 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+        cqrs.send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
             .await
             .unwrap();
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            &id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: 12345,
@@ -1708,8 +1692,8 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            &id,
             UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
                 amount_received: Usdc(dec!(99.99)),
@@ -1719,8 +1703,8 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            &id,
             UsdcRebalanceCommand::InitiateDeposit {
                 deposit: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
             },
@@ -1728,7 +1712,7 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
 
@@ -1776,7 +1760,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1808,8 +1792,8 @@ mod tests {
         // Verify aggregate is in ConversionFailed state (not uninitialized) by attempting
         // InitiateConversion which should fail because aggregate is no longer uninitialized
         let second_result = cqrs
-            .execute(
-                &id.0,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
@@ -1821,9 +1805,9 @@ mod tests {
         assert!(
             matches!(
                 &second_result,
-                Err(AggregateError::UserError(
+                Err(AggregateError::UserError(LifecycleError::Apply(
                     UsdcRebalanceError::AlreadyInitiated
-                ))
+                )))
             ),
             "Expected AlreadyInitiated error (aggregate should be in ConversionFailed state), got: {second_result:?}"
         );
@@ -1841,7 +1825,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1909,7 +1893,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -1974,7 +1958,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -2068,15 +2052,15 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("initiate-failure-test");
         let amount = Usdc(dec!(1000));
 
         // Pre-initialize aggregate to make InitiateConversion fail
-        cqrs.execute(
-            &id.0,
+        cqrs.send(
+            &id,
             UsdcRebalanceCommand::InitiateConversion {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
@@ -2116,7 +2100,9 @@ mod tests {
             matches!(
                 manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcRebalanceManagerError::Aggregate(
-                    AggregateError::UserError(UsdcRebalanceError::AlreadyInitiated)
+                    AggregateError::UserError(LifecycleError::Apply(
+                        UsdcRebalanceError::AlreadyInitiated
+                    ))
                 ))
             ),
             "Expected AlreadyInitiated error"
@@ -2140,7 +2126,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("failed-state-test");
@@ -2171,8 +2157,8 @@ mod tests {
         // Verify aggregate is in ConversionFailed state by attempting InitiateConversion
         // which should fail with AlreadyInitiated (not succeed with Uninitialized)
         let reinit_result = cqrs
-            .execute(
-                &id.0,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
@@ -2184,9 +2170,9 @@ mod tests {
         assert!(
             matches!(
                 &reinit_result,
-                Err(AggregateError::UserError(
+                Err(AggregateError::UserError(LifecycleError::Apply(
                     UsdcRebalanceError::AlreadyInitiated
-                ))
+                )))
             ),
             "Aggregate should be in ConversionFailed (not Uninitialized), got: {reinit_result:?}"
         );
@@ -2202,7 +2188,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId::new("complete-state-test");
@@ -2234,8 +2220,8 @@ mod tests {
         // Verify aggregate is in ConversionComplete state by attempting to start withdrawal
         // which should succeed from ConversionComplete but fail from other states
         let withdrawal_result = cqrs
-            .execute(
-                &id.0,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
@@ -2285,7 +2271,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let cqrs = create_test_store_instance().await;
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 

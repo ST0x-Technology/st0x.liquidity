@@ -9,13 +9,14 @@ pub(crate) mod mock;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
-use st0x_execution::Symbol;
 use thiserror::Error;
 
+use st0x_execution::{FractionalShares, Symbol};
+
+use st0x_event_sorcery::SendError;
+
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
-use crate::shares::FractionalShares;
+use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
@@ -23,7 +24,7 @@ pub(crate) enum RedemptionError {
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<EquityRedemptionError>),
+    Aggregate(#[from] SendError<EquityRedemption>),
 
     #[error("Redemption was rejected by Alpaca")]
     Rejected,
