@@ -376,7 +376,7 @@ where
     /// Skips if ANY venue (onchain or offchain) has inflight operations,
     /// because we cannot distinguish between "transfer completed but not
     /// confirmed" vs "unrelated inventory change".
-    fn react_to_onchain_snapshot(self, snapshot_balance: T) -> Self {
+    fn on_onchain_snapshot(self, snapshot_balance: T) -> Self {
         if self.has_inflight() {
             return self;
         }
@@ -396,7 +396,7 @@ where
     /// Skips if ANY venue (onchain or offchain) has inflight operations,
     /// because we cannot distinguish between "transfer completed but not
     /// confirmed" vs "unrelated inventory change".
-    fn react_to_offchain_snapshot(self, snapshot_balance: T) -> Self {
+    fn on_offchain_snapshot(self, snapshot_balance: T) -> Self {
         if self.has_inflight() {
             return self;
         }
@@ -824,14 +824,14 @@ impl InventoryView {
                     .try_fold(self, |view, (symbol, snapshot_balance)| {
                         view.update_equity(
                             symbol,
-                            |inventory| Ok(inventory.react_to_onchain_snapshot(*snapshot_balance)),
+                            |inventory| Ok(inventory.on_onchain_snapshot(*snapshot_balance)),
                             now,
                         )
                     })
             }
 
             OnchainCash { usdc_balance, .. } => self.update_usdc(
-                |inventory| Ok(inventory.react_to_onchain_snapshot(*usdc_balance)),
+                |inventory| Ok(inventory.on_onchain_snapshot(*usdc_balance)),
                 now,
             ),
 
@@ -841,7 +841,7 @@ impl InventoryView {
                     .try_fold(self, |view, (symbol, snapshot_balance)| {
                         view.update_equity(
                             symbol,
-                            |inventory| Ok(inventory.react_to_offchain_snapshot(*snapshot_balance)),
+                            |inventory| Ok(inventory.on_offchain_snapshot(*snapshot_balance)),
                             now,
                         )
                     })
@@ -853,10 +853,7 @@ impl InventoryView {
                 let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
                     InventoryViewError::CashBalanceConversion(*cash_balance_cents),
                 )?;
-                self.update_usdc(
-                    |inventory| Ok(inventory.react_to_offchain_snapshot(usdc)),
-                    now,
-                )
+                self.update_usdc(|inventory| Ok(inventory.on_offchain_snapshot(usdc)), now)
             }
         }
     }
@@ -1219,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_position_event_tracks_symbols_independently() {
+    fn on_position_event_tracks_symbols_independently() {
         let aapl = Symbol::new("AAPL").unwrap();
         let msft = Symbol::new("MSFT").unwrap();
         let view = make_view(vec![
@@ -1244,12 +1241,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_position_event_auto_registers_new_symbol() {
+    fn on_position_event_auto_registers_new_symbol() {
         let view = make_view(vec![]);
         let symbol = Symbol::new("AAPL").unwrap();
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
-        let updated = view.apply_position_event(&symbol, &event).unwrap();
+        let updated = view.on_position(&symbol, &event).unwrap();
 
         let equity = updated.equities.get(&symbol).unwrap();
         // Onchain is initialized by the position event
@@ -1262,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_position_event_other_events_only_update_last_updated() {
+    fn on_position_event_other_events_only_update_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         let original_time = Utc::now();
         let view = InventoryView {
@@ -1699,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_snapshot_event_auto_registers_new_symbol() {
+    fn on_snapshot_event_auto_registers_new_symbol() {
         let view = make_view(vec![]);
         let symbol = Symbol::new("AAPL").unwrap();
         let event = InventorySnapshotEvent::OffchainEquity {
@@ -1984,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_onchain_snapshot_auto_registers_new_symbol() {
+    fn on_onchain_snapshot_auto_registers_new_symbol() {
         let view = make_view(vec![]);
         let symbol = Symbol::new("AAPL").unwrap();
         let event = InventorySnapshotEvent::OnchainEquity {

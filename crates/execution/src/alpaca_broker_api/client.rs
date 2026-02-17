@@ -51,7 +51,7 @@ impl AlpacaBrokerApiClient {
         Ok(Self {
             http_client,
             base_url: ctx.base_url().to_string(),
-            account_id: ctx.account_id.clone(),
+            account_id: ctx.account_id,
             mode: ctx.mode(),
         })
     }

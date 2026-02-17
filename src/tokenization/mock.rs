@@ -170,9 +170,22 @@ impl Tokenizer for MockTokenizer {
         &self,
         _tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(TokenizationRequest::mock(
-            TokenizationRequestStatus::Pending,
-        ))
+        match self.detection_outcome {
+            Some(MockDetectionOutcome::Detected) | None => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
+            )),
+            Some(MockDetectionOutcome::Timeout) => Err(TokenizerError::Alpaca(
+                AlpacaTokenizationError::PollTimeout {
+                    elapsed: std::time::Duration::from_secs(60),
+                },
+            )),
+            Some(MockDetectionOutcome::ApiError) => {
+                Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "mock detection API error".to_string(),
+                }))
+            }
+        }
     }
 
     async fn poll_redemption_until_complete(

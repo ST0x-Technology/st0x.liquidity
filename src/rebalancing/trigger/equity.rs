@@ -432,26 +432,23 @@ mod tests {
 
     /// Verifies that quantity truncation doesn't lose the truncated portion from inventory.
     ///
-    /// When we truncate 3.1762222348598623822654992091 to 3.176222234 for Alpaca,
-    /// the 0.0000000008598623822654992091 must remain in inventory and accumulate.
+    /// When we truncate the excess to 9 decimal places for Alpaca,
+    /// the sub-nanoshare digits must remain in inventory and accumulate.
     #[tokio::test]
     async fn truncation_preserves_leftover_in_inventory() {
         let symbol = Symbol::new("RKLB").unwrap();
 
         // Set up inventory where excess calculation produces high-precision result.
-        // With 20% onchain, 80% offchain and 50% target:
-        // - Total = 100, target onchain = 50, current onchain = 20
-        // - Excess (too much offchain) = 50 - 20 = 30
+        // With ~20% onchain, ~80% offchain and 50% target:
         //
-        // Use precise values to get high-precision excess:
-        // onchain = 6.3524444697197247645309984182
-        // offchain = 25.4097778788788990581239936728
-        // total = 31.762222348598623822654992091
-        // target_onchain = 31.762222348598623822654992091 * 0.5 = 15.8811111742993119113274960455
-        // excess = 15.8811111742993119113274960455 - 6.3524444697197247645309984182
-        //        = 9.5286667045795871467964976273
-        let onchain = "6.3524444697197247645309984182";
-        let offchain = "25.4097778788788990581239936728";
+        // onchain = 6.352444469719724764
+        // offchain = 25.409777878878899058
+        // total = 31.762222348598623822
+        // target_onchain = 31.762222348598623822 * 0.5 = 15.881111174299311911
+        // excess = 15.881111174299311911 - 6.352444469719724764
+        //        = 9.528666704579587147
+        let onchain = "6.352444469719724764";
+        let offchain = "25.409777878878899058";
 
         let inventory = make_precise_imbalanced_view(&symbol, onchain, offchain);
         let threshold = ImbalanceThreshold {
@@ -484,7 +481,7 @@ mod tests {
         );
 
         // The original excess had more precision - verify truncation occurred
-        let full_excess = precise_shares("9.5286667045795871467964976273");
+        let full_excess = precise_shares("9.528666704579587147");
         assert_ne!(
             quantity, full_excess,
             "Quantity should differ from full-precision excess"
@@ -529,7 +526,7 @@ mod tests {
         drop(view);
 
         // After the mint, check the remaining imbalance.
-        // The leftover (0.0000000005795871467964976273) should still be there.
+        // The leftover (0.000000000579587147) should still be there.
         let remaining_imbalance = {
             let view = inventory.read().await;
             view.check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
@@ -539,10 +536,10 @@ mod tests {
         // But it IS still there in the inventory - not lost.
         // With target 50% and deviation 10%, the bounds are 40%-60%.
         // After minting 9.528666704:
-        // - new onchain = 6.3524444697197247645309984182 + 9.528666704 = 15.8811111737197247645309984182
-        // - new offchain = 25.4097778788788990581239936728 - 9.528666704 = 15.8811111748788990581239936728
-        // - new total = 31.7622223485986238226549920910
-        // - new ratio = 15.8811111737197247645309984182 / 31.7622223485986238226549920910 ~= 0.49999999998...
+        // - new onchain = 6.352444469719724764 + 9.528666704 = 15.881111173719724764
+        // - new offchain = 25.409777878878899058 - 9.528666704 = 15.881111174878899058
+        // - new total = 31.762222348598623822
+        // - new ratio = 15.881111173719724764 / 31.762222348598623822 ~= 0.49999999998...
         //
         // This is within the 40%-60% threshold, so no imbalance is detected.
         // But the LEFTOVER (the sub-9-decimal precision) is preserved in the totals.
@@ -560,8 +557,8 @@ mod tests {
         // Start with an imbalance that produces a high-precision excess
         let inventory = make_precise_imbalanced_view(
             &symbol,
-            "10.1234567891234567891234567891", // onchain
-            "89.8765432108765432108765432109", // offchain (much more)
+            "10.123456789123456789", // onchain
+            "89.876543210876543211", // offchain (much more)
         );
 
         // Target 50%, deviation 10% -> triggers when outside 40%-60%

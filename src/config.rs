@@ -645,6 +645,8 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
 
+            [rebalancing.equities]
+
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
@@ -811,6 +813,8 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
 
+            [rebalancing.equities]
+
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
@@ -879,7 +883,7 @@ pub(crate) mod tests {
             type = "alpaca-broker-api"
             api_key = "test-key"
             api_secret = "test-secret"
-            account_id = "test-account-id"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#;
 
         let ctx = Ctx::from_toml(minimal_config_toml(), secrets).unwrap();
@@ -924,6 +928,7 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
+            [rebalancing.equities]
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"

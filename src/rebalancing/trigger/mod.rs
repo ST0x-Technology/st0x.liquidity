@@ -777,6 +777,21 @@ mod tests {
     const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
+    /// Applies a position event to the trigger's inventory and runs the equity
+    /// rebalancing check, replicating what the `Reactor::react` closure does
+    /// for `Position` events.
+    async fn apply_position_event(
+        trigger: &RebalancingTrigger,
+        symbol: &Symbol,
+        event: &PositionEvent,
+    ) {
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory.clone().on_position(symbol, event).unwrap();
+        }
+        trigger.check_and_trigger_equity(symbol).await;
+    }
+
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
@@ -904,7 +919,7 @@ mod tests {
         //
         // In production, InventoryView::default() creates an empty equities
         // map. Position events arrive as onchain fills are processed. If the
-        // symbol isn't pre-registered, react_to_position_event_to_inventory must
+        // symbol isn't pre-registered, the position event handler must
         // handle it (either by auto-registering or by decoupling the
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
@@ -1592,6 +1607,8 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
+            [equities]
+
             [equity]
             target = "0.5"
             deviation = "0.2"
@@ -1666,6 +1683,8 @@ mod tests {
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [equities]
 
             [equity]
             target = "0.6"
@@ -1747,6 +1766,8 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [equities]
 
             [equity]
             target = "0.5"
@@ -2587,6 +2608,8 @@ mod tests {
             r#"
             redemption_wallet = "{derived_wallet}"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [equities]
 
             [equity]
             target = "0.5"

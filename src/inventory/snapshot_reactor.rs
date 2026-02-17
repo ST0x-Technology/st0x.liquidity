@@ -658,11 +658,11 @@ mod tests {
         //
         // Instead, we corrupt the inventory to force an error: put an inflight
         // transfer on equity, then apply a snapshot for that symbol. The
-        // react_to_snapshot_event itself won't fail on that. Let's use a different
+        // on_snapshot itself won't fail on that. Let's use a different
         // approach: InventoryViewError::CashBalanceConversion is the only error
         // path. We can't easily trigger it.
         //
-        // The warn! path IS covered by the fact that if react_to_snapshot_event
+        // The warn! path IS covered by the fact that if on_snapshot
         // ever fails, it will be logged. Let's verify the successful path
         // doesn't log a warning.
         let event = InventorySnapshotEvent::OnchainCash {

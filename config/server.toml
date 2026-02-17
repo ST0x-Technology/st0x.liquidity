@@ -59,7 +59,7 @@ wrapped = "0x82f5baee1076334357a34a19e04f7c282d51ce47"
 
 [rebalancing.equities.tBMNR]
 unwrapped = "0xfbde45df60249203b12148452fc77c3b5f811eb2"
-wrapped = "0x2512ec661f0ba89c275ea105e31bad6fcfcf319"
+wrapped = "0x02512ec661f0ba89c275ea105e31bad6fcfcf319"
 
 [rebalancing.equities.tRKLB]
 unwrapped = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
