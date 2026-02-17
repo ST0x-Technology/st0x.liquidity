@@ -334,8 +334,7 @@ impl FractionalShares {
         }
 
         let raw_str = value.to_string();
-        let raw_decimal =
-            Decimal::from_str(&raw_str).map_err(|_| SharesConversionError::Overflow)?;
+        let raw_decimal = Decimal::from_str(&raw_str)?;
 
         raw_decimal
             .checked_div(TOKENIZED_EQUITY_SCALE)
@@ -352,6 +351,8 @@ pub enum SharesConversionError {
     Underflow(Decimal),
     #[error("overflow when scaling shares to 18 decimals")]
     Overflow,
+    #[error("decimal conversion failed: {0}")]
+    DecimalConversion(#[from] rust_decimal::Error),
     #[error("precision loss when scaling to 18 decimals: {0} has sub-wei digits")]
     PrecisionLoss(Decimal),
     #[error("failed to parse U256: {0}")]
@@ -639,11 +640,10 @@ impl Display for ExecutorOrderId {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use alloy::primitives::U256;
     use proptest::prelude::*;
     use rust_decimal_macros::dec;
+    use std::str::FromStr;
 
     use super::*;
 
@@ -942,5 +942,35 @@ mod tests {
     #[test]
     fn dry_run_supports_fractional_shares() {
         assert!(SupportedExecutor::DryRun.supports_fractional_shares());
+    }
+
+    #[test]
+    fn from_u256_18_decimals_zero_returns_zero() {
+        let result = FractionalShares::from_u256_18_decimals(U256::ZERO).unwrap();
+        assert_eq!(result, FractionalShares::ZERO);
+    }
+
+    #[test]
+    fn from_u256_18_decimals_one_whole_share() {
+        let one_share = U256::from_str("1000000000000000000").unwrap();
+        let result = FractionalShares::from_u256_18_decimals(one_share).unwrap();
+        assert_eq!(result.inner(), Decimal::ONE);
+    }
+
+    #[test]
+    fn from_u256_18_decimals_fractional_amount() {
+        let one_and_a_half = U256::from_str("1500000000000000000").unwrap();
+        let result = FractionalShares::from_u256_18_decimals(one_and_a_half).unwrap();
+        assert_eq!(result.inner(), dec!(1.5));
+    }
+
+    #[test]
+    fn from_u256_18_decimals_overflow_returns_error() {
+        let result = FractionalShares::from_u256_18_decimals(U256::MAX);
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, SharesConversionError::DecimalConversion(_)),
+            "Expected DecimalConversion error, got: {error:?}"
+        );
     }
 }

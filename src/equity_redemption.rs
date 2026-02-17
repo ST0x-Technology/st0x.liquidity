@@ -9,14 +9,14 @@
 //! The aggregate progresses through the following states:
 //!
 //! ```text
-//! (start) --Redeem--> VaultWithdrawn ---> TokensSent ---> Pending ---> Completed
+//! (start) --Redeem--> WithdrawnFromRaindex ---> TokensSent ---> Pending ---> Completed
 //!              |              |               |             |
 //!              v              v               v             v
 //!            Failed        Failed          Failed        Failed
 //! ```
 //!
-//! - `Redeem` command atomically withdraws from vault and sends to Alpaca
-//! - `VaultWithdrawn` tracks tokens that left the vault but aren't yet sent
+//! - `Redeem` command atomically withdraws from Raindex vault and sends to Alpaca
+//! - `WithdrawnFromRaindex` tracks tokens that left the Raindex vault but aren't yet sent
 //! - `TokensSent` tracks tokens sent to Alpaca's redemption wallet
 //! - `Pending` indicates Alpaca detected the transfer
 //! - `Completed` and `Failed` are terminal states
@@ -88,15 +88,35 @@ impl FromStr for RedemptionAggregateId {
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum EquityRedemptionError {
-    /// Vault lookup failed for the given token
-    #[error("Token {0} not found in vault registry")]
-    VaultNotFound(Address),
-    /// Vault withdrawal transaction failed
-    #[error("Vault withdraw failed")]
-    VaultWithdrawFailed,
-    /// Sending tokens to Alpaca redemption wallet failed
-    #[error("Send for redemption failed")]
-    SendForRedemptionFailed,
+    /// Raindex vault lookup failed for the given token
+    #[error("Token {0} not found in Raindex vault registry")]
+    RaindexVaultNotFound(Address),
+    /// Raindex vault withdrawal transaction failed.
+    /// RaindexError can't be wrapped with #[from] because it contains
+    /// alloy types that don't implement Serialize/Deserialize (required
+    /// by DomainError).
+    #[error(
+        "Raindex vault withdraw failed for token {token}, \
+         amount {amount}: {error_message}"
+    )]
+    RaindexWithdrawFailed {
+        token: Address,
+        amount: U256,
+        error_message: String,
+    },
+    /// ERC-4626 unwrap operation failed.
+    /// WrapperError can't be wrapped with #[from] because it contains
+    /// alloy types that don't implement Serialize/Deserialize (required
+    /// by DomainError).
+    #[error(
+        "Token unwrap failed for {token}, \
+         wrapped_amount {wrapped_amount}: {error_message}"
+    )]
+    UnwrapFailed {
+        token: Address,
+        wrapped_amount: U256,
+        error_message: String,
+    },
     /// Transaction failed with a known tx hash
     #[error("Transaction failed: {tx_hash}")]
     TransactionFailed { tx_hash: TxHash },
@@ -218,18 +238,31 @@ pub(crate) enum EquityRedemptionEvent {
 
 impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
-        use EquityRedemption::*;
+        use EquityRedemptionEvent::*;
         match self {
             WithdrawnFromRaindex { .. } => {
                 "EquityRedemptionEvent::WithdrawnFromRaindex".to_string()
             }
-            TokensUnwrapped { .. } => "EquityRedemptionEvent::TokensUnwrapped".to_string(),
-            TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
-            TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
-            DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
-            Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
+            TokensUnwrapped { .. } => {
+                "EquityRedemptionEvent::TokensUnwrapped".to_string()
+            }
+            TransferFailed { .. } => {
+                "EquityRedemptionEvent::TransferFailed".to_string()
+            }
+            TokensSent { .. } => {
+                "EquityRedemptionEvent::TokensSent".to_string()
+            }
+            DetectionFailed { .. } => {
+                "EquityRedemptionEvent::DetectionFailed".to_string()
+            }
+            Detected { .. } => {
+                "EquityRedemptionEvent::Detected".to_string()
+            }
             RedemptionRejected { .. } => {
                 "EquityRedemptionEvent::RedemptionRejected".to_string()
+            }
+            Completed { .. } => {
+                "EquityRedemptionEvent::Completed".to_string()
             }
         }
     }
@@ -571,7 +604,11 @@ impl EventSourced for EquityRedemption {
                     Ok(tx) => tx,
                     Err(error) => {
                         warn!(%error, %token, %amount, "Raindex vault withdrawal failed");
-                        return Err(EquityRedemptionError::RaindexWithdrawFailed);
+                        return Err(EquityRedemptionError::RaindexWithdrawFailed {
+                            token,
+                            amount,
+                            error_message: error.to_string(),
+                        });
                     }
                 };
 
@@ -651,7 +688,11 @@ impl EventSourced for EquityRedemption {
                         .inspect_err(|error| {
                             warn!(%error, %token, "Token unwrap failed");
                         })
-                        .map_err(|_| EquityRedemptionError::UnwrapFailed)?;
+                        .map_err(|error| EquityRedemptionError::UnwrapFailed {
+                            token: *token,
+                            wrapped_amount: *wrapped_amount,
+                            error_message: error.to_string(),
+                        })?;
                     Ok(vec![TokensUnwrapped {
                         unwrap_tx_hash,
                         unwrapped_amount,

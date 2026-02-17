@@ -27,7 +27,8 @@ impl MockRaindex {
 
     pub(crate) fn failing_deposit() -> Self {
         Self {
-            vault_id: VaultId(B256::ZERO),
+            vault_id: RaindexVaultId(B256::ZERO),
+            token: Address::ZERO,
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
             deposit_fails: true,

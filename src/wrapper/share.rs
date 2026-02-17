@@ -11,6 +11,7 @@ use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
 use crate::bindings::IERC4626;
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 
 /// One unit with 18 decimals for ratio queries.
 const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -98,7 +99,10 @@ where
         let vault = IERC4626::new(wrapped_token, &self.provider);
 
         let pending = vault.deposit(underlying_amount, receiver).send().await?;
-        let receipt = pending.get_receipt().await?;
+        let receipt = pending
+            .with_required_confirmations(REQUIRED_CONFIRMATIONS)
+            .get_receipt()
+            .await?;
         let tx_hash = receipt.transaction_hash;
 
         let actual_shares = receipt
@@ -126,7 +130,10 @@ where
         let vault = IERC4626::new(wrapped_token, &self.provider);
 
         let pending = vault.redeem(wrapped_amount, receiver, owner).send().await?;
-        let receipt = pending.get_receipt().await?;
+        let receipt = pending
+            .with_required_confirmations(REQUIRED_CONFIRMATIONS)
+            .get_receipt()
+            .await?;
         let tx_hash = receipt.transaction_hash;
 
         let actual_assets = receipt

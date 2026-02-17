@@ -243,7 +243,7 @@ impl RebalancingTrigger {
     async fn on_position(&self, symbol: Symbol, event: PositionEvent) {
         let mut inventory = self.inventory.write().await;
 
-        let new_inventory = match inventory.clone().apply_position_event(&symbol, &event) {
+        let new_inventory = match inventory.clone().react_to_position_event(&symbol, &event) {
             Ok(updated) => updated,
             Err(error) => {
                 warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
@@ -262,7 +262,7 @@ impl RebalancingTrigger {
             return;
         };
 
-        self.apply_mint_event_to_inventory(&symbol, &event, quantity)
+        self.react_to_mint_event_to_inventory(&symbol, &event, quantity)
             .await;
 
         if Self::is_terminal_mint_event(&event) {
@@ -278,7 +278,7 @@ impl RebalancingTrigger {
             return;
         };
 
-        self.apply_redemption_event_to_inventory(&symbol, &event, quantity)
+        self.react_to_redemption_event_to_inventory(&symbol, &event, quantity)
             .await;
 
         if Self::is_terminal_redemption_event(&event) {
@@ -291,7 +291,7 @@ impl RebalancingTrigger {
 
     async fn on_usdc_rebalance(&self, event: UsdcRebalanceEvent) {
         if let Some((direction, amount)) = Self::extract_usdc_rebalance_info(&event) {
-            self.apply_usdc_rebalance_event_to_inventory(&event, &direction, amount)
+            self.react_to_usdc_rebalance_event_to_inventory(&event, &direction, amount)
                 .await;
         }
 
@@ -469,7 +469,7 @@ impl RebalancingTrigger {
         }
     }
 
-    async fn apply_mint_event_to_inventory(
+    async fn react_to_mint_event_to_inventory(
         &self,
         symbol: &Symbol,
         event: &TokenizedEquityMintEvent,
@@ -479,7 +479,7 @@ impl RebalancingTrigger {
 
         let result = inventory
             .clone()
-            .apply_mint_event(symbol, event, quantity, Utc::now());
+            .react_to_mint_event(symbol, event, quantity, Utc::now());
 
         match result {
             Ok(new_inventory) => {
@@ -497,7 +497,7 @@ impl RebalancingTrigger {
     ) -> Option<(Symbol, FractionalShares)> {
         use EquityRedemptionEvent::*;
 
-        if let VaultWithdrawn {
+        if let WithdrawnFromRaindex {
             symbol, quantity, ..
         } = event
         {
@@ -516,14 +516,14 @@ impl RebalancingTrigger {
             | DetectionFailed { .. }
             | RedemptionRejected { .. } => true,
 
-            VaultWithdrawn { .. }
+            WithdrawnFromRaindex { .. }
             | TokensUnwrapped { .. }
             | TokensSent { .. }
             | Detected { .. } => false,
         }
     }
 
-    async fn apply_redemption_event_to_inventory(
+    async fn react_to_redemption_event_to_inventory(
         &self,
         symbol: &Symbol,
         event: &EquityRedemptionEvent,
@@ -533,7 +533,7 @@ impl RebalancingTrigger {
 
         let result = inventory
             .clone()
-            .apply_redemption_event(symbol, event, quantity, Utc::now());
+            .react_to_redemption_event(symbol, event, quantity, Utc::now());
 
         match result {
             Ok(new_inventory) => {
@@ -581,7 +581,7 @@ impl RebalancingTrigger {
         )
     }
 
-    async fn apply_usdc_rebalance_event_to_inventory(
+    async fn react_to_usdc_rebalance_event_to_inventory(
         &self,
         event: &UsdcRebalanceEvent,
         direction: &RebalanceDirection,
@@ -592,7 +592,7 @@ impl RebalancingTrigger {
         let result =
             inventory
                 .clone()
-                .apply_usdc_rebalance_event(event, direction, amount, Utc::now());
+                .react_to_usdc_rebalance_event(event, direction, amount, Utc::now());
 
         match result {
             Ok(new_inventory) => {
@@ -615,7 +615,9 @@ mod tests {
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
     use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
-    use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce};
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce,
+    };
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -714,6 +716,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let pool = crate::test_utils::setup_test_db().await;
+        let wrapper = Arc::new(MockWrapper::new());
 
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
@@ -725,6 +728,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory,
             sender,
+            wrapper,
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -944,7 +948,7 @@ mod tests {
         //
         // In production, InventoryView::default() creates an empty equities
         // map. Position events arrive as onchain fills are processed. If the
-        // symbol isn't pre-registered, apply_position_event_to_inventory must
+        // symbol isn't pre-registered, react_to_position_event_to_inventory must
         // handle it (either by auto-registering or by decoupling the
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
@@ -1029,10 +1033,10 @@ mod tests {
 
         // Build balanced initial state: 50 onchain, 50 offchain.
         inventory = inventory
-            .apply_position_event(&symbol, &make_onchain_fill(shares(50), Direction::Buy))
+            .react_to_position_event(&symbol, &make_onchain_fill(shares(50), Direction::Buy))
             .unwrap();
         inventory = inventory
-            .apply_position_event(&symbol, &make_offchain_fill(shares(50), Direction::Buy))
+            .react_to_position_event(&symbol, &make_offchain_fill(shares(50), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
@@ -1060,10 +1064,10 @@ mod tests {
         // Build imbalanced state: 20 onchain, 80 offchain = 20% onchain ratio.
         // This is below the 30% lower threshold (50% - 20% deviation).
         inventory = inventory
-            .apply_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
+            .react_to_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
             .unwrap();
         inventory = inventory
-            .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
+            .react_to_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) =
@@ -1091,10 +1095,10 @@ mod tests {
         // At 1.5 ratio: 65 wrapped = 97.5 underlying-equivalent.
         //   97.5/(97.5+35) = 73.6% -> above 70% -> triggers redemption.
         inventory = inventory
-            .apply_position_event(&symbol, &make_onchain_fill(shares(65), Direction::Buy))
+            .react_to_position_event(&symbol, &make_onchain_fill(shares(65), Direction::Buy))
             .unwrap();
         inventory = inventory
-            .apply_position_event(&symbol, &make_offchain_fill(shares(35), Direction::Buy))
+            .react_to_position_event(&symbol, &make_offchain_fill(shares(35), Direction::Buy))
             .unwrap();
 
         let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
@@ -1168,9 +1172,9 @@ mod tests {
         // Threshold: target 50%, deviation 20%, so lower bound is 30%.
         // 20% < 30% triggers TooMuchOffchain.
         let inventory = inventory
-            .apply_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
+            .react_to_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
             .unwrap()
-            .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
+            .react_to_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) =
@@ -1190,7 +1194,7 @@ mod tests {
         // Apply MintAccepted - this moves shares to inflight.
         // Inflight should now block imbalance detection.
         trigger
-            .apply_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30))
+            .react_to_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30))
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1288,13 +1292,13 @@ mod tests {
         ));
     }
 
-    fn make_vault_withdrawn(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::VaultWithdrawn {
+    fn make_withdrawn_from_raindex(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::WithdrawnFromRaindex {
             symbol: symbol.clone(),
             quantity,
             token: Address::random(),
-            amount: U256::from(50_250_000_000_000_000_000_u128),
-            vault_withdraw_tx: TxHash::random(),
+            wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            raindex_withdraw_tx: TxHash::random(),
             withdrawn_at: Utc::now(),
         }
     }
@@ -1316,7 +1320,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            reason: "Alpaca timeout".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         }
     }
@@ -1343,16 +1347,16 @@ mod tests {
         // Threshold: target 50%, deviation 20%, so upper bound is 70%.
         // 80% > 70% triggers TooMuchOnchain.
         let inventory = inventory
-            .apply_position_event(&symbol, &make_onchain_fill(shares(80), Direction::Buy))
+            .react_to_position_event(&symbol, &make_onchain_fill(shares(80), Direction::Buy))
             .unwrap()
-            .apply_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
+            .react_to_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
         trigger
-            .apply_redemption_event_to_inventory(&symbol, &make_tokens_sent(), shares(30))
+            .react_to_redemption_event_to_inventory(&symbol, &make_tokens_sent(), shares(30))
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1407,7 +1411,7 @@ mod tests {
     #[test]
     fn extract_redemption_info_returns_symbol_and_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_vault_withdrawn(&symbol, dec!(42.5));
+        let event = make_withdrawn_from_raindex(&symbol, dec!(42.5));
 
         let (extracted_symbol, extracted_quantity) =
             RebalancingTrigger::extract_redemption_info(&event).unwrap();
@@ -1426,7 +1430,7 @@ mod tests {
     fn non_terminal_redemption_events_are_not_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         assert!(!RebalancingTrigger::is_terminal_redemption_event(
-            &make_vault_withdrawn(&symbol, dec!(30))
+            &make_withdrawn_from_raindex(&symbol, dec!(30))
         ));
         assert!(!RebalancingTrigger::is_terminal_redemption_event(
             &make_redemption_detected()

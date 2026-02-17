@@ -227,7 +227,8 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use st0x_execution::{
-        AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
+        TimeInForce,
     };
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -235,7 +236,7 @@ mod tests {
     use st0x_event_sorcery::{Projection, test_store};
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
+    use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;

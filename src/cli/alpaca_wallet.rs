@@ -480,7 +480,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use rust_decimal_macros::dec;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use url::Url;
     use uuid::uuid;
 

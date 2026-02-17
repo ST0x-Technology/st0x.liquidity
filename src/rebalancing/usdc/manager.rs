@@ -912,7 +912,8 @@ mod tests {
 
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
     use st0x_execution::{
-        AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor, TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor,
+        TimeInForce,
     };
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
@@ -920,8 +921,7 @@ mod tests {
     use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
+    use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError};
     use crate::onchain::raindex::RaindexService;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
