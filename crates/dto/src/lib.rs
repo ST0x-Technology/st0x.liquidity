@@ -12,7 +12,6 @@ use ts_rs::TS;
 
 /// Messages sent from the server to WebSocket clients.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerMessage {
     Initial(Box<InitialState>),
@@ -21,7 +20,6 @@ pub enum ServerMessage {
 
 /// Full dashboard snapshot sent to the frontend on connection.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct InitialState {
     pub recent_trades: Vec<Trade>,
@@ -51,7 +49,6 @@ impl InitialState {
 
 /// Single event from the event store for live updates.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 pub struct EventStoreEntry {
     pub aggregate_type: String,
     pub aggregate_id: String,
@@ -63,7 +60,6 @@ pub struct EventStoreEntry {
 
 /// Completed trade record.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct Trade {
     pub id: String,
@@ -71,7 +67,6 @@ pub struct Trade {
 
 /// Per-symbol net position.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     pub symbol: String,
@@ -81,7 +76,6 @@ pub struct Position {
 
 /// Per-symbol onchain/offchain/net balances.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolInventory {
     pub symbol: String,
@@ -95,7 +89,6 @@ pub struct SymbolInventory {
 
 /// Onchain and offchain USDC balances.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct UsdcInventory {
     #[ts(type = "string")]
@@ -106,7 +99,6 @@ pub struct UsdcInventory {
 
 /// Full inventory snapshot across all symbols and USDC.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
     pub per_symbol: Vec<SymbolInventory>,
@@ -127,7 +119,6 @@ impl Inventory {
 
 /// Absolute and percentage profit/loss.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export)]
 pub struct PnL {
     #[ts(type = "string")]
     pub absolute: Decimal,
@@ -137,7 +128,6 @@ pub struct PnL {
 
 /// Performance metrics for a single time window.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeframeMetrics {
     #[ts(type = "string")]
@@ -181,7 +171,6 @@ impl TimeframeMetrics {
 
 /// Metrics across all tracked timeframes.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 pub struct PerformanceMetrics {
     #[serde(rename = "1h")]
     pub one_hour: TimeframeMetrics,
@@ -209,7 +198,6 @@ impl PerformanceMetrics {
 
 /// Current bid/ask spread for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadSummary {
     pub symbol: String,
@@ -226,7 +214,6 @@ pub struct SpreadSummary {
 
 /// Incremental spread change for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadUpdate {
     pub symbol: String,
@@ -243,7 +230,6 @@ pub struct SpreadUpdate {
 
 /// Active or completed rebalance operation.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceOperation {
     pub id: String,
@@ -251,7 +237,6 @@ pub struct RebalanceOperation {
 
 /// Whether the trading circuit breaker is active.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CircuitBreakerStatus {
     Active,
@@ -259,7 +244,6 @@ pub enum CircuitBreakerStatus {
 
 /// Broker authentication status.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AuthStatus {
     NotConfigured,
@@ -269,6 +253,11 @@ pub enum AuthStatus {
 ///
 /// Each type is written to `out_dir/TypeName.ts`. The caller controls
 /// the output location explicitly -- no `TS_RS_EXPORT_DIR` magic.
+///
+/// # Errors
+///
+/// Returns [`ts_rs::ExportError`] if any type's binding file fails to
+/// write (e.g., `out_dir` does not exist or is not writable).
 pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     ServerMessage::export_all_to(out_dir)?;
     InitialState::export_all_to(out_dir)?;
@@ -312,7 +301,6 @@ mod tests {
     }
 
     #[derive(TS)]
-    #[ts(export)]
     struct TestOnlyBinding {
         _canary: bool,
     }

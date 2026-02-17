@@ -1,8 +1,7 @@
 use tracing::{debug, info};
 
-use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
-
 use st0x_event_sorcery::Projection;
+use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
 
 use crate::onchain::OnChainError;
 use crate::position::Position;

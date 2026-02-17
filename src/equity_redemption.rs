@@ -608,7 +608,7 @@ impl EventSourced for EquityRedemption {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use rust_decimal_macros::dec;
     use std::sync::Arc;
 

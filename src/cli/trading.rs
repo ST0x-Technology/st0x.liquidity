@@ -5,7 +5,6 @@ use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;

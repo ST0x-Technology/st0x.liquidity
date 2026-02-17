@@ -103,8 +103,7 @@ Example (Offchain Batching):
   - Too much USDC offchain: Withdraw from Alpaca -> bridge via Circle CCTP
     (Ethereum -> Base) -> deposit to orderbook vault
 - **Complete Audit Trail**: All rebalancing operations tracked as events
-  (EquityTransferToMarketMakingVenue, EquityTransferToHedgingVenue,
-  CrossVenueCashTransfer aggregates)
+  (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
   cross-chain USDC transfers
 
@@ -287,8 +286,6 @@ _System configuration_ (deploy-rs `activate.nixos`):
 _Per-service profiles_ (deploy-rs `activate.custom`, deployed independently):
 
 - `server` - hedging bot binary (serves both Schwab and Alpaca instances)
-- `reporter` - position reporter binary (serves both Schwab and Alpaca
-  instances)
 
 Each profile is independently deployable and rollback-able without affecting
 other profiles. The dashboard is served as static files by nginx (part of the
@@ -299,7 +296,7 @@ _Configuration management_:
 - Plaintext config per service (`config/*.toml`) baked into Nix closure
 - Encrypted secrets per service (`secret/*.toml.age`) decrypted at activation to
   `/run/agenix/`
-- Server uses `--config` + `--secrets` flags; reporter uses `--config` only
+- Server uses `--config` + `--secrets` flags
 
 _Infrastructure_:
 
@@ -502,9 +499,8 @@ Extract external API wrappers (no CQRS/ES dependencies):
 
 Extract rebalancing logic (already clean CQRS, no legacy persistence):
 
-- `st0x-rebalance`: EquityTransferToMarketMakingVenue,
-  EquityTransferToHedgingVenue, CrossVenueCashTransfer aggregates plus
-  orchestration logic
+- `st0x-rebalance`: CrossVenueEquityTransfer, CrossVenueCashTransfer and their
+  lifecycle aggregates plus orchestration logic
 
 ### Phase 4: Hedging Extraction & Application Layer
 
@@ -635,7 +631,7 @@ they serve different purposes in different bounded contexts.
 #### EventSourced Trait
 
 Domain types implement the `EventSourced` trait, which provides a safer, more
-ergonomic interface than cqrs-es's `Aggregate` directly:
+ergonomic interface than a raw `Aggregate` trait:
 
 ```rust
 #[async_trait]
@@ -670,12 +666,12 @@ trait EventSourced {
 
 ##### Why This Exists
 
-cqrs-es's `Aggregate` trait has sharp edges that have caused production bugs:
+A raw `Aggregate` trait has sharp edges that cause production bugs:
 
 - **Infallible `apply`**: Financial applications cannot panic on arithmetic
   overflow, but `Aggregate::apply` returns nothing
-- **Stringly-typed IDs**: `cqrs.execute("some-id", cmd)` takes `&str`, making it
-  trivial to pass the wrong ID
+- **Stringly-typed IDs**: `store.execute("some-id", cmd)` takes `&str`, making
+  it trivial to pass the wrong ID
 - **No schema versioning**: Stale snapshots and views cause silent corruption
 - **Flat command handling**: A single `handle` receives all commands regardless
   of lifecycle state
@@ -688,9 +684,9 @@ return).
 
 ##### Lifecycle Wrapper (Implementation Detail)
 
-`Lifecycle<Entity>` bridges `EventSourced` to cqrs-es via a blanket `Aggregate`
-impl. It is an implementation detail -- domain modules never interact with
-`Lifecycle` directly:
+`Lifecycle<Entity>` bridges `EventSourced` to the persistence layer via a
+blanket `Aggregate` impl. It is an implementation detail -- domain modules never
+interact with `Lifecycle` directly:
 
 ```rust
 enum Lifecycle<Entity: EventSourced> {
@@ -713,10 +709,10 @@ operations.
 
 ##### Store (Type-Safe Command Dispatch)
 
-`Store<Entity>` wraps `SqliteCqrs<Lifecycle<Entity>>` and enforces typed IDs:
+`Store<Entity>` enforces typed IDs for command dispatch:
 
 ```rust
-let positions: Store<Position> = /* built by CqrsBuilder */;
+let positions: Store<Position> = /* built by StoreBuilder */;
 positions.send(&symbol, PositionCommand::AcknowledgeFill { .. }).await?;
 ```
 
@@ -1179,8 +1175,8 @@ Two structs implement all four transfer directions:
   `Tokenizer` service traits.
 
 - **`CrossVenueCashTransfer`**: Implements both USDC directions. Holds a store
-  for the cash lifecycle aggregate plus `Bridge`, `AlpacaFunding`, and onchain
-  provider dependencies.
+  for the `UsdcRebalance` lifecycle aggregate plus `Bridge`, `AlpacaFunding`,
+  and onchain provider dependencies.
 
 Each transfer:
 
@@ -1188,10 +1184,9 @@ Each transfer:
 2. Sends commands that invoke domain service methods as side effects
 3. Returns when the lifecycle reaches a terminal state
 
-The lifecycle aggregates (EquityTransferToMarketMakingVenue,
-EquityTransferToHedgingVenue, CrossVenueCashTransfer) are implementation details
-of their respective transfer structs. External code interacts only through
-`CrossVenueTransfer::transfer()`.
+The lifecycle aggregates (TokenizedEquityMint, EquityRedemption, UsdcRebalance)
+are implementation details of their respective transfer structs. External code
+interacts only through `CrossVenueTransfer::transfer()`.
 
 ##### Rebalancer
 
@@ -1201,7 +1196,7 @@ for each of the four directions and calls `transfer()` on the right one.
 
 Three lifecycle aggregates handle the transfer workflows.
 
-#### EquityTransferToMarketMakingVenue Aggregate
+#### TokenizedEquityMint Aggregate
 
 **Purpose**: Transfers equity inventory from the hedging venue (Alpaca) to the
 market making venue (Raindex) by tokenizing shares and depositing them to a
@@ -1212,7 +1207,7 @@ vault for liquidity provision.
 **Services**:
 `EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
 Arc<dyn Tokenizer> }`
--- shared with `EquityTransferToHedgingVenue`.
+-- shared with `EquityRedemption`.
 
 ##### State Flow
 
@@ -1234,7 +1229,7 @@ stateDiagram-v2
 Terminal states store audit-critical fields not available from earlier events:
 
 ```rust
-enum EquityTransferToMarketMakingVenue {
+enum TokenizedEquityMint {
     MintRequested { symbol, quantity, wallet, requested_at },
     MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
     TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
@@ -1248,7 +1243,7 @@ enum EquityTransferToMarketMakingVenue {
 ##### Commands
 
 ```rust
-enum EquityTransferToMarketMakingVenueCommand {
+enum TokenizedEquityMintCommand {
     // Requests mint from Alpaca and polls until tokens arrive in wallet
     Mint { symbol, quantity, wallet },
     // Deposits tokens from wallet to Raindex vault
@@ -1261,7 +1256,7 @@ enum EquityTransferToMarketMakingVenueCommand {
 Each event captures data relevant to that state transition:
 
 ```rust
-enum EquityTransferToMarketMakingVenueEvent {
+enum TokenizedEquityMintEvent {
     MintRequested { symbol, quantity, wallet, requested_at },
 
     MintAccepted { symbol, quantity, issuer_request_id, tokenization_request_id, accepted_at },
@@ -1286,7 +1281,7 @@ struct HttpStatusCode(u16);
 - `Deposit` only from TokensReceived state
 - Completed and Failed are terminal states
 
-#### EquityTransferToHedgingVenue Aggregate
+#### EquityRedemption Aggregate
 
 **Purpose**: Transfers equity inventory from the market making venue (Raindex)
 to the hedging venue (Alpaca) by withdrawing tokens from vault, sending them for
@@ -1297,7 +1292,7 @@ redemption, and receiving shares at Alpaca.
 **Services**:
 `EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
 Arc<dyn Tokenizer> }`
--- shared with `EquityTransferToMarketMakingVenue`.
+-- shared with `TokenizedEquityMint`.
 
 **Services**:
 `EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
@@ -1328,7 +1323,7 @@ stateDiagram-v2
 ##### States
 
 ```rust
-enum EquityTransferToHedgingVenue {
+enum EquityRedemption {
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -1374,7 +1369,7 @@ enum EquityTransferToHedgingVenue {
 ##### Commands
 
 ```rust
-enum EquityTransferToHedgingVenueCommand {
+enum EquityRedemptionCommand {
     // Withdraws tokens from Raindex vault to wallet
     Withdraw {
         symbol: Symbol,
@@ -1390,7 +1385,7 @@ enum EquityTransferToHedgingVenueCommand {
 ##### Events
 
 ```rust
-enum EquityTransferToHedgingVenueEvent {
+enum EquityRedemptionEvent {
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -1452,7 +1447,7 @@ and redemption polling. No intermediate wrapper trait is needed.
   (tokens in wallet, not stranded)
 - Completed and Failed are terminal states
 
-#### CrossVenueCashTransfer Aggregate
+#### UsdcRebalance Aggregate
 
 **Purpose**: Manages bidirectional USDC movements between the hedging venue
 (Alpaca) and the market making venue (Raindex) via Circle CCTP bridge.
@@ -1484,7 +1479,7 @@ enum TransferRef {
 **States**:
 
 ```rust
-enum CrossVenueCashTransfer {
+enum UsdcRebalance {
     // Conversion phase (USD/USDC trading on Alpaca)
     Converting {
         direction: RebalanceDirection,
@@ -1598,7 +1593,7 @@ enum CrossVenueCashTransfer {
 ##### Commands
 
 ```rust
-enum CrossVenueCashTransferCommand {
+enum UsdcRebalanceCommand {
     // Conversion commands (AlpacaToBase: pre-withdrawal, BaseToAlpaca: post-deposit)
     InitiateConversion {
         direction: RebalanceDirection,
@@ -1635,7 +1630,7 @@ enum CrossVenueCashTransferCommand {
 ##### Events
 
 ```rust
-enum CrossVenueCashTransferEvent {
+enum UsdcRebalanceEvent {
     // Conversion events
     ConversionInitiated {
         direction: RebalanceDirection,
@@ -1644,7 +1639,7 @@ enum CrossVenueCashTransferEvent {
         initiated_at: DateTime<Utc>,
     },
     // direction: Required for incremental dispatch terminal detection
-    // (cqrs-es Query::dispatch only receives newly committed events)
+    // (reactors only receive newly committed events, not full history)
     ConversionConfirmed { direction: RebalanceDirection, converted_at: DateTime<Utc> },
     ConversionFailed { alpaca_order_id: Option<AlpacaOrderId>, failed_at: DateTime<Utc> },
 
@@ -1832,9 +1827,8 @@ When thresholds crossed AND minimum amounts met, InventoryView emits:
   estimated_value_usd }`
 - `UsdcImbalanceDetected { direction: AlpacaToBase/BaseToAlpaca, amount }`
 
-**Rebalancing Manager** (stateless) listens to these events and executes
-appropriate commands on EquityTransferToMarketMakingVenue,
-EquityTransferToHedgingVenue, or CrossVenueCashTransfer aggregates.
+**Rebalancer** (stateless) listens to these events and executes appropriate
+commands on TokenizedEquityMint, EquityRedemption, or UsdcRebalance aggregates.
 
 ##### Example Scenarios
 
@@ -1861,39 +1855,34 @@ know about cross-venue inventory.
   activity)
 - `PositionEvent::OffChainOrderFilled` - Updates available balances (trading
   activity)
-- `EquityTransferToMarketMakingVenueEvent::MintAccepted` - Moves shares to
-  inflight (leaving Alpaca)
-- `EquityTransferToMarketMakingVenueEvent::TokensReceived` - Moves from inflight
-  to Raindex available
-- `EquityTransferToMarketMakingVenueEvent::DepositedIntoRaindex` - No balance
-  change (completes transfer to Raindex, already counted at TokensReceived)
-- `EquityTransferToMarketMakingVenueEvent::RaindexDepositFailed` - No balance
-  change (tokens await retry or manual recovery)
-- `EquityTransferToMarketMakingVenueEvent::Completed` - No balance change
-  (finalization)
-- `EquityTransferToMarketMakingVenueEvent::MintRejected` - Reconciles inflight
-  back to Alpaca available
-- `EquityTransferToMarketMakingVenueEvent::MintAcceptanceFailed` - Reconciles
-  inflight back to Alpaca available
-- `EquityTransferToHedgingVenueEvent::WithdrawnFromRaindex` - Moves tokens to
-  inflight (leaving Raindex vault)
-- `EquityTransferToHedgingVenueEvent::TokensSent` - Tokens sent to Alpaca (still
-  inflight)
-- `EquityTransferToHedgingVenueEvent::Completed` - Moves from inflight to Alpaca
+- `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
+  Alpaca)
+- `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex
   available
-- `EquityTransferToHedgingVenueEvent::DetectionFailed` - Tokens stranded (manual
-  recovery)
-- `EquityTransferToHedgingVenueEvent::RedemptionRejected` - Reconciles inflight
-  back to Raindex available (tokens returned by Alpaca)
-- `CrossVenueCashTransferEvent::WithdrawalConfirmed` - Moves USDC to inflight
-  (leaving source)
-- `CrossVenueCashTransferEvent::DepositConfirmed` - Terminal success for
-  AlpacaToBase; moves from inflight to destination available
-- `CrossVenueCashTransferEvent::ConversionConfirmed` - Terminal success for
-  BaseToAlpaca; moves from inflight to destination available
-- `CrossVenueCashTransferEvent::WithdrawalFailed`, `BridgingFailed`,
-  `DepositFailed`, `ConversionFailed` - Reconciles inflight back to source
+- `TokenizedEquityMintEvent::DepositedIntoRaindex` - No balance change
+  (completes transfer to Raindex, already counted at TokensReceived)
+- `TokenizedEquityMintEvent::RaindexDepositFailed` - No balance change (tokens
+  await retry or manual recovery)
+- `TokenizedEquityMintEvent::Completed` - No balance change (finalization)
+- `TokenizedEquityMintEvent::MintRejected` - Reconciles inflight back to Alpaca
   available
+- `TokenizedEquityMintEvent::MintAcceptanceFailed` - Reconciles inflight back to
+  Alpaca available
+- `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
+  (leaving Raindex vault)
+- `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
+- `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
+- `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)
+- `EquityRedemptionEvent::RedemptionRejected` - Reconciles inflight back to
+  Raindex available (tokens returned by Alpaca)
+- `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
+  source)
+- `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;
+  moves from inflight to destination available
+- `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
+  moves from inflight to destination available
+- `UsdcRebalanceEvent::WithdrawalFailed`, `BridgingFailed`, `DepositFailed`,
+  `ConversionFailed` - Reconciles inflight back to source available
 - `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
   vaults
 - `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
@@ -1906,8 +1895,8 @@ know about cross-venue inventory.
 ##### Separation of concerns
 
 - Position: Tracks trading-induced position changes
-- EquityTransferToMarketMakingVenue/EquityTransferToHedgingVenue: Tracks
-  rebalancing-induced equity movements
+- CrossVenueEquityTransfer: Tracks rebalancing-induced equity movements (mint
+  and redemption)
 - CrossVenueCashTransfer: Tracks rebalancing-induced USDC movements
 - InventoryView: Combines all events to calculate total inventory
 - InventorySnapshot: Records fetched balances from onchain vaults and offchain
@@ -1936,305 +1925,26 @@ balances and emitting them as events the system can react to:
   conductor task. Onchain polling uses the `vaultBalance2` contract call;
   offchain polling uses the `Executor::get_inventory()` trait method.
 
-### View Design
+### InventoryView
 
-#### Position View
+`InventoryView` aggregates inventory across onchain and offchain venues and
+detects imbalances that trigger rebalancing. It is the central projection that
+monitors total system inventory.
 
-**Purpose**: Current position state for all symbols, optimized for querying by
-symbol and position status.
+Each asset type (equities per symbol, USDC) is tracked via a generic
+`Inventory<T>` containing `Option<VenueBalance<T>>` per venue. The `Option`
+distinguishes "not yet polled" from "polled with zero balance" — imbalance
+detection requires both venues to have been initialized by snapshot events.
 
-##### View State
+`InventoryView` listens to trading events (onchain/offchain fills),
+`TokenizedEquityMintEvent`, `EquityRedemptionEvent`, `UsdcRebalanceEvent`, and
+`InventorySnapshotEvent` to maintain venue balances. Inflight tracking ensures
+assets in transit (minting, redeeming, bridging) are accounted for.
 
-The position view type is `Lifecycle<Position>` -- the `Lifecycle` wrapper
-implements `View<Self>` via a blanket impl for any `EventSourced` type, so the
-view is the aggregate's current state serialized to the `position_view` table.
-This avoids a separate view type and keeps the read model exactly in sync with
-the aggregate state.
-
-The view is materialized via a `SqliteQuery<Position>` (alias for
-`GenericQuery<SqliteViewRepository<...>>`) registered as a query processor on
-the position `Store`. Loading position state for reads goes through
-`GenericQuery::load()` rather than replaying events.
-
-#### OffchainTradeView
-
-**Purpose**: All broker executions with filtering by status and symbol.
-
-##### View State
-
-```rust
-enum OffchainTradeView {
-    Unavailable,
-    Execution {
-        execution_id: ExecutionId,
-        symbol: Symbol,
-        shares: FractionalShares,
-        direction: Direction,
-        broker: SupportedBroker,
-        status: ExecutionStatus,
-        broker_order_id: Option<BrokerOrderId>,
-        price: Option<Dollars>,
-        initiated_at: DateTime<Utc>,
-        completed_at: Option<DateTime<Utc>>,
-    },
-}
-
-enum ExecutionStatus {
-    Pending,
-    Submitted,
-    Filled,
-    Failed,
-}
-```
-
-**Projection Logic**: Updates on `OffchainOrderEvent::*`, building view of
-filled orders (which become trades)
-
-#### OnChainTradeView
-
-**Purpose**: Immutable record of all blockchain trades.
-
-##### View State
-
-```rust
-enum OnChainTradeView {
-    Unavailable,
-    Trade {
-        tx_hash: TxHash,
-        log_index: u64,
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        gas_used: Option<u64>,
-        pyth_price: Option<PythPrice>,
-        recorded_at: DateTime<Utc>,
-    },
-}
-```
-
-**Projection Logic**: Builds from `OnChainTradeEvent::Filled` and
-`OnChainTradeEvent::Enriched`
-
-#### MetricsPnLView
-
-**Purpose**: Profit/loss calculations per symbol over time.
-
-##### View State
-
-```rust
-enum MetricsPnLView {
-    Unavailable,
-    Metrics {
-        id: i64,
-        symbol: Symbol,
-        timestamp: DateTime<Utc>,
-        venue: Venue,
-        trade_id: i64,
-        trade_direction: Direction,
-        quantity: Decimal,
-        price_per_share: Decimal,
-        realized_pnl: Option<Decimal>,
-        cumulative_pnl: Decimal,
-        net_position_after: Decimal,
-    },
-}
-
-enum Venue {
-    OnChain,
-    OffChain { broker: SupportedBroker },
-}
-```
-
-**Projection Logic**: Calculates from both `OnChainTradeEvent::Filled` and
-`PositionEvent::OffChainOrderFilled` events
-
-#### EquityTransferToMarketMakingVenueView
-
-**Purpose**: Tracks all equity mint operations (Alpaca shares to onchain
-tokens).
-
-##### View State
-
-```rust
-enum EquityTransferToMarketMakingVenueView {
-    Unavailable,
-    Mint {
-        mint_id: Uuid,
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        status: MintStatus,
-        issuer_request_id: Option<String>,
-        tokenization_request_id: Option<String>,
-        tx_hash: Option<TxHash>,
-        receipt_id: Option<U256>,
-        requested_at: DateTime<Utc>,
-        completed_at: Option<DateTime<Utc>>,
-    },
-}
-
-enum MintStatus {
-    Requested,
-    Accepted,
-    TokensReceived,
-    Completed,
-    Failed { reason: String },
-}
-```
-
-**Projection Logic**: Updates on `EquityTransferToMarketMakingVenueEvent::*`
-events
-
-#### EquityTransferToHedgingVenueView
-
-**Purpose**: Tracks all equity redemption operations (onchain tokens to Alpaca
-shares).
-
-##### View State
-
-```rust
-enum EquityTransferToHedgingVenueView {
-    Unavailable,
-    Redeem {
-        redeem_id: Uuid,
-        symbol: Symbol,
-        quantity: Decimal,
-        redemption_wallet: Address,
-        status: RedeemStatus,
-        tokenization_request_id: Option<String>,
-        tx_hash: Option<TxHash>,
-        sent_at: Option<DateTime<Utc>>,
-        completed_at: Option<DateTime<Utc>>,
-    },
-}
-
-enum RedeemStatus {
-    TokensSent,
-    Pending,
-    Completed,
-    Failed { reason: String },
-}
-```
-
-**Projection Logic**: Updates on `EquityTransferToHedgingVenueEvent::*` events
-
-#### CrossVenueCashTransferView
-
-**Purpose**: Tracks all USDC rebalancing operations across Alpaca and Base via
-Circle CCTP bridge.
-
-##### View State
-
-```rust
-enum CrossVenueCashTransferView {
-    Unavailable,
-    Rebalancing {
-        rebalancing_id: Uuid,
-        direction: RebalancingDirection,
-        amount: Usdc,
-        status: RebalancingStatus,
-        burn_tx_hash: Option<TxHash>,
-        mint_tx_hash: Option<TxHash>,
-        cctp_nonce: Option<u64>,
-        initiated_at: DateTime<Utc>,
-        completed_at: Option<DateTime<Utc>>,
-    },
-}
-
-enum RebalancingStatus {
-    Initiated,
-    SourceWithdrawn,
-    BridgeBurned,
-    AttestationReceived,
-    BridgeMinted,
-    DestinationDeposited,
-    Completed,
-    Failed { reason: String },
-}
-```
-
-**Projection Logic**: Updates on `CrossVenueCashTransferEvent::*` events
-
-#### InventoryView
-
-**Purpose**: Aggregates inventory across all venues and detects imbalances that
-trigger rebalancing operations. This is the central view that monitors total
-system inventory.
-
-##### View State
-
-```rust
-struct InventoryView {
-    per_symbol: HashMap<Symbol, SymbolInventory>,
-    usdc: UsdcInventory,
-    last_updated: DateTime<Utc>,
-}
-
-struct VenueBalance {
-    available: Decimal,
-    inflight: Decimal,
-}
-
-struct SymbolInventory {
-    symbol: Symbol,
-    onchain: VenueBalance,
-    offchain: VenueBalance,
-    last_rebalancing: Option<DateTime<Utc>>,
-}
-
-struct UsdcInventory {
-    onchain: VenueBalance,
-    offchain: VenueBalance,
-    last_rebalancing: Option<DateTime<Utc>>,
-}
-```
-
-**Projection Logic**: Listens to multiple event streams and updates inventory.
-
-**Trading Events**: Update available balances at the venue where trading occurs
-(onchain fills affect onchain available, offchain fills affect offchain
-available).
-
-**Equity Minting Events** (shares -> tokens):
-
-- When minting is accepted, shares move from offchain available to offchain
-  inflight
-- When minting completes, shares are removed from offchain inflight and tokens
-  are added to onchain available
-- When minting fails, shares move from offchain inflight back to offchain
-  available
-
-**Equity Redemption Events** (tokens -> shares):
-
-- When tokens are sent to redemption wallet, tokens move from onchain available
-  to onchain inflight
-- When redemption completes, tokens are removed from onchain inflight and shares
-  are added to offchain available
-- When redemption fails, tokens move from onchain inflight back to onchain
-  available
-
-**USDC Rebalancing Events**: Similar pattern - withdrawal moves assets from
-source venue's available to inflight, completion moves from inflight to
-destination venue's available, failure reconciles inflight back to source
-venue's available.
-
-**Imbalance Detection**: After each update, calculates imbalance ratios using
-total inventory (available + inflight). Compares ratios against configured
-thresholds and minimum amounts. Only triggers rebalancing when no inflight
-operations exist for that symbol/USDC to prevent redundant operations.
-
-For each symbol independently, compares equity ratio against target (e.g., 0.5)
-with deviation threshold (e.g., 0.2). Triggers mint when too much offchain,
-triggers redeem when too much onchain.
-
-For global USDC, compares USDC ratio against target (e.g., 0.5) with deviation
-threshold (e.g., 0.3). Triggers AlpacaToBase when too much offchain, triggers
-BaseToAlpaca when too much onchain.
-
-Trigger events are emitted to RebalancingManager for execution.
+Imbalance detection compares each asset's onchain ratio against a configurable
+`ImbalanceThreshold` (target ratio + deviation). Rebalancing is only triggered
+when no inflight operations exist for the asset. Trigger events are emitted to
+`Rebalancer` for execution.
 
 #### Failure Handling and Reconciliation
 
@@ -2386,7 +2096,7 @@ sequenceDiagram
     App->>App: Extract Pyth Price
     App->>OT: OnChainTradeCommand::Enrich
     OT-->>App: OnChainTradeEvent::Enriched
-    App->>Views: Update OnChainTradeView
+    App->>Views: Update projections
 ```
 
 #### Manager Pattern
@@ -2501,44 +2211,33 @@ src/                              - Main st0x-hedge library crate
   bin/
     server.rs                     - Main arbitrage bot server
     cli.rs                        - CLI for manual operations
-    reporter.rs                   - P&L reporter binary (deprecated)
-  position.rs                     - Position aggregate (commands, events, state in one file)
+  position.rs                     - Position aggregate
   onchain_trade.rs                - OnChainTrade aggregate
   offchain_order.rs               - OffchainOrder aggregate
+  tokenized_equity_mint.rs        - TokenizedEquityMint aggregate
+  equity_redemption.rs            - EquityRedemption aggregate
+  usdc_rebalance.rs               - UsdcRebalance aggregate
+  vault_registry.rs               - VaultRegistry aggregate
   shares.rs                       - FractionalShares newtype and arithmetic
-  threshold.rs                    - Execution threshold logic
+  threshold.rs                    - Execution threshold and Usdc/Dollars newtypes
   queue.rs                        - Event queue for idempotent processing
-  onchain/                        - Blockchain event processing
-  offchain/                       - Off-chain order execution
-  conductor/                      - Trade accumulation and execution orchestration
-  reporter/                       - FIFO P&L calculation and metrics
-  symbol/                         - Token symbol caching and locking
-  alpaca_wallet/                  - Alpaca cryptocurrency wallet management
+  config.rs                       - Application configuration
   api.rs                          - REST API endpoints
-  env.rs                          - Environment configuration
-  cctp.rs                         - Cross-chain token bridge (Circle CCTP)
+  tokenization.rs                 - Tokenizer trait and Alpaca tokenization
+  onchain/                        - Blockchain event processing, Raindex service
+  offchain/                       - Off-chain order execution and polling
+  conductor/                      - Trade accumulation and execution orchestration
+  inventory/                      - Cross-venue inventory tracking and imbalance detection
+  rebalancing/                    - Cross-venue transfer orchestration and triggers
+  symbol/                         - Token symbol caching and locking
+  alpaca_wallet/                  - Alpaca cryptocurrency wallet and CCTP bridge
+  dashboard/                      - Admin dashboard event streaming
+  cli/                            - CLI subcommands
 crates/
-  execution/                      - Trade execution library
-    src/
-      lib.rs                      - Executor trait and shared types
-      order/                      - Shared order types
-      schwab/
-        mod.rs                    - SchwabExecutor, SchwabAuthEnv, SchwabError
-        auth/                     - CQRS submodule (cmd.rs, event.rs, view.rs, oauth.rs)
-        executor.rs, order.rs, etc. - Private implementation
-      alpaca_trading_api/         - Alpaca Trading API implementation
-      alpaca_broker_api/          - Alpaca Broker API implementation
-      mock.rs                     - Mock implementation for testing
-```
-
-### Dependencies
-
-Add to `Cargo.toml`:
-
-```toml
-[dependencies]
-sqlite-es = "0.1"  # Will be published open source
-cqrs-es = "0.4"
+  bridge/                         - Circle CCTP bridge abstraction
+  dto/                            - TypeScript binding generation for dashboard
+  event-sorcery/                  - CQRS/ES framework (EventSourced, Store, Reactor, Projection)
+  execution/                      - Trade execution library (Executor trait, Schwab, Alpaca)
 ```
 
 ---
@@ -2929,8 +2628,8 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
    price, timestamp, venue.
 
 5. **Rebalancing** (Alpaca only): Active rebalancing operations with live status
-   updates (EquityTransferToMarketMakingVenue, EquityTransferToHedgingVenue,
-   CrossVenueCashTransfer). Below that, recent completed/failed rebalances.
+   updates (CrossVenueEquityTransfer, CrossVenueCashTransfer). Below that,
+   recent completed/failed rebalances.
 
 6. **Live Events**: Real-time stream of domain events as they occur
    (aggregate_type, aggregate_id, sequence, event_type, timestamp). Payloads

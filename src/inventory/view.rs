@@ -885,6 +885,26 @@ mod tests {
     }
 
     #[test]
+    fn ratio_returns_none_when_onchain_uninitialized() {
+        let inventory = Inventory {
+            onchain: None,
+            offchain: Some(venue(100, 0)),
+            last_rebalancing: None,
+        };
+        assert!(inventory.ratio().is_none());
+    }
+
+    #[test]
+    fn ratio_returns_none_when_offchain_uninitialized() {
+        let inventory = Inventory {
+            onchain: Some(venue(100, 0)),
+            offchain: None,
+            last_rebalancing: None,
+        };
+        assert!(inventory.ratio().is_none());
+    }
+
+    #[test]
     fn has_inflight_false_when_no_inflight() {
         let inventory = make_inventory(50, 0, 50, 0);
         assert!(!inventory.has_inflight());
