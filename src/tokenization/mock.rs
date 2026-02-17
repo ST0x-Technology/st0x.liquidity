@@ -52,6 +52,7 @@ pub(crate) struct MockTokenizer {
     mint_poll_outcome: MockMintPollOutcome,
     detection_outcome: Option<MockDetectionOutcome>,
     completion_outcome: Option<MockCompletionOutcome>,
+    should_fail_send: bool,
 }
 
 impl MockTokenizer {
@@ -63,6 +64,7 @@ impl MockTokenizer {
             mint_poll_outcome: MockMintPollOutcome::Completed,
             detection_outcome: None,
             completion_outcome: None,
+            should_fail_send: false,
         }
     }
 
@@ -83,6 +85,11 @@ impl MockTokenizer {
 
     pub(crate) fn with_completion_outcome(mut self, outcome: MockCompletionOutcome) -> Self {
         self.completion_outcome = Some(outcome);
+        self
+    }
+
+    pub(crate) fn with_send_failure(mut self) -> Self {
+        self.should_fail_send = true;
         self
     }
 }
@@ -141,6 +148,12 @@ impl Tokenizer for MockTokenizer {
         _token: Address,
         _amount: U256,
     ) -> Result<TxHash, TokenizerError> {
+        if self.should_fail_send {
+            return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "mock send_for_redemption failure".to_string(),
+            }));
+        }
         Ok(self.redemption_tx)
     }
 

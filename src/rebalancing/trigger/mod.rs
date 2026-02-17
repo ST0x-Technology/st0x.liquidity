@@ -662,6 +662,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_usdc_disabled_does_not_send() {
+        let (sender, mut receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let trigger = RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity: test_config().equity,
+                usdc: UsdcRebalancing::Disabled,
+            },
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            sender,
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty when USDC rebalancing is disabled"
+        );
+    }
+
+    #[tokio::test]
     async fn test_clear_equity_in_progress() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();

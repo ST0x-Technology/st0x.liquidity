@@ -508,7 +508,7 @@ mod tests {
         let rebalancer = services.into_rebalancer(
             &config,
             RebalancerAddresses {
-                market_maker_wallet: config.redemption_wallet,
+                market_maker_wallet: Address::random(),
             },
             rx,
             frameworks,

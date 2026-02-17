@@ -405,6 +405,9 @@ mod tests {
     use super::*;
     use crate::Table;
 
+    // Required for ReactorHarness::receive to resolve HasEntity<Counter>.
+    crate::register_entities!(Counter);
+
     /// Minimal counter entity for testing replay and harness.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Counter {
@@ -570,5 +573,93 @@ mod tests {
             .then_expect_error();
 
         assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_store_send_and_load() {
+        let store = TestStore::<Counter>::new(());
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 5 })
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(entity.value, 5);
+    }
+
+    #[tokio::test]
+    async fn test_store_load_nonexistent_returns_none() {
+        let store = TestStore::<Counter>::new(());
+
+        let result = store.load(&"nonexistent".to_string()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_multiple_commands() {
+        let store = TestStore::<Counter>::new(());
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 0 })
+            .await
+            .unwrap();
+        store.send(&id, CounterCommand::Increment).await.unwrap();
+        store.send(&id, CounterCommand::Increment).await.unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(entity.value, 2);
+    }
+
+    #[tokio::test]
+    async fn spy_reactor_captures_events() {
+        let spy = SpyReactor::<Counter>::new();
+        let store = TestStore::<Counter>::with_reactor(Arc::new(spy.clone()));
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 42 })
+            .await
+            .unwrap();
+
+        let captured = spy.events().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "counter-1");
+        assert_eq!(captured[0].1, CounterEvent::Created { initial: 42 });
+    }
+
+    #[tokio::test]
+    async fn spy_reactor_captures_multiple_events() {
+        let spy = SpyReactor::<Counter>::new();
+        let store = TestStore::<Counter>::with_reactor(Arc::new(spy.clone()));
+        let id = "counter-1".to_string();
+
+        store
+            .send(&id, CounterCommand::Create { initial: 0 })
+            .await
+            .unwrap();
+        store.send(&id, CounterCommand::Increment).await.unwrap();
+
+        let captured = spy.events().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].1, CounterEvent::Incremented);
+    }
+
+    #[tokio::test]
+    async fn reactor_harness_dispatches_to_spy() {
+        let spy = SpyReactor::<Counter>::new();
+        let harness = ReactorHarness::new(spy.clone());
+
+        harness
+            .receive::<Counter>("test-id".to_string(), CounterEvent::Created { initial: 7 })
+            .await
+            .unwrap();
+
+        let captured = spy.events().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "test-id");
+        assert_eq!(captured[0].1, CounterEvent::Created { initial: 7 });
     }
 }

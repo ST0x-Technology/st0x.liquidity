@@ -1552,8 +1552,8 @@ transfers work.
 
 **Middle layer -- Cross-venue transfer trait**: Abstracts the _how_. Each
 implementation is a complete directional transfer that accepts an amount and
-returns what arrived on the other end. The transfer steps (minting, bridging,
-vault operations) are encapsulated behind this trait.
+succeeds or fails. The transfer steps (minting, bridging, vault operations) are
+encapsulated behind this trait.
 
 ```rust
 /// Marker types for the two trading venues.

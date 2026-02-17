@@ -1024,6 +1024,35 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn redeem_with_send_failure_emits_vault_withdrawn_and_transfer_failed() {
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
+        };
+
+        let events = TestHarness::<EquityRedemption>::with(services)
+            .given_no_previous_events()
+            .when(EquityRedemptionCommand::Redeem {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: dec!(50.25),
+                token: Address::random(),
+                amount: U256::from(50_250_000_000_000_000_000_u128),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            EquityRedemptionEvent::VaultWithdrawn { .. }
+        ));
+        assert!(matches!(
+            events[1],
+            EquityRedemptionEvent::TransferFailed { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn redeem_when_already_started_returns_already_started() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
         let id = RedemptionAggregateId::new("redemption-1");
