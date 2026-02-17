@@ -11,8 +11,10 @@ pub(crate) struct MockWrapper {
     owner: Address,
     unwrap_tx: TxHash,
     unwrapped_token: Address,
+    wrapped_token: Address,
     ratio: U256,
     wrap_fails: bool,
+    unwrap_fails: bool,
 }
 
 impl MockWrapper {
@@ -21,8 +23,10 @@ impl MockWrapper {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
             unwrapped_token: Address::random(),
+            wrapped_token: Address::random(),
             ratio: RATIO_ONE,
             wrap_fails: false,
+            unwrap_fails: false,
         }
     }
 
@@ -32,8 +36,10 @@ impl MockWrapper {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
             unwrapped_token: Address::random(),
+            wrapped_token: Address::random(),
             ratio,
             wrap_fails: false,
+            unwrap_fails: false,
         }
     }
 
@@ -43,8 +49,23 @@ impl MockWrapper {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
             unwrapped_token: Address::random(),
+            wrapped_token: Address::random(),
             ratio: RATIO_ONE,
             wrap_fails: true,
+            unwrap_fails: false,
+        }
+    }
+
+    /// Creates a mock wrapper that fails on unwrap operations.
+    pub(crate) fn failing_unwrap() -> Self {
+        Self {
+            owner: Address::random(),
+            unwrap_tx: TxHash::random(),
+            unwrapped_token: Address::random(),
+            wrapped_token: Address::random(),
+            ratio: RATIO_ONE,
+            wrap_fails: false,
+            unwrap_fails: true,
         }
     }
 }
@@ -60,6 +81,10 @@ impl Wrapper for MockWrapper {
 
     fn lookup_unwrapped(&self, _symbol: &Symbol) -> Result<Address, WrapperError> {
         Ok(self.unwrapped_token)
+    }
+
+    fn lookup_wrapped(&self, _symbol: &Symbol) -> Result<Address, WrapperError> {
+        Ok(self.wrapped_token)
     }
 
     async fn to_wrapped(
@@ -82,6 +107,9 @@ impl Wrapper for MockWrapper {
         _receiver: Address,
         _owner: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
+        if self.unwrap_fails {
+            return Err(WrapperError::MissingWithdrawEvent);
+        }
         // 1:1 ratio for mock - underlying amount equals wrapped amount
         Ok((self.unwrap_tx, wrapped_amount))
     }

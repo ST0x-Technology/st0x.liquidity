@@ -178,7 +178,7 @@ impl Conductor {
 
         let vault_registry = Arc::new(
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .with(Arc::new((*vault_registry_projection).clone()))
+                .with(vault_registry_projection.clone())
                 .build(())
                 .await?,
         );
@@ -217,7 +217,7 @@ impl Conductor {
 
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with(Arc::new((*offchain_order_projection).clone()))
+                .with(offchain_order_projection.clone())
                 .build(order_placer)
                 .await?,
         );
@@ -3651,7 +3651,7 @@ mod tests {
 
         let triggered = receiver.try_recv().unwrap();
         let TriggeredOperation::Redemption {
-            symbol: s,
+            symbol: redeemed_symbol,
             quantity,
             wrapped_token,
             ..
@@ -3659,7 +3659,7 @@ mod tests {
         else {
             panic!("Expected Redemption, got {triggered:?}");
         };
-        assert_eq!(s, symbol);
+        assert_eq!(redeemed_symbol, symbol);
         assert_eq!(quantity, FractionalShares::new(dec!(25)));
         assert_eq!(wrapped_token, test_token);
     }
@@ -3691,7 +3691,7 @@ mod tests {
 
         let first = receiver.try_recv().unwrap();
         let TriggeredOperation::Redemption {
-            symbol: s,
+            symbol: redeemed_symbol,
             quantity,
             wrapped_token,
             ..
@@ -3699,7 +3699,7 @@ mod tests {
         else {
             panic!("Expected Redemption, got {first:?}");
         };
-        assert_eq!(s, symbol);
+        assert_eq!(redeemed_symbol, symbol);
         assert_eq!(quantity, FractionalShares::new(dec!(25)));
         assert_eq!(wrapped_token, test_token);
 

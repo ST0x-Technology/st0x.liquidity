@@ -1,12 +1,12 @@
 //! WrapperService implementation for ERC-4626 token wrapping/unwrapping.
 
-use std::collections::HashMap;
-
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::collections::HashMap;
+
 use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
@@ -88,6 +88,14 @@ where
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
         Ok(addresses.unwrapped)
+    }
+
+    fn lookup_wrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+        let addresses = self
+            .lookup_equity(symbol)
+            .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
+
+        Ok(addresses.wrapped)
     }
 
     async fn to_wrapped(

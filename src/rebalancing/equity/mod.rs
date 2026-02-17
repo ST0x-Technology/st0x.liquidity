@@ -324,7 +324,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
         let Equity { symbol, quantity } = asset;
         let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
 
-        debug!(issuer_request_id = %issuer_request_id.0, wallet = %self.wallet, "Requesting mint");
+        debug!(%issuer_request_id, wallet = %self.wallet, "Requesting mint");
 
         self.mint_store
             .send(
@@ -348,10 +348,10 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
 
-        let unwrapped_token = self.wrapper.lookup_unwrapped(&symbol)?;
+        let wrapped_token = self.wrapper.lookup_wrapped(&symbol)?;
         let (wrap_tx_hash, wrapped_shares) = self
             .wrapper
-            .to_wrapped(unwrapped_token, shares_minted, self.wallet)
+            .to_wrapped(wrapped_token, shares_minted, self.wallet)
             .await?;
 
         self.mint_store
@@ -366,11 +366,11 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         info!(%wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
 
-        let vault_id = self.raindex.lookup_vault_id(unwrapped_token).await?;
+        let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
         let vault_deposit_tx_hash = self
             .raindex
             .deposit(
-                unwrapped_token,
+                wrapped_token,
                 vault_id,
                 wrapped_shares,
                 TOKENIZED_EQUITY_DECIMALS,
@@ -406,7 +406,7 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
         let amount = quantity.to_u256_18_decimals()?;
         let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
-        info!(%token, %amount, aggregate_id = %aggregate_id.0, "Starting equity transfer to hedging venue");
+        info!(%token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
 
         self.withdraw_from_raindex(&aggregate_id, &symbol, quantity, token, amount)
             .await?;

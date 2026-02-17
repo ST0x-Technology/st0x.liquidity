@@ -1241,6 +1241,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unwrap_failure_returns_unwrap_failed_error() {
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::failing_unwrap()),
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![withdrawn_from_raindex_event()])
+            .when(EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::UnwrapFailed { .. })
+            ),
+            "Expected UnwrapFailed error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn redeem_when_already_started_returns_already_started() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
         let id = RedemptionAggregateId::new("redemption-1");

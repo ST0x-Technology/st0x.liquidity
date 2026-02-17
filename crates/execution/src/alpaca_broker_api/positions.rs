@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_inventory_truncates_sub_cent_market_value() {
+    async fn fetch_inventory_preserves_sub_cent_market_value() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -260,7 +260,6 @@ mod tests {
                     {
                         "symbol": "AAPL",
                         "qty": "10.0",
-                        // 1575.005 * 100 = 157500.5 -> truncates to 157500
                         "market_value": "1575.005"
                     }
                 ]));

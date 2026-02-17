@@ -1409,16 +1409,24 @@ enum EquityRedemption {
 ```rust
 enum EquityRedemptionCommand {
     // Withdraws wrapped tokens from Raindex vault to wallet
-    Withdraw {
+    Redeem {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
         amount: U256,
     },
-    // Unwraps ERC-4626 tokens to underlying unwrapped tokens
-    Unwrap,
-    // Sends unwrapped tokens to Alpaca and polls until terminal state
-    Send,
+    // Unwraps ERC-4626 wrapped tokens after Raindex withdrawal
+    UnwrapTokens,
+    // Sends unwrapped tokens to Alpaca's redemption wallet
+    SendTokens,
+    // Alpaca detected the token transfer
+    Detect { tokenization_request_id: TokenizationRequestId },
+    // Detection polling failed or timed out
+    FailDetection { failure: DetectionFailure },
+    // Redemption completed successfully
+    Complete,
+    // Alpaca rejected the redemption
+    RejectRedemption { reason: String },
 }
 ```
 

@@ -48,6 +48,9 @@ pub(crate) trait Wrapper: Send + Sync {
     /// Gets the unwrapped (underlying) token address for a symbol.
     fn lookup_unwrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
 
+    /// Gets the wrapped (ERC-4626 vault) token address for a symbol.
+    fn lookup_wrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
+
     /// Deposits underlying tokens to receive wrapped tokens.
     async fn to_wrapped(
         &self,

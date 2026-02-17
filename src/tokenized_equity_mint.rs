@@ -412,7 +412,25 @@ impl EventSourced for TokenizedEquityMint {
         use TokenizedEquityMintEvent::*;
 
         Ok(match event {
-            MintRequested { .. } | WrappingFailed { .. } => None,
+            MintRequested { .. } => None,
+
+            WrappingFailed {
+                symbol,
+                quantity,
+                failed_at,
+            } => {
+                let Self::TokensReceived { requested_at, .. } = entity else {
+                    return Ok(None);
+                };
+
+                Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    reason: "ERC-4626 wrapping failed".to_string(),
+                    requested_at: *requested_at,
+                    failed_at: *failed_at,
+                })
+            }
 
             MintRejected {
                 reason,
@@ -860,7 +878,7 @@ mod tests {
             matches!(
                 &events[1],
                 TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
-                    if issuer_request_id.0 == "ISS001"
+                    if *issuer_request_id == IssuerRequestId::new("ISS001")
             ),
             "Expected MintAccepted with ISS001, got: {:?}",
             events[1]
@@ -887,8 +905,6 @@ mod tests {
 
     #[tokio::test]
     async fn poll_rejected_emits_acceptance_failed() {
-        use crate::tokenization::mock::MockMintPollOutcome;
-
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = IssuerRequestId::new("ISS001");
@@ -1175,7 +1191,7 @@ mod tests {
         store.send(&id, mint_command()).await.unwrap();
 
         let recorded_id = tokenizer.last_issuer_request_id().unwrap();
-        assert_eq!(recorded_id.0, "ISS001");
+        assert_eq!(recorded_id, IssuerRequestId::new("ISS001"));
     }
 
     #[test]
@@ -1198,6 +1214,37 @@ mod tests {
         assert!(
             matches!(result, TokenizedEquityMint::Failed { ref reason, .. } if reason == "Insufficient balance"),
             "Expected Failed with reason, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_failed_evolves_from_tokens_received_to_failed() {
+        let tokens_received = TokenizedEquityMint::TokensReceived {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(10),
+            wallet: Address::random(),
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            tokenization_request_id: TokenizationRequestId("REQ001".to_string()),
+            tx_hash: TxHash::random(),
+            receipt_id: ReceiptId(U256::from(1)),
+            shares_minted: U256::from(10_000_000_000_000_000_000_u128),
+            requested_at: Utc::now(),
+            accepted_at: Utc::now(),
+            received_at: Utc::now(),
+        };
+
+        let event = TokenizedEquityMintEvent::WrappingFailed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(10),
+            failed_at: Utc::now(),
+        };
+
+        let result = TokenizedEquityMint::evolve(&tokens_received, &event)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state after wrapping failure, got: {result:?}"
         );
     }
 

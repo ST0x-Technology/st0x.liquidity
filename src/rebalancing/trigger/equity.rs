@@ -189,8 +189,8 @@ mod tests {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
-    fn shares(n: i64) -> FractionalShares {
-        FractionalShares::new(Decimal::from(n))
+    fn shares(quantity: i64) -> FractionalShares {
+        FractionalShares::new(Decimal::from(quantity))
     }
 
     fn make_imbalanced_view(

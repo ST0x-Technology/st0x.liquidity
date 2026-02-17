@@ -8,9 +8,10 @@
 
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
-use st0x_execution::AlpacaAccountId;
 use thiserror::Error;
 use tracing::debug;
+
+use st0x_execution::AlpacaAccountId;
 
 use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{WhitelistEntry, WhitelistStatus};
