@@ -17,7 +17,7 @@ use url::Url;
 
 use st0x_execution::{
     AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx, AlpacaTradingApiMode,
-    FractionalShares, Positive, SchwabCtx, SupportedExecutor,
+    FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
 };
 
 use crate::offchain::order_poller::OrderPollerCtx;
@@ -177,6 +177,8 @@ impl From<BrokerSecrets> for BrokerCtx {
                 api_secret,
                 account_id,
                 mode,
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::default(),
             }),
 
             BrokerSecrets::DryRun => Self::DryRun,
@@ -326,6 +328,16 @@ impl Ctx {
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
+        if let (Some(rebalancing_ctx), Some(configured_owner)) = (&rebalancing, evm.order_owner) {
+            let derived = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?.address();
+            if derived != configured_owner {
+                return Err(CtxError::OrderOwnerMismatch {
+                    configured: configured_owner,
+                    derived,
+                });
+            }
+        }
+
         if rebalancing.is_none() && evm.order_owner.is_none() {
             return Err(CtxError::MissingOrderOwner);
         }
@@ -352,7 +364,7 @@ impl Ctx {
         self.rebalancing.as_ref()
     }
 
-    pub const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
+    pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
         OrderPollerCtx {
             polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
             max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
@@ -391,6 +403,14 @@ pub enum CtxError {
     RebalancingSecretsMissing,
     #[error("rebalancing secrets present but rebalancing config missing in config")]
     RebalancingConfigMissing,
+    #[error(
+        "order_owner {configured} does not match market maker wallet \
+         {derived} derived from evm_private_key"
+    )]
+    OrderOwnerMismatch {
+        configured: Address,
+        derived: Address,
+    },
 }
 
 #[cfg(test)]
@@ -406,6 +426,7 @@ impl CtxError {
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",
+            Self::OrderOwnerMismatch { .. } => "order_owner mismatch",
         }
     }
 }
@@ -628,6 +649,7 @@ pub(crate) mod tests {
             app_key = "test_key"
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
             [rebalancing]
             ethereum_rpc_url = "https://mainnet.infura.io"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -641,12 +663,13 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+
+            [rebalancing.usdc]
+            mode = "disabled"
         "#;
 
         let result = Ctx::from_toml(config, secrets);
@@ -693,10 +716,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rebalancing_ignores_evm_order_owner_field() {
+    fn rebalancing_with_mismatched_order_owner_fails() {
         let config = example_config_toml().replace(
             "deployment_block = 1",
             "order_owner = \"0xcccccccccccccccccccccccccccccccccccccccc\"\ndeployment_block = 1",
+        );
+
+        let error = Ctx::from_toml(&config, example_secrets_toml()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::OrderOwnerMismatch { .. }),
+            "Expected OrderOwnerMismatch, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rebalancing_with_matching_order_owner_succeeds() {
+        // Private key 0x01 derives to 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+        let config = example_config_toml().replace(
+            "deployment_block = 1",
+            "order_owner = \"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\"\ndeployment_block = 1",
         );
 
         let ctx = Ctx::from_toml(&config, example_secrets_toml()).unwrap();
@@ -704,7 +742,6 @@ pub(crate) mod tests {
         assert_eq!(
             order_owner,
             address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"),
-            "order_owner() should derive from evm_private_key when rebalancing is enabled"
         );
     }
 
@@ -714,12 +751,10 @@ pub(crate) mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000000",
         );
 
-        let ctx = Ctx::from_toml(example_config_toml(), &secrets).unwrap();
-
-        let result = ctx.order_owner();
+        let error = Ctx::from_toml(example_config_toml(), &secrets).unwrap_err();
         assert!(
-            matches!(result, Err(CtxError::PrivateKeyDerivation(_))),
-            "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
+            matches!(error, CtxError::Rebalancing(_)),
+            "Expected Rebalancing error for zero private key, got {error:?}"
         );
     }
 
@@ -754,6 +789,7 @@ pub(crate) mod tests {
     fn telemetry_config_without_secrets_fails() {
         let config = r#"
             database_url = ":memory:"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -807,12 +843,13 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+
+            [rebalancing.usdc]
+            mode = "disabled"
         "#;
 
         let secrets = r#"
@@ -920,10 +957,11 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
+            [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -1015,6 +1053,27 @@ pub(crate) mod tests {
         assert!(
             matches!(err, CtxError::Toml(_)),
             "Expected TOML parse error for unknown broker field, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rebalancing_fails_when_market_maker_wallet_equals_redemption_wallet() {
+        // Private key 0x01 derives to 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+        let config = example_config_toml().replacen(
+            "redemption_wallet = \"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+            "redemption_wallet = \"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\"",
+            1,
+        );
+
+        let error = Ctx::from_toml(&config, example_secrets_toml()).unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::Rebalancing(_)),
+            "Expected Rebalancing error for matching wallets, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("must be different addresses"),
+            "Expected error about different addresses, got: {error}"
         );
     }
 }

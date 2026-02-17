@@ -63,11 +63,10 @@ pub fn decrypt_token(
     let ciphertext = token.as_bytes();
 
     if ciphertext.len() < NONCE_SIZE {
-        return Err(EncryptionError::InvalidCiphertext(format!(
-            "Ciphertext too short: expected at least {} bytes, got {}",
-            NONCE_SIZE,
-            ciphertext.len()
-        )));
+        return Err(EncryptionError::CiphertextTooShort {
+            expected_min_bytes: NONCE_SIZE,
+            actual_bytes: ciphertext.len(),
+        });
     }
 
     let (nonce_bytes, encrypted_data) = ciphertext.split_at(NONCE_SIZE);
@@ -88,8 +87,14 @@ pub enum EncryptionError {
     EncryptionFailed,
     #[error("Decryption failed (wrong key or corrupted data)")]
     DecryptionFailed,
-    #[error("Invalid ciphertext: {0}")]
-    InvalidCiphertext(String),
+    #[error(
+        "ciphertext too short: expected at least \
+         {expected_min_bytes} bytes, got {actual_bytes}"
+    )]
+    CiphertextTooShort {
+        expected_min_bytes: usize,
+        actual_bytes: usize,
+    },
     #[error("Decrypted data is not valid UTF-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("Hex decoding error: {0}")]
@@ -151,7 +156,7 @@ mod tests {
         let result = decrypt_token(&key, &token);
         assert!(matches!(
             result.unwrap_err(),
-            EncryptionError::InvalidCiphertext(_)
+            EncryptionError::CiphertextTooShort { .. }
         ));
     }
 

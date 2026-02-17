@@ -114,11 +114,12 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     Ok(())
 }
 
-fn build_cctp_bridge<BP: Provider + Clone>(
+fn build_cctp_bridge<BP: Provider + Clone + 'static>(
     ethereum_rpc_url: Url,
     base_provider: BP,
     signer: PrivateKeySigner,
-) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, CctpError> {
+) -> Result<CctpBridge<impl Provider + Clone + 'static, impl Provider + Clone + 'static>, CctpError>
+{
     let owner = signer.address();
 
     let ethereum_provider = ProviderBuilder::new()
@@ -263,7 +264,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
@@ -274,6 +275,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_rebalancing() -> Ctx {
@@ -303,20 +305,20 @@ mod tests {
             ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
             redemption_wallet: Address::ZERO,
+            market_maker_wallet: Address::ZERO,
             alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
             },
-            usdc_threshold: ImbalanceThreshold {
-                target: Decimal::from_str("0.5").unwrap(),
-                deviation: Decimal::from_str("0.1").unwrap(),
-            },
+            usdc: UsdcRebalancing::Disabled,
             alpaca_broker_auth: AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
                 account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::default(),
             },
         });
         ctx

@@ -17,7 +17,7 @@ in pkgs.stdenv.mkDerivation {
   dontRunLifecycleScripts = true;
 
   buildPhase = ''
-    st0x-dto
+    st0x-dto dashboard/src/lib/api
     cd dashboard
     bun run build
   '';

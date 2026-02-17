@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
 use super::auth::{AccountResponse, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+use super::executor::AssetResponse;
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
+use crate::Symbol;
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
@@ -105,6 +107,16 @@ impl AlpacaBrokerApiClient {
 
         debug!("Fetching order {} from {}", order_id, url);
 
+        self.get(&url).await
+    }
+
+    /// Get asset information by symbol
+    pub(super) async fn get_asset(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<AssetResponse, AlpacaBrokerApiError> {
+        let url = format!("{}/v1/assets/{symbol}", self.base_url);
+        debug!("Fetching asset info for {symbol}");
         self.get(&url).await
     }
 

@@ -5,18 +5,24 @@ pub enum PersistenceError {
     Database(#[from] sqlx::Error),
     #[error("Invalid direction in database: {0}")]
     InvalidDirection(#[from] crate::InvalidDirectionError),
-    #[error("Invalid trade status in database: {0}")]
-    InvalidTradeStatus(String),
+    #[error("Invalid trade status in database: {status_provided}")]
+    InvalidTradeStatus { status_provided: String },
+    #[error("Invalid price cents in database: {0}")]
+    InvalidPriceCents(i64),
     #[error("Execution missing ID after database save")]
     MissingExecutionId,
-    #[error("Invalid symbol in database: {0}")]
-    InvalidSymbol(String),
+    #[error("Invalid symbol in database: {symbol_provided}")]
+    InvalidSymbol { symbol_provided: String },
     #[error("Row not found for update: execution_id={execution_id}")]
     RowNotFound { execution_id: i64 },
     #[error("Execution not found: {0}")]
     ExecutionNotFound(i64),
     #[error("Execution error: {0}")]
     Execution(#[source] Box<crate::ExecutionError>),
+    #[error("Invalid shares in database: {0}")]
+    InvalidShares(#[from] crate::InvalidSharesError),
+    #[error("Decimal parse error: {0}")]
+    DecimalParse(#[from] rust_decimal::Error),
 }
 
 impl From<crate::ExecutionError> for PersistenceError {

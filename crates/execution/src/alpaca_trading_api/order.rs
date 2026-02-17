@@ -2,7 +2,7 @@ use apca::Client;
 use apca::api::v2::order;
 use chrono::Utc;
 use num_decimal::Num;
-use num_traits::ToPrimitive;
+use rust_decimal::Decimal;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -70,12 +70,12 @@ pub(super) async fn get_order_status(
 
     let status = map_alpaca_status_to_order_status(order_response.status);
 
-    let price_cents = extract_price_cents_from_order(&order_response)?;
+    let price = extract_price(&order_response)?;
 
     Ok(OrderUpdate {
         status,
         updated_at: Utc::now(),
-        price_cents,
+        price,
     })
 }
 
@@ -120,22 +120,14 @@ fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
     }
 }
 
-/// Extracts price in cents from Alpaca order
-fn extract_price_cents_from_order(
-    order: &order::Order,
-) -> Result<Option<u64>, AlpacaTradingApiError> {
-    if let Some(avg_fill_price) = &order.average_fill_price {
-        let price_str = format!("{avg_fill_price}");
-        let price_f64 = price_str.parse::<f64>()?;
-        let price_cents_float = (price_f64 * 100.0).round();
-        let price_cents = price_cents_float
-            .to_u64()
-            .ok_or(AlpacaTradingApiError::PriceConversion(price_f64))?;
+/// Extracts fill price as Decimal from Alpaca order
+fn extract_price(order: &order::Order) -> Result<Option<Decimal>, AlpacaTradingApiError> {
+    let Some(avg_fill_price) = &order.average_fill_price else {
+        return Ok(None);
+    };
 
-        Ok(Some(price_cents))
-    } else {
-        Ok(None)
-    }
+    let price: Decimal = format!("{avg_fill_price}").parse()?;
+    Ok(Some(price))
 }
 
 #[cfg(test)]
@@ -143,6 +135,7 @@ mod tests {
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
@@ -409,7 +402,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Submitted);
-        assert_eq!(order_update.price_cents, None);
+        assert_eq!(order_update.price, None);
     }
 
     #[tokio::test]
@@ -456,7 +449,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Filled);
-        assert_eq!(order_update.price_cents, Some(24567));
+        assert_eq!(order_update.price, Some(dec!(245.67)));
     }
 
     #[tokio::test]
@@ -503,7 +496,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Failed);
-        assert_eq!(order_update.price_cents, None);
+        assert_eq!(order_update.price, None);
     }
 
     #[tokio::test]
@@ -550,7 +543,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Submitted);
-        assert_eq!(order_update.price_cents, None);
+        assert_eq!(order_update.price, None);
     }
 
     proptest! {

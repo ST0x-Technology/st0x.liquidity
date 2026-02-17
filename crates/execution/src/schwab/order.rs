@@ -318,8 +318,10 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
+    use rust_decimal_macros::dec;
     use serde_json::json;
+
+    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
 
     #[test]
     fn test_new_buy() {
@@ -866,10 +868,8 @@ mod tests {
 
         assert_eq!(order_status.order_id, Some("1004055538123".to_string()));
         assert!(order_status.is_filled());
-        assert!((order_status.filled_quantity.unwrap() - 100.0).abs() < f64::EPSILON);
-        let avg_price = order_status.calculate_weighted_average_price().unwrap();
-        assert!((avg_price - 150.25).abs() < f64::EPSILON);
-        assert_eq!(order_status.price_in_cents().unwrap(), Some(15025));
+        assert_eq!(order_status.filled_quantity.unwrap(), dec!(100.0));
+        assert_eq!(order_status.price(), Some(dec!(150.25)));
     }
 
     #[tokio::test]
@@ -917,8 +917,8 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538456".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert!(order_status.filled_quantity.unwrap_or(0.0).abs() < f64::EPSILON);
-        assert_eq!(order_status.calculate_weighted_average_price(), None);
+        assert_eq!(order_status.filled_quantity, Some(dec!(0.0)));
+        assert_eq!(order_status.price(), None);
     }
 
     #[tokio::test]
@@ -982,13 +982,10 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538789".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert!((order_status.filled_quantity.unwrap() - 75.0).abs() < f64::EPSILON);
+        assert_eq!(order_status.filled_quantity.unwrap(), dec!(75.0));
         // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75 = 100.33333
-        assert!(
-            (order_status.calculate_weighted_average_price().unwrap() - 100.333_333_333_333_33)
-                .abs()
-                < 0.000_001
-        );
+        let expected_price = (dec!(50) * dec!(100.00) + dec!(25) * dec!(101.00)) / dec!(75);
+        assert_eq!(order_status.price(), Some(expected_price));
     }
 
     #[tokio::test]

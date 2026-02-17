@@ -7,38 +7,35 @@ use alloy::signers::local::PrivateKeySigner;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_event_sorcery::StoreBuilder;
+use st0x_event_sorcery::{Projection, StoreBuilder};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
+    TimeInForce,
 };
 
 use super::TransferDirection;
-use crate::alpaca_tokenization::{
-    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
-};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
-use crate::equity_redemption::RedemptionAggregateId;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::rebalancing::mint::Mint;
-use crate::rebalancing::redemption::Redeem;
-use crate::rebalancing::usdc::UsdcRebalanceManager;
-use crate::rebalancing::{MintManager, RedemptionManager};
+use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
+use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
+use crate::rebalancing::usdc::CrossVenueCashTransfer;
 use crate::threshold::Usdc;
+use crate::tokenization::{
+    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
+};
 use crate::tokenized_equity_mint::IssuerRequestId;
-use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::vault_registry::VaultRegistry;
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
     direction: TransferDirection,
     symbol: &Symbol,
     quantity: FractionalShares,
-    token_address: Option<Address>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -76,47 +73,94 @@ pub(super) async fn transfer_equity_command<W: Write>(
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
 
-            let mint_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
-            let mint_manager = MintManager::new(tokenization_service, mint_store);
-
-            let issuer_request_id =
-                IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
-
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
             let wallet = signer.address();
 
-            writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
+            let vault_registry_projection =
+                Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+            let raindex = Arc::new(RaindexService::new(
+                base_provider,
+                ctx.evm.orderbook,
+                vault_registry_projection.clone(),
+                wallet,
+            ));
+
+            let services = EquityTransferServices {
+                raindex: raindex.clone(),
+                tokenizer: tokenization_service.clone(),
+            };
+
+            let mint_store = Arc::new(
+                StoreBuilder::new(pool.clone())
+                    .build(services.clone())
+                    .await?,
+            );
+            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
+
+            let equity_transfer = CrossVenueEquityTransfer::new(
+                raindex,
+                tokenization_service,
+                wallet,
+                mint_store,
+                redemption_store,
+            );
+
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
 
-            mint_manager
-                .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
-                .await?;
+            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+                &equity_transfer,
+                Equity {
+                    symbol: symbol.clone(),
+                    quantity,
+                },
+            )
+            .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
         }
 
         TransferDirection::ToAlpaca => {
-            let token = token_address.ok_or_else(|| {
-                anyhow::anyhow!("--token-address is required for to-alpaca direction (redemption)")
-            })?;
-
-            writeln!(stdout, "   Token Address: {token}")?;
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
-            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_store);
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+            let owner = signer.address();
+            let vault_registry_projection =
+                Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+            let raindex = Arc::new(RaindexService::new(
+                base_provider,
+                ctx.evm.orderbook,
+                vault_registry_projection,
+                owner,
+            ));
 
-            let aggregate_id =
-                RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
+            let services = EquityTransferServices {
+                raindex: raindex.clone(),
+                tokenizer: tokenization_service.clone(),
+            };
 
-            let amount = quantity.to_u256_18_decimals()?;
+            let mint_store = Arc::new(
+                StoreBuilder::new(pool.clone())
+                    .build(services.clone())
+                    .await?,
+            );
+            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
 
-            writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
-            writeln!(stdout, "   Amount (wei): {amount}")?;
+            let equity_transfer = CrossVenueEquityTransfer::new(
+                raindex,
+                tokenization_service,
+                owner,
+                mint_store,
+                redemption_store,
+            );
 
-            redemption_manager
-                .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-                .await?;
+            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
+                &equity_transfer,
+                Equity {
+                    symbol: symbol.clone(),
+                    quantity,
+                },
+            )
+            .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;
         }
@@ -174,6 +218,8 @@ where
         api_secret: alpaca_auth.api_secret.clone(),
         account_id: rebalancing_config.alpaca_account_id.to_string(),
         mode: Some(broker_mode),
+        asset_cache_ttl: std::time::Duration::from_secs(3600),
+        time_in_force: TimeInForce::default(),
     };
 
     let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
@@ -194,40 +240,42 @@ where
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
     })?);
-    let vault_service = Arc::new(VaultService::new(
+    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+    let vault_service = Arc::new(RaindexService::new(
         base_provider_with_wallet,
         ctx.evm.orderbook,
+        vault_registry_projection,
+        owner,
     ));
     let usdc_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
 
-    let rebalance_manager = UsdcRebalanceManager::new(
+    let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
         alpaca_wallet,
         bridge,
         vault_service,
         usdc_store,
         owner,
-        VaultId(rebalancing_config.usdc_vault_id),
+        RaindexVaultId(rebalancing_config.usdc_vault_id),
     );
 
-    let rebalance_id = UsdcRebalanceId::new(format!("cli-usdc-{}", uuid::Uuid::new_v4()));
-    writeln!(
-        stdout,
-        "   Rebalance ID: {} (may take several minutes)",
-        rebalance_id.0
-    )?;
+    writeln!(stdout, "   Transfer may take several minutes...")?;
 
     match direction {
         TransferDirection::ToRaindex => {
-            rebalance_manager
-                .execute_alpaca_to_base(&rebalance_id, amount)
-                .await?;
+            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+                &rebalance_manager,
+                amount,
+            )
+            .await?;
             writeln!(stdout, "USDC transfer to Raindex completed successfully")?;
         }
         TransferDirection::ToAlpaca => {
-            rebalance_manager
-                .execute_base_to_alpaca(&rebalance_id, amount)
-                .await?;
+            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
+                &rebalance_manager,
+                amount,
+            )
+            .await?;
             writeln!(stdout, "USDC transfer to Alpaca completed successfully")?;
         }
     }
@@ -280,8 +328,14 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
+    let issuer_request_id = IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
     let request = tokenization_service
-        .request_mint(symbol.clone(), quantity, receiving_wallet)
+        .request_mint(
+            symbol.clone(),
+            quantity,
+            receiving_wallet,
+            issuer_request_id,
+        )
         .await?;
 
     writeln!(stdout, "   Request ID: {}", request.id.0)?;
@@ -308,7 +362,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Polling for tokens to arrive on Base...")?;
 
-    let poll_interval = Duration::from_secs(5);
+    let poll_interval = std::time::Duration::from_secs(5);
     let max_attempts = 60; // 5 minutes max
 
     for attempt in 1..=max_attempts {
@@ -381,14 +435,12 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Sending tokens to redemption wallet...")?;
 
-    let tx_hash = tokenization_service
-        .send_for_redemption(token, amount)
-        .await?;
+    let tx_hash = Tokenizer::send_for_redemption(&tokenization_service, token, amount).await?;
 
     writeln!(stdout, "   Transfer tx: {tx_hash}")?;
     writeln!(stdout, "   Waiting for Alpaca to detect transfer...")?;
 
-    let request = tokenization_service.poll_for_redemption(&tx_hash).await?;
+    let request = Tokenizer::poll_for_redemption(&tokenization_service, &tx_hash).await?;
 
     writeln!(stdout, "   Request ID: {}", request.id.0)?;
     writeln!(stdout, "   Status: {:?}", request.status)?;
@@ -396,9 +448,8 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     if request.status == TokenizationRequestStatus::Pending {
         writeln!(stdout, "   Polling until completion...")?;
 
-        let completed = tokenization_service
-            .poll_redemption_until_complete(&request.id)
-            .await?;
+        let completed =
+            Tokenizer::poll_redemption_until_complete(&tokenization_service, &request.id).await?;
 
         writeln!(stdout, "   Final status: {:?}", completed.status)?;
 
@@ -507,7 +558,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use std::str::FromStr;
     use url::Url;
 
@@ -544,6 +595,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         });
         ctx
     }
@@ -566,7 +619,6 @@ mod tests {
             TransferDirection::ToRaindex,
             &symbol,
             quantity,
-            None,
             &ctx,
             &pool,
         )
@@ -592,7 +644,6 @@ mod tests {
             TransferDirection::ToRaindex,
             &symbol,
             quantity,
-            None,
             &ctx,
             &pool,
         )
@@ -688,6 +739,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
@@ -710,6 +763,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Production),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {

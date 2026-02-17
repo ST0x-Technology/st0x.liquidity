@@ -4,16 +4,17 @@
 //! onchain vaults and offchain brokers. Events are consumed by InventoryView
 //! to reconcile tracked inventory with actual balances.
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
-
+use alloy::hex::FromHexError;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use st0x_execution::{FractionalShares, Symbol};
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use thiserror::Error;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Table};
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::threshold::Usdc;
 
@@ -31,19 +32,33 @@ impl std::fmt::Display for InventorySnapshotId {
     }
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum ParseInventorySnapshotIdError {
+    #[error("expected 'orderbook:owner', got '{id_provided}'")]
+    MissingDelimiter { id_provided: String },
+
+    #[error("invalid orderbook address: {0}")]
+    Orderbook(FromHexError),
+
+    #[error("invalid owner address: {0}")]
+    Owner(FromHexError),
+}
+
 impl FromStr for InventorySnapshotId {
-    type Err = String;
+    type Err = ParseInventorySnapshotIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (orderbook_str, owner_str) = value
-            .split_once(':')
-            .ok_or_else(|| format!("expected 'orderbook:owner', got '{value}'"))?;
+        let (orderbook_str, owner_str) = value.split_once(':').ok_or_else(|| {
+            ParseInventorySnapshotIdError::MissingDelimiter {
+                id_provided: value.to_string(),
+            }
+        })?;
         let orderbook = orderbook_str
             .parse()
-            .map_err(|err| format!("invalid orderbook address: {err}"))?;
+            .map_err(ParseInventorySnapshotIdError::Orderbook)?;
         let owner = owner_str
             .parse()
-            .map_err(|err| format!("invalid owner address: {err}"))?;
+            .map_err(ParseInventorySnapshotIdError::Owner)?;
         Ok(Self { orderbook, owner })
     }
 }
@@ -72,6 +87,7 @@ impl EventSourced for InventorySnapshot {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
+    const PROJECTION: Option<Table> = None;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -86,8 +102,8 @@ impl EventSourced for InventorySnapshot {
         Some(snapshot)
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
-        let mut snapshot = state.clone();
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
+        let mut snapshot = entity.clone();
         snapshot.apply_event(event);
         Ok(Some(snapshot))
     }
@@ -234,13 +250,50 @@ impl DomainEvent for InventorySnapshotEvent {
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
-    use st0x_event_sorcery::Aggregate;
     use std::str::FromStr;
 
     use super::*;
-    use st0x_event_sorcery::Lifecycle;
+    use st0x_event_sorcery::{TestHarness, replay};
 
-    type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
+    #[test]
+    fn inventory_snapshot_id_roundtrips_through_display_and_parse() {
+        let id = InventorySnapshotId {
+            orderbook: Address::repeat_byte(0xAB),
+            owner: Address::repeat_byte(0xCD),
+        };
+
+        let parsed: InventorySnapshotId = id.to_string().parse().unwrap();
+
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn inventory_snapshot_id_missing_delimiter() {
+        let error = "0xdeadbeef".parse::<InventorySnapshotId>().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseInventorySnapshotIdError::MissingDelimiter { .. }
+        ));
+    }
+
+    #[test]
+    fn inventory_snapshot_id_invalid_orderbook() {
+        let error = "not_hex:0xCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCdCd"
+            .parse::<InventorySnapshotId>()
+            .unwrap_err();
+
+        assert!(matches!(error, ParseInventorySnapshotIdError::Orderbook(_)));
+    }
+
+    #[test]
+    fn inventory_snapshot_id_invalid_owner() {
+        let error = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb:not_hex"
+            .parse::<InventorySnapshotId>()
+            .unwrap_err();
+
+        assert!(matches!(error, ParseInventorySnapshotIdError::Owner(_)));
+    }
 
     fn test_symbol(s: &str) -> Symbol {
         Symbol::new(s).unwrap()
@@ -252,20 +305,16 @@ mod tests {
 
     #[tokio::test]
     async fn first_command_initializes_aggregate() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OnchainEquity {
-                    balances: balances.clone(),
-                },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OnchainEquity {
+                balances: balances.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -281,27 +330,19 @@ mod tests {
 
     #[tokio::test]
     async fn record_onchain_equity_on_existing_aggregate() {
-        let mut aggregate = InventorySnapshotAggregate::default();
-
-        // First event initializes
-        aggregate.apply(InventorySnapshotEvent::OnchainCash {
-            usdc_balance: Usdc::from_str("1000").unwrap(),
-            fetched_at: Utc::now(),
-        });
-
-        // Second event updates
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OnchainEquity {
-                    balances: balances.clone(),
-                },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OnchainCash {
+                usdc_balance: Usdc::from_str("1000").unwrap(),
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::OnchainEquity {
+                balances: balances.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -317,14 +358,13 @@ mod tests {
 
     #[tokio::test]
     async fn record_onchain_cash_emits_event() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let usdc_balance = Usdc::from_str("10000.50").unwrap();
 
-        let events = aggregate
-            .handle(InventorySnapshotCommand::OnchainCash { usdc_balance }, &())
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OnchainCash { usdc_balance })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -340,20 +380,16 @@ mod tests {
 
     #[tokio::test]
     async fn record_offchain_equity_emits_event() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let mut positions = BTreeMap::new();
         positions.insert(test_symbol("AAPL"), test_shares(75));
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OffchainEquity {
-                    positions: positions.clone(),
-                },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OffchainEquity {
+                positions: positions.clone(),
+            })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -369,17 +405,13 @@ mod tests {
 
     #[tokio::test]
     async fn record_offchain_cash_emits_event() {
-        let aggregate = InventorySnapshotAggregate::default();
-
         let cash_balance_cents = 50_000_000; // $500,000.00
 
-        let events = aggregate
-            .handle(
-                InventorySnapshotCommand::OffchainCash { cash_balance_cents },
-                &(),
-            )
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OffchainCash { cash_balance_cents })
             .await
-            .unwrap();
+            .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -395,60 +427,49 @@ mod tests {
 
     #[test]
     fn apply_initializes_and_updates_state() {
-        let mut aggregate = InventorySnapshotAggregate::default();
-
-        // First event initializes
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
-            balances: balances.clone(),
-            fetched_at: Utc::now(),
-        });
-
-        let Lifecycle::Live(snapshot) = &aggregate else {
-            panic!("Expected Live state after first event");
-        };
-        assert_eq!(snapshot.onchain_equity, balances);
-        assert!(snapshot.onchain_cash.is_none());
-
-        // Second event updates
         let usdc = Usdc::from_str("5000").unwrap();
-        aggregate.apply(InventorySnapshotEvent::OnchainCash {
-            usdc_balance: usdc,
-            fetched_at: Utc::now(),
-        });
 
-        let Lifecycle::Live(snapshot) = &aggregate else {
-            panic!("Expected Live state after second event");
-        };
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OnchainEquity {
+                balances: balances.clone(),
+                fetched_at: Utc::now(),
+            },
+            InventorySnapshotEvent::OnchainCash {
+                usdc_balance: usdc,
+                fetched_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
         assert_eq!(snapshot.onchain_equity, balances);
         assert_eq!(snapshot.onchain_cash, Some(usdc));
     }
 
     #[test]
     fn subsequent_fetches_replace_previous_values() {
-        let mut aggregate = InventorySnapshotAggregate::default();
-
         let mut first_balances = BTreeMap::new();
         first_balances.insert(test_symbol("AAPL"), test_shares(100));
-
-        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
-            balances: first_balances,
-            fetched_at: Utc::now(),
-        });
 
         let mut second_balances = BTreeMap::new();
         second_balances.insert(test_symbol("MSFT"), test_shares(50));
 
-        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
-            balances: second_balances.clone(),
-            fetched_at: Utc::now(),
-        });
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OnchainEquity {
+                balances: first_balances,
+                fetched_at: Utc::now(),
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: second_balances.clone(),
+                fetched_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
 
-        let Lifecycle::Live(snapshot) = &aggregate else {
-            panic!("Expected Live state");
-        };
         assert_eq!(snapshot.onchain_equity, second_balances);
         assert!(!snapshot.onchain_equity.contains_key(&test_symbol("AAPL")));
     }

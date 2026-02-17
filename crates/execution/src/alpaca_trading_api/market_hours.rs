@@ -1,81 +1,15 @@
 use apca::api::v2::clock;
 use apca::{Client, RequestError};
-use chrono::Utc;
-use tracing::{debug, info};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MarketHoursError {
     #[error("Alpaca API request failed")]
     ApiRequest(#[from] RequestError<clock::GetError>),
-
-    #[error(
-        "Duration conversion failed: chrono duration cannot be converted to std::time::Duration"
-    )]
-    DurationConversion,
-
-    #[error(
-        "Inconsistent market data from Alpaca: market is open but next_close ({next_close}) is not in the future (now: {now})"
-    )]
-    MarketOpenButCloseInPast {
-        next_close: chrono::DateTime<Utc>,
-        now: chrono::DateTime<Utc>,
-    },
-
-    #[error(
-        "Inconsistent market data from Alpaca: market is closed but next_open ({next_open}) is not in the future (now: {now})"
-    )]
-    MarketClosedButOpenInPast {
-        next_open: chrono::DateTime<Utc>,
-        now: chrono::DateTime<Utc>,
-    },
 }
 
-pub(super) async fn wait_until_market_open(
-    client: &Client,
-) -> Result<std::time::Duration, MarketHoursError> {
-    loop {
-        debug!("Checking market status via Alpaca Clock API");
-
-        let clock_data = client.issue::<clock::Get>(&()).await?;
-
-        if clock_data.open {
-            let now = Utc::now();
-            let next_close_utc = clock_data.next_close;
-
-            if next_close_utc <= now {
-                return Err(MarketHoursError::MarketOpenButCloseInPast {
-                    next_close: next_close_utc,
-                    now,
-                });
-            }
-
-            let duration = (next_close_utc - now)
-                .to_std()
-                .map_err(|_| MarketHoursError::DurationConversion)?;
-
-            return Ok(duration);
-        }
-
-        let now = Utc::now();
-        let next_open_utc = clock_data.next_open;
-
-        if next_open_utc <= now {
-            return Err(MarketHoursError::MarketClosedButOpenInPast {
-                next_open: next_open_utc,
-                now,
-            });
-        }
-
-        let wait_duration = (next_open_utc - now)
-            .to_std()
-            .map_err(|_| MarketHoursError::DurationConversion)?;
-
-        info!(
-            "Market closed, waiting {} seconds until open",
-            wait_duration.as_secs()
-        );
-        tokio::time::sleep(wait_duration).await;
-    }
+pub(super) async fn is_market_open(client: &Client) -> Result<bool, MarketHoursError> {
+    let clock_data = client.issue::<clock::Get>(&()).await?;
+    Ok(clock_data.open)
 }
 
 #[cfg(test)]
@@ -92,48 +26,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wait_until_market_open_when_open() {
+    async fn is_market_open_returns_true_when_open() {
         let server = MockServer::start();
 
-        let mock = server.mock(|when, then| {
+        server.mock(|when, then| {
             when.method(GET).path("/v2/clock");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "timestamp": "2025-01-03T14:30:00-05:00",
-                    "is_open": true,
-                    "next_open": "2030-01-06T14:30:00+00:00",
-                    "next_close": "2030-01-06T21:00:00+00:00"
-                }));
+            then.status(200).json_body(json!({
+                "timestamp": "2024-01-15T10:30:00-05:00",
+                "is_open": true,
+                "next_open": "2024-01-16T09:30:00-05:00",
+                "next_close": "2024-01-15T16:00:00-05:00"
+            }));
         });
 
         let client = create_test_client(&server);
-        let duration = wait_until_market_open(&client).await.unwrap();
-
-        mock.assert();
-        assert!(duration.as_secs() > 0);
+        let result = is_market_open(&client).await.unwrap();
+        assert!(result);
     }
 
     #[tokio::test]
-    async fn test_wait_until_market_open_when_open_returns_duration() {
+    async fn is_market_open_returns_false_when_closed() {
         let server = MockServer::start();
 
-        let mock = server.mock(|when, then| {
+        server.mock(|when, then| {
             when.method(GET).path("/v2/clock");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "timestamp": "2026-01-03T14:30:00-05:00",
-                    "is_open": true,
-                    "next_open": "2030-01-06T14:30:00+00:00",
-                    "next_close": "2030-01-06T21:00:00+00:00"
-                }));
+            then.status(200).json_body(json!({
+                "timestamp": "2024-01-15T18:00:00-05:00",
+                "is_open": false,
+                "next_open": "2024-01-16T09:30:00-05:00",
+                "next_close": "2024-01-16T16:00:00-05:00"
+            }));
         });
 
         let client = create_test_client(&server);
-        let duration = wait_until_market_open(&client).await.unwrap();
+        let result = is_market_open(&client).await.unwrap();
+        assert!(!result);
+    }
 
-        mock.assert();
-        assert!(duration.as_secs() > 0);
+    #[tokio::test]
+    async fn is_market_open_returns_error_on_api_failure() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v2/clock");
+            then.status(500).body("Internal Server Error");
+        });
+
+        let client = create_test_client(&server);
+        let result = is_market_open(&client).await;
+        assert!(matches!(result, Err(MarketHoursError::ApiRequest(_))));
     }
 }

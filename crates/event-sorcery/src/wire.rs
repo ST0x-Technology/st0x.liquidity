@@ -22,24 +22,24 @@
 //!
 //! # Examples
 //!
-//! ## Single-entity queries (simple case)
+//! ## Single-entity reactors (simple case)
 //!
 //! ```ignore
-//! // Query only needs wiring to Position entity
+//! // Reactor only needs wiring to Position entity
 //! type ViewDeps = Cons<Position, Nil>;
 //! let view: Unwired<PositionView, ViewDeps> =
 //!     Unwired::new(view);
 //!
-//! // Build and discard -- query deps satisfied after wiring
+//! // Build and discard -- deps satisfied after wiring
 //! let position_store = StoreBuilder::<Position>::new(pool)
 //!     .wire(view)
 //!     .build(());
 //! ```
 //!
-//! ## Multi-entity queries
+//! ## Multi-entity reactors
 //!
 //! ```ignore
-//! // Query requiring wiring to Position, then Mint entities
+//! // Reactor requiring wiring to Position, then Mint entities
 //! type TriggerDeps = Cons<Position, Cons<TokenizedEquityMint, Nil>>;
 //! let trigger: Unwired<Trigger, TriggerDeps> =
 //!     Unwired::new(trigger);
@@ -71,54 +71,44 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use cqrs_es::Query;
-use cqrs_es::persist::ViewRepository;
 use sqlx::SqlitePool;
 
-use crate::Reactor;
+use crate::dependency::{Cons, InjectAtDepth, Nil, Successor, Zero};
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-use crate::projection::Projection;
-use crate::schema_registry::Reconciler;
+use crate::reactor::Reactor;
+use crate::schema_registry::{ReconcileError, Reconciler};
 use crate::{EventSourced, Store};
-
-/// Type-level cons cell for building linked lists of entities.
-///
-/// Forms a compile-time linked list:
-/// `Cons<Position, Cons<TokenizedEquityMint, Nil>>`.
-pub struct Cons<Head, Tail>(PhantomData<(Head, Tail)>);
-
-/// Type-level empty list (nil).
-///
-/// Terminal element for type-level lists. When an [`Unwired`]
-/// reaches this state, [`into_inner`](Unwired::into_inner)
-/// becomes available.
-pub struct Nil;
 
 /// A query processor with compile-time wiring dependencies.
 ///
 /// Wraps an `Arc<Processor>` and tracks which entities it still
-/// needs to be wired to via the `Deps` phantom type. The inner
-/// Arc is only extractable via [`into_inner`](Self::into_inner)
-/// when `Deps = Nil`.
+/// needs to be wired to via the `Deps` phantom type. `Depth`
+/// tracks how many entities have been wired so far, enabling
+/// correct event injection into the computed union type.
+///
+/// The inner Arc is only extractable via
+/// [`into_inner`](Self::into_inner) when `Deps = Nil`.
 ///
 /// # Type Parameter Evolution
 ///
-/// Each call to [`StoreBuilder::wire`] consumes this and returns a
-/// new instance with the head entity removed from `Deps`:
+/// Each call to [`StoreBuilder::wire`] consumes this and returns
+/// a new instance with the head entity removed from `Deps` and
+/// `Depth` incremented:
 ///
 /// ```text
-/// Unwired<Processor, Cons<A, Cons<B, Nil>>>
+/// Unwired<R, Cons<A, Cons<B, Nil>>, Zero>
 ///     --wire to A-->
-/// Unwired<Processor, Cons<B, Nil>>
+/// Unwired<R, Cons<B, Nil>, Successor<Zero>>
 ///     --wire to B-->
-/// Unwired<Processor, Nil>
+/// Unwired<R, Nil, Successor<Successor<Zero>>>
 ///     --into_inner-->
-/// Arc<Processor>
+/// Arc<R>
 /// ```
 #[must_use = "query must be wired via StoreBuilder, \
               then extracted with into_inner"]
-pub struct Unwired<Processor, Deps> {
-    pub(crate) query: Arc<Processor>,
-    pub(crate) _deps: PhantomData<Deps>,
+pub struct Unwired<Processor, Deps, Depth = Zero> {
+    pub(crate) inner: Arc<Processor>,
+    _phantom: PhantomData<(Deps, Depth)>,
 }
 
 impl<Processor, Deps> Unwired<Processor, Deps> {
@@ -127,15 +117,15 @@ impl<Processor, Deps> Unwired<Processor, Deps> {
     /// The `Deps` type parameter should encode all
     /// [`EventSourced`] entities this query needs to be wired to
     /// before it can be used.
-    pub fn new(query: Processor) -> Self {
+    pub fn new(processor: Processor) -> Self {
         Self {
-            query: Arc::new(query),
-            _deps: PhantomData,
+            inner: Arc::new(processor),
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<Processor> Unwired<Processor, Nil> {
+impl<Processor, Depth> Unwired<Processor, Nil, Depth> {
     /// Extracts the inner Arc. Only available when all
     /// dependencies are satisfied.
     ///
@@ -143,14 +133,14 @@ impl<Processor> Unwired<Processor, Nil> {
     /// all required entities have been wired via
     /// [`StoreBuilder::wire`].
     pub fn into_inner(self) -> Arc<Processor> {
-        self.query
+        self.inner
     }
 }
 
 /// The wired-output accumulator: a cons-cell pairing a
 /// partially-wired processor with the previously accumulated
 /// wired results.
-type WiredOutput<Processor, Tail, Rest> = (Unwired<Processor, Tail>, Rest);
+type WiredOutput<Processor, Tail, Depth, Rest> = (Unwired<Processor, Tail, Depth>, Rest);
 
 /// Builder for a single CQRS framework with type-tracked query
 /// wiring.
@@ -186,34 +176,30 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
     /// guarantees aren't needed. Production code should use
     /// [`wire`](StoreBuilder::wire) with [`Unwired`] instead.
     #[must_use]
-    pub fn with_query(mut self, query: impl Query<Lifecycle<Entity>> + 'static) -> Self {
+    pub(crate) fn with_query(mut self, query: impl Query<Lifecycle<Entity>> + 'static) -> Self {
         self.queries.push(Box::new(query));
         self
     }
 
-    /// Adds a reactor without type-level tracking.
+    /// Adds a single-entity reactor without type-level tracking.
     ///
-    /// Like [`with_query`](Self::with_query) but accepts a
-    /// [`Reactor<Entity>`] instead of a raw `Query<Lifecycle<Entity>>`.
+    /// Convenience for CLI and test code. The reactor must list
+    /// this `Entity` as first in its `Entities` list. For
+    /// multi-entity reactors with proper dependency tracking,
+    /// use [`wire`](StoreBuilder::wire) with [`Unwired`].
     #[must_use]
-    pub fn with_reactor(self, reactor: impl Reactor<Entity> + 'static) -> Self
+    pub fn with<R>(self, reactor: R) -> Self
     where
+        R: Reactor + 'static,
+        R::Dependencies: InjectAtDepth<Zero, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+        Entity::Id: Clone,
+        Entity::Event: Clone,
         <Entity::Id as FromStr>::Err: Debug,
     {
-        self.with_query(ReactorBridge(reactor))
-    }
-
-    /// Adds a projection without type-level tracking.
-    ///
-    /// Registers the projection's internal `GenericQuery` with the
-    /// CQRS framework so that it receives event updates.
-    #[must_use]
-    pub fn with_projection<Repo>(self, projection: &Projection<Entity, Repo>) -> Self
-    where
-        Entity: 'static,
-        Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync + 'static,
-    {
-        self.with_query(projection.inner_query())
+        self.with_query(ReactorBridge {
+            reactor: Arc::new(reactor),
+            _depth: PhantomData::<Zero>,
+        })
     }
 
     /// Builds the CQRS framework when no queries were wired.
@@ -223,105 +209,58 @@ impl<Entity: EventSourced> StoreBuilder<Entity, ()> {
     /// changed.
     ///
     /// Returns a [`Store`] for type-safe command dispatch.
-    pub async fn build(self, services: Entity::Services) -> Result<Store<Entity>, anyhow::Error> {
+    pub async fn build(self, services: Entity::Services) -> Result<Store<Entity>, ReconcileError> {
         Reconciler::new(self.pool.clone())
             .reconcile::<Entity>()
             .await?;
 
         #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
-        Ok(Store::new(cqrs))
+        let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
+        Ok(Store::new(cqrs, self.pool))
     }
 }
 
 impl<Entity: EventSourced, Wired> StoreBuilder<Entity, Wired> {
-    /// Wires a query processor to this CQRS framework.
+    /// Wires a reactor or projection to this CQRS framework with
+    /// type-level dependency tracking.
     ///
-    /// Consumes the [`Unwired`] and returns a new builder
-    /// with:
-    /// - The query added to the internal processors list
+    /// Consumes the [`Unwired`] processor and returns a new
+    /// builder with:
+    /// - The processor (bridged to cqrs-es `Query`) added to
+    ///   the internal processors list
     /// - An updated `Unwired` (with `Entity` removed from
-    ///   dependencies) added to the wired tuple for return at
-    ///   build time
+    ///   dependencies and `Depth` incremented) added to the
+    ///   wired tuple for return at build time
     ///
     /// # Type Evolution
     ///
-    /// The input query must have `Entity` as its next dependency:
-    /// `Unwired<Processor, Cons<Entity, Tail>>`. The
-    /// returned query will be
-    /// `Unwired<Processor, Tail>`.
-    pub fn wire<Processor, Tail>(
+    /// The input must have `Entity` as its next dependency:
+    /// `Unwired<R, Cons<Entity, Tail>, Depth>`. The returned
+    /// value will be `Unwired<R, Tail, Successor<Depth>>`.
+    pub fn wire<R, Tail, Depth>(
         mut self,
-        query: Unwired<Processor, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, WiredOutput<Processor, Tail, Wired>>
+        processor: Unwired<R, Cons<Entity, Tail>, Depth>,
+    ) -> StoreBuilder<Entity, WiredOutput<R, Tail, Successor<Depth>, Wired>>
     where
-        Processor: Send + Sync + 'static,
-        Arc<Processor>: Query<Lifecycle<Entity>>,
-    {
-        self.queries.push(Box::new(query.query.clone()));
-
-        StoreBuilder {
-            pool: self.pool,
-            queries: self.queries,
-            wired: (
-                Unwired {
-                    query: query.query,
-                    _deps: PhantomData,
-                },
-                self.wired,
-            ),
-        }
-    }
-
-    /// Wires a reactor to this CQRS framework.
-    ///
-    /// Like [`wire`](Self::wire) but for processors that
-    /// implement [`Reactor<Entity>`] instead of
-    /// `Query<Lifecycle<Entity>>`.
-    pub fn wire_reactor<Processor, Tail>(
-        mut self,
-        query: Unwired<Processor, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, WiredOutput<Processor, Tail, Wired>>
-    where
-        Processor: Send + Sync + 'static,
-        Arc<Processor>: Reactor<Entity>,
+        R: Reactor + 'static,
+        R::Dependencies: InjectAtDepth<Depth, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+        Entity::Id: Clone,
+        Entity::Event: Clone,
+        Depth: Send + Sync + 'static,
         <Entity::Id as FromStr>::Err: Debug + Send + Sync,
     {
-        self.queries
-            .push(Box::new(ReactorBridge(query.query.clone())));
+        self.queries.push(Box::new(ReactorBridge {
+            reactor: processor.inner.clone(),
+            _depth: PhantomData::<Depth>,
+        }));
 
         StoreBuilder {
             pool: self.pool,
             queries: self.queries,
             wired: (
                 Unwired {
-                    query: query.query,
-                    _deps: PhantomData,
-                },
-                self.wired,
-            ),
-        }
-    }
-
-    /// Wires a projection to this CQRS framework with type-level
-    /// tracking.
-    pub fn wire_projection<Repo, Tail>(
-        mut self,
-        projection: &Unwired<Projection<Entity, Repo>, Cons<Entity, Tail>>,
-    ) -> StoreBuilder<Entity, WiredOutput<Projection<Entity, Repo>, Tail, Wired>>
-    where
-        Entity: 'static,
-        Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync + 'static,
-    {
-        self.queries.push(Box::new(projection.query.inner_query()));
-
-        StoreBuilder {
-            pool: self.pool,
-            queries: self.queries,
-            wired: (
-                Unwired {
-                    query: Arc::clone(&projection.query),
-                    _deps: PhantomData,
+                    inner: processor.inner,
+                    _phantom: PhantomData,
                 },
                 self.wired,
             ),
@@ -340,166 +279,27 @@ impl<Entity: EventSourced, Head, Tail> StoreBuilder<Entity, (Head, Tail)> {
     pub async fn build(
         self,
         services: Entity::Services,
-    ) -> Result<(Store<Entity>, (Head, Tail)), anyhow::Error> {
+    ) -> Result<(Store<Entity>, (Head, Tail)), ReconcileError> {
         Reconciler::new(self.pool.clone())
             .reconcile::<Entity>()
             .await?;
 
         #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(self.pool, self.queries, services);
-        Ok((Store::new(cqrs), self.wired))
+        let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
+        Ok((Store::new(cqrs, self.pool), self.wired))
     }
-}
-
-/// Test-only escape hatch for creating CQRS frameworks directly.
-///
-/// Tests often need CQRS with specific configurations that don't
-/// fit the production wiring pattern. Use this instead of
-/// `sqlite_es::sqlite_cqrs`.
-#[cfg(any(test, feature = "test-support"))]
-pub fn test_store<Entity: EventSourced>(
-    pool: SqlitePool,
-    queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
-    services: Entity::Services,
-) -> Store<Entity> {
-    #[allow(clippy::disallowed_methods)]
-    let cqrs = sqlite_es::sqlite_cqrs(pool, queries, services);
-    Store::new(cqrs)
-}
-
-/// Like [`test_store`] but also accepts [`Reactor`] implementations.
-///
-/// Reactors are bridged to cqrs-es queries via [`ReactorBridge`]
-/// and appended after the provided queries.
-#[cfg(any(test, feature = "test-support"))]
-pub fn test_store_with_reactors<Entity: EventSourced + 'static>(
-    pool: SqlitePool,
-    mut queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
-    reactors: Vec<Box<dyn Reactor<Entity>>>,
-    services: Entity::Services,
-) -> Store<Entity>
-where
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    let reactor_queries: Vec<Box<dyn Query<Lifecycle<Entity>>>> = reactors
-        .into_iter()
-        .map(|reactor| Box::new(ReactorBridge(reactor)) as Box<dyn Query<Lifecycle<Entity>>>)
-        .collect();
-    queries.extend(reactor_queries);
-
-    #[allow(clippy::disallowed_methods)]
-    let cqrs = sqlite_es::sqlite_cqrs(pool, queries, services);
-    Store::new(cqrs)
-}
-
-/// In-memory event store for unit tests.
-///
-/// Provides the same typed-ID interface as [`Store`] but backed
-/// by an in-memory store instead of SQLite. Also exposes
-/// [`load`](Self::load) for inspecting aggregate state after
-/// commands, which production [`Store`] intentionally omits
-/// (use projections instead).
-#[cfg(any(test, feature = "test-support"))]
-pub struct TestStore<Entity: EventSourced> {
-    mem_store: cqrs_es::mem_store::MemStore<Lifecycle<Entity>>,
-    cqrs:
-        cqrs_es::CqrsFramework<Lifecycle<Entity>, cqrs_es::mem_store::MemStore<Lifecycle<Entity>>>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[allow(clippy::unwrap_used)]
-impl<Entity: EventSourced> TestStore<Entity>
-where
-    Lifecycle<Entity>: cqrs_es::Aggregate<
-            Command = Entity::Command,
-            Event = Entity::Event,
-            Error = crate::lifecycle::LifecycleError<Entity>,
-            Services = Entity::Services,
-        >,
-{
-    /// Send a command to the entity identified by `id`.
-    pub async fn send(
-        &self,
-        id: &Entity::Id,
-        command: Entity::Command,
-    ) -> Result<(), crate::SendError<Entity>> {
-        self.execute(&id.to_string(), command).await
-    }
-
-    /// Send a command using a raw string aggregate ID.
-    ///
-    /// Prefer [`send`](Self::send) with typed IDs. This exists
-    /// for tests that haven't been migrated to typed IDs yet.
-    pub async fn execute(
-        &self,
-        aggregate_id: &str,
-        command: Entity::Command,
-    ) -> Result<(), crate::SendError<Entity>> {
-        self.cqrs.execute(aggregate_id, command).await
-    }
-
-    /// Load the lifecycle state of an entity by typed ID.
-    pub async fn load(&self, id: &Entity::Id) -> Lifecycle<Entity> {
-        self.load_by_id(&id.to_string()).await
-    }
-
-    /// Load the lifecycle state using a raw string aggregate ID.
-    ///
-    /// Prefer [`load`](Self::load) with typed IDs. This exists
-    /// for tests that haven't been migrated to typed IDs yet.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "test-only helper, panicking on error is fine"
-    )]
-    pub async fn load_by_id(&self, aggregate_id: &str) -> Lifecycle<Entity> {
-        use cqrs_es::EventStore;
-
-        self.mem_store
-            .load_aggregate(aggregate_id)
-            .await
-            .unwrap()
-            .aggregate
-    }
-}
-
-/// Create an in-memory [`TestStore`] for fast, isolated unit
-/// tests.
-///
-/// Unlike [`test_store`] which uses SQLite, this is purely
-/// in-memory. Accepts [`Reactor`] impls which are internally
-/// bridged to cqrs-es queries via [`ReactorBridge`].
-#[cfg(any(test, feature = "test-support"))]
-pub fn test_mem_store<Entity: EventSourced + 'static>(
-    reactors: Vec<Box<dyn Reactor<Entity>>>,
-    services: Entity::Services,
-) -> TestStore<Entity>
-where
-    Lifecycle<Entity>: cqrs_es::Aggregate<
-            Command = Entity::Command,
-            Event = Entity::Event,
-            Error = crate::lifecycle::LifecycleError<Entity>,
-            Services = Entity::Services,
-        >,
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    let queries: Vec<Box<dyn Query<Lifecycle<Entity>>>> = reactors
-        .into_iter()
-        .map(|reactor| Box::new(ReactorBridge(reactor)) as Box<dyn Query<Lifecycle<Entity>>>)
-        .collect();
-
-    let mem_store = cqrs_es::mem_store::MemStore::default();
-    #[allow(clippy::disallowed_methods)]
-    let cqrs = cqrs_es::CqrsFramework::new(mem_store.clone(), queries, services);
-    TestStore { mem_store, cqrs }
 }
 
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use cqrs_es::{DomainEvent, EventEnvelope};
+    use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::Table;
+    use crate::dependency::{Dependent, EntityList};
+    use crate::deps;
     use crate::lifecycle::Never;
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -543,13 +343,14 @@ mod tests {
         type Services = ();
 
         const AGGREGATE_TYPE: &'static str = "AggregateA";
+        const PROJECTION: Option<Table> = None;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &EventA) -> Option<Self> {
             Some(Self)
         }
 
-        fn evolve(_event: &EventA, _state: &Self) -> Result<Option<Self>, Never> {
+        fn evolve(_entity: &Self, _event: &EventA) -> Result<Option<Self>, Never> {
             Ok(Some(Self))
         }
 
@@ -571,13 +372,14 @@ mod tests {
         type Services = ();
 
         const AGGREGATE_TYPE: &'static str = "AggregateB";
+        const PROJECTION: Option<Table> = None;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &EventB) -> Option<Self> {
             Some(Self)
         }
 
-        fn evolve(_event: &EventB, _state: &Self) -> Result<Option<Self>, Never> {
+        fn evolve(_entity: &Self, _event: &EventB) -> Result<Option<Self>, Never> {
             Ok(Some(Self))
         }
 
@@ -590,60 +392,68 @@ mod tests {
         }
     }
 
-    struct MultiEntityQuery {
+    struct MultiEntityReactor {
         name: &'static str,
     }
 
-    #[async_trait]
-    impl Query<Lifecycle<AggregateA>> for Arc<MultiEntityQuery> {
-        async fn dispatch(&self, _: &str, _: &[EventEnvelope<Lifecycle<AggregateA>>]) {}
+    impl Dependent for MultiEntityReactor {
+        type Dependencies = Cons<AggregateA, Cons<AggregateB, Nil>>;
     }
 
     #[async_trait]
-    impl Query<Lifecycle<AggregateB>> for Arc<MultiEntityQuery> {
-        async fn dispatch(&self, _: &str, _: &[EventEnvelope<Lifecycle<AggregateB>>]) {}
+    impl Reactor for MultiEntityReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            event
+                .on(|_id, _event| async {})
+                .on(|_id, _event| async {})
+                .exhaustive()
+                .await;
+            Ok(())
+        }
     }
 
-    struct SingleEntityQuery;
+    struct SingleEntityReactor;
+
+    impl Dependent for SingleEntityReactor {
+        type Dependencies = Cons<AggregateA, Nil>;
+    }
 
     #[async_trait]
-    impl Query<Lifecycle<AggregateA>> for Arc<SingleEntityQuery> {
-        async fn dispatch(&self, _: &str, _: &[EventEnvelope<Lifecycle<AggregateA>>]) {}
+    impl Reactor for SingleEntityReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, _event) = event.into_inner();
+            Ok(())
+        }
     }
 
     #[test]
-    fn single_entity_query_wiring() {
-        type Deps = Cons<AggregateA, Nil>;
-        let query: Unwired<SingleEntityQuery, Deps> = Unwired::new(SingleEntityQuery);
-
-        // Simulate wiring (no actual pool needed for type-level test)
-        let query: Unwired<SingleEntityQuery, Nil> = Unwired {
-            query: query.query,
-            _deps: PhantomData,
+    fn single_entity_reactor_into_inner() {
+        let reactor: Unwired<SingleEntityReactor, Nil, Successor<Zero>> = Unwired {
+            inner: Arc::new(SingleEntityReactor),
+            _phantom: PhantomData,
         };
 
-        let _arc: Arc<SingleEntityQuery> = query.into_inner();
+        let _arc: Arc<SingleEntityReactor> = reactor.into_inner();
     }
 
     #[test]
-    fn multi_entity_query_wiring_sequence() {
-        type Deps = Cons<AggregateA, Cons<AggregateB, Nil>>;
-        let query: Unwired<MultiEntityQuery, Deps> =
-            Unwired::new(MultiEntityQuery { name: "test" });
-
-        // After wiring to A, only B remains
-        let query: Unwired<MultiEntityQuery, Cons<AggregateB, Nil>> = Unwired {
-            query: query.query,
-            _deps: PhantomData,
+    fn multi_entity_reactor_into_inner() {
+        let reactor: Unwired<MultiEntityReactor, Nil, Successor<Successor<Zero>>> = Unwired {
+            inner: Arc::new(MultiEntityReactor { name: "test" }),
+            _phantom: PhantomData,
         };
 
-        // After wiring to B, Nil
-        let query: Unwired<MultiEntityQuery, Nil> = Unwired {
-            query: query.query,
-            _deps: PhantomData,
-        };
-
-        let arc = query.into_inner();
+        let arc = reactor.into_inner();
         assert_eq!(arc.name, "test");
     }
 
@@ -652,14 +462,11 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
 
-        type MultiDeps = Cons<AggregateA, Cons<AggregateB, Nil>>;
-        type SingleDeps = Cons<AggregateA, Nil>;
+        let multi: Unwired<MultiEntityReactor, deps![AggregateA, AggregateB]> =
+            Unwired::new(MultiEntityReactor { name: "multi" });
+        let single: Unwired<SingleEntityReactor, deps![AggregateA]> =
+            Unwired::new(SingleEntityReactor);
 
-        let multi: Unwired<MultiEntityQuery, MultiDeps> =
-            Unwired::new(MultiEntityQuery { name: "multi" });
-        let single: Unwired<SingleEntityQuery, SingleDeps> = Unwired::new(SingleEntityQuery);
-
-        // Build AggregateA Store
         let (_store_a, (single, (multi, ()))) = StoreBuilder::<AggregateA>::new(pool.clone())
             .wire(multi)
             .wire(single)
@@ -667,15 +474,14 @@ mod tests {
             .await
             .unwrap();
 
-        let _single_arc: Arc<SingleEntityQuery> = single.into_inner();
+        let _single_arc: Arc<SingleEntityReactor> = single.into_inner();
 
-        // Build AggregateB Store
         let (_store_b, (multi, ())) = StoreBuilder::<AggregateB>::new(pool.clone())
             .wire(multi)
             .build(())
             .await
             .unwrap();
 
-        let _multi_arc: Arc<MultiEntityQuery> = multi.into_inner();
+        let _multi_arc: Arc<MultiEntityReactor> = multi.into_inner();
     }
 }

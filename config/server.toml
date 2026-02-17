@@ -13,10 +13,11 @@ deployment_block = 40850446
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
 usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000ffaabb"
 
-[rebalancing.equity_threshold]
+[rebalancing.equity]
 target = "0.5"
 deviation = "0.2"
 
-[rebalancing.usdc_threshold]
+[rebalancing.usdc]
+mode = "enabled"
 target = "0.5"
 deviation = "0.3"

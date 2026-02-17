@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_error_decoding::AbiDecodedErrorType;
 use reqwest::{Client, StatusCode};
@@ -35,8 +36,9 @@ use serde::{Deserialize, Serialize};
 use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
+use super::{Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{AlpacaAccountId, Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
@@ -88,6 +90,7 @@ where
         underlying_symbol: Symbol,
         quantity: FractionalShares,
         wallet: Address,
+        issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
         let request = MintRequest {
             underlying_symbol,
@@ -95,6 +98,7 @@ where
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet,
+            issuer_request_id,
         };
         self.client.request_mint(request).await
     }
@@ -222,6 +226,49 @@ pub(crate) struct TokenizationRequest {
     updated_at: Option<DateTime<Utc>>,
 }
 
+#[cfg(test)]
+impl TokenizationRequest {
+    /// Create a mock TokenizationRequest for testing.
+    pub(crate) fn mock(status: TokenizationRequestStatus) -> Self {
+        Self {
+            id: TokenizationRequestId("MOCK_REQ_ID".to_string()),
+            r#type: None,
+            status,
+            underlying_symbol: Symbol::new("AAPL").unwrap(),
+            token_symbol: None,
+            quantity: FractionalShares::ZERO,
+            issuer: Issuer::new("alpaca"),
+            network: Network::new("base"),
+            wallet: None,
+            issuer_request_id: None,
+            tx_hash: None,
+            fees: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    /// Create a mock completed TokenizationRequest with tx_hash for testing.
+    pub(crate) fn mock_completed() -> Self {
+        Self {
+            id: TokenizationRequestId("MOCK_REQ_ID".to_string()),
+            r#type: None,
+            status: TokenizationRequestStatus::Completed,
+            underlying_symbol: Symbol::new("AAPL").unwrap(),
+            token_symbol: None,
+            quantity: FractionalShares::ZERO,
+            issuer: Issuer::new("alpaca"),
+            network: Network::new("base"),
+            wallet: None,
+            issuer_request_id: None,
+            tx_hash: Some(TxHash::ZERO),
+            fees: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+}
+
 fn deserialize_tokenized_symbol<'de, D>(
     deserializer: D,
 ) -> Result<Option<TokenizedEquitySymbol>, D::Error>
@@ -257,6 +304,7 @@ struct MintRequest {
     network: Network,
     #[serde(rename = "wallet_address")]
     wallet: Address,
+    issuer_request_id: IssuerRequestId,
 }
 
 /// Parameters for filtering tokenization requests.
@@ -297,11 +345,26 @@ pub(crate) enum AlpacaTokenizationError {
     #[error("Contract reverted: {0}")]
     Revert(#[from] AbiDecodedErrorType),
 
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
+    #[error("Transaction error: {source}")]
+    Transaction {
+        tx_hash: TxHash,
+        #[source]
+        source: alloy::providers::PendingTransactionError,
+    },
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
+}
+
+impl AlpacaTokenizationError {
+    /// Returns the HTTP status code if this error was caused by an API response.
+    pub(crate) fn status_code(&self) -> Option<StatusCode> {
+        match self {
+            Self::ApiError { status, .. } => Some(*status),
+            Self::Reqwest(error) => error.status(),
+            _ => None,
+        }
+    }
 }
 
 fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> AlpacaTokenizationError {
@@ -488,7 +551,7 @@ where
 
         if status.is_success() {
             let body = response.text().await?;
-            debug!(body = %body, "List requests response body");
+            trace!(body = %body, "List requests response body");
 
             let requests: Vec<TokenizationRequest> =
                 serde_json::from_str(&body).inspect_err(|error| {
@@ -498,6 +561,8 @@ where
                         "Failed to deserialize list requests response"
                     );
                 })?;
+
+            debug!(count = requests.len(), "Listed tokenization requests");
 
             return Ok(requests);
         }
@@ -548,9 +613,12 @@ where
             Err(error) => return Err(handle_contract_error(error).await),
         };
 
-        let receipt = pending.get_receipt().await?;
+        let tx_hash = *pending.tx_hash();
+        if let Err(source) = pending.get_receipt().await {
+            return Err(AlpacaTokenizationError::Transaction { tx_hash, source });
+        }
 
-        Ok(receipt.transaction_hash)
+        Ok(tx_hash)
     }
 
     /// Find a redemption request by its onchain transaction hash.
@@ -645,6 +713,55 @@ where
                 return Ok(request);
             }
         }
+    }
+}
+
+#[async_trait]
+impl<P> Tokenizer for AlpacaTokenizationService<P>
+where
+    P: Provider + Clone + Send + Sync,
+{
+    async fn request_mint(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        wallet: Address,
+        issuer_request_id: IssuerRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(Self::request_mint(self, symbol, quantity, wallet, issuer_request_id).await?)
+    }
+
+    async fn poll_mint_until_complete(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(Self::poll_mint_until_complete(self, id).await?)
+    }
+
+    fn redemption_wallet(&self) -> Address {
+        Self::redemption_wallet(self)
+    }
+
+    async fn send_for_redemption(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<TxHash, TokenizerError> {
+        Ok(Self::send_for_redemption(self, token, amount).await?)
+    }
+
+    async fn poll_for_redemption(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(Self::poll_for_redemption(self, tx_hash).await?)
+    }
+
+    async fn poll_redemption_until_complete(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(Self::poll_redemption_until_complete(self, id).await?)
     }
 }
 
@@ -747,6 +864,7 @@ pub(crate) mod tests {
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            issuer_request_id: IssuerRequestId::new("test-issuer-request-id"),
         }
     }
 
@@ -766,7 +884,8 @@ pub(crate) mod tests {
                     "qty": "100.5",
                     "issuer": "st0x",
                     "network": "base",
-                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "issuer_request_id": "test-issuer-request-id"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1373,7 +1492,7 @@ pub(crate) mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let mint_result = service
-            .request_mint(symbol, quantity, wallet)
+            .request_mint(symbol, quantity, wallet, IssuerRequestId::new("test-id"))
             .await
             .unwrap();
 
@@ -1458,5 +1577,60 @@ pub(crate) mod tests {
 
         detection_mock.assert();
         complete_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_request_mint_includes_issuer_request_id_in_body() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let issuer_request_id = IssuerRequestId::new("our-tracking-id-123");
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(tokenization_mint_path())
+                .json_body(json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "100.5",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "issuer_request_id": "our-tracking-id-123"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "tokenization_request_id": "tok_req_456",
+                    "type": "mint",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100.5",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "issuer_request_id": "our-tracking-id-123",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(dec!(100.5));
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let result = service
+            .request_mint(symbol, quantity, wallet, issuer_request_id.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.issuer_request_id,
+            Some(issuer_request_id),
+            "Alpaca should return the same issuer_request_id we sent"
+        );
+
+        mint_mock.assert();
     }
 }

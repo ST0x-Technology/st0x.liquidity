@@ -425,10 +425,10 @@ pub(crate) enum TradeValidationError {
     #[error("Negative USDC amount: {0}")]
     NegativeUsdc(Decimal),
     #[error(
-        "Symbol '{0}' is not a tokenized equity \
+        "symbol '{symbol_provided}' is not a tokenized equity \
          (must have 't' prefix, e.g. tAAPL, tSPYM)"
     )]
-    NotTokenizedEquity(String),
+    NotTokenizedEquity { symbol_provided: String },
 }
 
 #[cfg(test)]

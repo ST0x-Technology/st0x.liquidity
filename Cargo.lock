@@ -6658,6 +6658,7 @@ name = "st0x-dto"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "clap",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -6668,7 +6669,6 @@ dependencies = [
 name = "st0x-event-sorcery"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "cqrs-es",
  "serde",

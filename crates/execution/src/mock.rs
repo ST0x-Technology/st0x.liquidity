@@ -1,10 +1,11 @@
 use async_trait::async_trait;
+use rust_decimal_macros::dec;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement, OrderState,
@@ -23,6 +24,7 @@ pub struct MockExecutor {
     failure_message: String,
     inventory_result: InventoryResult,
     order_status_override: Option<OrderState>,
+    market_open: bool,
 }
 
 impl MockExecutor {
@@ -33,6 +35,7 @@ impl MockExecutor {
             failure_message: String::new(),
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
+            market_open: true,
         }
     }
 
@@ -43,6 +46,7 @@ impl MockExecutor {
             failure_message: message.into(),
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
+            market_open: true,
         }
     }
 
@@ -57,6 +61,13 @@ impl MockExecutor {
     #[must_use]
     pub fn with_order_status(mut self, status: OrderState) -> Self {
         self.order_status_override = Some(status);
+        self
+    }
+
+    /// Configures whether the market is considered open.
+    #[must_use]
+    pub fn with_market_open(mut self, open: bool) -> Self {
+        self.market_open = open;
         self
     }
 
@@ -83,11 +94,8 @@ impl Executor for MockExecutor {
         Ok(Self::new())
     }
 
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
-        info!("[TEST] Market hours check - market is always open in test mode");
-        // Test executor should never block on market hours, so return Duration::MAX
-        // to signal no time limit
-        Ok(std::time::Duration::MAX)
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        Ok(self.market_open)
     }
 
     #[tracing::instrument(skip(self), fields(symbol = %order.symbol, shares = %order.shares, direction = %order.direction), level = tracing::Level::INFO)]
@@ -137,7 +145,7 @@ impl Executor for MockExecutor {
         Ok(OrderState::Filled {
             executed_at: chrono::Utc::now(),
             order_id: order_id.clone(),
-            price_cents: 10000, // $100.00 mock price
+            price: dec!(100.00),
         })
     }
 
@@ -188,26 +196,6 @@ mod tests {
         let executor = MockExecutor::try_from_ctx(MockExecutorCtx).await.unwrap();
         assert!(!executor.should_fail);
         assert_eq!(executor.failure_message, "");
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open_always_returns_none() {
-        let executor = MockExecutor::new();
-
-        assert_eq!(
-            executor.wait_until_market_open().await.unwrap(),
-            std::time::Duration::MAX
-        );
-    }
-
-    #[tokio::test]
-    async fn test_failure_executor_wait_until_market_open() {
-        let executor = MockExecutor::with_failure("Test failure");
-
-        assert_eq!(
-            executor.wait_until_market_open().await.unwrap(),
-            std::time::Duration::MAX
-        );
     }
 
     #[tokio::test]
@@ -299,7 +287,7 @@ mod tests {
             positions: vec![crate::EquityPosition {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(Decimal::from(100)),
-                market_value_cents: Some(1_500_000),
+                market_value: Some(Decimal::new(1_500_000, 2)),
             }],
             cash_balance_cents: 5_000_000,
         };

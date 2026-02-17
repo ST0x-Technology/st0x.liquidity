@@ -8,7 +8,7 @@ use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 
-use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor};
+use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor, Positive};
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
@@ -164,11 +164,11 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     );
 
     let usdc_asset = TokenSymbol::new("USDC");
-    let amount_decimal: Decimal = amount.into();
+    let positive_amount = Positive::new(amount)?;
 
     writeln!(stdout, "   Initiating withdrawal...")?;
     let transfer = alpaca_wallet
-        .initiate_withdrawal(amount_decimal, &usdc_asset, &destination)
+        .initiate_withdrawal(positive_amount, &usdc_asset, &destination)
         .await?;
 
     writeln!(stdout, "   Withdrawal initiated: {}", transfer.id)?;
@@ -289,6 +289,86 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     Ok(())
 }
 
+pub(super) async fn alpaca_whitelist_list_command<W: Write>(
+    stdout: &mut W,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-whitelist-list requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("alpaca-whitelist-list requires rebalancing configuration")
+    })?;
+
+    let alpaca_wallet = AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    );
+
+    writeln!(stdout, "Fetching whitelisted addresses...")?;
+
+    let entries = alpaca_wallet.get_whitelisted_addresses().await?;
+
+    if entries.is_empty() {
+        writeln!(stdout, "\nNo whitelisted addresses found.")?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "\nFound {} whitelist entries:\n", entries.len())?;
+
+    for entry in &entries {
+        writeln!(stdout, "Entry {}", entry.id)?;
+        writeln!(stdout, "   Address: {}", entry.address)?;
+        writeln!(stdout, "   Asset: {}", entry.asset.as_ref())?;
+        writeln!(stdout, "   Chain: {}", entry.chain.as_ref())?;
+        writeln!(stdout, "   Status: {:?}", entry.status)?;
+        writeln!(stdout, "   Created: {}", entry.created_at)?;
+        writeln!(stdout)?;
+    }
+
+    Ok(())
+}
+
+pub(super) async fn alpaca_unwhitelist_command<W: Write>(
+    stdout: &mut W,
+    address: Address,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-unwhitelist requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = ctx
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-unwhitelist requires rebalancing configuration"))?;
+
+    writeln!(stdout, "Removing address from Alpaca whitelist")?;
+    writeln!(stdout, "   Address: {address}")?;
+
+    let alpaca_wallet = AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    );
+
+    let removed = alpaca_wallet.remove_whitelist_entries(&address).await?;
+
+    writeln!(stdout, "Removed {} whitelist entry/entries:", removed.len())?;
+    for entry in &removed {
+        writeln!(stdout, "   ID: {}", entry.id)?;
+        writeln!(stdout, "   Asset: {}", entry.asset.as_ref())?;
+        writeln!(stdout, "   Status was: {:?}", entry.status)?;
+        writeln!(stdout, "   Created: {}", entry.created_at)?;
+    }
+
+    Ok(())
+}
+
 pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,
@@ -387,16 +467,9 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     if let Some(filled_qty) = order.filled_quantity {
         writeln!(stdout, "   Filled Quantity: {filled_qty}")?;
     }
-    if let (Some(price), Some(qty)) = (order.filled_average_price, order.filled_quantity) {
-        match Decimal::try_from(price) {
-            Ok(price_decimal) => {
-                let usd_amount = price_decimal * qty;
-                writeln!(stdout, "   USD Amount: ${usd_amount}")?;
-            }
-            Err(error) => {
-                writeln!(stdout, "   USD Amount: (conversion error: {error})")?;
-            }
-        }
+    if let (Some(price), Some(quantity)) = (order.filled_average_price, order.filled_quantity) {
+        let usd_amount = price * quantity;
+        writeln!(stdout, "   USD Amount: ${usd_amount}")?;
     }
     writeln!(stdout, "   Created: {}", order.created_at)?;
 
@@ -407,7 +480,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use rust_decimal_macros::dec;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use url::Url;
     use uuid::uuid;
 
@@ -418,6 +491,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -447,6 +521,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         });
         ctx
     }
@@ -470,6 +546,8 @@ mod tests {
                 api_secret: "test-secret".to_string(),
                 account_id: alpaca_account_id.to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
             rebalancing: Some(RebalancingCtx {
@@ -477,20 +555,20 @@ mod tests {
                 ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 usdc_vault_id: B256::ZERO,
                 redemption_wallet: Address::ZERO,
+                market_maker_wallet: Address::ZERO,
                 alpaca_account_id,
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc_threshold: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.1),
-                },
+                usdc: UsdcRebalancing::Disabled,
                 alpaca_broker_auth: AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
                     account_id: alpaca_account_id.to_string(),
                     mode: Some(AlpacaBrokerApiMode::Sandbox),
+                    asset_cache_ttl: std::time::Duration::from_secs(3600),
+                    time_in_force: TimeInForce::default(),
                 },
             }),
             execution_threshold: ExecutionThreshold::whole_share(),

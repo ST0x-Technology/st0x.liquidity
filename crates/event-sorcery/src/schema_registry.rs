@@ -13,16 +13,16 @@
 //!
 //! [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
 
-use std::collections::BTreeMap;
-
 use async_trait::async_trait;
+use cqrs_es::AggregateError;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use tracing::info;
 
-use crate::lifecycle::{Lifecycle, Never};
-use crate::{DomainEvent, EventSourced};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::{DomainEvent, EventSourced, Table};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
@@ -68,6 +68,7 @@ impl EventSourced for SchemaRegistry {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
+    const PROJECTION: Option<Table> = None;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -77,9 +78,9 @@ impl EventSourced for SchemaRegistry {
         Some(Self { versions })
     }
 
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         let SchemaRegistryEvent::VersionUpdated { name, version } = event;
-        let mut new_state = state.clone();
+        let mut new_state = entity.clone();
         new_state.versions.insert(name.clone(), *version);
         Ok(Some(new_state))
     }
@@ -124,7 +125,7 @@ impl Reconciler {
     }
 
     /// Rebuilds SchemaRegistry state from the full event log.
-    async fn load_registry(&self) -> Result<Option<SchemaRegistry>, anyhow::Error> {
+    async fn load_registry(&self) -> Result<Option<SchemaRegistry>, ReconcileError> {
         let payloads: Vec<String> = sqlx::query_scalar(
             "SELECT payload FROM events \
              WHERE aggregate_type = 'SchemaRegistry' \
@@ -142,7 +143,7 @@ impl Reconciler {
             state = match state {
                 None => SchemaRegistry::originate(&event),
                 Some(current) => {
-                    let evolved = SchemaRegistry::evolve(&event, &current)?;
+                    let evolved = SchemaRegistry::evolve(&current, &event)?;
                     Some(evolved.unwrap_or(current))
                 }
             };
@@ -156,7 +157,7 @@ impl Reconciler {
     ///
     /// Returns `true` if snapshots were cleared (schema changed),
     /// `false` if versions matched.
-    pub async fn reconcile<Entity: EventSourced>(&self) -> Result<bool, anyhow::Error> {
+    pub async fn reconcile<Entity: EventSourced>(&self) -> Result<bool, ReconcileError> {
         let name = Entity::AGGREGATE_TYPE;
         let current_version = Entity::SCHEMA_VERSION;
 
@@ -192,6 +193,23 @@ impl Reconciler {
             .await?;
 
         Ok(needs_clear)
+    }
+}
+
+/// Errors from schema reconciliation during startup.
+#[derive(Debug, thiserror::Error)]
+pub enum ReconcileError {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Aggregate(#[from] AggregateError<LifecycleError<SchemaRegistry>>),
+}
+
+impl From<Never> for ReconcileError {
+    fn from(never: Never) -> Self {
+        match never {}
     }
 }
 

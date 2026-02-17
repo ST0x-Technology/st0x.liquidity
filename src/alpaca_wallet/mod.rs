@@ -27,8 +27,11 @@ mod transfer;
 mod whitelist;
 
 use alloy::primitives::{Address, TxHash};
-use rust_decimal::Decimal;
 use std::sync::Arc;
+
+use st0x_execution::Positive;
+
+use crate::threshold::Usdc;
 
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;
@@ -78,12 +81,11 @@ impl AlpacaWalletService {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The amount is invalid (zero or negative)
     /// - The address is not whitelisted and approved
     /// - The API call fails
     pub(crate) async fn initiate_withdrawal(
         &self,
-        amount: Decimal,
+        amount: Positive<Usdc>,
         asset: &TokenSymbol,
         to_address: &Address,
     ) -> Result<Transfer, AlpacaWalletError> {
@@ -101,7 +103,7 @@ impl AlpacaWalletService {
             });
         }
 
-        transfer::initiate_withdrawal(&self.client, amount, &asset.0, &to_address.to_string()).await
+        transfer::initiate_withdrawal(&self.client, amount, asset, to_address).await
     }
 
     /// Polls a transfer until it reaches a terminal state (Complete or Failed).
@@ -174,7 +176,7 @@ impl AlpacaWalletService {
 mod tests {
     use alloy::primitives::address;
     use httpmock::prelude::*;
-    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use serde_json::json;
     use std::time::Duration;
     use uuid::uuid;
@@ -210,10 +212,11 @@ mod tests {
 
         let asset = TokenSymbol::new("USDC");
         let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
 
         assert!(matches!(
             service
-                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .initiate_withdrawal(amount, &asset, &to_address)
                 .await
                 .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }
@@ -244,10 +247,11 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
 
         assert!(matches!(
             service
-                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .initiate_withdrawal(amount, &asset, &to_address)
                 .await
                 .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }
@@ -300,9 +304,10 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
 
         let result = service
-            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+            .initiate_withdrawal(amount, &asset, &to_address)
             .await
             .unwrap();
 

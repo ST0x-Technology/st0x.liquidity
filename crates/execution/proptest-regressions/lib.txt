@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 448b2aa6796d77578aedcc27617375dd3db8abfe7e86a86665dd08b31e74ce43 # shrinks to mantissa = 432228522177, scale = 2
+cc 3eb3b79e6c354c0b90353865a47acbbdb01c357f46120079108b617270be855f # shrinks to mantissa = 441021769102, scale = 2

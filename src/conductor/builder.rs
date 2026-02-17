@@ -10,12 +10,11 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::Executor;
 
-use st0x_event_sorcery::{SqliteProjection, Store};
-
 use super::{
-    Conductor, EventProcessingError, spawn_event_processor, spawn_inventory_poller,
+    Conductor, EventProcessingError, TradingTasks, spawn_event_processor, spawn_inventory_poller,
     spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
     spawn_queue_processor,
 };
@@ -23,8 +22,8 @@ use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
 use crate::inventory::InventorySnapshot;
 use crate::offchain_order::OffchainOrder;
+use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
-use crate::onchain::vault::VaultService;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
@@ -38,9 +37,11 @@ type TakeStream =
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
     pub(crate) position: Arc<Store<Position>>,
-    pub(crate) position_query: Arc<SqliteProjection<Position>>,
+    pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
-    pub(crate) vault_registry: Store<VaultRegistry>,
+    pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
+    pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
+    pub(crate) vault_registry_projection: Arc<Projection<VaultRegistry>>,
     pub(crate) snapshot: Store<InventorySnapshot>,
 }
 
@@ -166,14 +167,16 @@ where
 
         let inventory_poller = match self.common.ctx.order_owner() {
             Ok(order_owner) => {
-                let vault_service = Arc::new(VaultService::new(
+                let raindex_service = Arc::new(RaindexService::new(
                     self.common.provider.clone(),
                     self.common.ctx.evm.orderbook,
+                    self.common.frameworks.vault_registry_projection.clone(),
+                    order_owner,
                 ));
                 Some(spawn_inventory_poller(
-                    self.common.pool.clone(),
-                    vault_service,
+                    raindex_service,
                     self.common.executor.clone(),
+                    self.common.frameworks.vault_registry.clone(),
                     self.common.ctx.evm.orderbook,
                     order_owner,
                     self.common.frameworks.snapshot,
@@ -188,8 +191,8 @@ where
 
         let order_poller = spawn_order_poller(
             &self.common.ctx,
-            &self.common.pool,
             self.common.executor.clone(),
+            (*self.common.frameworks.offchain_order_projection).clone(),
             self.common.frameworks.offchain_order.clone(),
             self.common.frameworks.position.clone(),
         );
@@ -202,16 +205,15 @@ where
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
-            self.common.pool.clone(),
             self.common.frameworks.position.clone(),
-            self.common.frameworks.position_query.clone(),
+            self.common.frameworks.position_projection.clone(),
             self.common.frameworks.offchain_order.clone(),
             self.common.execution_threshold,
         );
         let trade_cqrs = super::TradeProcessingCqrs {
             onchain_trade: self.common.frameworks.onchain_trade,
             position: self.common.frameworks.position,
-            position_query: self.common.frameworks.position_query,
+            position_projection: self.common.frameworks.position_projection,
             offchain_order: self.common.frameworks.offchain_order,
             execution_threshold: self.common.execution_threshold,
         };
@@ -227,13 +229,15 @@ where
 
         Conductor {
             executor_maintenance,
-            order_poller,
-            dex_event_receiver,
-            event_processor,
-            position_checker,
-            queue_processor,
             rebalancer,
             inventory_poller,
+            trading_tasks: Some(TradingTasks {
+                order_poller,
+                dex_event_receiver,
+                event_processor,
+                position_checker,
+                queue_processor,
+            }),
         }
     }
 }

@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -105,9 +104,9 @@ pub(super) struct OrderResponse {
     #[serde(
         rename = "filled_avg_price",
         default,
-        deserialize_with = "deserialize_optional_price"
+        deserialize_with = "deserialize_optional_decimal"
     )]
-    pub filled_average_price: Option<f64>,
+    pub filled_average_price: Option<Decimal>,
 }
 
 /// Order request for crypto trading (e.g., USDC/USD conversion).
@@ -136,9 +135,9 @@ pub struct CryptoOrderResponse {
     #[serde(
         rename = "filled_avg_price",
         default,
-        deserialize_with = "deserialize_optional_price"
+        deserialize_with = "deserialize_optional_decimal"
     )]
-    pub filled_average_price: Option<f64>,
+    pub filled_average_price: Option<Decimal>,
     #[serde(
         rename = "filled_qty",
         default,
@@ -182,19 +181,6 @@ where
     let s = String::deserialize(deserializer)?;
     let value: Decimal = s.parse().map_err(serde::de::Error::custom)?;
     Positive::new(FractionalShares::new(value)).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_optional_price<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |value| {
-        value
-            .parse::<f64>()
-            .map(Some)
-            .map_err(serde::de::Error::custom)
-    })
 }
 
 fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
@@ -265,7 +251,7 @@ pub(super) async fn get_order_status(
     let response = client.get_order(order_uuid).await?;
 
     let status = map_broker_status_to_order_status(response.status);
-    let price_cents = convert_price_to_cents(response.filled_average_price)?;
+    let price = response.filled_average_price;
 
     if response.status == BrokerOrderStatus::PartiallyFilled {
         debug!(
@@ -280,7 +266,7 @@ pub(super) async fn get_order_status(
     Ok(OrderUpdate {
         status,
         updated_at: Utc::now(),
-        price_cents,
+        price,
     })
 }
 
@@ -308,16 +294,6 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
         | BrokerOrderStatus::Suspended
         | BrokerOrderStatus::Calculated => OrderStatus::Failed,
     }
-}
-
-fn convert_price_to_cents(price: Option<f64>) -> Result<Option<u64>, AlpacaBrokerApiError> {
-    price.map_or(Ok(None), |price_value| {
-        let cents_float = (price_value * 100.0).round();
-        let cents = cents_float
-            .to_u64()
-            .ok_or(AlpacaBrokerApiError::PriceConversion(price_value))?;
-        Ok(Some(cents))
-    })
 }
 
 /// Convert USDC to/from USD on Alpaca.
@@ -398,10 +374,10 @@ pub(crate) async fn poll_crypto_order_until_filled(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use httpmock::prelude::*;
+    use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::str::FromStr;
 
     use super::*;
     use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
@@ -530,7 +506,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Submitted);
-        assert_eq!(order_update.price_cents, None);
+        assert_eq!(order_update.price, None);
     }
 
     #[tokio::test]
@@ -560,7 +536,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Filled);
-        assert_eq!(order_update.price_cents, Some(24567));
+        assert_eq!(order_update.price, Some(dec!(245.67)));
     }
 
     #[tokio::test]
@@ -590,27 +566,6 @@ mod tests {
 
         mock.assert();
         assert_eq!(order_update.status, OrderStatus::Failed);
-    }
-
-    #[test]
-    fn test_convert_price_to_cents_some() {
-        let result = convert_price_to_cents(Some(245.67)).unwrap();
-        assert_eq!(result, Some(24567));
-    }
-
-    #[test]
-    fn test_convert_price_to_cents_none() {
-        let result = convert_price_to_cents(None).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_convert_price_to_cents_negative_fails() {
-        let result = convert_price_to_cents(Some(-100.0));
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaBrokerApiError::PriceConversion(_)
-        ));
     }
 
     #[test]
@@ -719,7 +674,7 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
-        assert_eq!(order.quantity, Decimal::from_str("500").unwrap());
+        assert_eq!(order.quantity, dec!(500));
         assert_eq!(order.status_display(), "filled");
     }
 

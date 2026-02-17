@@ -19,10 +19,6 @@ use tokio::sync::{RwLock, mpsc};
 use st0x_event_sorcery::{Lifecycle, SqliteQuery, Store, test_store, test_store_with_reactors};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
-use crate::alpaca_tokenization::tests::{
-    TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
-    tokenization_requests_path,
-};
 use crate::bindings::{IERC20, TestERC20};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
@@ -37,6 +33,10 @@ use crate::rebalancing::{
 };
 use crate::test_utils::setup_test_db;
 use crate::threshold::{ExecutionThreshold, Usdc};
+use crate::tokenization::alpaca::tests::{
+    TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
+    tokenization_requests_path,
+};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 

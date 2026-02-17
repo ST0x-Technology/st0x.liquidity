@@ -10,7 +10,7 @@ use super::auth::{AccountStatus, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::order::{ConversionDirection, CryptoOrderResponse};
 use crate::{
-    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor,
+    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor, Symbol,
     TryIntoExecutor,
 };
 
@@ -49,8 +49,8 @@ impl Executor for AlpacaBrokerApi {
         })
     }
 
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
-        super::market_hours::wait_until_market_open(&self.client).await
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        super::market_hours::is_market_open(&self.client).await
     }
 
     async fn place_market_order(
@@ -68,7 +68,7 @@ impl Executor for AlpacaBrokerApi {
                 order_id: order_id.clone(),
             }),
             OrderStatus::Filled => {
-                let price_cents = order_update.price_cents.ok_or_else(|| {
+                let price = order_update.price.ok_or_else(|| {
                     AlpacaBrokerApiError::IncompleteFilledOrder {
                         order_id: order_id.clone(),
                         field: "price".to_string(),
@@ -78,7 +78,7 @@ impl Executor for AlpacaBrokerApi {
                 Ok(OrderState::Filled {
                     executed_at: order_update.updated_at,
                     order_id: order_id.clone(),
-                    price_cents,
+                    price,
                 })
             }
             OrderStatus::Failed => Ok(OrderState::Failed {
@@ -147,8 +147,6 @@ impl AlpacaBrokerApi {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use chrono_tz::America::New_York;
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -212,43 +210,6 @@ mod tests {
             error,
             AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401
         ));
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        let account_mock = create_account_mock(&server);
-
-        // Get today's date in ET timezone to build a response that represents
-        // market currently being open
-        let now = Utc::now();
-        let now_et = now.with_timezone(&New_York);
-        let today = now_et.date_naive();
-        let today_str = today.format("%Y-%m-%d").to_string();
-
-        // Mock calendar endpoint - returns today as a trading day with market
-        // hours that span the entire day so the test always finds market "open"
-        let calendar_mock = server.mock(|when, then| {
-            when.method(GET).path("/v1/calendar");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "date": today_str,
-                        "open": "00:00",
-                        "close": "23:59"
-                    }
-                ]));
-        });
-
-        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
-        let wait = executor.wait_until_market_open().await.unwrap();
-
-        account_mock.assert();
-        calendar_mock.assert();
-        assert!(wait.as_secs() > 0);
     }
 
     #[tokio::test]

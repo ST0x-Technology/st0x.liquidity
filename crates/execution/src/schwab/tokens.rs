@@ -222,7 +222,7 @@ async fn start_automatic_token_refresh_loop(
     ctx: SchwabAuthCtx,
 ) -> Result<(), SchwabError> {
     let refresh_interval_secs = (ACCESS_TOKEN_DURATION_MINUTES - 1) * 60;
-    let refresh_interval_u64: u64 = refresh_interval_secs.try_into()?;
+    let refresh_interval_u64 = refresh_interval_secs.try_into()?;
     let mut interval_timer = interval(TokioDuration::from_secs(refresh_interval_u64));
 
     loop {

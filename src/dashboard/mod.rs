@@ -80,6 +80,7 @@ mod tests {
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
     use st0x_dto::EventStoreEntry;
+    use std::sync::Mutex;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
 
@@ -162,7 +163,7 @@ mod tests {
         };
 
         let (port_tx, port_rx) = oneshot::channel::<u16>();
-        let port_tx = std::sync::Mutex::new(Some(port_tx));
+        let port_tx = Mutex::new(Some(port_tx));
 
         let rocket = rocket::build()
             .configure(config)
@@ -220,7 +221,7 @@ mod tests {
         };
 
         let (port_tx, port_rx) = oneshot::channel::<u16>();
-        let port_tx = std::sync::Mutex::new(Some(port_tx));
+        let port_tx = Mutex::new(Some(port_tx));
 
         let rocket = rocket::build()
             .configure(config)

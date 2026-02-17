@@ -14,16 +14,13 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
-use st0x_execution::{
-    Direction, FractionalShares, MockExecutor, OrderState, SupportedExecutor, Symbol,
-};
+use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Symbol};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use st0x_event_sorcery::{Lifecycle, Projection, SqliteProjection, SqliteQuery, Store, test_store};
+use st0x_event_sorcery::{Lifecycle, Projection, SqliteQuery, Store, test_store};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
-use crate::alpaca_tokenization::tests::setup_anvil;
 use crate::bindings::IOrderBookV5::{self, TakeOrderV3};
 use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, OrderBook, Parser, Store as RainStore,
@@ -44,6 +41,7 @@ use crate::queue::{self, QueuedEvent};
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
+use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::vault_registry::VaultRegistryId;
 
 const TEST_AAPL: &str = "AAPL";
@@ -56,7 +54,7 @@ const MSFT_PRICE: u32 = 200;
 /// The `last_updated` timestamp is non-deterministic and is asserted against the loaded value.
 #[bon::builder]
 async fn assert_position(
-    query: &SqliteProjection<Position>,
+    query: &Projection<Position>,
     symbol: &Symbol,
     net: FractionalShares,
     accumulated_long: FractionalShares,
@@ -105,8 +103,9 @@ impl AnvilTrade {
         event_id: i64,
         cqrs: &TradeProcessingCqrs,
     ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+        let executor = MockExecutor::default();
         process_queued_trade(
-            SupportedExecutor::DryRun,
+            &executor,
             pool,
             &self.queued_event,
             event_id,
@@ -150,14 +149,14 @@ async fn seed_event_queue(pool: &SqlitePool, queued_event: &QueuedEvent) -> i64 
 
 /// Creates a poller with the default MockExecutor (returns Filled) and polls pending orders.
 async fn poll_and_fill(
-    pool: &SqlitePool,
+    offchain_order_projection: &Projection<OffchainOrder>,
     offchain_order: &Arc<Store<crate::offchain_order::OffchainOrder>>,
     position: &Arc<Store<Position>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let poller = OrderStatusPoller::new(
         OrderPollerCtx::default(),
-        pool.clone(),
         MockExecutor::new(),
+        offchain_order_projection.clone(),
         offchain_order.clone(),
         position.clone(),
     );
@@ -590,8 +589,9 @@ fn create_test_cqrs(
 ) -> (
     TradeProcessingCqrs,
     Arc<Store<Position>>,
-    Arc<SqliteProjection<Position>>,
+    Arc<Projection<Position>>,
     Arc<Store<crate::offchain_order::OffchainOrder>>,
+    Arc<Projection<OffchainOrder>>,
 ) {
     let onchain_trade = Arc::new(test_store(pool.clone(), vec![], ()));
 
@@ -615,6 +615,7 @@ fn create_test_cqrs(
     >::new(
         pool.clone(), "offchain_order_view".to_string()
     ));
+    let offchain_order_projection = Arc::new(Projection::new(offchain_order_view_repo.clone()));
     let offchain_order = Arc::new(test_store(
         pool.clone(),
         vec![Box::new(SqliteQuery::<OffchainOrder>::new(
@@ -626,12 +627,18 @@ fn create_test_cqrs(
     let cqrs = TradeProcessingCqrs {
         onchain_trade,
         position: position.clone(),
-        position_query: position_projection.clone(),
+        position_projection: position_projection.clone(),
         offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
     };
 
-    (cqrs, position, position_projection, offchain_order)
+    (
+        cqrs,
+        position,
+        position_projection,
+        offchain_order,
+        offchain_order_projection,
+    )
 }
 
 #[tokio::test]
@@ -639,7 +646,8 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Checkpoint 1: before any trades -- no Position aggregate exists
@@ -745,7 +753,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     assert_eq!(offchain_placed["shares"].as_str().unwrap(), "1.2");
 
     // Fulfillment: order poller detects the filled order and completes the lifecycle
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     assert_position()
         .query(&position_query)
@@ -779,7 +787,8 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
 async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Two trades: 0.5 + 0.7 = 1.2 shares, crosses threshold
@@ -816,8 +825,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     });
     OrderStatusPoller::new(
         OrderPollerCtx::default(),
-        pool.clone(),
         failed_executor,
+        offchain_order_projection.as_ref().clone(),
         offchain_order.clone(),
         position.clone(),
     )
@@ -860,7 +869,6 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     // Position checker finds the unexecuted position and retries
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &pool,
         &position,
         &position_query,
         &offchain_order,
@@ -868,7 +876,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     )
     .await?;
 
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     // Final: position fully hedged
     assert_position()
@@ -910,7 +918,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool);
     let aapl = Symbol::new(TEST_AAPL).unwrap();
     let msft = Symbol::new(TEST_MSFT).unwrap();
 
@@ -1029,7 +1038,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(aapl_placed["shares"].as_str().unwrap(), "1.2");
 
     // Poll and fill AAPL, verify MSFT unchanged
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     assert_position()
         .query(&position_query)
@@ -1116,7 +1125,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(msft_placed["shares"].as_str().unwrap(), "1.0");
 
     // Poll and fill MSFT, both positions end fully hedged
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     assert_position()
         .query(&position_query)
@@ -1158,7 +1167,8 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
 async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.5 shares, below threshold
@@ -1251,7 +1261,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     );
 
     // Fill the hedge order
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     assert_position()
         .query(&position_query)
@@ -1278,7 +1288,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
 async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let t1 = ob
@@ -1344,7 +1354,8 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
 async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool);
 
     // Complete a full hedge cycle so position net=0
     let t1 = ob
@@ -1358,14 +1369,13 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
     t1.seed_and_submit(&pool, &cqrs)
         .await?
         .expect("Threshold crossed");
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     let events_before = fetch_events(&pool).await;
 
     // Position checker should find nothing to do
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &pool,
         &position,
         &position_query,
         &offchain_order,
@@ -1389,7 +1399,8 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
 async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // First cycle: 1.0 share sell -> hedge -> fill
@@ -1406,7 +1417,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("First threshold crossing");
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     assert_position()
         .query(&position_query)
@@ -1446,7 +1457,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
 
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     assert_position()
         .query(&position_query)
@@ -1498,7 +1509,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
 async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, _, _, _) = create_test_cqrs(&pool);
+    let (cqrs, _, _, _, _) = create_test_cqrs(&pool);
 
     let t1 = ob
         .take_order()
@@ -1588,7 +1599,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
 async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let t1 = ob
@@ -1633,7 +1644,7 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
 async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let t1 = ob
@@ -1689,7 +1700,8 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
 async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.8 AAPL -> net=+0.8, below threshold
@@ -1817,7 +1829,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     assert_eq!(placed["shares"].as_str().unwrap(), "1.1");
 
     // Fill the hedge and verify net returns to zero
-    poll_and_fill(&pool, &offchain_order, &position).await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     assert_position()
         .query(&position_query)
@@ -1839,7 +1851,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Sell 1.5 AAPL -> crosses threshold, offchain order placed
@@ -1927,7 +1939,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
 async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order) = create_test_cqrs(&pool);
+    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool);
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let t1 = ob

@@ -32,8 +32,9 @@ uuid = { version = "1.10.0", features = ["v4", "serde"] }
 aes-gcm = "0.10.3"
 cqrs-es.workspace = true
 sqlite-es.workspace = true
-rust_decimal.workspace = true
+rust_decimal = { workspace = true, features = ["serde-with-float"] }
 num-decimal.workspace = true
+rust_decimal_macros = "1.40.0"
 
 [dev-dependencies]
 httpmock.workspace = true

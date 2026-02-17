@@ -4,10 +4,11 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use chrono::Utc;
+use rust_decimal::Decimal;
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,20 +16,16 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
-use st0x_event_sorcery::{AggregateError, LifecycleError, Reactor, load_aggregate};
+use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Never, Reactor, Store, deps};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaAccountId;
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
-use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
+use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
-use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintEvent,
-};
-use crate::usdc_rebalance::{
-    RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
-};
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Why loading a token address from the vault registry failed.
@@ -45,8 +42,20 @@ enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
-    #[error("broker account_id is not a valid UUID: {0}")]
-    InvalidAccountId(#[from] uuid::Error),
+    #[error(transparent)]
+    Ecdsa(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
+    WalletCollision(Address),
+    #[error(transparent)]
+    Uuid(#[from] uuid::Error),
+}
+
+/// USDC rebalancing configuration with explicit enable/disable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum UsdcRebalancing {
+    Enabled { target: Decimal, deviation: Decimal },
+    Disabled,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,11 +65,11 @@ pub(crate) struct RebalancingSecrets {
     pub(crate) evm_private_key: B256,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
 }
@@ -69,14 +78,16 @@ pub(crate) struct RebalancingConfig {
 /// Constructed from `RebalancingConfig` + `RebalancingSecrets` + broker's `AlpacaBrokerApiCtx`.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
+    /// Derived once from `evm_private_key` during construction.
+    pub(crate) market_maker_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Derived from broker config's account_id.
+    /// Parsed from `alpaca_broker_auth.account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Cloned from broker config - ensures consistency.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
@@ -93,11 +104,17 @@ impl RebalancingCtx {
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
+        let market_maker_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)?.address();
+
+        if market_maker_wallet == config.redemption_wallet {
+            return Err(RebalancingCtxError::WalletCollision(market_maker_wallet));
+        }
 
         Ok(Self {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            equity: config.equity,
+            usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
+            market_maker_wallet,
             ethereum_rpc_url: secrets.ethereum_rpc_url,
             evm_private_key: secrets.evm_private_key,
             usdc_vault_id: config.usdc_vault_id,
@@ -110,9 +127,10 @@ impl RebalancingCtx {
 impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingCtx")
-            .field("equity_threshold", &self.equity_threshold)
-            .field("usdc_threshold", &self.usdc_threshold)
+            .field("equity", &self.equity)
+            .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
+            .field("market_maker_wallet", &self.market_maker_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
@@ -125,8 +143,8 @@ impl std::fmt::Debug for RebalancingCtx {
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancing,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -152,19 +170,19 @@ pub(crate) enum TriggeredOperation {
 /// Trigger that monitors inventory and sends rebalancing operations.
 pub(crate) struct RebalancingTrigger {
     config: RebalancingTriggerConfig,
-    pool: SqlitePool,
+    vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<RwLock<InventoryView>>,
-    equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
-    usdc_in_progress: Arc<AtomicBool>,
+    pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+    pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
 }
 
 impl RebalancingTrigger {
     pub(crate) fn new(
         config: RebalancingTriggerConfig,
-        pool: SqlitePool,
+        vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         order_owner: Address,
         inventory: Arc<RwLock<InventoryView>>,
@@ -172,7 +190,7 @@ impl RebalancingTrigger {
     ) -> Self {
         Self {
             config,
-            pool,
+            vault_registry,
             orderbook,
             order_owner,
             inventory,
@@ -183,72 +201,100 @@ impl RebalancingTrigger {
     }
 }
 
-#[async_trait]
-impl Reactor<Position> for RebalancingTrigger {
-    async fn react(&self, symbol: &Symbol, event: &PositionEvent) {
-        self.apply_position_event_and_check(symbol, event).await;
-    }
-}
+deps!(
+    RebalancingTrigger,
+    [
+        Position,
+        TokenizedEquityMint,
+        EquityRedemption,
+        UsdcRebalance
+    ]
+);
 
 #[async_trait]
-impl Reactor<TokenizedEquityMint> for RebalancingTrigger {
-    async fn react(&self, _id: &IssuerRequestId, event: &TokenizedEquityMintEvent) {
-        let Some((symbol, quantity)) = Self::extract_mint_info(event) else {
-            return;
-        };
+impl Reactor for RebalancingTrigger {
+    type Error = Never;
 
-        self.apply_mint_event_to_inventory(&symbol, event, quantity)
+    async fn react(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        event
+            .on(|symbol, event| self.on_position(symbol, event))
+            .on(|_id, event| self.on_mint(event))
+            .on(|_id, event| self.on_redemption(event))
+            .on(|_id, event| self.on_usdc_rebalance(event))
+            .exhaustive()
             .await;
 
-        if Self::is_terminal_mint_event(event) {
-            self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
-
-            // After mint completes, USDC balances may have changed
-            self.check_and_trigger_usdc().await;
-        }
-    }
-}
-
-#[async_trait]
-impl Reactor<EquityRedemption> for RebalancingTrigger {
-    async fn react(&self, _id: &RedemptionAggregateId, event: &EquityRedemptionEvent) {
-        let Some((symbol, quantity)) = Self::extract_redemption_info(event) else {
-            return;
-        };
-
-        self.apply_redemption_event_to_inventory(&symbol, event, quantity)
-            .await;
-
-        if Self::is_terminal_redemption_event(event) {
-            self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
-
-            // After redemption completes, USDC balances may have changed
-            self.check_and_trigger_usdc().await;
-        }
-    }
-}
-
-#[async_trait]
-impl Reactor<UsdcRebalance> for RebalancingTrigger {
-    async fn react(&self, _id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) {
-        if let Some((direction, amount)) = Self::extract_usdc_rebalance_info(event) {
-            self.apply_usdc_rebalance_event_to_inventory(event, &direction, amount)
-                .await;
-        }
-
-        if Self::is_terminal_usdc_rebalance_event(event) {
-            self.clear_usdc_in_progress();
-            debug!("Cleared USDC in-progress flag after rebalance terminal event");
-
-            // After USDC rebalance completes, check if more rebalancing is needed
-            self.check_and_trigger_usdc().await;
-        }
+        Ok(())
     }
 }
 
 impl RebalancingTrigger {
+    async fn on_position(&self, symbol: Symbol, event: PositionEvent) {
+        let mut inventory = self.inventory.write().await;
+
+        let new_inventory = match inventory.clone().apply_position_event(&symbol, &event) {
+            Ok(updated) => updated,
+            Err(error) => {
+                warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
+                return;
+            }
+        };
+
+        *inventory = new_inventory;
+        drop(inventory);
+
+        self.check_and_trigger_equity(&symbol).await;
+    }
+
+    async fn on_mint(&self, event: TokenizedEquityMintEvent) {
+        let Some((symbol, quantity)) = Self::extract_mint_info(&event) else {
+            return;
+        };
+
+        self.apply_mint_event_to_inventory(&symbol, &event, quantity)
+            .await;
+
+        if Self::is_terminal_mint_event(&event) {
+            self.clear_equity_in_progress(&symbol);
+            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+
+            self.check_and_trigger_usdc().await;
+        }
+    }
+
+    async fn on_redemption(&self, event: EquityRedemptionEvent) {
+        let Some((symbol, quantity)) = Self::extract_redemption_info(&event) else {
+            return;
+        };
+
+        self.apply_redemption_event_to_inventory(&symbol, &event, quantity)
+            .await;
+
+        if Self::is_terminal_redemption_event(&event) {
+            self.clear_equity_in_progress(&symbol);
+            debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
+
+            self.check_and_trigger_usdc().await;
+        }
+    }
+
+    async fn on_usdc_rebalance(&self, event: UsdcRebalanceEvent) {
+        if let Some((direction, amount)) = Self::extract_usdc_rebalance_info(&event) {
+            self.apply_usdc_rebalance_event_to_inventory(&event, &direction, amount)
+                .await;
+        }
+
+        if Self::is_terminal_usdc_rebalance_event(&event) {
+            self.clear_usdc_in_progress();
+            debug!("Cleared USDC in-progress flag after rebalance terminal event");
+
+            self.check_and_trigger_usdc().await;
+        }
+    }
+
     /// Checks inventory for equity imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_equity(&self, symbol: &Symbol) {
         let Some(guard) = equity::InProgressGuard::try_claim(
@@ -276,7 +322,9 @@ impl RebalancingTrigger {
         let token_address = match self.load_token_address(symbol).await {
             Ok(Some(addr)) => addr,
             Ok(None) => {
-                error!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
+                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
+                // tokenized equities and won't be in the vault registry.
+                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
                 return None;
             }
             Err(error) => {
@@ -287,7 +335,7 @@ impl RebalancingTrigger {
 
         equity::check_imbalance_and_build_operation(
             symbol,
-            &self.config.equity_threshold,
+            &self.config.equity,
             &self.inventory,
             token_address,
         )
@@ -304,7 +352,9 @@ impl RebalancingTrigger {
             owner: self.order_owner,
         };
 
-        let registry = load_aggregate::<VaultRegistry>(self.pool.clone(), &vault_registry_id)
+        let registry = self
+            .vault_registry
+            .load(&vault_registry_id)
             .await?
             .ok_or(TokenAddressError::Uninitialized)?;
 
@@ -313,15 +363,19 @@ impl RebalancingTrigger {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
+        let UsdcRebalancing::Enabled { target, deviation } = self.config.usdc else {
+            return;
+        };
+
         let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
         else {
             debug!("Skipped USDC trigger: already in progress");
             return;
         };
 
+        let threshold = ImbalanceThreshold { target, deviation };
         let Ok(operation) =
-            usdc::check_imbalance_and_build_operation(&self.config.usdc_threshold, &self.inventory)
-                .await
+            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory).await
         else {
             return;
         };
@@ -349,30 +403,6 @@ impl RebalancingTrigger {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
     }
 
-    async fn apply_position_event_and_check(&self, symbol: &Symbol, event: &PositionEvent) {
-        if let Err(error) = self.apply_position_event_to_inventory(symbol, event).await {
-            warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
-            return;
-        }
-
-        self.check_and_trigger_equity(symbol).await;
-    }
-
-    async fn apply_position_event_to_inventory(
-        &self,
-        symbol: &Symbol,
-        event: &PositionEvent,
-    ) -> Result<(), InventoryViewError> {
-        let mut inventory = self.inventory.write().await;
-
-        let new_inventory = inventory.clone().apply_position_event(symbol, event)?;
-
-        *inventory = new_inventory;
-        drop(inventory);
-
-        Ok(())
-    }
-
     fn extract_mint_info(event: &TokenizedEquityMintEvent) -> Option<(Symbol, FractionalShares)> {
         use TokenizedEquityMintEvent::*;
 
@@ -389,10 +419,17 @@ impl RebalancingTrigger {
     fn is_terminal_mint_event(event: &TokenizedEquityMintEvent) -> bool {
         use TokenizedEquityMintEvent::*;
 
-        matches!(
-            event,
-            MintCompleted { .. } | MintRejected { .. } | MintAcceptanceFailed { .. }
-        )
+        match event {
+            MintCompleted { .. }
+            | MintRejected { .. }
+            | MintAcceptanceFailed { .. }
+            | RaindexDepositFailed { .. } => true,
+
+            MintRequested { .. }
+            | MintAccepted { .. }
+            | TokensReceived { .. }
+            | VaultDeposited { .. } => false,
+        }
     }
 
     async fn apply_mint_event_to_inventory(
@@ -423,7 +460,7 @@ impl RebalancingTrigger {
     ) -> Option<(Symbol, FractionalShares)> {
         use EquityRedemptionEvent::*;
 
-        if let TokensSent {
+        if let VaultWithdrawn {
             symbol, quantity, ..
         } = event
         {
@@ -436,10 +473,14 @@ impl RebalancingTrigger {
     fn is_terminal_redemption_event(event: &EquityRedemptionEvent) -> bool {
         use EquityRedemptionEvent::*;
 
-        matches!(
-            event,
-            Completed { .. } | DetectionFailed { .. } | RedemptionRejected { .. }
-        )
+        match event {
+            Completed { .. }
+            | TransferFailed { .. }
+            | DetectionFailed { .. }
+            | RedemptionRejected { .. } => true,
+
+            VaultWithdrawn { .. } | TokensSent { .. } | Detected { .. } => false,
+        }
     }
 
     async fn apply_redemption_event_to_inventory(
@@ -528,31 +569,38 @@ impl RebalancingTrigger {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
+    use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive};
+    use sqlx::SqlitePool;
+    use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
+    use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
-    use uuid::uuid;
+    use uuid::{Uuid, uuid};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::offchain_order::{OffchainOrderId, PriceCents};
+    use crate::equity_redemption::DetectionFailure;
+    use crate::inventory::InventorySnapshotReactor;
+    use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
+    use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
-    use crate::tokenized_equity_mint::{ReceiptId, TokenizationRequestId};
-    use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand};
+    use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
     use crate::vault_registry::VaultRegistryCommand;
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancing::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
@@ -567,7 +615,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                pool,
+                Arc::new(test_store::<VaultRegistry>(pool, ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -610,6 +658,35 @@ mod tests {
                 mpsc::error::TryRecvError::Empty
             ),
             "Expected channel to be empty (no message sent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_usdc_disabled_does_not_send() {
+        let (sender, mut receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let trigger = RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity: test_config().equity,
+                usdc: UsdcRebalancing::Disabled,
+            },
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            sender,
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty when USDC rebalancing is disabled"
         );
     }
 
@@ -683,7 +760,7 @@ mod tests {
             shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
             executor_order_id: ExecutorOrderId::new("ORD1"),
-            price_cents: PriceCents(15000),
+            price: Dollars(dec!(150.00)),
             broker_timestamp: Utc::now(),
         }
     }
@@ -693,7 +770,7 @@ mod tests {
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let store = st0x_event_sorcery::test_store::<VaultRegistry>(pool.clone(), vec![], ());
+        let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -725,7 +802,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                pool,
+                Arc::new(test_store::<VaultRegistry>(pool, ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -748,7 +825,7 @@ mod tests {
         (
             RebalancingTrigger::new(
                 test_config(),
-                pool,
+                Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
                 inventory,
@@ -772,10 +849,11 @@ mod tests {
 
     #[tokio::test]
     async fn load_token_address_returns_address_for_known_symbol() {
-        let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        seed_vault_registry(&trigger.pool, &symbol).await;
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
         let result = trigger.load_token_address(&symbol).await.unwrap();
         assert_eq!(result, Some(TEST_TOKEN));
@@ -783,35 +861,71 @@ mod tests {
 
     #[tokio::test]
     async fn load_token_address_returns_none_for_unknown_symbol() {
-        let (trigger, _receiver) = make_trigger().await;
         let known = Symbol::new("AAPL").unwrap();
         let unknown = Symbol::new("MSFT").unwrap();
+        let inventory = InventoryView::default().with_equity(known.clone());
 
-        seed_vault_registry(&trigger.pool, &known).await;
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &known).await;
 
         let result = trigger.load_token_address(&unknown).await.unwrap();
         assert_eq!(result, None);
     }
 
     #[tokio::test]
-    async fn position_event_for_unknown_symbol_logs_error_without_panic() {
-        let (trigger, mut receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+    async fn position_events_auto_register_symbol_and_trigger_rebalancing() {
+        // Reproduces the production scenario: InventoryView starts empty (no
+        // with_equity call), position events arrive for a symbol that exists
+        // in the vault registry. After accumulating an imbalance, rebalancing
+        // must be triggered.
+        //
+        // In production, InventoryView::default() creates an empty equities
+        // map. Position events arrive as onchain fills are processed. If the
+        // symbol isn't pre-registered, apply_position_event_to_inventory must
+        // handle it (either by auto-registering or by decoupling the
+        // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_onchain_fill(shares(10), Direction::Buy);
+        let (sender, mut receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let pool = crate::test_utils::setup_test_db().await;
 
-        // Should handle the error gracefully without panicking.
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        seed_vault_registry(&pool, &symbol).await;
 
-        // Verify no operation was triggered.
-        trigger.check_and_trigger_equity(&symbol).await;
+        let trigger = RebalancingTrigger::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            sender,
+        );
+
+        // Simulate production: onchain fills arrive on an empty inventory.
+        // 20 onchain buys, 80 offchain buys -> 20% onchain ratio.
+        // Threshold: target 50%, deviation 20%, lower bound 30%.
+        // 20% < 30% -> should trigger Mint (too much offchain).
+        for _ in 0..20 {
+            let event = make_onchain_fill(shares(1), Direction::Buy);
+            trigger.on_position(symbol.clone(), event).await;
+        }
+
+        for _ in 0..80 {
+            let event = make_offchain_fill(shares(1), Direction::Buy);
+            trigger.on_position(symbol.clone(), event).await;
+        }
+
+        // Drain any intermediate triggers and do a final check.
+        while receiver.try_recv().is_ok() {}
+        trigger.clear_equity_in_progress(&symbol);
+
+        // One more event to trigger the check after the imbalance is built up.
+        let event = make_onchain_fill(shares(1), Direction::Buy);
+        trigger.on_position(symbol.clone(), event).await;
+
+        let triggered = receiver.try_recv();
         assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty (no message sent)"
+            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
+            "Expected Mint for imbalanced inventory starting from empty, got {triggered:?}"
         );
     }
 
@@ -824,18 +938,14 @@ mod tests {
 
         // Apply onchain buy - should add to onchain available.
         let event = make_onchain_fill(shares(50), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // Apply offchain buy - should add to offchain available.
         let event = make_offchain_fill(shares(50), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // Now inventory has 50 onchain, 50 offchain = balanced at 50%.
-        // Drain any previous triggered operations (from apply_position_event_and_check).
+        // Drain any previous triggered operations (from on_position).
         while receiver.try_recv().is_ok() {}
 
         trigger.check_and_trigger_equity(&symbol).await;
@@ -866,9 +976,7 @@ mod tests {
         // Apply a small buy that maintains balance (5 shares onchain).
         // After: 55 onchain, 50 offchain = 52.4% ratio, within 30-70% bounds.
         let event = make_onchain_fill(shares(5), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // No operation should be triggered.
         assert!(
@@ -899,9 +1007,7 @@ mod tests {
 
         // Apply a small event that triggers the imbalance check.
         let event = make_onchain_fill(shares(1), Direction::Buy);
-        trigger
-            .apply_position_event_and_check(&symbol, &event)
-            .await;
+        trigger.on_position(symbol.clone(), event).await;
 
         // Mint should be triggered because too much offchain.
         let triggered = receiver.try_recv();
@@ -936,14 +1042,14 @@ mod tests {
 
     fn make_mint_rejected() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRejected {
-            reason: "API timeout".to_string(),
+            reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         }
     }
 
     fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
-            reason: "Transaction reverted".to_string(),
+            reason: "test failure".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -1086,12 +1192,20 @@ mod tests {
         ));
     }
 
-    fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::TokensSent {
+    fn make_vault_withdrawn(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawn {
             symbol: symbol.clone(),
             quantity,
+            token: Address::random(),
+            vault_withdraw_tx: TxHash::random(),
+            withdrawn_at: Utc::now(),
+        }
+    }
+
+    fn make_tokens_sent() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensSent {
             redemption_wallet: Address::random(),
-            tx_hash: TxHash::random(),
+            redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
         }
     }
@@ -1105,7 +1219,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            reason: "Alpaca timeout".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         }
     }
@@ -1118,7 +1232,7 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
-            reason: "Insufficient balance".to_string(),
+            reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         }
     }
@@ -1141,11 +1255,7 @@ mod tests {
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
         trigger
-            .apply_redemption_event_to_inventory(
-                &symbol,
-                &make_tokens_sent(&symbol, dec!(30)),
-                shares(30),
-            )
+            .apply_redemption_event_to_inventory(&symbol, &make_tokens_sent(), shares(30))
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1200,7 +1310,7 @@ mod tests {
     #[test]
     fn extract_redemption_info_returns_symbol_and_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_tokens_sent(&symbol, dec!(42.5));
+        let event = make_vault_withdrawn(&symbol, dec!(42.5));
 
         let (extracted_symbol, extracted_quantity) =
             RebalancingTrigger::extract_redemption_info(&event).unwrap();
@@ -1219,7 +1329,7 @@ mod tests {
     fn non_terminal_redemption_events_are_not_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         assert!(!RebalancingTrigger::is_terminal_redemption_event(
-            &make_tokens_sent(&symbol, dec!(30))
+            &make_vault_withdrawn(&symbol, dec!(30))
         ));
         assert!(!RebalancingTrigger::is_terminal_redemption_event(
             &make_redemption_detected()
@@ -1417,11 +1527,12 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#
@@ -1440,6 +1551,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
         }
     }
 
@@ -1447,10 +1560,14 @@ mod tests {
     fn deserialize_config_succeeds() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        assert_eq!(config.equity_threshold.target, dec!(0.5));
-        assert_eq!(config.equity_threshold.deviation, dec!(0.2));
-        assert_eq!(config.usdc_threshold.target, dec!(0.5));
-        assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
+        assert_eq!(config.equity.target, dec!(0.5));
+        assert_eq!(config.equity.deviation, dec!(0.2));
+
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.5));
+        assert_eq!(deviation, dec!(0.3));
         assert_eq!(
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -1488,8 +1605,8 @@ mod tests {
         let result = RebalancingCtx::new(config, secrets, broker_auth);
 
         assert!(
-            matches!(result, Err(RebalancingCtxError::InvalidAccountId(_))),
-            "Expected InvalidAccountId error, got {result:?}"
+            matches!(result, Err(RebalancingCtxError::Uuid(_))),
+            "Expected Uuid error, got {result:?}"
         );
     }
 
@@ -1500,11 +1617,12 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.6"
             deviation = "0.1"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.4"
             deviation = "0.15"
         "#,
@@ -1514,10 +1632,14 @@ mod tests {
 
         let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
 
-        assert_eq!(ctx.equity_threshold.target, dec!(0.6));
-        assert_eq!(ctx.equity_threshold.deviation, dec!(0.1));
-        assert_eq!(ctx.usdc_threshold.target, dec!(0.4));
-        assert_eq!(ctx.usdc_threshold.deviation, dec!(0.15));
+        assert_eq!(ctx.equity.target, dec!(0.6));
+        assert_eq!(ctx.equity.deviation, dec!(0.1));
+
+        let UsdcRebalancing::Enabled { target, deviation } = ctx.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.4));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
@@ -1525,13 +1647,12 @@ mod tests {
         let toml_str = r#"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -1555,21 +1676,39 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_equity_threshold_fails() {
+    fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
         assert!(
-            error.message().contains("equity_threshold"),
-            "Expected missing equity_threshold error, got: {error}"
+            error.message().contains("equity"),
+            "Expected missing equity error, got: {error}"
         );
+    }
+
+    #[test]
+    fn deserialize_usdc_disabled() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#;
+
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(matches!(config.usdc, UsdcRebalancing::Disabled));
     }
 
     /// Spy reactor that records all dispatched events for verification.
@@ -1587,36 +1726,43 @@ mod tests {
         }
     }
 
+    deps!(EventCapturingReactor, [UsdcRebalance]);
+
     #[async_trait]
-    impl Reactor<UsdcRebalance> for EventCapturingReactor {
-        async fn react(&self, _id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) {
+    impl Reactor for EventCapturingReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
             self.captured_events.lock().await.push(event.clone());
 
-            let is_terminal = RebalancingTrigger::is_terminal_usdc_rebalance_event(event);
+            let is_terminal = RebalancingTrigger::is_terminal_usdc_rebalance_event(&event);
             self.terminal_detection_results
                 .lock()
                 .await
                 .push(is_terminal);
+
+            Ok(())
         }
     }
 
     #[tokio::test]
     async fn terminal_detection_identifies_deposit_confirmed_alone_for_base_to_alpaca() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let aggregate_id = "base-to-alpaca-001";
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
         // Execute full BaseToAlpaca flow - each command triggers a dispatch with only
         // the new event(s), so terminal detection must work without seeing history
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc(dec!(500)),
@@ -1627,21 +1773,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 12345,
@@ -1651,8 +1797,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
                     amount_received: Usdc(dec!(99.99)),
@@ -1663,8 +1809,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(tx_hash),
                 },
@@ -1673,7 +1819,7 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
 
@@ -1693,19 +1839,16 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_deposit_confirmed_alone_for_alpaca_to_base() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let aggregate_id = "alpaca-to-base-001";
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(1000)),
@@ -1716,21 +1859,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 67890,
@@ -1740,8 +1883,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
                     amount_received: Usdc(dec!(99.99)),
@@ -1752,8 +1895,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(tx_hash),
                 },
@@ -1762,7 +1905,7 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
 
@@ -1780,17 +1923,14 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_withdrawal_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let aggregate_id = "withdrawal-failed-test";
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(100)),
@@ -1801,8 +1941,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::FailWithdrawal {
                     reason: "Test failure".to_string(),
                 },
@@ -1824,19 +1964,16 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_bridging_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let aggregate_id = "bridging-failed-test";
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(uuid::Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(100)),
@@ -1847,21 +1984,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::FailBridging {
                     reason: "Bridge timeout".to_string(),
                 },
@@ -1883,16 +2020,13 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_conversion_failed_alone() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let aggregate_id = "conversion-failed-test";
+        let id = UsdcRebalanceId(Uuid::new_v4());
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc(dec!(100)),
@@ -1903,8 +2037,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::FailConversion {
                     reason: "Order rejected".to_string(),
                 },
@@ -1933,7 +2067,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
-            pool,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             Address::ZERO,
             Address::ZERO,
             inventory,
@@ -1948,29 +2082,33 @@ mod tests {
         // and terminal DepositConfirmed
         let tx_hash =
             fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
-        let id = UsdcRebalanceId::new("test-clear-001".to_string());
+        let id = UsdcRebalanceId(Uuid::new_v4());
 
-        Reactor::<UsdcRebalance>::react(
-            trigger.as_ref(),
-            &id,
-            &UsdcRebalanceEvent::Initiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000)),
-                withdrawal_ref: TransferRef::OnchainTx(tx_hash),
-                initiated_at: chrono::Utc::now(),
-            },
-        )
-        .await;
+        let trigger_harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        Reactor::<UsdcRebalance>::react(
-            trigger.as_ref(),
-            &id,
-            &UsdcRebalanceEvent::DepositConfirmed {
-                direction: RebalanceDirection::AlpacaToBase,
-                deposit_confirmed_at: chrono::Utc::now(),
-            },
-        )
-        .await;
+        trigger_harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000)),
+                    withdrawal_ref: TransferRef::OnchainTx(tx_hash),
+                    initiated_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger_harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
 
         // Verify in_progress flag was cleared (AlpacaToBase deposit is terminal)
         assert!(
@@ -1982,18 +2120,15 @@ mod tests {
     #[tokio::test]
     async fn terminal_detection_identifies_conversion_confirmed_alone_for_base_to_alpaca() {
         let spy = Arc::new(EventCapturingReactor::new());
-        let store = st0x_event_sorcery::test_mem_store::<UsdcRebalance>(
-            vec![Box::new(Arc::clone(&spy))],
-            (),
-        );
+        let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let aggregate_id = "conversion-base-to-alpaca-001";
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc(dec!(500)),
@@ -2004,21 +2139,21 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
             )
             .await
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 99999,
@@ -2028,8 +2163,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
                     amount_received: Usdc(dec!(99.99)),
@@ -2040,8 +2175,8 @@ mod tests {
             .unwrap();
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiateDeposit {
                     deposit: TransferRef::OnchainTx(tx_hash),
                 },
@@ -2050,14 +2185,14 @@ mod tests {
             .unwrap();
 
         store
-            .execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
             .await
             .unwrap();
 
         // Now start post-deposit conversion (USDC to USD)
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: uuid::Uuid::new_v4(),
                     amount: Usdc(dec!(500)),
@@ -2082,8 +2217,8 @@ mod tests {
         drop(terminal_results);
 
         store
-            .execute(
-                aggregate_id,
+            .send(
+                &id,
                 UsdcRebalanceCommand::ConfirmConversion {
                     filled_amount: Usdc(dec!(499)), // ~0.2% slippage
                 },
@@ -2099,6 +2234,320 @@ mod tests {
                 .copied()
                 .unwrap(),
             "has_terminal_usdc_rebalance_event must identify ConversionConfirmed alone as terminal"
+        );
+    }
+
+    /// BUG REPRODUCTION: Trigger incorrectly fires with partial inventory data.
+    ///
+    /// When inventory polling starts:
+    /// 1. Onchain equity is polled first
+    /// 2. Trigger fires with onchain=X, offchain=0 (not yet polled)
+    /// 3. Ratio = X/(X+0) = 100% -> detects "TooMuchOnchain" -> Redemption
+    ///
+    /// This is WRONG because offchain hasn't been polled yet, not because
+    /// there's actually no offchain inventory.
+    ///
+    /// CORRECT behavior: trigger should NOT fire until both onchain AND
+    /// offchain data are available for the symbol.
+    #[tokio::test]
+    async fn bug_trigger_should_not_fire_with_partial_inventory_data() {
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        // Empty inventory - simulates startup state before polling completes
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+        let (sender, mut receiver) = mpsc::channel(10);
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Seed vault registry so token lookup succeeds
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Simulate what happens during inventory polling:
+        // OnchainEquity event arrives FIRST (offchain not yet polled)
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100)); // 100 shares onchain
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        // React to the onchain event - this should NOT trigger rebalancing
+        // because we don't have offchain data yet
+        harness
+            .receive(id.clone(), onchain_event.clone())
+            .await
+            .unwrap();
+
+        // CORRECT BEHAVIOR: No operation should be triggered because
+        // offchain data hasn't arrived yet. The system should wait until
+        // it has a complete picture of inventory before deciding to rebalance.
+        //
+        // CURRENT BUG: A Redemption is incorrectly triggered because:
+        // - Onchain: 100 shares
+        // - Offchain: 0 shares (not polled yet, treated as "no holdings")
+        // - Ratio: 100% onchain -> "TooMuchOnchain" -> Redemption
+        let triggered = receiver.try_recv();
+
+        assert!(
+            triggered.is_err(),
+            "CORRECT: No operation should trigger with partial inventory data. \
+             BUG: Got {triggered:?} - system incorrectly treated missing offchain \
+             data as 'zero holdings' and triggered rebalancing."
+        );
+    }
+
+    /// Complementary test: verify that trigger DOES fire once both venues have data.
+    #[sqlx::test]
+    async fn trigger_fires_when_both_venues_have_data(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, mut receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Apply onchain snapshot (100 shares)
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        harness.receive(id.clone(), onchain_event).await.unwrap();
+
+        // No trigger yet - only one venue has data
+        assert!(
+            receiver.try_recv().is_err(),
+            "should not trigger with only onchain data"
+        );
+
+        // Apply offchain snapshot (0 shares) - now both venues have data
+        let mut positions = BTreeMap::new();
+        positions.insert(symbol.clone(), shares(0));
+
+        let offchain_event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: Utc::now(),
+        };
+
+        harness.receive(id.clone(), offchain_event).await.unwrap();
+
+        // Now both venues have data: 100 onchain, 0 offchain = 100% ratio
+        // With target 50% and deviation 10%, ratio 100% > upper bound 60%
+        // So TooMuchOnchain -> should trigger Redemption
+        let triggered = receiver.try_recv();
+
+        assert!(
+            triggered.is_ok(),
+            "should trigger rebalancing once both venues have data"
+        );
+
+        assert!(
+            matches!(triggered.unwrap(), TriggeredOperation::Redemption { .. }),
+            "expected Redemption for 100% onchain ratio"
+        );
+    }
+
+    /// Verifies logging shows when imbalance check skips due to partial data.
+    #[tracing_test::traced_test]
+    #[sqlx::test]
+    async fn logs_show_partial_data_skips_imbalance_check(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, _receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Apply ONLY onchain data - offchain not yet polled
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        harness.receive(id.clone(), onchain_event).await.unwrap();
+
+        // Verify the logs show:
+        // 1. The snapshot event was applied
+        // 2. Imbalance check was skipped due to partial data
+        assert!(
+            logs_contain("Applied inventory snapshot event"),
+            "Should log when snapshot event is applied"
+        );
+        assert!(
+            logs_contain("No equity imbalance detected"),
+            "Should log that imbalance was not detected (due to partial data)"
+        );
+        assert!(
+            !logs_contain("Triggered equity rebalancing"),
+            "Should NOT trigger rebalancing with partial data"
+        );
+    }
+
+    /// Verifies logging shows trigger fires when both venues have data.
+    #[tracing_test::traced_test]
+    #[sqlx::test]
+    async fn logs_show_trigger_fires_with_complete_data(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, _receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let harness = ReactorHarness::new(InventorySnapshotReactor::new(
+            inventory.clone(),
+            Some(trigger.clone()),
+        ));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Apply onchain data first
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        harness
+            .receive(
+                id.clone(),
+                InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Now apply offchain data - both venues now have data
+        let mut positions = BTreeMap::new();
+        positions.insert(symbol.clone(), shares(0));
+
+        harness
+            .receive(
+                id.clone(),
+                InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify the trigger fired after both venues have data
+        assert!(
+            logs_contain("Triggered equity rebalancing"),
+            "Should trigger rebalancing once both venues have data"
+        );
+    }
+
+    #[test]
+    fn new_derives_market_maker_wallet_from_private_key() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+
+        let expected_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
+            .unwrap()
+            .address();
+
+        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
+
+        assert_eq!(ctx.market_maker_wallet, expected_wallet);
+    }
+
+    #[test]
+    fn new_rejects_identical_market_maker_and_redemption_wallets() {
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+        let derived_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
+            .unwrap()
+            .address();
+
+        let config_toml = format!(
+            r#"
+            redemption_wallet = "{derived_wallet}"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#
+        );
+        let config: RebalancingConfig = toml::from_str(&config_toml).unwrap();
+
+        let error = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::WalletCollision(addr) if addr == derived_wallet),
+            "Expected WalletCollision with {derived_wallet}, got: {error:?}"
         );
     }
 }

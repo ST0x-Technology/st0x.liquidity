@@ -8,7 +8,6 @@
 
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
-use rust_decimal::Decimal;
 use thiserror::Error;
 use tracing::debug;
 
@@ -25,8 +24,6 @@ pub enum AlpacaWalletError {
     ParseError(#[from] serde_json::Error),
     #[error(transparent)]
     FromHex(#[from] FromHexError),
-    #[error("Amount must be positive and non-zero, got: {amount}")]
-    InvalidAmount { amount: Decimal },
     #[error("Transfer not found: {transfer_id}")]
     TransferNotFound { transfer_id: AlpacaTransferId },
     #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
@@ -49,6 +46,8 @@ pub enum AlpacaWalletError {
         asset: TokenSymbol,
         network: Network,
     },
+    #[error("No whitelist entries found for address {address}")]
+    NoWhitelistEntries { address: Address },
     #[error("Deposit with tx hash {tx_hash} not detected after {elapsed:?}")]
     DepositTimeout {
         tx_hash: TxHash,
@@ -143,6 +142,32 @@ impl AlpacaWalletClient {
         Ok(response)
     }
 
+    pub(super) async fn delete(&self, path: &str) -> Result<Response, AlpacaWalletError> {
+        let url = format!("{}{}", self.base_url, path);
+        debug!("DELETE {url}");
+
+        let response = self
+            .client
+            .delete(&url)
+            .basic_auth(&self.api_key, Some(&self.api_secret))
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+
+            return Err(AlpacaWalletError::ApiError { status, message });
+        }
+
+        Ok(response)
+    }
+
     pub(super) fn account_id(&self) -> &AlpacaAccountId {
         &self.account_id
     }
@@ -205,6 +230,19 @@ impl AlpacaWalletClient {
         debug!("Whitelist creation response: {text}");
 
         Ok(serde_json::from_str::<WhitelistEntry>(&text)?)
+    }
+
+    pub(super) async fn delete_whitelist_entry(
+        &self,
+        whitelist_id: &str,
+    ) -> Result<(), AlpacaWalletError> {
+        let path = format!(
+            "/v1/accounts/{}/wallets/whitelists/{}",
+            self.account_id, whitelist_id
+        );
+
+        self.delete(&path).await?;
+        Ok(())
     }
 
     /// Gets or creates a wallet deposit address for a specific asset and network.

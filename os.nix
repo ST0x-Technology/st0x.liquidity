@@ -6,27 +6,43 @@ let
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
 
-  mkService = name: cfg: {
-    description = "st0x ${cfg.bin} (${name})";
-    wantedBy = [ "multi-user.target" ];
-    restartIfChanged = false;
-    unitConfig.ConditionPathExists =
-      "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
-    serviceConfig = {
-      DynamicUser = true;
-      SupplementaryGroups = [ "st0x" ];
-      ExecStart = builtins.concatStringsSep " " [
-        "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}"
-        "--config"
-        "${./config/${name}.toml}"
-        "--secrets"
-        "/run/agenix/${name}.toml"
-      ];
-      Restart = "always";
-      RestartSec = 5;
-      ReadWritePaths = [ "/mnt/data" ];
+  mkService = name: cfg:
+    let
+      path = "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
+      configFile = ./config/${name}.toml;
+    in {
+      description = "st0x ${cfg.bin} (${name})";
+
+      # Service is started by deploy.nix profile, not by systemd on boot.
+      # This avoids coordination issues during deployments.
+      wantedBy = [ ];
+
+      restartIfChanged = false;
+      stopIfChanged = false;
+
+      unitConfig = {
+        "X-OnlyManualStart" = true;
+
+        # Marker file created ONLY by service profile activation.
+        # Guarantees service is SKIPPED (not failed) during system activation.
+        ConditionPathExists = "/run/st0x/${name}.ready";
+      };
+
+      serviceConfig = {
+        DynamicUser = true;
+        SupplementaryGroups = [ "st0x" ];
+        ExecStart = builtins.concatStringsSep " " [
+          path
+          "--config"
+          "${configFile}"
+          "--secrets"
+          "/run/agenix/${name}.toml"
+        ];
+        Restart = "always";
+        RestartSec = 5;
+        ReadWritePaths = [ "/mnt/data" ];
+      };
     };
-  };
 
   mkSecret = name: _: {
     file = ./secret/${name}.toml.age;
@@ -163,18 +179,19 @@ in {
   };
 
   users.groups.st0x = { };
+  programs.bash.interactiveShellInit = "set -o vi";
 
   age.secrets = lib.mapAttrs mkSecret enabledServices;
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
-  programs.bash.interactiveShellInit = "set -o vi";
   environment.systemPackages = with pkgs; [
     bat
     curl
     htop
     magic-wormhole
     sqlite
+    rage
     zellij
   ];
 

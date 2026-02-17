@@ -75,55 +75,40 @@
 //! immediately obvious whether code belongs to this crate or
 //! to cqrs-es.
 
+pub(crate) mod dependency;
 mod lifecycle;
 mod projection;
+mod reactor;
 mod schema_registry;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;
 mod wire;
 
-pub use lifecycle::{Lifecycle, LifecycleError, Never};
-pub use projection::{Projection, SqliteProjection};
-pub use schema_registry::{Reconciler, SchemaRegistry};
-#[cfg(any(test, feature = "test-support"))]
-pub use testing::{TestHarness, TestResult, replay};
-pub use wire::{Cons, Nil, StoreBuilder, Unwired};
-#[cfg(any(test, feature = "test-support"))]
-pub use wire::{TestStore, test_mem_store, test_store, test_store_with_reactors};
-
-/// Convenience alias for a SQLite-backed CQRS view query over a
-/// [`Lifecycle`]-wrapped entity.
-pub type SqliteQuery<Entity> = cqrs_es::persist::GenericQuery<
-    sqlite_es::SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
-    Lifecycle<Entity>,
-    Lifecycle<Entity>,
->;
-
 use async_trait::async_trait;
-use cqrs_es::EventStore;
-use cqrs_es::persist::PersistedEventStore;
-
-pub use cqrs_es::Aggregate;
 pub use cqrs_es::AggregateError;
 pub use cqrs_es::DomainEvent;
-pub use cqrs_es::persist::ViewRepository;
-
-// Test-only re-exports: let st0x-hedge test code access cqrs-es
-// internals without depending on cqrs-es directly.
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::EventEnvelope;
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::Query;
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::View;
-#[cfg(any(test, feature = "test-support"))]
-pub use cqrs_es::test::TestFramework;
+use cqrs_es::EventStore;
+use cqrs_es::persist::PersistedEventStore;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlite_es::{SqliteCqrs, SqliteEventRepository};
 use sqlx::SqlitePool;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
+
+#[doc(hidden)]
+pub use dependency::{Cons, Nil};
+pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
+use lifecycle::Lifecycle;
+pub use lifecycle::{LifecycleError, Never};
+pub use projection::{Column, Projection, ProjectionError, SqliteProjectionRepo, Table};
+pub use reactor::Reactor;
+pub use schema_registry::{ReconcileError, Reconciler, SchemaRegistry};
+#[cfg(any(test, feature = "test-support"))]
+pub use testing::{
+    ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
+};
+pub use wire::{StoreBuilder, Unwired};
 
 /// The core abstraction for event-sourced domain entities.
 ///
@@ -194,6 +179,14 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     type Services: Send + Sync;
 
     const AGGREGATE_TYPE: &'static str;
+
+    /// The materialized view table for this entity, if any.
+    ///
+    /// Set to `Some(Table("..."))` to enable [`Projection::sqlite`]
+    /// for this entity type. Set to `None` for entities without
+    /// materialized views.
+    const PROJECTION: Option<Table>;
+
     const SCHEMA_VERSION: u64;
 
     /// Create initial state from a genesis event.
@@ -201,17 +194,17 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     /// Returns `Some(state)` if this event creates the entity,
     /// `None` if it requires existing state. Returning `None`
     /// causes [`Lifecycle`] to enter a `Failed` state with a
-    /// [`LifecycleError::Mismatch`].
+    /// [`LifecycleError::EventCantOriginate`].
     fn originate(event: &Self::Event) -> Option<Self>;
 
-    /// Derive new state from an event applied to existing state.
+    /// Derive new entity from an event applied to the current one.
     ///
-    /// - `Ok(Some(new_state))` -- event applied successfully
-    /// - `Ok(None)` -- event doesn't apply to current state
-    ///   (becomes [`LifecycleError::Mismatch`])
+    /// - `Ok(Some(new_entity))` -- event applied successfully
+    /// - `Ok(None)` -- event doesn't apply to current entity
+    ///   (becomes [`LifecycleError::UnexpectedEvent`])
     /// - `Err(error)` -- domain error during application
     ///   (becomes [`LifecycleError::Apply`])
-    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error>;
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error>;
 
     /// Handle a command when the entity doesn't exist yet.
     ///
@@ -257,25 +250,20 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
 pub struct Store<Entity: EventSourced> {
-    inner: SqliteCqrs<Lifecycle<Entity>>,
+    cqrs: SqliteCqrs<Lifecycle<Entity>>,
+    event_store: PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>,
 }
 
-impl<Entity: EventSourced> Store<Entity>
-where
-    Lifecycle<Entity>: Aggregate<
-            Command = Entity::Command,
-            Event = Entity::Event,
-            Error = LifecycleError<Entity>,
-            Services = Entity::Services,
-        >,
-{
+impl<Entity: EventSourced> Store<Entity> {
     /// Wrap an existing `SqliteCqrs` framework.
     ///
     /// Prefer using `StoreBuilder::build()` which handles wiring
     /// and reconciliation. This constructor exists for cases
     /// where direct construction is needed (e.g., tests).
-    pub fn new(inner: SqliteCqrs<Lifecycle<Entity>>) -> Self {
-        Self { inner }
+    pub(crate) fn new(cqrs: SqliteCqrs<Lifecycle<Entity>>, pool: SqlitePool) -> Self {
+        let repo = SqliteEventRepository::new(pool);
+        let event_store = PersistedEventStore::new_event_store(repo);
+        Self { cqrs, event_store }
     }
 
     /// Send a command to the entity identified by `id`.
@@ -290,40 +278,35 @@ where
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        self.inner.execute(&id.to_string(), command).await
+        self.cqrs.execute(&id.to_string(), command).await
+    }
+
+    /// Load an entity's current state directly from the event store.
+    ///
+    /// Replays events to reconstruct aggregate state. No query
+    /// processors are dispatched.
+    ///
+    /// Returns:
+    /// - `Ok(Some(entity))` if the entity is live
+    /// - `Ok(None)` if the entity has not been initialized
+    /// - `Err` if the entity is in a failed lifecycle state or on infrastructure error
+    pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, SendError<Entity>> {
+        let context = self.event_store.load_aggregate(&id.to_string()).await?;
+
+        Ok(context.aggregate.into_result()?)
     }
 }
 
-/// Error returned by [`Store::send`].
+/// Error returned by [`Store::send`] and [`Store::load`].
 ///
 /// Wraps the cqrs-es `AggregateError` containing a
 /// `LifecycleError` so that consumers don't import from cqrs-es
 /// or lifecycle directly.
 pub type SendError<Entity> = AggregateError<LifecycleError<Entity>>;
 
-/// Load an entity's current state directly from the event store.
-///
-/// Bypasses the CQRS framework -- no query processors are
-/// dispatched. Use this when you need to read aggregate state
-/// outside of a command flow (e.g., loading `VaultRegistry` to
-/// look up a token address).
-///
-/// Returns `Some(entity)` if live, `None` if uninitialized or
-/// failed.
-pub async fn load_aggregate<Entity: EventSourced>(
-    pool: SqlitePool,
-    id: &Entity::Id,
-) -> Result<Option<Entity>, AggregateError<LifecycleError<Entity>>> {
-    let repo = SqliteEventRepository::new(pool);
-    let store =
-        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_event_store(repo);
-
-    let aggregate_id = id.to_string();
-    let context = store.load_aggregate(&aggregate_id).await?;
-
-    match &context.aggregate {
-        Lifecycle::Live(entity) => Ok(Some(entity.clone())),
-        Lifecycle::Uninitialized | Lifecycle::Failed { .. } => Ok(None),
+impl<Entity: EventSourced> From<LifecycleError<Entity>> for SendError<Entity> {
+    fn from(error: LifecycleError<Entity>) -> Self {
+        Self::UserError(error)
     }
 }
 
@@ -336,25 +319,11 @@ pub async fn load_aggregate<Entity: EventSourced>(
 /// one place so implementors see a single meaningful name
 /// instead of a long bound list.
 pub trait DomainError:
-    std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
+    std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
 }
 
 impl<T> DomainError for T where
-    T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
+    T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
-}
-
-/// Event reactor for a specific entity type.
-///
-/// Replaces `cqrs_es::Query<Lifecycle<E>>` with a cleaner
-/// interface: typed IDs instead of `&str`, one event at a time
-/// instead of an array of envelopes, and no Lifecycle leak.
-///
-/// Internally bridged to `Query<Lifecycle<E>>` via
-/// [`ReactorBridge`](lifecycle::ReactorBridge) so that
-/// cqrs-es continues to work unmodified.
-#[async_trait]
-pub trait Reactor<Entity: EventSourced>: Send + Sync {
-    async fn react(&self, id: &Entity::Id, event: &Entity::Event);
 }

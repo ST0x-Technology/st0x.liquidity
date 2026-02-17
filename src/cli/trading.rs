@@ -5,15 +5,14 @@ use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sqlite_es::SqliteViewRepository;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
 
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutorCtx,
-    OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
+    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
@@ -85,14 +84,12 @@ pub(super) async fn order_status_command<W: Write>(
         OrderState::Filled {
             executed_at,
             order_id,
-            price_cents,
+            price,
         } => {
-            let dollars = price_cents / 100;
-            let cents = price_cents % 100;
             writeln!(stdout, "✅ Order Status: FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
             writeln!(stdout, "   Executed At: {executed_at}")?;
-            writeln!(stdout, "   Fill Price: ${dollars}.{cents:02}")?;
+            writeln!(stdout, "   Fill Price: ${price}")?;
         }
         OrderState::Failed {
             failed_at,
@@ -295,14 +292,10 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let position_view_repo = Arc::new(SqliteViewRepository::new(
-        pool.clone(),
-        "position_view".to_string(),
-    ));
-    let position_query = Projection::new(Arc::clone(&position_view_repo));
+    let position_projection = Projection::<Position>::sqlite(pool.clone())?;
     let position_store: Arc<Store<Position>> = Arc::new(
         StoreBuilder::new(pool.clone())
-            .with_projection(&position_query)
+            .with(position_projection.clone())
             .build(())
             .await?,
     );
@@ -313,8 +306,11 @@ pub(super) async fn process_found_trade<W: Write>(
     let executor_type = ctx.broker.to_supported_executor();
     let base_symbol = onchain_trade.symbol.base();
 
+    // CLI test command uses MockExecutor (market always open)
+    let executor = MockExecutor::new();
     let Some(params) =
-        check_execution_readiness(&position_query, base_symbol, executor_type).await?
+        check_execution_readiness(&executor, &position_projection, base_symbol, executor_type)
+            .await?
     else {
         writeln!(
             stdout,

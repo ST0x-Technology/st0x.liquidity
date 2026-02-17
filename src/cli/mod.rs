@@ -109,9 +109,6 @@ pub enum Commands {
         /// Number of shares to transfer (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Token contract address (required for to-alpaca direction)
-        #[arg(long = "token-address")]
-        token_address: Option<Address>,
     },
 
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
@@ -162,6 +159,21 @@ pub enum Commands {
         /// Address to whitelist (defaults to SENDER_WALLET from env)
         #[arg(short = 'a', long = "address")]
         address: Option<Address>,
+    },
+
+    /// List all whitelisted addresses for Alpaca withdrawals
+    ///
+    /// Shows all whitelist entries with their status, asset, and creation date.
+    AlpacaWhitelistList,
+
+    /// Remove an address from Alpaca withdrawal whitelist
+    ///
+    /// Deletes all whitelist entries matching the given address.
+    /// Use this to revoke withdrawal access from older wallets.
+    AlpacaUnwhitelist {
+        /// Address to remove from whitelist
+        #[arg(short = 'a', long = "address")]
+        address: Address,
     },
 
     /// List all Alpaca crypto wallet transfers
@@ -362,7 +374,6 @@ enum SimpleCommand {
         direction: TransferDirection,
         symbol: Symbol,
         quantity: FractionalShares,
-        token_address: Option<Address>,
     },
     AlpacaDeposit {
         amount: Usdc,
@@ -373,6 +384,10 @@ enum SimpleCommand {
     },
     AlpacaWhitelist {
         address: Option<Address>,
+    },
+    AlpacaWhitelistList,
+    AlpacaUnwhitelist {
+        address: Address,
     },
     AlpacaTransfers,
     AlpacaConvert {
@@ -454,18 +469,18 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             direction,
             symbol,
             quantity,
-            token_address,
         } => Ok(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
-            token_address,
         }),
         Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
         Commands::AlpacaWithdraw { amount, to_address } => {
             Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
         }
         Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
+        Commands::AlpacaWhitelistList => Ok(SimpleCommand::AlpacaWhitelistList),
+        Commands::AlpacaUnwhitelist { address } => Ok(SimpleCommand::AlpacaUnwhitelist { address }),
         Commands::AlpacaTransfers => Ok(SimpleCommand::AlpacaTransfers),
         Commands::AlpacaConvert { direction, amount } => {
             Ok(SimpleCommand::AlpacaConvert { direction, amount })
@@ -538,24 +553,21 @@ async fn run_simple_command<W: Write>(
             direction,
             symbol,
             quantity,
-            token_address,
         } => {
-            rebalancing::transfer_equity_command(
-                stdout,
-                direction,
-                &symbol,
-                quantity,
-                token_address,
-                ctx,
-                pool,
-            )
-            .await
+            rebalancing::transfer_equity_command(stdout, direction, &symbol, quantity, ctx, pool)
+                .await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command(stdout, amount, ctx).await
         }
         SimpleCommand::AlpacaWhitelist { address } => {
             alpaca_wallet::alpaca_whitelist_command(stdout, address, ctx).await
+        }
+        SimpleCommand::AlpacaWhitelistList => {
+            alpaca_wallet::alpaca_whitelist_list_command(stdout, ctx).await
+        }
+        SimpleCommand::AlpacaUnwhitelist { address } => {
+            alpaca_wallet::alpaca_unwhitelist_command(stdout, address, ctx).await
         }
         SimpleCommand::AlpacaWithdraw { amount, to_address } => {
             alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, ctx).await
@@ -607,11 +619,16 @@ async fn run_provider_command<W: Write>(
             vault_id,
             decimals,
         } => {
-            vault::vault_deposit_command(stdout, amount, token, vault_id, decimals, ctx, provider)
-                .await
+            let deposit = vault::Deposit {
+                amount,
+                token,
+                vault_id,
+                decimals,
+            };
+            vault::vault_deposit_command(stdout, deposit, ctx, pool, provider).await
         }
         ProviderCommand::VaultWithdraw { amount } => {
-            vault::vault_withdraw_command(stdout, amount, ctx, provider).await
+            vault::vault_withdraw_command(stdout, amount, ctx, pool, provider).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command(stdout, amount, all, from, ctx, provider).await
@@ -652,23 +669,29 @@ mod tests {
     use alloy::sol_types::{SolCall, SolEvent};
     use clap::CommandFactory;
     use httpmock::MockServer;
+    use rain_math_float::Float;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::str::FromStr;
+    use url::Url;
+
     use st0x_execution::{
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
-    use std::str::FromStr;
-    use url::Url;
+
+    use st0x_event_sorcery::{Column, Projection};
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{BrokerCtx, LogLevel, SchwabAuth};
-    use crate::offchain::execution::find_orders_by_status;
+    use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
+
+    const STATUS: Column = Column("status");
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -1190,7 +1213,6 @@ mod tests {
         });
 
         fn create_float_from_u256(value: U256, decimals: u8) -> B256 {
-            use rain_math_float::Float;
             let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
             float.get_inner()
         }
@@ -1782,13 +1804,14 @@ mod tests {
             result.as_ref().err()
         );
 
-        let executions = find_orders_by_status(&pool, OrderStatus::Submitted)
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
+            .unwrap()
+            .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
         assert_eq!(executions.len(), 1);
 
-        let (order_id, lifecycle) = &executions[0];
-        let order = lifecycle.live().unwrap();
+        let (order_id, order) = &executions[0];
         assert_eq!(
             order.shares(),
             Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
@@ -1885,11 +1908,13 @@ mod tests {
             result1.as_ref().err()
         );
 
-        let executions = find_orders_by_status(&pool, OrderStatus::Submitted)
+        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
+            .unwrap()
+            .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
         assert_eq!(executions.len(), 1);
-        let order = executions[0].1.live().unwrap();
+        let order = &executions[0].1;
         assert_eq!(
             order.shares(),
             Positive::new(FractionalShares::new(dec!(5))).unwrap()
@@ -2019,12 +2044,10 @@ mod tests {
             "AAPL",
             "-q",
             "5.0",
-            "--token-address",
-            "0x1234567890123456789012345678901234567890",
         ]);
         assert!(
             result.is_ok(),
-            "transfer-equity to-alpaca with token-address should succeed: {:?}",
+            "transfer-equity to-alpaca should succeed: {:?}",
             result.err()
         );
     }

@@ -115,9 +115,9 @@ pub enum SchwabError {
         body: String,
     },
 
-    /// Integer conversion failed during configuration.
-    #[error("Configuration integer conversion failed: {0}")]
-    IntegerConversion(#[from] std::num::TryFromIntError),
+    /// Integer conversion failed (e.g. negative to unsigned).
+    #[error("integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
 
     /// Order execution database persistence failed, wraps [`crate::error::PersistenceError`].
     #[error("Execution persistence error: {0}")]
