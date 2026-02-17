@@ -34,7 +34,9 @@ the limit:
 
 - **README.md** — if project structure, features, commands, or architecture
   changed
-- **ROADMAP.md** — mark completed issues, link PRs
+- **ROADMAP.md** — mark completed issues, link PRs. When a PR is chained
+  (depends on a parent PR), mark both as done in the roadmap so it's up to date
+  by the time they merge.
 
 ## Ownership Principles
 

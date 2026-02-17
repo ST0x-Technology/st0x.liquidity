@@ -4,6 +4,9 @@
 
 ### Live testing of auto-rebalancing on the Alpaca instance
 
+- [x] PR:
+      [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
+
 - [ ] [#263 Check offchain inventory before placing counter trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/263)
 - [ ] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
 - [ ] [#105 Run the Alpaca instance without whole share accumulation](https://github.com/ST0x-Technology/st0x.liquidity/issues/105)
@@ -18,6 +21,8 @@
 
 All auto-rebalancing logic uses ES/CQRS. Time to disable legacy:
 
+- [x] PR:
+      [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
 - [ ] [#235 Add feature flag to disable legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/issues/235)
 - [ ] [#131 Add monitoring and validation tooling for dual-write period](https://github.com/ST0x-Technology/st0x.liquidity/issues/131)
 - [ ] [#141 Implement MetricsPnL view](https://github.com/ST0x-Technology/st0x.liquidity/issues/141)
