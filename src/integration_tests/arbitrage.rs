@@ -365,7 +365,7 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
         let log_index = trade.log_index;
 
         let queued_event = QueuedEvent {
-            id: Some(1),
+            id: None,
             tx_hash,
             log_index,
             block_number: take_log.block_number.unwrap_or(1),
@@ -394,7 +394,7 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
     async fn take_order(
         &mut self,
         symbol: &str,
-        amount: f64,
+        amount: Decimal,
         direction: Direction,
         price: u32,
     ) -> AnvilTrade {
@@ -408,11 +408,10 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
 
         let is_sell = direction == Direction::Sell;
         let usdc_addr = self.usdc_addr;
-        let usdc_total = amount * f64::from(price);
+        let usdc_total = amount * Decimal::from(price);
 
-        // Format amounts with fixed precision to avoid f64 representation artifacts
-        let amount_str = format!("{amount:.6}");
-        let usdc_total_str = format!("{usdc_total:.6}");
+        let amount_str = amount.to_string();
+        let usdc_total_str = usdc_total.to_string();
 
         // Order: input = what order receives, output = what order gives
         let (input_token, output_token) = if is_sell {
@@ -660,7 +659,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.5)
+        .amount(dec!(0.5))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -694,7 +693,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let t2 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.7)
+        .amount(dec!(0.7))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -731,17 +730,20 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let events = assert_events(&pool, &expected).await;
 
     // Payload spot-checks: financial values in OnChainOrderFilled events
+    assert_eq!(events[1].event_type, "PositionEvent::OnChainOrderFilled");
     let t1_filled = &events[1].payload["OnChainOrderFilled"];
     assert_eq!(t1_filled["amount"].as_str().unwrap(), "0.5");
     assert_eq!(t1_filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(t1_filled["price_usdc"].as_str().unwrap(), "100");
 
+    assert_eq!(events[3].event_type, "PositionEvent::OnChainOrderFilled");
     let t2_filled = &events[3].payload["OnChainOrderFilled"];
     assert_eq!(t2_filled["amount"].as_str().unwrap(), "0.7");
     assert_eq!(t2_filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(t2_filled["price_usdc"].as_str().unwrap(), "100");
 
     // Payload spot-checks: OffChainOrderPlaced and Placed shares/direction
+    assert_eq!(events[5].event_type, "PositionEvent::OffChainOrderPlaced");
     let placed_pos = &events[5].payload["OffChainOrderPlaced"];
     assert_eq!(
         placed_pos["offchain_order_id"].as_str().unwrap(),
@@ -750,6 +752,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     assert_eq!(placed_pos["direction"].as_str().unwrap(), "Buy");
     assert_eq!(placed_pos["shares"].as_str().unwrap(), "1.2");
 
+    assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
     let offchain_placed = &events[6].payload["Placed"];
     assert_eq!(offchain_placed["symbol"].as_str().unwrap(), TEST_AAPL);
     assert_eq!(offchain_placed["direction"].as_str().unwrap(), "Buy");
@@ -774,6 +777,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
     ]);
     let events = assert_events(&pool, &expected).await;
+    assert_eq!(events[9].event_type, "PositionEvent::OffChainOrderFilled");
     assert_eq!(
         events[9].payload["OffChainOrderFilled"]["offchain_order_id"]
             .as_str()
@@ -798,7 +802,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.5)
+        .amount(dec!(0.5))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -809,7 +813,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let t2 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.7)
+        .amount(dec!(0.7))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -865,6 +869,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFailed"),
     ];
     let events = assert_events(&pool, &expected).await;
+    assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
     let placed = &events[6].payload["Placed"];
     assert_eq!(placed["symbol"].as_str().unwrap(), TEST_AAPL);
     assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
@@ -895,6 +900,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 
     // Extract retry order ID from the new OffchainOrderEvent::Placed event
     let all_events = fetch_events(&pool).await;
+    assert_eq!(all_events[11].event_type, "OffchainOrderEvent::Placed");
     let retry_id = all_events[11].aggregate_id.clone();
     assert_ne!(
         retry_id, order_id_str,
@@ -930,7 +936,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.6)
+        .amount(dec!(0.6))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -940,7 +946,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let t2 = ob
         .take_order()
         .symbol(TEST_MSFT)
-        .amount(0.4)
+        .amount(dec!(0.4))
         .direction(Direction::Sell)
         .price(MSFT_PRICE)
         .call()
@@ -958,7 +964,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let t3 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.6)
+        .amount(dec!(0.6))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1035,6 +1041,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     let events = assert_events(&pool, &expected).await;
 
+    assert_eq!(events[9].event_type, "OffchainOrderEvent::Placed");
     let aapl_placed = &events[9].payload["Placed"];
     assert_eq!(aapl_placed["symbol"].as_str().unwrap(), TEST_AAPL);
     assert_eq!(aapl_placed["direction"].as_str().unwrap(), "Buy");
@@ -1078,7 +1085,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let t4 = ob
         .take_order()
         .symbol(TEST_MSFT)
-        .amount(0.6)
+        .amount(dec!(0.6))
         .direction(Direction::Sell)
         .price(MSFT_PRICE)
         .call()
@@ -1122,6 +1129,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     let events = assert_events(&pool, &expected).await;
 
+    assert_eq!(events[16].event_type, "OffchainOrderEvent::Placed");
     let msft_placed = &events[16].payload["Placed"];
     assert_eq!(msft_placed["symbol"].as_str().unwrap(), TEST_MSFT);
     assert_eq!(msft_placed["direction"].as_str().unwrap(), "Buy");
@@ -1178,7 +1186,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.5)
+        .amount(dec!(0.5))
         .direction(Direction::Buy)
         .price(AAPL_PRICE)
         .call()
@@ -1202,7 +1210,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let t2 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.7)
+        .amount(dec!(0.7))
         .direction(Direction::Buy)
         .price(AAPL_PRICE)
         .call()
@@ -1243,17 +1251,20 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let events = assert_events(&pool, &expected).await;
 
     // Verify financial values in OnChainOrderFilled events (Buy direction)
+    assert_eq!(events[1].event_type, "PositionEvent::OnChainOrderFilled");
     let t1_filled = &events[1].payload["OnChainOrderFilled"];
     assert_eq!(t1_filled["amount"].as_str().unwrap(), "0.5");
     assert_eq!(t1_filled["direction"].as_str().unwrap(), "Buy");
     assert_eq!(t1_filled["price_usdc"].as_str().unwrap(), "100");
 
+    assert_eq!(events[3].event_type, "PositionEvent::OnChainOrderFilled");
     let t2_filled = &events[3].payload["OnChainOrderFilled"];
     assert_eq!(t2_filled["amount"].as_str().unwrap(), "0.7");
     assert_eq!(t2_filled["direction"].as_str().unwrap(), "Buy");
     assert_eq!(t2_filled["price_usdc"].as_str().unwrap(), "100");
 
     // Hedge direction should be Sell (opposite of onchain Buy), shares = abs(net)
+    assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
     assert_eq!(
         events[6].payload["Placed"]["direction"].as_str().unwrap(),
         "Sell"
@@ -1297,7 +1308,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(1.0)
+        .amount(dec!(1))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1335,15 +1346,18 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let events = assert_events(&pool, &expected).await;
 
     // Payload spot-checks: financial values in the single-trade threshold crossing
+    assert_eq!(events[1].event_type, "PositionEvent::OnChainOrderFilled");
     let filled = &events[1].payload["OnChainOrderFilled"];
     assert_eq!(filled["amount"].as_str().unwrap(), "1");
     assert_eq!(filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(filled["price_usdc"].as_str().unwrap(), "100");
 
+    assert_eq!(events[3].event_type, "PositionEvent::OffChainOrderPlaced");
     let placed_pos = &events[3].payload["OffChainOrderPlaced"];
     assert_eq!(placed_pos["direction"].as_str().unwrap(), "Buy");
     assert_eq!(placed_pos["shares"].as_str().unwrap(), "1");
 
+    assert_eq!(events[4].event_type, "OffchainOrderEvent::Placed");
     let placed = &events[4].payload["Placed"];
     assert_eq!(placed["symbol"].as_str().unwrap(), TEST_AAPL);
     assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
@@ -1364,7 +1378,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(1.0)
+        .amount(dec!(1))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1410,7 +1424,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(1.0)
+        .amount(dec!(1))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1437,7 +1451,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let t2 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(1.5)
+        .amount(dec!(1.5))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1517,7 +1531,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(1.0)
+        .amount(dec!(1))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1608,7 +1622,7 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.001)
+        .amount(dec!(0.001))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1653,7 +1667,7 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(500.0)
+        .amount(dec!(500))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1711,7 +1725,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.8)
+        .amount(dec!(0.8))
         .direction(Direction::Buy)
         .price(AAPL_PRICE)
         .call()
@@ -1734,7 +1748,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let t2 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.5)
+        .amount(dec!(0.5))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1757,7 +1771,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let t3 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.8)
+        .amount(dec!(0.8))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1780,7 +1794,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let t4 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.6)
+        .amount(dec!(0.6))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1827,6 +1841,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     )
     .await;
 
+    assert_eq!(events[10].event_type, "OffchainOrderEvent::Placed");
     let placed = &events[10].payload["Placed"];
     assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
     assert_eq!(placed["shares"].as_str().unwrap(), "1.1");
@@ -1861,7 +1876,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(1.5)
+        .amount(dec!(1.5))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1888,7 +1903,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     let t2 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.5)
+        .amount(dec!(0.5))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1948,7 +1963,7 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
     let t1 = ob
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(0.5)
+        .amount(dec!(0.5))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
