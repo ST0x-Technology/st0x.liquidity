@@ -48,7 +48,7 @@ sol!(
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    DeployableERC20, "lib/rain.orderbook/out/TestERC20.sol/TestERC20.json"
+    DeployableERC20, "lib/rain.orderbook/lib/rain.interpreter/out/TestERC20.sol/TestERC20.json"
 );
 
 #[cfg(test)]
