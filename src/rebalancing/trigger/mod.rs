@@ -17,11 +17,13 @@ use tracing::{debug, error, warn};
 use url::Url;
 
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
-use st0x_execution::{AlpacaBrokerApiCtx, Direction, FractionalShares, Symbol};
+use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
-use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, InventoryViewError};
+use crate::inventory::{
+    ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, TransferOp, Venue,
+};
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{
@@ -242,25 +244,17 @@ impl Reactor for RebalancingTrigger {
                 let update = match &event {
                     OnChainOrderFilled {
                         amount, direction, ..
-                    } => {
-                        let amount = *amount;
-                        match direction {
-                            Direction::Buy => Inventory::add_onchain_available(amount),
-                            Direction::Sell => Inventory::remove_onchain_available(amount),
-                        }
-                    }
+                    } => Inventory::available(Venue::MarketMaking, (*direction).into(), *amount),
 
                     OffChainOrderFilled {
                         shares_filled,
                         direction,
                         ..
-                    } => {
-                        let shares = shares_filled.inner();
-                        match direction {
-                            Direction::Buy => Inventory::add_offchain_available(shares),
-                            Direction::Sell => Inventory::remove_offchain_available(shares),
-                        }
-                    }
+                    } => Inventory::available(
+                        Venue::Hedging,
+                        (*direction).into(),
+                        shares_filled.inner(),
+                    ),
 
                     Initialized { .. }
                     | OffChainOrderPlaced { .. }
@@ -285,14 +279,11 @@ impl Reactor for RebalancingTrigger {
                     direction, amount, ..
                 } = &event
                 {
-                    let update = match direction {
-                        RebalanceDirection::AlpacaToBase => {
-                            Inventory::move_offchain_to_inflight(*amount)
-                        }
-                        RebalanceDirection::BaseToAlpaca => {
-                            Inventory::move_onchain_to_inflight(*amount)
-                        }
+                    let venue = match direction {
+                        RebalanceDirection::AlpacaToBase => Venue::Hedging,
+                        RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
                     };
+                    let update = Inventory::transfer(venue, TransferOp::Start, *amount);
 
                     let mut inventory = self.inventory.write().await;
                     *inventory = inventory.clone().update_usdc(update, Utc::now())?;
@@ -318,22 +309,23 @@ impl Reactor for RebalancingTrigger {
                         |view, (symbol, snapshot_balance)| {
                             view.update_equity(
                                 symbol,
-                                Inventory::on_onchain_snapshot(*snapshot_balance),
+                                Inventory::on_snapshot(Venue::MarketMaking, *snapshot_balance),
                                 now,
                             )
                         },
                     ),
 
-                    OnchainCash { usdc_balance, .. } => inventory
-                        .clone()
-                        .update_usdc(Inventory::on_onchain_snapshot(*usdc_balance), now),
+                    OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
+                        Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance),
+                        now,
+                    ),
 
                     OffchainEquity { positions, .. } => positions.iter().try_fold(
                         inventory.clone(),
                         |view, (symbol, snapshot_balance)| {
                             view.update_equity(
                                 symbol,
-                                Inventory::on_offchain_snapshot(*snapshot_balance),
+                                Inventory::on_snapshot(Venue::Hedging, *snapshot_balance),
                                 now,
                             )
                         },
@@ -347,7 +339,7 @@ impl Reactor for RebalancingTrigger {
                         )?;
                         inventory
                             .clone()
-                            .update_usdc(Inventory::on_offchain_snapshot(usdc), now)
+                            .update_usdc(Inventory::on_snapshot(Venue::Hedging, usdc), now)
                     }
                 }?;
 
@@ -536,11 +528,21 @@ impl RebalancingTrigger {
         use TokenizedEquityMintEvent::*;
 
         let update = match &event {
-            MintAccepted { .. } => Some(Inventory::move_offchain_to_inflight(quantity)),
-            MintAcceptanceFailed { .. } => Some(Inventory::cancel_offchain_inflight(quantity)),
-            TokensReceived { .. } => {
-                Some(Inventory::transfer_offchain_inflight_to_onchain(quantity))
-            }
+            MintAccepted { .. } => Some(Inventory::transfer(
+                Venue::Hedging,
+                TransferOp::Start,
+                quantity,
+            )),
+            MintAcceptanceFailed { .. } => Some(Inventory::transfer(
+                Venue::Hedging,
+                TransferOp::Cancel,
+                quantity,
+            )),
+            TokensReceived { .. } => Some(Inventory::transfer(
+                Venue::Hedging,
+                TransferOp::Complete,
+                quantity,
+            )),
             DepositedIntoRaindex { deposited_at, .. } => {
                 Some(Inventory::with_last_rebalancing(*deposited_at))
             }
@@ -590,7 +592,11 @@ impl RebalancingTrigger {
         use EquityRedemptionEvent::*;
 
         let update = match &event {
-            WithdrawnFromRaindex { .. } => Some(Inventory::move_onchain_to_inflight(quantity)),
+            WithdrawnFromRaindex { .. } => Some(Inventory::transfer(
+                Venue::MarketMaking,
+                TransferOp::Start,
+                quantity,
+            )),
 
             Completed { completed_at } => {
                 let completed_at = *completed_at;
@@ -601,7 +607,9 @@ impl RebalancingTrigger {
                         + Send,
                 > = Box::new(move |inventory| {
                     let transferred =
-                        Inventory::transfer_onchain_inflight_to_offchain(quantity)(inventory)?;
+                        Inventory::transfer(Venue::MarketMaking, TransferOp::Complete, quantity)(
+                            inventory,
+                        )?;
                     Inventory::with_last_rebalancing(completed_at)(transferred)
                 });
                 Some(composed)
@@ -740,6 +748,7 @@ mod tests {
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
+    use crate::inventory::{Operator, TransferOp, Venue};
     use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::{PositionEvent, TradeId};
     use crate::threshold::{ExecutionThreshold, Usdc};
@@ -1157,13 +1166,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(50)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(50)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(50)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(50)),
                 Utc::now(),
             )
             .unwrap();
@@ -1196,13 +1205,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1233,13 +1242,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(65)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(65)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(35)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(35)),
                 Utc::now(),
             )
             .unwrap();
@@ -1339,13 +1348,13 @@ mod tests {
         let inventory = inventory
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1372,7 +1381,7 @@ mod tests {
                 .clone()
                 .update_equity(
                     &symbol,
-                    Inventory::move_offchain_to_inflight(shares(30)),
+                    Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(30)),
                     Utc::now(),
                 )
                 .unwrap();
@@ -1510,7 +1519,7 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(100)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
                 Utc::now(),
             )
             .unwrap();
@@ -1548,13 +1557,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1599,13 +1608,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1649,13 +1658,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1697,13 +1706,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1754,13 +1763,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1799,13 +1808,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -1844,7 +1853,7 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(100)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
                 Utc::now(),
             )
             .unwrap();
@@ -1883,7 +1892,7 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(100)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
                 Utc::now(),
             )
             .unwrap();
@@ -1922,7 +1931,7 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(100)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
                 Utc::now(),
             )
             .unwrap();
@@ -1997,13 +2006,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(80)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(20)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap();
@@ -2049,13 +2058,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(20)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(80)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap();
@@ -2107,13 +2116,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(80)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(20)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap();
@@ -2156,13 +2165,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(80)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(20)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap();
@@ -2398,13 +2407,13 @@ mod tests {
         let inventory = inventory
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(shares(80)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(shares(20)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
                 Utc::now(),
             )
             .unwrap();

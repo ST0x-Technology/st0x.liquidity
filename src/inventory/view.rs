@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
-use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Symbol};
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::threshold::Usdc;
@@ -42,6 +42,51 @@ pub(crate) struct ImbalanceThreshold {
     pub(crate) deviation: Decimal,
 }
 
+/// Discriminant for the two venues tracked by an [`Inventory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Venue {
+    /// Onchain venue (Raindex) -- where market making happens.
+    MarketMaking,
+    /// Offchain venue (brokerage) -- where hedging happens.
+    Hedging,
+}
+
+impl Venue {
+    fn other(self) -> Self {
+        match self {
+            Self::MarketMaking => Self::Hedging,
+            Self::Hedging => Self::MarketMaking,
+        }
+    }
+}
+
+/// Add or remove from a venue's available balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operator {
+    Add,
+    Remove,
+}
+
+impl From<Direction> for Operator {
+    fn from(direction: Direction) -> Self {
+        match direction {
+            Direction::Buy => Self::Add,
+            Direction::Sell => Self::Remove,
+        }
+    }
+}
+
+/// Stage of an inflight transfer between venues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferOp {
+    /// Move available to inflight (assets leaving this venue).
+    Start,
+    /// Confirm inflight at source and add available at destination.
+    Complete,
+    /// Cancel inflight back to available at source.
+    Cancel,
+}
+
 /// Inventory at a pair of venues (onchain/offchain).
 ///
 /// Venues are `Option` to distinguish "not yet polled" from "polled with zero balance".
@@ -69,6 +114,26 @@ where
     fn has_inflight(&self) -> bool {
         self.onchain.as_ref().is_some_and(|v| v.has_inflight())
             || self.offchain.as_ref().is_some_and(|v| v.has_inflight())
+    }
+
+    fn get_venue(&self, venue: Venue) -> Option<VenueBalance<T>> {
+        match venue {
+            Venue::MarketMaking => self.onchain,
+            Venue::Hedging => self.offchain,
+        }
+    }
+
+    fn set_venue(self, venue: Venue, balance: Option<VenueBalance<T>>) -> Self {
+        match venue {
+            Venue::MarketMaking => Self {
+                onchain: balance,
+                ..self
+            },
+            Venue::Hedging => Self {
+                offchain: balance,
+                ..self
+            },
+        }
     }
 }
 
@@ -214,159 +279,73 @@ where
         + Send
         + 'static,
 {
-    pub(crate) fn add_onchain_available(
+    /// Add or remove from a venue's available balance.
+    pub(crate) fn available(
+        venue: Venue,
+        op: Operator,
         amount: T,
     ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
         Box::new(move |inventory| {
-            let onchain = match inventory.onchain {
-                Some(venue) => venue.add_available(amount)?,
-                None => VenueBalance::new(amount, T::ZERO),
+            let balance = match op {
+                Operator::Add => match inventory.get_venue(venue) {
+                    Some(v) => v.add_available(amount)?,
+                    None => VenueBalance::new(amount, T::ZERO),
+                },
+                Operator::Remove => inventory
+                    .get_venue(venue)
+                    .unwrap_or_default()
+                    .remove_available(amount)?,
             };
 
-            Ok(Self {
-                onchain: Some(onchain),
-                ..inventory
-            })
+            Ok(inventory.set_venue(venue, Some(balance)))
         })
     }
 
-    pub(crate) fn remove_onchain_available(
+    /// Perform a transfer lifecycle operation at a venue.
+    ///
+    /// - [`TransferOp::Start`]: move available to inflight (assets leaving).
+    /// - [`TransferOp::Complete`]: confirm inflight at `from` and add
+    ///   available at the other venue.
+    /// - [`TransferOp::Cancel`]: return inflight back to available.
+    pub(crate) fn transfer(
+        from: Venue,
+        op: TransferOp,
         amount: T,
     ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let onchain = inventory
-                .onchain
-                .unwrap_or_default()
-                .remove_available(amount)?;
+        Box::new(move |inventory| match op {
+            TransferOp::Start => {
+                let balance = inventory
+                    .get_venue(from)
+                    .unwrap_or_default()
+                    .move_to_inflight(amount)?;
 
-            Ok(Self {
-                onchain: Some(onchain),
-                ..inventory
-            })
-        })
-    }
+                Ok(inventory.set_venue(from, Some(balance)))
+            }
 
-    pub(crate) fn add_offchain_available(
-        amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let offchain = match inventory.offchain {
-                Some(venue) => venue.add_available(amount)?,
-                None => VenueBalance::new(amount, T::ZERO),
-            };
+            TransferOp::Complete => {
+                let source = inventory
+                    .get_venue(from)
+                    .unwrap_or_default()
+                    .confirm_inflight(amount)?;
 
-            Ok(Self {
-                offchain: Some(offchain),
-                ..inventory
-            })
-        })
-    }
+                let dest = match inventory.get_venue(from.other()) {
+                    Some(v) => v.add_available(amount)?,
+                    None => VenueBalance::new(amount, T::ZERO),
+                };
 
-    pub(crate) fn remove_offchain_available(
-        amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let offchain = inventory
-                .offchain
-                .unwrap_or_default()
-                .remove_available(amount)?;
+                Ok(inventory
+                    .set_venue(from, Some(source))
+                    .set_venue(from.other(), Some(dest)))
+            }
 
-            Ok(Self {
-                offchain: Some(offchain),
-                ..inventory
-            })
-        })
-    }
+            TransferOp::Cancel => {
+                let balance = inventory
+                    .get_venue(from)
+                    .unwrap_or_default()
+                    .cancel_inflight(amount)?;
 
-    pub(crate) fn move_offchain_to_inflight(
-        amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let offchain = inventory
-                .offchain
-                .unwrap_or_default()
-                .move_to_inflight(amount)?;
-
-            Ok(Self {
-                offchain: Some(offchain),
-                ..inventory
-            })
-        })
-    }
-
-    pub(crate) fn transfer_offchain_inflight_to_onchain(
-        amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let offchain = inventory
-                .offchain
-                .unwrap_or_default()
-                .confirm_inflight(amount)?;
-
-            let onchain = match inventory.onchain {
-                Some(venue) => venue.add_available(amount)?,
-                None => VenueBalance::new(amount, T::ZERO),
-            };
-
-            Ok(Self {
-                offchain: Some(offchain),
-                onchain: Some(onchain),
-                ..inventory
-            })
-        })
-    }
-
-    pub(crate) fn cancel_offchain_inflight(
-        amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let offchain = inventory
-                .offchain
-                .unwrap_or_default()
-                .cancel_inflight(amount)?;
-
-            Ok(Self {
-                offchain: Some(offchain),
-                ..inventory
-            })
-        })
-    }
-
-    pub(crate) fn move_onchain_to_inflight(
-        amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let onchain = inventory
-                .onchain
-                .unwrap_or_default()
-                .move_to_inflight(amount)?;
-
-            Ok(Self {
-                onchain: Some(onchain),
-                ..inventory
-            })
-        })
-    }
-
-    pub(crate) fn transfer_onchain_inflight_to_offchain(
-        amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let onchain = inventory
-                .onchain
-                .unwrap_or_default()
-                .confirm_inflight(amount)?;
-
-            let offchain = match inventory.offchain {
-                Some(venue) => venue.add_available(amount)?,
-                None => VenueBalance::new(amount, T::ZERO),
-            };
-
-            Ok(Self {
-                onchain: Some(onchain),
-                offchain: Some(offchain),
-                ..inventory
-            })
+                Ok(inventory.set_venue(from, Some(balance)))
+            }
         })
     }
 
@@ -381,11 +360,13 @@ where
         })
     }
 
-    /// Apply a fetched onchain venue snapshot.
+    /// Apply a fetched venue snapshot.
+    ///
     /// Skips if ANY venue has inflight operations, because we cannot
     /// distinguish "transfer completed but not confirmed" from
     /// "unrelated inventory change".
-    pub(crate) fn on_onchain_snapshot(
+    pub(crate) fn on_snapshot(
+        venue: Venue,
         snapshot_balance: T,
     ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
         Box::new(move |inventory| {
@@ -393,39 +374,12 @@ where
                 return Ok(inventory);
             }
 
-            let onchain = inventory
-                .onchain
+            let balance = inventory
+                .get_venue(venue)
                 .unwrap_or_default()
                 .apply_snapshot(snapshot_balance);
 
-            Ok(Self {
-                onchain: Some(onchain),
-                ..inventory
-            })
-        })
-    }
-
-    /// Apply a fetched offchain venue snapshot.
-    /// Skips if ANY venue has inflight operations, because we cannot
-    /// distinguish "transfer completed but not confirmed" from
-    /// "unrelated inventory change".
-    pub(crate) fn on_offchain_snapshot(
-        snapshot_balance: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            if inventory.has_inflight() {
-                return Ok(inventory);
-            }
-
-            let offchain = inventory
-                .offchain
-                .unwrap_or_default()
-                .apply_snapshot(snapshot_balance);
-
-            Ok(Self {
-                offchain: Some(offchain),
-                ..inventory
-            })
+            Ok(inventory.set_venue(venue, Some(balance)))
         })
     }
 }
@@ -949,37 +903,37 @@ mod tests {
 
     #[test]
     fn detect_imbalance_normalized_returns_none_when_balanced() {
-        let inv = make_inventory(50, 0, 50, 0);
+        let inventory = make_inventory(50, 0, 50, 0);
         let thresh = threshold("0.5", "0.2");
 
         // Normalized onchain = 50 (same as raw)
         let normalized = shares(50);
-        let result = inv.detect_imbalance_normalized(&thresh, normalized);
+        let result = inventory.detect_imbalance_normalized(&thresh, normalized);
 
         assert!(result.is_none());
     }
 
     #[test]
     fn detect_imbalance_normalized_detects_too_much_onchain() {
-        let inv = make_inventory(50, 0, 50, 0);
+        let inventory = make_inventory(50, 0, 50, 0);
         let thresh = threshold("0.5", "0.2");
 
         // Normalized onchain = 100 (double the raw wrapped amount)
         // Total = 100 + 50 = 150, ratio = 100/150 ~= 0.67 (within threshold)
         // But if normalized = 120, ratio = 120/170 ~= 0.71 (above 70%)
         let normalized = shares(120);
-        let result = inv.detect_imbalance_normalized(&thresh, normalized);
+        let result = inventory.detect_imbalance_normalized(&thresh, normalized);
 
         assert!(matches!(result, Some(Imbalance::TooMuchOnchain { .. })));
     }
 
     #[test]
     fn detect_imbalance_normalized_returns_none_when_inflight() {
-        let inv = make_inventory(50, 10, 50, 0);
+        let inventory = make_inventory(50, 10, 50, 0);
         let thresh = threshold("0.5", "0.2");
 
         let normalized = shares(120);
-        let result = inv.detect_imbalance_normalized(&thresh, normalized);
+        let result = inventory.detect_imbalance_normalized(&thresh, normalized);
 
         // Even with high normalized value, inflight blocks detection
         assert!(result.is_none());

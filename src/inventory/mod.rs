@@ -8,5 +8,6 @@ mod view;
 pub(crate) use polling::InventoryPollingService;
 pub(crate) use snapshot::InventorySnapshot;
 pub(crate) use view::{
-    Imbalance, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
+    Imbalance, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, Operator,
+    TransferOp, Venue,
 };

@@ -1486,7 +1486,7 @@ mod tests {
     };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::inventory::{ImbalanceThreshold, Inventory};
+    use crate::inventory::{ImbalanceThreshold, Inventory, Operator, Venue};
     use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::trigger::UsdcRebalancing;
@@ -3224,13 +3224,21 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 symbol,
-                Inventory::add_onchain_available(FractionalShares::new(dec!(20))),
+                Inventory::available(
+                    Venue::MarketMaking,
+                    Operator::Add,
+                    FractionalShares::new(dec!(20)),
+                ),
                 chrono::Utc::now(),
             )
             .unwrap()
             .update_equity(
                 symbol,
-                Inventory::add_offchain_available(FractionalShares::new(dec!(80))),
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(80)),
+                ),
                 chrono::Utc::now(),
             )
             .unwrap()
@@ -3344,7 +3352,11 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(FractionalShares::new(dec!(50))),
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(50)),
+                ),
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -3424,13 +3436,21 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(FractionalShares::new(dec!(50))),
+                Inventory::available(
+                    Venue::MarketMaking,
+                    Operator::Add,
+                    FractionalShares::new(dec!(50)),
+                ),
                 chrono::Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(FractionalShares::new(dec!(50))),
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(50)),
+                ),
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -3537,13 +3557,21 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 &symbol,
-                Inventory::add_onchain_available(FractionalShares::new(dec!(65))),
+                Inventory::available(
+                    Venue::MarketMaking,
+                    Operator::Add,
+                    FractionalShares::new(dec!(65)),
+                ),
                 chrono::Utc::now(),
             )
             .unwrap()
             .update_equity(
                 &symbol,
-                Inventory::add_offchain_available(FractionalShares::new(dec!(35))),
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(35)),
+                ),
                 chrono::Utc::now(),
             )
             .unwrap();

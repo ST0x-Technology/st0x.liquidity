@@ -181,7 +181,7 @@ mod tests {
     use st0x_execution::FractionalShares;
 
     use super::*;
-    use crate::inventory::Inventory;
+    use crate::inventory::{Inventory, Operator, TransferOp, Venue};
     use crate::wrapper::RATIO_ONE;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
@@ -201,13 +201,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 symbol,
-                Inventory::add_onchain_available(shares(onchain)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(onchain)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 symbol,
-                Inventory::add_offchain_available(shares(offchain)),
+                Inventory::available(Venue::Hedging, Operator::Add, shares(offchain)),
                 Utc::now(),
             )
             .unwrap();
@@ -395,13 +395,13 @@ mod tests {
             .with_equity(symbol.clone())
             .update_equity(
                 symbol,
-                Inventory::add_onchain_available(precise_shares(onchain)),
+                Inventory::available(Venue::MarketMaking, Operator::Add, precise_shares(onchain)),
                 Utc::now(),
             )
             .unwrap()
             .update_equity(
                 symbol,
-                Inventory::add_offchain_available(precise_shares(offchain)),
+                Inventory::available(Venue::Hedging, Operator::Add, precise_shares(offchain)),
                 Utc::now(),
             )
             .unwrap();
@@ -475,7 +475,7 @@ mod tests {
             .clone()
             .update_equity(
                 &symbol,
-                Inventory::move_offchain_to_inflight(quantity),
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, quantity),
                 Utc::now(),
             )
             .unwrap();
@@ -485,7 +485,7 @@ mod tests {
             .clone()
             .update_equity(
                 &symbol,
-                Inventory::transfer_offchain_inflight_to_onchain(quantity),
+                Inventory::transfer(Venue::Hedging, TransferOp::Complete, quantity),
                 Utc::now(),
             )
             .unwrap();
@@ -566,7 +566,7 @@ mod tests {
                 .clone()
                 .update_equity(
                     &symbol,
-                    Inventory::move_offchain_to_inflight(qty1),
+                    Inventory::transfer(Venue::Hedging, TransferOp::Start, qty1),
                     Utc::now(),
                 )
                 .unwrap();
@@ -574,7 +574,7 @@ mod tests {
                 .clone()
                 .update_equity(
                     &symbol,
-                    Inventory::transfer_offchain_inflight_to_onchain(qty1),
+                    Inventory::transfer(Venue::Hedging, TransferOp::Complete, qty1),
                     Utc::now(),
                 )
                 .unwrap();
@@ -590,7 +590,11 @@ mod tests {
                 .clone()
                 .update_equity(
                     &symbol,
-                    Inventory::add_offchain_available(precise_shares("100.0000000001")),
+                    Inventory::available(
+                        Venue::Hedging,
+                        Operator::Add,
+                        precise_shares("100.0000000001"),
+                    ),
                     Utc::now(),
                 )
                 .unwrap();
