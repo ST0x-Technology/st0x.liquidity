@@ -10,7 +10,7 @@ use super::auth::{AccountStatus, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::order::{ConversionDirection, CryptoOrderResponse};
 use crate::{
-    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor, Symbol,
+    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor,
     TryIntoExecutor,
 };
 
@@ -151,6 +151,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::TimeInForce;
     use crate::alpaca_broker_api::auth::AlpacaBrokerApiMode;
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
@@ -159,6 +160,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 

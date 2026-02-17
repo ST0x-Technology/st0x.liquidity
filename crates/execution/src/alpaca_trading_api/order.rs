@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
 use crate::order::OrderUpdate;
-use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus};
+use crate::{
+    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, Positive, Symbol,
+};
 
 pub(super) async fn place_market_order(
     client: &Client,
@@ -59,7 +61,7 @@ pub(super) async fn place_market_order(
 pub(super) async fn get_order_status(
     client: &Client,
     order_id: &str,
-) -> Result<OrderUpdate, AlpacaTradingApiError> {
+) -> Result<OrderUpdate<String>, AlpacaTradingApiError> {
     debug!("Querying Alpaca order status for order ID: {}", order_id);
 
     let order_uuid = Uuid::parse_str(order_id)?;
@@ -68,11 +70,24 @@ pub(super) async fn get_order_status(
 
     let order_response = client.issue::<order::Get>(&alpaca_order_id).await?;
 
+    let symbol = Symbol::new(order_response.symbol.clone())?;
+
+    let shares = extract_shares_from_amount(&order_response.amount)?;
+
+    let direction = match order_response.side {
+        order::Side::Buy => Direction::Buy,
+        order::Side::Sell => Direction::Sell,
+    };
+
     let status = map_alpaca_status_to_order_status(order_response.status);
 
     let price = extract_price(&order_response)?;
 
     Ok(OrderUpdate {
+        order_id: order_id.to_string(),
+        symbol,
+        shares,
+        direction,
         status,
         updated_at: Utc::now(),
         price,
@@ -117,6 +132,18 @@ fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
             debug!("Unknown Alpaca order status encountered: {unknown:?}, treating as Failed");
             OrderStatus::Failed
         }
+    }
+}
+
+fn extract_shares_from_amount(
+    amount: &order::Amount,
+) -> Result<Positive<FractionalShares>, AlpacaTradingApiError> {
+    match amount {
+        order::Amount::Quantity { quantity } => {
+            let qty_decimal: Decimal = quantity.to_string().parse()?;
+            Ok(Positive::new(FractionalShares::new(qty_decimal))?)
+        }
+        order::Amount::Notional { .. } => Err(AlpacaTradingApiError::NotionalOrdersNotSupported),
     }
 }
 

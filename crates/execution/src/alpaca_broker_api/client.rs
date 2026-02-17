@@ -8,8 +8,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
+use super::AssetResponse;
 use super::auth::{AccountResponse, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
-use super::executor::AssetResponse;
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
 use crate::Symbol;
 
@@ -195,6 +195,7 @@ mod tests {
     use httpmock::prelude::*;
 
     use super::*;
+    use crate::TimeInForce;
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
@@ -202,6 +203,8 @@ mod tests {
             api_secret: "test_secret_key".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 

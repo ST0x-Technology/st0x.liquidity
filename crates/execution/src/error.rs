@@ -20,7 +20,7 @@ pub enum PersistenceError {
     #[error("Execution error: {0}")]
     Execution(#[source] Box<crate::ExecutionError>),
     #[error("Invalid shares in database: {0}")]
-    InvalidShares(#[from] crate::InvalidSharesError),
+    InvalidShares(#[from] crate::WholeSharesError),
     #[error("Decimal parse error: {0}")]
     DecimalParse(#[from] rust_decimal::Error),
 }

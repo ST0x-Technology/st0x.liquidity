@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::TimeInForce;
+
 /// Mode for Alpaca Broker API
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,6 +34,25 @@ pub struct AlpacaBrokerApiCtx {
     pub api_secret: String,
     pub account_id: String,
     pub mode: Option<AlpacaBrokerApiMode>,
+    #[serde(
+        default = "default_asset_cache_ttl_secs",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub asset_cache_ttl: std::time::Duration,
+    #[serde(default)]
+    pub time_in_force: TimeInForce,
+}
+
+fn default_asset_cache_ttl_secs() -> std::time::Duration {
+    std::time::Duration::from_secs(3600)
+}
+
+fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let secs = u64::deserialize(deserializer)?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 impl AlpacaBrokerApiCtx {
@@ -60,6 +81,8 @@ impl std::fmt::Debug for AlpacaBrokerApiCtx {
             .field("api_secret", &"[REDACTED]")
             .field("account_id", &self.account_id)
             .field("mode", &self.mode())
+            .field("asset_cache_ttl", &self.asset_cache_ttl)
+            .field("time_in_force", &self.time_in_force)
             .finish()
     }
 }
@@ -97,6 +120,8 @@ mod tests {
             api_secret: "test_secret_key".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 
@@ -134,6 +159,8 @@ mod tests {
             api_secret: "ultra_secret_secret_456".to_string(),
             account_id: "account_789".to_string(),
             mode: None,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         };
 
         let debug_output = format!("{ctx:?}");

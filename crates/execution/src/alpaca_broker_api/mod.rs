@@ -38,6 +38,13 @@ pub enum AssetStatus {
     Inactive,
 }
 
+/// Response from the asset endpoint
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct AssetResponse {
+    pub status: AssetStatus,
+    pub tradable: bool,
+}
+
 pub use auth::{AccountStatus, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use order::{ConversionDirection, CryptoOrderResponse};

@@ -15,7 +15,7 @@ use url::Url;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::{
     EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
-    InvalidSharesError, PersistenceError, SharesConversionError,
+    NonPositiveError, PersistenceError, SharesConversionError, WholeSharesError,
 };
 
 use st0x_event_sorcery::ProjectionError;
@@ -114,7 +114,9 @@ pub(crate) enum OnChainError {
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
     #[error(transparent)]
-    InvalidShares(#[from] InvalidSharesError),
+    InvalidShares(#[from] WholeSharesError),
+    #[error(transparent)]
+    NonPositive(#[from] NonPositiveError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
     #[error("Position error: {0}")]

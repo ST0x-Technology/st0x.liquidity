@@ -241,7 +241,7 @@ pub(super) async fn place_market_order(
 pub(super) async fn get_order_status(
     client: &AlpacaBrokerApiClient,
     order_id: &str,
-) -> Result<OrderUpdate, AlpacaBrokerApiError> {
+) -> Result<OrderUpdate<String>, AlpacaBrokerApiError> {
     debug!(
         "Querying Alpaca Broker API order status for order ID: {}",
         order_id
@@ -249,6 +249,11 @@ pub(super) async fn get_order_status(
 
     let order_uuid = Uuid::parse_str(order_id)?;
     let response = client.get_order(order_uuid).await?;
+
+    let direction = match response.side {
+        OrderSide::Buy => Direction::Buy,
+        OrderSide::Sell => Direction::Sell,
+    };
 
     let status = map_broker_status_to_order_status(response.status);
     let price = response.filled_average_price;
@@ -264,6 +269,10 @@ pub(super) async fn get_order_status(
     }
 
     Ok(OrderUpdate {
+        order_id: order_id.to_string(),
+        symbol: response.symbol,
+        shares: response.quantity,
+        direction,
         status,
         updated_at: Utc::now(),
         price,
@@ -380,6 +389,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::TimeInForce;
     use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
@@ -388,6 +398,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 

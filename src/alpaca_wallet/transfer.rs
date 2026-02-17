@@ -257,7 +257,7 @@ mod tests {
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use st0x_execution::InvalidSharesError;
+    use st0x_execution::NonPositiveError;
     use std::str::FromStr;
     use uuid::uuid;
 
@@ -331,7 +331,7 @@ mod tests {
     fn test_initiate_withdrawal_zero_amount() {
         assert!(matches!(
             Positive::new(Usdc(Decimal::ZERO)).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::ZERO
+            NonPositiveError(value) if value == Decimal::ZERO
         ));
     }
 
@@ -339,7 +339,7 @@ mod tests {
     fn test_initiate_withdrawal_negative_amount() {
         assert!(matches!(
             Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::new(-100, 0)
+            NonPositiveError(value) if value == Decimal::new(-100, 0)
         ));
     }
 

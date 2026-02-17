@@ -159,6 +159,28 @@ impl AlpacaWalletService {
             .await
     }
 
+    pub(crate) async fn remove_whitelist_entries(
+        &self,
+        address: &Address,
+    ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
+        let entries = self.client.get_whitelisted_addresses().await?;
+
+        let matching: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry.address == *address)
+            .collect();
+
+        if matching.is_empty() {
+            return Err(AlpacaWalletError::NoWhitelistEntries { address: *address });
+        }
+
+        for entry in &matching {
+            self.client.delete_whitelist_entry(&entry.id).await?;
+        }
+
+        Ok(matching)
+    }
+
     /// Gets all whitelisted addresses for this account.
     pub(crate) async fn get_whitelisted_addresses(
         &self,
