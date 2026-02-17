@@ -2312,10 +2312,13 @@ know about cross-venue inventory.
   back to Raindex available (tokens returned by Alpaca)
 - `CrossVenueCashTransferEvent::WithdrawalConfirmed` - Moves USDC to inflight
   (leaving source)
-- `CrossVenueCashTransferEvent::RebalancingCompleted` - Moves from inflight to
-  destination available
-- `CrossVenueCashTransferEvent::RebalancingFailed` - Reconciles inflight back to
-  source available
+- `CrossVenueCashTransferEvent::DepositConfirmed` - Terminal success for
+  AlpacaToBase; moves from inflight to destination available
+- `CrossVenueCashTransferEvent::ConversionConfirmed` - Terminal success for
+  BaseToAlpaca; moves from inflight to destination available
+- `CrossVenueCashTransferEvent::WithdrawalFailed`, `BridgingFailed`,
+  `DepositFailed`, `ConversionFailed` - Reconciles inflight back to source
+  available
 - `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
   vaults
 - `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
