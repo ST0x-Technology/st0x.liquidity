@@ -3,9 +3,9 @@
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use reqwest::StatusCode;
+use std::sync::Mutex;
 
 use st0x_execution::{FractionalShares, Symbol};
-use std::sync::Mutex;
 
 use super::{
     AlpacaTokenizationError, TokenizationRequest, TokenizationRequestStatus, Tokenizer,

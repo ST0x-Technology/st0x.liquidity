@@ -2473,8 +2473,8 @@ mod tests {
         let thresh = threshold("0.5", "0.2");
 
         // Normalized onchain = 100 (double the raw wrapped amount)
-        // Total = 100 + 50 = 150, ratio = 100/150 ≈ 0.67 (within threshold)
-        // But if normalized = 120, ratio = 120/170 ≈ 0.71 (above 70%)
+        // Total = 100 + 50 = 150, ratio = 100/150 ~= 0.67 (within threshold)
+        // But if normalized = 120, ratio = 120/170 ~= 0.71 (above 70%)
         let normalized = shares(120);
         let result = inv.detect_imbalance_normalized(&thresh, normalized);
 

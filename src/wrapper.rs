@@ -10,6 +10,7 @@ use alloy::contract::Error as ContractError;
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::PendingTransactionError;
 use async_trait::async_trait;
+
 use st0x_execution::Symbol;
 
 pub(crate) use ratio::{RatioError, UnderlyingPerWrapped};

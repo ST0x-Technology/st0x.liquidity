@@ -250,10 +250,10 @@ impl OnchainTrade {
             created_at: None,
             gas_used,
             effective_gas_price,
-            pyth_price: pyth_pricing.as_ref().map(|p| p.price),
-            pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
-            pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
-            pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
+            pyth_price: pyth_pricing.as_ref().map(|pricing| pricing.price),
+            pyth_confidence: pyth_pricing.as_ref().map(|pricing| pricing.confidence),
+            pyth_exponent: pyth_pricing.as_ref().map(|pricing| pricing.exponent),
+            pyth_publish_time: pyth_pricing.as_ref().map(|pricing| pricing.publish_time),
         };
 
         Ok(Some(trade))

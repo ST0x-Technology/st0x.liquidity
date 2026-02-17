@@ -24,21 +24,21 @@ pub struct EquityTokenAddresses {
 }
 
 /// Service for managing ERC-4626 token wrapping/unwrapping operations.
-pub(crate) struct WrapperService<P>
+pub(crate) struct WrapperService<Node>
 where
-    P: Provider + Clone,
+    Node: Provider + Clone,
 {
-    provider: P,
+    provider: Node,
     owner: Address,
     config: HashMap<Symbol, EquityTokenAddresses>,
 }
 
-impl<P> WrapperService<P>
+impl<Node> WrapperService<Node>
 where
-    P: Provider + Clone,
+    Node: Provider + Clone,
 {
     pub(crate) fn new(
-        provider: P,
+        provider: Node,
         owner: Address,
         config: HashMap<Symbol, EquityTokenAddresses>,
     ) -> Self {
@@ -67,9 +67,9 @@ where
 }
 
 #[async_trait]
-impl<P> Wrapper for WrapperService<P>
+impl<Node> Wrapper for WrapperService<Node>
 where
-    P: Provider + Clone + Send + Sync,
+    Node: Provider + Clone + Send + Sync,
 {
     async fn get_ratio_for_symbol(
         &self,

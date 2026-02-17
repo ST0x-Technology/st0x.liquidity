@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
-use st0x_event_sorcery::{Projection, Store};
+use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Executor};
 
 use super::equity::CrossVenueEquityTransfer;
@@ -192,6 +192,7 @@ where
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
+            self.wrapper,
             market_maker_wallet,
             frameworks.mint,
             frameworks.redemption,

@@ -30,9 +30,10 @@ use crate::tokenization::{
     AlpacaTokenizationError, TokenizationRequestStatus, Tokenizer, TokenizerError,
 };
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizationRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    IssuerRequestId, TOKENIZED_EQUITY_DECIMALS, TokenizationRequestId, TokenizedEquityMint,
+    TokenizedEquityMintCommand,
 };
-use crate::wrapper::Wrapper;
+use crate::wrapper::{Wrapper, WrapperError};
 
 /// A quantity of equity in a specific symbol.
 #[derive(Debug)]
@@ -57,6 +58,18 @@ pub(crate) struct EquityTransferServices {
 pub(crate) enum MintError {
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<TokenizedEquityMint>>),
+    #[error("Wrapper error: {0}")]
+    Wrapper(#[from] WrapperError),
+    #[error("Raindex error: {0}")]
+    Raindex(#[from] RaindexError),
+    #[error(
+        "Entity not found after command: expected {expected_state} \
+         for {issuer_request_id}"
+    )]
+    EntityNotFound {
+        issuer_request_id: IssuerRequestId,
+        expected_state: &'static str,
+    },
 }
 
 impl From<SendError<TokenizedEquityMint>> for MintError {
@@ -97,6 +110,7 @@ pub(crate) enum RedemptionError {
 pub(crate) struct CrossVenueEquityTransfer {
     raindex: Arc<dyn Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn Wrapper>,
     wallet: Address,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
@@ -106,6 +120,7 @@ impl CrossVenueEquityTransfer {
     pub(crate) fn new(
         raindex: Arc<dyn Raindex>,
         tokenizer: Arc<dyn Tokenizer>,
+        wrapper: Arc<dyn Wrapper>,
         wallet: Address,
         mint_store: Arc<Store<TokenizedEquityMint>>,
         redemption_store: Arc<Store<EquityRedemption>>,
@@ -113,21 +128,49 @@ impl CrossVenueEquityTransfer {
         Self {
             raindex,
             tokenizer,
+            wrapper,
             wallet,
             mint_store,
             redemption_store,
         }
     }
 
-    /// Sends the Redeem command and extracts the redemption tx hash.
-    async fn send_redeem_command(
+    /// Loads the aggregate after Poll and extracts shares_minted from
+    /// the TokensReceived state.
+    async fn load_shares_minted(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<U256, MintError> {
+        let entity = self
+            .mint_store
+            .load(issuer_request_id)
+            .await?
+            .ok_or_else(|| MintError::EntityNotFound {
+                issuer_request_id: issuer_request_id.clone(),
+                expected_state: "TokensReceived",
+            })?;
+
+        match entity {
+            TokenizedEquityMint::TokensReceived { shares_minted, .. } => Ok(shares_minted),
+            other => {
+                error!(?other, "Expected TokensReceived after Poll");
+                Err(MintError::EntityNotFound {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_state: "TokensReceived",
+                })
+            }
+        }
+    }
+
+    /// Sends the Redeem command to withdraw from Raindex vault.
+    async fn withdraw_from_raindex(
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,
         quantity: FractionalShares,
         token: Address,
         amount: U256,
-    ) -> Result<TxHash, RedemptionError> {
+    ) -> Result<(), RedemptionError> {
         self.redemption_store
             .send(
                 aggregate_id,
@@ -140,6 +183,25 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
+        Ok(())
+    }
+
+    /// Unwraps ERC-4626 tokens and sends to Alpaca, returning the
+    /// redemption tx hash.
+    async fn unwrap_and_send(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<TxHash, RedemptionError> {
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::UnwrapTokens)
+            .await?;
+
+        info!("Tokens unwrapped, sending to Alpaca");
+
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::SendTokens)
+            .await?;
+
         let entity = self.redemption_store.load(aggregate_id).await?.ok_or(
             RedemptionError::EntityNotFound {
                 aggregate_id: aggregate_id.clone(),
@@ -150,7 +212,7 @@ impl CrossVenueEquityTransfer {
             EquityRedemption::TokensSent { redemption_tx, .. } => Ok(redemption_tx),
             entity @ EquityRedemption::Failed { .. } => Err(RedemptionError::SendFailed { entity }),
             entity => {
-                error!(?entity, "Unexpected entity after Redeem command");
+                error!(?entity, "Unexpected entity after SendTokens command");
                 Err(RedemptionError::UnexpectedEntity { entity })
             }
         }
@@ -262,7 +324,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
         let Equity { symbol, quantity } = asset;
         let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
 
-        debug!(issuer_request_id = %issuer_request_id.0, wallet = %self.wallet, "Executing mint command");
+        debug!(issuer_request_id = %issuer_request_id.0, wallet = %self.wallet, "Requesting mint");
 
         self.mint_store
             .send(
@@ -282,7 +344,49 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
             .await?;
 
-        info!("Mint tokens received");
+        let shares_minted = self.load_shares_minted(&issuer_request_id).await?;
+
+        info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
+
+        let unwrapped_token = self.wrapper.lookup_unwrapped(&symbol)?;
+        let (wrap_tx_hash, wrapped_shares) = self
+            .wrapper
+            .to_wrapped(unwrapped_token, shares_minted, self.wallet)
+            .await?;
+
+        self.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash,
+                    wrapped_shares,
+                },
+            )
+            .await?;
+
+        info!(%wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
+
+        let vault_id = self.raindex.lookup_vault_id(unwrapped_token).await?;
+        let vault_deposit_tx_hash = self
+            .raindex
+            .deposit(
+                unwrapped_token,
+                vault_id,
+                wrapped_shares,
+                TOKENIZED_EQUITY_DECIMALS,
+            )
+            .await?;
+
+        self.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::DepositToVault {
+                    vault_deposit_tx_hash,
+                },
+            )
+            .await?;
+
+        info!(%vault_deposit_tx_hash, "Mint workflow completed");
         Ok(())
     }
 }
@@ -304,9 +408,12 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
 
         info!(%token, %amount, aggregate_id = %aggregate_id.0, "Starting equity transfer to hedging venue");
 
-        let redemption_tx = self
-            .send_redeem_command(&aggregate_id, &symbol, quantity, token, amount)
+        self.withdraw_from_raindex(&aggregate_id, &symbol, quantity, token, amount)
             .await?;
+
+        info!("Withdrawn from Raindex, unwrapping and sending to Alpaca");
+
+        let redemption_tx = self.unwrap_and_send(&aggregate_id).await?;
 
         info!(%redemption_tx, "Tokens sent, polling for detection");
         let request_id = self.poll_detection(&aggregate_id, &redemption_tx).await?;
@@ -353,9 +460,12 @@ mod tests {
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services));
 
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+
         CrossVenueEquityTransfer::new(
             raindex,
             tokenizer,
+            wrapper,
             Address::random(),
             mint_store,
             redemption_store,

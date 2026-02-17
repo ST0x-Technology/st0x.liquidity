@@ -19,19 +19,16 @@ use url::Url;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Never, Reactor, Store, deps};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::{ImbalanceThreshold, InventoryView};
-use crate::position::{Position, PositionEvent};
+use crate::position::Position;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintEvent,
 };
-use crate::usdc_rebalance::{
-    RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
-};
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use crate::wrapper::Wrapper;
-use crate::wrapper::{EquityTokenAddresses, UnderlyingPerWrapped};
+use crate::wrapper::{EquityTokenAddresses, UnderlyingPerWrapped, Wrapper};
 
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
@@ -183,6 +180,12 @@ pub(crate) struct RebalancingTrigger {
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
     wrapper: Arc<dyn Wrapper>,
+    /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
+    /// event carries this data; follow-up events don't.
+    mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, (Symbol, FractionalShares)>>>,
+    /// Tracks symbol/quantity for in-flight redemptions. The initial
+    /// `WithdrawnFromRaindex` event carries this data; follow-up events don't.
+    redemption_tracking: Arc<RwLock<HashMap<RedemptionAggregateId, (Symbol, FractionalShares)>>>,
 }
 
 impl RebalancingTrigger {
@@ -205,6 +208,8 @@ impl RebalancingTrigger {
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
             wrapper,
+            mint_tracking: Arc::new(RwLock::new(HashMap::new())),
+            redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -245,8 +250,21 @@ impl Reactor for RebalancingTrigger {
 
                 self.check_and_trigger_equity(&symbol).await;
             })
-            .on(|_id, event| async move {
-                let Some((symbol, quantity)) = Self::extract_mint_info(&event) else {
+            .on(|id, event| async move {
+                if let Some((symbol, quantity)) = Self::extract_mint_info(&event) {
+                    self.mint_tracking
+                        .write()
+                        .await
+                        .insert(id.clone(), (symbol, quantity));
+                }
+
+                let Some((symbol, quantity)) =
+                    self.mint_tracking.read().await.get(&id).cloned()
+                else {
+                    warn!(
+                        id = %id,
+                        "Mint event for untracked aggregate"
+                    );
                     return;
                 };
 
@@ -265,14 +283,28 @@ impl Reactor for RebalancingTrigger {
                 }
 
                 if Self::is_terminal_mint_event(&event) {
+                    self.mint_tracking.write().await.remove(&id);
                     self.clear_equity_in_progress(&symbol);
                     debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
 
                     self.check_and_trigger_usdc().await;
                 }
             })
-            .on(|_id, event| async move {
-                let Some((symbol, quantity)) = Self::extract_redemption_info(&event) else {
+            .on(|id, event| async move {
+                if let Some((symbol, quantity)) = Self::extract_redemption_info(&event) {
+                    self.redemption_tracking
+                        .write()
+                        .await
+                        .insert(id.clone(), (symbol, quantity));
+                }
+
+                let Some((symbol, quantity)) =
+                    self.redemption_tracking.read().await.get(&id).cloned()
+                else {
+                    warn!(
+                        id = %id,
+                        "Redemption event for untracked aggregate"
+                    );
                     return;
                 };
 
@@ -291,6 +323,7 @@ impl Reactor for RebalancingTrigger {
                 }
 
                 if Self::is_terminal_redemption_event(&event) {
+                    self.redemption_tracking.write().await.remove(&id);
                     self.clear_equity_in_progress(&symbol);
                     debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
 
@@ -586,7 +619,7 @@ mod tests {
     use crate::inventory::InventorySnapshotReactor;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::offchain_order::{Dollars, OffchainOrderId};
-    use crate::position::TradeId;
+    use crate::position::{PositionEvent, TradeId};
     use crate::threshold::Usdc;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
     use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
@@ -1265,6 +1298,68 @@ mod tests {
         assert!(!RebalancingTrigger::is_terminal_mint_event(
             &make_tokens_received()
         ));
+    }
+
+    #[tokio::test]
+    async fn mint_rejection_via_reactor_clears_in_progress() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+
+        let trigger = Arc::new(trigger);
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = IssuerRequestId::new("mint-1");
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, dec!(10)))
+            .await
+            .unwrap();
+
+        harness
+            .receive::<TokenizedEquityMint>(id, make_mint_rejected())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            "In-progress flag should be cleared after terminal MintRejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_completion_via_reactor_clears_in_progress() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+
+        let trigger = Arc::new(trigger);
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("redemption-1");
+
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_withdrawn_from_raindex(&symbol, dec!(10)))
+            .await
+            .unwrap();
+
+        harness
+            .receive::<EquityRedemption>(id, make_redemption_completed())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            "In-progress flag should be cleared after terminal Completed"
+        );
     }
 
     fn make_withdrawn_from_raindex(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {

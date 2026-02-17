@@ -53,7 +53,7 @@ use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::TokenizationRequestStatus;
 
 /// Alpaca issuer request identifier returned when a tokenization request is accepted.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct IssuerRequestId(pub(crate) String);
 
 impl IssuerRequestId {
@@ -357,7 +357,7 @@ pub(crate) enum TokenizedEquityMint {
 }
 
 /// Our tokenized equity tokens use 18 decimals.
-const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
+pub(crate) const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, TokenizedEquityMintError> {
     if value.is_sign_negative() {

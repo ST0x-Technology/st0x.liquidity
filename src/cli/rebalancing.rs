@@ -29,7 +29,6 @@ use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
 use crate::tokenized_equity_mint::IssuerRequestId;
-use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 
@@ -77,17 +76,20 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
             let wallet = signer.address();
+            let provider_with_wallet = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(signer))
+                .connect_provider(base_provider);
 
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
             let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-                base_provider.clone(),
+                provider_with_wallet.clone(),
                 wallet,
                 rebalancing_config.equities.clone(),
             ));
 
             let raindex = Arc::new(RaindexService::new(
-                base_provider,
+                provider_with_wallet,
                 ctx.evm.orderbook,
                 vault_registry_projection.clone(),
                 wallet,
@@ -96,7 +98,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let services = EquityTransferServices {
                 raindex: raindex.clone(),
                 tokenizer: tokenization_service.clone(),
-                wrapper,
+                wrapper: wrapper.clone(),
             };
 
             let mint_store = Arc::new(
@@ -109,6 +111,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let equity_transfer = CrossVenueEquityTransfer::new(
                 raindex,
                 tokenization_service,
+                wrapper,
                 wallet,
                 mint_store,
                 redemption_store,
@@ -133,16 +136,20 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
             let owner = signer.address();
+            let provider_with_wallet = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(signer))
+                .connect_provider(base_provider);
+
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
             let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-                base_provider.clone(),
+                provider_with_wallet.clone(),
                 owner,
                 rebalancing_config.equities.clone(),
             ));
 
             let raindex = Arc::new(RaindexService::new(
-                base_provider,
+                provider_with_wallet,
                 ctx.evm.orderbook,
                 vault_registry_projection,
                 owner,
@@ -151,7 +158,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let services = EquityTransferServices {
                 raindex: raindex.clone(),
                 tokenizer: tokenization_service.clone(),
-                wrapper,
+                wrapper: wrapper.clone(),
             };
 
             let mint_store = Arc::new(
@@ -164,6 +171,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let equity_transfer = CrossVenueEquityTransfer::new(
                 raindex,
                 tokenization_service,
+                wrapper,
                 owner,
                 mint_store,
                 redemption_store,
