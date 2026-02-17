@@ -368,38 +368,195 @@ impl EventSourced for TokenizedEquityMint {
 
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use TokenizedEquityMintEvent::*;
+
         Ok(match event {
             MintRequested { .. } => None,
+
             MintRejected {
                 reason,
                 rejected_at,
-            } => entity.try_apply_rejected(reason, *rejected_at),
+            } => {
+                let Self::MintRequested {
+                    symbol,
+                    quantity,
+                    requested_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    reason: reason.to_string(),
+                    requested_at: *requested_at,
+                    failed_at: *rejected_at,
+                })
+            }
+
             MintAccepted {
                 issuer_request_id,
                 tokenization_request_id,
                 accepted_at,
             } => {
-                entity.try_apply_accepted(issuer_request_id, tokenization_request_id, *accepted_at)
+                let Self::MintRequested {
+                    symbol,
+                    quantity,
+                    wallet,
+                    requested_at,
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::MintAccepted {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    wallet: *wallet,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    requested_at: *requested_at,
+                    accepted_at: *accepted_at,
+                })
             }
+
             MintAcceptanceFailed { reason, failed_at } => {
-                entity.try_apply_acceptance_failed(reason, *failed_at)
+                let Self::MintAccepted {
+                    symbol,
+                    quantity,
+                    requested_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    reason: reason.to_string(),
+                    requested_at: *requested_at,
+                    failed_at: *failed_at,
+                })
             }
+
             TokensReceived {
                 tx_hash,
                 receipt_id,
                 shares_minted,
                 received_at,
             } => {
-                entity.try_apply_tokens_received(*tx_hash, receipt_id, *shares_minted, *received_at)
+                let Self::MintAccepted {
+                    symbol,
+                    quantity,
+                    wallet,
+                    issuer_request_id,
+                    tokenization_request_id,
+                    requested_at,
+                    accepted_at,
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::TokensReceived {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    wallet: *wallet,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    tx_hash: *tx_hash,
+                    receipt_id: receipt_id.clone(),
+                    shares_minted: *shares_minted,
+                    requested_at: *requested_at,
+                    accepted_at: *accepted_at,
+                    received_at: *received_at,
+                })
             }
+
             VaultDeposited {
                 vault_deposit_tx_hash,
                 deposited_at,
-            } => entity.try_apply_vault_deposited(*vault_deposit_tx_hash, *deposited_at),
-            RaindexDepositFailed { failed_at, .. } => {
-                entity.try_apply_vault_deposit_failed(*failed_at)
+            } => {
+                let Self::TokensReceived {
+                    symbol,
+                    quantity,
+                    wallet,
+                    issuer_request_id,
+                    tokenization_request_id,
+                    tx_hash,
+                    receipt_id,
+                    shares_minted,
+                    requested_at,
+                    accepted_at,
+                    received_at,
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::DepositedIntoRaindex {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    wallet: *wallet,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    tx_hash: *tx_hash,
+                    receipt_id: receipt_id.clone(),
+                    shares_minted: *shares_minted,
+                    vault_deposit_tx_hash: *vault_deposit_tx_hash,
+                    requested_at: *requested_at,
+                    accepted_at: *accepted_at,
+                    received_at: *received_at,
+                    deposited_at: *deposited_at,
+                })
             }
-            MintCompleted { completed_at } => entity.try_apply_completed(*completed_at),
+
+            RaindexDepositFailed { failed_at, .. } => {
+                let Self::TokensReceived {
+                    symbol,
+                    quantity,
+                    requested_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    reason: "Raindex vault deposit failed".to_string(),
+                    requested_at: *requested_at,
+                    failed_at: *failed_at,
+                })
+            }
+
+            MintCompleted { completed_at } => {
+                let Self::DepositedIntoRaindex {
+                    symbol,
+                    quantity,
+                    issuer_request_id,
+                    tokenization_request_id,
+                    tx_hash,
+                    vault_deposit_tx_hash,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Completed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    token_tx_hash: *tx_hash,
+                    vault_deposit_tx_hash: *vault_deposit_tx_hash,
+                    completed_at: *completed_at,
+                })
+            }
         })
     }
 
@@ -584,194 +741,6 @@ impl EventSourced for TokenizedEquityMint {
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
         }
-    }
-}
-
-impl TokenizedEquityMint {
-    fn try_apply_accepted(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        tokenization_request_id: &TokenizationRequestId,
-        accepted_at: DateTime<Utc>,
-    ) -> Option<Self> {
-        let Self::MintRequested {
-            symbol,
-            quantity,
-            wallet,
-            requested_at,
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::MintAccepted {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            wallet: *wallet,
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            requested_at: *requested_at,
-            accepted_at,
-        })
-    }
-
-    fn try_apply_tokens_received(
-        &self,
-        tx_hash: TxHash,
-        receipt_id: &ReceiptId,
-        shares_minted: U256,
-        received_at: DateTime<Utc>,
-    ) -> Option<Self> {
-        let Self::MintAccepted {
-            symbol,
-            quantity,
-            wallet,
-            issuer_request_id,
-            tokenization_request_id,
-            requested_at,
-            accepted_at,
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::TokensReceived {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            wallet: *wallet,
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            tx_hash,
-            receipt_id: receipt_id.clone(),
-            shares_minted,
-            requested_at: *requested_at,
-            accepted_at: *accepted_at,
-            received_at,
-        })
-    }
-
-    fn try_apply_vault_deposited(
-        &self,
-        vault_deposit_tx_hash: TxHash,
-        deposited_at: DateTime<Utc>,
-    ) -> Option<Self> {
-        let Self::TokensReceived {
-            symbol,
-            quantity,
-            wallet,
-            issuer_request_id,
-            tokenization_request_id,
-            tx_hash,
-            receipt_id,
-            shares_minted,
-            requested_at,
-            accepted_at,
-            received_at,
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::DepositedIntoRaindex {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            wallet: *wallet,
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            tx_hash: *tx_hash,
-            receipt_id: receipt_id.clone(),
-            shares_minted: *shares_minted,
-            vault_deposit_tx_hash,
-            requested_at: *requested_at,
-            accepted_at: *accepted_at,
-            received_at: *received_at,
-            deposited_at,
-        })
-    }
-
-    fn try_apply_vault_deposit_failed(&self, failed_at: DateTime<Utc>) -> Option<Self> {
-        let Self::TokensReceived {
-            symbol,
-            quantity,
-            requested_at,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            reason: "Raindex vault deposit failed".to_string(),
-            requested_at: *requested_at,
-            failed_at,
-        })
-    }
-
-    fn try_apply_completed(&self, completed_at: DateTime<Utc>) -> Option<Self> {
-        let Self::DepositedIntoRaindex {
-            symbol,
-            quantity,
-            issuer_request_id,
-            tokenization_request_id,
-            tx_hash,
-            vault_deposit_tx_hash,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Completed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            token_tx_hash: *tx_hash,
-            vault_deposit_tx_hash: *vault_deposit_tx_hash,
-            completed_at,
-        })
-    }
-
-    fn try_apply_rejected(&self, reason: &str, rejected_at: DateTime<Utc>) -> Option<Self> {
-        let Self::MintRequested {
-            symbol,
-            quantity,
-            requested_at,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            reason: reason.to_string(),
-            requested_at: *requested_at,
-            failed_at: rejected_at,
-        })
-    }
-
-    fn try_apply_acceptance_failed(&self, reason: &str, failed_at: DateTime<Utc>) -> Option<Self> {
-        let Self::MintAccepted {
-            symbol,
-            quantity,
-            requested_at,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        Some(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            reason: reason.to_string(),
-            requested_at: *requested_at,
-            failed_at,
-        })
     }
 }
 
