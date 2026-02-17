@@ -16,9 +16,8 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
-use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
-
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Never, Reactor, Store, deps};
+use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};

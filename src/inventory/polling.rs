@@ -13,9 +13,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
-use st0x_execution::{Executor, InventoryResult};
-
 use st0x_event_sorcery::{SendError, Store};
+use st0x_execution::{Executor, InventoryResult};
 
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,

@@ -19,7 +19,7 @@ pub(crate) struct ExecutionCtx {
 ///
 /// Loads the position from the CQRS view and checks if the net exposure
 /// exceeds the configured threshold. Also verifies the market is open.
-/// The Position aggregate already tracks pending executions —
+/// The Position aggregate already tracks pending executions --
 /// `is_ready_for_execution` returns `None` if one is already in flight.
 pub(crate) async fn check_execution_readiness<E: Executor>(
     executor: &E,

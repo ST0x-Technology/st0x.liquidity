@@ -29,8 +29,9 @@ mod whitelist;
 use alloy::primitives::{Address, TxHash};
 use std::sync::Arc;
 
-use crate::threshold::Usdc;
 use st0x_execution::Positive;
+
+use crate::threshold::Usdc;
 
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;

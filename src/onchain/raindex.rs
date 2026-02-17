@@ -18,10 +18,11 @@ use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
-use st0x_event_sorcery::ProjectionError;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+use st0x_event_sorcery::ProjectionError;
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::bindings::{IERC20, IOrderBookV5};
 use crate::error_decoding::handle_contract_error;

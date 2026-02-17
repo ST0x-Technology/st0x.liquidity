@@ -10,9 +10,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
+use st0x_execution::Positive;
+
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
 use crate::threshold::Usdc;
-use st0x_execution::Positive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);

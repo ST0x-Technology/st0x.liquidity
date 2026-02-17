@@ -1,6 +1,5 @@
-use std::path::PathBuf;
-
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(about = "Export TypeScript bindings for the dashboard")]

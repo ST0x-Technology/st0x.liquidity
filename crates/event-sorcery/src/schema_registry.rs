@@ -13,13 +13,12 @@
 //!
 //! [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
 
-use std::collections::BTreeMap;
-
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use tracing::info;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
