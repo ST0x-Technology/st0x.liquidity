@@ -569,6 +569,7 @@ impl RebalancingTrigger {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
+    use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -2474,6 +2475,50 @@ mod tests {
         assert!(
             logs_contain("Triggered equity rebalancing"),
             "Should trigger rebalancing once both venues have data"
+        );
+    }
+
+    #[test]
+    fn new_derives_market_maker_wallet_from_private_key() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+
+        let expected_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
+            .unwrap()
+            .address();
+
+        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
+
+        assert_eq!(ctx.market_maker_wallet, expected_wallet);
+    }
+
+    #[test]
+    fn new_rejects_identical_market_maker_and_redemption_wallets() {
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+        let derived_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
+            .unwrap()
+            .address();
+
+        let config_toml = format!(
+            r#"
+            redemption_wallet = "{derived_wallet}"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#
+        );
+        let config: RebalancingConfig = toml::from_str(&config_toml).unwrap();
+
+        let error = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::WalletCollision(addr) if addr == derived_wallet),
+            "Expected WalletCollision with {derived_wallet}, got: {error:?}"
         );
     }
 }

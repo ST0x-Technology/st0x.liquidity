@@ -124,6 +124,9 @@ pub(crate) enum TokenizedEquityMintError {
     /// U256 conversion failed for a scaled decimal value
     #[error("Failed to convert scaled decimal {scaled_value} to U256")]
     U256ConversionFailed { scaled_value: String },
+    /// Negative quantity is invalid for minting
+    #[error("Negative quantity: {value}")]
+    NegativeQuantity { value: Decimal },
     /// Vault lookup failed for the given symbol
     #[error("Vault lookup failed for {0}")]
     VaultLookupFailed(Symbol),
@@ -315,6 +318,10 @@ pub(crate) enum TokenizedEquityMint {
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, TokenizedEquityMintError> {
+    if value.is_sign_negative() {
+        return Err(TokenizedEquityMintError::NegativeQuantity { value });
+    }
+
     let scale_factor = Decimal::from(10u64.pow(18));
     let scaled = value
         .checked_mul(scale_factor)
@@ -422,7 +429,7 @@ impl EventSourced for TokenizedEquityMint {
                         symbol,
                         FractionalShares::new(quantity),
                         wallet,
-                        issuer_request_id,
+                        issuer_request_id.clone(),
                     )
                     .await
                 {
@@ -444,9 +451,7 @@ impl EventSourced for TokenizedEquityMint {
                 }
 
                 let mint_accepted = MintAccepted {
-                    issuer_request_id: alpaca_request
-                        .issuer_request_id
-                        .unwrap_or_else(|| IssuerRequestId::new("unknown")),
+                    issuer_request_id,
                     tokenization_request_id: alpaca_request.id.clone(),
                     accepted_at: now,
                 };
@@ -496,9 +501,14 @@ impl EventSourced for TokenizedEquityMint {
                             failed_at: Utc::now(),
                         },
                     ]),
-                    TokenizationRequestStatus::Pending => {
-                        unreachable!("poll_mint_until_complete should not return Pending status")
-                    }
+                    TokenizationRequestStatus::Pending => Ok(vec![
+                        mint_requested,
+                        mint_accepted,
+                        MintAcceptanceFailed {
+                            reason: "Unexpected Pending status after polling".to_string(),
+                            failed_at: Utc::now(),
+                        },
+                    ]),
                 }
             }
 
@@ -1217,6 +1227,85 @@ mod tests {
             ),
             "Expected RaindexDepositFailed, got: {:?}",
             events[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_happy_path_emits_vault_deposited_and_completed() {
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(tokens_received_events())
+            .when(TokenizedEquityMintCommand::Deposit)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], TokenizedEquityMintEvent::VaultDeposited { .. }),
+            "Expected VaultDeposited, got: {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], TokenizedEquityMintEvent::MintCompleted { .. }),
+            "Expected MintCompleted, got: {:?}",
+            events[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_pending_status_emits_acceptance_failed() {
+        let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Pending);
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(tokenizer))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[2], TokenizedEquityMintEvent::MintAcceptanceFailed { reason, .. }
+                if reason.contains("Pending")),
+            "Expected MintAcceptanceFailed with Pending reason, got: {:?}",
+            events[2]
+        );
+    }
+
+    #[test]
+    fn decimal_to_u256_18_decimals_rejects_negative() {
+        let error = decimal_to_u256_18_decimals(dec!(-5)).unwrap_err();
+        assert!(
+            matches!(error, TokenizedEquityMintError::NegativeQuantity { .. }),
+            "Expected NegativeQuantity, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn decimal_to_u256_18_decimals_converts_correctly() {
+        let result = decimal_to_u256_18_decimals(dec!(3)).unwrap();
+        assert_eq!(result, U256::from(3_000_000_000_000_000_000_u128));
+    }
+
+    #[test]
+    fn decimal_to_u256_18_decimals_zero_returns_zero() {
+        let result = decimal_to_u256_18_decimals(dec!(0)).unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn mint_uses_command_issuer_request_id() {
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                &events[1],
+                TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
+                    if issuer_request_id.0 == "ISS001"
+            ),
+            "Expected issuer_request_id from command, got: {:?}",
+            events[1]
         );
     }
 }

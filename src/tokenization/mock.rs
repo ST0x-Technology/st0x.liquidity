@@ -41,6 +41,7 @@ pub(crate) enum MockMintRequestOutcome {
 pub(crate) enum MockMintPollOutcome {
     Completed,
     Rejected,
+    Pending,
     PollError,
 }
 
@@ -119,6 +120,9 @@ impl Tokenizer for MockTokenizer {
             MockMintPollOutcome::Completed => Ok(TokenizationRequest::mock_completed()),
             MockMintPollOutcome::Rejected => Ok(TokenizationRequest::mock(
                 TokenizationRequestStatus::Rejected,
+            )),
+            MockMintPollOutcome::Pending => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
             )),
             MockMintPollOutcome::PollError => Err(TokenizerError::Alpaca(
                 AlpacaTokenizationError::PollTimeout {
