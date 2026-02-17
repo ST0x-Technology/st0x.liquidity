@@ -22,11 +22,11 @@ use rain_math_float::Float;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
-use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Symbol};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
+use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Symbol};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::IOrderBookV5::{self, TakeOrderV3};
@@ -368,7 +368,7 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             id: None,
             tx_hash,
             log_index,
-            block_number: take_log.block_number.unwrap_or(1),
+            block_number: take_log.block_number.unwrap(),
             event: TradeEvent::TakeOrderV3(Box::new(take_event_for_queue)),
             processed: false,
             created_at: None,

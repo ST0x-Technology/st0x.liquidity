@@ -16,7 +16,7 @@ struct StoredEvent {
 /// infrastructure events (e.g. SchemaRegistry reconciliation).
 async fn fetch_events(pool: &SqlitePool) -> Vec<StoredEvent> {
     sqlx::query_as::<_, StoredEvent>(
-        "SELECT aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata \
+        "SELECT aggregate_type, aggregate_id, event_type, payload \
          FROM events \
          WHERE aggregate_type != 'SchemaRegistry' \
          ORDER BY rowid ASC",
