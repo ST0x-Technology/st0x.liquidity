@@ -152,7 +152,11 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     //    should complete.
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // 8. Cleanup
+    // 8. Assert the bot placed an order and polled until filled
+    broker.assert_order_placed("AAPL", "buy");
+    broker.assert_order_filled("e2e-order-1");
+
+    // 9. Cleanup
     bot.abort();
     Ok(())
 }
