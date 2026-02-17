@@ -149,7 +149,7 @@ where
 
         let wallet = Arc::new(AlpacaWalletService::new(
             broker_auth.base_url().to_string(),
-            ctx.alpaca_account_id,
+            ctx.alpaca_broker_auth.account_id,
             broker_auth.api_key.clone(),
             broker_auth.api_secret.clone(),
         ));
@@ -244,6 +244,7 @@ mod tests {
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::VaultRegistry;
+    use crate::wrapper::mock::MockWrapper;
 
     /// Provider type returned by `ProviderBuilder::new().connect_http()` without wallet.
     type BaseTestProvider = FillProvider<
@@ -280,7 +281,6 @@ mod tests {
             usdc_vault_id: b256!(
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
-            alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
             alpaca_broker_auth: AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
@@ -379,7 +379,7 @@ mod tests {
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             server.base_url(),
-            rebalancing_ctx.alpaca_account_id,
+            rebalancing_ctx.alpaca_broker_auth.account_id,
             "test_key".into(),
             "test_secret".into(),
             base_provider.clone(),
@@ -390,12 +390,12 @@ mod tests {
         let _account_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
                 "/v1/trading/accounts/{}/account",
-                rebalancing_ctx.alpaca_account_id
+                rebalancing_ctx.alpaca_broker_auth.account_id
             ));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "id": rebalancing_ctx.alpaca_account_id.to_string(),
+                    "id": rebalancing_ctx.alpaca_broker_auth.account_id.to_string(),
                     "status": "ACTIVE"
                 }));
         });
@@ -403,7 +403,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: rebalancing_ctx.alpaca_account_id,
+            account_id: rebalancing_ctx.alpaca_broker_auth.account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
@@ -416,7 +416,7 @@ mod tests {
 
         let wallet = Arc::new(AlpacaWalletService::new(
             server.base_url(),
-            rebalancing_ctx.alpaca_account_id,
+            rebalancing_ctx.alpaca_broker_auth.account_id,
             "test_key".into(),
             "test_secret".into(),
         ));
@@ -481,7 +481,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "invalid_key".to_string(),
             api_secret: "invalid_secret".to_string(),
-            account_id: rebalancing_ctx.alpaca_account_id,
+            account_id: rebalancing_ctx.alpaca_broker_auth.account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
@@ -507,6 +507,7 @@ mod tests {
         let mock_services = EquityTransferServices {
             tokenizer: Arc::new(MockTokenizer::new()),
             raindex: Arc::new(MockRaindex::new()),
+            wrapper: Arc::new(MockWrapper::new()),
         };
         let mint_cqrs = Arc::new(test_store(pool.clone(), mock_services.clone()));
         let usdc_cqrs = Arc::new(test_store(pool.clone(), ()));

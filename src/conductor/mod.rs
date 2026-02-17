@@ -59,6 +59,7 @@ use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+use crate::wrapper::WrapperService;
 
 use self::manifest::QueryManifest;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
@@ -330,7 +331,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let tokenization = Arc::new(AlpacaTokenizationService::new(
         rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
         rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
         provider.clone(),
@@ -339,9 +340,16 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let tokenizer: Arc<dyn Tokenizer> = tokenization;
 
+    let wrapper = Arc::new(WrapperService::new(
+        provider.clone(),
+        market_maker_wallet,
+        rebalancing_ctx.equities.clone(),
+    ));
+
     let equity_transfer_services = EquityTransferServices {
         raindex: raindex_service.clone(),
         tokenizer: tokenizer.clone(),
+        wrapper: wrapper.clone(),
     };
 
     let manifest = QueryManifest::new(
@@ -355,6 +363,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         inventory.clone(),
         operation_sender,
         event_sender,
+        wrapper,
     );
 
     let (built, wired) = manifest

@@ -29,9 +29,9 @@ use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
 use crate::tokenized_equity_mint::IssuerRequestId;
-use crate::tokenized_equity_mint::MintServices;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistry;
+use crate::wrapper::{Wrapper, WrapperService};
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
@@ -64,7 +64,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         base_provider.clone(),
@@ -80,6 +80,12 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+            let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
+                base_provider.clone(),
+                wallet,
+                rebalancing_config.equities.clone(),
+            ));
+
             let raindex = Arc::new(RaindexService::new(
                 base_provider,
                 ctx.evm.orderbook,
@@ -90,6 +96,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let services = EquityTransferServices {
                 raindex: raindex.clone(),
                 tokenizer: tokenization_service.clone(),
+                wrapper,
             };
 
             let mint_store = Arc::new(
@@ -128,6 +135,12 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let owner = signer.address();
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+            let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
+                base_provider.clone(),
+                owner,
+                rebalancing_config.equities.clone(),
+            ));
+
             let raindex = Arc::new(RaindexService::new(
                 base_provider,
                 ctx.evm.orderbook,
@@ -138,6 +151,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let services = EquityTransferServices {
                 raindex: raindex.clone(),
                 tokenizer: tokenization_service.clone(),
+                wrapper,
             };
 
             let mint_store = Arc::new(
@@ -218,7 +232,7 @@ where
     let broker_auth = AlpacaBrokerApiCtx {
         api_key: alpaca_auth.api_key.clone(),
         api_secret: alpaca_auth.api_secret.clone(),
-        account_id: rebalancing_config.alpaca_account_id,
+        account_id: rebalancing_config.alpaca_broker_auth.account_id,
         mode: Some(broker_mode),
         asset_cache_ttl: std::time::Duration::from_secs(3600),
         time_in_force: TimeInForce::default(),
@@ -228,7 +242,7 @@ where
 
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         broker_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     ));
@@ -321,7 +335,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         provider.clone(),
@@ -425,7 +439,7 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         provider_with_wallet,
@@ -491,7 +505,7 @@ pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider +
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         provider,

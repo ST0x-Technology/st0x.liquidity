@@ -7,15 +7,15 @@
 //! # State Flow
 //!
 //! ```text
-//! MintRequested -> MintAccepted -> TokensReceived -> TokensWrapped -> DepositedIntoRaindex -> Completed
-//!       |               |               |                 |                   |
-//!       v               v               v                 v                   v
-//!     Failed          Failed          Failed           Failed              Failed
+//! MintRequested -> MintAccepted -> TokensReceived -> TokensWrapped -> DepositedIntoRaindex
+//!       |               |               |                 |
+//!       v               v               v                 v
+//!     Failed          Failed          Failed           Failed
 //! ```
 //!
 //! - `MintRequested` can be rejected via `RejectMint`
 //! - `MintAccepted` can fail via `FailAcceptance`
-//! - `Completed` and `Failed` are terminal states
+//! - `DepositedIntoRaindex` and `Failed` are terminal states
 //!
 //! # Alpaca API Integration
 //!
@@ -28,15 +28,14 @@
 //! 3. **Transfer**: Alpaca executes onchain transfer, system detects
 //!    transaction
 //! 4. **Wrapping**: Tokens wrapped into ERC-4626 vault shares
-//! 5. **Vault Deposit**: Wrapped tokens deposited into Raindex vault
-//! 6. **Completion**: System verifies receipt and finalizes mint
+//! 5. **Vault Deposit**: Wrapped tokens deposited into Raindex vault (terminal)
 //!
 //! # Error Handling
 //!
 //! The aggregate enforces strict state transitions:
 //!
 //! - Commands that don't match current state return appropriate errors
-//! - Terminal states (Completed, Failed) reject all state-changing commands
+//! - Terminal states (DepositedIntoRaindex, Failed) reject all state-changing commands
 //! - All state transitions are captured as events for complete audit trail
 
 use alloy::primitives::{Address, TxHash, U256};
@@ -116,9 +115,6 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to wrap before tokens were received
     #[error("Cannot wrap: tokens not received for wrapping")]
     TokensNotReceivedForWrap,
-    /// Attempted to finalize before vault deposit is complete
-    #[error("Cannot finalize: vault deposit not complete")]
-    VaultDepositNotComplete,
     /// Attempted to modify a completed mint operation
     #[error("Already completed")]
     AlreadyCompleted,
@@ -189,7 +185,6 @@ pub(crate) enum TokenizedEquityMintCommand {
     DepositToVault {
         vault_deposit_tx_hash: TxHash,
     },
-    Finalize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,7 +235,7 @@ pub(crate) enum TokenizedEquityMintEvent {
     },
 
     /// Wrapped tokens deposited to Raindex vault.
-    VaultDeposited {
+    DepositedIntoRaindex {
         vault_deposit_tx_hash: TxHash,
         deposited_at: DateTime<Utc>,
     },
@@ -249,10 +244,6 @@ pub(crate) enum TokenizedEquityMintEvent {
     RaindexDepositFailed {
         reason: String,
         failed_at: DateTime<Utc>,
-    },
-
-    MintCompleted {
-        completed_at: DateTime<Utc>,
     },
 }
 
@@ -268,11 +259,12 @@ impl DomainEvent for TokenizedEquityMintEvent {
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
             Self::TokensWrapped { .. } => "TokenizedEquityMintEvent::TokensWrapped".to_string(),
             Self::WrappingFailed { .. } => "TokenizedEquityMintEvent::WrappingFailed".to_string(),
-            Self::VaultDeposited { .. } => "TokenizedEquityMintEvent::VaultDeposited".to_string(),
+            Self::DepositedIntoRaindex { .. } => {
+                "TokenizedEquityMintEvent::DepositedIntoRaindex".to_string()
+            }
             Self::RaindexDepositFailed { .. } => {
                 "TokenizedEquityMintEvent::RaindexDepositFailed".to_string()
             }
-            Self::MintCompleted { .. } => "TokenizedEquityMintEvent::MintCompleted".to_string(),
         }
     }
 
@@ -341,7 +333,7 @@ pub(crate) enum TokenizedEquityMint {
     },
 
     /// Wrapped tokens deposited to Raindex vault
-    VaultDeposited {
+    DepositedIntoRaindex {
         symbol: Symbol,
         quantity: Decimal,
         /// Alpaca cross-system identifiers for auditing
@@ -356,26 +348,11 @@ pub(crate) enum TokenizedEquityMint {
         deposited_at: DateTime<Utc>,
     },
 
-    /// Mint operation successfully completed (terminal state)
-    Completed {
-        symbol: Symbol,
-        quantity: Decimal,
-        /// Alpaca cross-system identifiers for auditing
-        issuer_request_id: IssuerRequestId,
-        tokenization_request_id: TokenizationRequestId,
-        /// Token receipt transaction from Alpaca
-        token_tx_hash: TxHash,
-        /// Wrapping transaction
-        wrap_tx_hash: TxHash,
-        /// Vault deposit transaction to Raindex
-        vault_deposit_tx_hash: TxHash,
-        completed_at: DateTime<Utc>,
-    },
-
     /// Mint operation failed (terminal state)
     Failed {
         symbol: Symbol,
         quantity: Decimal,
+        reason: String,
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -587,7 +564,7 @@ impl EventSourced for TokenizedEquityMint {
 
             WrappingFailed { .. } => None,
 
-            VaultDeposited {
+            DepositedIntoRaindex {
                 vault_deposit_tx_hash,
                 deposited_at,
             } => {
@@ -604,7 +581,7 @@ impl EventSourced for TokenizedEquityMint {
                     return Ok(None);
                 };
 
-                Some(Self::VaultDeposited {
+                Some(Self::DepositedIntoRaindex {
                     symbol: symbol.clone(),
                     quantity: *quantity,
                     issuer_request_id: issuer_request_id.clone(),
@@ -616,10 +593,7 @@ impl EventSourced for TokenizedEquityMint {
                 })
             }
 
-            RaindexDepositFailed {
-                reason: _,
-                failed_at,
-            } => {
+            RaindexDepositFailed { reason, failed_at } => {
                 let Self::TokensWrapped {
                     symbol,
                     quantity,
@@ -633,35 +607,9 @@ impl EventSourced for TokenizedEquityMint {
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
+                    reason: reason.to_string(),
                     requested_at: *requested_at,
                     failed_at: *failed_at,
-                })
-            }
-
-            MintCompleted { completed_at } => {
-                let Self::VaultDeposited {
-                    symbol,
-                    quantity,
-                    issuer_request_id,
-                    tokenization_request_id,
-                    token_tx_hash,
-                    wrap_tx_hash,
-                    vault_deposit_tx_hash,
-                    ..
-                } = entity
-                else {
-                    return Ok(None);
-                };
-
-                Some(Self::Completed {
-                    symbol: symbol.clone(),
-                    quantity: *quantity,
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: tokenization_request_id.clone(),
-                    token_tx_hash: *token_tx_hash,
-                    wrap_tx_hash: *wrap_tx_hash,
-                    vault_deposit_tx_hash: *vault_deposit_tx_hash,
-                    completed_at: *completed_at,
                 })
             }
         })
@@ -702,9 +650,9 @@ impl EventSourced for TokenizedEquityMint {
                     reason,
                     rejected_at: Utc::now(),
                 }]),
-                Self::Completed { .. }
-                | Self::VaultDeposited { .. }
-                | Self::TokensWrapped { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+                Self::DepositedIntoRaindex { .. } | Self::TokensWrapped { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
@@ -718,7 +666,9 @@ impl EventSourced for TokenizedEquityMint {
                     tokenization_request_id,
                     accepted_at: Utc::now(),
                 }]),
-                Self::Completed { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+                Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
@@ -729,7 +679,9 @@ impl EventSourced for TokenizedEquityMint {
                     failed_at: Utc::now(),
                 }]),
                 Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
-                Self::Completed { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+                Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
@@ -746,10 +698,11 @@ impl EventSourced for TokenizedEquityMint {
                     received_at: Utc::now(),
                 }]),
                 Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
-                Self::Completed { .. }
-                | Self::TokensReceived { .. }
+                Self::TokensReceived { .. }
                 | Self::TokensWrapped { .. }
-                | Self::VaultDeposited { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+                | Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
 
@@ -765,39 +718,25 @@ impl EventSourced for TokenizedEquityMint {
                 Self::MintRequested { .. } | Self::MintAccepted { .. } => {
                     Err(TokenizedEquityMintError::TokensNotReceivedForWrap)
                 }
-                Self::Completed { .. }
-                | Self::TokensWrapped { .. }
-                | Self::VaultDeposited { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+                Self::TokensWrapped { .. } | Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
 
             TokenizedEquityMintCommand::DepositToVault {
                 vault_deposit_tx_hash,
             } => match self {
-                Self::TokensWrapped { .. } => Ok(vec![VaultDeposited {
+                Self::TokensWrapped { .. } => Ok(vec![DepositedIntoRaindex {
                     vault_deposit_tx_hash,
                     deposited_at: Utc::now(),
                 }]),
                 Self::MintRequested { .. }
                 | Self::MintAccepted { .. }
                 | Self::TokensReceived { .. } => Err(TokenizedEquityMintError::TokensNotWrapped),
-                Self::Completed { .. } | Self::VaultDeposited { .. } => {
+                Self::DepositedIntoRaindex { .. } => {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
-                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
-            },
-
-            TokenizedEquityMintCommand::Finalize => match self {
-                Self::VaultDeposited { .. } => Ok(vec![MintCompleted {
-                    completed_at: Utc::now(),
-                }]),
-                Self::MintRequested { .. }
-                | Self::MintAccepted { .. }
-                | Self::TokensReceived { .. }
-                | Self::TokensWrapped { .. } => {
-                    Err(TokenizedEquityMintError::VaultDepositNotComplete)
-                }
-                Self::Completed { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
         }
@@ -845,7 +784,7 @@ mod tests {
     }
 
     fn vault_deposited_event() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::VaultDeposited {
+        TokenizedEquityMintEvent::DepositedIntoRaindex {
             vault_deposit_tx_hash: TxHash::random(),
             deposited_at: Utc::now(),
         }
@@ -853,14 +792,15 @@ mod tests {
 
     #[test]
     fn test_evolve_accepted_rejects_wrong_state() {
-        let completed = TokenizedEquityMint::Completed {
+        let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(100.5),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             token_tx_hash: TxHash::random(),
+            wrap_tx_hash: TxHash::random(),
             vault_deposit_tx_hash: TxHash::random(),
-            completed_at: Utc::now(),
+            deposited_at: Utc::now(),
         };
 
         let event = TokenizedEquityMintEvent::MintAccepted {
@@ -869,7 +809,7 @@ mod tests {
             accepted_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&completed, &event).unwrap();
+        let result = TokenizedEquityMint::evolve(&deposited, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -890,26 +830,6 @@ mod tests {
         };
 
         let result = TokenizedEquityMint::evolve(&requested, &event).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_evolve_completed_rejects_wrong_state() {
-        let accepted = TokenizedEquityMint::MintAccepted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            requested_at: Utc::now(),
-            accepted_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::MintCompleted {
-            completed_at: Utc::now(),
-        };
-
-        let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
         assert_eq!(result, None);
     }
 
@@ -984,7 +904,7 @@ mod tests {
             accepted_at: Utc::now(),
         };
 
-        let event = TokenizedEquityMintEvent::VaultDeposited {
+        let event = TokenizedEquityMintEvent::DepositedIntoRaindex {
             vault_deposit_tx_hash: TxHash::random(),
             deposited_at: Utc::now(),
         };

@@ -48,7 +48,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -158,7 +158,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -244,7 +244,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -303,7 +303,7 @@ pub(super) async fn alpaca_whitelist_list_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -351,7 +351,7 @@ pub(super) async fn alpaca_unwhitelist_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -384,7 +384,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -393,7 +393,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     writeln!(
         stdout,
         "   Account: {}",
-        rebalancing_config.alpaca_account_id
+        rebalancing_config.alpaca_broker_auth.account_id
     )?;
 
     let transfers = alpaca_wallet.list_all_transfers().await?;
@@ -556,7 +556,6 @@ mod tests {
                 usdc_vault_id: B256::ZERO,
                 redemption_wallet: Address::ZERO,
                 market_maker_wallet: Address::ZERO,
-                alpaca_account_id,
                 equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),

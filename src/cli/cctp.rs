@@ -302,7 +302,6 @@ mod tests {
             usdc_vault_id: B256::ZERO,
             redemption_wallet: Address::ZERO,
             market_maker_wallet: Address::ZERO,
-            alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             equity: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),

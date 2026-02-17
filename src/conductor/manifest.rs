@@ -32,6 +32,7 @@ use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, Triggered
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
+use crate::wrapper::Wrapper;
 
 type RebalancingTriggerDeps = deps![
     Position,
@@ -76,7 +77,7 @@ impl QueryManifest {
         inventory: Arc<RwLock<InventoryView>>,
         operation_sender: mpsc::Sender<TriggeredOperation>,
         event_sender: broadcast::Sender<ServerMessage>,
-        wrapper: Arc<dyn crate::wrapper::Wrapper>,
+        wrapper: Arc<dyn Wrapper>,
     ) -> Self {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,
@@ -181,6 +182,7 @@ mod tests {
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::wrapper::mock::MockWrapper;
 
     fn test_trigger_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
@@ -211,11 +213,13 @@ mod tests {
             Arc::new(RwLock::new(InventoryView::default())),
             operation_sender,
             event_sender,
+            Arc::new(MockWrapper::new()),
         );
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
         };
 
         let (_frameworks, queries) = manifest.wire(pool, services).await.unwrap();

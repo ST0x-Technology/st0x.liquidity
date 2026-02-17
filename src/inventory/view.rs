@@ -583,7 +583,7 @@ impl InventoryView {
     /// - `MintAccepted`: Move quantity from `offchain.available` to `offchain.inflight`.
     /// - `MintAcceptanceFailed`: Cancel inflight back to available (safe to restore).
     /// - `TokensReceived`: Remove from `offchain.inflight`, add to `onchain.available`.
-    /// - `Completed`: Update `last_rebalancing` timestamp.
+    /// - `DepositedIntoRaindex`: Update `last_rebalancing` timestamp.
     ///
     /// The `quantity` parameter is the mint quantity in `FractionalShares`, needed for
     /// events that modify balances but don't carry the quantity themselves.
@@ -594,41 +594,42 @@ impl InventoryView {
         quantity: FractionalShares,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        use TokenizedEquityMintEvent::*;
+
         match event {
             // No venue inventory changes. TokensWrapped converts unwrapped to wrapped in-place.
             // DepositedIntoRaindex completes the transfer to Raindex (already counted when
             // TokensReceived). WrappingFailed/RaindexDepositFailed leaves tokens in wallet
             // awaiting retry or manual recovery.
-            TokenizedEquityMintEvent::MintRequested { .. }
-            | TokenizedEquityMintEvent::MintRejected { .. }
-            | TokenizedEquityMintEvent::TokensWrapped { .. }
-            | TokenizedEquityMintEvent::WrappingFailed { .. }
-            | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
-            | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => Ok(Self {
+            MintRequested { .. }
+            | MintRejected { .. }
+            | TokensWrapped { .. }
+            | WrappingFailed { .. }
+            | RaindexDepositFailed { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
 
-            TokenizedEquityMintEvent::MintAccepted { .. } => self.update_equity(
+            MintAccepted { .. } => self.update_equity(
                 symbol,
                 |inventory| inventory.move_offchain_to_inflight(quantity),
                 now,
             ),
-            TokenizedEquityMintEvent::MintAcceptanceFailed { .. } => self.update_equity(
+            MintAcceptanceFailed { .. } => self.update_equity(
                 symbol,
                 |inventory| inventory.cancel_offchain_inflight(quantity),
                 now,
             ),
 
-            TokenizedEquityMintEvent::TokensReceived { .. } => self.update_equity(
+            TokensReceived { .. } => self.update_equity(
                 symbol,
                 |inventory| inventory.transfer_offchain_inflight_to_onchain(quantity),
                 now,
             ),
 
-            TokenizedEquityMintEvent::Completed { completed_at, .. } => self.update_equity(
+            DepositedIntoRaindex { deposited_at, .. } => self.update_equity(
                 symbol,
-                |inventory| Ok(inventory.with_last_rebalancing(*completed_at)),
+                |inventory| Ok(inventory.with_last_rebalancing(*deposited_at)),
                 now,
             ),
         }
@@ -651,8 +652,10 @@ impl InventoryView {
         quantity: FractionalShares,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        use EquityRedemptionEvent::*;
+
         match event {
-            EquityRedemptionEvent::VaultWithdrawn { .. } => self.update_equity(
+            WithdrawnFromRaindex { .. } => self.update_equity(
                 symbol,
                 |inventory| inventory.move_onchain_to_inflight(quantity),
                 now,
@@ -660,22 +663,22 @@ impl InventoryView {
 
             // These events don't change venue balances, only timestamps:
             // - TokensUnwrapped: converts wrapped to unwrapped in-place
-            // - SendFailed: vault withdraw succeeded but send failed, keep inflight
-            // - TokensSent: tokens already inflight from VaultWithdrawn
+            // - SendFailed: Raindex withdraw succeeded but send failed, keep inflight
+            // - TokensSent: tokens already inflight from WithdrawnFromRaindex
             // - DetectionFailed: tokens sent but detection failed, keep inflight
             // - Detected: no balance change at this stage
             // - RedemptionRejected: rejection after detection, keep inflight
-            EquityRedemptionEvent::TokensUnwrapped { .. }
-            | EquityRedemptionEvent::SendFailed { .. }
-            | EquityRedemptionEvent::TokensSent { .. }
-            | EquityRedemptionEvent::DetectionFailed { .. }
-            | EquityRedemptionEvent::Detected { .. }
-            | EquityRedemptionEvent::RedemptionRejected { .. } => Ok(Self {
+            TokensUnwrapped { .. }
+            | TransferFailed { .. }
+            | TokensSent { .. }
+            | DetectionFailed { .. }
+            | Detected { .. }
+            | RedemptionRejected { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
 
-            EquityRedemptionEvent::Completed { completed_at } => self.update_equity(
+            Completed { completed_at } => self.update_equity(
                 symbol,
                 |inventory| {
                     inventory
@@ -1314,9 +1317,10 @@ mod tests {
         }
     }
 
-    fn make_mint_completed() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
-            completed_at: Utc::now(),
+    fn make_deposited_into_raindex() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::DepositedIntoRaindex {
+            vault_deposit_tx_hash: TxHash::random(),
+            deposited_at: Utc::now(),
         }
     }
 
@@ -1335,7 +1339,7 @@ mod tests {
     }
 
     fn make_vault_deposited() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::VaultDeposited {
+        TokenizedEquityMintEvent::DepositedIntoRaindex {
             vault_deposit_tx_hash: TxHash::random(),
             deposited_at: Utc::now(),
         }
@@ -1420,7 +1424,7 @@ mod tests {
     fn apply_mint_completed_updates_last_rebalancing() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_mint_completed();
+        let event = make_deposited_into_raindex();
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(0), Utc::now())
@@ -1588,7 +1592,7 @@ mod tests {
 
         // Completed: Update last_rebalancing
         let view = view
-            .apply_mint_event(&symbol, &make_mint_completed(), shares(0), Utc::now())
+            .apply_mint_event(&symbol, &make_deposited_into_raindex(), shares(0), Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert!(inventory.last_rebalancing.is_some());
@@ -1701,13 +1705,13 @@ mod tests {
         assert_eq!(equity.offchain.unwrap().available(), shares(50));
     }
 
-    fn make_vault_withdrawn(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::VaultWithdrawn {
+    fn make_withdrawn_from_raindex(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::WithdrawnFromRaindex {
             symbol: symbol.clone(),
             quantity,
             token: Address::random(),
-            amount: U256::from(50_250_000_000_000_000_000_u128),
-            vault_withdraw_tx: TxHash::random(),
+            wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            raindex_withdraw_tx: TxHash::random(),
             withdrawn_at: Utc::now(),
         }
     }
@@ -1751,7 +1755,7 @@ mod tests {
     fn apply_vault_withdrawn_moves_onchain_to_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
-        let event = make_vault_withdrawn(&symbol, dec!(30));
+        let event = make_withdrawn_from_raindex(&symbol, dec!(30));
 
         let updated = view
             .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
@@ -1868,11 +1872,11 @@ mod tests {
         // Initial state: 100 onchain, 100 offchain
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
 
-        // VaultWithdrawn: Move 30 from onchain available to inflight
+        // WithdrawnFromRaindex: Move 30 from onchain available to inflight
         let view = view
             .apply_redemption_event(
                 &symbol,
-                &make_vault_withdrawn(&symbol, dec!(30)),
+                &make_withdrawn_from_raindex(&symbol, dec!(30)),
                 quantity,
                 Utc::now(),
             )
@@ -1925,11 +1929,11 @@ mod tests {
 
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
 
-        // VaultWithdrawn: Move 30 from onchain available to inflight
+        // WithdrawnFromRaindex: Move 30 from onchain available to inflight
         let view = view
             .apply_redemption_event(
                 &symbol,
-                &make_vault_withdrawn(&symbol, dec!(30)),
+                &make_withdrawn_from_raindex(&symbol, dec!(30)),
                 quantity,
                 Utc::now(),
             )

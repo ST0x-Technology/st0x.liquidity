@@ -32,6 +32,7 @@ use crate::tokenization::{
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizationRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
+use crate::wrapper::Wrapper;
 
 /// A quantity of equity in a specific symbol.
 #[derive(Debug)]
@@ -49,6 +50,7 @@ pub(crate) struct Equity {
 pub(crate) struct EquityTransferServices {
     pub(crate) raindex: Arc<dyn Raindex>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) wrapper: Arc<dyn Wrapper>,
 }
 
 #[derive(Debug, Error)]
@@ -265,8 +267,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
         self.mint_store
             .send(
                 &issuer_request_id,
-                TokenizedEquityMintCommand::Mint {
-                    issuer_request_id: issuer_request_id.clone(),
+                TokenizedEquityMintCommand::RequestMint {
                     symbol: symbol.clone(),
                     quantity: quantity.inner(),
                     wallet: self.wallet,
@@ -274,13 +275,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             )
             .await?;
 
-        debug!("Executing deposit command");
-
-        self.mint_store
-            .send(&issuer_request_id, TokenizedEquityMintCommand::Deposit)
-            .await?;
-
-        info!("Mint workflow completed successfully");
+        info!("Mint request submitted");
         Ok(())
     }
 }
@@ -330,11 +325,13 @@ mod tests {
     use super::*;
     use crate::onchain::mock::MockRaindex;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
+    use crate::wrapper::mock::MockWrapper;
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
         }
     }
 

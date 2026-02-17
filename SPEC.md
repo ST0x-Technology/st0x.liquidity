@@ -1213,17 +1213,15 @@ Arc<dyn Tokenizer> }`
 
 ```mermaid
 stateDiagram-v2
-    [*] --> MintRequested: Mint
+    [*] --> MintRequested: RequestMint
     MintRequested --> MintAccepted
     MintRequested --> Failed
     MintAccepted --> TokensReceived
     MintAccepted --> Failed
-    TokensReceived --> TokensWrapped: Wrap
+    TokensReceived --> TokensWrapped: WrapTokens
     TokensReceived --> Failed
-    TokensWrapped --> DepositedIntoRaindex: Deposit
+    TokensWrapped --> DepositedIntoRaindex: DepositToVault
     TokensWrapped --> Failed
-    DepositedIntoRaindex --> Completed
-    DepositedIntoRaindex --> Failed
 ```
 
 Alpaca mints unwrapped tokens. Before depositing to Raindex, we wrap them into
@@ -1239,9 +1237,8 @@ enum TokenizedEquityMint {
     MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
     TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
     TokensWrapped { /* + wrap_tx_hash, wrapped_shares */ },
-    DepositedIntoRaindex { /* + vault_deposit_tx_hash */ },
-    Completed { symbol, quantity, issuer_request_id, tokenization_request_id,
-                token_tx_hash, wrap_tx_hash, vault_deposit_tx_hash, completed_at },
+    DepositedIntoRaindex { symbol, quantity, issuer_request_id, tokenization_request_id,
+                           token_tx_hash, wrap_tx_hash, vault_deposit_tx_hash, deposited_at },
     Failed { symbol, quantity, reason, failed_at },
 }
 ```
@@ -1250,12 +1247,13 @@ enum TokenizedEquityMint {
 
 ```rust
 enum TokenizedEquityMintCommand {
-    // Requests mint from Alpaca and polls until tokens arrive in wallet
-    Mint { symbol, quantity, wallet },
-    // Wraps unwrapped tokens into ERC-4626 vault shares
-    Wrap,
-    // Deposits wrapped tokens to Raindex vault
-    Deposit,
+    RequestMint { symbol, quantity, wallet },
+    RejectMint { reason },
+    AcknowledgeAcceptance { issuer_request_id, tokenization_request_id },
+    FailAcceptance { reason },
+    ReceiveTokens { tx_hash, receipt_id, shares_minted },
+    WrapTokens { wrap_tx_hash, wrapped_shares },
+    DepositToVault { vault_deposit_tx_hash },
 }
 ```
 
@@ -1275,14 +1273,11 @@ enum TokenizedEquityMintEvent {
     TokensWrapped { wrap_tx_hash, wrapped_shares, wrapped_at },
     WrapFailed { symbol, quantity, reason, failed_at },
 
-    DepositedIntoRaindex { symbol, quantity, vault_deposit_tx_hash, deposited_at },
-    RaindexDepositFailed { symbol, quantity, failed_tx_hash: Option<TxHash>, failed_at },
+    DepositedIntoRaindex { vault_deposit_tx_hash, deposited_at },
+    RaindexDepositFailed { reason, failed_at },
 
-    Completed { symbol, quantity, completed_at },
-    MintRejected { symbol, quantity, status_code: Option<HttpStatusCode>, rejected_at },
+    MintRejected { reason, rejected_at },
 }
-
-struct HttpStatusCode(u16);
 ```
 
 ##### Business Rules

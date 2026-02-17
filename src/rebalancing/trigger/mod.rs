@@ -19,7 +19,6 @@ use url::Url;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Never, Reactor, Store, deps};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
-use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::position::{Position, PositionEvent};
@@ -50,8 +49,6 @@ pub enum RebalancingCtxError {
     NotAlpacaBroker,
     #[error("invalid EVM private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
-    #[error("invalid Alpaca account ID: {0}")]
-    InvalidAccountId(#[from] uuid::Error),
     #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
     WalletsMatch(Address),
 }
@@ -94,9 +91,6 @@ pub(crate) struct RebalancingCtx {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
-    pub(crate) alpaca_account_id: AlpacaAccountId,
-    /// Cloned from broker config - ensures consistency.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Registry of wrapped token configurations for ERC-4626 vault operations.
     pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
@@ -112,11 +106,10 @@ impl RebalancingCtx {
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
-        let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
         let market_maker_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)?.address();
 
         if market_maker_wallet == config.redemption_wallet {
-            return Err(RebalancingCtxError::WalletCollision(market_maker_wallet));
+            return Err(RebalancingCtxError::WalletsMatch(market_maker_wallet));
         }
 
         Ok(Self {
@@ -127,7 +120,6 @@ impl RebalancingCtx {
             ethereum_rpc_url: secrets.ethereum_rpc_url,
             evm_private_key: secrets.evm_private_key,
             usdc_vault_id: config.usdc_vault_id,
-            alpaca_account_id,
             alpaca_broker_auth: broker_auth,
             equities: config.equities,
         })
@@ -144,7 +136,6 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
-            .field("alpaca_account_id", &self.alpaca_account_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("equities", &self.equities)
             .finish()
@@ -465,15 +456,16 @@ impl RebalancingTrigger {
         use TokenizedEquityMintEvent::*;
 
         match event {
-            MintCompleted { .. }
+            DepositedIntoRaindex { .. }
             | MintRejected { .. }
             | MintAcceptanceFailed { .. }
-            | RaindexDepositFailed { .. } => true,
+            | RaindexDepositFailed { .. }
+            | WrappingFailed { .. } => true,
 
             MintRequested { .. }
             | MintAccepted { .. }
             | TokensReceived { .. }
-            | VaultDeposited { .. } => false,
+            | TokensWrapped { .. } => false,
         }
     }
 
@@ -1137,9 +1129,10 @@ mod tests {
         }
     }
 
-    fn make_mint_completed() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
-            completed_at: Utc::now(),
+    fn make_deposited_into_raindex() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::DepositedIntoRaindex {
+            vault_deposit_tx_hash: TxHash::random(),
+            deposited_at: Utc::now(),
         }
     }
 
@@ -1225,9 +1218,9 @@ mod tests {
         }
         assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
 
-        // Check that MintCompleted is detected as terminal.
+        // Check that DepositedIntoRaindex is detected as terminal.
         assert!(RebalancingTrigger::is_terminal_mint_event(
-            &make_mint_completed()
+            &make_deposited_into_raindex()
         ));
 
         // Simulate what dispatch does - clear in-progress on terminal.
@@ -1277,7 +1270,7 @@ mod tests {
 
     #[test]
     fn extract_mint_info_returns_none_without_mint_requested() {
-        let result = RebalancingTrigger::extract_mint_info(&make_mint_completed());
+        let result = RebalancingTrigger::extract_mint_info(&make_deposited_into_raindex());
         assert!(result.is_none());
     }
 
@@ -1653,7 +1646,7 @@ mod tests {
         AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
@@ -1694,23 +1687,8 @@ mod tests {
         assert_eq!(ctx.alpaca_broker_auth.api_key, "test_key");
         assert_eq!(ctx.alpaca_broker_auth.api_secret, "test_secret");
         assert_eq!(
-            ctx.alpaca_account_id,
+            ctx.alpaca_broker_auth.account_id,
             AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"))
-        );
-    }
-
-    #[test]
-    fn new_fails_with_invalid_account_id() {
-        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
-        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
-        let mut broker_auth = test_broker_auth();
-        broker_auth.account_id = "not-a-uuid".to_string();
-
-        let result = RebalancingCtx::new(config, secrets, broker_auth);
-
-        assert!(
-            matches!(result, Err(RebalancingCtxError::Uuid(_))),
-            "Expected Uuid error, got {result:?}"
         );
     }
 
@@ -2655,8 +2633,8 @@ mod tests {
         let error = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap_err();
 
         assert!(
-            matches!(error, RebalancingCtxError::WalletCollision(addr) if addr == derived_wallet),
-            "Expected WalletCollision with {derived_wallet}, got: {error:?}"
+            matches!(error, RebalancingCtxError::WalletsMatch(addr) if addr == derived_wallet),
+            "Expected WalletsMatch with {derived_wallet}, got: {error:?}"
         );
     }
 }

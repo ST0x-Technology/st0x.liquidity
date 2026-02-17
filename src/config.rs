@@ -16,8 +16,8 @@ use tracing::Level;
 use url::Url;
 
 use st0x_execution::{
-    AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx, AlpacaTradingApiMode,
-    FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
+    AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
 };
 
 use crate::offchain::order_poller::OrderPollerCtx;
@@ -85,7 +85,7 @@ enum BrokerSecrets {
     AlpacaBrokerApi {
         api_key: String,
         api_secret: String,
-        account_id: String,
+        account_id: AlpacaAccountId,
         mode: Option<AlpacaBrokerApiMode>,
     },
     DryRun,
