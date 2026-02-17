@@ -561,8 +561,10 @@ reviewing code that uses configuration instead of reading secrets directly.
 - **Database Isolation**: In-memory SQLite databases for test isolation
 - **Edge Case Coverage**: Comprehensive error scenario testing for trade
   conversion logic
-- **Testing Principle**: Only cover happy paths with all components working and
-  connected in integration tests and cover everything in unit tests
+- **Testing Principle**: Follow the testing pyramid — most coverage in unit
+  tests, fewer integration tests, fewest e2e tests. Integration tests may cover
+  failure scenarios when those failures can only be triggered by wiring multiple
+  components together
 - **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: Tests
   exist to verify the system works correctly. If code is broken or incomplete,
   tests MUST assert the correct expected behavior and FAIL until the code is
