@@ -328,6 +328,16 @@ impl Ctx {
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
+        if let (Some(rebalancing_ctx), Some(configured_owner)) = (&rebalancing, evm.order_owner) {
+            let derived = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?.address();
+            if derived != configured_owner {
+                return Err(CtxError::OrderOwnerMismatch {
+                    configured: configured_owner,
+                    derived,
+                });
+            }
+        }
+
         if rebalancing.is_none() && evm.order_owner.is_none() {
             return Err(CtxError::MissingOrderOwner);
         }
@@ -393,6 +403,14 @@ pub enum CtxError {
     RebalancingSecretsMissing,
     #[error("rebalancing secrets present but rebalancing config missing in config")]
     RebalancingConfigMissing,
+    #[error(
+        "order_owner {configured} does not match market maker wallet \
+         {derived} derived from evm_private_key"
+    )]
+    OrderOwnerMismatch {
+        configured: Address,
+        derived: Address,
+    },
 }
 
 #[cfg(test)]
@@ -408,6 +426,7 @@ impl CtxError {
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",
+            Self::OrderOwnerMismatch { .. } => "order_owner mismatch",
         }
     }
 }
@@ -699,10 +718,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rebalancing_ignores_evm_order_owner_field() {
+    fn rebalancing_with_mismatched_order_owner_fails() {
         let config = example_config_toml().replace(
             "deployment_block = 1",
             "order_owner = \"0xcccccccccccccccccccccccccccccccccccccccc\"\ndeployment_block = 1",
+        );
+
+        let error = Ctx::from_toml(&config, example_secrets_toml()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::OrderOwnerMismatch { .. }),
+            "Expected OrderOwnerMismatch, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rebalancing_with_matching_order_owner_succeeds() {
+        // Private key 0x01 derives to 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+        let config = example_config_toml().replace(
+            "deployment_block = 1",
+            "order_owner = \"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\"\ndeployment_block = 1",
         );
 
         let ctx = Ctx::from_toml(&config, example_secrets_toml()).unwrap();
@@ -710,7 +744,6 @@ pub(crate) mod tests {
         assert_eq!(
             order_owner,
             address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"),
-            "order_owner() should derive from evm_private_key when rebalancing is enabled"
         );
     }
 
