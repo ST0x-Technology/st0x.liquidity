@@ -379,6 +379,7 @@ mod tests {
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::str::FromStr;
 
     use super::*;
     use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
@@ -690,7 +691,7 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
-        assert_eq!(order.quantity, Decimal::from_str("500").unwrap());
+        assert_eq!(order.quantity, dec!(500));
         assert_eq!(order.status_display(), "filled");
     }
 

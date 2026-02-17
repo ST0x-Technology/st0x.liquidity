@@ -316,11 +316,11 @@ mod tests {
         }
     }
 
-    fn test_trade(amount: f64, log_index: u64) -> OnchainTrade {
+    fn test_trade(amount: Decimal, log_index: u64) -> OnchainTrade {
         OnchainTradeBuilder::default()
             .with_symbol("tAAPL")
-            .with_amount(Decimal::try_from(amount).unwrap())
-            .with_price(Decimal::try_from(150.0).unwrap())
+            .with_amount(amount)
+            .with_price(dec!(150.0))
             .with_log_index(log_index)
             .build()
     }

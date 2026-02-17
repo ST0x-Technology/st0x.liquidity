@@ -191,6 +191,7 @@ pub(super) async fn vault_withdraw_command<
 mod tests {
     use alloy::primitives::{address, b256};
     use alloy::providers::mock::Asserter;
+    use rust_decimal_macros::dec;
     use std::str::FromStr;
     use url::Url;
 
@@ -284,11 +285,10 @@ mod tests {
     async fn test_vault_deposit_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
-        let amount = Decimal::from_str("500.50").unwrap();
 
         let mut stdout = Vec::new();
         let deposit = Deposit {
-            amount,
+            amount: dec!(500.50),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
             decimals: 6,

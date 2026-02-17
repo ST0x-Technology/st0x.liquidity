@@ -206,7 +206,7 @@ defined in `migrations/20250703115746_trades.sql`.
 - Uses `debug_traceTransaction` RPC method to analyze transaction execution
 - Parses Pyth oracle contract calls to retrieve precise price data including
   price value, confidence interval, exponent, and publish timestamp
-- Prices are stored in the `onchain_trades` table alongside trade records
+- Prices are stored in the `onchain_trade_view` alongside trade records
 - NULL price values indicate extraction failed (e.g., no Pyth call in trace, RPC
   errors)
 - CLI command for testing: `cargo run --bin cli get-pyth-price <TX_HASH>`
@@ -479,7 +479,7 @@ This enables:
 
 ### Implementation Phases
 
-The crate extraction is sequenced around the CQRS/ES migration:
+The crate extraction is sequenced in phases:
 
 ### Phase 1: Prerequisite Refactors
 
@@ -508,8 +508,6 @@ Extract rebalancing logic (already clean CQRS, no legacy persistence):
 
 ### Phase 4: Hedging Extraction & Application Layer
 
-After CQRS migration Phase 3 completes.
-
 Extract hedging logic and create application binary (must happen atomically):
 
 - `st0x-hedge`: Pure library with conductor, accumulator, position tracking,
@@ -517,7 +515,6 @@ Extract hedging logic and create application binary (must happen atomically):
 - `st0x-server`: Application binary that wires hedging + rebalancing together
 - Dashboard stays as feature-gated module in server
 - CLI remains temporary utility
-- Depends on OnChainTrade, OffchainOrder, Position migration completing first
 
 ## System Risks
 
@@ -554,213 +551,28 @@ implementation. Solutions will be developed in later iterations.
 
 ---
 
-## DDD/CQRS/ES Migration Proposal
+## DDD/CQRS/ES Architecture
 
-### Background
-
-The current implementation provides some auditability through `onchain_trades`,
-`schwab_executions`, and `trade_execution_links`. However, these tables are
-mutable and don't form a complete event log:
-
-#### Current Limitations
-
-- **Mutable state**: Tables can be updated/deleted, losing history of state
-  transitions (e.g., `schwab_executions.status` transitions from PENDING ->
-  SUBMITTED -> COMPLETED are lost, we only see final state)
-- **Partial audit trail**: Know which trades linked to which executions, but not
-  why batching decisions were made or when thresholds were crossed
-- **Can't rebuild from history**: If `trade_accumulators.net_position` gets
-  corrupted, can't reconstruct it from trades (trades are facts, but the
-  accumulation logic isn't captured)
-- **Schema evolution requires migrations**: Adding new metrics (e.g., PnL
-  tracking, fill quality analysis) requires ALTER TABLE and backfilling
-- **State machine in application code**: Position lifecycle rules (when to
-  execute, how to batch) are scattered across functions - hard to test in
-  isolation
-
-#### Event Sourcing Improvements
-
-Events ARE immutable facts, but the current system only captures some facts
-(trades executed, final execution state) while losing others (when thresholds
-were crossed, status transitions, why batching decisions occurred). An event
-store treats every significant occurrence as a fact:
+The system uses Domain-Driven Design with CQRS and Event Sourcing. All state is
+derived from an immutable event log.
 
 - **Complete history**: Every state change is a fact with timestamp and sequence
-- **Reproducible state**: Replay facts to rebuild any view, fixing corruption
+- **Reproducible state**: Replay facts to rebuild any view
 - **Temporal queries**: "What was the position at any point in time?"
 - **Zero-downtime projections**: Add new views by replaying existing events
 - **Testable business logic**: Given-When-Then tests validate rules without
   database
 - **Type-safe state machines**: Invalid transitions become compilation errors
 
-We will migrate st0x.liquidity-a to DDD/CQRS/ES patterns for:
-
-- **Auditability**: Complete audit trail of all system state changes
-- **Debuggability**: Time-travel debugging by replaying events
-- **Schema Evolution**: Easy to add new projections without migrations
-- **Type Safety**: Make invalid states unrepresentable through ADTs
-- **Testability**: Given-When-Then testing pattern for business logic
-- **Reasoning**: Clear separation between facts (events) and derived data
-  (views)
-
-### Migration Strategy Overview
-
-This migration will transform the current database from a CRUD-style schema to
-an event-sourced architecture through **three independently deployable phases**.
-
-**Before**: Multiple mutable state tables with potential contradictions
-
-#### After
+### Architecture
 
 - **Event Store**: Immutable append-only log (single source of truth)
 - **Snapshots**: Performance optimization for aggregate reconstruction
 - **Views**: Materialized projections optimized for queries
 
-**Grafana Dashboard Strategy**: The migration aims to minimize changes to
-existing Grafana dashboards by using SQLite generated columns to expose the same
-column names as current tables. This allows most queries to work with only table
-name changes (e.g., `onchain_trades` -> `onchain_trade_view`). Additionally, we
-can create specialized views that pre-compute complex metrics, simplifying
-queries and improving performance.
-
-#### Phase 1: Dual-Write Foundation (Shadow Mode)
-
-**Goal**: Run CQRS/ES alongside existing system to validate correctness before
-cutting over.
-
-##### Implementation
-
-- Implement event sourcing infrastructure (sqlite-es integration)
-- Create event store and view tables via migrations
-- Implement all aggregates with command/event modeling (OnChainTrade, Position,
-  OffchainOrder, SchwabAuth)
-- Implement data import binary to convert existing CRUD data to events
-- Implement dual-write: Conductor writes to **BOTH** old tables AND event store
-- Events persist and update views, but **views are NOT yet used for reads**
-- Old tables remain the source of truth for all queries (API, CLI, Grafana)
-- Monitoring/logging to compare old table data vs new view data
-
-##### Deployment sequence
-
-1. Deploy schema migrations (creates event store and view tables)
-2. Run data import binary once (`migrate_to_events`) to convert all existing
-   CRUD data into events
-3. Start application with dual-write enabled (reads from old tables, writes to
-   both)
-4. Verify views match old tables and new events appear in both systems
-5. Monitor for errors and performance issues
-
-##### Benefits
-
-- **Low risk**: Old system continues working; new system validates in shadow
-  mode
-- **Complete data**: Event store contains all data from day one, enabling proper
-  validation
-- **Real-world validation**: Event sourcing logic tested against actual
-  production data
-- **Easy rollback**: Stop writing events; old system unaffected
-- **Catch discrepancies**: Identify any bugs in event logic before cutover
-
-##### Deployment verification
-
-- After import: Verify view counts and sample records match old tables exactly
-- After dual-write starts: Spot check that new events appear in both systems
-- Monitor for any errors in event processing
-- Confirm no performance degradation
-
-##### Phase complete when
-
-- Dual-write running in production for sufficient validation period
-- View data consistently matches old table data
-- No event processing errors
-- Performance acceptable
-
-#### Phase 2: Rebalancing Feature (New Feature on CQRS/ES)
-
-**Goal**: Implement inventory rebalancing using CQRS/ES architecture from day
-one.
-
-##### Why now
-
-- Rebalancing is a business priority
-- Building on new architecture proves CQRS/ES works for new features
-- Avoids having to migrate rebalancing logic later
-- Demonstrates value of event sourcing (complete audit trail for all rebalancing
-  operations)
-
-##### Implementation scope
-
-- Three rebalancing aggregates (EquityTransferToMarketMakingVenue,
-  EquityTransferToHedgingVenue, CrossVenueCashTransfer)
-- Integration with Alpaca for share/USDC management
-- Integration with Circle CCTP bridge (Ethereum mainnet <-> Base for USDC)
-- InventoryView for monitoring imbalance ratios
-- RebalancingManager for triggering rebalancing operations
-- Complete event-sourced audit trail for all rebalancing operations
-
-##### Integration points
-
-- Alpaca for share and USDC management
-- Circle's USDC native bridge via CCTP (cross-chain transfers between Ethereum
-  mainnet and Base)
-- Rain OrderBook (deposit2/withdraw2 for vault operations on Base)
-- Position aggregate (provides inventory data to InventoryView)
-
-##### Benefits
-
-- New feature built using the new architecture
-- Proves CQRS/ES architecture in production
-- Complete audit trail for compliance and debugging
-- Easier to reason about rebalancing state transitions
-
-##### Phase complete when
-
-- Rebalancing working in production with Alpaca
-- Complete audit trail visible in events
-- No issues with CQRS/ES patterns
-
-#### Phase 3: Complete Migration (Cut Over to Views)
-
-**Goal**: Make views the source of truth and remove old tables.
-
-##### Implementation
-
-- Update Conductor to read from views instead of old tables
-- Update API/CLI to query views
-- Implement remaining managers (TradeManager, OrderManager)
-- Add MetricsPnL view for financial analysis
-- Stop writing to old tables
-- After validation period, drop old tables
-
-##### Cutover approach
-
-- Switch application reads from old tables to views
-- Stop dual-write (only write to event store)
-- Monitor for issues
-- After validation period, drop old tables
-
-##### Benefits
-
-- Old system completely removed
-- Full CQRS/ES benefits realized (time-travel debugging, easy projections,
-  complete audit trail)
-- Cleaner codebase
-- Foundation for future features
-
-##### Phase complete when
-
-- All reads happening from views
-- No code querying old tables
-- Production running successfully on views
-- Old tables dropped
-
-#### Phased Migration Benefits
-
-- **Risk mitigation**: Each phase is independently deployable and reversible
-- **Incremental validation**: Catch issues early before they compound
-- **Business continuity**: System remains operational throughout migration
-- **Prove value early**: Rebalancing feature demonstrates CQRS/ES benefits
-- **Learn and adapt**: Each phase informs the next
+**Grafana Dashboard Strategy**: Views use SQLite generated columns to expose
+JSON fields as queryable columns. Specialized views can pre-compute complex
+metrics, simplifying dashboard queries.
 
 ### Core Architecture
 
@@ -783,216 +595,16 @@ flowchart LR
 
 #### Database Schema
 
-##### Event Store Tables (Single Source of Truth)
+The source of truth for all table schemas is the `migrations/` directory.
 
-```sql
--- Events table: stores all domain events
-CREATE TABLE events (
-    aggregate_type TEXT NOT NULL,      -- 'OnChainTrade', 'Position', 'OffchainOrder', etc.
-    aggregate_id TEXT NOT NULL,        -- Unique identifier for aggregate instance
-    sequence BIGINT NOT NULL,          -- Sequence number (starts at 1)
-    event_type TEXT NOT NULL,          -- Event name (e.g., 'OnChainOrderFilled')
-    event_version TEXT NOT NULL,       -- Event schema version (e.g., '1.0')
-    payload JSON NOT NULL,             -- Event data as JSON
-    metadata JSON NOT NULL,            -- Correlation IDs, timestamps, etc.
-    PRIMARY KEY (aggregate_type, aggregate_id, sequence)
-);
+**Event store** (managed by event-sorcery): `events`, `snapshots`.
 
-CREATE INDEX idx_events_type ON events(aggregate_type);
-CREATE INDEX idx_events_aggregate ON events(aggregate_id);
+**CQRS projection views**: `position_view`, `offchain_order_view`,
+`onchain_trade_view`, `usdc_rebalance_view`, `vault_registry_view`,
+`equity_redemption_view`, `schwab_auth_view`. Some views use SQLite generated
+columns to expose JSON fields as queryable columns for Grafana dashboards.
 
--- Snapshots table: aggregate cache for performance
-CREATE TABLE snapshots (
-    aggregate_type TEXT NOT NULL,
-    aggregate_id TEXT NOT NULL,
-    last_sequence BIGINT NOT NULL,    -- Last event sequence in snapshot
-    payload JSON NOT NULL,             -- Serialized aggregate state
-    timestamp TEXT NOT NULL,
-    PRIMARY KEY (aggregate_type, aggregate_id)
-);
-```
-
-##### View Tables (Derived Read Models)
-
-Views are materialized projections built from events, optimized for specific
-query patterns. These views use SQLite generated columns to expose JSON fields
-as regular columns, maintaining backward compatibility with existing Grafana
-dashboards and queries.
-
-```sql
--- Position view: current position state per symbol
--- Replaces: trade_accumulators table
-CREATE TABLE position_view (
-    view_id TEXT PRIMARY KEY,         -- symbol
-    version BIGINT NOT NULL,          -- Last event sequence applied
-    payload JSON NOT NULL,            -- Current position state
-
-    -- Generated columns for backward compatibility with trade_accumulators
-    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
-    net_position REAL GENERATED ALWAYS AS (json_extract(payload, '$.net_position')) VIRTUAL,
-    accumulated_long REAL GENERATED ALWAYS AS (json_extract(payload, '$.accumulated_long')) VIRTUAL,
-    accumulated_short REAL GENERATED ALWAYS AS (json_extract(payload, '$.accumulated_short')) VIRTUAL,
-    pending_execution_id TEXT GENERATED ALWAYS AS (json_extract(payload, '$.pending_execution_id')) VIRTUAL,
-    last_updated TEXT GENERATED ALWAYS AS (json_extract(payload, '$.last_updated')) VIRTUAL
-);
-
-CREATE INDEX idx_position_view_symbol ON position_view(symbol);
-CREATE INDEX idx_position_view_net_position ON position_view(net_position);
-CREATE INDEX idx_position_view_last_updated ON position_view(last_updated);
-
--- Offchain trade view: all broker trade executions
--- Replaces: schwab_executions table
-CREATE TABLE offchain_trade_view (
-    view_id TEXT PRIMARY KEY,         -- execution_id
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL,
-
-    -- Generated columns for backward compatibility with schwab_executions
-    id INTEGER GENERATED ALWAYS AS (CAST(json_extract(payload, '$.execution_id') AS INTEGER)) VIRTUAL,
-    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
-    shares INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.shares')) VIRTUAL,
-    direction TEXT GENERATED ALWAYS AS (json_extract(payload, '$.direction')) VIRTUAL,
-    order_id TEXT GENERATED ALWAYS AS (json_extract(payload, '$.broker_order_id')) VIRTUAL,
-    price_cents INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.price_cents')) VIRTUAL,
-    status TEXT GENERATED ALWAYS AS (json_extract(payload, '$.status')) VIRTUAL,
-    executed_at TEXT GENERATED ALWAYS AS (json_extract(payload, '$.completed_at')) VIRTUAL
-);
-
-CREATE INDEX idx_offchain_trade_view_symbol ON offchain_trade_view(symbol);
-CREATE INDEX idx_offchain_trade_view_status ON offchain_trade_view(status);
-
--- OnChain trade view: blockchain trade records
--- Replaces: onchain_trades table
-CREATE TABLE onchain_trade_view (
-    view_id TEXT PRIMARY KEY,         -- tx_hash:log_index
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL,
-
-    -- Generated columns for backward compatibility with onchain_trades
-    id INTEGER GENERATED ALWAYS AS (CAST(json_extract(payload, '$.id') AS INTEGER)) VIRTUAL,
-    tx_hash TEXT GENERATED ALWAYS AS (json_extract(payload, '$.tx_hash')) VIRTUAL,
-    log_index INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.log_index')) VIRTUAL,
-    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
-    amount REAL GENERATED ALWAYS AS (json_extract(payload, '$.amount')) VIRTUAL,
-    direction TEXT GENERATED ALWAYS AS (json_extract(payload, '$.direction')) VIRTUAL,
-    price_usdc REAL GENERATED ALWAYS AS (json_extract(payload, '$.price_usdc')) VIRTUAL,
-    block_number INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.block_number')) VIRTUAL,
-    block_timestamp TEXT GENERATED ALWAYS AS (json_extract(payload, '$.block_timestamp')) VIRTUAL,
-    gas_used INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.gas_used')) VIRTUAL,
-    pyth_price_value TEXT GENERATED ALWAYS AS (json_extract(payload, '$.pyth_price.value')) VIRTUAL,
-    pyth_price_expo INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.pyth_price.expo')) VIRTUAL,
-    pyth_price_conf TEXT GENERATED ALWAYS AS (json_extract(payload, '$.pyth_price.conf')) VIRTUAL,
-    created_at TEXT GENERATED ALWAYS AS (json_extract(payload, '$.recorded_at')) VIRTUAL
-);
-
-CREATE INDEX idx_onchain_trade_view_symbol ON onchain_trade_view(symbol);
-CREATE INDEX idx_onchain_trade_view_block_number ON onchain_trade_view(block_number);
-CREATE INDEX idx_onchain_trade_view_created_at ON onchain_trade_view(created_at);
-CREATE INDEX idx_onchain_trade_view_direction ON onchain_trade_view(direction);
-
--- PnL metrics view: profit/loss calculations
--- Replaces: metrics_pnl table
-CREATE TABLE metrics_pnl_view (
-    view_id TEXT PRIMARY KEY,         -- unique metric id
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL,
-
-    -- Generated columns for backward compatibility with metrics_pnl
-    id INTEGER GENERATED ALWAYS AS (CAST(json_extract(payload, '$.id') AS INTEGER)) VIRTUAL,
-    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
-    timestamp TEXT GENERATED ALWAYS AS (json_extract(payload, '$.timestamp')) VIRTUAL,
-    trade_type TEXT GENERATED ALWAYS AS (json_extract(payload, '$.trade_type')) VIRTUAL,
-    trade_id INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.trade_id')) VIRTUAL,
-    trade_direction TEXT GENERATED ALWAYS AS (json_extract(payload, '$.trade_direction')) VIRTUAL,
-    quantity REAL GENERATED ALWAYS AS (json_extract(payload, '$.quantity')) VIRTUAL,
-    price_per_share REAL GENERATED ALWAYS AS (json_extract(payload, '$.price_per_share')) VIRTUAL,
-    realized_pnl REAL GENERATED ALWAYS AS (json_extract(payload, '$.realized_pnl')) VIRTUAL,
-    cumulative_pnl REAL GENERATED ALWAYS AS (json_extract(payload, '$.cumulative_pnl')) VIRTUAL,
-    net_position_after REAL GENERATED ALWAYS AS (json_extract(payload, '$.net_position_after')) VIRTUAL
-);
-
-CREATE INDEX idx_metrics_pnl_view_symbol ON metrics_pnl_view(symbol);
-CREATE INDEX idx_metrics_pnl_view_timestamp ON metrics_pnl_view(timestamp);
-CREATE INDEX idx_metrics_pnl_view_symbol_timestamp ON metrics_pnl_view(symbol, timestamp);
-
--- Schwab auth view: OAuth token storage for internal bot use only
--- Replaces: schwab_auth table
-CREATE TABLE schwab_auth_view (
-    view_id TEXT PRIMARY KEY,         -- Always 'schwab' (singleton)
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- Encrypted tokens
-);
-```
-
-##### Grafana Dashboard Migration
-
-Most existing Grafana queries can migrate with only table name changes:
-
-Consider this hypothetical query:
-
-```sql
--- Old query (using onchain_trades table)
-SELECT symbol, amount, price_usdc, created_at
-FROM onchain_trades
-WHERE symbol = 'AAPL' AND created_at > datetime('now', '-7 days');
-
--- New query (using onchain_trade_view table) - only table name changes
-SELECT symbol, amount, price_usdc, created_at
-FROM onchain_trade_view
-WHERE symbol = 'AAPL' AND created_at > datetime('now', '-7 days');
-```
-
-Generated columns are indexed for query performance, ensuring dashboards
-maintain their current performance characteristics.
-
-##### Opportunity for Dashboard Simplification
-
-The event-sourced architecture allows us to create specialized views that
-pre-compute complex metrics, replacing complex Grafana queries with simple
-SELECTs.
-
-For example, a dashboard showing buy and sell prices from both onchain and
-offchain trades would need to UNION data from multiple tables and convert price
-units:
-
-```sql
--- Before: Complex query UNIONing onchain and offchain trades
-SELECT
-    created_at,
-    direction,
-    price,
-    'ONCHAIN' as trade_type
-FROM (
-    -- Onchain trades with price in USDC
-    SELECT
-        created_at,
-        direction,
-        price_usdc as price
-    FROM onchain_trades
-    WHERE symbol = '${Symbol}'
-
-    UNION ALL
-
-    -- Offchain trades with price in cents, converted to dollars
-    SELECT
-        executed_at as created_at,
-        direction,
-        CAST(price_cents AS REAL) / 100.0 as price
-    FROM schwab_executions
-    WHERE symbol = '${Symbol}'
-      AND status = 'FILLED'
-)
-ORDER BY created_at;
-
--- After: Pre-computed unified view with normalized prices
-SELECT created_at, direction, price, trade_type
-FROM unified_trade_view
-WHERE symbol = '${Symbol}'
-ORDER BY created_at;
-```
-
-Complex queries can be identified and replaced with optimized views, improving
-both dashboard performance and maintainability.
+**Legacy tables** (still used directly): `event_queue`, `schwab_auth`.
 
 ### Architecture Decision: Position as Aggregate
 
@@ -1165,17 +777,6 @@ enum OnChainTradeCommand {
 
 ```rust
 enum OnChainTradeEvent {
-    Migrated {
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        gas_used: Option<u64>,
-        pyth_price: Option<PythPrice>,
-        migrated_at: DateTime<Utc>,
-    },
     Filled {
         symbol: Symbol,
         amount: Decimal,
@@ -1255,7 +856,7 @@ enum PositionCommand {
         shares_filled: FractionalShares,
         direction: Direction,
         broker_order_id: BrokerOrderId,
-        price_cents: PriceCents,
+        price: Dollars,
         broker_timestamp: DateTime<Utc>,
     },
     FailOffChainOrder {
@@ -1269,14 +870,6 @@ enum PositionCommand {
 
 ```rust
 enum PositionEvent {
-    Migrated {
-        symbol: Symbol,
-        net_position: FractionalShares,
-        accumulated_long: FractionalShares,
-        accumulated_short: FractionalShares,
-        threshold: ExecutionThreshold,
-        migrated_at: DateTime<Utc>,
-    },
     OnChainOrderFilled {
         trade_id: TradeId,
         amount: FractionalShares,
@@ -1298,7 +891,7 @@ enum PositionEvent {
         shares_filled: FractionalShares,
         direction: Direction,
         broker_order_id: BrokerOrderId,
-        price_cents: PriceCents,
+        price: Dollars,
         broker_timestamp: DateTime<Utc>,
     },
     OffChainOrderFailed {
@@ -1342,7 +935,7 @@ enum TriggerReason {
 **Purpose**: Manages the lifecycle of a single broker order, tracking
 submission, filling, and settlement.
 
-**Aggregate ID**: `execution_id` (integer from schwab_executions table)
+**Aggregate ID**: `OffchainOrderId` (UUID)
 
 **Type**: `OffchainOrder` (implements `EventSourced` with `Error = Never`)
 
@@ -1373,7 +966,7 @@ enum OffchainOrder {
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
-        avg_price_cents: PriceCents,
+        avg_price: Dollars,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
         partially_filled_at: DateTime<Utc>,
@@ -1384,7 +977,7 @@ enum OffchainOrder {
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
-        price_cents: PriceCents,
+        price: Dollars,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
         filled_at: DateTime<Utc>,
@@ -1416,10 +1009,10 @@ enum OffchainOrderCommand {
     },
     UpdatePartialFill {
         shares_filled: FractionalShares,
-        avg_price_cents: PriceCents,
+        avg_price: Dollars,
     },
     CompleteFill {
-        price_cents: PriceCents,
+        price: Dollars,
     },
     MarkFailed {
         error: String,
@@ -1431,17 +1024,6 @@ enum OffchainOrderCommand {
 
 ```rust
 enum OffchainOrderEvent {
-    Migrated {
-        symbol: Symbol,
-        shares: FractionalShares,
-        direction: Direction,
-        broker: SupportedBroker,
-        status: MigratedOrderStatus,
-        broker_order_id: Option<BrokerOrderId>,
-        price_cents: Option<PriceCents>,
-        executed_at: Option<DateTime<Utc>>,
-        migrated_at: DateTime<Utc>,
-    },
     Placed {
         symbol: Symbol,
         shares: FractionalShares,
@@ -1455,24 +1037,17 @@ enum OffchainOrderEvent {
     },
     PartiallyFilled {
         shares_filled: FractionalShares,
-        avg_price_cents: PriceCents,
+        avg_price: Dollars,
         partially_filled_at: DateTime<Utc>,
     },
     Filled {
-        price_cents: PriceCents,
+        price: Dollars,
         filled_at: DateTime<Utc>,
     },
     Failed {
         broker_code: Option<BrokerErrorCode>,
         failed_at: DateTime<Utc>,
     },
-}
-
-enum MigratedOrderStatus {
-    Pending,
-    Submitted,
-    Filled,
-    Failed { broker_code: Option<BrokerErrorCode> },
 }
 
 struct BrokerErrorCode(String);
@@ -2398,7 +1973,7 @@ enum OffchainTradeView {
         broker: SupportedBroker,
         status: ExecutionStatus,
         broker_order_id: Option<BrokerOrderId>,
-        price_cents: Option<PriceCents>,
+        price: Option<Dollars>,
         initiated_at: DateTime<Utc>,
         completed_at: Option<DateTime<Utc>>,
     },
@@ -2840,14 +2415,7 @@ Blockchain reorganizations occur before block finalization. When we eventually
 implement reorg handling, the event-sourced architecture will make it
 significantly easier than the current CRUD approach.
 
-##### CRUD Approach (Current)
-
-Would require orchestrating multiple coordinated steps: identify affected
-trades, delete/mark invalid records in `onchain_trades`, update
-`trade_accumulators`, check triggered executions, potentially reverse offchain
-executions. This would be error-prone and lose audit trail.
-
-##### Event-Sourced Approach (Future)
+##### Why Event Sourcing Helps
 
 Simply append a reorg event that reverses the position change. The event would
 be: PositionCommand::RecordReorg with tx_hash, log_index, symbol, amount,
@@ -2865,156 +2433,6 @@ original trade's position impact. Views would update automatically. The
 
 This demonstrates how the event-sourced architecture provides a cleaner
 foundation for future enhancements.
-
-### Data Migration Strategy
-
-**Note**: This data import occurs in **Phase 1** as part of initial deployment,
-before dual-write begins. This ensures the event store contains all existing
-data, allowing proper validation that views match old tables from day one.
-
-#### Importing Existing Data
-
-Use genesis events as snapshots from the legacy system. Migrated events
-initialize aggregates without synthesizing full event histories:
-
-##### Migrated Event Types
-
-Migrated events use proper domain types (FractionalShares, TxHash, etc.)
-matching the new system:
-
-```rust
-// Migrated events are part of each aggregate's event enum
-
-enum OnChainTradeEvent {
-    // Normal events (future system)
-    Filled { /* ... */ },
-    Enriched { /* ... */ },
-
-    // Migrated event (migration only)
-    Migrated {
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        gas_used: Option<u64>,
-        pyth_price: Option<PythPrice>,
-        migrated_at: DateTime<Utc>,
-    },
-}
-
-enum PositionEvent {
-    // Normal events (future system)
-    OnChainOrderFilled { /* ... */ },
-    OffChainOrderPlaced { /* ... */ },
-    OffChainOrderFilled { /* ... */ },
-
-    // Migrated event (migration only)
-    Migrated {
-        symbol: Symbol,
-        net_position: FractionalShares,
-        accumulated_long: FractionalShares,
-        accumulated_short: FractionalShares,
-        threshold: ExecutionThreshold,
-        migrated_at: DateTime<Utc>,
-    },
-}
-
-enum OffchainOrderEvent {
-    // Normal events (future system)
-    Placed { /* ... */ },
-    Submitted { /* ... */ },
-    Filled { /* ... */ },
-    Failed { /* ... */ },
-
-    // Migrated event (migration only)
-    Migrated {
-        symbol: Symbol,
-        shares: FractionalShares,
-        direction: Direction,
-        broker: SupportedBroker,
-        status: MigratedOrderStatus,
-        broker_order_id: Option<BrokerOrderId>,
-        price_cents: Option<PriceCents>,
-        executed_at: Option<DateTime<Utc>>,
-        migrated_at: DateTime<Utc>,
-    },
-}
-
-// Migrated-specific status includes only observable states from legacy system
-enum MigratedOrderStatus {
-    Pending,
-    Submitted,
-    Filled,
-    Failed { error: String },
-}
-```
-
-##### Existing Data Import
-
-One-time binary: `src/bin/migrate_to_events.rs`
-
-This binary converts existing CRUD data from old tables into the event store. It
-is separate from schema migrations (`sqlx migrate run`), which create tables
-automatically on every deployment.
-
-###### Steps
-
-1. Read from `onchain_trades` table, emit OnChainTradeEvent::Migrated for each
-   trade
-2. Read from `trade_accumulators` table, emit PositionEvent::Migrated for each
-   position
-3. Read from `schwab_executions` table, emit OffchainOrderEvent::Migrated for
-   each execution
-4. Read from `schwab_auth` table, emit SchwabAuthEvent::TokensStored
-5. Rebuild all views from events
-6. Verify counts and sample records match between old tables and new views
-
-##### Migrating OnChain Trades
-
-Query `onchain_trades` ordered by `created_at, tx_hash, log_index`. For each
-trade:
-
-- Aggregate ID: `"{tx_hash}:{log_index}"`
-- Sequence: 1
-- Event: OnChainTradeEvent::Migrated with all fields from legacy table
-
-##### Migrating Positions
-
-Query `trade_accumulators`. For each position:
-
-- Aggregate ID: `symbol`
-- Sequence: 1
-- Event: PositionEvent::Migrated with all fields including threshold
-- Threshold: `ExecutionThreshold::Shares(Decimal::ONE)` (production currently
-  only supports whole share thresholds for Schwab compatibility)
-
-##### Migrating OffChain Orders
-
-Query `schwab_executions` ordered by `id`. For each execution:
-
-- Aggregate ID: execution_id as string
-- Sequence: 1
-- Event: OffchainOrderEvent::Migrated with status mapped from legacy system
-- Broker: SupportedBroker::Schwab (legacy system only used Schwab)
-
-##### Migrating Schwab Auth
-
-Query `schwab_auth` table (singleton):
-
-- Aggregate ID: "schwab"
-- Sequence: 1
-- Event: SchwabAuthEvent::TokensStored
-
-##### Verification Strategy
-
-After migration:
-
-1. Rebuild all views from events
-2. Compare record counts: old tables vs new views
-3. Verify random sample of records match
-4. For positions: verify net_position, accumulated_long, accumulated_short match
 
 ### Testing Strategy
 
