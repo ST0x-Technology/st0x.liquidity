@@ -108,7 +108,7 @@ pub use schema_registry::{ReconcileError, Reconciler, SchemaRegistry};
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
 };
-pub use wire::{StoreBuilder, Unwired};
+pub use wire::StoreBuilder;
 
 /// The core abstraction for event-sourced domain entities.
 ///

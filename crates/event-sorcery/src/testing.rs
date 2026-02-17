@@ -11,12 +11,11 @@
 use async_trait::async_trait;
 use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::dependency::{HasEntity, InjectAtDepth, Zero};
+use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
 use crate::{EventSourced, Store};
@@ -323,12 +322,9 @@ impl<Entity: EventSourced> TestStore<Entity> {
         Entity::Event: Clone,
         <Entity::Id as FromStr>::Err: Debug + Send + Sync,
         R: Reactor + 'static,
-        R::Dependencies: InjectAtDepth<Zero, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+        R::Dependencies: HasEntity<Entity>,
     {
-        let query: Box<dyn Query<Lifecycle<Entity>>> = Box::new(ReactorBridge {
-            reactor,
-            _depth: PhantomData::<Zero>,
-        });
+        let query: Box<dyn Query<Lifecycle<Entity>>> = Box::new(ReactorBridge { reactor });
         Self::build(vec![query], services)
     }
 
@@ -357,7 +353,7 @@ where
         Entity::Event: Clone,
         <Entity::Id as FromStr>::Err: Debug + Send + Sync,
         R: Reactor + 'static,
-        R::Dependencies: InjectAtDepth<Zero, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+        R::Dependencies: HasEntity<Entity>,
     {
         Self::with_reactor_and(reactor, Entity::Services::default())
     }

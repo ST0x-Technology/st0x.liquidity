@@ -394,16 +394,8 @@ impl EventSourced for EquityRedemption {
                     quantity,
                     raindex_withdraw_tx,
                     ..
-                } => Some(Self::Failed {
-                    symbol: symbol.clone(),
-                    quantity: *quantity,
-                    raindex_withdraw_tx: Some(*raindex_withdraw_tx),
-                    redemption_tx: *tx_hash,
-                    tokenization_request_id: None,
-                    failed_at: *failed_at,
-                }),
-
-                Self::TokensUnwrapped {
+                }
+                | Self::TokensUnwrapped {
                     symbol,
                     quantity,
                     raindex_withdraw_tx,

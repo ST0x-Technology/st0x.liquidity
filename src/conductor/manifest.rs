@@ -2,56 +2,40 @@
 //!
 //! This module enumerates ALL query processors that must be wired to
 //! CQRS frameworks. The exhaustive destructuring in
-//! [`QueryManifest::wire()`] ensures that adding a new query to
-//! `QueryManifest` forces you to wire it.
+//! [`QueryManifest::build_frameworks()`] ensures that adding a new
+//! query to `QueryManifest` forces you to wire it.
 //!
 //! # Adding a new query processor
 //!
-//! 1. Add field to [`QueryManifest`] with dependencies encoded in
-//!    the type
-//! 2. Add corresponding field to [`WiredQueries`]
+//! 1. Add field to [`QueryManifest`]
+//! 2. Add corresponding field to [`WiredQueries`] if needed
 //! 3. Create it in [`QueryManifest::new()`]
-//! 4. Wire it in [`QueryManifest::wire()`] - destructuring forces
-//!    you to handle it
+//! 4. Wire it in [`QueryManifest::build_frameworks()`] -
+//!    destructuring forces you to handle it
 //! 5. Extract and return it in [`WiredQueries`]
 
-use alloy::primitives::Address;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast, mpsc};
 
-use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Projection, Store, StoreBuilder, Unwired, deps};
+use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::EquityRedemption;
-use crate::inventory::{InventorySnapshot, InventorySnapshotReactor, InventoryView};
+use crate::inventory::InventorySnapshot;
 use crate::position::Position;
+use crate::rebalancing::RebalancingTrigger;
 use crate::rebalancing::equity::EquityTransferServices;
-use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::VaultRegistry;
-use crate::wrapper::Wrapper;
-
-type RebalancingTriggerDeps = deps![
-    Position,
-    TokenizedEquityMint,
-    EquityRedemption,
-    UsdcRebalance
-];
-
-type EventBroadcasterDeps = deps![TokenizedEquityMint, EquityRedemption, UsdcRebalance];
 
 /// All query processors that must be created and wired when
 /// rebalancing is enabled.
 ///
-/// Exhaustive destructuring in [`Self::wire()`] ensures every field
-/// is handled.
+/// Exhaustive destructuring in [`Self::build()`]
+/// ensures every field is handled.
 pub(super) struct QueryManifest {
-    rebalancing_trigger: Unwired<RebalancingTrigger, RebalancingTriggerDeps>,
-    event_broadcaster: Unwired<EventBroadcaster, EventBroadcasterDeps>,
-    inventory: Arc<RwLock<InventoryView>>,
+    rebalancing_trigger: Arc<RebalancingTrigger>,
+    event_broadcaster: Arc<EventBroadcaster>,
 }
 
 /// All query processors after wiring is complete.
@@ -70,40 +54,21 @@ pub(super) struct BuiltFrameworks {
 
 impl QueryManifest {
     pub(super) fn new(
-        config: RebalancingTriggerConfig,
-        vault_registry: Arc<Store<VaultRegistry>>,
-        orderbook: Address,
-        market_maker_wallet: Address,
-        inventory: Arc<RwLock<InventoryView>>,
-        operation_sender: mpsc::Sender<TriggeredOperation>,
-        event_sender: broadcast::Sender<ServerMessage>,
-        wrapper: Arc<dyn Wrapper>,
+        rebalancing_trigger: Arc<RebalancingTrigger>,
+        event_broadcaster: Arc<EventBroadcaster>,
     ) -> Self {
-        let rebalancing_trigger = RebalancingTrigger::new(
-            config,
-            vault_registry,
-            orderbook,
-            market_maker_wallet,
-            inventory.clone(),
-            operation_sender,
-            wrapper,
-        );
-
-        let event_broadcaster = EventBroadcaster::new(event_sender);
-
         Self {
-            rebalancing_trigger: Unwired::new(rebalancing_trigger),
-            event_broadcaster: Unwired::new(event_broadcaster),
-            inventory,
+            rebalancing_trigger,
+            event_broadcaster,
         }
     }
 
-    /// Wires all query processors and builds their CQRS frameworks.
+    /// Builds all CQRS frameworks, wiring query processors to each.
     ///
     /// Destructures `self` to ensure every field is handled. If you
     /// add a new query to the manifest, this method won't compile
     /// until you wire it.
-    pub(super) async fn wire(
+    pub(super) async fn build(
         self,
         pool: SqlitePool,
         services: EquityTransferServices,
@@ -111,50 +76,38 @@ impl QueryManifest {
         let Self {
             rebalancing_trigger,
             event_broadcaster,
-            inventory,
         } = self;
 
-        let position_view = Projection::<Position>::sqlite(pool.clone())?;
+        let position_projection = Projection::<Position>::sqlite(pool.clone())?;
 
-        let (position, (rebalancing_trigger, ())) = StoreBuilder::<Position>::new(pool.clone())
-            .with(position_view.clone())
-            .wire(rebalancing_trigger)
+        let position = StoreBuilder::<Position>::new(pool.clone())
+            .with(Arc::new(position_projection.clone()))
+            .with(rebalancing_trigger.clone())
             .build(())
             .await?;
 
-        let (mint, (event_broadcaster, (rebalancing_trigger, ()))) =
-            StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-                .wire(rebalancing_trigger)
-                .wire(event_broadcaster)
-                .build(services.clone())
-                .await?;
+        let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(rebalancing_trigger.clone())
+            .with(event_broadcaster.clone())
+            .build(services.clone())
+            .await?;
 
-        let (redemption, (event_broadcaster, (rebalancing_trigger, ()))) =
-            StoreBuilder::<EquityRedemption>::new(pool.clone())
-                .wire(rebalancing_trigger)
-                .wire(event_broadcaster)
-                .build(services)
-                .await?;
+        let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(rebalancing_trigger.clone())
+            .with(event_broadcaster.clone())
+            .build(services)
+            .await?;
 
-        let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) =
-            StoreBuilder::<UsdcRebalance>::new(pool.clone())
-                .wire(rebalancing_trigger)
-                .wire(event_broadcaster)
-                .build(())
-                .await?;
+        let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .with(rebalancing_trigger.clone())
+            .with(event_broadcaster)
+            .build(())
+            .await?;
 
-        let rebalancing_trigger = rebalancing_trigger.into_inner();
-        let _event_broadcaster = event_broadcaster.into_inner();
-
-        let snapshot_reactor = InventorySnapshotReactor::new(inventory, Some(rebalancing_trigger));
-        let snapshot_unwired: Unwired<InventorySnapshotReactor, deps![InventorySnapshot]> =
-            Unwired::new(snapshot_reactor);
-
-        let (snapshot, (_snapshot_reactor, ())) =
-            StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                .wire(snapshot_unwired)
-                .build(())
-                .await?;
+        let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .with(rebalancing_trigger)
+            .build(())
+            .await?;
 
         Ok((
             BuiltFrameworks {
@@ -164,7 +117,9 @@ impl QueryManifest {
                 usdc,
                 snapshot,
             },
-            WiredQueries { position_view },
+            WiredQueries {
+                position_view: position_projection,
+            },
         ))
     }
 }
@@ -179,6 +134,7 @@ mod tests {
     use super::*;
     use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
@@ -198,23 +154,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_produces_working_stores() {
+    async fn build_frameworks_produces_working_stores() {
         let pool = setup_test_db().await;
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
-        let manifest = QueryManifest::new(
+        let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
             test_trigger_config(),
             vault_registry,
             Address::ZERO,
             Address::ZERO,
             Arc::new(RwLock::new(InventoryView::default())),
             operation_sender,
-            event_sender,
             Arc::new(MockWrapper::new()),
-        );
+        ));
+
+        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender));
+        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
@@ -222,7 +180,7 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
         };
 
-        let (_frameworks, queries) = manifest.wire(pool, services).await.unwrap();
+        let (_frameworks, queries) = manifest.build(pool, services).await.unwrap();
 
         // Verify stores are usable by checking that loading a
         // nonexistent position returns None

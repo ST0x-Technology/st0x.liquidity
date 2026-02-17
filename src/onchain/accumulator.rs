@@ -127,6 +127,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
 mod tests {
     use alloy::primitives::TxHash;
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
@@ -145,7 +146,7 @@ mod tests {
     ) -> (Store<Position>, Projection<Position>) {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = StoreBuilder::new(pool.clone())
-            .with(projection.clone())
+            .with(Arc::new(projection.clone()))
             .build(())
             .await
             .unwrap();

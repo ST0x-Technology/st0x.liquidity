@@ -25,7 +25,7 @@ pub(crate) async fn build_offchain_order_cqrs(
     let projection = Projection::<OffchainOrder>::sqlite(pool.clone())?;
 
     let store = StoreBuilder::new(pool.clone())
-        .with(projection.clone())
+        .with(Arc::new(projection.clone()))
         .build(order_placer)
         .await?;
 

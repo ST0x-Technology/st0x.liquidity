@@ -26,10 +26,6 @@ pub(crate) enum InventoryError<T> {
         "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
     )]
     InsufficientInflight { requested: T, inflight: T },
-    #[error(
-        "amount received {amount_received:?} exceeds amount sent {amount_sent:?} (fees cannot be negative)"
-    )]
-    NegativeFee { amount_sent: T, amount_received: T },
     #[error(transparent)]
     Arithmetic(#[from] ArithmeticError<T>),
 }

@@ -173,18 +173,15 @@ struct AlpacaPrecisionLoss {
 mod tests {
     use std::str::FromStr;
 
-    use alloy::primitives::{TxHash, U256, address};
+    use alloy::primitives::{U256, address};
+    use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    use st0x_execution::{Direction, ExecutorOrderId, FractionalShares, Positive};
+    use st0x_execution::FractionalShares;
 
     use super::*;
-    use crate::offchain_order::{Dollars, OffchainOrderId};
-    use crate::position::{PositionEvent, TradeId};
-    use crate::tokenized_equity_mint::{
-        IssuerRequestId, ReceiptId, TokenizationRequestId, TokenizedEquityMintEvent,
-    };
+    use crate::inventory::Inventory;
     use crate::wrapper::RATIO_ONE;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
@@ -195,31 +192,6 @@ mod tests {
         FractionalShares::new(Decimal::from(n))
     }
 
-    fn make_onchain_fill(amount: FractionalShares, direction: Direction) -> PositionEvent {
-        PositionEvent::OnChainOrderFilled {
-            trade_id: TradeId {
-                tx_hash: TxHash::random(),
-                log_index: 0,
-            },
-            amount,
-            direction,
-            price_usdc: dec!(150.0),
-            block_timestamp: chrono::Utc::now(),
-            seen_at: chrono::Utc::now(),
-        }
-    }
-
-    fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
-        PositionEvent::OffChainOrderFilled {
-            offchain_order_id: OffchainOrderId::new(),
-            shares_filled: Positive::new(shares_filled).unwrap(),
-            direction,
-            executor_order_id: ExecutorOrderId::new("ORD1"),
-            price: Dollars(dec!(150.00)),
-            broker_timestamp: chrono::Utc::now(),
-        }
-    }
-
     fn make_imbalanced_view(
         symbol: &Symbol,
         onchain: i64,
@@ -227,11 +199,16 @@ mod tests {
     ) -> Arc<RwLock<InventoryView>> {
         let view = InventoryView::default()
             .with_equity(symbol.clone())
-            .on_position(symbol, &make_onchain_fill(shares(onchain), Direction::Buy))
-            .unwrap()
-            .on_position(
+            .update_equity(
                 symbol,
-                &make_offchain_fill(shares(offchain), Direction::Buy),
+                Inventory::add_onchain_available(shares(onchain)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                symbol,
+                Inventory::add_offchain_available(shares(offchain)),
+                Utc::now(),
             )
             .unwrap();
 
@@ -416,14 +393,16 @@ mod tests {
     ) -> Arc<RwLock<InventoryView>> {
         let view = InventoryView::default()
             .with_equity(symbol.clone())
-            .on_position(
+            .update_equity(
                 symbol,
-                &make_onchain_fill(precise_shares(onchain), Direction::Buy),
+                Inventory::add_onchain_available(precise_shares(onchain)),
+                Utc::now(),
             )
             .unwrap()
-            .on_position(
+            .update_equity(
                 symbol,
-                &make_offchain_fill(precise_shares(offchain), Direction::Buy),
+                Inventory::add_offchain_available(precise_shares(offchain)),
+                Utc::now(),
             )
             .unwrap();
 
@@ -490,36 +469,24 @@ mod tests {
         // Now simulate the mint completing with the TRUNCATED quantity.
         // The inventory should be updated with only the truncated amount.
         let mut view = inventory.write().await;
-        let now = chrono::Utc::now();
 
         // MintAccepted: move truncated quantity from offchain.available to offchain.inflight
         *view = view
             .clone()
-            .on_mint(
+            .update_equity(
                 &symbol,
-                &TokenizedEquityMintEvent::MintAccepted {
-                    issuer_request_id: IssuerRequestId::new("test"),
-                    tokenization_request_id: TokenizationRequestId("test".to_string()),
-                    accepted_at: now,
-                },
-                quantity,
-                now,
+                Inventory::move_offchain_to_inflight(quantity),
+                Utc::now(),
             )
             .unwrap();
 
         // TokensReceived: move from offchain.inflight to onchain.available
         *view = view
             .clone()
-            .on_mint(
+            .update_equity(
                 &symbol,
-                &TokenizedEquityMintEvent::TokensReceived {
-                    tx_hash: TxHash::random(),
-                    receipt_id: ReceiptId(U256::from(1)),
-                    shares_minted: U256::ZERO, // Not used by inventory update
-                    received_at: now,
-                },
-                quantity,
-                now,
+                Inventory::transfer_offchain_inflight_to_onchain(quantity),
+                Utc::now(),
             )
             .unwrap();
 
@@ -595,32 +562,20 @@ mod tests {
         // Simulate mint completing
         {
             let mut view = inventory.write().await;
-            let now = chrono::Utc::now();
             *view = view
                 .clone()
-                .on_mint(
+                .update_equity(
                     &symbol,
-                    &TokenizedEquityMintEvent::MintAccepted {
-                        issuer_request_id: IssuerRequestId::new("test"),
-                        tokenization_request_id: TokenizationRequestId("test1".to_string()),
-                        accepted_at: now,
-                    },
-                    qty1,
-                    now,
+                    Inventory::move_offchain_to_inflight(qty1),
+                    Utc::now(),
                 )
                 .unwrap();
             *view = view
                 .clone()
-                .on_mint(
+                .update_equity(
                     &symbol,
-                    &TokenizedEquityMintEvent::TokensReceived {
-                        tx_hash: TxHash::random(),
-                        receipt_id: ReceiptId(U256::from(1)),
-                        shares_minted: U256::ZERO,
-                        received_at: now,
-                    },
-                    qty1,
-                    now,
+                    Inventory::transfer_offchain_inflight_to_onchain(qty1),
+                    Utc::now(),
                 )
                 .unwrap();
         }
@@ -633,9 +588,10 @@ mod tests {
             let mut view = inventory.write().await;
             *view = view
                 .clone()
-                .on_position(
+                .update_equity(
                     &symbol,
-                    &make_offchain_fill(precise_shares("100.0000000001"), Direction::Buy),
+                    Inventory::add_offchain_available(precise_shares("100.0000000001")),
+                    Utc::now(),
                 )
                 .unwrap();
         }

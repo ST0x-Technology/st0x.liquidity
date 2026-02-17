@@ -277,7 +277,7 @@ mod tests {
         let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(position_projection.clone())
+                .with(Arc::new(position_projection.clone()))
                 .build(())
                 .await
                 .unwrap(),
@@ -287,7 +287,7 @@ mod tests {
         let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with(offchain_order_projection.clone())
+                .with(Arc::new(offchain_order_projection.clone()))
                 .build(order_placer)
                 .await
                 .unwrap(),

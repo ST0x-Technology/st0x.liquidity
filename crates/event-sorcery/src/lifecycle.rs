@@ -12,13 +12,12 @@ use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::EventSourced;
-use crate::dependency::InjectAtDepth;
+use crate::dependency::HasEntity;
 use crate::reactor::Reactor;
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
@@ -252,21 +251,19 @@ where
 ///
 /// Parses the stringly-typed aggregate ID into `Entity::Id`,
 /// injects the entity's (Id, Event) pair into the reactor's
-/// computed event type at the correct depth, and dispatches it.
-pub(crate) struct ReactorBridge<R, Depth> {
+/// computed event type via [`HasEntity`], and dispatches it.
+pub(crate) struct ReactorBridge<R> {
     pub(crate) reactor: Arc<R>,
-    pub(crate) _depth: PhantomData<Depth>,
 }
 
 #[async_trait]
-impl<R, Depth, Entity> Query<Lifecycle<Entity>> for ReactorBridge<R, Depth>
+impl<R, Entity> Query<Lifecycle<Entity>> for ReactorBridge<R>
 where
     R: Reactor,
-    R::Dependencies: InjectAtDepth<Depth, EntityId = Entity::Id, EntityEvent = Entity::Event>,
+    R::Dependencies: HasEntity<Entity>,
     Entity: EventSourced,
     Entity::Id: Clone,
     Entity::Event: Clone,
-    Depth: Send + Sync,
     <Entity::Id as FromStr>::Err: Debug,
     Lifecycle<Entity>: Aggregate<Event = Entity::Event>,
 {
@@ -281,7 +278,7 @@ where
         };
 
         for envelope in events {
-            let injected = <R::Dependencies as InjectAtDepth<Depth>>::inject(
+            let injected = <R::Dependencies as HasEntity<Entity>>::inject(
                 typed_id.clone(),
                 envelope.payload.clone(),
             );

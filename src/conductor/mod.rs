@@ -23,16 +23,15 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder, Unwired, deps};
+use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
-use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
-};
+use crate::dashboard::EventBroadcaster;
+use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -51,7 +50,8 @@ use crate::queue::{
 };
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
-    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig, spawn_rebalancer,
+    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
+    spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -178,7 +178,7 @@ impl Conductor {
 
         let vault_registry = Arc::new(
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .with((*vault_registry_projection).clone())
+                .with(Arc::new((*vault_registry_projection).clone()))
                 .build(())
                 .await?,
         );
@@ -205,7 +205,9 @@ impl Conductor {
                 )
             } else {
                 let (position, position_projection) = build_position_cqrs(pool).await?;
-                let snapshot = build_inventory_snapshot_store(pool, inventory.clone()).await?;
+                let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                    .build(())
+                    .await?;
                 (position, position_projection, snapshot, None)
             };
 
@@ -215,7 +217,7 @@ impl Conductor {
 
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with((*offchain_order_projection).clone())
+                .with(Arc::new((*offchain_order_projection).clone()))
                 .build(order_placer)
                 .await?,
         );
@@ -352,7 +354,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         wrapper: wrapper.clone(),
     };
 
-    let manifest = QueryManifest::new(
+    let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
         RebalancingTriggerConfig {
             equity: rebalancing_ctx.equity,
             usdc: rebalancing_ctx.usdc.clone(),
@@ -362,12 +364,14 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         market_maker_wallet,
         inventory.clone(),
         operation_sender,
-        event_sender,
         wrapper,
-    );
+    ));
+
+    let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender));
+    let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
     let (built, wired) = manifest
-        .wire(pool.clone(), equity_transfer_services)
+        .build(pool.clone(), equity_transfer_services)
         .await?;
 
     let frameworks = RebalancingCqrsFrameworks {
@@ -459,29 +463,11 @@ async fn build_position_cqrs(
     let position_view = Projection::<Position>::sqlite(pool.clone())?;
 
     let store = StoreBuilder::<Position>::new(pool.clone())
-        .with(position_view.clone())
+        .with(Arc::new(position_view.clone()))
         .build(())
         .await?;
 
     Ok((Arc::new(store), Arc::new(position_view)))
-}
-
-/// Constructs the inventory snapshot store with its query.
-async fn build_inventory_snapshot_store(
-    pool: &SqlitePool,
-    inventory: Arc<RwLock<InventoryView>>,
-) -> anyhow::Result<Store<InventorySnapshot>> {
-    let snapshot_reactor = InventorySnapshotReactor::new(inventory, None);
-
-    let query: Unwired<InventorySnapshotReactor, deps![InventorySnapshot]> =
-        Unwired::new(snapshot_reactor);
-
-    let (store, (_query, ())) = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-        .wire(query)
-        .build(())
-        .await?;
-
-    Ok(store)
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
@@ -1500,10 +1486,9 @@ mod tests {
     };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::inventory::ImbalanceThreshold;
-    use crate::offchain_order::{Dollars, OffchainOrderId};
+    use crate::inventory::{ImbalanceThreshold, Inventory};
+    use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
-    use crate::position::PositionEvent;
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
@@ -2727,7 +2712,7 @@ mod tests {
         let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(position_projection.clone())
+                .with(Arc::new(position_projection.clone()))
                 .build(())
                 .await
                 .unwrap(),
@@ -2736,7 +2721,7 @@ mod tests {
         let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with(offchain_order_projection.clone())
+                .with(Arc::new(offchain_order_projection.clone()))
                 .build(order_placer)
                 .await
                 .unwrap(),
@@ -3237,31 +3222,16 @@ mod tests {
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
             .with_equity(symbol.clone())
-            .on_position(
+            .update_equity(
                 symbol,
-                &PositionEvent::OnChainOrderFilled {
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 0,
-                    },
-                    amount: FractionalShares::new(dec!(20)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: chrono::Utc::now(),
-                    seen_at: chrono::Utc::now(),
-                },
+                Inventory::add_onchain_available(FractionalShares::new(dec!(20))),
+                chrono::Utc::now(),
             )
             .unwrap()
-            .on_position(
+            .update_equity(
                 symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(80))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::add_offchain_available(FractionalShares::new(dec!(80))),
+                chrono::Utc::now(),
             )
             .unwrap()
     }
@@ -3322,7 +3292,7 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(Arc::clone(&trigger))
                 .build(())
                 .await
@@ -3372,16 +3342,10 @@ mod tests {
         // Seed inventory with 50 offchain shares. CQRS will add 50 onchain.
         let initial_inventory = InventoryView::default()
             .with_equity(symbol.clone())
-            .on_position(
+            .update_equity(
                 &symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("SEED"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::add_offchain_available(FractionalShares::new(dec!(50))),
+                chrono::Utc::now(),
             )
             .unwrap();
 
@@ -3409,7 +3373,7 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(Arc::clone(&trigger))
                 .build(())
                 .await
@@ -3456,34 +3420,18 @@ mod tests {
         let order_owner = address!("0x0000000000000000000000000000000000000002");
 
         // Start balanced: 50 onchain, 50 offchain.
-        let mut initial_inventory = InventoryView::default().with_equity(symbol.clone());
-        initial_inventory = initial_inventory
-            .on_position(
+        let initial_inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .update_equity(
                 &symbol,
-                &PositionEvent::OnChainOrderFilled {
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 0,
-                    },
-                    amount: FractionalShares::new(dec!(50)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: chrono::Utc::now(),
-                    seen_at: chrono::Utc::now(),
-                },
+                Inventory::add_onchain_available(FractionalShares::new(dec!(50))),
+                chrono::Utc::now(),
             )
-            .unwrap();
-        initial_inventory = initial_inventory
-            .on_position(
+            .unwrap()
+            .update_equity(
                 &symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::add_offchain_available(FractionalShares::new(dec!(50))),
+                chrono::Utc::now(),
             )
             .unwrap();
 
@@ -3514,7 +3462,7 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(trigger.clone())
                 .build(())
                 .await
@@ -3587,31 +3535,16 @@ mod tests {
         // 65 onchain, 35 offchain = 65% < 70% upper bound -> within bounds.
         let initial_inventory = InventoryView::default()
             .with_equity(symbol.clone())
-            .on_position(
+            .update_equity(
                 &symbol,
-                &PositionEvent::OnChainOrderFilled {
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 0,
-                    },
-                    amount: FractionalShares::new(dec!(65)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: chrono::Utc::now(),
-                    seen_at: chrono::Utc::now(),
-                },
+                Inventory::add_onchain_available(FractionalShares::new(dec!(65))),
+                chrono::Utc::now(),
             )
             .unwrap()
-            .on_position(
+            .update_equity(
                 &symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(35))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::add_offchain_available(FractionalShares::new(dec!(35))),
+                chrono::Utc::now(),
             )
             .unwrap();
 
@@ -3642,7 +3575,7 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(trigger)
                 .build(())
                 .await
