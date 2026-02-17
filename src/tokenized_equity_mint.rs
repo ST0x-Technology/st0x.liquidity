@@ -100,6 +100,9 @@ pub(crate) struct HttpStatusCode(pub(crate) u16);
 /// invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum TokenizedEquityMintError {
+    /// Command sent to a non-existent aggregate (must use RequestMint to initialize)
+    #[error("Aggregate not initialized: use RequestMint to start a new mint")]
+    NotInitialized,
     /// Attempted to request mint when already in progress
     #[error("Mint already in progress")]
     AlreadyInProgress,
@@ -159,6 +162,7 @@ pub(crate) enum TokenizedEquityMintCommand {
     ///                     or MintRejected (immediate failure)
     ///                     or MintAcceptanceFailed (failure after acceptance)
     RequestMint {
+        issuer_request_id: IssuerRequestId,
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
@@ -617,20 +621,114 @@ impl EventSourced for TokenizedEquityMint {
 
     async fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            TokenizedEquityMintCommand::RequestMint {
+        use TokenizedEquityMintEvent::*;
+
+        let TokenizedEquityMintCommand::RequestMint {
+            issuer_request_id,
+            symbol,
+            quantity,
+            wallet,
+        } = command
+        else {
+            return Err(TokenizedEquityMintError::NotInitialized);
+        };
+
+        let now = Utc::now();
+        let mint_requested = MintRequested {
+            symbol: symbol.clone(),
+            quantity,
+            wallet,
+            requested_at: now,
+        };
+
+        let alpaca_request = match services
+            .tokenizer
+            .request_mint(
                 symbol,
-                quantity,
+                FractionalShares::new(quantity),
                 wallet,
-            } => Ok(vec![TokenizedEquityMintEvent::MintRequested {
-                symbol,
-                quantity,
-                wallet,
-                requested_at: Utc::now(),
-            }]),
-            _ => Err(TokenizedEquityMintError::TokensNotReceived),
+                issuer_request_id.clone(),
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(error) => {
+                warn!(%error, "Mint request failed");
+                return Err(TokenizedEquityMintError::RequestFailed);
+            }
+        };
+
+        if matches!(alpaca_request.status, TokenizationRequestStatus::Rejected) {
+            return Ok(vec![
+                mint_requested,
+                MintRejected {
+                    reason: "Rejected by Alpaca".to_string(),
+                    rejected_at: now,
+                },
+            ]);
+        }
+
+        let mint_accepted = MintAccepted {
+            issuer_request_id,
+            tokenization_request_id: alpaca_request.id.clone(),
+            accepted_at: now,
+        };
+
+        let completed = match services
+            .tokenizer
+            .poll_mint_until_complete(&alpaca_request.id)
+            .await
+        {
+            Ok(req) => req,
+            Err(error) => {
+                warn!(%error, "Polling failed");
+                return Ok(vec![
+                    mint_requested,
+                    mint_accepted,
+                    MintAcceptanceFailed {
+                        reason: format!("Polling failed: {error}"),
+                        failed_at: Utc::now(),
+                    },
+                ]);
+            }
+        };
+
+        match completed.status {
+            TokenizationRequestStatus::Completed => {
+                let tx_hash = completed
+                    .tx_hash
+                    .ok_or(TokenizedEquityMintError::MissingTxHash)?;
+                let shares_minted = decimal_to_u256_18_decimals(quantity)?;
+
+                Ok(vec![
+                    mint_requested,
+                    mint_accepted,
+                    TokensReceived {
+                        tx_hash,
+                        receipt_id: ReceiptId(U256::ZERO),
+                        shares_minted,
+                        received_at: Utc::now(),
+                    },
+                ])
+            }
+            TokenizationRequestStatus::Rejected => Ok(vec![
+                mint_requested,
+                mint_accepted,
+                MintAcceptanceFailed {
+                    reason: "Rejected by Alpaca after acceptance".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ]),
+            TokenizationRequestStatus::Pending => Ok(vec![
+                mint_requested,
+                mint_accepted,
+                MintAcceptanceFailed {
+                    reason: "Unexpected Pending status after polling".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ]),
         }
     }
 
@@ -745,9 +843,33 @@ impl EventSourced for TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rust_decimal_macros::dec;
 
+    use st0x_event_sorcery::TestHarness;
+
     use super::*;
+    use crate::onchain::mock::MockRaindex;
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::wrapper::mock::MockWrapper;
+
+    fn mint_services(tokenizer: MockTokenizer) -> EquityTransferServices {
+        EquityTransferServices {
+            tokenizer: Arc::new(tokenizer),
+            raindex: Arc::new(MockRaindex::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        }
+    }
+
+    fn mint_command() -> TokenizedEquityMintCommand {
+        TokenizedEquityMintCommand::RequestMint {
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(10),
+            wallet: Address::ZERO,
+        }
+    }
 
     fn mint_requested_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
@@ -788,6 +910,51 @@ mod tests {
             vault_deposit_tx_hash: TxHash::random(),
             deposited_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn initialize_mint_happy_path_emits_requested_accepted_tokens_received() {
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], TokenizedEquityMintEvent::MintRequested { symbol, .. } if symbol == &Symbol::new("AAPL").unwrap()),
+            "Expected MintRequested, got: {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], TokenizedEquityMintEvent::MintAccepted { .. }),
+            "Expected MintAccepted, got: {:?}",
+            events[1]
+        );
+        assert!(
+            matches!(&events[2], TokenizedEquityMintEvent::TokensReceived { .. }),
+            "Expected TokensReceived, got: {:?}",
+            events[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_uses_command_issuer_request_id() {
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given_no_previous_events()
+            .when(mint_command())
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                &events[1],
+                TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
+                    if issuer_request_id.0 == "ISS001"
+            ),
+            "Expected issuer_request_id from command, got: {:?}",
+            events[1]
+        );
     }
 
     #[test]
@@ -949,25 +1116,6 @@ mod tests {
         let value = Decimal::from_str("1.123456789012345678").unwrap();
         let result = decimal_to_u256_18_decimals(value).unwrap();
         assert_eq!(result, U256::from(1_123_456_789_012_345_678_u128));
-    }
-
-    #[tokio::test]
-    async fn mint_uses_command_issuer_request_id() {
-        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
-            .given_no_previous_events()
-            .when(mint_command())
-            .await
-            .events();
-
-        assert!(
-            matches!(
-                &events[1],
-                TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
-                    if issuer_request_id.0 == "ISS001"
-            ),
-            "Expected issuer_request_id from command, got: {:?}",
-            events[1]
-        );
     }
 
     #[test]

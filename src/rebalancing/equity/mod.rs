@@ -268,6 +268,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             .send(
                 &issuer_request_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
                     quantity: quantity.inner(),
                     wallet: self.wallet,
