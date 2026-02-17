@@ -3,11 +3,10 @@
 mod polling;
 pub(crate) mod snapshot;
 mod venue_balance;
-mod view;
+pub(crate) mod view;
 
 pub(crate) use polling::InventoryPollingService;
 pub(crate) use snapshot::InventorySnapshot;
 pub(crate) use view::{
-    Imbalance, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, Operator,
-    TransferOp, Venue,
+    Imbalance, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, TransferOp, Venue,
 };

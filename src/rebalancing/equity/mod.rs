@@ -452,6 +452,7 @@ mod tests {
     async fn create_equity_transfer(
         tokenizer: Arc<dyn Tokenizer>,
         raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
     ) -> CrossVenueEquityTransfer {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
@@ -459,8 +460,6 @@ mod tests {
 
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services));
-
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
 
         CrossVenueEquityTransfer::new(
             raindex,
@@ -474,9 +473,12 @@ mod tests {
 
     #[tokio::test]
     async fn mint_transfer_sends_mint_and_deposit_commands() {
-        let transfer =
-            create_equity_transfer(Arc::new(MockTokenizer::new()), Arc::new(MockRaindex::new()))
-                .await;
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
 
         CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
             &transfer,
@@ -498,7 +500,8 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -521,7 +524,8 @@ mod tests {
             Arc::new(MockTokenizer::new().with_detection_outcome(MockDetectionOutcome::Timeout));
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -545,7 +549,8 @@ mod tests {
             Arc::new(MockTokenizer::new().with_detection_outcome(MockDetectionOutcome::ApiError));
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -572,7 +577,8 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -599,7 +605,8 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -614,6 +621,56 @@ mod tests {
         assert!(
             matches!(error, RedemptionError::UnexpectedPendingStatus),
             "Expected UnexpectedPendingStatus error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_wrapper_fails() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, MintError::Wrapper(_)),
+            "Expected Wrapper error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_raindex_deposit_fails() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::failing_deposit()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, MintError::Raindex(_)),
+            "Expected Raindex error, got: {error:?}"
         );
     }
 }

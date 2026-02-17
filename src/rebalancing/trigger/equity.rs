@@ -181,7 +181,8 @@ mod tests {
     use st0x_execution::FractionalShares;
 
     use super::*;
-    use crate::inventory::{Inventory, Operator, TransferOp, Venue};
+    use crate::inventory::view::Operator;
+    use crate::inventory::{Inventory, TransferOp, Venue};
     use crate::wrapper::RATIO_ONE;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {

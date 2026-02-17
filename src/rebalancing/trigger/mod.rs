@@ -748,7 +748,8 @@ mod tests {
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
-    use crate::inventory::{Operator, TransferOp, Venue};
+    use crate::inventory::view::Operator;
+    use crate::inventory::{TransferOp, Venue};
     use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::{PositionEvent, TradeId};
     use crate::threshold::{ExecutionThreshold, Usdc};

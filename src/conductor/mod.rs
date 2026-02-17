@@ -1486,7 +1486,8 @@ mod tests {
     };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::inventory::{ImbalanceThreshold, Inventory, Operator, Venue};
+    use crate::inventory::view::Operator;
+    use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
     use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::trigger::UsdcRebalancing;

@@ -13,7 +13,7 @@
 //!     Failed          Failed          Failed           Failed
 //! ```
 //!
-//! - `MintRequested` can be rejected via `RejectMint`
+//! - `MintRequested` can be rejected by Alpaca during `RequestMint`
 //! - `MintAccepted` can fail via `Poll` (rejection/timeout/error)
 //! - `DepositedIntoRaindex` and `Failed` are terminal states
 //!
@@ -173,9 +173,6 @@ pub(crate) enum TokenizedEquityMintCommand {
     /// Emits TokensReceived (success)
     ///     or MintAcceptanceFailed (rejection/timeout/error)
     Poll,
-    RejectMint {
-        reason: String,
-    },
     WrapTokens {
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
@@ -737,18 +734,6 @@ impl EventSourced for TokenizedEquityMint {
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
             },
 
-            TokenizedEquityMintCommand::RejectMint { reason } => match self {
-                Self::MintRequested { .. } => Ok(vec![MintRejected {
-                    reason,
-                    rejected_at: Utc::now(),
-                }]),
-                Self::DepositedIntoRaindex { .. } | Self::TokensWrapped { .. } => {
-                    Err(TokenizedEquityMintError::AlreadyCompleted)
-                }
-                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
-                _ => Err(TokenizedEquityMintError::AlreadyInProgress),
-            },
-
             TokenizedEquityMintCommand::WrapTokens {
                 wrap_tx_hash,
                 wrapped_shares,
@@ -791,12 +776,12 @@ mod tests {
     use std::sync::Arc;
 
     use rust_decimal_macros::dec;
-
-    use st0x_event_sorcery::{TestHarness, TestStore};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
-    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenization::Tokenizer;
+    use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
     use crate::wrapper::mock::MockWrapper;
 
     fn mint_services(tokenizer: MockTokenizer) -> EquityTransferServices {
@@ -1102,5 +1087,210 @@ mod tests {
 
         let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn request_mint_rejected_by_alpaca_emits_rejected() {
+        let tokenizer =
+            MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::Rejected);
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state after rejection, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_mint_api_error_returns_error() {
+        let tokenizer =
+            MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError);
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+        let id = IssuerRequestId::new("ISS001");
+
+        let error = store.send(&id, mint_command()).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    TokenizedEquityMintError::RequestFailed
+                ))
+            ),
+            "Expected RequestFailed, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_pending_emits_acceptance_failed() {
+        let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Pending);
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state after pending poll, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_error_emits_acceptance_failed() {
+        let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::PollError);
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state after poll error, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_mint_passes_issuer_request_id_to_tokenizer() {
+        let tokenizer: Arc<MockTokenizer> = Arc::new(MockTokenizer::new());
+        let store = TestStore::<TokenizedEquityMint>::new(EquityTransferServices {
+            tokenizer: Arc::clone(&tokenizer) as Arc<dyn Tokenizer>,
+            raindex: Arc::new(MockRaindex::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        });
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+
+        let recorded_id = tokenizer.last_issuer_request_id().unwrap();
+        assert_eq!(recorded_id.0, "ISS001");
+    }
+
+    #[test]
+    fn reject_mint_evolves_from_requested_to_failed() {
+        let requested = TokenizedEquityMint::MintRequested {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(10),
+            wallet: Address::random(),
+            requested_at: Utc::now(),
+        };
+
+        let event = TokenizedEquityMintEvent::MintRejected {
+            reason: "Insufficient balance".to_string(),
+            rejected_at: Utc::now(),
+        };
+
+        let result = TokenizedEquityMint::evolve(&requested, &event)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, TokenizedEquityMint::Failed { ref reason, .. } if reason == "Insufficient balance"),
+            "Expected Failed with reason, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_tokens_is_pure_state_transition() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: TxHash::random(),
+                    wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "Expected TokensWrapped, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_to_vault_is_pure_state_transition() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: TxHash::random(),
+                    wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::DepositToVault {
+                    vault_deposit_tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "Expected DepositedIntoRaindex, got: {entity:?}"
+        );
+    }
+
+    #[test]
+    fn evolve_full_happy_path_with_event_helpers() {
+        let mut state: Option<TokenizedEquityMint> = None;
+
+        let events = [
+            mint_requested_event(),
+            mint_accepted_event(),
+            tokens_received_event(),
+            tokens_wrapped_event(),
+            vault_deposited_event(),
+        ];
+
+        for event in &events {
+            state = state.as_ref().map_or_else(
+                || TokenizedEquityMint::originate(event),
+                |current| TokenizedEquityMint::evolve(current, event).unwrap(),
+            );
+        }
+
+        assert!(
+            matches!(
+                state,
+                Some(TokenizedEquityMint::DepositedIntoRaindex { .. })
+            ),
+            "Expected DepositedIntoRaindex after full lifecycle, got: {state:?}"
+        );
     }
 }
