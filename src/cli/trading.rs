@@ -85,14 +85,12 @@ pub(super) async fn order_status_command<W: Write>(
         OrderState::Filled {
             executed_at,
             order_id,
-            price_cents,
+            price,
         } => {
-            let dollars = price_cents / 100;
-            let cents = price_cents % 100;
             writeln!(stdout, "✅ Order Status: FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
             writeln!(stdout, "   Executed At: {executed_at}")?;
-            writeln!(stdout, "   Fill Price: ${dollars}.{cents:02}")?;
+            writeln!(stdout, "   Fill Price: ${price}")?;
         }
         OrderState::Failed {
             failed_at,

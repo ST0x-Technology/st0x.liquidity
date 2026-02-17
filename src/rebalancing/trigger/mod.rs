@@ -587,7 +587,7 @@ mod tests {
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::InventorySnapshotReactor;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
-    use crate::offchain_order::{OffchainOrderId, PriceCents};
+    use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -760,7 +760,7 @@ mod tests {
             shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
             executor_order_id: ExecutorOrderId::new("ORD1"),
-            price_cents: PriceCents(15000),
+            price: Dollars(dec!(150.00)),
             broker_timestamp: Utc::now(),
         }
     }

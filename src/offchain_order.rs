@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::str::FromStr;
@@ -56,7 +57,7 @@ pub(crate) enum OffchainOrder {
         direction: Direction,
         executor: SupportedExecutor,
         executor_order_id: ExecutorOrderId,
-        avg_price_cents: PriceCents,
+        avg_price: Dollars,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
         partially_filled_at: DateTime<Utc>,
@@ -67,7 +68,7 @@ pub(crate) enum OffchainOrder {
         direction: Direction,
         executor: SupportedExecutor,
         executor_order_id: ExecutorOrderId,
-        price_cents: PriceCents,
+        price: Dollars,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
         filled_at: DateTime<Utc>,
@@ -148,7 +149,7 @@ impl EventSourced for OffchainOrder {
 
             PartiallyFilled {
                 shares_filled,
-                avg_price_cents,
+                avg_price,
                 partially_filled_at,
             } => Ok(match entity {
                 Self::Submitted {
@@ -176,7 +177,7 @@ impl EventSourced for OffchainOrder {
                     direction: *direction,
                     executor: *executor,
                     executor_order_id: executor_order_id.clone(),
-                    avg_price_cents: *avg_price_cents,
+                    avg_price: *avg_price,
                     placed_at: *placed_at,
                     submitted_at: *submitted_at,
                     partially_filled_at: *partially_filled_at,
@@ -185,10 +186,7 @@ impl EventSourced for OffchainOrder {
                 Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => None,
             }),
 
-            Filled {
-                price_cents,
-                filled_at,
-            } => Ok(match entity {
+            Filled { price, filled_at } => Ok(match entity {
                 Self::Submitted {
                     symbol,
                     shares,
@@ -213,7 +211,7 @@ impl EventSourced for OffchainOrder {
                     direction: *direction,
                     executor: *executor,
                     executor_order_id: executor_order_id.clone(),
-                    price_cents: *price_cents,
+                    price: *price,
                     placed_at: *placed_at,
                     submitted_at: *submitted_at,
                     filled_at: *filled_at,
@@ -319,12 +317,12 @@ impl EventSourced for OffchainOrder {
 
             OffchainOrderCommand::UpdatePartialFill {
                 shares_filled,
-                avg_price_cents,
+                avg_price,
             } => match self {
                 Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
                     Ok(vec![OffchainOrderEvent::PartiallyFilled {
                         shares_filled,
-                        avg_price_cents,
+                        avg_price,
                         partially_filled_at: Utc::now(),
                     }])
                 }
@@ -334,10 +332,10 @@ impl EventSourced for OffchainOrder {
                 }
             },
 
-            OffchainOrderCommand::CompleteFill { price_cents } => match self {
+            OffchainOrderCommand::CompleteFill { price } => match self {
                 Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
                     Ok(vec![OffchainOrderEvent::Filled {
-                        price_cents,
+                        price,
                         filled_at: Utc::now(),
                     }])
                 }
@@ -475,7 +473,7 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PriceCents(pub(crate) u64);
+pub(crate) struct Dollars(pub(crate) Decimal);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OffchainOrderCommand {
@@ -487,10 +485,10 @@ pub(crate) enum OffchainOrderCommand {
     },
     UpdatePartialFill {
         shares_filled: FractionalShares,
-        avg_price_cents: PriceCents,
+        avg_price: Dollars,
     },
     CompleteFill {
-        price_cents: PriceCents,
+        price: Dollars,
     },
     MarkFailed {
         error: String,
@@ -512,11 +510,11 @@ pub(crate) enum OffchainOrderEvent {
     },
     PartiallyFilled {
         shares_filled: FractionalShares,
-        avg_price_cents: PriceCents,
+        avg_price: Dollars,
         partially_filled_at: DateTime<Utc>,
     },
     Filled {
-        price_cents: PriceCents,
+        price: Dollars,
         filled_at: DateTime<Utc>,
     },
     Failed {
@@ -578,14 +576,6 @@ pub(crate) enum OffchainOrderError {
     AlreadyCompleted,
     #[error("Order has not been placed yet")]
     NotPlaced,
-}
-
-impl TryFrom<i64> for PriceCents {
-    type Error = std::num::TryFromIntError;
-
-    fn try_from(value: i64) -> Result<Self, Self::Error> {
-        u64::try_from(value).map(Self)
-    }
 }
 
 #[cfg(test)]
@@ -670,7 +660,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -717,7 +707,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price_cents: PriceCents(15000),
+                    avg_price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -738,7 +728,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price_cents: PriceCents(15000),
+                    avg_price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -748,7 +738,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled: FractionalShares::new(dec!(75)),
-                    avg_price_cents: PriceCents(15050),
+                    avg_price: Dollars(dec!(150.50)),
                 },
             )
             .await
@@ -772,7 +762,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -793,7 +783,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled: FractionalShares::new(dec!(75)),
-                    avg_price_cents: PriceCents(15000),
+                    avg_price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -802,7 +792,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price_cents: PriceCents(15025),
+                    price: Dollars(dec!(150.25)),
                 },
             )
             .await
@@ -821,7 +811,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -842,7 +832,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -852,7 +842,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -894,7 +884,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price_cents: PriceCents(15000),
+                    avg_price: Dollars(dec!(150.00)),
                 },
             )
             .await
@@ -923,7 +913,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                 },
             )
             .await

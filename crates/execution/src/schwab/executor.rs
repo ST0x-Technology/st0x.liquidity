@@ -9,8 +9,7 @@ use crate::schwab::SchwabAuthCtx;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    Direction, ExecutionError, Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState,
-    OrderStatus, OrderUpdate, Positive, Symbol, TryIntoExecutor,
+    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, TryIntoExecutor,
 };
 
 /// Everything the Schwab executor needs to initialize: auth credentials,
@@ -180,63 +179,6 @@ impl Executor for Schwab {
                 order_id: order_id.clone(),
             })
         }
-    }
-
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
-        info!("Polling pending orders");
-
-        // Query database directly for submitted orders
-        let rows = sqlx::query!(
-            "SELECT * FROM offchain_trades WHERE status = 'SUBMITTED' ORDER BY id ASC"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut updates = Vec::new();
-
-        for row in rows {
-            let Some(order_id_value) = row.order_id else {
-                return Err(ExecutionError::MissingOrderId {
-                    status: OrderStatus::Submitted,
-                });
-            };
-
-            // Get current status from Schwab API
-            match self.get_order_status(&order_id_value).await {
-                Ok(current_state) => {
-                    // Only include orders that have changed status
-                    if !matches!(current_state, OrderState::Submitted { .. }) {
-                        let price = match &current_state {
-                            OrderState::Filled { price, .. } => Some(*price),
-                            _ => None,
-                        };
-
-                        let symbol = Symbol::new(row.symbol)?;
-                        let shares_decimal: rust_decimal::Decimal =
-                            row.shares.to_string().parse()?;
-                        let shares = Positive::new(FractionalShares::new(shares_decimal))?;
-                        let direction: Direction = row.direction.parse()?;
-
-                        updates.push(OrderUpdate {
-                            order_id: order_id_value.clone(),
-                            symbol,
-                            shares,
-                            direction,
-                            status: current_state.status(),
-                            updated_at: chrono::Utc::now(),
-                            price,
-                        });
-                    }
-                }
-                Err(e) => {
-                    // Log error but continue with other orders
-                    info!("Failed to get status for order {}: {}", order_id_value, e);
-                }
-            }
-        }
-
-        info!("Found {} order updates", updates.len());
-        Ok(updates)
     }
 
     fn to_supported_executor(&self) -> crate::SupportedExecutor {

@@ -173,7 +173,7 @@ mod tests {
     use st0x_execution::{Direction, ExecutorOrderId, FractionalShares, Positive};
 
     use super::*;
-    use crate::offchain_order::{OffchainOrderId, PriceCents};
+    use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::{PositionEvent, TradeId};
     use crate::tokenized_equity_mint::{
         IssuerRequestId, ReceiptId, TokenizationRequestId, TokenizedEquityMintEvent,
@@ -203,7 +203,7 @@ mod tests {
             shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
             executor_order_id: ExecutorOrderId::new("ORD1"),
-            price_cents: PriceCents(15000),
+            price: Dollars(dec!(150.00)),
             broker_timestamp: chrono::Utc::now(),
         }
     }

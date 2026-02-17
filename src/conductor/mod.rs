@@ -1497,7 +1497,7 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::inventory::ImbalanceThreshold;
-    use crate::offchain_order::{OffchainOrderId, PriceCents};
+    use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::trigger::UsdcRebalancing;
@@ -3068,9 +3068,9 @@ mod tests {
                 PositionCommand::CompleteOffChainOrder {
                     offchain_order_id: first_order_id,
                     shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
-                    direction: st0x_execution::Direction::Sell,
+                    direction: Direction::Sell,
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
-                    price_cents: crate::offchain_order::PriceCents(15000),
+                    price: Dollars(dec!(150)),
                     broker_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3249,7 +3249,7 @@ mod tests {
                     shares_filled: Positive::new(FractionalShares::new(dec!(80))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                     broker_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3368,7 +3368,7 @@ mod tests {
                     shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("SEED"),
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                     broker_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3469,7 +3469,7 @@ mod tests {
                     shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                     broker_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3596,7 +3596,7 @@ mod tests {
                     shares_filled: Positive::new(FractionalShares::new(dec!(35))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price_cents: PriceCents(15000),
+                    price: Dollars(dec!(150.00)),
                     broker_timestamp: chrono::Utc::now(),
                 },
             )

@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -271,50 +270,6 @@ pub(super) async fn get_order_status(
         updated_at: Utc::now(),
         price,
     })
-}
-
-pub(super) async fn poll_pending_orders(
-    client: &AlpacaBrokerApiClient,
-) -> Result<Vec<OrderUpdate<String>>, AlpacaBrokerApiError> {
-    debug!("Polling all pending Alpaca Broker API orders");
-
-    let orders = client.list_open_orders().await?;
-
-    let order_updates = orders
-        .into_iter()
-        .map(|response| {
-            let direction = match response.side {
-                OrderSide::Buy => Direction::Buy,
-                OrderSide::Sell => Direction::Sell,
-            };
-
-            let status = map_broker_status_to_order_status(response.status);
-            let price = response.filled_average_price;
-
-            if response.status == BrokerOrderStatus::PartiallyFilled {
-                debug!(
-                    order_id = %response.id,
-                    symbol = %response.symbol,
-                    ordered_qty = %response.quantity.inner(),
-                    filled_qty = ?response.filled_quantity,
-                    "Order is partially filled"
-                );
-            }
-
-            Ok(OrderUpdate {
-                order_id: response.id.to_string(),
-                symbol: response.symbol,
-                shares: response.quantity,
-                direction,
-                status,
-                updated_at: Utc::now(),
-                price,
-            })
-        })
-        .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
-
-    debug!("Found {} pending orders", order_updates.len());
-    Ok(order_updates)
 }
 
 fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
@@ -627,79 +582,6 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.status, OrderStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn test_poll_pending_orders_multiple() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/orders")
-                .query_param("status", "open");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "id": "904837e3-3b76-47ec-b432-046db621571b",
-                        "symbol": "AAPL",
-                        "qty": "100",
-                        "side": "buy",
-                        "status": "new",
-                        "filled_avg_price": null
-                    },
-                    {
-                        "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
-                        "symbol": "TSLA",
-                        "qty": "50",
-                        "side": "sell",
-                        "status": "partially_filled",
-                        "filled_avg_price": null
-                    }
-                ]));
-        });
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let order_updates = poll_pending_orders(&client).await.unwrap();
-
-        mock.assert();
-        assert_eq!(order_updates.len(), 2);
-
-        assert_eq!(
-            order_updates[0].order_id,
-            "904837e3-3b76-47ec-b432-046db621571b"
-        );
-        assert_eq!(order_updates[0].symbol.to_string(), "AAPL");
-        assert_eq!(order_updates[0].status, OrderStatus::Submitted);
-
-        assert_eq!(
-            order_updates[1].order_id,
-            "61e7b016-9c91-4a97-b912-615c9d365c9d"
-        );
-        assert_eq!(order_updates[1].symbol.to_string(), "TSLA");
-        assert_eq!(order_updates[1].status, OrderStatus::Submitted);
-    }
-
-    #[tokio::test]
-    async fn test_poll_pending_orders_empty() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/orders")
-                .query_param("status", "open");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let order_updates = poll_pending_orders(&client).await.unwrap();
-
-        mock.assert();
-        assert!(order_updates.is_empty());
     }
 
     #[test]
