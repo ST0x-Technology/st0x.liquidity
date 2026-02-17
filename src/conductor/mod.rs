@@ -416,11 +416,21 @@ async fn wait_for_all_tasks(
         &mut tasks.queue_processor
     );
 
-    log_task_result(poller, "Order poller");
-    log_task_result(dex, "DEX event receiver");
-    log_task_result(processor, "Event processor");
-    log_task_result(position, "Position checker");
-    log_task_result(queue, "Queue processor");
+    for (name, result) in [
+        ("Order poller", poller),
+        ("DEX event receiver", dex),
+        ("Event processor", processor),
+        ("Position checker", position),
+        ("Queue processor", queue),
+    ] {
+        if let Err(join_error) = result {
+            if join_error.is_cancelled() {
+                info!("{name} cancelled (expected during shutdown)");
+                continue;
+            }
+            return Err(anyhow::anyhow!("{name} task failed: {join_error}"));
+        }
+    }
 
     Ok(())
 }
@@ -434,12 +444,6 @@ async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: 
             info!("{task_name} cancelled (expected during shutdown)");
         }
         Err(error) => error!("{task_name} task panicked: {error}"),
-    }
-}
-
-fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) {
-    if let Err(error) = result {
-        error!("{task_name} task panicked: {error}");
     }
 }
 
@@ -1145,9 +1149,7 @@ async fn process_queued_trade<E: Executor>(
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
-    mark_event_processed(pool, event_id)
-        .await
-        .inspect_err(|error| error!("Failed to mark event {event_id} as processed: {error}"))?;
+    mark_event_processed(pool, event_id).await?;
 
     info!(
         "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",

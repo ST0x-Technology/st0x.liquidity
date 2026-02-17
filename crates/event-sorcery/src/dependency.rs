@@ -328,3 +328,192 @@ macro_rules! register_entities {
         $crate::OneOf::There($crate::register_entities!(@wrap [$($rest),*] $expr))
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use cqrs_es::DomainEvent;
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::Table;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Alpha {
+        tag: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum AlphaEvent {
+        Born,
+    }
+
+    impl DomainEvent for AlphaEvent {
+        fn event_type(&self) -> String {
+            "AlphaBorn".into()
+        }
+        fn event_version(&self) -> String {
+            "1".into()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+    #[error("alpha error")]
+    struct AlphaError;
+
+    #[async_trait]
+    impl EventSourced for Alpha {
+        type Id = String;
+        type Event = AlphaEvent;
+        type Command = ();
+        type Error = AlphaError;
+        type Services = ();
+
+        const AGGREGATE_TYPE: &'static str = "Alpha";
+        const PROJECTION: Option<Table> = None;
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &AlphaEvent) -> Option<Self> {
+            match event {
+                AlphaEvent::Born => Some(Self {
+                    tag: "alpha".into(),
+                }),
+            }
+        }
+
+        fn evolve(_: &Self, _: &AlphaEvent) -> Result<Option<Self>, AlphaError> {
+            Ok(None)
+        }
+
+        async fn initialize((): (), (): &()) -> Result<Vec<AlphaEvent>, AlphaError> {
+            Ok(vec![AlphaEvent::Born])
+        }
+
+        async fn transition(&self, (): (), (): &()) -> Result<Vec<AlphaEvent>, AlphaError> {
+            Ok(vec![])
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Beta {
+        tag: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum BetaEvent {
+        Spawned,
+    }
+
+    impl DomainEvent for BetaEvent {
+        fn event_type(&self) -> String {
+            "BetaSpawned".into()
+        }
+        fn event_version(&self) -> String {
+            "1".into()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+    #[error("beta error")]
+    struct BetaError;
+
+    #[async_trait]
+    impl EventSourced for Beta {
+        type Id = String;
+        type Event = BetaEvent;
+        type Command = ();
+        type Error = BetaError;
+        type Services = ();
+
+        const AGGREGATE_TYPE: &'static str = "Beta";
+        const PROJECTION: Option<Table> = None;
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &BetaEvent) -> Option<Self> {
+            match event {
+                BetaEvent::Spawned => Some(Self { tag: "beta".into() }),
+            }
+        }
+
+        fn evolve(_: &Self, _: &BetaEvent) -> Result<Option<Self>, BetaError> {
+            Ok(None)
+        }
+
+        async fn initialize((): (), (): &()) -> Result<Vec<BetaEvent>, BetaError> {
+            Ok(vec![BetaEvent::Spawned])
+        }
+
+        async fn transition(&self, (): (), (): &()) -> Result<Vec<BetaEvent>, BetaError> {
+            Ok(vec![])
+        }
+    }
+
+    crate::register_entities!(Alpha, Beta);
+
+    type TwoEntityList = deps![Alpha, Beta];
+
+    #[test]
+    fn single_entity_into_inner() {
+        type SingleList = deps![Alpha];
+        let event = <SingleList as InjectAtDepth<Zero>>::inject("a1".to_string(), AlphaEvent::Born);
+        let (id, inner_event) = event.into_inner();
+        assert_eq!(id, "a1");
+        assert_eq!(inner_event, AlphaEvent::Born);
+    }
+
+    #[test]
+    fn inject_at_depth_zero_produces_here() {
+        let event =
+            <TwoEntityList as InjectAtDepth<Zero>>::inject("a1".to_string(), AlphaEvent::Born);
+        assert!(matches!(event, OneOf::Here(_)));
+    }
+
+    #[test]
+    fn inject_at_depth_one_produces_there_here() {
+        let event = <TwoEntityList as InjectAtDepth<Successor<Zero>>>::inject(
+            "b1".to_string(),
+            BetaEvent::Spawned,
+        );
+        assert!(matches!(event, OneOf::There(OneOf::Here(_))));
+    }
+
+    #[test]
+    fn has_entity_inject_alpha() {
+        let event = <TwoEntityList as HasEntity<Alpha>>::inject("a1".to_string(), AlphaEvent::Born);
+        assert!(matches!(event, OneOf::Here(_)));
+    }
+
+    #[test]
+    fn has_entity_inject_beta() {
+        let event =
+            <TwoEntityList as HasEntity<Beta>>::inject("b1".to_string(), BetaEvent::Spawned);
+        assert!(matches!(event, OneOf::There(OneOf::Here(_))));
+    }
+
+    #[tokio::test]
+    async fn on_chain_handles_alpha_event() {
+        let event = <TwoEntityList as HasEntity<Alpha>>::inject("a1".to_string(), AlphaEvent::Born);
+
+        let result = event
+            .on(|id, event| async move { format!("alpha:{id}:{event:?}") })
+            .on(|id, event| async move { format!("beta:{id}:{event:?}") })
+            .exhaustive()
+            .await;
+
+        assert_eq!(result, "alpha:a1:Born");
+    }
+
+    #[tokio::test]
+    async fn on_chain_handles_beta_event() {
+        let event =
+            <TwoEntityList as HasEntity<Beta>>::inject("b1".to_string(), BetaEvent::Spawned);
+
+        let result = event
+            .on(|id, event| async move { format!("alpha:{id}:{event:?}") })
+            .on(|id, event| async move { format!("beta:{id}:{event:?}") })
+            .exhaustive()
+            .await;
+
+        assert_eq!(result, "beta:b1:Spawned");
+    }
+}

@@ -127,6 +127,12 @@ pub(crate) enum TokenizedEquityMintError {
     /// Negative quantity is invalid for minting
     #[error("Negative quantity: {value}")]
     NegativeQuantity { value: Decimal },
+    /// Input has more than 18 decimal places, conversion would lose precision
+    #[error(
+        "Precision loss: {value} has more than 18 decimal places \
+         (scaled value {scaled} has fractional part)"
+    )]
+    PrecisionLoss { value: Decimal, scaled: Decimal },
     /// Vault lookup failed for the given symbol
     #[error("Vault lookup failed for {0}")]
     VaultLookupFailed(Symbol),
@@ -326,9 +332,12 @@ fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, TokenizedEquityMi
     let scaled = value
         .checked_mul(scale_factor)
         .ok_or(TokenizedEquityMintError::DecimalScalingOverflow { value })?;
-    let truncated = scaled.trunc();
 
-    let repr = truncated.to_string();
+    if scaled.fract() != Decimal::ZERO {
+        return Err(TokenizedEquityMintError::PrecisionLoss { value, scaled });
+    }
+
+    let repr = scaled.trunc().to_string();
     let Ok(amount) = U256::from_str_radix(&repr, 10) else {
         return Err(TokenizedEquityMintError::U256ConversionFailed { scaled_value: repr });
     };
@@ -1257,6 +1266,23 @@ mod tests {
     fn decimal_to_u256_18_decimals_zero_returns_zero() {
         let result = decimal_to_u256_18_decimals(dec!(0)).unwrap();
         assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn decimal_to_u256_18_decimals_rejects_19_decimal_places() {
+        let value = Decimal::from_str("1.1234567890123456789").unwrap();
+        let error = decimal_to_u256_18_decimals(value).unwrap_err();
+        assert!(
+            matches!(error, TokenizedEquityMintError::PrecisionLoss { .. }),
+            "Expected PrecisionLoss, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn decimal_to_u256_18_decimals_accepts_exactly_18_decimal_places() {
+        let value = Decimal::from_str("1.123456789012345678").unwrap();
+        let result = decimal_to_u256_18_decimals(value).unwrap();
+        assert_eq!(result, U256::from(1_123_456_789_012_345_678_u128));
     }
 
     #[tokio::test]

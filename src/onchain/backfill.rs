@@ -580,7 +580,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result.unwrap_err(), OnChainError::Alloy(_)));
+        assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
     }
 
     #[tokio::test]
@@ -1159,7 +1159,7 @@ mod tests {
         let result =
             enqueue_batch_events(&pool, &provider, &evm_ctx, 100, 200, test_retry_strategy()).await;
 
-        assert!(matches!(result.unwrap_err(), OnChainError::Alloy(_)));
+        assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
     }
 
     #[tokio::test]
@@ -1200,7 +1200,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result.unwrap_err(), OnChainError::Alloy(_)));
+        assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
     }
 
     #[tokio::test]

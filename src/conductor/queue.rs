@@ -199,9 +199,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
-    mark_event_processed(pool, event_id)
-        .await
-        .inspect_err(|error| error!("Failed to mark event {event_id} as processed: {error}"))?;
+    mark_event_processed(pool, event_id).await?;
 
     info!(
         "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",
@@ -232,9 +230,10 @@ mod tests {
     use alloy::primitives::{B256, Bytes, TxHash, U256, address};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
+
     use st0x_event_sorcery::{Projection, StoreBuilder, test_store};
     use st0x_execution::{ExecutorOrderId, MarketOrder, MockExecutor, Symbol};
-    use std::sync::Arc;
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
