@@ -5,11 +5,12 @@
 
 use alloy::providers::Provider;
 use sqlx::SqlitePool;
-use st0x_event_sorcery::Store;
-use st0x_execution::Executor;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
+
+use st0x_event_sorcery::Store;
+use st0x_execution::Executor;
 
 use super::{
     EventProcessingError, TradeProcessingCqrs, VaultDiscoveryCtx, convert_event_to_trade,

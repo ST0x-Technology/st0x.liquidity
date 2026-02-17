@@ -166,7 +166,7 @@ mod tests {
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
         assert_eq!(aapl.quantity, FractionalShares::new(Decimal::new(105, 1)));
-        assert_eq!(aapl.market_value, Some(Decimal::new(157500, 2)));
+        assert_eq!(aapl.market_value, Some(Decimal::new(157_500, 2)));
     }
 
     #[tokio::test]
@@ -313,6 +313,6 @@ mod tests {
             .iter()
             .find(|position| position.symbol.to_string() == "RKLB")
             .unwrap();
-        assert_eq!(rklb.market_value, Some(Decimal::new(5116476, 4)),);
+        assert_eq!(rklb.market_value, Some(Decimal::new(5_116_476, 4)),);
     }
 }

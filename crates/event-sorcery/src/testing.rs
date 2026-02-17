@@ -223,8 +223,17 @@ impl<R: Reactor> ReactorHarness<R> {
 /// let events = spy.events().await;
 /// assert_eq!(events.len(), 1);
 /// ```
+type EventLog<Entity> = Arc<
+    Mutex<
+        Vec<(
+            <Entity as EventSourced>::Id,
+            <Entity as EventSourced>::Event,
+        )>,
+    >,
+>;
+
 pub struct SpyReactor<Entity: EventSourced> {
-    events: Arc<Mutex<Vec<(Entity::Id, Entity::Event)>>>,
+    events: EventLog<Entity>,
 }
 
 impl<Entity: EventSourced> SpyReactor<Entity> {
@@ -241,6 +250,12 @@ impl<Entity: EventSourced> SpyReactor<Entity> {
         Entity::Event: Clone,
     {
         self.events.lock().await.clone()
+    }
+}
+
+impl<Entity: EventSourced> Default for SpyReactor<Entity> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

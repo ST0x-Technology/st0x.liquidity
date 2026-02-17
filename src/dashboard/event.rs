@@ -7,7 +7,6 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use st0x_dto::{EventStoreEntry, ServerMessage};
-
 use st0x_event_sorcery::{DomainEvent, EntityList, EventSourced, Never, Reactor, deps};
 
 use crate::equity_redemption::EquityRedemption;

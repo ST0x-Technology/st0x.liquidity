@@ -1,4 +1,4 @@
-//! Operation executor that dispatches triggered rebalancing operations to
+//! Operation executor that routes triggered rebalancing operations to
 //! cross-venue transfer implementations.
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ type UsdcToMarketMaking = dyn CrossVenueTransfer<HedgingVenue, MarketMakingVenue
 /// Type-erased USDC transfer (market-making -> hedging).
 type UsdcToHedging = dyn CrossVenueTransfer<MarketMakingVenue, HedgingVenue, Asset = Usdc, Error = UsdcTransferError>;
 
-/// Receives triggered rebalancing operations and dispatches them to the
+/// Receives triggered rebalancing operations and routes them to the
 /// appropriate cross-venue transfer implementation.
 pub(crate) struct Rebalancer {
     equity_to_mm: Arc<EquityToMarketMaking>,
@@ -51,52 +51,60 @@ impl Rebalancer {
         }
     }
 
-    /// Runs the rebalancer loop, receiving operations and dispatching them.
+    /// Runs the rebalancer loop, receiving and executing operations.
     /// Returns when the sender channel is closed.
     pub(crate) async fn run(mut self) {
         info!("Rebalancer started");
 
         while let Some(operation) = self.receiver.recv().await {
-            self.dispatch(operation).await;
+            self.execute(operation).await;
         }
 
         info!("Rebalancer stopped (channel closed)");
     }
 
-    async fn dispatch(&self, operation: TriggeredOperation) {
+    async fn execute(&self, operation: TriggeredOperation) {
         match operation {
             TriggeredOperation::Mint { symbol, quantity } => {
-                if let Err(error) = self
-                    .equity_to_mm
+                self.equity_to_mm
                     .transfer(Equity { symbol, quantity })
                     .await
-                {
-                    error!(?error, "Equity transfer to market-making venue failed");
-                }
+                    .inspect_err(|error| {
+                        error!(?error, "Equity transfer to market-making venue failed");
+                    })
+                    .ok();
             }
 
             TriggeredOperation::Redemption {
                 symbol, quantity, ..
             } => {
-                if let Err(error) = self
-                    .equity_to_hedging
+                self.equity_to_hedging
                     .transfer(Equity { symbol, quantity })
                     .await
-                {
-                    error!(?error, "Equity transfer to hedging venue failed");
-                }
+                    .inspect_err(|error| {
+                        error!(?error, "Equity transfer to hedging venue failed");
+                    })
+                    .ok();
             }
 
             TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                if let Err(error) = self.usdc_to_mm.transfer(amount).await {
-                    error!(?error, "USDC transfer to market-making venue failed");
-                }
+                self.usdc_to_mm
+                    .transfer(amount)
+                    .await
+                    .inspect_err(|error| {
+                        error!(?error, "USDC transfer to market-making venue failed");
+                    })
+                    .ok();
             }
 
             TriggeredOperation::UsdcBaseToAlpaca { amount } => {
-                if let Err(error) = self.usdc_to_hedging.transfer(amount).await {
-                    error!(?error, "USDC transfer to hedging venue failed");
-                }
+                self.usdc_to_hedging
+                    .transfer(amount)
+                    .await
+                    .inspect_err(|error| {
+                        error!(?error, "USDC transfer to hedging venue failed");
+                    })
+                    .ok();
             }
         }
     }
@@ -114,7 +122,7 @@ mod tests {
     use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 
-    async fn dispatch(
+    async fn execute(
         operations: Vec<TriggeredOperation>,
     ) -> (Arc<MockCrossVenueEquityTransfer>, Arc<MockUsdcRebalance>) {
         let equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -140,8 +148,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_mint_calls_equity_to_market_making() {
-        let (equity, usdc) = dispatch(vec![TriggeredOperation::Mint {
+    async fn execute_mint_calls_equity_to_market_making() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(dec!(10)),
         }])
@@ -154,8 +162,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_redemption_calls_equity_to_hedging() {
-        let (equity, usdc) = dispatch(vec![TriggeredOperation::Redemption {
+    async fn execute_redemption_calls_equity_to_hedging() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(dec!(50)),
             token: address!("0x1234567890123456789012345678901234567890"),
@@ -169,8 +177,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_usdc_alpaca_to_base_calls_usdc_to_market_making() {
-        let (equity, usdc) = dispatch(vec![TriggeredOperation::UsdcAlpacaToBase {
+    async fn execute_usdc_alpaca_to_base_calls_usdc_to_market_making() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::UsdcAlpacaToBase {
             amount: Usdc(dec!(1000)),
         }])
         .await;
@@ -182,8 +190,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_usdc_base_to_alpaca_calls_usdc_to_hedging() {
-        let (equity, usdc) = dispatch(vec![TriggeredOperation::UsdcBaseToAlpaca {
+    async fn execute_usdc_base_to_alpaca_calls_usdc_to_hedging() {
+        let (equity, usdc) = execute(vec![TriggeredOperation::UsdcBaseToAlpaca {
             amount: Usdc(dec!(2000)),
         }])
         .await;
@@ -196,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_processes_multiple_operations() {
-        let (equity, usdc) = dispatch(vec![
+        let (equity, usdc) = execute(vec![
             TriggeredOperation::Mint {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(dec!(10)),
@@ -227,6 +235,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_terminates_when_channel_closes() {
-        dispatch(vec![]).await;
+        execute(vec![]).await;
     }
 }

@@ -113,8 +113,8 @@ impl<Id, Event, Tail> OneOf<(Id, Event), Tail> {
         Fut: Future<Output = T> + Send + 'a,
     {
         match self {
-            OneOf::Here((id, event)) => Fold::Done(Box::pin(handler(id, event))),
-            OneOf::There(tail) => Fold::Remaining(tail),
+            Self::Here((id, event)) => Fold::Done(Box::pin(handler(id, event))),
+            Self::There(tail) => Fold::Remaining(tail),
         }
     }
 }
@@ -126,8 +126,8 @@ impl<A> OneOf<A, Never> {
     /// computed event is `OneOf<(Id, Event), Never>`.
     pub fn into_inner(self) -> A {
         match self {
-            OneOf::Here(inner) => inner,
-            OneOf::There(never) => match never {},
+            Self::Here(inner) => inner,
+            Self::There(never) => match never {},
         }
     }
 }
@@ -175,8 +175,8 @@ impl<T> Fold<T, Never> {
     /// exhaustiveness at compile time.
     pub fn exhaustive(self) -> T {
         match self {
-            Fold::Done(result) => result,
-            Fold::Remaining(never) => match never {},
+            Self::Done(result) => result,
+            Self::Remaining(never) => match never {},
         }
     }
 }
@@ -214,9 +214,8 @@ impl<Head: EventSourced, Tail: EntityList> InjectAtDepth<Zero> for Cons<Head, Ta
     }
 }
 
-impl<Head: EventSourced, Tail: EntityList, N> InjectAtDepth<Successor<N>> for Cons<Head, Tail>
-where
-    Tail: InjectAtDepth<N>,
+impl<Head: EventSourced, Tail: EntityList + InjectAtDepth<N>, N> InjectAtDepth<Successor<N>>
+    for Cons<Head, Tail>
 {
     type EntityId = <Tail as InjectAtDepth<N>>::EntityId;
     type EntityEvent = <Tail as InjectAtDepth<N>>::EntityEvent;
