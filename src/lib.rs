@@ -45,6 +45,8 @@ mod wrapper;
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 
 #[cfg(test)]
+mod integration_tests;
+#[cfg(test)]
 pub mod test_utils;
 
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
