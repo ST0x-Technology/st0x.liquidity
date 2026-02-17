@@ -475,4 +475,31 @@ mod tests {
             "Expected Rejected error, got: {error:?}"
         );
     }
+
+    #[tokio::test]
+    async fn redemption_transfer_fails_on_pending_status() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Pending),
+        );
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+
+        let transfer = create_equity_transfer(tokenizer, raindex).await;
+
+        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("TEST").unwrap(),
+                quantity: FractionalShares::new(dec!(50)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, RedemptionError::UnexpectedPendingStatus),
+            "Expected UnexpectedPendingStatus error, got: {error:?}"
+        );
+    }
 }

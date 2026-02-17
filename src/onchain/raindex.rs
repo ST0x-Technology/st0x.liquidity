@@ -1047,15 +1047,14 @@ mod tests {
         .with_required_confirmations(1);
 
         // This should succeed - the approve inside deposit() should cover the transferFrom amount
-        let result = service
+        service
             .deposit(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 deposit_amount,
                 TEST_TOKEN_DECIMALS,
             )
-            .await;
-
-        assert!(result.is_ok(), "Deposit failed: {:?}", result.unwrap_err());
+            .await
+            .unwrap();
     }
 }

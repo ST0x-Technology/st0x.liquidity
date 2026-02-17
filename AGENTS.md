@@ -445,8 +445,11 @@ is the source of truth for terminology and naming conventions.
   top-of-module imports. Note that I said top-of-module and not top-of-file,
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
-- **Error Handling**: Avoid `unwrap()` even post-validation since validation
-  logic changes might leave panics in the codebase
+- **Error Handling**: Avoid `unwrap()` and `.expect()` in production code, even
+  post-validation, since validation logic changes might leave panics in the
+  codebase. **Exception**: `.unwrap()` and `.expect()` are fine in test code
+  (`#[cfg(test)]` modules) where panicking on unexpected state is the desired
+  behavior
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
   String values that throw away type information**. This is strictly forbidden
   and violates our error handling principles:

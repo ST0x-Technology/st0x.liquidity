@@ -318,6 +318,7 @@ impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo> {
     }
 }
 
+// Same private_bounds suppression as above -- see HKD TODO.
 #[allow(private_bounds)]
 impl<Entity, Repo> Dependent for Projection<Entity, Repo>
 where
@@ -327,6 +328,7 @@ where
     type Dependencies = Cons<Entity, Nil>;
 }
 
+// Same private_bounds suppression as above -- see HKD TODO.
 #[async_trait]
 #[allow(private_bounds)]
 impl<Entity, Repo> Reactor for Projection<Entity, Repo>

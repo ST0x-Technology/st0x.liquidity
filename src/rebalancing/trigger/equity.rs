@@ -4,9 +4,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
-use st0x_execution::{FractionalShares, Symbol};
 use tokio::sync::RwLock;
 use tracing::{trace, warn};
+
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
@@ -552,13 +553,8 @@ mod tests {
                 .await;
 
         // Should trigger again (we added significant new imbalance)
-        assert!(
-            result2.is_ok(),
-            "Should trigger again after adding more offchain shares"
-        );
-
         let TriggeredOperation::Mint { quantity: qty2, .. } = result2.unwrap() else {
-            panic!("Expected Mint");
+            panic!("Expected Mint after adding more offchain shares");
         };
 
         // The second quantity includes accumulated leftovers from previous truncation

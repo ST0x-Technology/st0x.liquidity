@@ -6,10 +6,11 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_event_sorcery::Projection;
 use std::io::Write;
 use std::sync::Arc;
 use thiserror::Error;
+
+use st0x_event_sorcery::Projection;
 
 use crate::bindings::IERC20;
 use crate::config::Ctx;

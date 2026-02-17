@@ -90,7 +90,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
     use std::collections::BTreeMap;
-    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::{self, error::TryRecvError};
 
     use st0x_event_sorcery::{ReactorHarness, test_store};
     use st0x_execution::{FractionalShares, Symbol};
@@ -512,7 +512,8 @@ mod tests {
             .unwrap();
 
         // No trigger yet - only one venue has data
-        assert!(receiver.try_recv().is_err());
+        let error = receiver.try_recv().unwrap_err();
+        assert!(matches!(error, TryRecvError::Empty));
 
         // Set up imbalanced inventory: lots of onchain USDC, none offchain
         let onchain_event = InventorySnapshotEvent::OnchainCash {
@@ -561,7 +562,8 @@ mod tests {
             .unwrap();
 
         // No trigger yet - only one venue has data
-        assert!(receiver.try_recv().is_err());
+        let error = receiver.try_recv().unwrap_err();
+        assert!(matches!(error, TryRecvError::Empty));
 
         // Set up imbalanced inventory: lots of offchain USDC, none onchain
         let offchain_event = InventorySnapshotEvent::OffchainCash {
@@ -731,10 +733,8 @@ mod tests {
         );
 
         // Trigger won't fire without VaultRegistry, so channel should be empty
-        assert!(
-            receiver.try_recv().is_err(),
-            "Equity trigger requires VaultRegistry, should not fire without it"
-        );
+        let error = receiver.try_recv().unwrap_err();
+        assert!(matches!(error, TryRecvError::Empty));
     }
 
     #[sqlx::test]
@@ -796,10 +796,8 @@ mod tests {
         );
 
         // Same as above: no VaultRegistry -> trigger doesn't fire
-        assert!(
-            receiver.try_recv().is_err(),
-            "Equity trigger requires VaultRegistry, should not fire without it"
-        );
+        let error = receiver.try_recv().unwrap_err();
+        assert!(matches!(error, TryRecvError::Empty));
     }
 
     #[sqlx::test]
@@ -828,7 +826,8 @@ mod tests {
             .unwrap();
 
         // No trigger yet - only one venue has data
-        assert!(receiver.try_recv().is_err());
+        let error = receiver.try_recv().unwrap_err();
+        assert!(matches!(error, TryRecvError::Empty));
 
         // Now apply onchain snapshot with 200k
         let onchain_event = InventorySnapshotEvent::OnchainCash {

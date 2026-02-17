@@ -25,6 +25,7 @@ pub(crate) enum MockDetectionOutcome {
 pub(crate) enum MockCompletionOutcome {
     Completed,
     Rejected,
+    Pending,
 }
 
 /// Configurable outcome for mint request.
@@ -172,6 +173,9 @@ impl Tokenizer for MockTokenizer {
             )),
             Some(MockCompletionOutcome::Rejected) => Ok(TokenizationRequest::mock(
                 TokenizationRequestStatus::Rejected,
+            )),
+            Some(MockCompletionOutcome::Pending) => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
             )),
             None => {
                 unimplemented!(
