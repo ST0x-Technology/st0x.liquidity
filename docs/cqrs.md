@@ -1,27 +1,350 @@
-# CQRS/ES Patterns with cqrs-es
+# Event Sourcing with st0x-event-sorcery
 
-Quick reference for cqrs-es usage patterns in this codebase.
+Quick reference for event-sourcing patterns in this codebase. The
+`st0x-event-sorcery` crate provides the primary interface; cqrs-es is an
+implementation detail hidden behind it.
 
 ## Core Principle: Events Are Immutable
 
 **Events are the source of truth and can NEVER be changed or deleted.**
-Everything else - aggregates, commands, views - can be freely modified because
-they're derived from events.
+Everything else -- entities, commands, projections -- can be freely modified
+because they're derived from events.
 
 - **Commands**: Can add, remove, or change freely
-- **Aggregates**: Can restructure, add fields, change logic freely
-- **Views**: Can add, drop, restructure freely (just replay from events)
+- **Entities**: Can restructure, add fields, change logic freely
+- **Projections**: Can add, drop, restructure freely (just replay from events)
 - **Events**: PERMANENT. Think carefully before adding new event types.
 
-This is the power of event sourcing: unlimited flexibility in how you interpret
-historical data, as long as you preserve the raw facts.
+## Architecture
 
-## sqlite-es Table Schemas
+```text
+Domain type          Adapter             cqrs-es (hidden)
++--------------+     +----------------+  +------------+
+| impl         | --> | Lifecycle      |  | Aggregate  |
+| EventSourced |     | (blanket impl) |--| trait      |
++--------------+     +----------------+  +------------+
+                            |
+                     +------+------+
+                     | Store       |
+                     | (typed IDs, |
+                     |  send())    |
+                     +-------------+
+```
 
-sqlite-es and cqrs-es mandate specific table schemas. All three tables are
-created in the `event_store` migration.
+Consumers implement `EventSourced`. `Lifecycle` bridges to cqrs-es
+automatically. `Store` provides type-safe command dispatch with strongly-typed
+IDs.
 
-### Events Table
+## Implementing a New Entity
+
+### 1. Define the Domain Type
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyEntity {
+    // domain state
+}
+```
+
+### 2. Define Events and Commands
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MyEntityEvent {
+    Created { /* fields */ },
+    Updated { /* fields */ },
+}
+
+impl DomainEvent for MyEntityEvent {
+    fn event_type(&self) -> String { /* e.g., "MyEntityEvent::Created" */ }
+    fn event_version(&self) -> String { "1.0".to_string() }
+}
+
+pub enum MyEntityCommand {
+    Create { /* fields */ },
+    Update { /* fields */ },
+}
+```
+
+### 3. Implement EventSourced
+
+```rust
+#[async_trait]
+impl EventSourced for MyEntity {
+    type Id = MyEntityId;       // strongly-typed, Display + FromStr
+    type Event = MyEntityEvent;
+    type Command = MyEntityCommand;
+    type Error = Never;         // or a thiserror type
+    type Services = ();         // or Arc<dyn SomeService>
+
+    const AGGREGATE_TYPE: &'static str = "MyEntity";
+    const PROJECTION: Option<Table> = Some(Table("my_entity_view"));
+    const SCHEMA_VERSION: u64 = 1;
+
+    // Event-side: reconstruct state from events
+    fn originate(event: &Self::Event) -> Option<Self> { /* ... */ }
+    fn evolve(entity: &Self, event: &Self::Event)
+        -> Result<Option<Self>, Self::Error> { /* ... */ }
+
+    // Command-side: process commands to produce events
+    async fn initialize(command: Self::Command, services: &Self::Services)
+        -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
+    async fn transition(&self, command: Self::Command, services: &Self::Services)
+        -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
+}
+```
+
+**Method naming conventions:**
+
+| Method       | Purpose                                | Theme         |
+| ------------ | -------------------------------------- | ------------- |
+| `originate`  | Create initial state from first event  | Evolution     |
+| `evolve`     | Derive new state from subsequent event | Evolution     |
+| `initialize` | Handle command when no state exists    | State machine |
+| `transition` | Handle command against existing state  | State machine |
+
+## Key Types
+
+| Type                   | Purpose                                      |
+| ---------------------- | -------------------------------------------- |
+| `EventSourced`         | Core trait -- implement on domain types      |
+| `Store<Entity>`        | Type-safe command dispatch                   |
+| `StoreBuilder<Entity>` | Wires reactors/projections, builds Store     |
+| `Projection<Entity>`   | Read-side materialized view                  |
+| `Reactor<Entity>`      | Event side-effect handler                    |
+| `SendError<Entity>`    | Error from `Store::send()`                   |
+| `LifecycleError<E>`    | Errors from event application                |
+| `Never`                | Error type for infallible entities           |
+| `DomainEvent`          | Trait for event serialization (from cqrs-es) |
+| `Table`                | Newtype for projection table name            |
+
+## Sending Commands
+
+```rust
+let store: Store<Position> = /* built by StoreBuilder */;
+
+let symbol = Symbol::new("AAPL").unwrap();
+store.send(&symbol, PositionCommand::AcknowledgeFill { /* ... */ }).await?;
+```
+
+`Store::send()` routes based on lifecycle state:
+
+- Uninitialized -> `Entity::initialize`
+- Live -> `Entity::transition`
+- Failed -> returns the stored error
+
+## Reading State via Projections
+
+Production code reads entity state through `Projection`, never by loading
+aggregates directly:
+
+```rust
+let projection: Projection<Position> = Projection::sqlite(pool.clone())?;
+
+// Load by typed ID
+let position: Option<Position> = projection.load(&symbol).await?;
+```
+
+Projections are materialized views stored in SQLite tables (named by
+`PROJECTION` constant). They're automatically updated when events are persisted
+through a `Store` that has the projection wired.
+
+### Filtered Queries with Columns
+
+```rust
+const STATUS: Column = Column("status");
+
+let pending_orders: Vec<OffchainOrder> = projection
+    .load_where(STATUS, "Pending")
+    .await?;
+```
+
+## Wiring: StoreBuilder
+
+`StoreBuilder` wires projections and reactors to a `Store` at startup. It uses
+type-level linked lists (`Cons`/`Nil`) to ensure all required processors are
+wired at compile time.
+
+```rust
+let projection = Projection::<Position>::sqlite(pool.clone())?;
+
+let (store, (trigger, ())) = StoreBuilder::<Position>::new(pool)
+    .with(projection.clone())  // wire the projection
+    .wire(trigger)             // wire a reactor (via Unwired)
+    .build(services)
+    .await?;
+```
+
+The `QueryManifest` pattern in `conductor/manifest.rs` ensures exhaustive wiring
+by destructuring all processors.
+
+## Reactors
+
+Side-effect handlers that process events one at a time with typed IDs:
+
+```rust
+#[async_trait]
+impl Reactor<TokenizedEquityMint> for EventBroadcaster {
+    async fn react(&self, id: &IssuerRequestId, event: &MintEvent) {
+        // broadcast to dashboard, trigger downstream, etc.
+    }
+}
+```
+
+Wire reactors via `Unwired` + `StoreBuilder::wire()`.
+
+## Services Pattern
+
+Inject external dependencies into command handlers:
+
+```rust
+type Services = Arc<dyn OrderPlacer>;
+
+async fn transition(
+    &self,
+    command: Self::Command,
+    services: &Self::Services,
+) -> Result<Vec<Self::Event>, Self::Error> {
+    let result = services.place_order(/* ... */).await?;
+    Ok(vec![MyEvent::OrderPlaced { /* ... */ }])
+}
+```
+
+Pass services when building the `Store`:
+
+```rust
+let store = StoreBuilder::<MyEntity>::new(pool)
+    .build(services)
+    .await?;
+```
+
+For entities that don't need services, use `type Services = ()`.
+
+## Schema Versioning
+
+Bump `SCHEMA_VERSION` when the entity's state, event, or projection schema
+changes. On startup, the wiring infrastructure (via `StoreBuilder::build()`)
+detects version mismatches and automatically clears stale snapshots.
+
+## Testing
+
+### replay -- reconstruct state from events
+
+```rust
+use st0x_event_sorcery::replay;
+
+let position = replay::<Position>(vec![
+    PositionEvent::Initialized { /* ... */ },
+    PositionEvent::FillAcknowledged { /* ... */ },
+]).unwrap().unwrap();
+
+assert_eq!(position.net, dec!(100));
+```
+
+### TestHarness -- BDD-style command testing
+
+```rust
+use st0x_event_sorcery::TestHarness;
+
+TestHarness::<Position>::with(())
+    .given(vec![PositionEvent::Initialized { /* ... */ }])
+    .when(PositionCommand::AcknowledgeFill { /* ... */ })
+    .await
+    .then_expect_events(&[PositionEvent::FillAcknowledged { /* ... */ }]);
+```
+
+### TestStore -- in-memory command dispatch
+
+```rust
+use st0x_event_sorcery::TestStore;
+
+let store = TestStore::<MyEntity>::new(vec![], ());
+store.send(&id, MyCommand::Create { /* ... */ }).await.unwrap();
+
+let entity = store.load(&id).await.unwrap().unwrap();
+assert_eq!(entity.field, expected);
+```
+
+### test_store -- SQLite-backed store without reactors
+
+```rust
+use st0x_event_sorcery::test_store;
+
+let store = test_store::<VaultRegistry>(pool.clone(), ());
+store.send(&id, command).await.unwrap();
+```
+
+Use `test_store` when you need SQLite persistence but don't care about
+projections or reactors. If you need projection data visible after commands, use
+`StoreBuilder` with the projection wired.
+
+### load_aggregate -- test-only aggregate loading
+
+```rust
+use st0x_event_sorcery::load_aggregate;
+
+let entity: Option<Position> = load_aggregate::<Position>(pool, &symbol)
+    .await.unwrap();
+```
+
+Gated behind `#[cfg(test)]` / `feature = "test-support"`. Bypasses the CQRS
+framework (no reactors dispatched). Production code reads through `Projection`.
+
+## Event Upcasters
+
+When you MUST change event structure (e.g., adding required fields to existing
+events), use upcasters to transform old events to the new format at load time:
+
+```rust
+use cqrs_es::persist::{EventUpcaster, SemanticVersionEventUpcaster};
+
+fn upcast_v1_to_v2(mut payload: Value) -> Value {
+    payload["new_field"] = json!("default");
+    payload
+}
+
+pub fn create_my_upcaster() -> Box<dyn EventUpcaster> {
+    Box::new(SemanticVersionEventUpcaster::new(
+        "MyAggregate::MyEvent",  // event_type to match
+        "2.0",                    // target version
+        Box::new(upcast_v1_to_v2),
+    ))
+}
+```
+
+Update `event_version()` in your event enum to return the new version for new
+events.
+
+## Forbidden Patterns
+
+1. **NEVER write directly to the `events` table** -- use `Store::send()`
+2. **NEVER query the `events` table with raw SQL** -- use framework APIs
+3. **NEVER modify or delete events** -- they're immutable historical facts
+4. **NEVER implement `Aggregate` directly** -- implement `EventSourced`
+5. **NEVER construct `Lifecycle` in application code** -- it's an internal
+   adapter
+6. **NEVER call `sqlite_cqrs()` or `CqrsFramework::new()` in production code**
+   -- use `StoreBuilder`
+7. **NEVER create multiple `Store<Entity>` for the same entity type** -- one per
+   entity, wired once at startup
+
+## Single Framework Instance Per Entity
+
+Each entity type must have exactly ONE `Store<Entity>` instance, constructed
+once in `Conductor::start` via `StoreBuilder`, then shared. Multiple instances
+cause silent bugs: events persist but reactors/projections on other instances
+never see them.
+
+## cqrs-es / sqlite-es Internals Reference
+
+These details are hidden by st0x-event-sorcery but documented here for debugging
+and migration authoring.
+
+### sqlite-es Table Schemas
+
+All three tables are created in the `event_store` migration.
+
+**Events table:**
 
 ```sql
 CREATE TABLE IF NOT EXISTS events (
