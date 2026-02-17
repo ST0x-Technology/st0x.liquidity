@@ -1,3 +1,12 @@
+//! Integration tests for the hedging pipeline: onchain trades flow through
+//! the CQRS aggregates (OnChainTrade, Position, OffchainOrder), accumulate
+//! fractional shares, and trigger offchain hedge orders when the position
+//! crosses the execution threshold.
+//!
+//! Tests use a real Rain OrderBook deployed on Anvil to produce authentic
+//! `TakeOrderV3` events, ensuring the full parsing and conversion pipeline
+//! is exercised end-to-end.
+
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::AnvilInstance;
 use alloy::primitives::{

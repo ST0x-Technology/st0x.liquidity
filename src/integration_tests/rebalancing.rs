@@ -1,3 +1,9 @@
+//! Integration tests for the inventory rebalancing pipeline: position changes
+//! flow through the RebalancingTrigger (wired as a CQRS query processor),
+//! update the InventoryView, detect equity or USDC imbalances, and dispatch
+//! operations through the Rebalancer to drive mints, redemptions, and USDC
+//! transfers to completion.
+
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, TxHash, U256, address, keccak256};
 use alloy::providers::ProviderBuilder;
@@ -9,13 +15,13 @@ use httpmock::prelude::*;
 use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlx::SqlitePool;
-use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
-};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
+use st0x_execution::{
+    Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
+};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
@@ -1086,7 +1092,10 @@ async fn threshold_config_controls_trigger_sensitivity() {
         drop(trigger);
 
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Disconnected
+            ),
             "Wide threshold (10%-90%) should not trigger at 35% onchain ratio"
         );
     }
