@@ -1287,7 +1287,7 @@ enum TokenizedEquityMintEvent {
 - `Wrap` only from TokensReceived state; wraps unwrapped tokens into ERC-4626
   shares
 - `Deposit` only from TokensWrapped state
-- Completed and Failed are terminal states
+- DepositedIntoRaindex and Failed are terminal states
 
 #### EquityRedemption Aggregate
 
@@ -1342,14 +1342,14 @@ enum EquityRedemption {
         quantity: Decimal,
         token: Address,
         amount: U256,
-        vault_withdraw_tx: TxHash,
+        raindex_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
     },
     TokensUnwrapped {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
-        vault_withdraw_tx: TxHash,
+        raindex_withdraw_tx: TxHash,
         unwrap_tx: TxHash,
         underlying_amount: U256,
         unwrapped_at: DateTime<Utc>,
@@ -1358,7 +1358,7 @@ enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
-        vault_withdraw_tx: TxHash,
+        raindex_withdraw_tx: TxHash,
         unwrap_tx: TxHash,
         redemption_wallet: Address,
         redemption_tx: TxHash,
@@ -1382,7 +1382,7 @@ enum EquityRedemption {
     Failed {
         symbol: Symbol,
         quantity: Decimal,
-        vault_withdraw_tx: Option<TxHash>,
+        raindex_withdraw_tx: Option<TxHash>,
         unwrap_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
@@ -1418,7 +1418,7 @@ enum EquityRedemptionEvent {
         quantity: Decimal,
         token: Address,
         amount: U256,
-        vault_withdraw_tx: TxHash,
+        raindex_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
     },
 
@@ -1905,7 +1905,6 @@ know about cross-venue inventory.
   (completes transfer to Raindex, already counted at TokensReceived)
 - `TokenizedEquityMintEvent::RaindexDepositFailed` - No balance change (tokens
   await retry or manual recovery)
-- `TokenizedEquityMintEvent::Completed` - No balance change (finalization)
 - `TokenizedEquityMintEvent::MintRejected` - Reconciles inflight back to Alpaca
   available
 - `TokenizedEquityMintEvent::MintAcceptanceFailed` - Reconciles inflight back to
