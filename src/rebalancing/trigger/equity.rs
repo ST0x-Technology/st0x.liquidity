@@ -227,9 +227,9 @@ mod tests {
     ) -> Arc<RwLock<InventoryView>> {
         let view = InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(symbol, &make_onchain_fill(shares(onchain), Direction::Buy))
+            .on_position(symbol, &make_onchain_fill(shares(onchain), Direction::Buy))
             .unwrap()
-            .apply_position_event(
+            .on_position(
                 symbol,
                 &make_offchain_fill(shares(offchain), Direction::Buy),
             )
@@ -416,12 +416,12 @@ mod tests {
     ) -> Arc<RwLock<InventoryView>> {
         let view = InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(
+            .on_position(
                 symbol,
                 &make_onchain_fill(precise_shares(onchain), Direction::Buy),
             )
             .unwrap()
-            .apply_position_event(
+            .on_position(
                 symbol,
                 &make_offchain_fill(precise_shares(offchain), Direction::Buy),
             )
@@ -498,7 +498,7 @@ mod tests {
         // MintAccepted: move truncated quantity from offchain.available to offchain.inflight
         *view = view
             .clone()
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &TokenizedEquityMintEvent::MintAccepted {
                     issuer_request_id: IssuerRequestId::new("test"),
@@ -513,7 +513,7 @@ mod tests {
         // TokensReceived: move from offchain.inflight to onchain.available
         *view = view
             .clone()
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &TokenizedEquityMintEvent::TokensReceived {
                     tx_hash: TxHash::random(),
@@ -601,7 +601,7 @@ mod tests {
             let now = chrono::Utc::now();
             *view = view
                 .clone()
-                .apply_mint_event(
+                .on_mint(
                     &symbol,
                     &TokenizedEquityMintEvent::MintAccepted {
                         issuer_request_id: IssuerRequestId::new("test"),
@@ -614,7 +614,7 @@ mod tests {
                 .unwrap();
             *view = view
                 .clone()
-                .apply_mint_event(
+                .on_mint(
                     &symbol,
                     &TokenizedEquityMintEvent::TokensReceived {
                         tx_hash: TxHash::random(),
@@ -636,7 +636,7 @@ mod tests {
             let mut view = inventory.write().await;
             *view = view
                 .clone()
-                .apply_position_event(
+                .on_position(
                     &symbol,
                     &make_offchain_fill(precise_shares("100.0000000001"), Direction::Buy),
                 )

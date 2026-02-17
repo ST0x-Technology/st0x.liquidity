@@ -243,27 +243,13 @@ impl DomainEvent for EquityRedemptionEvent {
             WithdrawnFromRaindex { .. } => {
                 "EquityRedemptionEvent::WithdrawnFromRaindex".to_string()
             }
-            TokensUnwrapped { .. } => {
-                "EquityRedemptionEvent::TokensUnwrapped".to_string()
-            }
-            TransferFailed { .. } => {
-                "EquityRedemptionEvent::TransferFailed".to_string()
-            }
-            TokensSent { .. } => {
-                "EquityRedemptionEvent::TokensSent".to_string()
-            }
-            DetectionFailed { .. } => {
-                "EquityRedemptionEvent::DetectionFailed".to_string()
-            }
-            Detected { .. } => {
-                "EquityRedemptionEvent::Detected".to_string()
-            }
-            RedemptionRejected { .. } => {
-                "EquityRedemptionEvent::RedemptionRejected".to_string()
-            }
-            Completed { .. } => {
-                "EquityRedemptionEvent::Completed".to_string()
-            }
+            TokensUnwrapped { .. } => "EquityRedemptionEvent::TokensUnwrapped".to_string(),
+            TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
+            TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
+            DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
+            Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
+            RedemptionRejected { .. } => "EquityRedemptionEvent::RedemptionRejected".to_string(),
+            Completed { .. } => "EquityRedemptionEvent::Completed".to_string(),
         }
     }
 

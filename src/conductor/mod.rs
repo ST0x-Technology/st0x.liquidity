@@ -3237,7 +3237,7 @@ mod tests {
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(
+            .on_position(
                 symbol,
                 &PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
@@ -3252,7 +3252,7 @@ mod tests {
                 },
             )
             .unwrap()
-            .apply_position_event(
+            .on_position(
                 symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),
@@ -3372,7 +3372,7 @@ mod tests {
         // Seed inventory with 50 offchain shares. CQRS will add 50 onchain.
         let initial_inventory = InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(
+            .on_position(
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),
@@ -3458,7 +3458,7 @@ mod tests {
         // Start balanced: 50 onchain, 50 offchain.
         let mut initial_inventory = InventoryView::default().with_equity(symbol.clone());
         initial_inventory = initial_inventory
-            .apply_position_event(
+            .on_position(
                 &symbol,
                 &PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
@@ -3474,7 +3474,7 @@ mod tests {
             )
             .unwrap();
         initial_inventory = initial_inventory
-            .apply_position_event(
+            .on_position(
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),
@@ -3587,7 +3587,7 @@ mod tests {
         // 65 onchain, 35 offchain = 65% < 70% upper bound -> within bounds.
         let initial_inventory = InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(
+            .on_position(
                 &symbol,
                 &PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
@@ -3602,7 +3602,7 @@ mod tests {
                 },
             )
             .unwrap()
-            .apply_position_event(
+            .on_position(
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),

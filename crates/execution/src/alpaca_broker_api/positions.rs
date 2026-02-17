@@ -100,6 +100,7 @@ async fn get_account_details(
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
@@ -170,8 +171,8 @@ mod tests {
             .iter()
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
-        assert_eq!(aapl.quantity, FractionalShares::new(Decimal::new(105, 1)));
-        assert_eq!(aapl.market_value, Some(Decimal::new(157_500, 2)));
+        assert_eq!(aapl.quantity, FractionalShares::new(dec!(10.5)));
+        assert_eq!(aapl.market_value, Some(dec!(1575.00)));
     }
 
     #[tokio::test]
@@ -331,9 +332,9 @@ mod tests {
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
         assert_eq!(
-            aapl.market_value_cents,
-            Some(157_500),
-            "Sub-cent market value 1575.005 should truncate to 157500 cents"
+            aapl.market_value,
+            Some(dec!(1575.005)),
+            "Sub-cent market value 1575.005 should be preserved as Decimal"
         );
     }
 
@@ -410,6 +411,6 @@ mod tests {
             .iter()
             .find(|position| position.symbol.to_string() == "RKLB")
             .unwrap();
-        assert_eq!(rklb.market_value, Some(Decimal::new(5_116_476, 4)),);
+        assert_eq!(rklb.market_value, Some(dec!(511.6476)));
     }
 }

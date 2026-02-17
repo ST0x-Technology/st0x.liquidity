@@ -376,7 +376,7 @@ where
     /// Skips if ANY venue (onchain or offchain) has inflight operations,
     /// because we cannot distinguish between "transfer completed but not
     /// confirmed" vs "unrelated inventory change".
-    fn apply_onchain_snapshot(self, snapshot_balance: T) -> Self {
+    fn react_to_onchain_snapshot(self, snapshot_balance: T) -> Self {
         if self.has_inflight() {
             return self;
         }
@@ -396,7 +396,7 @@ where
     /// Skips if ANY venue (onchain or offchain) has inflight operations,
     /// because we cannot distinguish between "transfer completed but not
     /// confirmed" vs "unrelated inventory change".
-    fn apply_offchain_snapshot(self, snapshot_balance: T) -> Self {
+    fn react_to_offchain_snapshot(self, snapshot_balance: T) -> Self {
         if self.has_inflight() {
             return self;
         }
@@ -528,7 +528,7 @@ impl InventoryView {
     /// - `OnChainOrderFilled`: Buy adds to onchain available, Sell removes.
     /// - `OffChainOrderFilled`: Buy adds to offchain available, Sell removes.
     /// - Other events: Update `last_updated` only.
-    pub(crate) fn apply_position_event(
+    pub(crate) fn on_position(
         self,
         symbol: &Symbol,
         event: &PositionEvent,
@@ -587,7 +587,7 @@ impl InventoryView {
     ///
     /// The `quantity` parameter is the mint quantity in `FractionalShares`, needed for
     /// events that modify balances but don't carry the quantity themselves.
-    pub(crate) fn apply_mint_event(
+    pub(crate) fn on_mint(
         self,
         symbol: &Symbol,
         event: &TokenizedEquityMintEvent,
@@ -645,7 +645,7 @@ impl InventoryView {
     ///
     /// The `quantity` parameter is the redemption quantity in `FractionalShares`, needed for
     /// events that modify balances but don't carry the quantity themselves.
-    pub(crate) fn apply_redemption_event(
+    pub(crate) fn on_redemption(
         self,
         symbol: &Symbol,
         event: &EquityRedemptionEvent,
@@ -706,7 +706,7 @@ impl InventoryView {
     ///
     /// The `amount` parameter is the rebalance amount, needed for events that
     /// don't carry the amount themselves.
-    pub(crate) fn apply_usdc_rebalance_event(
+    pub(crate) fn on_usdc_rebalance(
         self,
         event: &UsdcRebalanceEvent,
         direction: &RebalanceDirection,
@@ -811,48 +811,52 @@ impl InventoryView {
     /// - `OnchainCash`: Sets onchain USDC available to snapshot value (if no inflight anywhere).
     /// - `OffchainEquity`: Sets offchain available to snapshot value (if no inflight anywhere).
     /// - `OffchainCash`: Converts cents to Usdc and sets offchain available (if no inflight anywhere).
-    pub(crate) fn apply_snapshot_event(
+    pub(crate) fn on_snapshot(
         self,
         event: &InventorySnapshotEvent,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        use InventorySnapshotEvent::*;
         match event {
-            InventorySnapshotEvent::OnchainEquity { balances, .. } => {
+            OnchainEquity { balances, .. } => {
                 balances
                     .iter()
                     .try_fold(self, |view, (symbol, snapshot_balance)| {
                         view.update_equity(
                             symbol,
-                            |inventory| Ok(inventory.apply_onchain_snapshot(*snapshot_balance)),
+                            |inventory| Ok(inventory.react_to_onchain_snapshot(*snapshot_balance)),
                             now,
                         )
                     })
             }
 
-            InventorySnapshotEvent::OnchainCash { usdc_balance, .. } => self.update_usdc(
-                |inventory| Ok(inventory.apply_onchain_snapshot(*usdc_balance)),
+            OnchainCash { usdc_balance, .. } => self.update_usdc(
+                |inventory| Ok(inventory.react_to_onchain_snapshot(*usdc_balance)),
                 now,
             ),
 
-            InventorySnapshotEvent::OffchainEquity { positions, .. } => {
+            OffchainEquity { positions, .. } => {
                 positions
                     .iter()
                     .try_fold(self, |view, (symbol, snapshot_balance)| {
                         view.update_equity(
                             symbol,
-                            |inventory| Ok(inventory.apply_offchain_snapshot(*snapshot_balance)),
+                            |inventory| Ok(inventory.react_to_offchain_snapshot(*snapshot_balance)),
                             now,
                         )
                     })
             }
 
-            InventorySnapshotEvent::OffchainCash {
+            OffchainCash {
                 cash_balance_cents, ..
             } => {
                 let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
                     InventoryViewError::CashBalanceConversion(*cash_balance_cents),
                 )?;
-                self.update_usdc(|inventory| Ok(inventory.apply_offchain_snapshot(usdc)), now)
+                self.update_usdc(
+                    |inventory| Ok(inventory.react_to_offchain_snapshot(usdc)),
+                    now,
+                )
             }
         }
     }
@@ -869,6 +873,7 @@ mod tests {
     use st0x_execution::{ExecutorOrderId, Positive};
 
     use super::*;
+    use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::TradeId;
@@ -1143,7 +1148,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
-        let updated = view.apply_position_event(&symbol, &event).unwrap();
+        let updated = view.on_position(&symbol, &event).unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1162,7 +1167,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
         let event = make_onchain_fill(shares(10), Direction::Sell);
 
-        let updated = view.apply_position_event(&symbol, &event).unwrap();
+        let updated = view.on_position(&symbol, &event).unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1181,7 +1186,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
         let event = make_offchain_fill(shares(10), Direction::Buy);
 
-        let updated = view.apply_position_event(&symbol, &event).unwrap();
+        let updated = view.on_position(&symbol, &event).unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1200,7 +1205,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
         let event = make_offchain_fill(shares(10), Direction::Sell);
 
-        let updated = view.apply_position_event(&symbol, &event).unwrap();
+        let updated = view.on_position(&symbol, &event).unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1223,7 +1228,7 @@ mod tests {
         ]);
 
         let event = make_onchain_fill(shares(10), Direction::Buy);
-        let updated = view.apply_position_event(&aapl, &event).unwrap();
+        let updated = view.on_position(&aapl, &event).unwrap();
 
         let aapl_inv = updated.equities.get(&aapl).unwrap();
         assert_eq!(
@@ -1275,7 +1280,7 @@ mod tests {
             initialized_at: event_time,
         };
 
-        let updated = view.apply_position_event(&symbol, &event).unwrap();
+        let updated = view.on_position(&symbol, &event).unwrap();
 
         // Timestamp should come from the event, not Utc::now()
         assert_eq!(updated.last_updated, event_time);
@@ -1345,11 +1350,9 @@ mod tests {
         }
     }
 
-    fn make_raindex_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+    fn make_raindex_deposit_failed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::RaindexDepositFailed {
-            symbol: symbol.clone(),
-            quantity,
-            failed_tx_hash: Some(TxHash::random()),
+            reason: "test deposit failure".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -1361,7 +1364,7 @@ mod tests {
         let event = make_mint_requested(&symbol, dec!(50));
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(50), Utc::now())
+            .on_mint(&symbol, &event, shares(50), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1382,7 +1385,7 @@ mod tests {
         let event = make_mint_accepted();
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .on_mint(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1405,7 +1408,7 @@ mod tests {
         let event = make_tokens_received(U256::from(30_000_000_000_000_000_000_u128));
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .on_mint(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1427,7 +1430,7 @@ mod tests {
         let event = make_deposited_into_raindex();
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(0), Utc::now())
+            .on_mint(&symbol, &event, shares(0), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1441,7 +1444,7 @@ mod tests {
         let event = make_mint_rejected();
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .on_mint(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1464,7 +1467,7 @@ mod tests {
         let event = make_vault_deposited();
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .on_mint(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1486,10 +1489,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: tokens in wallet (counted as onchain available)
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_raindex_deposit_failed(&symbol, dec!(30));
+        let event = make_raindex_deposit_failed();
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .on_mint(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1513,7 +1516,7 @@ mod tests {
         let event = make_mint_acceptance_failed();
 
         let updated = view
-            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .on_mint(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1538,7 +1541,7 @@ mod tests {
 
         // MintRequested: No balance change
         let view = view
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &make_mint_requested(&symbol, dec!(30)),
                 quantity,
@@ -1557,7 +1560,7 @@ mod tests {
 
         // MintAccepted: Move 30 from offchain available to inflight
         let view = view
-            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
+            .on_mint(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1572,7 +1575,7 @@ mod tests {
 
         // TokensReceived: Remove from offchain inflight, add to onchain available
         let view = view
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &make_tokens_received(U256::from(30_000_000_000_000_000_000_u128)),
                 quantity,
@@ -1592,7 +1595,12 @@ mod tests {
 
         // Completed: Update last_rebalancing
         let view = view
-            .apply_mint_event(&symbol, &make_deposited_into_raindex(), shares(0), Utc::now())
+            .on_mint(
+                &symbol,
+                &make_deposited_into_raindex(),
+                shares(0),
+                Utc::now(),
+            )
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert!(inventory.last_rebalancing.is_some());
@@ -1606,7 +1614,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
 
         let view = view
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &make_mint_requested(&symbol, dec!(30)),
                 quantity,
@@ -1615,13 +1623,13 @@ mod tests {
             .unwrap();
 
         let view = view
-            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
+            .on_mint(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert!(inventory.has_inflight());
 
         let view = view
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &make_mint_acceptance_failed(),
                 quantity,
@@ -1648,7 +1656,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]);
 
         let view = view
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &make_mint_requested(&symbol, dec!(30)),
                 quantity,
@@ -1657,11 +1665,11 @@ mod tests {
             .unwrap();
 
         let view = view
-            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
+            .on_mint(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
 
         let view = view
-            .apply_mint_event(
+            .on_mint(
                 &symbol,
                 &make_tokens_received(U256::from(30_000_000_000_000_000_000_u128)),
                 quantity,
@@ -1699,7 +1707,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        let updated = view.apply_snapshot_event(&event, Utc::now()).unwrap();
+        let updated = view.on_snapshot(&event, Utc::now()).unwrap();
 
         let equity = updated.equities.get(&symbol).unwrap();
         assert_eq!(equity.offchain.unwrap().available(), shares(50));
@@ -1739,7 +1747,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            reason: "Alpaca timeout".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         }
     }
@@ -1758,7 +1766,7 @@ mod tests {
         let event = make_withdrawn_from_raindex(&symbol, dec!(30));
 
         let updated = view
-            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .on_redemption(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1781,7 +1789,7 @@ mod tests {
         let event = make_redemption_detected();
 
         let updated = view
-            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .on_redemption(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1804,7 +1812,7 @@ mod tests {
         let event = make_redemption_completed();
 
         let updated = view
-            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .on_redemption(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1827,7 +1835,7 @@ mod tests {
         let event = make_detection_failed();
 
         let updated = view
-            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .on_redemption(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1849,7 +1857,7 @@ mod tests {
         let event = make_redemption_rejected();
 
         let updated = view
-            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .on_redemption(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
@@ -1874,7 +1882,7 @@ mod tests {
 
         // WithdrawnFromRaindex: Move 30 from onchain available to inflight
         let view = view
-            .apply_redemption_event(
+            .on_redemption(
                 &symbol,
                 &make_withdrawn_from_raindex(&symbol, dec!(30)),
                 quantity,
@@ -1890,12 +1898,12 @@ mod tests {
 
         // TokensSent: No balance change (already inflight)
         let view = view
-            .apply_redemption_event(&symbol, &make_tokens_sent(), quantity, Utc::now())
+            .on_redemption(&symbol, &make_tokens_sent(), quantity, Utc::now())
             .unwrap();
 
         // Detected: No balance change
         let view = view
-            .apply_redemption_event(&symbol, &make_redemption_detected(), quantity, Utc::now())
+            .on_redemption(&symbol, &make_redemption_detected(), quantity, Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1906,7 +1914,7 @@ mod tests {
 
         // Completed: Remove from onchain inflight, add to offchain available
         let view = view
-            .apply_redemption_event(&symbol, &make_redemption_completed(), quantity, Utc::now())
+            .on_redemption(&symbol, &make_redemption_completed(), quantity, Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert_eq!(
@@ -1931,7 +1939,7 @@ mod tests {
 
         // WithdrawnFromRaindex: Move 30 from onchain available to inflight
         let view = view
-            .apply_redemption_event(
+            .on_redemption(
                 &symbol,
                 &make_withdrawn_from_raindex(&symbol, dec!(30)),
                 quantity,
@@ -1941,15 +1949,15 @@ mod tests {
 
         // TokensSent: No balance change
         let view = view
-            .apply_redemption_event(&symbol, &make_tokens_sent(), quantity, Utc::now())
+            .on_redemption(&symbol, &make_tokens_sent(), quantity, Utc::now())
             .unwrap();
 
         let view = view
-            .apply_redemption_event(&symbol, &make_redemption_detected(), quantity, Utc::now())
+            .on_redemption(&symbol, &make_redemption_detected(), quantity, Utc::now())
             .unwrap();
 
         let view = view
-            .apply_redemption_event(&symbol, &make_redemption_rejected(), quantity, Utc::now())
+            .on_redemption(&symbol, &make_redemption_rejected(), quantity, Utc::now())
             .unwrap();
         let inventory = view.equities.get(&symbol).unwrap();
         assert!(inventory.has_inflight());
@@ -1984,7 +1992,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        let updated = view.apply_snapshot_event(&event, Utc::now()).unwrap();
+        let updated = view.on_snapshot(&event, Utc::now()).unwrap();
 
         let equity = updated.equities.get(&symbol).unwrap();
         assert_eq!(equity.onchain.unwrap().available(), shares(25));
@@ -2043,7 +2051,7 @@ mod tests {
         let event = make_initiated_event();
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::AlpacaToBase,
                 usdc(100),
@@ -2069,7 +2077,7 @@ mod tests {
         let event = make_initiated_event();
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::BaseToAlpaca,
                 usdc(100),
@@ -2095,7 +2103,7 @@ mod tests {
         let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::AlpacaToBase,
                 usdc(100),
@@ -2120,7 +2128,7 @@ mod tests {
         let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::BaseToAlpaca,
                 usdc(100),
@@ -2146,7 +2154,7 @@ mod tests {
         let event = make_deposit_confirmed_event(direction.clone());
 
         let updated = view
-            .apply_usdc_rebalance_event(&event, &direction, usdc(100), Utc::now())
+            .on_usdc_rebalance(&event, &direction, usdc(100), Utc::now())
             .unwrap();
 
         assert!(updated.usdc.last_rebalancing.is_some());
@@ -2159,7 +2167,7 @@ mod tests {
         let direction = RebalanceDirection::AlpacaToBase;
 
         let after_initiated = view
-            .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
+            .on_usdc_rebalance(&make_initiated_event(), &direction, amount, Utc::now())
             .unwrap();
         assert_eq!(
             after_initiated
@@ -2174,7 +2182,7 @@ mod tests {
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &make_bridged_event(amount, Usdc(dec!(0))),
                 &direction,
                 amount,
@@ -2198,7 +2206,7 @@ mod tests {
         assert!(!after_bridged.usdc.has_inflight());
 
         let after_confirmed = after_bridged
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &make_deposit_confirmed_event(direction.clone()),
                 &direction,
                 amount,
@@ -2215,7 +2223,7 @@ mod tests {
         let direction = RebalanceDirection::BaseToAlpaca;
 
         let after_initiated = view
-            .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
+            .on_usdc_rebalance(&make_initiated_event(), &direction, amount, Utc::now())
             .unwrap();
         assert_eq!(
             after_initiated
@@ -2230,7 +2238,7 @@ mod tests {
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &make_bridged_event(amount, Usdc(dec!(0))),
                 &direction,
                 amount,
@@ -2254,7 +2262,7 @@ mod tests {
         assert!(!after_bridged.usdc.has_inflight());
 
         let after_confirmed = after_bridged
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &make_deposit_confirmed_event(direction.clone()),
                 &direction,
                 amount,
@@ -2276,7 +2284,7 @@ mod tests {
         };
         let after_withdrawal_failed = view
             .clone()
-            .apply_usdc_rebalance_event(&withdrawal_failed, &direction, amount, Utc::now())
+            .on_usdc_rebalance(&withdrawal_failed, &direction, amount, Utc::now())
             .unwrap();
         assert!(
             after_withdrawal_failed
@@ -2294,7 +2302,7 @@ mod tests {
         };
         let after_bridging_failed = view
             .clone()
-            .apply_usdc_rebalance_event(&bridging_failed, &direction, amount, Utc::now())
+            .on_usdc_rebalance(&bridging_failed, &direction, amount, Utc::now())
             .unwrap();
         assert!(after_bridging_failed.usdc.offchain.unwrap().has_inflight());
 
@@ -2304,7 +2312,7 @@ mod tests {
             failed_at: Utc::now(),
         };
         let after_deposit_failed = view
-            .apply_usdc_rebalance_event(&deposit_failed, &direction, amount, Utc::now())
+            .on_usdc_rebalance(&deposit_failed, &direction, amount, Utc::now())
             .unwrap();
         assert!(after_deposit_failed.usdc.offchain.unwrap().has_inflight());
     }
@@ -2549,7 +2557,7 @@ mod tests {
         };
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::AlpacaToBase,
                 Usdc(dec!(500)),
@@ -2590,7 +2598,7 @@ mod tests {
         };
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::BaseToAlpaca,
                 Usdc(dec!(500)),
@@ -2626,7 +2634,7 @@ mod tests {
         };
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::AlpacaToBase,
                 requested_amount, // This should be ignored - event's amount_received should be used
@@ -2676,7 +2684,7 @@ mod tests {
         };
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::AlpacaToBase,
                 Usdc(dec!(100)),
@@ -2723,7 +2731,7 @@ mod tests {
         };
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::BaseToAlpaca,
                 Usdc(dec!(100)),
@@ -2775,7 +2783,7 @@ mod tests {
         };
 
         let updated = view
-            .apply_usdc_rebalance_event(
+            .on_usdc_rebalance(
                 &event,
                 &RebalanceDirection::AlpacaToBase,
                 Usdc(dec!(1000)),
@@ -2820,7 +2828,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         let equity = updated.equities.get(&aapl).unwrap();
         assert_eq!(
@@ -2866,7 +2874,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         let equity = updated.equities.get(&aapl).unwrap();
         assert_eq!(
@@ -2904,7 +2912,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         let equity = updated.equities.get(&aapl).unwrap();
         assert_eq!(equity.onchain.unwrap().available(), shares(95));
@@ -2931,7 +2939,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         assert_eq!(
             updated.usdc.onchain.unwrap().available(),
@@ -2969,7 +2977,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         assert_eq!(
             updated.usdc.onchain.unwrap().available(),
@@ -2999,7 +3007,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         assert_eq!(updated.usdc.onchain.unwrap().available(), Usdc(dec!(950)));
         assert_eq!(updated.usdc.onchain.unwrap().inflight(), Usdc(dec!(0)));
@@ -3032,7 +3040,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         let equity = updated.equities.get(&aapl).unwrap();
         assert_eq!(
@@ -3078,7 +3086,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         let equity = updated.equities.get(&aapl).unwrap();
         assert_eq!(
@@ -3116,7 +3124,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         let equity = updated.equities.get(&aapl).unwrap();
         assert_eq!(equity.offchain.unwrap().available(), shares(55));
@@ -3143,7 +3151,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         assert_eq!(
             updated.usdc.offchain.unwrap().available(),
@@ -3181,7 +3189,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         assert_eq!(
             updated.usdc.offchain.unwrap().available(),
@@ -3212,7 +3220,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         assert_eq!(updated.usdc.offchain.unwrap().available(), Usdc(dec!(950)));
         assert_eq!(updated.usdc.offchain.unwrap().inflight(), Usdc(dec!(0)));
@@ -3257,7 +3265,7 @@ mod tests {
             fetched_at: now,
         };
 
-        let updated = view.apply_snapshot_event(&event, now).unwrap();
+        let updated = view.on_snapshot(&event, now).unwrap();
 
         assert_eq!(
             updated

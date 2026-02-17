@@ -228,10 +228,99 @@ impl Reactor for RebalancingTrigger {
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
         event
-            .on(|symbol, event| self.on_position(symbol, event))
-            .on(|_id, event| self.on_mint(event))
-            .on(|_id, event| self.on_redemption(event))
-            .on(|_id, event| self.on_usdc_rebalance(event))
+            .on(|symbol, event| async move {
+                let mut inventory = self.inventory.write().await;
+
+                let new_inventory =
+                    match inventory.clone().on_position(&symbol, &event) {
+                        Ok(updated) => updated,
+                        Err(error) => {
+                            warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
+                            return;
+                        }
+                    };
+
+                *inventory = new_inventory;
+                drop(inventory);
+
+                self.check_and_trigger_equity(&symbol).await;
+            })
+            .on(|_id, event| async move {
+                let Some((symbol, quantity)) = Self::extract_mint_info(&event) else {
+                    return;
+                };
+
+                {
+                    let mut inventory = self.inventory.write().await;
+
+                    match inventory
+                        .clone()
+                        .on_mint(&symbol, &event, quantity, Utc::now())
+                    {
+                        Ok(new_inventory) => *inventory = new_inventory,
+                        Err(error) => {
+                            warn!(symbol = %symbol, error = %error, "Failed to apply mint event to inventory");
+                        }
+                    }
+                }
+
+                if Self::is_terminal_mint_event(&event) {
+                    self.clear_equity_in_progress(&symbol);
+                    debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+
+                    self.check_and_trigger_usdc().await;
+                }
+            })
+            .on(|_id, event| async move {
+                let Some((symbol, quantity)) = Self::extract_redemption_info(&event) else {
+                    return;
+                };
+
+                {
+                    let mut inventory = self.inventory.write().await;
+
+                    match inventory
+                        .clone()
+                        .on_redemption(&symbol, &event, quantity, Utc::now())
+                    {
+                        Ok(new_inventory) => *inventory = new_inventory,
+                        Err(error) => {
+                            warn!(symbol = %symbol, error = %error, "Failed to apply redemption event to inventory");
+                        }
+                    }
+                }
+
+                if Self::is_terminal_redemption_event(&event) {
+                    self.clear_equity_in_progress(&symbol);
+                    debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
+
+                    self.check_and_trigger_usdc().await;
+                }
+            })
+            .on(|_id, event| async move {
+                if let Some((direction, amount)) = Self::extract_usdc_rebalance_info(&event) {
+                    let mut inventory = self.inventory.write().await;
+
+                    match inventory.clone().on_usdc_rebalance(
+                        &event,
+                        &direction,
+                        amount,
+                        Utc::now(),
+                    ) {
+                        Ok(new_inventory) => *inventory = new_inventory,
+                        Err(error) => {
+                            warn!(error = %error, "Failed to apply USDC rebalance event to inventory");
+                        }
+                    }
+                }
+
+                if Self::is_terminal_usdc_rebalance_event(&event) {
+                    self.clear_usdc_in_progress();
+                    debug!("Cleared USDC in-progress flag after rebalance terminal event");
+
+                    self.check_and_trigger_usdc().await;
+                }
+            })
             .exhaustive()
             .await;
 
@@ -240,69 +329,6 @@ impl Reactor for RebalancingTrigger {
 }
 
 impl RebalancingTrigger {
-    async fn on_position(&self, symbol: Symbol, event: PositionEvent) {
-        let mut inventory = self.inventory.write().await;
-
-        let new_inventory = match inventory.clone().react_to_position_event(&symbol, &event) {
-            Ok(updated) => updated,
-            Err(error) => {
-                warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
-                return;
-            }
-        };
-
-        *inventory = new_inventory;
-        drop(inventory);
-
-        self.check_and_trigger_equity(&symbol).await;
-    }
-
-    async fn on_mint(&self, event: TokenizedEquityMintEvent) {
-        let Some((symbol, quantity)) = Self::extract_mint_info(&event) else {
-            return;
-        };
-
-        self.react_to_mint_event_to_inventory(&symbol, &event, quantity)
-            .await;
-
-        if Self::is_terminal_mint_event(&event) {
-            self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
-
-            self.check_and_trigger_usdc().await;
-        }
-    }
-
-    async fn on_redemption(&self, event: EquityRedemptionEvent) {
-        let Some((symbol, quantity)) = Self::extract_redemption_info(&event) else {
-            return;
-        };
-
-        self.react_to_redemption_event_to_inventory(&symbol, &event, quantity)
-            .await;
-
-        if Self::is_terminal_redemption_event(&event) {
-            self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
-
-            self.check_and_trigger_usdc().await;
-        }
-    }
-
-    async fn on_usdc_rebalance(&self, event: UsdcRebalanceEvent) {
-        if let Some((direction, amount)) = Self::extract_usdc_rebalance_info(&event) {
-            self.react_to_usdc_rebalance_event_to_inventory(&event, &direction, amount)
-                .await;
-        }
-
-        if Self::is_terminal_usdc_rebalance_event(&event) {
-            self.clear_usdc_in_progress();
-            debug!("Cleared USDC in-progress flag after rebalance terminal event");
-
-            self.check_and_trigger_usdc().await;
-        }
-    }
-
     /// Checks inventory for equity imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_equity(&self, symbol: &Symbol) {
         let Some(guard) = equity::InProgressGuard::try_claim(
@@ -469,29 +495,6 @@ impl RebalancingTrigger {
         }
     }
 
-    async fn react_to_mint_event_to_inventory(
-        &self,
-        symbol: &Symbol,
-        event: &TokenizedEquityMintEvent,
-        quantity: FractionalShares,
-    ) {
-        let mut inventory = self.inventory.write().await;
-
-        let result = inventory
-            .clone()
-            .react_to_mint_event(symbol, event, quantity, Utc::now());
-
-        match result {
-            Ok(new_inventory) => {
-                *inventory = new_inventory;
-                drop(inventory);
-            }
-            Err(error) => {
-                warn!(symbol = %symbol, error = %error, "Failed to apply mint event to inventory");
-            }
-        }
-    }
-
     fn extract_redemption_info(
         event: &EquityRedemptionEvent,
     ) -> Option<(Symbol, FractionalShares)> {
@@ -520,29 +523,6 @@ impl RebalancingTrigger {
             | TokensUnwrapped { .. }
             | TokensSent { .. }
             | Detected { .. } => false,
-        }
-    }
-
-    async fn react_to_redemption_event_to_inventory(
-        &self,
-        symbol: &Symbol,
-        event: &EquityRedemptionEvent,
-        quantity: FractionalShares,
-    ) {
-        let mut inventory = self.inventory.write().await;
-
-        let result = inventory
-            .clone()
-            .react_to_redemption_event(symbol, event, quantity, Utc::now());
-
-        match result {
-            Ok(new_inventory) => {
-                *inventory = new_inventory;
-                drop(inventory);
-            }
-            Err(error) => {
-                warn!(symbol = %symbol, error = %error, "Failed to apply redemption event to inventory");
-            }
         }
     }
 
@@ -579,30 +559,6 @@ impl RebalancingTrigger {
                     ..
                 }
         )
-    }
-
-    async fn react_to_usdc_rebalance_event_to_inventory(
-        &self,
-        event: &UsdcRebalanceEvent,
-        direction: &RebalanceDirection,
-        amount: Usdc,
-    ) {
-        let mut inventory = self.inventory.write().await;
-
-        let result =
-            inventory
-                .clone()
-                .react_to_usdc_rebalance_event(event, direction, amount, Utc::now());
-
-        match result {
-            Ok(new_inventory) => {
-                *inventory = new_inventory;
-                drop(inventory);
-            }
-            Err(error) => {
-                warn!(error = %error, "Failed to apply USDC rebalance event to inventory");
-            }
-        }
     }
 }
 
@@ -1033,10 +989,10 @@ mod tests {
 
         // Build balanced initial state: 50 onchain, 50 offchain.
         inventory = inventory
-            .react_to_position_event(&symbol, &make_onchain_fill(shares(50), Direction::Buy))
+            .on_position(&symbol, &make_onchain_fill(shares(50), Direction::Buy))
             .unwrap();
         inventory = inventory
-            .react_to_position_event(&symbol, &make_offchain_fill(shares(50), Direction::Buy))
+            .on_position(&symbol, &make_offchain_fill(shares(50), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
@@ -1064,10 +1020,10 @@ mod tests {
         // Build imbalanced state: 20 onchain, 80 offchain = 20% onchain ratio.
         // This is below the 30% lower threshold (50% - 20% deviation).
         inventory = inventory
-            .react_to_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
+            .on_position(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
             .unwrap();
         inventory = inventory
-            .react_to_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
+            .on_position(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) =
@@ -1095,10 +1051,10 @@ mod tests {
         // At 1.5 ratio: 65 wrapped = 97.5 underlying-equivalent.
         //   97.5/(97.5+35) = 73.6% -> above 70% -> triggers redemption.
         inventory = inventory
-            .react_to_position_event(&symbol, &make_onchain_fill(shares(65), Direction::Buy))
+            .on_position(&symbol, &make_onchain_fill(shares(65), Direction::Buy))
             .unwrap();
         inventory = inventory
-            .react_to_position_event(&symbol, &make_offchain_fill(shares(35), Direction::Buy))
+            .on_position(&symbol, &make_offchain_fill(shares(35), Direction::Buy))
             .unwrap();
 
         let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
@@ -1172,9 +1128,9 @@ mod tests {
         // Threshold: target 50%, deviation 20%, so lower bound is 30%.
         // 20% < 30% triggers TooMuchOffchain.
         let inventory = inventory
-            .react_to_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
+            .on_position(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
             .unwrap()
-            .react_to_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
+            .on_position(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) =
@@ -1193,9 +1149,13 @@ mod tests {
 
         // Apply MintAccepted - this moves shares to inflight.
         // Inflight should now block imbalance detection.
-        trigger
-            .react_to_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30))
-            .await;
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .on_mint(&symbol, &make_mint_accepted(), shares(30), Utc::now())
+                .unwrap();
+        }
 
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await;
@@ -1347,17 +1307,21 @@ mod tests {
         // Threshold: target 50%, deviation 20%, so upper bound is 70%.
         // 80% > 70% triggers TooMuchOnchain.
         let inventory = inventory
-            .react_to_position_event(&symbol, &make_onchain_fill(shares(80), Direction::Buy))
+            .on_position(&symbol, &make_onchain_fill(shares(80), Direction::Buy))
             .unwrap()
-            .react_to_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
+            .on_position(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
             .unwrap();
 
         let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
-        trigger
-            .react_to_redemption_event_to_inventory(&symbol, &make_tokens_sent(), shares(30))
-            .await;
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .on_redemption(&symbol, &make_tokens_sent(), shares(30), Utc::now())
+                .unwrap();
+        }
 
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await;
