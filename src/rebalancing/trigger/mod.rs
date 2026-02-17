@@ -777,10 +777,10 @@ mod tests {
     const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
-    /// Applies a position event to the trigger's inventory and runs the equity
-    /// rebalancing check, replicating what the `Reactor::react` closure does
-    /// for `Position` events.
-    async fn apply_position_event(
+    /// Dispatches a position event to the trigger's inventory and runs the
+    /// equity rebalancing check, replicating what the `Reactor::react`
+    /// closure does for `Position` events.
+    async fn dispatch_position_event(
         trigger: &RebalancingTrigger,
         symbol: &Symbol,
         event: &PositionEvent,
@@ -945,12 +945,12 @@ mod tests {
         // 20% < 30% -> should trigger Mint (too much offchain).
         for _ in 0..20 {
             let event = make_onchain_fill(shares(1), Direction::Buy);
-            trigger.on_position(symbol.clone(), event).await;
+            dispatch_position_event(&trigger, &symbol, &event).await;
         }
 
         for _ in 0..80 {
             let event = make_offchain_fill(shares(1), Direction::Buy);
-            trigger.on_position(symbol.clone(), event).await;
+            dispatch_position_event(&trigger, &symbol, &event).await;
         }
 
         // Drain any intermediate triggers and do a final check.
@@ -959,7 +959,7 @@ mod tests {
 
         // One more event to trigger the check after the imbalance is built up.
         let event = make_onchain_fill(shares(1), Direction::Buy);
-        trigger.on_position(symbol.clone(), event).await;
+        dispatch_position_event(&trigger, &symbol, &event).await;
 
         let triggered = receiver.try_recv();
         assert!(
@@ -977,11 +977,11 @@ mod tests {
 
         // Apply onchain buy - should add to onchain available.
         let event = make_onchain_fill(shares(50), Direction::Buy);
-        trigger.on_position(symbol.clone(), event).await;
+        dispatch_position_event(&trigger, &symbol, &event).await;
 
         // Apply offchain buy - should add to offchain available.
         let event = make_offchain_fill(shares(50), Direction::Buy);
-        trigger.on_position(symbol.clone(), event).await;
+        dispatch_position_event(&trigger, &symbol, &event).await;
 
         // Now inventory has 50 onchain, 50 offchain = balanced at 50%.
         // Drain any previous triggered operations (from on_position).
@@ -1015,7 +1015,7 @@ mod tests {
         // Apply a small buy that maintains balance (5 shares onchain).
         // After: 55 onchain, 50 offchain = 52.4% ratio, within 30-70% bounds.
         let event = make_onchain_fill(shares(5), Direction::Buy);
-        trigger.on_position(symbol.clone(), event).await;
+        dispatch_position_event(&trigger, &symbol, &event).await;
 
         // No operation should be triggered.
         assert!(
@@ -1046,7 +1046,7 @@ mod tests {
 
         // Apply a small event that triggers the imbalance check.
         let event = make_onchain_fill(shares(1), Direction::Buy);
-        trigger.on_position(symbol.clone(), event).await;
+        dispatch_position_event(&trigger, &symbol, &event).await;
 
         // Mint should be triggered because too much offchain.
         let triggered = receiver.try_recv();

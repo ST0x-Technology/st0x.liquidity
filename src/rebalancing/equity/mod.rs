@@ -276,7 +276,13 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             )
             .await?;
 
-        info!("Mint request submitted");
+        info!("Mint request accepted, polling for completion");
+
+        self.mint_store
+            .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
+            .await?;
+
+        info!("Mint tokens received");
         Ok(())
     }
 }

@@ -1206,23 +1206,31 @@ vault for liquidity provision.
 
 **Services**:
 `EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
-Arc<dyn Tokenizer> }`
+Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 -- shared with `EquityRedemption`.
 
 ##### State Flow
 
 ```mermaid
 stateDiagram-v2
-    [*] --> MintRequested: RequestMint
-    MintRequested --> MintAccepted
-    MintRequested --> Failed
-    MintAccepted --> TokensReceived
-    MintAccepted --> Failed
+    [*] --> MintAccepted: RequestMint (calls request_mint)
+    [*] --> Failed: RequestMint (rejected)
+    MintAccepted --> TokensReceived: Poll (calls poll_mint_until_complete)
+    MintAccepted --> Failed: Poll (rejected/error)
     TokensReceived --> TokensWrapped: WrapTokens
     TokensReceived --> Failed
     TokensWrapped --> DepositedIntoRaindex: DepositToVault
     TokensWrapped --> Failed
 ```
+
+`RequestMint` is the initialize command -- it calls `request_mint()` on the
+tokenizer service and emits `MintRequested` + `MintAccepted` atomically. If the
+tokenizer rejects the request, it emits `MintRequested` + `MintRejected`.
+
+`Poll` is a separate transition command that calls `poll_mint_until_complete()`
+on the tokenizer service. This split ensures that the
+`MintRequested`/`MintAccepted` events are persisted before the potentially
+long-running poll begins.
 
 Alpaca mints unwrapped tokens. Before depositing to Raindex, we wrap them into
 ERC-4626 vault shares using the Wrapper service.
@@ -1237,9 +1245,10 @@ enum TokenizedEquityMint {
     MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
     TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
     TokensWrapped { /* + wrap_tx_hash, wrapped_shares */ },
-    DepositedIntoRaindex { symbol, quantity, issuer_request_id, tokenization_request_id,
-                           token_tx_hash, wrap_tx_hash, vault_deposit_tx_hash, deposited_at },
-    Failed { symbol, quantity, reason, failed_at },
+    DepositedIntoRaindex { symbol, quantity, issuer_request_id,
+        tokenization_request_id, token_tx_hash, wrap_tx_hash,
+        vault_deposit_tx_hash, deposited_at },
+    Failed { symbol, quantity, reason, requested_at, failed_at },
 }
 ```
 
@@ -1247,11 +1256,13 @@ enum TokenizedEquityMint {
 
 ```rust
 enum TokenizedEquityMintCommand {
-    RequestMint { symbol, quantity, wallet },
+    /// Initialize: calls tokenizer.request_mint(), emits
+    /// MintRequested + MintAccepted (or MintRejected on rejection).
+    RequestMint { issuer_request_id, symbol, quantity, wallet },
+    /// Transition: calls tokenizer.poll_mint_until_complete(),
+    /// emits TokensReceived (or MintAcceptanceFailed).
+    Poll,
     RejectMint { reason },
-    AcknowledgeAcceptance { issuer_request_id, tokenization_request_id },
-    FailAcceptance { reason },
-    ReceiveTokens { tx_hash, receipt_id, shares_minted },
     WrapTokens { wrap_tx_hash, wrapped_shares },
     DepositToVault { vault_deposit_tx_hash },
 }
@@ -1265,13 +1276,13 @@ Each event captures data relevant to that state transition:
 enum TokenizedEquityMintEvent {
     MintRequested { symbol, quantity, wallet, requested_at },
 
-    MintAccepted { symbol, quantity, issuer_request_id, tokenization_request_id, accepted_at },
-    MintAcceptanceFailed { symbol, quantity, last_status: TokenizationRequestStatus, failed_at },
+    MintAccepted { issuer_request_id, tokenization_request_id, accepted_at },
+    MintAcceptanceFailed { reason, failed_at },
 
-    TokensReceived { symbol, quantity, tx_hash, receipt_id, shares_minted, received_at },
+    TokensReceived { tx_hash, receipt_id, shares_minted, received_at },
 
     TokensWrapped { wrap_tx_hash, wrapped_shares, wrapped_at },
-    WrapFailed { symbol, quantity, reason, failed_at },
+    WrappingFailed { reason, failed_at },
 
     DepositedIntoRaindex { vault_deposit_tx_hash, deposited_at },
     RaindexDepositFailed { reason, failed_at },
@@ -1282,11 +1293,13 @@ enum TokenizedEquityMintEvent {
 
 ##### Business Rules
 
-- `Mint` only from uninitialized state; polls Alpaca until tokens arrive or
-  failure
-- `Wrap` only from TokensReceived state; wraps unwrapped tokens into ERC-4626
-  shares
-- `Deposit` only from TokensWrapped state
+- `RequestMint` only from uninitialized state; calls `request_mint()` on the
+  tokenizer service to submit the request and get acceptance
+- `Poll` only from MintAccepted state; calls `poll_mint_until_complete()` on the
+  tokenizer service until tokens arrive or failure
+- `WrapTokens` only from TokensReceived state; wraps unwrapped tokens into
+  ERC-4626 shares
+- `DepositToVault` only from TokensWrapped state
 - DepositedIntoRaindex and Failed are terminal states
 
 #### EquityRedemption Aggregate
