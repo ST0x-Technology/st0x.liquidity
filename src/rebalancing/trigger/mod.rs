@@ -580,7 +580,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
-    use uuid::uuid;
+    use uuid::{Uuid, uuid};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -1725,7 +1725,7 @@ mod tests {
         let spy = Arc::new(EventCapturingReactor::new());
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let id = UsdcRebalanceId::new("base-to-alpaca-001");
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
@@ -1812,7 +1812,7 @@ mod tests {
         let spy = Arc::new(EventCapturingReactor::new());
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let id = UsdcRebalanceId::new("alpaca-to-base-001");
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
@@ -1896,7 +1896,7 @@ mod tests {
         let spy = Arc::new(EventCapturingReactor::new());
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let id = UsdcRebalanceId::new("withdrawal-failed-test");
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
 
         store
@@ -1937,7 +1937,7 @@ mod tests {
         let spy = Arc::new(EventCapturingReactor::new());
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let id = UsdcRebalanceId::new("bridging-failed-test");
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(uuid::Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
@@ -1993,7 +1993,7 @@ mod tests {
         let spy = Arc::new(EventCapturingReactor::new());
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let id = UsdcRebalanceId::new("conversion-failed-test");
+        let id = UsdcRebalanceId(Uuid::new_v4());
 
         store
             .send(
@@ -2053,7 +2053,7 @@ mod tests {
         // and terminal DepositConfirmed
         let tx_hash =
             fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
-        let id = UsdcRebalanceId::new("test-clear-001".to_string());
+        let id = UsdcRebalanceId(Uuid::new_v4());
 
         let trigger_harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -2093,7 +2093,7 @@ mod tests {
         let spy = Arc::new(EventCapturingReactor::new());
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
-        let id = UsdcRebalanceId::new("conversion-base-to-alpaca-001");
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
 

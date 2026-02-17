@@ -1595,24 +1595,34 @@ recovery by persisting state transitions as events.
 
 ##### Transfer Implementations
 
-Each `CrossVenueTransfer` impl:
+Two structs implement all four transfer directions:
 
-1. Holds a `Store<LifecycleAggregate>` plus domain service traits (`Tokenizer`,
-   `Raindex`, etc.)
-2. Creates a lifecycle aggregate instance for each transfer
-3. Sends commands that invoke domain service methods as side effects
-4. Returns when the lifecycle reaches a terminal state
+- **`CrossVenueEquityTransfer`**: Implements
+  `CrossVenueTransfer<HedgingVenue, MarketMakingVenue>` (mint direction) and
+  `CrossVenueTransfer<MarketMakingVenue, HedgingVenue>` (redemption direction).
+  Holds stores for both equity lifecycle aggregates plus `Raindex` and
+  `Tokenizer` service traits.
+
+- **`CrossVenueCashTransfer`**: Implements both USDC directions. Holds a store
+  for the cash lifecycle aggregate plus `Bridge`, `AlpacaFunding`, and onchain
+  provider dependencies.
+
+Each transfer:
+
+1. Creates a lifecycle aggregate instance (UUID) for crash recovery
+2. Sends commands that invoke domain service methods as side effects
+3. Returns when the lifecycle reaches a terminal state
 
 The lifecycle aggregates (EquityTransferToMarketMakingVenue,
-EquityTransferToHedgingVenue, CrossVenueCashTransfer) are internal to their
-transfer impls. External code interacts with transfers only through
+EquityTransferToHedgingVenue, CrossVenueCashTransfer) are implementation details
+of their respective transfer structs. External code interacts only through
 `CrossVenueTransfer::transfer()`.
 
 ##### Rebalancer
 
 The `Rebalancer` receives `TriggeredOperation`s and dispatches to the
-appropriate `CrossVenueTransfer` impl. It holds four transfer impls (equity
-in/out, USDC in/out) and calls `transfer()` on the right one.
+appropriate `CrossVenueTransfer` impl. It holds `Arc<dyn CrossVenueTransfer>`
+for each of the four directions and calls `transfer()` on the right one.
 
 Three lifecycle aggregates handle the transfer workflows.
 

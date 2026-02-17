@@ -300,7 +300,7 @@ mod tests {
             positions: vec![crate::EquityPosition {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(Decimal::from(100)),
-                market_value_cents: Some(1_500_000),
+                market_value: Some(Decimal::new(1_500_000, 2)),
             }],
             cash_balance_cents: 5_000_000,
         };

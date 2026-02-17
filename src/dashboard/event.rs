@@ -82,6 +82,7 @@ impl Reactor for EventBroadcaster {
 mod tests {
     use alloy::primitives::Address;
     use st0x_execution::Symbol;
+    use uuid::Uuid;
 
     use st0x_event_sorcery::ReactorHarness;
 
@@ -193,10 +194,10 @@ mod tests {
         let (sender, mut receiver) = broadcast::channel(16);
         let harness = ReactorHarness::new(EventBroadcaster::new(sender));
 
-        let id = UsdcRebalanceId::new("usdc-456".to_string());
+        let id = UsdcRebalanceId(Uuid::new_v4());
 
         harness
-            .receive::<UsdcRebalance>(id, make_usdc_withdrawal_confirmed())
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
             .await
             .unwrap();
 
@@ -205,7 +206,7 @@ mod tests {
         match msg {
             ServerMessage::Event(entry) => {
                 assert_eq!(entry.aggregate_type, "UsdcRebalance");
-                assert_eq!(entry.aggregate_id, "usdc-456");
+                assert_eq!(entry.aggregate_id, id.to_string());
                 assert_eq!(entry.event_type, "UsdcRebalanceEvent::WithdrawalConfirmed");
             }
             ServerMessage::Initial(_) => panic!("expected Event message"),

@@ -73,13 +73,7 @@ use crate::threshold::Usdc;
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct UsdcRebalanceId(pub(crate) String);
-
-impl UsdcRebalanceId {
-    pub(crate) fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-}
+pub(crate) struct UsdcRebalanceId(pub(crate) Uuid);
 
 impl Display for UsdcRebalanceId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -88,10 +82,10 @@ impl Display for UsdcRebalanceId {
 }
 
 impl FromStr for UsdcRebalanceId {
-    type Err = std::convert::Infallible;
+    type Err = uuid::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(value.to_string()))
+        Ok(Self(Uuid::parse_str(value)?))
     }
 }
 

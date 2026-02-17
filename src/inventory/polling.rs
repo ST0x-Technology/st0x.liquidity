@@ -309,12 +309,12 @@ mod tests {
                 EquityPosition {
                     symbol: test_symbol("AAPL"),
                     quantity: test_shares(100),
-                    market_value_cents: Some(1_500_000),
+                    market_value: Some(Decimal::new(1_500_000, 2)),
                 },
                 EquityPosition {
                     symbol: test_symbol("MSFT"),
                     quantity: test_shares(50),
-                    market_value_cents: Some(2_000_000),
+                    market_value: Some(Decimal::new(2_000_000, 2)),
                 },
             ],
             cash_balance_cents: 10_000_000,
@@ -493,7 +493,7 @@ mod tests {
             positions: vec![EquityPosition {
                 symbol: test_symbol("AAPL"),
                 quantity: test_shares(1000),
-                market_value_cents: Some(15_000_000),
+                market_value: Some(Decimal::new(15_000_000, 2)),
             }],
             cash_balance_cents: -5_000_000, // -$50,000 (margin debt)
         };
@@ -540,7 +540,7 @@ mod tests {
             positions: vec![EquityPosition {
                 symbol: test_symbol("AAPL"),
                 quantity: fractional_qty,
-                market_value_cents: Some(185_175), // ~$1851.75
+                market_value: Some(Decimal::new(185_175, 2)), // ~$1851.75
             }],
             cash_balance_cents: 1_000_000,
         };

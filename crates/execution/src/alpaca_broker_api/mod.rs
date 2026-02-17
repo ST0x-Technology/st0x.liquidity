@@ -140,13 +140,4 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Invalid symbol in position: {0}")]
     InvalidSymbol(#[from] crate::EmptySymbolError),
-
-    #[error(
-        "Market value conversion failed for symbol \
-         {symbol}: {market_value:?}"
-    )]
-    MarketValueConversion {
-        symbol: Symbol,
-        market_value: Option<Decimal>,
-    },
 }
