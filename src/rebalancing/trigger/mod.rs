@@ -299,7 +299,7 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         let inventory_error = match error {
             RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
-            other => return Err(other),
+            other @ RebalancingTriggerError::EquityTrigger(_) => return Err(other),
         };
 
         warn!(

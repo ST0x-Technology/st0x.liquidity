@@ -407,13 +407,17 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestError(&'static str);
+    struct TestError {
+        _reason: &'static str,
+    }
 
     #[test]
     fn force_apply_snapshot_clears_inflight() {
         let balance = equity_balance(90, 10);
         let snapshot_balance = FractionalShares::new(Decimal::from(95));
-        let error = TestError("stuck inflight");
+        let error = TestError {
+            _reason: "stuck inflight",
+        };
 
         let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
@@ -425,7 +429,9 @@ mod tests {
     fn force_apply_snapshot_works_when_inflight_zero() {
         let balance = equity_balance(100, 0);
         let snapshot_balance = FractionalShares::new(Decimal::from(75));
-        let error = TestError("recovery");
+        let error = TestError {
+            _reason: "recovery",
+        };
 
         let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
@@ -437,7 +443,9 @@ mod tests {
     fn force_apply_snapshot_works_with_usdc() {
         let balance = usdc_balance(1000, 200);
         let snapshot_balance = Usdc(Decimal::from(950));
-        let error = TestError("usdc corruption");
+        let error = TestError {
+            _reason: "usdc corruption",
+        };
 
         let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
