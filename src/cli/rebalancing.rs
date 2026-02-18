@@ -313,6 +313,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
+    recipient: Option<Address>,
     ctx: &Ctx,
     provider: P,
 ) -> anyhow::Result<()> {
@@ -329,8 +330,13 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
         anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let receiving_wallet = signer.address();
+    let receiving_wallet = match recipient {
+        Some(address) => address,
+        None => {
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
+            signer.address()
+        }
+    };
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
     let erc20 = IERC20::new(token, provider.clone());

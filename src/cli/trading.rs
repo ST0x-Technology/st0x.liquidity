@@ -12,7 +12,7 @@ use tracing::{error, info};
 
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
-    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
+    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
@@ -43,7 +43,7 @@ impl OrderPlacer for CliOrderPlacer {
         order: MarketOrder,
     ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
         let placement =
-            execute_broker_order(&self.ctx, &self.pool, order, &mut std::io::sink()).await?;
+            execute_broker_order(&self.ctx, &self.pool, order, None, &mut std::io::sink()).await?;
         Ok(ExecutorOrderId::new(&placement.order_id))
     }
 }
@@ -138,6 +138,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
     quantity: u64,
     direction: Direction,
+    time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -150,7 +151,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 
     info!("Created order: symbol={symbol}, direction={direction:?}, quantity={quantity}");
 
-    match execute_broker_order(ctx, pool, market_order, stdout).await {
+    match execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await {
         Ok(placement) => {
             info!(
                 symbol = %symbol,
@@ -229,6 +230,7 @@ pub(super) async fn execute_broker_order<W: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
     market_order: MarketOrder,
+    time_in_force: Option<TimeInForce>,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &ctx.broker {
@@ -258,7 +260,11 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
-            let broker = alpaca_auth.clone().try_into_executor().await?;
+            let mut auth = alpaca_auth.clone();
+            if let Some(tif) = time_in_force {
+                auth.time_in_force = tif;
+            }
+            let broker = auth.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -547,6 +553,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -571,6 +578,7 @@ mod tests {
             Symbol::new("TSLA").unwrap(),
             50,
             Direction::Sell,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -612,6 +620,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -634,6 +643,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -677,6 +687,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,

@@ -276,7 +276,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
+    opt.filter(|symbol_str| !symbol_str.is_empty())
+        .map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
         .transpose()
 }
 
