@@ -334,6 +334,13 @@ All SSH keys centralized in `keys.nix` with role-based access:
 `os.nix` imports `roles.ssh` for `authorizedKeys`. CI uses its key (stored as
 `SSH_KEY` GitHub secret) for both deployment and terraform state decryption.
 
+### Wallet Management (Fireblocks)
+
+All onchain write operations are submitted through Fireblocks MPC-based key
+management via the `ContractCaller` trait abstraction. See
+[crates/contract-caller/README.md](crates/contract-caller/README.md) for
+architecture, configuration, and consumer details.
+
 ## Crate Architecture
 
 The codebase is organized into multiple Rust crates to achieve:
@@ -423,16 +430,18 @@ The system provides two top-level capabilities:
 
 **Integration Layer** (external API wrappers):
 
-| Crate               | Purpose                                              | Feature Flags                      |
-| ------------------- | ---------------------------------------------------- | ---------------------------------- |
-| `st0x-execution`    | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock` |
-| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
-| `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                             |
-| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                             |
+| Crate                  | Purpose                                              | Feature Flags                      |
+| ---------------------- | ---------------------------------------------------- | ---------------------------------- |
+| `st0x-execution`       | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock` |
+| `st0x-tokenization`    | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
+| `st0x-bridge`          | Cross-chain asset transfers                          | `cctp`                             |
+| `st0x-raindex`         | Rain orderbook vault deposit/withdraw operations     | `rain`                             |
+| `st0x-contract-caller` | Onchain transaction submission abstraction           | `fireblocks`, `local-signer`       |
 
 Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
-`Raindex`) with one or more implementations selectable via feature flags. This
-allows swapping implementations without changing domain logic.
+`Raindex`, `ContractCaller`) with one or more implementations selectable via
+feature flags. This allows swapping implementations without changing domain
+logic.
 
 **Domain Logic Layer** (business rules):
 

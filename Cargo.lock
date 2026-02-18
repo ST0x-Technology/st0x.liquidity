@@ -6619,6 +6619,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-contract-caller"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "st0x-dto"
 version = "0.1.0"
 dependencies = [

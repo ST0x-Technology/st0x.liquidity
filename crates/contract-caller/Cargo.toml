@@ -1,0 +1,20 @@
+[package]
+name = "st0x-contract-caller"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+local-signer = []
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true
