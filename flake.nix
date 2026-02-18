@@ -200,6 +200,7 @@
               cargo-chef
               terraform
               ragenix.packages.${system}.default
+              packages.ci
               packages.prepSolArtifacts
               packages.remote
               packages.deployNixos
