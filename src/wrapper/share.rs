@@ -1,17 +1,19 @@
 //! WrapperService implementation for ERC-4626 token wrapping/unwrapping.
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::info;
 
+use st0x_contract_caller::ContractCaller;
 use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
 use crate::bindings::IERC4626;
-use crate::onchain::REQUIRED_CONFIRMATIONS;
 
 /// One unit with 18 decimals for ratio queries.
 const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -29,6 +31,7 @@ where
     Node: Provider + Clone,
 {
     provider: Node,
+    caller: Arc<dyn ContractCaller>,
     owner: Address,
     config: HashMap<Symbol, EquityTokenAddresses>,
 }
@@ -39,11 +42,13 @@ where
 {
     pub(crate) fn new(
         provider: Node,
+        caller: Arc<dyn ContractCaller>,
         owner: Address,
         config: HashMap<Symbol, EquityTokenAddresses>,
     ) -> Self {
         Self {
             provider,
+            caller,
             owner,
             config,
         }
@@ -104,12 +109,19 @@ where
         underlying_amount: U256,
         receiver: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
-        let vault = IERC4626::new(wrapped_token, &self.provider);
+        let calldata = IERC4626::depositCall {
+            assets: underlying_amount,
+            receiver,
+        };
 
-        let pending = vault.deposit(underlying_amount, receiver).send().await?;
-        let receipt = pending
-            .with_required_confirmations(REQUIRED_CONFIRMATIONS)
-            .get_receipt()
+        info!("Sending ERC4626 deposit to {wrapped_token}");
+        let receipt = self
+            .caller
+            .call_contract(
+                wrapped_token,
+                Bytes::from(SolCall::abi_encode(&calldata)),
+                "ERC4626 deposit",
+            )
             .await?;
         let tx_hash = receipt.transaction_hash;
 
@@ -135,12 +147,20 @@ where
         receiver: Address,
         owner: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
-        let vault = IERC4626::new(wrapped_token, &self.provider);
+        let calldata = IERC4626::redeemCall {
+            shares: wrapped_amount,
+            receiver,
+            owner,
+        };
 
-        let pending = vault.redeem(wrapped_amount, receiver, owner).send().await?;
-        let receipt = pending
-            .with_required_confirmations(REQUIRED_CONFIRMATIONS)
-            .get_receipt()
+        info!("Sending ERC4626 redeem to {wrapped_token}");
+        let receipt = self
+            .caller
+            .call_contract(
+                wrapped_token,
+                Bytes::from(SolCall::abi_encode(&calldata)),
+                "ERC4626 redeem",
+            )
             .await?;
         let tx_hash = receipt.transaction_hash;
 

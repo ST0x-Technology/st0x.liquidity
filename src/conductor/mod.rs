@@ -343,7 +343,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         rebalancing_ctx.alpaca_broker_auth.account_id,
         rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
         rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
-        base_caller,
+        base_caller.clone(),
         rebalancing_ctx.redemption_wallet,
     ));
 
@@ -351,6 +351,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let wrapper = Arc::new(WrapperService::new(
         provider.clone(),
+        base_caller,
         market_maker_wallet,
         rebalancing_ctx.equities.clone(),
     ));

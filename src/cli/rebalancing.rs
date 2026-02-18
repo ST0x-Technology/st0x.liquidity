@@ -79,7 +79,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
         rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        base_caller,
+        base_caller.clone(),
         rebalancing_config.redemption_wallet,
     ));
 
@@ -91,6 +91,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
             let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
                 provider_with_wallet.clone(),
+                base_caller.clone(),
                 wallet,
                 rebalancing_config.equities.clone(),
             ));
@@ -145,6 +146,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
             let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
                 provider_with_wallet.clone(),
+                base_caller,
                 wallet,
                 rebalancing_config.equities.clone(),
             ));

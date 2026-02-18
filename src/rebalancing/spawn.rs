@@ -172,11 +172,12 @@ where
             usdc_ethereum: USDC_ETHEREUM,
             usdc_base: USDC_BASE,
             ethereum_caller,
-            base_caller,
+            base_caller: base_caller.clone(),
         })?);
 
         let wrapper = Arc::new(WrapperService::new(
             base_provider.clone(),
+            base_caller,
             owner,
             ctx.equities.clone(),
         ));
@@ -454,13 +455,14 @@ mod tests {
                 usdc_ethereum: USDC_ETHEREUM,
                 usdc_base: USDC_BASE,
                 ethereum_caller,
-                base_caller,
+                base_caller: base_caller.clone(),
             })
             .unwrap(),
         );
 
         let wrapper = Arc::new(WrapperService::new(
             base_provider.clone(),
+            base_caller,
             owner,
             rebalancing_ctx.equities.clone(),
         ));
