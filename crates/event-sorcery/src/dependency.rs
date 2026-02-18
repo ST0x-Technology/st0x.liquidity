@@ -20,7 +20,11 @@
 //!
 //! Consume events via the [`.on()`](OneOf::on) /
 //! [`.exhaustive()`](Fold::exhaustive) chain, which guarantees
-//! at compile time that every entity is handled.
+//! at compile time that every entity is handled. Use
+//! [`.on_with_fallback()`](OneOf::on_with_fallback) instead of
+//! `.on()` when a handler needs a recovery path — if the
+//! primary handler fails, the fallback receives the error plus
+//! the same `(Id, Event)` to reprocess from the errored state.
 
 use std::future::Future;
 use std::marker::PhantomData;
