@@ -50,6 +50,13 @@ struct MockOrder {
     filled_price: Option<String>,
 }
 
+/// A single calendar entry controlling market open/close times.
+pub struct CalendarEntry {
+    pub date: String,
+    pub open: String,
+    pub close: String,
+}
+
 struct MockState {
     account: MockAccount,
     orders: HashMap<String, MockOrder>,
@@ -57,6 +64,8 @@ struct MockState {
     /// Per-symbol fill prices, checked before `default_fill_price`.
     symbol_fill_prices: HashMap<String, String>,
     mode: MockMode,
+    /// Dynamic calendar entries. The endpoint reads from this on each request.
+    calendar_entries: Vec<CalendarEntry>,
 }
 
 /// Snapshot of a placed order, returned by [`AlpacaBrokerMock::orders`].
@@ -91,6 +100,7 @@ pub struct AlpacaBrokerMockBuilder {
     fill_price: String,
     symbol_fill_prices: HashMap<String, String>,
     mode: MockMode,
+    market_closed: bool,
 }
 
 impl AlpacaBrokerMockBuilder {
@@ -130,7 +140,32 @@ impl AlpacaBrokerMockBuilder {
         self
     }
 
+    /// Start the mock with the market closed. Calendar shows today's
+    /// open/close times in the past so `is_market_open()` returns false.
+    pub fn with_market_closed(mut self) -> Self {
+        self.market_closed = true;
+        self
+    }
+
     pub async fn build(self) -> AlpacaBrokerMock {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+
+        let calendar_entries = if self.market_closed {
+            // Market already closed: open/close both in the past
+            vec![CalendarEntry {
+                date: today,
+                open: "04:00".to_string(),
+                close: "04:01".to_string(),
+            }]
+        } else {
+            // Market open all day
+            vec![CalendarEntry {
+                date: today,
+                open: "00:00".to_string(),
+                close: "23:59".to_string(),
+            }]
+        };
+
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
                 cash: self.cash,
@@ -141,6 +176,7 @@ impl AlpacaBrokerMockBuilder {
             default_fill_price: self.fill_price,
             symbol_fill_prices: self.symbol_fill_prices,
             mode: self.mode,
+            calendar_entries,
         }));
 
         let server = MockServer::start_async().await;
@@ -167,6 +203,7 @@ impl AlpacaBrokerMock {
             fill_price: "150.00".to_string(),
             symbol_fill_prices: HashMap::new(),
             mode: MockMode::HappyPath,
+            market_closed: false,
         }
     }
 
@@ -189,6 +226,21 @@ impl AlpacaBrokerMock {
     /// Changes the mock mode for subsequent requests.
     pub fn set_mode(&self, mode: MockMode) {
         lock(&self.state).mode = mode;
+    }
+
+    /// Switches the calendar to market-open (all day) for today.
+    pub fn set_market_open(&self) {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        lock(&self.state).calendar_entries = vec![CalendarEntry {
+            date: today,
+            open: "00:00".to_string(),
+            close: "23:59".to_string(),
+        }];
+    }
+
+    /// Replaces the calendar entries with custom values.
+    pub fn set_calendar(&self, entries: Vec<CalendarEntry>) {
+        lock(&self.state).calendar_entries = entries;
     }
 
     /// Returns a snapshot of all orders placed through this mock.
@@ -246,7 +298,7 @@ fn lock(state: &Mutex<MockState>) -> MutexGuard<'_, MockState> {
 /// Registers all dynamic endpoints on the mock server.
 fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_account_endpoint(server, state);
-    register_calendar_endpoint(server);
+    register_calendar_endpoint(server, state);
     register_positions_endpoint(server, state);
     register_asset_endpoint(server);
     register_order_placement_endpoint(server, state);
@@ -273,17 +325,24 @@ fn register_account_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>)
     });
 }
 
-fn register_calendar_endpoint(server: &MockServer) {
-    let today = Utc::now().format("%Y-%m-%d").to_string();
+fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
     server.mock(|when, then| {
         when.method(GET).path("/v1/calendar");
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([{
-                "date": today,
-                "open": "00:00",
-                "close": "23:59"
-            }]));
+        then.respond_with(move |_request: &HttpMockRequest| {
+            let entries: Vec<Value> = lock(&state)
+                .calendar_entries
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "date": entry.date,
+                        "open": entry.open,
+                        "close": entry.close
+                    })
+                })
+                .collect();
+            json_response(200, &Value::Array(entries))
+        });
     });
 }
 

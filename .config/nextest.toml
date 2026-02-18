@@ -1,0 +1,8 @@
+[test-groups.anvil-fork]
+# All tests that fork Base mainnet via Anvil must run one at a time to
+# avoid rate-limiting (HTTP 429) from the public Base RPC endpoint.
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(smoke_test_base_fork) | test(e2e_hedging_via_launch) | test(multi_asset_sustained_load) | test(backfilling) | test(resumption_after_shutdown) | test(crash_recovery_eventual_consistency) | test(market_hours_transitions) | test(chain_reorganization)'
+test-group = 'anvil-fork'

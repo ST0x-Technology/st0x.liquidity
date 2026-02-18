@@ -140,6 +140,24 @@ impl<P: Provider + Clone> BaseChain<P> {
         Ok(self.anvil.ws_endpoint().parse()?)
     }
 
+    /// Takes an EVM snapshot and returns the snapshot ID.
+    pub async fn snapshot(&self) -> anyhow::Result<U256> {
+        Ok(self.provider.anvil_snapshot().await?)
+    }
+
+    /// Reverts the chain to a previously taken snapshot.
+    pub async fn revert(&self, snapshot_id: U256) -> anyhow::Result<bool> {
+        Ok(self.provider.anvil_revert(snapshot_id).await?)
+    }
+
+    /// Mines `count` empty blocks.
+    pub async fn mine_blocks(&self, count: u64) -> anyhow::Result<()> {
+        for _ in 0..count {
+            self.provider.anvil_mine(Some(1), None).await?;
+        }
+        Ok(())
+    }
+
     /// Sets `recipient`'s USDC balance to `amount` (6-decimal raw units)
     /// by writing directly to Circle's FiatToken `balances` storage slot.
     pub async fn mint_usdc(&self, recipient: Address, amount: U256) -> anyhow::Result<()> {
@@ -264,10 +282,15 @@ impl<P: Provider + Clone> BaseChain<P> {
             .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
             .get_inner();
 
+        // Over-approve to account for Rain float precision rounding.
+        // The deposit3 function uses Rain floats which can round up
+        // slightly, so the exact approval may be insufficient.
         let deposit_approve: U256 = if is_sell {
-            parse_units(&amount_str, 18)?.into()
+            let base: U256 = parse_units(&amount_str, 18)?.into();
+            base * U256::from(2)
         } else {
-            parse_units(&usdc_total_str, 6)?.into()
+            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
+            base * U256::from(2)
         };
 
         DeployableERC20::new(output_token, &self.provider)
@@ -284,11 +307,13 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get_receipt()
             .await?;
 
-        // Approve taker's payment (input token from order's perspective)
+        // Over-approve taker's payment for the same Rain float precision reason
         let taker_approve: U256 = if is_sell {
-            parse_units(&usdc_total_str, 6)?.into()
+            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
+            base * U256::from(2)
         } else {
-            parse_units(&amount_str, 18)?.into()
+            let base: U256 = parse_units(&amount_str, 18)?.into();
+            base * U256::from(2)
         };
 
         DeployableERC20::new(input_token, &self.provider)
