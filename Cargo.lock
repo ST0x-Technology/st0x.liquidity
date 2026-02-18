@@ -6816,27 +6816,10 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
- "st0x-contract-caller",
+ "st0x-evm",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "st0x-contract-caller"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "async-trait",
- "chrono",
- "fireblocks-sdk",
- "rain-error-decoding",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -6864,6 +6847,23 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "st0x-evm"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "chrono",
+ "fireblocks-sdk",
+ "rain-error-decoding",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6937,9 +6937,9 @@ dependencies = [
  "sqlite-es",
  "sqlx",
  "st0x-bridge",
- "st0x-contract-caller",
  "st0x-dto",
  "st0x-event-sorcery",
+ "st0x-evm",
  "st0x-execution",
  "temp-env",
  "tempfile",

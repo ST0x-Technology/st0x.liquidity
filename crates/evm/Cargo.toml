@@ -1,5 +1,5 @@
 [package]
-name = "st0x-contract-caller"
+name = "st0x-evm"
 version = "0.1.0"
 edition = "2024"
 

@@ -7,7 +7,7 @@ use alloy::sol_types::{SolCall, SolEvent};
 use std::sync::Arc;
 use tracing::{info, trace};
 
-use st0x_contract_caller::{ContractCallError, ContractCaller};
+use st0x_evm::{Evm, EvmError};
 
 use super::{
     CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,

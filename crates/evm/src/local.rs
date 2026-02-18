@@ -1,53 +1,66 @@
 //! Local signer implementation for test environments (anvil).
 //!
-//! `LocalCaller` wraps an alloy provider with an embedded `EthereumWallet`
+//! `RawPrivateKeyWallet` wraps an alloy provider with an embedded `EthereumWallet`
 //! and submits transactions directly. This is only compiled when the
 //! `local-signer` feature is enabled and should only be used in tests.
 
 use alloy::primitives::{Address, Bytes};
-use alloy::providers::Provider;
+use alloy::providers::{Provider, WalletProvider};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use tracing::info;
 
-use crate::{ContractCallError, ContractCaller};
+use crate::{Evm, EvmError, Wallet};
 
-/// Contract caller that signs and submits transactions locally.
+/// Local wallet that signs and submits transactions directly.
 ///
 /// Wraps a provider that includes a wallet filler (e.g., built with
 /// `ProviderBuilder::new().wallet(wallet).connect_http(...)`).
-pub struct LocalCaller<P> {
+///
+/// The wallet address is derived from the provider's default signer —
+/// no separate address parameter is needed.
+pub struct RawPrivateKeyWallet<P> {
     provider: P,
     required_confirmations: u64,
-    address: Address,
 }
 
-impl<P> LocalCaller<P> {
-    /// Creates a new `LocalCaller` with the given provider and confirmation count.
-    pub fn new(provider: P, required_confirmations: u64, address: Address) -> Self {
+impl<P> RawPrivateKeyWallet<P> {
+    /// Creates a new `RawPrivateKeyWallet` with the given provider and confirmation count.
+    pub fn new(provider: P, required_confirmations: u64) -> Self {
         Self {
             provider,
             required_confirmations,
-            address,
         }
     }
 }
 
 #[async_trait]
-impl<P> ContractCaller for LocalCaller<P>
+impl<P> Evm for RawPrivateKeyWallet<P>
 where
-    P: Provider + Clone + Send + Sync,
+    P: Provider + WalletProvider + Clone + Send + Sync,
+{
+    type Provider = P;
+
+    fn provider(&self) -> &P {
+        &self.provider
+    }
+}
+
+#[async_trait]
+impl<P> Wallet for RawPrivateKeyWallet<P>
+where
+    P: Provider + WalletProvider + Clone + Send + Sync,
 {
     fn address(&self) -> Address {
-        self.address
+        self.provider.default_signer_address()
     }
 
-    async fn call_contract(
+    async fn send(
         &self,
         contract: Address,
         calldata: Bytes,
         note: &str,
-    ) -> Result<TransactionReceipt, ContractCallError> {
+    ) -> Result<TransactionReceipt, EvmError> {
         info!(%contract, note, "Submitting local contract call");
 
         let tx = alloy::rpc::types::TransactionRequest::default()
@@ -64,7 +77,7 @@ where
             .await?;
 
         if !receipt.status() {
-            return Err(ContractCallError::Reverted {
+            return Err(EvmError::Reverted {
                 tx_hash: receipt.transaction_hash,
             });
         }
@@ -100,7 +113,7 @@ mod tests {
     );
 
     async fn setup_anvil_with_token() -> (
-        LocalCaller<impl Provider + Clone>,
+        RawPrivateKeyWallet<impl Provider + WalletProvider + Clone>,
         impl Provider + Clone,
         Address,
         Address,
@@ -129,13 +142,13 @@ mod tests {
             .await
             .unwrap();
 
-        let caller = LocalCaller::new(provider.clone(), 1, signer_address);
+        let caller = RawPrivateKeyWallet::new(provider.clone(), 1);
 
         (caller, provider, token_address, signer_address)
     }
 
     #[tokio::test]
-    async fn call_contract_submits_and_returns_receipt() {
+    async fn send_submits_and_returns_receipt() {
         let (caller, _provider, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
@@ -147,7 +160,7 @@ mod tests {
         .abi_encode();
 
         let receipt = caller
-            .call_contract(token_address, Bytes::from(calldata), "ERC20 transfer")
+            .send(token_address, Bytes::from(calldata), "ERC20 transfer")
             .await
             .unwrap();
 
@@ -156,7 +169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_contract_state_change_persists() {
+    async fn send_state_change_persists() {
         let (caller, provider, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
@@ -173,7 +186,7 @@ mod tests {
         .abi_encode();
 
         caller
-            .call_contract(token_address, Bytes::from(calldata), "ERC20 transfer")
+            .send(token_address, Bytes::from(calldata), "ERC20 transfer")
             .await
             .unwrap();
 
@@ -182,7 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_contract_detects_revert() {
+    async fn send_detects_revert() {
         let (caller, _provider, token_address, _signer) = setup_anvil_with_token().await;
 
         // Transfer more than balance to trigger revert
@@ -196,7 +209,7 @@ mod tests {
         .abi_encode();
 
         let result = caller
-            .call_contract(token_address, Bytes::from(calldata), "should revert")
+            .send(token_address, Bytes::from(calldata), "should revert")
             .await;
 
         assert!(

@@ -1,6 +1,6 @@
-//! Fireblocks MPC-based contract call submission.
+//! Fireblocks MPC-based transaction submission.
 //!
-//! `FireblocksCaller` submits CONTRACT_CALL transactions via the
+//! `FireblocksWallet` submits CONTRACT_CALL transactions via the
 //! Fireblocks API and polls until completion. A read-only provider
 //! fetches the transaction receipt after Fireblocks confirms. This
 //! module is only compiled when the `fireblocks` feature is enabled.
@@ -10,18 +10,18 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
-use fireblocks_sdk::{Client, ClientBuilder};
 use fireblocks_sdk::apis::transactions_api::{CreateTransactionError, CreateTransactionParams};
 use fireblocks_sdk::apis::vaults_api::{
     GetVaultAccountAssetAddressesPaginatedError, GetVaultAccountAssetAddressesPaginatedParams,
 };
 use fireblocks_sdk::models::{self, TransactionOperation, TransactionStatus};
+use fireblocks_sdk::{Client, ClientBuilder};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::{ContractCallError, ContractCaller};
+use crate::{Evm, EvmError, Wallet};
 
 /// Polling timeout for Fireblocks transaction completion.
 const POLL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -187,8 +187,8 @@ pub enum FireblocksError {
     },
 }
 
-/// Contract caller that submits transactions via Fireblocks MPC.
-pub struct FireblocksCaller<P> {
+/// Wallet that submits transactions via Fireblocks MPC.
+pub struct FireblocksWallet<P> {
     client: Client,
     vault_account_id: FireblocksVaultAccountId,
     asset_id: AssetId,
@@ -196,7 +196,7 @@ pub struct FireblocksCaller<P> {
     address: Address,
 }
 
-impl<P> FireblocksCaller<P> {
+impl<P> FireblocksWallet<P> {
     /// Builds a Fireblocks SDK client, resolves the vault deposit address
     /// from the Fireblocks API, and returns a ready-to-use caller.
     pub async fn new(ctx: FireblocksCtx<P>) -> Result<Self, FireblocksError> {
@@ -244,7 +244,19 @@ impl<P> FireblocksCaller<P> {
 }
 
 #[async_trait]
-impl<P> ContractCaller for FireblocksCaller<P>
+impl<P> Evm for FireblocksWallet<P>
+where
+    P: Provider + Clone + Send + Sync,
+{
+    type Provider = P;
+
+    fn provider(&self) -> &P {
+        &self.provider
+    }
+}
+
+#[async_trait]
+impl<P> Wallet for FireblocksWallet<P>
 where
     P: Provider + Clone + Send + Sync,
 {
@@ -252,12 +264,12 @@ where
         self.address
     }
 
-    async fn call_contract(
+    async fn send(
         &self,
         contract: Address,
         calldata: Bytes,
         note: &str,
-    ) -> Result<TransactionReceipt, ContractCallError> {
+    ) -> Result<TransactionReceipt, EvmError> {
         let external_tx_id = generate_external_tx_id(note);
 
         let tx_request = build_contract_call_request(
@@ -286,7 +298,7 @@ where
             .create_transaction(params)
             .await?;
 
-        let tx_id = create_response.id.ok_or(ContractCallError::Fireblocks(
+        let tx_id = create_response.id.ok_or(EvmError::Fireblocks(
             FireblocksError::MissingTransactionId,
         ))?;
 
@@ -316,7 +328,7 @@ where
                     "Polling timed out but transaction may still confirm on-chain"
                 );
             }
-            return Err(ContractCallError::Fireblocks(
+            return Err(EvmError::Fireblocks(
                 FireblocksError::TransactionFailed {
                     tx_id,
                     status: result.status,
@@ -325,7 +337,7 @@ where
         }
 
         let tx_hash_str = result.tx_hash.ok_or_else(|| {
-            ContractCallError::Fireblocks(FireblocksError::MissingTxHash {
+            EvmError::Fireblocks(FireblocksError::MissingTxHash {
                 tx_id: tx_id.clone(),
             })
         })?;
@@ -344,11 +356,11 @@ where
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| {
-                ContractCallError::Fireblocks(FireblocksError::MissingReceipt { tx_hash })
+                EvmError::Fireblocks(FireblocksError::MissingReceipt { tx_hash })
             })?;
 
         if !receipt.status() {
-            return Err(ContractCallError::Reverted {
+            return Err(EvmError::Reverted {
                 tx_hash: receipt.transaction_hash,
             });
         }
@@ -573,26 +585,22 @@ mod tests {
 
     #[test]
     fn fireblocks_environment_deserializes_lowercase() {
-        let prod: FireblocksEnvironment =
-            serde_json::from_str("\"production\"").unwrap();
+        let prod: FireblocksEnvironment = serde_json::from_str("\"production\"").unwrap();
         assert_eq!(prod, FireblocksEnvironment::Production);
 
-        let sandbox: FireblocksEnvironment =
-            serde_json::from_str("\"sandbox\"").unwrap();
+        let sandbox: FireblocksEnvironment = serde_json::from_str("\"sandbox\"").unwrap();
         assert_eq!(sandbox, FireblocksEnvironment::Sandbox);
     }
 
     #[test]
     fn fireblocks_api_user_id_deserializes_from_string() {
-        let user_id: FireblocksApiUserId =
-            serde_json::from_str("\"my-api-user\"").unwrap();
+        let user_id: FireblocksApiUserId = serde_json::from_str("\"my-api-user\"").unwrap();
         assert_eq!(user_id.as_str(), "my-api-user");
     }
 
     #[test]
     fn fireblocks_vault_account_id_deserializes_from_string() {
-        let vault_id: FireblocksVaultAccountId =
-            serde_json::from_str("\"42\"").unwrap();
+        let vault_id: FireblocksVaultAccountId = serde_json::from_str("\"42\"").unwrap();
         assert_eq!(vault_id.as_str(), "42");
     }
 }
