@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = []
 local-signer = []
-fireblocks = ["dep:fireblocks-sdk", "dep:chrono", "dep:uuid"]
+fireblocks = ["dep:fireblocks-sdk", "dep:chrono", "dep:uuid", "dep:serde"]
 
 [dependencies]
 alloy.workspace = true
@@ -14,6 +14,7 @@ async-trait.workspace = true
 chrono = { workspace = true, optional = true }
 fireblocks-sdk = { version = "2025.10.17", optional = true }
 rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
+serde = { workspace = true, features = ["derive"], optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, optional = true, features = ["v4"] }

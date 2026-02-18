@@ -470,7 +470,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{LogLevel, SchwabAuth};
+    use crate::config::{LogLevel, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
@@ -485,7 +485,6 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -499,7 +498,9 @@ mod tests {
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

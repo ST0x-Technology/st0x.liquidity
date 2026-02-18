@@ -60,6 +60,9 @@ impl From<alloy::hex::FromHexError> for ContractCallError {
 /// signed or submitted.
 #[async_trait]
 pub trait ContractCaller: Send + Sync {
+    /// Returns the address this caller signs transactions from.
+    fn address(&self) -> Address;
+
     /// Submit a contract call transaction.
     ///
     /// - `contract` -- target contract address

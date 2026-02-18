@@ -1,16 +1,12 @@
 //! Transfer equity and USDC rebalancing CLI commands.
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::signers::local::PrivateKeySigner;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_contract_caller::ContractCaller;
-use st0x_contract_caller::local::LocalCaller;
 use st0x_event_sorcery::{Projection, StoreBuilder};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
@@ -19,10 +15,9 @@ use st0x_execution::{
 
 use super::TransferDirection;
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::onchain::{REQUIRED_CONFIRMATIONS, USDC_BASE, USDC_ETHEREUM};
+use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::CrossVenueCashTransfer;
@@ -55,15 +50,12 @@ pub(super) async fn transfer_equity_command<W: Write>(
         anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("transfer-equity requires rebalancing configuration"))?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
     let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
     let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let wallet = signer.address();
     let provider_with_wallet = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
@@ -76,11 +68,11 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_broker_auth.account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         base_caller.clone(),
-        rebalancing_config.redemption_wallet,
+        rebalancing_ctx.redemption_wallet,
     ));
 
     match direction {
@@ -93,7 +85,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 provider_with_wallet.clone(),
                 base_caller.clone(),
                 wallet,
-                rebalancing_config.equities.clone(),
+                rebalancing_ctx.equities.clone(),
             ));
 
             let raindex = Arc::new(RaindexService::new(
@@ -148,7 +140,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 provider_with_wallet.clone(),
                 base_caller,
                 wallet,
-                rebalancing_config.equities.clone(),
+                rebalancing_ctx.equities.clone(),
             ));
 
             let raindex = Arc::new(RaindexService::new(
@@ -217,18 +209,15 @@ where
         anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("transfer-usdc requires rebalancing configuration"))?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
+    writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
 
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(rebalancing_config.ethereum_rpc_url.clone());
+        .connect_http(rebalancing_ctx.ethereum_rpc_url.clone());
 
     let base_provider_with_wallet = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
@@ -243,7 +232,7 @@ where
     let broker_auth = AlpacaBrokerApiCtx {
         api_key: alpaca_auth.api_key.clone(),
         api_secret: alpaca_auth.api_secret.clone(),
-        account_id: rebalancing_config.alpaca_broker_auth.account_id,
+        account_id: rebalancing_ctx.alpaca_broker_auth.account_id,
         mode: Some(broker_mode),
         asset_cache_ttl: std::time::Duration::from_secs(3600),
         time_in_force: TimeInForce::default(),
@@ -253,7 +242,7 @@ where
 
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         broker_auth.base_url().to_string(),
-        rebalancing_config.alpaca_broker_auth.account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     ));
@@ -294,7 +283,7 @@ where
         vault_service,
         usdc_store,
         owner,
-        RaindexVaultId(rebalancing_config.usdc_vault_id),
+        RaindexVaultId(rebalancing_ctx.usdc_vault_id),
     );
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
@@ -339,11 +328,9 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'sta
         anyhow::bail!("alpaca-tokenize requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
-    })?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let receiving_wallet = signer.address();
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
@@ -360,11 +347,11 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'sta
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_broker_auth.account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         caller,
-        rebalancing_config.redemption_wallet,
+        rebalancing_ctx.redemption_wallet,
     );
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
@@ -450,14 +437,12 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone + 'stati
         anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("alpaca-redeem requires rebalancing configuration for wallet addresses")
-    })?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let redemption_wallet = rebalancing_config.redemption_wallet;
+    let redemption_wallet = rebalancing_ctx.redemption_wallet;
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let provider_with_wallet = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_provider(provider);
@@ -469,7 +454,7 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone + 'stati
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_broker_auth.account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         caller,
@@ -530,22 +515,18 @@ pub(super) async fn alpaca_tokenization_requests_command<
         anyhow::bail!("alpaca-tokenization-requests requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "alpaca-tokenization-requests requires rebalancing configuration for account ID"
-        )
-    })?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
     let caller: Arc<dyn ContractCaller> =
         Arc::new(LocalCaller::new(provider, REQUIRED_CONFIRMATIONS));
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_config.alpaca_broker_auth.account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         caller,
-        rebalancing_config.redemption_wallet,
+        rebalancing_ctx.redemption_wallet,
     );
 
     let requests = tokenization_service.list_requests().await?;
@@ -616,7 +597,7 @@ mod tests {
     use uuid::uuid;
 
     use super::*;
-    use crate::config::LogLevel;
+    use crate::config::{LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -629,14 +610,15 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerCtx::DryRun,
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

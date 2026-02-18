@@ -4,12 +4,8 @@
 //! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
 
-use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, TxHash, U256};
-use alloy::providers::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
-};
-use alloy::providers::{Identity, Provider, RootProvider};
+use alloy::providers::Provider;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -32,49 +28,36 @@ use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
 
-/// Provider type for Ethereum HTTP connections (used for CCTP Ethereum side).
-type EthereumHttpProvider = FillProvider<
-    JoinFill<
-        JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-        >,
-        WalletFiller<EthereumWallet>,
-    >,
-    RootProvider<Ethereum>,
-    Ethereum,
->;
-
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
 /// # Type Parameters
 ///
-/// * `BP` - Base provider type
-pub(crate) struct CrossVenueCashTransfer<BP>
+/// * `EthereumNode` - Ethereum provider type
+/// * `BaseNode` - Base provider type
+pub(crate) struct CrossVenueCashTransfer<EthereumNode, BaseNode>
 where
-    BP: Provider + Clone,
+    EthereumNode: Provider + Clone,
+    BaseNode: Provider + Clone,
 {
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
-    cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-    raindex: Arc<RaindexService<BP>>,
+    cctp_bridge: Arc<CctpBridge<EthereumNode, BaseNode>>,
+    raindex: Arc<RaindexService<BaseNode>>,
     cqrs: Arc<Store<UsdcRebalance>>,
-    /// Market maker's (our) wallet address
-    /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
     market_maker_wallet: Address,
-    /// Vault ID for Rain OrderBook deposits
     vault_id: RaindexVaultId,
 }
 
-impl<BP> CrossVenueCashTransfer<BP>
+impl<EthereumNode, BaseNode> CrossVenueCashTransfer<EthereumNode, BaseNode>
 where
-    BP: Provider + Clone + Send + Sync + 'static,
+    EthereumNode: Provider + Clone + Send + Sync + 'static,
+    BaseNode: Provider + Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
-        cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-        raindex: Arc<RaindexService<BP>>,
+        cctp_bridge: Arc<CctpBridge<EthereumNode, BaseNode>>,
+        raindex: Arc<RaindexService<BaseNode>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
         vault_id: RaindexVaultId,
@@ -863,9 +846,11 @@ fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
 /// Alpaca -> Base (hedging -> market-making): convert USD to USDC,
 /// withdraw, bridge via CCTP, deposit to vault.
 #[async_trait]
-impl<BP> CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueCashTransfer<BP>
+impl<EthereumNode, BaseNode> CrossVenueTransfer<HedgingVenue, MarketMakingVenue>
+    for CrossVenueCashTransfer<EthereumNode, BaseNode>
 where
-    BP: Provider + Clone + Send + Sync + 'static,
+    EthereumNode: Provider + Clone + Send + Sync + 'static,
+    BaseNode: Provider + Clone + Send + Sync + 'static,
 {
     type Asset = Usdc;
     type Error = UsdcTransferError;
@@ -879,9 +864,11 @@ where
 /// Base -> Alpaca (market-making -> hedging): withdraw from vault,
 /// bridge via CCTP, deposit USDC, convert to USD.
 #[async_trait]
-impl<BP> CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueCashTransfer<BP>
+impl<EthereumNode, BaseNode> CrossVenueTransfer<MarketMakingVenue, HedgingVenue>
+    for CrossVenueCashTransfer<EthereumNode, BaseNode>
 where
-    BP: Provider + Clone + Send + Sync + 'static,
+    EthereumNode: Provider + Clone + Send + Sync + 'static,
+    BaseNode: Provider + Clone + Send + Sync + 'static,
 {
     type Asset = Usdc;
     type Error = UsdcTransferError;

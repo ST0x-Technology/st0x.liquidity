@@ -6831,6 +6831,7 @@ dependencies = [
  "chrono",
  "fireblocks-sdk",
  "rain-error-decoding",
+ "serde",
  "serde_json",
  "thiserror 2.0.17",
  "tokio",

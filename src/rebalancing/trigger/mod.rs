@@ -4,18 +4,24 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
+use st0x_contract_caller::ContractCaller;
+use st0x_contract_caller::fireblocks::{
+    ChainAssetIds, FireblocksApiUserId, FireblocksCaller, FireblocksCtx,
+    FireblocksEnvironment, FireblocksError, FireblocksVaultAccountId,
+};
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
@@ -47,10 +53,14 @@ enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
-    #[error("invalid EVM private key: {0}")]
-    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
-    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
-    WalletsMatch(Address),
+    #[error("failed to read Fireblocks secret file: {0}")]
+    FireblocksSecretRead(#[from] std::io::Error),
+    #[error("failed to build Fireblocks caller: {0}")]
+    FireblocksCaller(#[from] FireblocksCallerError),
+    #[error("failed to resolve vault address from Fireblocks: {0}")]
+    VaultAddressResolution(FireblocksError),
+    #[error("RPC error during rebalancing initialization: {0}")]
+    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -65,7 +75,8 @@ pub(crate) enum UsdcRebalancing {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
     pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
+    pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
+    pub(crate) fireblocks_secret_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -76,54 +87,138 @@ pub(crate) struct RebalancingConfig {
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
     pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
+    pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
+    pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
+    pub(crate) fireblocks_environment: FireblocksEnvironment,
 }
 
+
 /// Runtime configuration for rebalancing operations.
-/// Constructed from `RebalancingConfig` + `RebalancingSecrets` + broker's `AlpacaBrokerApiCtx`.
+///
+/// Constructed asynchronously from `RebalancingConfig` + `RebalancingSecrets`
+/// + broker auth + base chain RPC URL. During construction, Fireblocks callers
+/// are pre-built for both chains (each resolving the vault address from the
+/// Fireblocks API). After construction, all fields are immutable.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    /// Derived once from `evm_private_key` during construction.
-    pub(crate) market_maker_wallet: Address,
-    pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Registry of wrapped token configurations for ERC-4626 vault operations.
     pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
+    /// Pre-built contract caller for the base chain (e.g. Base mainnet).
+    base_caller: Arc<dyn ContractCaller>,
+    /// Pre-built contract caller for Ethereum mainnet.
+    ethereum_caller: Arc<dyn ContractCaller>,
+    /// Pre-built HTTP provider for Ethereum read-only calls (balances, allowances).
+    ethereum_provider: Arc<RootProvider>,
 }
 
 impl RebalancingCtx {
-    /// Construct from config, secrets, and broker's Alpaca auth.
+    /// Construct from config, secrets, broker auth, and base chain RPC URL.
     ///
-    /// This is the ONLY way to construct a `RebalancingCtx`, which enforces
-    /// the invariant that rebalancing always has valid `AlpacaBrokerApiCtx`.
-    pub(crate) fn new(
+    /// Reads the Fireblocks RSA secret, builds async callers for both
+    /// chains (resolving the vault address), and stores an Ethereum
+    /// read provider. After construction, everything is immutable.
+    pub(crate) async fn new(
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
+        base_rpc_url: Url,
     ) -> Result<Self, RebalancingCtxError> {
-        let market_maker_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)?.address();
+        let fireblocks_secret = std::fs::read(&secrets.fireblocks_secret_path)?;
 
-        if market_maker_wallet == config.redemption_wallet {
-            return Err(RebalancingCtxError::WalletsMatch(market_maker_wallet));
-        }
+        let base_provider =
+            RootProvider::new(crate::onchain::http_client_with_retry(base_rpc_url));
+        let base_chain_id = base_provider.get_chain_id().await?;
+
+        let ethereum_provider = Arc::new(RootProvider::new(
+            crate::onchain::http_client_with_retry(secrets.ethereum_rpc_url),
+        ));
+        let ethereum_chain_id = ethereum_provider.get_chain_id().await?;
+
+        let base_caller = build_fireblocks_caller(
+            &config,
+            &secrets,
+            &fireblocks_secret,
+            base_chain_id,
+            base_provider,
+        )
+        .await?;
+
+        let ethereum_caller = build_fireblocks_caller(
+            &config,
+            &secrets,
+            &fireblocks_secret,
+            ethereum_chain_id,
+            ethereum_provider.clone(),
+        )
+        .await?;
+
+        info!(
+            wallet = %base_caller.address(),
+            "Resolved market maker wallet from Fireblocks"
+        );
 
         Ok(Self {
             equity: config.equity,
             usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
-            market_maker_wallet,
-            ethereum_rpc_url: secrets.ethereum_rpc_url,
-            evm_private_key: secrets.evm_private_key,
             usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
             equities: config.equities,
+            base_caller: Arc::new(base_caller),
+            ethereum_caller: Arc::new(ethereum_caller),
+            ethereum_provider,
         })
     }
+
+    pub(crate) fn base_caller(&self) -> &Arc<dyn ContractCaller> {
+        &self.base_caller
+    }
+
+    pub(crate) fn ethereum_caller(&self) -> &Arc<dyn ContractCaller> {
+        &self.ethereum_caller
+    }
+
+    pub(crate) fn ethereum_provider(&self) -> &Arc<RootProvider> {
+        &self.ethereum_provider
+    }
+}
+
+async fn build_fireblocks_caller<P: Provider + Clone + Send + Sync>(
+    config: &RebalancingConfig,
+    secrets: &RebalancingSecrets,
+    fireblocks_secret: &[u8],
+    chain_id: u64,
+    provider: P,
+) -> Result<FireblocksCaller<P>, FireblocksCallerError> {
+    let asset_id = config
+        .fireblocks_chain_asset_ids
+        .get(chain_id)
+        .cloned()
+        .ok_or(FireblocksCallerError::MissingChainAssetId { chain_id })?;
+
+    Ok(FireblocksCaller::new(FireblocksCtx {
+        api_user_id: secrets.fireblocks_api_user_id.clone(),
+        secret: fireblocks_secret.to_vec(),
+        vault_account_id: config.fireblocks_vault_account_id.clone(),
+        environment: config.fireblocks_environment,
+        asset_id,
+        provider,
+    })
+    .await?)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FireblocksCallerError {
+    #[error(transparent)]
+    Fireblocks(#[from] FireblocksError),
+    #[error("no Fireblocks asset ID configured for chain {chain_id}")]
+    MissingChainAssetId { chain_id: u64 },
 }
 
 impl std::fmt::Debug for RebalancingCtx {
@@ -132,12 +227,10 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("market_maker_wallet", &self.market_maker_wallet)
-            .field("ethereum_rpc_url", &"[REDACTED]")
-            .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("equities", &self.equities)
+            .field("wallet_address", &self.wallet_address)
             .finish()
     }
 }

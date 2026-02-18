@@ -23,7 +23,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_contract_caller::ContractCaller;
-use st0x_contract_caller::local::LocalCaller;
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
@@ -31,7 +30,7 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
-use crate::config::{Ctx, CtxError};
+use crate::config::Ctx;
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
@@ -101,8 +100,6 @@ pub(crate) enum EventProcessingError {
     EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
-    #[error("Ctx error: {0}")]
-    Ctx(#[from] CtxError),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("Execution error: {0}")]
@@ -185,32 +182,33 @@ impl Conductor {
                 .await?,
         );
 
-        let (position, position_projection, snapshot, rebalancer) =
-            if let Some(rebalancing_ctx) = ctx.rebalancing_ctx() {
-                let (position, position_projection, snapshot, rebalancer_handle) =
-                    spawn_rebalancing_infrastructure(
-                        rebalancing_ctx,
-                        pool,
-                        ctx,
-                        &inventory,
-                        event_sender,
-                        &provider,
-                        vault_registry.clone(),
-                    )
-                    .await?;
+        let (position, position_projection, snapshot, rebalancer, order_owner) =
+            if let Ok(rebalancing_ctx) = ctx.rebalancing_ctx() {
+                let (infra, market_maker_wallet) = spawn_rebalancing_infrastructure(
+                    rebalancing_ctx,
+                    pool,
+                    ctx,
+                    &inventory,
+                    event_sender,
+                    &provider,
+                    vault_registry.clone(),
+                )
+                .await?;
 
                 (
-                    position,
-                    position_projection,
-                    snapshot,
-                    Some(rebalancer_handle),
+                    infra.position,
+                    infra.position_projection,
+                    infra.snapshot,
+                    Some(infra.rebalancer),
+                    market_maker_wallet,
                 )
             } else {
+                let order_owner = ctx.order_owner()?;
                 let (position, position_projection) = build_position_cqrs(pool).await?;
                 let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                     .build(())
                     .await?;
-                (position, position_projection, snapshot, None)
+                (position, position_projection, snapshot, None, order_owner)
             };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
@@ -251,7 +249,7 @@ impl Conductor {
             builder = builder.with_rebalancer(rebalancer_handle);
         }
 
-        Ok(builder.spawn())
+        Ok(builder.spawn(order_owner))
     }
 }
 
@@ -303,6 +301,13 @@ impl Conductor {
     }
 }
 
+struct RebalancingInfrastructure {
+    position: Arc<Store<Position>>,
+    position_projection: Arc<Projection<Position>>,
+    snapshot: Store<InventorySnapshot>,
+    rebalancer: JoinHandle<()>,
+}
+
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
     rebalancing_ctx: &RebalancingCtx,
     pool: &SqlitePool,
@@ -311,15 +316,17 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
     vault_registry: Arc<Store<VaultRegistry>>,
-) -> anyhow::Result<(
-    Arc<Store<Position>>,
-    Arc<Projection<Position>>,
-    Store<InventorySnapshot>,
-    JoinHandle<()>,
-)> {
+) -> anyhow::Result<(RebalancingInfrastructure, Address)> {
     info!("Initializing rebalancing infrastructure");
 
-    let market_maker_wallet = rebalancing_ctx.market_maker_wallet;
+    let base_chain_id = provider.get_chain_id().await?;
+    let base_fireblocks_caller =
+        rebalancing_ctx.fireblocks_caller(base_chain_id, provider.clone())?;
+
+    let market_maker_wallet = base_fireblocks_caller.fetch_vault_address().await?;
+    info!(%market_maker_wallet, "Resolved market maker wallet from Fireblocks");
+
+    let base_caller: Arc<dyn ContractCaller> = Arc::new(base_fireblocks_caller);
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -331,11 +338,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         ctx.evm.orderbook,
         vault_registry_projection,
         market_maker_wallet,
-    ));
-
-    let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
-        provider.clone(),
-        crate::onchain::REQUIRED_CONFIRMATIONS,
     ));
 
     let tokenization = Arc::new(AlpacaTokenizationService::new(
@@ -388,8 +390,14 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         usdc: Arc::new(built.usdc),
     };
 
+    let ethereum_provider = ProviderBuilder::new()
+        .connect_client(crate::onchain::http_client_with_retry(
+            rebalancing_ctx.ethereum_rpc_url.clone(),
+        ));
+
     let handle = spawn_rebalancer(
         rebalancing_ctx,
+        ethereum_provider,
         provider.clone(),
         market_maker_wallet,
         operation_receiver,
@@ -399,12 +407,14 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     )
     .await?;
 
-    Ok((
-        Arc::new(built.position),
-        Arc::new(wired.position_view),
-        built.snapshot,
-        handle,
-    ))
+    let infra = RebalancingInfrastructure {
+        position: Arc::new(built.position),
+        position_projection: Arc::new(wired.position_view),
+        snapshot: built.snapshot,
+        rebalancer: handle,
+    };
+
+    Ok((infra, market_maker_wallet))
 }
 
 async fn wait_for_infrastructure(
@@ -550,6 +560,7 @@ fn spawn_queue_processor<P, E>(
     provider: P,
     cqrs: TradeProcessingCqrs,
     vault_registry: Arc<Store<VaultRegistry>>,
+    order_owner: Address,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -570,6 +581,7 @@ where
             provider,
             &cqrs,
             &vault_registry,
+            order_owner,
         )
         .await;
     })
@@ -779,6 +791,7 @@ async fn run_queue_processor<P, E>(
     provider: P,
     cqrs: &TradeProcessingCqrs,
     vault_registry: &Store<VaultRegistry>,
+    order_owner: Address,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -795,6 +808,7 @@ async fn run_queue_processor<P, E>(
         feed_id_cache: &feed_id_cache,
         vault_registry,
         executor,
+        order_owner,
     };
 
     loop {
@@ -839,6 +853,7 @@ struct QueueProcessingCtx<'a, E> {
     feed_id_cache: &'a FeedIdCache,
     vault_registry: &'a Store<VaultRegistry>,
     executor: &'a E,
+    order_owner: Address,
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
@@ -864,6 +879,7 @@ async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
         provider,
         &queued_event,
         queue_context.feed_id_cache,
+        queue_context.order_owner,
     )
     .await?;
 
@@ -884,7 +900,7 @@ async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
     let vault_discovery_ctx = VaultDiscoveryCtx {
         vault_registry: queue_context.vault_registry,
         orderbook: ctx.evm.orderbook,
-        order_owner: ctx.order_owner()?,
+        order_owner: queue_context.order_owner,
     };
 
     process_valid_trade(
@@ -977,9 +993,9 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     provider: &P,
     queued_event: &QueuedEvent,
     feed_id_cache: &FeedIdCache,
+    order_owner: Address,
 ) -> Result<Option<OnchainTrade>, EventProcessingError> {
     let reconstructed_log = reconstruct_log_from_queued_event(&ctx.evm, queued_event);
-    let order_owner = ctx.order_owner()?;
 
     let onchain_trade = match &queued_event.event {
         TradeEvent::ClearV3(clear_event) => {
@@ -1584,6 +1600,7 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
+            order_owner: ctx.order_owner().unwrap(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -1635,6 +1652,7 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
+            order_owner: ctx.order_owner().unwrap(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -1685,6 +1703,7 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
+            order_owner: ctx.order_owner().unwrap(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);

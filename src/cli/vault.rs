@@ -1,9 +1,7 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::providers::Provider;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
@@ -12,9 +10,7 @@ use thiserror::Error;
 
 use st0x_event_sorcery::Projection;
 
-use crate::bindings::IERC20;
 use crate::config::Ctx;
-use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistry;
@@ -72,59 +68,30 @@ pub(super) async fn vault_deposit_command<
     writeln!(stdout, "   Token: {token}")?;
     writeln!(stdout, "   Decimals: {decimals}")?;
 
-    let rebalancing_config = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("vault-deposit requires rebalancing configuration"))?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let base_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let chain_id = base_provider.get_chain_id().await?;
+    let caller = rebalancing_ctx.fireblocks_caller(chain_id, base_provider.clone())?;
+    let sender_address = caller.fetch_vault_address().await?;
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(base_wallet)
-        .connect_provider(base_provider);
-
-    let token_contract = IERC20::IERC20Instance::new(token, &base_provider_with_wallet);
-
-    let balance = token_contract.balanceOf(sender_address).call().await?;
-    writeln!(stdout, "   Current token balance: {balance}")?;
-
     let amount_u256 = decimal_to_u256(amount, decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
-
-    if balance < amount_u256 {
-        anyhow::bail!("Insufficient token balance: have {balance}, need {amount_u256}");
-    }
-
-    writeln!(stdout, "   Approving orderbook to spend tokens...")?;
-    let approve_receipt = token_contract
-        .approve(ctx.evm.orderbook, amount_u256)
-        .send()
-        .await?
-        .with_required_confirmations(REQUIRED_CONFIRMATIONS)
-        .get_receipt()
-        .await?;
-    writeln!(
-        stdout,
-        "   Approval tx: {}",
-        approve_receipt.transaction_hash
-    )?;
 
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
-        base_provider_with_wallet,
+        base_provider,
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
-    );
+    )
+    .with_caller(Arc::new(caller));
 
-    writeln!(stdout, "   Depositing to vault...")?;
+    writeln!(stdout, "   Depositing to vault (approve + deposit via Fireblocks)...")?;
     let deposit_tx = raindex_service
         .deposit(token, RaindexVaultId(vault_id), amount_u256, decimals)
         .await?;
@@ -148,32 +115,27 @@ pub(super) async fn vault_withdraw_command<
     writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_config = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("vault-withdraw requires rebalancing configuration"))?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let base_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let chain_id = base_provider.get_chain_id().await?;
+    let caller = rebalancing_ctx.fireblocks_caller(chain_id, base_provider.clone())?;
+    let sender_address = caller.fetch_vault_address().await?;
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
-    writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
-
-    let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(base_wallet)
-        .connect_provider(base_provider);
+    writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
 
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
-        base_provider_with_wallet,
+        base_provider,
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
-    );
-    let vault_id = RaindexVaultId(rebalancing_config.usdc_vault_id);
+    )
+    .with_caller(Arc::new(caller));
+
+    let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -196,7 +158,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{BrokerCtx, LogLevel};
+    use crate::config::{BrokerCtx, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -208,14 +170,15 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerCtx::DryRun,
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

@@ -10,12 +10,14 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
-use fireblocks_sdk::Client;
+use fireblocks_sdk::{Client, ClientBuilder};
 use fireblocks_sdk::apis::transactions_api::{CreateTransactionError, CreateTransactionParams};
 use fireblocks_sdk::apis::vaults_api::{
     GetVaultAccountAssetAddressesPaginatedError, GetVaultAccountAssetAddressesPaginatedParams,
 };
 use fireblocks_sdk::models::{self, TransactionOperation, TransactionStatus};
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -27,8 +29,30 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Polling interval between status checks.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Fireblocks API user ID for authentication.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(transparent)]
+pub struct FireblocksApiUserId(String);
+
+impl FireblocksApiUserId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FireblocksApiUserId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Fireblocks vault account identifier.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(transparent)]
 pub struct FireblocksVaultAccountId(String);
 
 impl FireblocksVaultAccountId {
@@ -48,14 +72,11 @@ impl std::fmt::Display for FireblocksVaultAccountId {
 }
 
 /// Fireblocks asset identifier (e.g. "ETH", "BASECHAIN_ETH").
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
 pub struct AssetId(String);
 
 impl AssetId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -67,8 +88,27 @@ impl std::fmt::Display for AssetId {
     }
 }
 
+/// Chain ID to Fireblocks asset ID mapping.
+///
+/// Deserialized from a TOML table:
+/// ```toml
+/// [rebalancing.fireblocks_chain_asset_ids]
+/// 1 = "ETH"
+/// 8453 = "BASECHAIN_ETH"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(transparent)]
+pub struct ChainAssetIds(BTreeMap<u64, AssetId>);
+
+impl ChainAssetIds {
+    pub fn get(&self, chain_id: u64) -> Option<&AssetId> {
+        self.0.get(&chain_id)
+    }
+}
+
 /// Fireblocks environment selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FireblocksEnvironment {
     Production,
     Sandbox,
@@ -76,13 +116,39 @@ pub enum FireblocksEnvironment {
 
 /// Construction context for `FireblocksCaller`.
 ///
-/// Contains everything needed to build a caller. The main crate is
-/// responsible for assembling this from its own config/secrets split.
+/// Contains everything needed to construct a caller: Fireblocks API
+/// credentials, chain-specific asset ID, and a read-only provider
+/// for fetching receipts. The main crate assembles this from its own
+/// config/secrets split.
 pub struct FireblocksCtx<P> {
-    pub client: Client,
+    pub api_user_id: FireblocksApiUserId,
+    pub secret: Vec<u8>,
     pub vault_account_id: FireblocksVaultAccountId,
+    pub environment: FireblocksEnvironment,
     pub asset_id: AssetId,
     pub provider: P,
+}
+
+impl<P> std::fmt::Debug for FireblocksCtx<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FireblocksCtx")
+            .field("api_user_id", &self.api_user_id)
+            .field("secret", &"[REDACTED]")
+            .field("vault_account_id", &self.vault_account_id)
+            .field("environment", &self.environment)
+            .field("asset_id", &self.asset_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P> FireblocksCtx<P> {
+    fn build_client(&self) -> Result<Client, FireblocksError> {
+        let mut builder = ClientBuilder::new(self.api_user_id.as_str(), &self.secret);
+        if self.environment == FireblocksEnvironment::Sandbox {
+            builder = builder.use_sandbox();
+        }
+        Ok(builder.build()?)
+    }
 }
 
 /// Errors specific to the Fireblocks signing backend.
@@ -127,59 +193,54 @@ pub struct FireblocksCaller<P> {
     vault_account_id: FireblocksVaultAccountId,
     asset_id: AssetId,
     provider: P,
+    address: Address,
 }
 
 impl<P> FireblocksCaller<P> {
-    /// Creates a new `FireblocksCaller` from the given context.
-    pub fn new(ctx: FireblocksCtx<P>) -> Self {
-        Self {
-            client: ctx.client,
+    /// Builds a Fireblocks SDK client, resolves the vault deposit address
+    /// from the Fireblocks API, and returns a ready-to-use caller.
+    pub async fn new(ctx: FireblocksCtx<P>) -> Result<Self, FireblocksError> {
+        let client = ctx.build_client()?;
+
+        let params = GetVaultAccountAssetAddressesPaginatedParams {
+            vault_account_id: ctx.vault_account_id.0.clone(),
+            asset_id: ctx.asset_id.0.clone(),
+            limit: None,
+            before: None,
+            after: None,
+        };
+
+        let addresses = client
+            .vaults_api()
+            .get_vault_account_asset_addresses_paginated(params)
+            .await?;
+
+        let address_str = addresses
+            .addresses
+            .and_then(|addrs| addrs.into_iter().next())
+            .and_then(|entry| entry.address)
+            .ok_or_else(|| {
+                warn!(
+                    vault_id = ctx.vault_account_id.as_str(),
+                    asset_id = ctx.asset_id.as_str(),
+                    "No deposit address found"
+                );
+                FireblocksError::NoDepositAddress {
+                    vault_account_id: ctx.vault_account_id.clone(),
+                    asset_id: ctx.asset_id.clone(),
+                }
+            })?;
+
+        let address = address_str.parse()?;
+
+        Ok(Self {
+            client,
             vault_account_id: ctx.vault_account_id,
             asset_id: ctx.asset_id,
             provider: ctx.provider,
-        }
+            address,
+        })
     }
-}
-
-/// Fetches the deposit address for a vault account and asset.
-///
-/// Used during startup to derive the `market_maker_wallet` address
-/// from the Fireblocks vault configuration.
-pub async fn fetch_vault_address(
-    client: &Client,
-    vault_account_id: &FireblocksVaultAccountId,
-    asset_id: &AssetId,
-) -> Result<Address, FireblocksError> {
-    let params = GetVaultAccountAssetAddressesPaginatedParams {
-        vault_account_id: vault_account_id.0.clone(),
-        asset_id: asset_id.0.clone(),
-        limit: None,
-        before: None,
-        after: None,
-    };
-
-    let addresses = client
-        .vaults_api()
-        .get_vault_account_asset_addresses_paginated(params)
-        .await?;
-
-    let address_str = addresses
-        .addresses
-        .and_then(|addrs| addrs.into_iter().next())
-        .and_then(|entry| entry.address)
-        .ok_or_else(|| {
-            warn!(
-                vault_id = vault_account_id.as_str(),
-                asset_id = asset_id.as_str(),
-                "No deposit address found"
-            );
-            FireblocksError::NoDepositAddress {
-                vault_account_id: vault_account_id.clone(),
-                asset_id: asset_id.clone(),
-            }
-        })?;
-
-    Ok(address_str.parse()?)
 }
 
 #[async_trait]
@@ -187,6 +248,10 @@ impl<P> ContractCaller for FireblocksCaller<P>
 where
     P: Provider + Clone + Send + Sync,
 {
+    fn address(&self) -> Address {
+        self.address
+    }
+
     async fn call_contract(
         &self,
         contract: Address,
@@ -495,5 +560,39 @@ mod tests {
     #[test]
     fn is_not_pending_for_rejected() {
         assert!(!is_still_pending(&TransactionStatus::Rejected));
+    }
+
+    #[test]
+    fn chain_asset_ids_deserializes_from_json_table() {
+        let json = serde_json::json!({"1": "ETH", "8453": "BASECHAIN_ETH"});
+        let ids: ChainAssetIds = serde_json::from_value(json).unwrap();
+        assert_eq!(ids.get(1).unwrap().as_str(), "ETH");
+        assert_eq!(ids.get(8453).unwrap().as_str(), "BASECHAIN_ETH");
+        assert!(ids.get(42).is_none());
+    }
+
+    #[test]
+    fn fireblocks_environment_deserializes_lowercase() {
+        let prod: FireblocksEnvironment =
+            serde_json::from_str("\"production\"").unwrap();
+        assert_eq!(prod, FireblocksEnvironment::Production);
+
+        let sandbox: FireblocksEnvironment =
+            serde_json::from_str("\"sandbox\"").unwrap();
+        assert_eq!(sandbox, FireblocksEnvironment::Sandbox);
+    }
+
+    #[test]
+    fn fireblocks_api_user_id_deserializes_from_string() {
+        let user_id: FireblocksApiUserId =
+            serde_json::from_str("\"my-api-user\"").unwrap();
+        assert_eq!(user_id.as_str(), "my-api-user");
+    }
+
+    #[test]
+    fn fireblocks_vault_account_id_deserializes_from_string() {
+        let vault_id: FireblocksVaultAccountId =
+            serde_json::from_str("\"42\"").unwrap();
+        assert_eq!(vault_id.as_str(), "42");
     }
 }

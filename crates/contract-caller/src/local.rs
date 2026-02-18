@@ -19,14 +19,16 @@ use crate::{ContractCallError, ContractCaller};
 pub struct LocalCaller<P> {
     provider: P,
     required_confirmations: u64,
+    address: Address,
 }
 
 impl<P> LocalCaller<P> {
     /// Creates a new `LocalCaller` with the given provider and confirmation count.
-    pub fn new(provider: P, required_confirmations: u64) -> Self {
+    pub fn new(provider: P, required_confirmations: u64, address: Address) -> Self {
         Self {
             provider,
             required_confirmations,
+            address,
         }
     }
 }
@@ -36,6 +38,10 @@ impl<P> ContractCaller for LocalCaller<P>
 where
     P: Provider + Clone + Send + Sync,
 {
+    fn address(&self) -> Address {
+        self.address
+    }
+
     async fn call_contract(
         &self,
         contract: Address,
@@ -123,7 +129,7 @@ mod tests {
             .await
             .unwrap();
 
-        let caller = LocalCaller::new(provider.clone(), 1);
+        let caller = LocalCaller::new(provider.clone(), 1, signer_address);
 
         (caller, provider, token_address, signer_address)
     }

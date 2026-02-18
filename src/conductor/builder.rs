@@ -1,5 +1,6 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
@@ -8,7 +9,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::Executor;
@@ -156,7 +157,7 @@ where
         self
     }
 
-    pub(crate) fn spawn(self) -> Conductor {
+    pub(crate) fn spawn(self, order_owner: Address) -> Conductor {
         info!("Starting conductor orchestration");
 
         let executor_maintenance = self.state.executor_maintenance;
@@ -165,28 +166,20 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
-        let inventory_poller = match self.common.ctx.order_owner() {
-            Ok(order_owner) => {
-                let raindex_service = Arc::new(RaindexService::new(
-                    self.common.provider.clone(),
-                    self.common.ctx.evm.orderbook,
-                    self.common.frameworks.vault_registry_projection.clone(),
-                    order_owner,
-                ));
-                Some(spawn_inventory_poller(
-                    raindex_service,
-                    self.common.executor.clone(),
-                    self.common.frameworks.vault_registry.clone(),
-                    self.common.ctx.evm.orderbook,
-                    order_owner,
-                    self.common.frameworks.snapshot,
-                ))
-            }
-            Err(error) => {
-                warn!(%error, "Inventory poller disabled: could not resolve order owner");
-                None
-            }
-        };
+        let raindex_service = Arc::new(RaindexService::new(
+            self.common.provider.clone(),
+            self.common.ctx.evm.orderbook,
+            self.common.frameworks.vault_registry_projection.clone(),
+            order_owner,
+        ));
+        let inventory_poller = Some(spawn_inventory_poller(
+            raindex_service,
+            self.common.executor.clone(),
+            self.common.frameworks.vault_registry.clone(),
+            self.common.ctx.evm.orderbook,
+            order_owner,
+            self.common.frameworks.snapshot,
+        ));
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 
         let order_poller = spawn_order_poller(
@@ -225,6 +218,7 @@ where
             self.common.provider,
             trade_cqrs,
             self.common.frameworks.vault_registry,
+            order_owner,
         );
 
         Conductor {

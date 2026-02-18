@@ -1,23 +1,19 @@
 //! CCTP bridge and recovery CLI commands.
 
-use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::SolCall;
 use rust_decimal::Decimal;
 use std::io::Write;
-
-use std::sync::Arc;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
 use st0x_contract_caller::ContractCaller;
-use st0x_contract_caller::local::LocalCaller;
 
 use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
-use crate::onchain::{REQUIRED_CONFIRMATIONS, USDC_BASE, USDC_ETHEREUM, http_client_with_retry};
+use crate::onchain::{USDC_BASE, USDC_ETHEREUM, http_client_with_retry};
 use crate::rebalancing::RebalancingCtx;
 use crate::threshold::Usdc;
 
@@ -39,19 +35,16 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
-    let rebalancing = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("cctp-bridge requires rebalancing configuration"))?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let wallet = signer.address();
 
     let amount_u256 = if all {
         let balance = match from {
             CctpChain::Ethereum => {
                 let provider = ProviderBuilder::new()
-                    .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
+                    .connect_client(http_client_with_retry(rebalancing_ctx.ethereum_rpc_url.clone()));
                 IERC20::IERC20Instance::new(USDC_ETHEREUM, provider)
                     .balanceOf(wallet)
                     .call()
@@ -86,7 +79,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
     writeln!(stdout, "   Wallet: {wallet}")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer.clone())?;
+    let cctp_bridge = build_cctp_bridge(rebalancing_ctx, base_provider, signer.clone())?;
 
     let direction = from.to_bridge_direction();
 
@@ -159,11 +152,8 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     writeln!(stdout, "   Burn tx: {burn_tx}")?;
     writeln!(stdout, "   Source chain: {source_chain:?}")?;
 
-    let rebalancing = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("cctp-recover requires rebalancing configuration"))?;
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
 
     let direction = source_chain.to_bridge_direction();
     let dest_chain = match source_chain {
@@ -173,7 +163,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     writeln!(stdout, "   Destination chain: {dest_chain:?}")?;
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer)?;
+    let cctp_bridge = build_cctp_bridge(rebalancing_ctx, base_provider, signer)?;
 
     // Use the V2 API which returns both message and attestation from tx hash
     let response = cctp_bridge.poll_attestation(direction, burn_tx).await?;
@@ -201,12 +191,9 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
     ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
-    let rebalancing = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("reset-allowance requires rebalancing configuration"))?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let wallet = EthereumWallet::from(signer.clone());
     let owner = signer.address();
 
@@ -224,7 +211,7 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
         CctpChain::Ethereum => {
             let provider = ProviderBuilder::new()
                 .wallet(wallet)
-                .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
+                .connect_client(http_client_with_retry(rebalancing_ctx.ethereum_rpc_url.clone()));
             reset_allowance(stdout, usdc_address, owner, spender, &provider).await
         }
         CctpChain::Base => {
@@ -279,7 +266,7 @@ mod tests {
     use uuid::uuid;
 
     use super::*;
-    use crate::config::{BrokerCtx, LogLevel};
+    use crate::config::{BrokerCtx, LogLevel, TradingMode};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
@@ -295,21 +282,22 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerCtx::DryRun,
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
     fn create_ctx_with_rebalancing() -> Ctx {
         let mut ctx = create_ctx_without_rebalancing();
-        ctx.rebalancing = Some(RebalancingCtx {
+        ctx.trading_mode = TradingMode::Rebalancing(RebalancingCtx {
             evm_private_key: B256::ZERO,
             ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,

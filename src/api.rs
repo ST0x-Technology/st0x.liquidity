@@ -98,7 +98,7 @@ mod tests {
 
     use super::*;
     use crate::config::SchwabAuth;
-    use crate::config::{BrokerCtx, Ctx};
+    use crate::config::{BrokerCtx, Ctx, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -113,7 +113,6 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
-                order_owner: Some(address!("0x2222222222222222222222222222222222222222")),
                 deployment_block: 0,
             },
             order_polling_interval: 15,
@@ -127,7 +126,9 @@ mod tests {
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: address!("0x2222222222222222222222222222222222222222"),
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

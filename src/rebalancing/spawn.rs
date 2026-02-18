@@ -1,12 +1,8 @@
 //! Spawns the rebalancing infrastructure.
 
-use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::Address;
-use alloy::providers::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
-};
-use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::providers::Provider;
+use alloy::transports::{RpcError, TransportErrorKind};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -14,7 +10,7 @@ use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_contract_caller::ContractCaller;
-use st0x_contract_caller::local::LocalCaller;
+use st0x_contract_caller::fireblocks::{FireblocksCaller, FireblocksCtx, FireblocksError};
 use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Executor};
 
@@ -24,7 +20,6 @@ use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::equity_redemption::EquityRedemption;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::onchain::{REQUIRED_CONFIRMATIONS, http_client_with_retry};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -34,8 +29,8 @@ use crate::wrapper::WrapperService;
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpawnRebalancerError {
-    #[error("invalid Ethereum private key: {0}")]
-    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("failed to create Fireblocks caller: {0}")]
+    Fireblocks(#[from] FireblocksError),
     #[error("failed to create Alpaca wallet service: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
     #[error("failed to create Alpaca broker API: {0}")]
@@ -44,20 +39,11 @@ pub(crate) enum SpawnRebalancerError {
     Cctp(#[from] CctpError),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
+    #[error("RPC error: {0}")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
+    #[error("no Fireblocks asset ID configured for chain {chain_id}")]
+    MissingChainAssetId { chain_id: u64 },
 }
-
-/// Provider type returned by `ProviderBuilder::connect_http` with wallet.
-type HttpProvider = FillProvider<
-    JoinFill<
-        JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-        >,
-        WalletFiller<EthereumWallet>,
-    >,
-    RootProvider<Ethereum>,
-    Ethereum,
->;
 
 pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) mint: Arc<Store<TokenizedEquityMint>>,
@@ -69,26 +55,25 @@ pub(crate) struct RebalancingCqrsFrameworks {
 ///
 /// All CQRS frameworks are created in the conductor and passed here to ensure
 /// single-instance initialization with all required query processors.
-pub(crate) async fn spawn_rebalancer<BP>(
+pub(crate) async fn spawn_rebalancer<EthereumNode, BaseNode>(
     ctx: &RebalancingCtx,
-    base_provider: BP,
+    ethereum: EthereumNode,
+    base: BaseNode,
     market_maker_wallet: Address,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
-    raindex_service: Arc<RaindexService<BP>>,
+    raindex_service: Arc<RaindexService<BaseNode>>,
     tokenizer: Arc<dyn Tokenizer>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
-    BP: Provider + Clone + Send + Sync + 'static,
+    EthereumNode: Provider + Clone + Send + Sync + 'static,
+    BaseNode: Provider + Clone + Send + Sync + 'static,
 {
-    let signer = PrivateKeySigner::from_bytes(&ctx.evm_private_key)?;
-    let ethereum_wallet = EthereumWallet::from(signer.clone());
-
     let services = Services::new(
         ctx,
-        &ethereum_wallet,
-        signer.address(),
-        base_provider,
+        ethereum,
+        base,
+        market_maker_wallet,
         raindex_service,
         tokenizer,
     )
@@ -109,89 +94,29 @@ where
 ///
 /// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
 ///
-/// Generic over `BP` (Base Provider) to allow reusing the existing WebSocket
-/// connection from the main bot. The Ethereum provider uses a fixed HTTP type
-/// since it's created from a URL in the rebalancing config.
-struct Services<BP>
+/// Generic over `EthereumNode` and `BaseNode`. The base
+/// provider reuses the existing WebSocket connection from the main bot; the
+/// Ethereum provider is a read-only HTTP client created from the rebalancing
+/// config URL. Both are used for view calls only — writes go through
+/// `FireblocksCaller` via the `ContractCaller` trait.
+struct Services<EthereumNode, BaseNode>
 where
-    BP: Provider + Clone,
+    EthereumNode: Provider + Clone,
+    BaseNode: Provider + Clone,
 {
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
-    cctp: Arc<CctpBridge<HttpProvider, BP>>,
-    raindex: Arc<RaindexService<BP>>,
+    cctp: Arc<CctpBridge<EthereumNode, BaseNode>>,
+    raindex: Arc<RaindexService<BaseNode>>,
     tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<WrapperService<BP>>,
+    wrapper: Arc<WrapperService<BaseNode>>,
 }
 
-impl<BP> Services<BP>
+impl<EthereumNode, BaseNode> Services<EthereumNode, BaseNode>
 where
-    BP: Provider + Clone + 'static,
+    EthereumNode: Provider + Clone + 'static,
+    BaseNode: Provider + Clone + 'static,
 {
-    /// Creates the services needed for rebalancing.
-    ///
-    /// RaindexService is passed in rather than created here because it is needed
-    /// for CQRS framework initialization in the conductor, which must happen
-    /// before spawn_rebalancer is called.
-    async fn new(
-        ctx: &RebalancingCtx,
-        ethereum_wallet: &EthereumWallet,
-        owner: Address,
-        base_provider: BP,
-        raindex: Arc<RaindexService<BP>>,
-        tokenizer: Arc<dyn Tokenizer>,
-    ) -> Result<Self, SpawnRebalancerError> {
-        let ethereum_provider = ProviderBuilder::new()
-            .wallet(ethereum_wallet.clone())
-            .connect_client(http_client_with_retry(ctx.ethereum_rpc_url.clone()));
-
-        let broker_auth = &ctx.alpaca_broker_auth;
-
-        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
-
-        let wallet = Arc::new(AlpacaWalletService::new(
-            broker_auth.base_url().to_string(),
-            ctx.alpaca_broker_auth.account_id,
-            broker_auth.api_key.clone(),
-            broker_auth.api_secret.clone(),
-        ));
-
-        let ethereum_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
-            ethereum_provider.clone(),
-            REQUIRED_CONFIRMATIONS,
-        ));
-        let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
-            base_provider.clone(),
-            REQUIRED_CONFIRMATIONS,
-        ));
-
-        let cctp = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
-            ethereum_provider,
-            base_provider: base_provider.clone(),
-            owner,
-            usdc_ethereum: USDC_ETHEREUM,
-            usdc_base: USDC_BASE,
-            ethereum_caller,
-            base_caller: base_caller.clone(),
-        })?);
-
-        let wrapper = Arc::new(WrapperService::new(
-            base_provider.clone(),
-            base_caller,
-            owner,
-            ctx.equities.clone(),
-        ));
-
-        Ok(Self {
-            broker,
-            wallet,
-            cctp,
-            raindex,
-            tokenizer,
-            wrapper,
-        })
-    }
-
     /// Converts Services into a configured Rebalancer.
     fn into_rebalancer(
         self,
@@ -201,7 +126,8 @@ where
         frameworks: RebalancingCqrsFrameworks,
     ) -> Rebalancer
     where
-        BP: Send + Sync + 'static,
+        EthereumNode: Send + Sync,
+        BaseNode: Send + Sync,
     {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
@@ -232,15 +158,122 @@ where
     }
 }
 
+impl<EthereumNode, BaseNode> Services<EthereumNode, BaseNode>
+where
+    EthereumNode: Provider + Clone + 'static,
+    BaseNode: Provider + Clone + 'static,
+{
+    /// Creates the services needed for rebalancing.
+    ///
+    /// Builds `FireblocksCaller` instances for Ethereum and Base chains
+    /// and wires up all downstream services.
+    ///
+    /// RaindexService is passed in rather than created here because it is needed
+    /// for CQRS framework initialization in the conductor, which must happen
+    /// before spawn_rebalancer is called.
+    async fn new(
+        ctx: &RebalancingCtx,
+        ethereum_provider: EthereumNode,
+        base_provider: BaseNode,
+        market_maker_wallet: Address,
+        raindex: Arc<RaindexService<BaseNode>>,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> Result<Self, SpawnRebalancerError> {
+        let ethereum_chain_id = ethereum_provider.get_chain_id().await?;
+        let base_chain_id = base_provider.get_chain_id().await?;
+
+        let ethereum_asset_id = ctx
+            .fireblocks_chain_asset_ids
+            .get(ethereum_chain_id)
+            .cloned()
+            .ok_or(SpawnRebalancerError::MissingChainAssetId {
+                chain_id: ethereum_chain_id,
+            })?;
+
+        let base_asset_id = ctx
+            .fireblocks_chain_asset_ids
+            .get(base_chain_id)
+            .cloned()
+            .ok_or(SpawnRebalancerError::MissingChainAssetId {
+                chain_id: base_chain_id,
+            })?;
+
+        let ethereum_caller: Arc<dyn ContractCaller> =
+            Arc::new(FireblocksCaller::new(FireblocksCtx {
+                api_user_id: ctx.fireblocks_api_user_id.clone(),
+                secret: ctx.fireblocks_secret.clone(),
+                vault_account_id: ctx.fireblocks_vault_account_id.clone(),
+                environment: ctx.fireblocks_environment,
+                asset_id: ethereum_asset_id,
+                provider: ethereum_provider.clone(),
+            })?);
+
+        let base_caller: Arc<dyn ContractCaller> =
+            Arc::new(FireblocksCaller::new(FireblocksCtx {
+                api_user_id: ctx.fireblocks_api_user_id.clone(),
+                secret: ctx.fireblocks_secret.clone(),
+                vault_account_id: ctx.fireblocks_vault_account_id.clone(),
+                environment: ctx.fireblocks_environment,
+                asset_id: base_asset_id,
+                provider: base_provider.clone(),
+            })?);
+
+        let broker_auth = &ctx.alpaca_broker_auth;
+
+        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
+
+        let wallet = Arc::new(AlpacaWalletService::new(
+            broker_auth.base_url().to_string(),
+            ctx.alpaca_broker_auth.account_id,
+            broker_auth.api_key.clone(),
+            broker_auth.api_secret.clone(),
+        ));
+
+        let cctp = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
+            ethereum_provider,
+            base_provider: base_provider.clone(),
+            owner: market_maker_wallet,
+            usdc_ethereum: USDC_ETHEREUM,
+            usdc_base: USDC_BASE,
+            ethereum_caller,
+            base_caller: base_caller.clone(),
+        })?);
+
+        let wrapper = Arc::new(WrapperService::new(
+            base_provider.clone(),
+            base_caller,
+            market_maker_wallet,
+            ctx.equities.clone(),
+        ));
+
+        Ok(Self {
+            broker,
+            wallet,
+            cctp,
+            raindex,
+            tokenizer,
+            wrapper,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{address, b256};
-    use alloy::providers::ProviderBuilder;
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
+        WalletFiller,
+    };
+    use alloy::providers::{Identity, ProviderBuilder, RootProvider};
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::network::EthereumWallet;
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_contract_caller::local::LocalCaller;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
         TimeInForce,
@@ -248,6 +281,9 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
+    use st0x_contract_caller::fireblocks::{
+        ChainAssetIds, FireblocksApiUserId, FireblocksEnvironment, FireblocksVaultAccountId,
+    };
     use st0x_event_sorcery::{Projection, test_store};
 
     use super::*;
@@ -262,7 +298,6 @@ mod tests {
     use crate::vault_registry::VaultRegistry;
     use crate::wrapper::mock::MockWrapper;
 
-    /// Provider type returned by `ProviderBuilder::new().connect_http()` without wallet.
     type BaseTestProvider = FillProvider<
         JoinFill<
             Identity,
@@ -275,12 +310,6 @@ mod tests {
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_ctx() -> RebalancingCtx {
-        let evm_private_key =
-            b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-        let market_maker_wallet = PrivateKeySigner::from_bytes(&evm_private_key)
-            .unwrap()
-            .address();
-
         RebalancingCtx {
             equity: ImbalanceThreshold {
                 target: dec!(0.5),
@@ -291,9 +320,7 @@ mod tests {
                 deviation: dec!(0.15),
             },
             redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
-            market_maker_wallet,
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
-            evm_private_key,
             usdc_vault_id: b256!(
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
@@ -306,20 +333,15 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             },
             equities: HashMap::new(),
+            fireblocks_api_user_id: FireblocksApiUserId::new("test-user"),
+            fireblocks_secret: vec![0u8; 32],
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_chain_asset_ids: serde_json::from_value(
+                serde_json::json!({"1": "ETH", "8453": "BASECHAIN_ETH"}),
+            )
+            .unwrap(),
         }
-    }
-
-    #[test]
-    fn spawn_rebalancer_error_display_invalid_private_key() {
-        let err =
-            SpawnRebalancerError::InvalidPrivateKey(alloy::signers::k256::ecdsa::Error::new());
-
-        let display = format!("{err}");
-
-        assert!(
-            display.contains("invalid Ethereum private key"),
-            "Expected error message to contain 'invalid Ethereum private key', got: {display}"
-        );
     }
 
     #[test]
@@ -333,6 +355,18 @@ mod tests {
         assert!(
             display.contains("failed to create Alpaca wallet service"),
             "Expected error message to contain 'failed to create Alpaca wallet service', got: {display}"
+        );
+    }
+
+    #[test]
+    fn spawn_rebalancer_error_display_missing_chain_asset_id() {
+        let err = SpawnRebalancerError::MissingChainAssetId { chain_id: 42161 };
+
+        let display = format!("{err}");
+
+        assert!(
+            display.contains("42161"),
+            "Expected chain_id in error message, got: {display}"
         );
     }
 
@@ -365,28 +399,30 @@ mod tests {
         assert_eq!(deviation, dec!(0.15));
     }
 
-    #[test]
-    fn private_key_signer_from_valid_bytes_succeeds() {
-        let rebalancing_ctx = make_ctx();
-
-        PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key).unwrap();
-    }
-
-    #[test]
-    fn private_key_signer_from_zero_bytes_fails() {
-        let zero_key = b256!("0x0000000000000000000000000000000000000000000000000000000000000000");
-
-        PrivateKeySigner::from_bytes(&zero_key).unwrap_err();
-    }
+    /// Wallet-equipped provider type for tests (LocalCaller needs a signing provider).
+    type WalletTestProvider = FillProvider<
+        JoinFill<
+            JoinFill<
+                Identity,
+                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+            >,
+            WalletFiller<EthereumWallet>,
+        >,
+        RootProvider<Ethereum>,
+        Ethereum,
+    >;
 
     async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
-    ) -> (Services<BaseTestProvider>, RebalancingCtx) {
+    ) -> (Services<WalletTestProvider, BaseTestProvider>, RebalancingCtx) {
         let anvil = Anvil::new().spawn();
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         let rebalancing_ctx = make_ctx();
-        let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key).unwrap();
+
+        let evm_private_key =
+            b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let signer = PrivateKeySigner::from_bytes(&evm_private_key).unwrap();
         let ethereum_wallet = EthereumWallet::from(signer.clone());
 
         let ethereum_provider = ProviderBuilder::new()
@@ -405,7 +441,6 @@ mod tests {
             rebalancing_ctx.redemption_wallet,
         ));
 
-        // Mock the broker account verification endpoint
         let _account_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
                 "/v1/trading/accounts/{}/account",
@@ -493,7 +528,6 @@ mod tests {
     async fn broker_auth_failure_returns_spawn_error() {
         let server = MockServer::start();
 
-        // Mock account endpoint to return 401 unauthorized
         let _account_mock = server.mock(|when, then| {
             when.method(GET).path_contains("/trading/accounts/");
             then.status(401)
@@ -511,7 +545,6 @@ mod tests {
             time_in_force: TimeInForce::default(),
         };
 
-        // Verify the error can be converted to SpawnRebalancerError
         let spawn_error: SpawnRebalancerError = AlpacaBrokerApi::try_from_ctx(broker_auth)
             .await
             .unwrap_err()
