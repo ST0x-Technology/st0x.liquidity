@@ -237,6 +237,12 @@ pub(super) async fn execute_broker_order<W: Write>(
         BrokerCtx::Schwab(schwab_auth) => {
             ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
             writeln!(stdout, "🔄 Executing Schwab order...")?;
+            if time_in_force.is_some() {
+                writeln!(
+                    stdout,
+                    "⚠️  --time-in-force is ignored for Schwab (only supported by Alpaca Broker API)"
+                )?;
+            }
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let broker = schwab_ctx.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
@@ -249,6 +255,13 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Trading API order...")?;
+            if time_in_force.is_some() {
+                writeln!(
+                    stdout,
+                    "⚠️  --time-in-force is ignored for Alpaca Trading API \
+                     (only supported by Alpaca Broker API)"
+                )?;
+            }
             let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
@@ -275,6 +288,13 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerCtx::DryRun => {
             writeln!(stdout, "🔄 Executing dry-run order...")?;
+            if time_in_force.is_some() {
+                writeln!(
+                    stdout,
+                    "⚠️  --time-in-force is ignored for dry-run \
+                     (only supported by Alpaca Broker API)"
+                )?;
+            }
             let broker = MockExecutorCtx.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
@@ -698,6 +718,35 @@ mod tests {
         assert!(
             output.contains("❌ Failed to place order"),
             "Expected failure message, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_time_in_force_warning_for_schwab() {
+        let server = MockServer::start();
+        let ctx = create_schwab_test_ctx(&server);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
+
+        setup_schwab_order_mocks(&server);
+
+        let mut stdout_buffer = Vec::new();
+        execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            100,
+            Direction::Buy,
+            Some(TimeInForce::Day),
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(
+            output.contains("--time-in-force is ignored"),
+            "Expected warning about ignored --time-in-force, got: {output}"
         );
     }
 }

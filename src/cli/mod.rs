@@ -1411,8 +1411,47 @@ mod tests {
             .unwrap();
 
         let _matches = cmd
+            .clone()
             .try_get_matches_from(vec!["schwab", "sell", "-s", "TSLA", "-q", "50"])
             .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "schwab",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "day",
+            ])
+            .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "schwab",
+                "sell",
+                "-s",
+                "TSLA",
+                "-q",
+                "50",
+                "--time-in-force",
+                "market-on-close",
+            ])
+            .unwrap();
+
+        cmd.try_get_matches_from(vec![
+            "schwab",
+            "buy",
+            "-s",
+            "AAPL",
+            "-q",
+            "100",
+            "--time-in-force",
+            "invalid",
+        ])
+        .unwrap_err();
     }
 
     #[tokio::test]
