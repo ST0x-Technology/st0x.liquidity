@@ -15,6 +15,12 @@ sol!(
     IERC20, "lib/forge-std/out/IERC20.sol/IERC20.json"
 );
 
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    IERC4626, "lib/forge-std/out/IERC4626.sol/IERC4626.json"
+);
+
 #[cfg(test)]
 sol!(
     #![sol(all_derives = true, rpc)]

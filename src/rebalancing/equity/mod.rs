@@ -15,7 +15,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
@@ -30,8 +30,10 @@ use crate::tokenization::{
     AlpacaTokenizationError, TokenizationRequestStatus, Tokenizer, TokenizerError,
 };
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizationRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    IssuerRequestId, TOKENIZED_EQUITY_DECIMALS, TokenizationRequestId, TokenizedEquityMint,
+    TokenizedEquityMintCommand,
 };
+use crate::wrapper::{Wrapper, WrapperError};
 
 /// A quantity of equity in a specific symbol.
 #[derive(Debug)]
@@ -49,12 +51,34 @@ pub(crate) struct Equity {
 pub(crate) struct EquityTransferServices {
     pub(crate) raindex: Arc<dyn Raindex>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) wrapper: Arc<dyn Wrapper>,
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<TokenizedEquityMint>>),
+    #[error("Wrapper error: {0}")]
+    Wrapper(#[from] WrapperError),
+    #[error("Raindex error: {0}")]
+    Raindex(#[from] RaindexError),
+    #[error(
+        "Entity not found after command: expected {expected_state} \
+         for {issuer_request_id}"
+    )]
+    EntityNotFound {
+        issuer_request_id: IssuerRequestId,
+        expected_state: &'static str,
+    },
+    #[error(
+        "Unexpected mint state for {issuer_request_id}: expected \
+         {expected_state}, got {entity:?}"
+    )]
+    UnexpectedState {
+        issuer_request_id: IssuerRequestId,
+        expected_state: &'static str,
+        entity: Box<TokenizedEquityMint>,
+    },
 }
 
 impl From<SendError<TokenizedEquityMint>> for MintError {
@@ -95,6 +119,7 @@ pub(crate) enum RedemptionError {
 pub(crate) struct CrossVenueEquityTransfer {
     raindex: Arc<dyn Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn Wrapper>,
     wallet: Address,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
@@ -104,6 +129,7 @@ impl CrossVenueEquityTransfer {
     pub(crate) fn new(
         raindex: Arc<dyn Raindex>,
         tokenizer: Arc<dyn Tokenizer>,
+        wrapper: Arc<dyn Wrapper>,
         wallet: Address,
         mint_store: Arc<Store<TokenizedEquityMint>>,
         redemption_store: Arc<Store<EquityRedemption>>,
@@ -111,21 +137,47 @@ impl CrossVenueEquityTransfer {
         Self {
             raindex,
             tokenizer,
+            wrapper,
             wallet,
             mint_store,
             redemption_store,
         }
     }
 
-    /// Sends the Redeem command and extracts the redemption tx hash.
-    async fn send_redeem_command(
+    /// Loads the aggregate after Poll and extracts shares_minted from
+    /// the TokensReceived state.
+    async fn load_shares_minted(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<U256, MintError> {
+        let entity = self
+            .mint_store
+            .load(issuer_request_id)
+            .await?
+            .ok_or_else(|| MintError::EntityNotFound {
+                issuer_request_id: issuer_request_id.clone(),
+                expected_state: "TokensReceived",
+            })?;
+
+        match entity {
+            TokenizedEquityMint::TokensReceived { shares_minted, .. } => Ok(shares_minted),
+            other => Err(MintError::UnexpectedState {
+                issuer_request_id: issuer_request_id.clone(),
+                expected_state: "TokensReceived",
+                entity: Box::new(other),
+            }),
+        }
+    }
+
+    /// Sends the Redeem command to withdraw from Raindex vault.
+    async fn withdraw_from_raindex(
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,
         quantity: FractionalShares,
         token: Address,
         amount: U256,
-    ) -> Result<TxHash, RedemptionError> {
+    ) -> Result<(), RedemptionError> {
         self.redemption_store
             .send(
                 aggregate_id,
@@ -138,6 +190,25 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
+        Ok(())
+    }
+
+    /// Unwraps ERC-4626 tokens and sends to Alpaca, returning the
+    /// redemption tx hash.
+    async fn unwrap_and_send(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<TxHash, RedemptionError> {
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::UnwrapTokens)
+            .await?;
+
+        info!("Tokens unwrapped, sending to Alpaca");
+
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::SendTokens)
+            .await?;
+
         let entity = self.redemption_store.load(aggregate_id).await?.ok_or(
             RedemptionError::EntityNotFound {
                 aggregate_id: aggregate_id.clone(),
@@ -147,10 +218,7 @@ impl CrossVenueEquityTransfer {
         match entity {
             EquityRedemption::TokensSent { redemption_tx, .. } => Ok(redemption_tx),
             entity @ EquityRedemption::Failed { .. } => Err(RedemptionError::SendFailed { entity }),
-            entity => {
-                error!(?entity, "Unexpected entity after Redeem command");
-                Err(RedemptionError::UnexpectedEntity { entity })
-            }
+            entity => Err(RedemptionError::UnexpectedEntity { entity }),
         }
     }
 
@@ -260,12 +328,12 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
         let Equity { symbol, quantity } = asset;
         let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
 
-        debug!(issuer_request_id = %issuer_request_id.0, wallet = %self.wallet, "Executing mint command");
+        debug!(%issuer_request_id, wallet = %self.wallet, "Requesting mint");
 
         self.mint_store
             .send(
                 &issuer_request_id,
-                TokenizedEquityMintCommand::Mint {
+                TokenizedEquityMintCommand::RequestMint {
                     issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
                     quantity: quantity.inner(),
@@ -274,13 +342,55 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             )
             .await?;
 
-        debug!("Executing deposit command");
+        info!("Mint request accepted, polling for completion");
 
         self.mint_store
-            .send(&issuer_request_id, TokenizedEquityMintCommand::Deposit)
+            .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
             .await?;
 
-        info!("Mint workflow completed successfully");
+        let shares_minted = self.load_shares_minted(&issuer_request_id).await?;
+
+        info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
+
+        let wrapped_token = self.wrapper.lookup_wrapped(&symbol)?;
+        let (wrap_tx_hash, wrapped_shares) = self
+            .wrapper
+            .to_wrapped(wrapped_token, shares_minted, self.wallet)
+            .await?;
+
+        self.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash,
+                    wrapped_shares,
+                },
+            )
+            .await?;
+
+        info!(%wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
+
+        let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
+        let vault_deposit_tx_hash = self
+            .raindex
+            .deposit(
+                wrapped_token,
+                vault_id,
+                wrapped_shares,
+                TOKENIZED_EQUITY_DECIMALS,
+            )
+            .await?;
+
+        self.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::DepositToVault {
+                    vault_deposit_tx_hash,
+                },
+            )
+            .await?;
+
+        info!(%vault_deposit_tx_hash, "Mint workflow completed");
         Ok(())
     }
 }
@@ -300,11 +410,14 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
         let amount = quantity.to_u256_18_decimals()?;
         let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
-        info!(%token, %amount, aggregate_id = %aggregate_id.0, "Starting equity transfer to hedging venue");
+        info!(%token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
 
-        let redemption_tx = self
-            .send_redeem_command(&aggregate_id, &symbol, quantity, token, amount)
+        self.withdraw_from_raindex(&aggregate_id, &symbol, quantity, token, amount)
             .await?;
+
+        info!("Withdrawn from Raindex, unwrapping and sending to Alpaca");
+
+        let redemption_tx = self.unwrap_and_send(&aggregate_id).await?;
 
         info!(%redemption_tx, "Tokens sent, polling for detection");
         let request_id = self.poll_detection(&aggregate_id, &redemption_tx).await?;
@@ -330,17 +443,20 @@ mod tests {
     use super::*;
     use crate::onchain::mock::MockRaindex;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
+    use crate::wrapper::mock::MockWrapper;
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
         }
     }
 
     async fn create_equity_transfer(
         tokenizer: Arc<dyn Tokenizer>,
         raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
     ) -> CrossVenueEquityTransfer {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
@@ -352,6 +468,7 @@ mod tests {
         CrossVenueEquityTransfer::new(
             raindex,
             tokenizer,
+            wrapper,
             Address::random(),
             mint_store,
             redemption_store,
@@ -360,9 +477,12 @@ mod tests {
 
     #[tokio::test]
     async fn mint_transfer_sends_mint_and_deposit_commands() {
-        let transfer =
-            create_equity_transfer(Arc::new(MockTokenizer::new()), Arc::new(MockRaindex::new()))
-                .await;
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
 
         CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
             &transfer,
@@ -384,7 +504,8 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -407,7 +528,8 @@ mod tests {
             Arc::new(MockTokenizer::new().with_detection_outcome(MockDetectionOutcome::Timeout));
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -431,7 +553,8 @@ mod tests {
             Arc::new(MockTokenizer::new().with_detection_outcome(MockDetectionOutcome::ApiError));
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -458,7 +581,8 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -485,7 +609,8 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer = create_equity_transfer(tokenizer, raindex).await;
+        let transfer =
+            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
             &transfer,
@@ -500,6 +625,56 @@ mod tests {
         assert!(
             matches!(error, RedemptionError::UnexpectedPendingStatus),
             "Expected UnexpectedPendingStatus error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_wrapper_fails() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, MintError::Wrapper(_)),
+            "Expected Wrapper error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_raindex_deposit_fails() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::failing_deposit()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, MintError::Raindex(_)),
+            "Expected Raindex error, got: {error:?}"
         );
     }
 }

@@ -166,7 +166,8 @@ mod tests {
         let (equity, usdc) = execute(vec![TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(dec!(50)),
-            token: address!("0x1234567890123456789012345678901234567890"),
+            wrapped_token: address!("0x1234567890123456789012345678901234567890"),
+            unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
         }])
         .await;
 
@@ -216,7 +217,8 @@ mod tests {
             TriggeredOperation::Redemption {
                 symbol: Symbol::new("GOOG").unwrap(),
                 quantity: FractionalShares::new(dec!(5)),
-                token: address!("0x1234567890123456789012345678901234567890"),
+                wrapped_token: address!("0x1234567890123456789012345678901234567890"),
+                unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
             },
             TriggeredOperation::UsdcAlpacaToBase {
                 amount: Usdc(dec!(500)),

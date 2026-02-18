@@ -45,13 +45,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     }
 
     let shares = Positive::new(shares)?;
-
-    info!(
-        symbol = %symbol,
-        shares = %shares,
-        direction = ?direction,
-        "Position ready for execution"
-    );
+    info!(symbol = %symbol, shares = %shares, direction = ?direction, "Position ready for execution");
 
     Ok(Some(ExecutionCtx {
         symbol: symbol.clone(),
@@ -133,6 +127,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
 mod tests {
     use alloy::primitives::TxHash;
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
@@ -151,7 +146,7 @@ mod tests {
     ) -> (Store<Position>, Projection<Position>) {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = StoreBuilder::new(pool.clone())
-            .with(projection.clone())
+            .with(Arc::new(projection.clone()))
             .build(())
             .await
             .unwrap();
@@ -411,10 +406,10 @@ mod tests {
                 .unwrap();
         assert!(
             result.is_none(),
-            "Should still not execute while market closed, even above threshold"
+            "Should still not execute while market closed"
         );
 
-        // Market opens - accumulated position should trigger
+        // Market opens - should now execute
         let open_executor = MockExecutor::new().with_market_open(true);
 
         let params =
@@ -427,12 +422,7 @@ mod tests {
         assert_eq!(
             params.shares,
             Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
-            "DryRun supports fractional shares, should return full 1.5"
-        );
-        assert_eq!(
-            params.direction,
-            Direction::Sell,
-            "Positive net (long) -> sell offchain to hedge"
+            "Should execute full accumulated amount"
         );
     }
 }

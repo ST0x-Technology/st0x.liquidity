@@ -629,7 +629,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let reactor = EventCounter(counter.clone());
         let observed_store = StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .with(reactor)
+            .with(Arc::new(reactor))
             .build(())
             .await
             .unwrap();

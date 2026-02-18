@@ -36,7 +36,9 @@ mod tests {
     use uuid::uuid;
 
     use super::super::client::AlpacaWalletClient;
-    use super::super::transfer::{AlpacaAccountId, Network, TokenSymbol};
+    use st0x_execution::AlpacaAccountId;
+
+    use super::super::transfer::{Network, TokenSymbol};
     use super::*;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =

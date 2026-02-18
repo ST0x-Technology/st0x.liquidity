@@ -32,6 +32,7 @@ mod onchain_trade;
 mod position;
 mod queue;
 mod rebalancing;
+mod shares;
 mod symbol;
 mod telemetry;
 mod threshold;
@@ -39,6 +40,7 @@ mod tokenization;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;
+mod wrapper;
 
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 

@@ -8,7 +8,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountResponse, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+use super::auth::{AccountResponse, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use super::executor::AssetResponse;
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
 use crate::Symbol;
@@ -17,7 +17,7 @@ use crate::Symbol;
 pub(crate) struct AlpacaBrokerApiClient {
     http_client: reqwest::Client,
     base_url: String,
-    account_id: String,
+    account_id: AlpacaAccountId,
     mode: AlpacaBrokerApiMode,
 }
 
@@ -51,7 +51,7 @@ impl AlpacaBrokerApiClient {
         Ok(Self {
             http_client,
             base_url: ctx.base_url().to_string(),
-            account_id: ctx.account_id.clone(),
+            account_id: ctx.account_id,
             mode: ctx.mode(),
         })
     }
@@ -60,8 +60,8 @@ impl AlpacaBrokerApiClient {
         &self.base_url
     }
 
-    pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
+    pub(crate) fn account_id(&self) -> AlpacaAccountId {
+        self.account_id
     }
 
     pub(crate) fn is_sandbox(&self) -> bool {
@@ -193,15 +193,20 @@ impl AlpacaBrokerApiClient {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use uuid::uuid;
 
     use super::*;
+    use crate::alpaca_broker_api::auth::AlpacaAccountId;
     use crate::alpaca_broker_api::{AssetStatus, TimeInForce};
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
@@ -214,7 +219,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
 
         assert!(client.is_sandbox());
-        assert_eq!(client.account_id(), "test_account_123");
+        assert_eq!(client.account_id(), TEST_ACCOUNT_ID);
     }
 
     #[test]
@@ -246,7 +251,7 @@ mod tests {
 
         assert!(!debug_output.contains("test_key_id"));
         assert!(!debug_output.contains("test_secret_key"));
-        assert!(debug_output.contains("test_account_123"));
+        assert!(debug_output.contains("904837e3-3b76-47ec-b432-046db621571b"));
         assert!(debug_output.contains("Sandbox"));
     }
 
@@ -257,7 +262,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account")
                 .header(
                     "authorization",
                     "Basic dGVzdF9rZXlfaWQ6dGVzdF9zZWNyZXRfa2V5",
@@ -290,7 +295,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({

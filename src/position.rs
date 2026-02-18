@@ -573,6 +573,7 @@ pub(crate) enum TriggerReason {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     use st0x_execution::Positive;
 
@@ -1302,7 +1303,7 @@ mod tests {
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
 
         let store = StoreBuilder::<Position>::new(pool.clone())
-            .with(projection.clone())
+            .with(Arc::new(projection.clone()))
             .build(())
             .await
             .unwrap();

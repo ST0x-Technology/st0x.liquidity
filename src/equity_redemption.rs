@@ -1,7 +1,7 @@
 //! Aggregate modeling the lifecycle of redeeming tokenized
 //! equities for underlying shares.
 //!
-//! Tracks the workflow from withdrawing tokens from the vault
+//! Tracks the workflow from withdrawing tokens from the Raindex vault
 //! through sending to Alpaca's redemption wallet to share delivery.
 //!
 //! # State Flow
@@ -9,14 +9,28 @@
 //! The aggregate progresses through the following states:
 //!
 //! ```text
-//! (start) --Redeem--> VaultWithdrawn ---> TokensSent ---> Pending ---> Completed
-//!              |              |               |             |
-//!              v              v               v             v
-//!            Failed        Failed          Failed        Failed
+//!     Redeem ------------> Failed
+//!       |
+//!       v
+//!     WithdrawnFromRaindex --> Failed
+//!       |
+//!       v
+//!     TokensUnwrapped ------> Failed
+//!       |
+//!       v
+//!     TokensSent ------------> Failed
+//!       |
+//!       v
+//!     Pending ---------------> Failed
+//!       |
+//!       v
+//!     Completed
 //! ```
 //!
-//! - `Redeem` command atomically withdraws from vault and sends to Alpaca
-//! - `VaultWithdrawn` tracks tokens that left the vault but aren't yet sent
+//! - `Redeem` withdraws wrapped tokens from the Raindex vault
+//! - `WithdrawnFromRaindex` tracks tokens withdrawn, awaiting unwrap
+//! - `UnwrapTokens` unwraps ERC-4626 shares into underlying tokens
+//! - `TokensUnwrapped` tracks unwrapped tokens, ready to send
 //! - `TokensSent` tracks tokens sent to Alpaca's redemption wallet
 //! - `Pending` indicates Alpaca detected the transfer
 //! - `Completed` and `Failed` are terminal states
@@ -29,8 +43,8 @@
 //! - `vault.withdraw()` - Withdraws tokens from Rain OrderBook vault
 //! - `tokenizer.send_for_redemption()` - Sends tokens to Alpaca's redemption wallet
 //!
-//! This pattern ensures that if vault withdraw succeeds but send fails, the aggregate stays
-//! in `VaultWithdrawn` state (tokens in wallet, not stranded).
+//! This pattern ensures that if Raindex withdraw succeeds but send fails, the aggregate stays
+//! in `WithdrawnFromRaindex` state (tokens in wallet, not stranded).
 //!
 //! # Error Handling
 //!
@@ -60,7 +74,7 @@ use crate::tokenized_equity_mint::TokenizationRequestId;
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// Unique identifier for a redemption aggregate instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct RedemptionAggregateId(pub(crate) String);
 
 impl RedemptionAggregateId {
@@ -88,18 +102,44 @@ impl FromStr for RedemptionAggregateId {
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum EquityRedemptionError {
-    /// Vault lookup failed for the given token
-    #[error("Token {0} not found in vault registry")]
-    VaultNotFound(Address),
-    /// Vault withdrawal transaction failed
-    #[error("Vault withdraw failed")]
-    VaultWithdrawFailed,
-    /// Sending tokens to Alpaca redemption wallet failed
-    #[error("Send for redemption failed")]
-    SendForRedemptionFailed,
+    /// Raindex vault lookup failed for the given token
+    #[error("Token {0} not found in Raindex vault registry")]
+    RaindexVaultNotFound(Address),
+    /// Raindex vault withdrawal transaction failed.
+    /// RaindexError can't be wrapped with #[from] because it contains
+    /// alloy types that don't implement Serialize/Deserialize (required
+    /// by DomainError).
+    #[error(
+        "Raindex vault withdraw failed for token {token}, \
+         amount {amount}: {error_message}"
+    )]
+    RaindexWithdrawFailed {
+        token: Address,
+        amount: U256,
+        error_message: String,
+    },
+    /// ERC-4626 unwrap operation failed.
+    /// WrapperError can't be wrapped with #[from] because it contains
+    /// alloy types that don't implement Serialize/Deserialize (required
+    /// by DomainError).
+    #[error(
+        "Token unwrap failed for {token}, \
+         wrapped_amount {wrapped_amount}: {error_message}"
+    )]
+    UnwrapFailed {
+        token: Address,
+        wrapped_amount: U256,
+        error_message: String,
+    },
     /// Transaction failed with a known tx hash
     #[error("Transaction failed: {tx_hash}")]
     TransactionFailed { tx_hash: TxHash },
+    /// Attempted to unwrap tokens when redemption is already in progress
+    #[error("Cannot unwrap tokens: redemption already in progress")]
+    CannotUnwrapAlreadyStarted,
+    /// Attempted to send tokens before unwrapping
+    #[error("Cannot send: tokens not unwrapped")]
+    TokensNotUnwrapped,
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
@@ -128,15 +168,18 @@ pub(crate) enum EquityRedemptionError {
 
 #[derive(Debug, Clone)]
 pub(crate) enum EquityRedemptionCommand {
-    /// Atomic command: withdraws from vault and sends to Alpaca.
-    /// Emits VaultWithdrawn, then TokensSent on success.
-    /// If vault withdraw succeeds but send fails, stays in VaultWithdrawn.
+    /// Withdraws wrapped tokens from the Raindex vault.
+    /// Emits WithdrawnFromRaindex.
     Redeem {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
         amount: U256,
     },
+    /// Unwrap ERC-4626 wrapped tokens after Raindex withdrawal.
+    UnwrapTokens,
+    /// Send unwrapped tokens to Alpaca's redemption wallet.
+    SendTokens,
     /// Alpaca detected the token transfer.
     Detect {
         tokenization_request_id: TokenizationRequestId,
@@ -158,15 +201,22 @@ pub(crate) enum DetectionFailure {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum EquityRedemptionEvent {
-    /// Tokens withdrawn from vault to wallet.
-    VaultWithdrawn {
+    /// Tokens withdrawn from Raindex vault to wallet.
+    WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
-        vault_withdraw_tx: TxHash,
+        wrapped_amount: U256,
+        raindex_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
     },
-    /// Vault withdraw succeeded but transfer to redemption wallet failed.
+    /// ERC-4626 wrapped tokens have been unwrapped.
+    TokensUnwrapped {
+        unwrap_tx_hash: TxHash,
+        unwrapped_amount: U256,
+        unwrapped_at: DateTime<Utc>,
+    },
+    /// Raindex withdraw succeeded but transfer to redemption wallet failed.
     TransferFailed {
         tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
@@ -203,16 +253,18 @@ pub(crate) enum EquityRedemptionEvent {
 
 impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
+        use EquityRedemptionEvent::*;
         match self {
-            Self::VaultWithdrawn { .. } => "EquityRedemptionEvent::VaultWithdrawn".to_string(),
-            Self::TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
-            Self::TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
-            Self::DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
-            Self::Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
-            Self::RedemptionRejected { .. } => {
-                "EquityRedemptionEvent::RedemptionRejected".to_string()
+            WithdrawnFromRaindex { .. } => {
+                "EquityRedemptionEvent::WithdrawnFromRaindex".to_string()
             }
-            Self::Completed { .. } => "EquityRedemptionEvent::Completed".to_string(),
+            TokensUnwrapped { .. } => "EquityRedemptionEvent::TokensUnwrapped".to_string(),
+            TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
+            TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
+            DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
+            Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
+            RedemptionRejected { .. } => "EquityRedemptionEvent::RedemptionRejected".to_string(),
+            Completed { .. } => "EquityRedemptionEvent::Completed".to_string(),
         }
     }
 
@@ -227,13 +279,26 @@ impl DomainEvent for EquityRedemptionEvent {
 /// Each variant contains exactly the data valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum EquityRedemption {
-    /// Tokens withdrawn from vault to wallet, not yet sent to Alpaca
-    VaultWithdrawn {
+    /// Tokens withdrawn from Raindex vault to wallet, not yet sent to Alpaca
+    WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
-        vault_withdraw_tx: TxHash,
+        wrapped_amount: U256,
+        raindex_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
+    },
+
+    /// Wrapped tokens have been unwrapped, ready to send to Alpaca
+    TokensUnwrapped {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        raindex_withdraw_tx: TxHash,
+        unwrap_tx_hash: TxHash,
+        unwrapped_amount: U256,
+        withdrawn_at: DateTime<Utc>,
+        unwrapped_at: DateTime<Utc>,
     },
 
     /// Tokens sent to Alpaca's redemption wallet
@@ -241,7 +306,8 @@ pub(crate) enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
-        vault_withdraw_tx: TxHash,
+        raindex_withdraw_tx: TxHash,
+        unwrap_tx_hash: Option<TxHash>,
         redemption_wallet: Address,
         redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
@@ -269,13 +335,13 @@ pub(crate) enum EquityRedemption {
     /// Redemption failed (terminal state)
     ///
     /// Fields preserve context depending on when failure occurred:
-    /// - `vault_withdraw_tx`: Present if vault withdraw succeeded
+    /// - `raindex_withdraw_tx`: Present if Raindex withdraw succeeded
     /// - `redemption_tx`: Present if send succeeded
     /// - `tokenization_request_id`: Present if Alpaca detected the transfer
     Failed {
         symbol: Symbol,
         quantity: Decimal,
-        vault_withdraw_tx: Option<TxHash>,
+        raindex_withdraw_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
         failed_at: DateTime<Utc>,
@@ -297,17 +363,19 @@ impl EventSourced for EquityRedemption {
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
         match event {
-            VaultWithdrawn {
+            WithdrawnFromRaindex {
                 symbol,
                 quantity,
                 token,
-                vault_withdraw_tx,
+                wrapped_amount,
+                raindex_withdraw_tx,
                 withdrawn_at,
-            } => Some(Self::VaultWithdrawn {
+            } => Some(Self::WithdrawnFromRaindex {
                 symbol: symbol.clone(),
                 quantity: *quantity,
                 token: *token,
-                vault_withdraw_tx: *vault_withdraw_tx,
+                wrapped_amount: *wrapped_amount,
+                raindex_withdraw_tx: *raindex_withdraw_tx,
                 withdrawn_at: *withdrawn_at,
             }),
             _ => None,
@@ -318,26 +386,58 @@ impl EventSourced for EquityRedemption {
         use EquityRedemptionEvent::*;
 
         Ok(match event {
-            VaultWithdrawn { .. } => None,
+            WithdrawnFromRaindex { .. } => None,
 
-            TransferFailed { tx_hash, failed_at } => {
-                let Self::VaultWithdrawn {
+            TransferFailed { tx_hash, failed_at } => match entity {
+                Self::WithdrawnFromRaindex {
                     symbol,
                     quantity,
-                    vault_withdraw_tx,
+                    raindex_withdraw_tx,
+                    ..
+                }
+                | Self::TokensUnwrapped {
+                    symbol,
+                    quantity,
+                    raindex_withdraw_tx,
+                    ..
+                } => Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    raindex_withdraw_tx: Some(*raindex_withdraw_tx),
+                    redemption_tx: *tx_hash,
+                    tokenization_request_id: None,
+                    failed_at: *failed_at,
+                }),
+
+                _ => return Ok(None),
+            },
+
+            TokensUnwrapped {
+                unwrap_tx_hash,
+                unwrapped_amount,
+                unwrapped_at,
+            } => {
+                let Self::WithdrawnFromRaindex {
+                    symbol,
+                    quantity,
+                    token,
+                    raindex_withdraw_tx,
+                    withdrawn_at,
                     ..
                 } = entity
                 else {
                     return Ok(None);
                 };
 
-                Some(Self::Failed {
+                Some(Self::TokensUnwrapped {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    vault_withdraw_tx: Some(*vault_withdraw_tx),
-                    redemption_tx: *tx_hash,
-                    tokenization_request_id: None,
-                    failed_at: *failed_at,
+                    token: *token,
+                    raindex_withdraw_tx: *raindex_withdraw_tx,
+                    unwrap_tx_hash: *unwrap_tx_hash,
+                    unwrapped_amount: *unwrapped_amount,
+                    withdrawn_at: *withdrawn_at,
+                    unwrapped_at: *unwrapped_at,
                 })
             }
 
@@ -345,28 +445,42 @@ impl EventSourced for EquityRedemption {
                 redemption_wallet,
                 redemption_tx,
                 sent_at,
-            } => {
-                let Self::VaultWithdrawn {
+            } => match entity {
+                Self::WithdrawnFromRaindex {
                     symbol,
                     quantity,
                     token,
-                    vault_withdraw_tx,
+                    raindex_withdraw_tx,
                     ..
-                } = entity
-                else {
-                    return Ok(None);
-                };
-
-                Some(Self::TokensSent {
+                } => Some(Self::TokensSent {
                     symbol: symbol.clone(),
                     quantity: *quantity,
                     token: *token,
-                    vault_withdraw_tx: *vault_withdraw_tx,
+                    raindex_withdraw_tx: *raindex_withdraw_tx,
+                    unwrap_tx_hash: None,
                     redemption_wallet: *redemption_wallet,
                     redemption_tx: *redemption_tx,
                     sent_at: *sent_at,
-                })
-            }
+                }),
+                Self::TokensUnwrapped {
+                    symbol,
+                    quantity,
+                    token,
+                    raindex_withdraw_tx,
+                    unwrap_tx_hash,
+                    ..
+                } => Some(Self::TokensSent {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    token: *token,
+                    raindex_withdraw_tx: *raindex_withdraw_tx,
+                    unwrap_tx_hash: Some(*unwrap_tx_hash),
+                    redemption_wallet: *redemption_wallet,
+                    redemption_tx: *redemption_tx,
+                    sent_at: *sent_at,
+                }),
+                _ => None,
+            },
 
             Detected {
                 tokenization_request_id,
@@ -400,7 +514,7 @@ impl EventSourced for EquityRedemption {
                 let Self::TokensSent {
                     symbol,
                     quantity,
-                    vault_withdraw_tx,
+                    raindex_withdraw_tx,
                     redemption_tx,
                     ..
                 } = entity
@@ -411,7 +525,7 @@ impl EventSourced for EquityRedemption {
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    vault_withdraw_tx: Some(*vault_withdraw_tx),
+                    raindex_withdraw_tx: Some(*raindex_withdraw_tx),
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: None,
                     failed_at: *failed_at,
@@ -454,7 +568,7 @@ impl EventSourced for EquityRedemption {
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    vault_withdraw_tx: None,
+                    raindex_withdraw_tx: None,
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: Some(tokenization_request_id.clone()),
                     failed_at: *rejected_at,
@@ -479,74 +593,51 @@ impl EventSourced for EquityRedemption {
                 let vault_id = match services.raindex.lookup_vault_id(token).await {
                     Ok(id) => id,
                     Err(error) => {
-                        warn!(%error, %token, "Vault lookup failed");
-                        return Err(EquityRedemptionError::VaultNotFound(token));
+                        warn!(%error, %token, "Raindex vault lookup failed");
+                        return Err(EquityRedemptionError::RaindexVaultNotFound(token));
                     }
                 };
 
-                info!(?vault_id, %token, %amount, "Withdrawing tokens from vault");
+                info!(?vault_id, %token, %amount, "Withdrawing tokens from Raindex vault");
 
-                let vault_withdraw_tx = match services
+                let raindex_withdraw_tx = match services
                     .raindex
                     .withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
                     .await
                 {
                     Ok(tx) => tx,
                     Err(error) => {
-                        warn!(%error, %token, %amount, "Vault withdrawal failed");
-                        return Err(EquityRedemptionError::VaultWithdrawFailed);
+                        warn!(%error, %token, %amount, "Raindex vault withdrawal failed");
+                        return Err(EquityRedemptionError::RaindexWithdrawFailed {
+                            token,
+                            amount,
+                            error_message: error.to_string(),
+                        });
                     }
                 };
 
-                let now = Utc::now();
-                let vault_withdrawn = VaultWithdrawn {
+                Ok(vec![WithdrawnFromRaindex {
                     symbol,
                     quantity,
                     token,
-                    vault_withdraw_tx,
-                    withdrawn_at: now,
-                };
-
-                info!(%token, %amount, "Sending tokens for redemption");
-
-                match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
-                    .await
-                {
-                    Ok(redemption_tx) => {
-                        let redemption_wallet =
-                            Tokenizer::redemption_wallet(services.tokenizer.as_ref());
-
-                        Ok(vec![
-                            vault_withdrawn,
-                            TokensSent {
-                                redemption_wallet,
-                                redemption_tx,
-                                sent_at: now,
-                            },
-                        ])
-                    }
-                    Err(error) => {
-                        warn!(%error, %token, %amount, "Send for redemption failed");
-                        Ok(vec![
-                            vault_withdrawn,
-                            TransferFailed {
-                                tx_hash: None,
-                                failed_at: now,
-                            },
-                        ])
-                    }
-                }
+                    wrapped_amount: amount,
+                    raindex_withdraw_tx,
+                    withdrawn_at: Utc::now(),
+                }])
             }
-            Detect { .. } | FailDetection { .. } | Complete | RejectRedemption { .. } => {
-                Err(EquityRedemptionError::NotStarted)
-            }
+            UnwrapTokens
+            | SendTokens
+            | Detect { .. }
+            | FailDetection { .. }
+            | Complete
+            | RejectRedemption { .. } => Err(EquityRedemptionError::NotStarted),
         }
     }
 
     async fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use EquityRedemptionCommand::*;
         use EquityRedemptionEvent::*;
@@ -557,6 +648,74 @@ impl EventSourced for EquityRedemption {
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
+            UnwrapTokens => match self {
+                Self::WithdrawnFromRaindex {
+                    token,
+                    wrapped_amount,
+                    ..
+                } => {
+                    let owner = services.wrapper.owner();
+                    let (unwrap_tx_hash, unwrapped_amount) = services
+                        .wrapper
+                        .to_underlying(*token, *wrapped_amount, owner, owner)
+                        .await
+                        .inspect_err(|error| {
+                            warn!(%error, %token, "Token unwrap failed");
+                        })
+                        .map_err(|error| EquityRedemptionError::UnwrapFailed {
+                            token: *token,
+                            wrapped_amount: *wrapped_amount,
+                            error_message: error.to_string(),
+                        })?;
+                    Ok(vec![TokensUnwrapped {
+                        unwrap_tx_hash,
+                        unwrapped_amount,
+                        unwrapped_at: Utc::now(),
+                    }])
+                }
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
+            },
+
+            SendTokens => match self {
+                Self::TokensUnwrapped {
+                    token,
+                    unwrapped_amount,
+                    ..
+                } => {
+                    let token = *token;
+                    let amount = *unwrapped_amount;
+
+                    info!(%token, %amount, "Sending unwrapped tokens for redemption");
+
+                    match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
+                        .await
+                    {
+                        Ok(redemption_tx) => {
+                            let redemption_wallet =
+                                Tokenizer::redemption_wallet(services.tokenizer.as_ref());
+
+                            Ok(vec![TokensSent {
+                                redemption_wallet,
+                                redemption_tx,
+                                sent_at: Utc::now(),
+                            }])
+                        }
+                        Err(error) => {
+                            warn!(%error, %token, %amount, "Send for redemption failed");
+                            Ok(vec![TransferFailed {
+                                tx_hash: None,
+                                failed_at: Utc::now(),
+                            }])
+                        }
+                    }
+                }
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                _ => Err(EquityRedemptionError::TokensNotUnwrapped),
+            },
+
             Detect {
                 tokenization_request_id,
             } => match self {
@@ -564,7 +723,9 @@ impl EventSourced for EquityRedemption {
                     tokenization_request_id,
                     detected_at: Utc::now(),
                 }]),
-                Self::VaultWithdrawn { .. } => Err(EquityRedemptionError::TokensNotSent),
+                Self::WithdrawnFromRaindex { .. } | Self::TokensUnwrapped { .. } => {
+                    Err(EquityRedemptionError::TokensNotSent)
+                }
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
@@ -575,16 +736,18 @@ impl EventSourced for EquityRedemption {
                     failure,
                     failed_at: Utc::now(),
                 }]),
-                Self::VaultWithdrawn { .. } => Err(EquityRedemptionError::TokensNotSent),
+                Self::WithdrawnFromRaindex { .. } | Self::TokensUnwrapped { .. } => {
+                    Err(EquityRedemptionError::TokensNotSent)
+                }
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
             Complete => match self {
-                Self::VaultWithdrawn { .. } | Self::TokensSent { .. } => {
-                    Err(EquityRedemptionError::NotPending)
-                }
+                Self::WithdrawnFromRaindex { .. }
+                | Self::TokensUnwrapped { .. }
+                | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPending),
                 Self::Pending { .. } => Ok(vec![Completed {
                     completed_at: Utc::now(),
                 }]),
@@ -593,9 +756,9 @@ impl EventSourced for EquityRedemption {
             },
 
             RejectRedemption { reason } => match self {
-                Self::VaultWithdrawn { .. } | Self::TokensSent { .. } => {
-                    Err(EquityRedemptionError::NotPendingForRejection)
-                }
+                Self::WithdrawnFromRaindex { .. }
+                | Self::TokensUnwrapped { .. }
+                | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPendingForRejection),
                 Self::Pending { .. } => Ok(vec![RedemptionRejected {
                     reason,
                     rejected_at: Utc::now(),
@@ -617,20 +780,23 @@ mod tests {
     use super::*;
     use crate::onchain::mock::MockRaindex;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::wrapper::mock::MockWrapper;
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
         }
     }
 
-    fn vault_withdrawn_event() -> EquityRedemptionEvent {
-        EquityRedemptionEvent::VaultWithdrawn {
+    fn withdrawn_from_raindex_event() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::WithdrawnFromRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(50.25),
             token: Address::random(),
-            vault_withdraw_tx: TxHash::random(),
+            wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            raindex_withdraw_tx: TxHash::random(),
             withdrawn_at: Utc::now(),
         }
     }
@@ -651,7 +817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redeem_from_uninitialized_produces_vault_withdrawn_and_tokens_sent() {
+    async fn redeem_from_uninitialized_produces_withdrawn_from_raindex() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Redeem {
@@ -663,21 +829,17 @@ mod tests {
             .await
             .events();
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            EquityRedemptionEvent::VaultWithdrawn { .. }
-        ));
-        assert!(matches!(
-            events[1],
-            EquityRedemptionEvent::TokensSent { .. }
+            EquityRedemptionEvent::WithdrawnFromRaindex { .. }
         ));
     }
 
     #[tokio::test]
     async fn detect_after_tokens_sent_produces_detected() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![vault_withdrawn_event(), tokens_sent_event()])
+            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::Detect {
                 tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
             })
@@ -692,7 +854,7 @@ mod tests {
     async fn complete_from_pending_produces_completed() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![
-                vault_withdrawn_event(),
+                withdrawn_from_raindex_event(),
                 tokens_sent_event(),
                 detected_event(),
             ])
@@ -719,6 +881,16 @@ mod tests {
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                 },
             )
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::SendTokens)
             .await
             .unwrap();
 
@@ -774,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn fail_detection_from_tokens_sent_state() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![vault_withdrawn_event(), tokens_sent_event()])
+            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::FailDetection {
                 failure: DetectionFailure::Timeout,
             })
@@ -795,7 +967,7 @@ mod tests {
     async fn reject_redemption_from_pending_state() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![
-                vault_withdrawn_event(),
+                withdrawn_from_raindex_event(),
                 tokens_sent_event(),
                 detected_event(),
             ])
@@ -815,7 +987,7 @@ mod tests {
     #[tokio::test]
     async fn cannot_reject_redemption_before_pending() {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![vault_withdrawn_event(), tokens_sent_event()])
+            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::RejectRedemption {
                 reason: "test rejection".to_string(),
             })
@@ -834,11 +1006,12 @@ mod tests {
         let redemption_tx = TxHash::random();
 
         let entity = replay::<EquityRedemption>(vec![
-            EquityRedemptionEvent::VaultWithdrawn {
+            EquityRedemptionEvent::WithdrawnFromRaindex {
                 symbol: symbol.clone(),
                 quantity: dec!(50.25),
                 token: Address::random(),
-                vault_withdraw_tx: TxHash::random(),
+                wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+                raindex_withdraw_tx: TxHash::random(),
                 withdrawn_at: Utc::now(),
             },
             EquityRedemptionEvent::TokensSent {
@@ -935,7 +1108,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(50.25),
             token: Address::random(),
-            vault_withdraw_tx: TxHash::random(),
+            raindex_withdraw_tx: TxHash::random(),
+            unwrap_tx_hash: None,
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
@@ -975,7 +1149,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(50.25),
             token: Address::random(),
-            vault_withdraw_tx: TxHash::random(),
+            raindex_withdraw_tx: TxHash::random(),
+            unwrap_tx_hash: None,
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
@@ -996,7 +1171,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(50.25),
             token: Address::random(),
-            vault_withdraw_tx: TxHash::random(),
+            raindex_withdraw_tx: TxHash::random(),
+            unwrap_tx_hash: None,
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
@@ -1024,32 +1200,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redeem_with_send_failure_emits_vault_withdrawn_and_transfer_failed() {
+    async fn send_tokens_with_failure_emits_transfer_failed() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
+            wrapper: Arc::new(MockWrapper::new()),
         };
 
-        let events = TestHarness::<EquityRedemption>::with(services)
-            .given_no_previous_events()
-            .when(EquityRedemptionCommand::Redeem {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: dec!(50.25),
-                token: Address::random(),
-                amount: U256::from(50_250_000_000_000_000_000_u128),
-            })
-            .await
-            .events();
+        let store = TestStore::<EquityRedemption>::new(services);
+        let id = RedemptionAggregateId::new("send-fail");
 
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::VaultWithdrawn { .. }
-        ));
-        assert!(matches!(
-            events[1],
-            EquityRedemptionEvent::TransferFailed { .. }
-        ));
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: dec!(50.25),
+                    token: Address::random(),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Failed { .. }),
+            "Expected Failed state after send failure, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unwrap_failure_returns_unwrap_failed_error() {
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::failing_unwrap()),
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![withdrawn_from_raindex_event()])
+            .when(EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::UnwrapFailed { .. })
+            ),
+            "Expected UnwrapFailed error, got: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1104,6 +1315,16 @@ mod tests {
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                 },
             )
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::SendTokens)
             .await
             .unwrap();
 

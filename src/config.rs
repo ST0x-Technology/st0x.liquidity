@@ -16,8 +16,8 @@ use tracing::Level;
 use url::Url;
 
 use st0x_execution::{
-    AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx, AlpacaTradingApiMode,
-    FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
+    AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
 };
 
 use crate::offchain::order_poller::OrderPollerCtx;
@@ -85,7 +85,7 @@ enum BrokerSecrets {
     AlpacaBrokerApi {
         api_key: String,
         api_secret: String,
-        account_id: String,
+        account_id: AlpacaAccountId,
         mode: Option<AlpacaBrokerApiMode>,
     },
     DryRun,
@@ -664,6 +664,8 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
 
+            [rebalancing.equities]
+
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
@@ -844,6 +846,8 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
 
+            [rebalancing.equities]
+
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
@@ -912,7 +916,7 @@ pub(crate) mod tests {
             type = "alpaca-broker-api"
             api_key = "test-key"
             api_secret = "test-secret"
-            account_id = "test-account-id"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#;
 
         let ctx = Ctx::from_toml(minimal_config_toml(), secrets).unwrap();
@@ -957,6 +961,7 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
+            [rebalancing.equities]
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"

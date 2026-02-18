@@ -40,11 +40,6 @@ impl HasZero for Usdc {
 const USDC_DECIMAL_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
 
 impl Usdc {
-    #[cfg(test)]
-    pub(crate) fn inner(self) -> Decimal {
-        self.0
-    }
-
     /// Creates a Usdc amount from cents (e.g., 12345 cents = $123.45).
     pub(crate) fn from_cents(cents: i64) -> Option<Self> {
         Decimal::from(cents).checked_div(dec!(100)).map(Self)

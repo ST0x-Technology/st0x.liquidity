@@ -382,13 +382,18 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    };
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
@@ -402,7 +407,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "AAPL",
                     "qty": "100",
@@ -448,7 +453,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "TSLA",
                     "qty": "50",
@@ -495,7 +500,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/trading/accounts/test_account_123/orders/{order_id}"
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -529,7 +534,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/trading/accounts/test_account_123/orders/{order_id}"
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -563,7 +568,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/trading/accounts/test_account_123/orders/{order_id}"
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -616,7 +621,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "USDCUSD",
                     "qty": "1000.50",
@@ -659,7 +664,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "USDCUSD",
                     "qty": "500",

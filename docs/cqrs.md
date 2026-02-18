@@ -180,15 +180,46 @@ by destructuring all processors.
 
 ## Reactors
 
-Side-effect handlers that process events one at a time with typed IDs:
+Multi-entity event handlers with compile-time exhaustiveness. Declare
+dependencies once with `deps!`, then handle each entity in the `.on()` /
+`.exhaustive()` chain:
 
 ```rust
+deps!(RebalancingTrigger, [Position, TokenizedEquityMint]);
+
 #[async_trait]
-impl Reactor<TokenizedEquityMint> for EventBroadcaster {
-    async fn react(&self, id: &IssuerRequestId, event: &MintEvent) {
-        // broadcast to dashboard, trigger downstream, etc.
+impl Reactor for RebalancingTrigger {
+    type Error = TriggerError;
+
+    async fn react(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        event
+            .on(|symbol, event| async move {
+                self.on_position(symbol, event).await
+            })
+            .on(|id, event| async move {
+                self.on_mint(id, event).await
+            })
+            .exhaustive()
+            .await
     }
 }
+```
+
+Use `.on_with_fallback(handler, fallback)` instead of `.on()` when a handler
+needs a recovery path. If the primary handler returns `Err(error)`, the fallback
+receives `(error, id, event)` and can reprocess the event from the errored state
+(e.g., force-applying a snapshot that the normal path rejected):
+
+```rust
+.on_with_fallback(
+    |id, event| async move { self.on_snapshot(event).await },
+    |error, id, event| async move {
+        self.on_snapshot_recovery(error, event).await
+    },
+)
 ```
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.

@@ -8,6 +8,6 @@ async fn main() -> anyhow::Result<()> {
     let (ctx, command) = cli::CliEnv::parse_and_convert()?;
     setup_tracing(&ctx.log_level);
 
-    cli::run_command(ctx, command).await?;
+    Box::pin(cli::run_command(ctx, command)).await?;
     Ok(())
 }

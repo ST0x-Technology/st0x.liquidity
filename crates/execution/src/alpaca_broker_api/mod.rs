@@ -37,7 +37,7 @@ pub enum AssetStatus {
     Inactive,
 }
 
-pub use auth::{AccountStatus, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use order::{ConversionDirection, CryptoOrderResponse};
 

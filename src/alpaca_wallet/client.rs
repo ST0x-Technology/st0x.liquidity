@@ -11,7 +11,9 @@ use reqwest::{Client, Response, StatusCode};
 use thiserror::Error;
 use tracing::debug;
 
-use super::transfer::{AlpacaAccountId, AlpacaTransferId, Network, TokenSymbol, TransferStatus};
+use st0x_execution::AlpacaAccountId;
+
+use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{WhitelistEntry, WhitelistStatus};
 
 #[derive(Debug, Error)]

@@ -57,7 +57,7 @@ where
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-    vault: Arc<RaindexService<BP>>,
+    raindex: Arc<RaindexService<BP>>,
     cqrs: Arc<Store<UsdcRebalance>>,
     /// Market maker's (our) wallet address
     /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
@@ -74,7 +74,7 @@ where
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-        vault: Arc<RaindexService<BP>>,
+        raindex: Arc<RaindexService<BP>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
         vault_id: RaindexVaultId,
@@ -83,7 +83,7 @@ where
             alpaca_broker,
             alpaca_wallet,
             cctp_bridge,
-            vault,
+            raindex,
             cqrs,
             market_maker_wallet,
             vault_id,
@@ -522,7 +522,7 @@ where
         id: &UsdcRebalanceId,
         amount: U256,
     ) -> Result<(), UsdcTransferError> {
-        let deposit_tx = match self.vault.deposit_usdc(self.vault_id, amount).await {
+        let deposit_tx = match self.raindex.deposit_usdc(self.vault_id, amount).await {
             Ok(tx) => tx,
             Err(error) => {
                 warn!("Vault deposit failed: {error}");
@@ -618,7 +618,7 @@ where
         amount: Usdc,
         amount_u256: U256,
     ) -> Result<(), UsdcTransferError> {
-        let withdraw_tx = match self.vault.withdraw_usdc(self.vault_id, amount_u256).await {
+        let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
             Ok(tx) => tx,
             Err(error) => {
                 warn!("Vault withdrawal failed: {error}");
@@ -912,7 +912,8 @@ mod tests {
 
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
     use st0x_execution::{
-        AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor, TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor,
+        TimeInForce,
     };
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
@@ -920,8 +921,7 @@ mod tests {
     use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
+    use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError};
     use crate::onchain::raindex::RaindexService;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
@@ -1048,7 +1048,7 @@ mod tests {
         let auth = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),

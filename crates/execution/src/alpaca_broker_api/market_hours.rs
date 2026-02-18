@@ -85,13 +85,18 @@ mod tests {
 
     use super::*;
     use crate::alpaca_broker_api::TimeInForce;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    };
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,

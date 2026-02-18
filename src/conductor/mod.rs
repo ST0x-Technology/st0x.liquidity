@@ -6,9 +6,11 @@
 mod builder;
 mod manifest;
 
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
@@ -23,16 +25,15 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder, Unwired, deps};
+use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
-use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
-};
+use crate::dashboard::EventBroadcaster;
+use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -51,7 +52,7 @@ use crate::queue::{
 };
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
-    RebalancerAddresses, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig,
+    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
     spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
@@ -60,6 +61,7 @@ use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+use crate::wrapper::WrapperService;
 
 use self::manifest::QueryManifest;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
@@ -178,7 +180,7 @@ impl Conductor {
 
         let vault_registry = Arc::new(
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .with((*vault_registry_projection).clone())
+                .with(vault_registry_projection.clone())
                 .build(())
                 .await?,
         );
@@ -205,7 +207,9 @@ impl Conductor {
                 )
             } else {
                 let (position, position_projection) = build_position_cqrs(pool).await?;
-                let snapshot = build_inventory_snapshot_store(pool, inventory.clone()).await?;
+                let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                    .build(())
+                    .await?;
                 (position, position_projection, snapshot, None)
             };
 
@@ -215,7 +219,7 @@ impl Conductor {
 
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with((*offchain_order_projection).clone())
+                .with(offchain_order_projection.clone())
                 .build(order_placer)
                 .await?,
         );
@@ -315,7 +319,13 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 )> {
     info!("Initializing rebalancing infrastructure");
 
-    let market_maker_wallet = rebalancing_ctx.market_maker_wallet;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
+    let evm_wallet = EthereumWallet::from(signer);
+    let base_provider = ProviderBuilder::new()
+        .wallet(evm_wallet)
+        .connect_provider(provider.clone());
+
+    let market_maker_wallet = rebalancing_ctx.market_maker_wallet()?;
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -323,7 +333,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = Arc::new(RaindexService::new(
-        provider.clone(),
+        base_provider.clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         market_maker_wallet,
@@ -331,21 +341,28 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let tokenization = Arc::new(AlpacaTokenizationService::new(
         rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_account_id,
+        rebalancing_ctx.alpaca_broker_auth.account_id,
         rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
         rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
-        provider.clone(),
+        base_provider.clone(),
         rebalancing_ctx.redemption_wallet,
     ));
 
     let tokenizer: Arc<dyn Tokenizer> = tokenization;
 
+    let wrapper = Arc::new(WrapperService::new(
+        base_provider.clone(),
+        market_maker_wallet,
+        rebalancing_ctx.equities.clone(),
+    ));
+
     let equity_transfer_services = EquityTransferServices {
         raindex: raindex_service.clone(),
         tokenizer: tokenizer.clone(),
+        wrapper: wrapper.clone(),
     };
 
-    let manifest = QueryManifest::new(
+    let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
         RebalancingTriggerConfig {
             equity: rebalancing_ctx.equity,
             usdc: rebalancing_ctx.usdc.clone(),
@@ -355,11 +372,14 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         market_maker_wallet,
         inventory.clone(),
         operation_sender,
-        event_sender,
-    );
+        wrapper,
+    ));
+
+    let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender));
+    let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
     let (built, wired) = manifest
-        .wire(pool.clone(), equity_transfer_services)
+        .build(pool.clone(), equity_transfer_services)
         .await?;
 
     let frameworks = RebalancingCqrsFrameworks {
@@ -368,14 +388,10 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         usdc: Arc::new(built.usdc),
     };
 
-    let addresses = RebalancerAddresses {
-        market_maker_wallet,
-    };
-
     let handle = spawn_rebalancer(
         rebalancing_ctx,
-        provider.clone(),
-        addresses,
+        base_provider,
+        market_maker_wallet,
         operation_receiver,
         frameworks,
         raindex_service.clone(),
@@ -455,29 +471,11 @@ async fn build_position_cqrs(
     let position_view = Projection::<Position>::sqlite(pool.clone())?;
 
     let store = StoreBuilder::<Position>::new(pool.clone())
-        .with(position_view.clone())
+        .with(Arc::new(position_view.clone()))
         .build(())
         .await?;
 
     Ok((Arc::new(store), Arc::new(position_view)))
-}
-
-/// Constructs the inventory snapshot store with its query.
-async fn build_inventory_snapshot_store(
-    pool: &SqlitePool,
-    inventory: Arc<RwLock<InventoryView>>,
-) -> anyhow::Result<Store<InventorySnapshot>> {
-    let snapshot_reactor = InventorySnapshotReactor::new(inventory, None);
-
-    let query: Unwired<InventorySnapshotReactor, deps![InventorySnapshot]> =
-        Unwired::new(snapshot_reactor);
-
-    let (store, (_query, ())) = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-        .wire(query)
-        .build(())
-        .await?;
-
-    Ok(store)
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
@@ -1496,14 +1494,20 @@ mod tests {
     };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::inventory::ImbalanceThreshold;
-    use crate::offchain_order::{Dollars, OffchainOrderId};
+    use crate::inventory::view::Operator;
+    use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
+    use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
-    use crate::position::PositionEvent;
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+    use crate::wrapper::mock::MockWrapper;
+    use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
+
+    fn one_to_one_ratio() -> UnderlyingPerWrapped {
+        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
 
     fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
@@ -2717,7 +2721,7 @@ mod tests {
         let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(position_projection.clone())
+                .with(Arc::new(position_projection.clone()))
                 .build(())
                 .await
                 .unwrap(),
@@ -2726,7 +2730,7 @@ mod tests {
         let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with(offchain_order_projection.clone())
+                .with(Arc::new(offchain_order_projection.clone()))
                 .build(order_placer)
                 .await
                 .unwrap(),
@@ -3227,31 +3231,24 @@ mod tests {
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(
+            .update_equity(
                 symbol,
-                &PositionEvent::OnChainOrderFilled {
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 0,
-                    },
-                    amount: FractionalShares::new(dec!(20)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: chrono::Utc::now(),
-                    seen_at: chrono::Utc::now(),
-                },
+                Inventory::available(
+                    Venue::MarketMaking,
+                    Operator::Add,
+                    FractionalShares::new(dec!(20)),
+                ),
+                chrono::Utc::now(),
             )
             .unwrap()
-            .apply_position_event(
+            .update_equity(
                 symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(80))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(80)),
+                ),
+                chrono::Utc::now(),
             )
             .unwrap()
     }
@@ -3306,12 +3303,13 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(Arc::clone(&trigger))
                 .build(())
                 .await
@@ -3361,16 +3359,14 @@ mod tests {
         // Seed inventory with 50 offchain shares. CQRS will add 50 onchain.
         let initial_inventory = InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(
+            .update_equity(
                 &symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("SEED"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(50)),
+                ),
+                chrono::Utc::now(),
             )
             .unwrap();
 
@@ -3392,12 +3388,13 @@ mod tests {
             order_owner,
             Arc::clone(&inventory),
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(Arc::clone(&trigger))
                 .build(())
                 .await
@@ -3429,7 +3426,8 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&symbol, &threshold)
+                .check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
+                .unwrap()
                 .is_none(),
             "50/50 inventory should be balanced (no imbalance detected)"
         );
@@ -3444,34 +3442,26 @@ mod tests {
         let order_owner = address!("0x0000000000000000000000000000000000000002");
 
         // Start balanced: 50 onchain, 50 offchain.
-        let mut initial_inventory = InventoryView::default().with_equity(symbol.clone());
-        initial_inventory = initial_inventory
-            .apply_position_event(
+        let initial_inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .update_equity(
                 &symbol,
-                &PositionEvent::OnChainOrderFilled {
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 0,
-                    },
-                    amount: FractionalShares::new(dec!(50)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: chrono::Utc::now(),
-                    seen_at: chrono::Utc::now(),
-                },
+                Inventory::available(
+                    Venue::MarketMaking,
+                    Operator::Add,
+                    FractionalShares::new(dec!(50)),
+                ),
+                chrono::Utc::now(),
             )
-            .unwrap();
-        initial_inventory = initial_inventory
-            .apply_position_event(
+            .unwrap()
+            .update_equity(
                 &symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(50)),
+                ),
+                chrono::Utc::now(),
             )
             .unwrap();
 
@@ -3496,12 +3486,13 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(trigger.clone())
                 .build(())
                 .await
@@ -3574,31 +3565,24 @@ mod tests {
         // 65 onchain, 35 offchain = 65% < 70% upper bound -> within bounds.
         let initial_inventory = InventoryView::default()
             .with_equity(symbol.clone())
-            .apply_position_event(
+            .update_equity(
                 &symbol,
-                &PositionEvent::OnChainOrderFilled {
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 0,
-                    },
-                    amount: FractionalShares::new(dec!(65)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: chrono::Utc::now(),
-                    seen_at: chrono::Utc::now(),
-                },
+                Inventory::available(
+                    Venue::MarketMaking,
+                    Operator::Add,
+                    FractionalShares::new(dec!(65)),
+                ),
+                chrono::Utc::now(),
             )
             .unwrap()
-            .apply_position_event(
+            .update_equity(
                 &symbol,
-                &PositionEvent::OffChainOrderFilled {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: Positive::new(FractionalShares::new(dec!(35))).unwrap(),
-                    direction: Direction::Buy,
-                    executor_order_id: ExecutorOrderId::new("ORD1"),
-                    price: Dollars(dec!(150.00)),
-                    broker_timestamp: chrono::Utc::now(),
-                },
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(dec!(35)),
+                ),
+                chrono::Utc::now(),
             )
             .unwrap();
 
@@ -3623,12 +3607,13 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
         let position_store = Arc::new(
             StoreBuilder::<Position>::new(pool.clone())
-                .with(projection.clone())
+                .with(Arc::new(projection.clone()))
                 .with(trigger)
                 .build(())
                 .await
@@ -3674,14 +3659,18 @@ mod tests {
             .unwrap();
 
         let triggered = receiver.try_recv().unwrap();
-        assert_eq!(
-            triggered,
-            TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(dec!(25)),
-                token: test_token,
-            }
-        );
+        let TriggeredOperation::Redemption {
+            symbol: redeemed_symbol,
+            quantity,
+            wrapped_token,
+            ..
+        } = triggered
+        else {
+            panic!("Expected Redemption, got {triggered:?}");
+        };
+        assert_eq!(redeemed_symbol, symbol);
+        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(wrapped_token, test_token);
     }
 
     #[tokio::test]
@@ -3710,14 +3699,18 @@ mod tests {
             .unwrap();
 
         let first = receiver.try_recv().unwrap();
-        assert_eq!(
-            first,
-            TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(dec!(25)),
-                token: test_token,
-            }
-        );
+        let TriggeredOperation::Redemption {
+            symbol: redeemed_symbol,
+            quantity,
+            wrapped_token,
+            ..
+        } = first
+        else {
+            panic!("Expected Redemption, got {first:?}");
+        };
+        assert_eq!(redeemed_symbol, symbol);
+        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(wrapped_token, test_token);
 
         // Second fill while in-progress NOT cleared -> no second trigger.
         position_store

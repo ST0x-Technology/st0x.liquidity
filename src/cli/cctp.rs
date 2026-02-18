@@ -259,13 +259,14 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
 
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+
     use super::*;
-    use crate::alpaca_wallet::AlpacaAccountId;
     use crate::config::{BrokerCtx, LogLevel};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
@@ -300,8 +301,6 @@ mod tests {
             ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
             redemption_wallet: Address::ZERO,
-            market_maker_wallet: Address::ZERO,
-            alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             equity: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
@@ -310,11 +309,12 @@ mod tests {
             alpaca_broker_auth: AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
-                account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+                account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
             },
+            equities: HashMap::new(),
         });
         ctx
     }
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cctp_bridge_requires_rebalancing_config() {
+    async fn test_cctp_bridge_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cctp_recover_requires_rebalancing_config() {
+    async fn test_cctp_recover_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let burn_tx = B256::ZERO;
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reset_allowance_requires_rebalancing_config() {
+    async fn test_reset_allowance_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
 

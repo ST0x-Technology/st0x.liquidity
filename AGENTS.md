@@ -615,13 +615,17 @@ assignments is useless; test actual behavior like
   the list first (`cargo check` + `cargo test` passing), then run clippy as a
   final pass before handing over.
 
-#### CRITICAL: Lint Policy
+#### CRITICAL: Quality Control Policy
 
-**NEVER add `#[allow(clippy::*)]` attributes or disable any lints without
-explicit permission.** This is strictly forbidden. When clippy reports issues,
-you MUST fix the underlying code problems, not suppress the warnings.
+**NEVER bypass, disable, or suppress ANY quality control mechanism without
+explicit permission being granted.** This applies to ALL checks including but
+not limited to:
 
-**Required approach for clippy issues:**
+- Clippy lints (`#[allow(clippy::*)]`)
+- Compiler warnings (`#[allow(deprecated)]`, `#[allow(dead_code)]`, etc.)
+- Deadnix, rustfmt, or any other linting/formatting tools
+- Test assertions or validation logic
+- Any other strictness or quality enforcement
 
 Clippy lint errors are not about the exact specific cosmetic thing -- they are
 often indications of poor design or broader things worth reconsidering. Upon

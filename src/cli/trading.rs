@@ -295,7 +295,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let position_projection = Projection::<Position>::sqlite(pool.clone())?;
     let position_store: Arc<Store<Position>> = Arc::new(
         StoreBuilder::new(pool.clone())
-            .with(position_projection.clone())
+            .with(Arc::new(position_projection.clone()))
             .build(())
             .await?,
     );

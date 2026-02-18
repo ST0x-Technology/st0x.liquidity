@@ -147,7 +147,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
 
 impl<P, E> ConductorBuilder<P, E, WithDexStreams>
 where
-    P: Provider + Clone + Send + 'static,
+    P: Provider + Clone + Send + Sync + 'static,
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {

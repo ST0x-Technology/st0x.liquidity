@@ -4,6 +4,14 @@
 
 ### Live testing of auto-rebalancing on the Alpaca instance
 
+**Wrapped Token Handling:**
+
+- [x] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
+  - PR:
+    [#241 Wrapped Token Handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/241)
+
+**Alpaca Trading Improvements:**
+
 - [x] PR:
       [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
 
@@ -128,7 +136,9 @@ Extract hedging logic and create application binary:
 
 **Production Enhancements:**
 
-- [ ] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
+- [x] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
+  - PR:
+    [#241 Wrapped Token Handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/241)
 - [ ] [#36 Set up Git Hooks for formatting](https://github.com/ST0x-Technology/st0x.liquidity/issues/36) -
       Automated formatting and linting checks
 
