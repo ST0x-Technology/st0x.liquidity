@@ -72,12 +72,12 @@ pub(super) async fn vault_deposit_command<
     writeln!(stdout, "   Token: {token}")?;
     writeln!(stdout, "   Decimals: {decimals}")?;
 
-    let rebalancing_config = ctx
+    let rebalancing_ctx = ctx
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("vault-deposit requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -148,18 +148,18 @@ pub(super) async fn vault_withdraw_command<
     writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_config = ctx
+    let rebalancing_ctx = ctx
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("vault-withdraw requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
-    writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
+    writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
 
     let base_provider_with_wallet = ProviderBuilder::new()
         .wallet(base_wallet)
@@ -173,7 +173,7 @@ pub(super) async fn vault_withdraw_command<
         vault_registry_projection,
         sender_address,
     );
-    let vault_id = RaindexVaultId(rebalancing_config.usdc_vault_id);
+    let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -230,7 +230,7 @@ mod tests {
         b256!("0000000000000000000000000000000000000000000000000000000000000001");
 
     #[tokio::test]
-    async fn test_vault_deposit_requires_rebalancing_config() {
+    async fn test_vault_deposit_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Decimal::from_str("100").unwrap();
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vault_withdraw_requires_rebalancing_config() {
+    async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());

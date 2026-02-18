@@ -9,18 +9,24 @@ use tracing::{trace, warn};
 
 use st0x_execution::{FractionalShares, Symbol};
 
-use super::TriggeredOperation;
-use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
-use crate::wrapper::UnderlyingPerWrapped;
+use super::{TokenAddressError, TriggeredOperation};
+use crate::inventory::{EquityImbalanceError, Imbalance, ImbalanceThreshold, InventoryView};
+use crate::wrapper::{UnderlyingPerWrapped, WrapperError};
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u32 = 9;
 
-/// Why an equity trigger check did not produce an operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum EquityTriggerSkip {
-    /// No imbalance detected for this symbol.
-    NoImbalance,
+/// Why an equity trigger failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EquityTriggerError {
+    #[error("token not in vault registry")]
+    TokenNotInRegistry,
+    #[error(transparent)]
+    Imbalance(#[from] EquityImbalanceError),
+    #[error(transparent)]
+    TokenAddress(#[from] TokenAddressError),
+    #[error(transparent)]
+    Wrapper(#[from] WrapperError),
 }
 
 /// RAII guard that holds an equity in-progress claim.
@@ -94,79 +100,56 @@ pub(super) async fn check_imbalance_and_build_operation(
     wrapped_token: Address,
     unwrapped_token: Address,
     vault_ratio: &UnderlyingPerWrapped,
-) -> Result<TriggeredOperation, EquityTriggerSkip> {
+) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
     let imbalance = {
         let inventory = inventory.read().await;
-        inventory.check_equity_imbalance(symbol, threshold, vault_ratio)
+        inventory.check_equity_imbalance(symbol, threshold, vault_ratio)?
     };
 
     let Some(imbalance) = imbalance else {
-        trace!(symbol = %symbol, "No equity imbalance detected (balanced, partial data, or inflight)");
-        return Err(EquityTriggerSkip::NoImbalance);
+        trace!(%symbol, "No equity imbalance detected (balanced, partial data, or inflight)");
+        return Ok(None);
     };
 
-    let resolve_precision = |result: Result<FractionalShares, AlpacaPrecisionLoss>| match result {
-        Ok(quantity) => quantity,
-        Err(loss) => {
-            warn!(
-                symbol = %loss.symbol,
-                original = %loss.original.inner(),
-                truncated = %loss.truncated.inner(),
-                "Truncated quantity to {} decimal places for Alpaca API",
-                ALPACA_QUANTITY_MAX_DECIMAL_PLACES
-            );
-            loss.truncated
-        }
-    };
-
-    match imbalance {
+    Ok(Some(match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let quantity = resolve_precision(truncate_for_alpaca(symbol, excess));
-            Ok(TriggeredOperation::Mint {
+            let quantity = truncate_for_alpaca(symbol, excess);
+            TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
-            })
+            }
         }
         Imbalance::TooMuchOnchain { excess } => {
-            let quantity = resolve_precision(truncate_for_alpaca(symbol, excess));
-            Ok(TriggeredOperation::Redemption {
+            let quantity = truncate_for_alpaca(symbol, excess);
+            TriggeredOperation::Redemption {
                 symbol: symbol.clone(),
                 quantity,
                 wrapped_token,
                 unwrapped_token,
-            })
+            }
         }
-    }
+    }))
 }
 
-/// Rounds to the Alpaca API decimal limit. Returns the original value when
-/// no rounding is needed, or `Err(AlpacaPrecisionLoss)` with the rounded
-/// value when sub-nanoshare digits must be dropped.
-fn truncate_for_alpaca(
-    symbol: &Symbol,
-    quantity: FractionalShares,
-) -> Result<FractionalShares, AlpacaPrecisionLoss> {
+/// Truncates to the Alpaca API decimal limit, logging a warning when
+/// sub-nanoshare digits are dropped.
+fn truncate_for_alpaca(symbol: &Symbol, quantity: FractionalShares) -> FractionalShares {
     let truncated_decimal = quantity
         .inner()
         .trunc_with_scale(ALPACA_QUANTITY_MAX_DECIMAL_PLACES);
     let truncated = FractionalShares::new(truncated_decimal);
 
-    if truncated == quantity {
-        return Ok(truncated);
+    if truncated != quantity {
+        warn!(
+            %symbol,
+            original = %quantity.inner(),
+            truncated = %truncated.inner(),
+            "Truncated quantity to {} decimal places for Alpaca API",
+            ALPACA_QUANTITY_MAX_DECIMAL_PLACES
+        );
     }
 
-    Err(AlpacaPrecisionLoss {
-        symbol: symbol.clone(),
-        original: quantity,
-        truncated,
-    })
-}
-
-#[derive(Debug)]
-struct AlpacaPrecisionLoss {
-    symbol: Symbol,
-    original: FractionalShares,
-    truncated: FractionalShares,
+    truncated
 }
 
 #[cfg(test)]
@@ -260,7 +243,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_balanced_inventory_returns_no_imbalance() {
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = InventoryView::default().with_equity(symbol.clone());
+        let inventory = Arc::new(RwLock::new(view));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -268,7 +253,7 @@ mod tests {
         let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         let result = check_imbalance_and_build_operation(
-            &Symbol::new("AAPL").unwrap(),
+            &symbol,
             &threshold,
             &inventory,
             Address::ZERO,
@@ -277,7 +262,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(EquityTriggerSkip::NoImbalance));
+        assert_eq!(result.unwrap(), None);
     }
 
     #[tokio::test]
@@ -300,7 +285,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Ok(TriggeredOperation::Mint { .. })));
+        assert!(matches!(result, Ok(Some(TriggeredOperation::Mint { .. }))));
     }
 
     #[tokio::test]
@@ -325,11 +310,11 @@ mod tests {
         )
         .await;
 
-        let Ok(TriggeredOperation::Redemption {
+        let Ok(Some(TriggeredOperation::Redemption {
             wrapped_token,
             unwrapped_token,
             ..
-        }) = result
+        })) = result
         else {
             panic!("Expected Redemption, got {result:?}");
         };
@@ -363,7 +348,7 @@ mod tests {
             &ratio_1_to_1,
         )
         .await;
-        assert_eq!(result_1_to_1, Err(EquityTriggerSkip::NoImbalance));
+        assert_eq!(result_1_to_1.unwrap(), None);
 
         // At 1.5 ratio, this triggers redemption
         let ratio_1_5 =
@@ -378,7 +363,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result_1_5, Ok(TriggeredOperation::Redemption { .. })),
+            matches!(result_1_5, Ok(Some(TriggeredOperation::Redemption { .. }))),
             "Expected redemption with 1.5 ratio, got {result_1_5:?}"
         );
     }
@@ -447,6 +432,7 @@ mod tests {
             &vault_ratio,
         )
         .await
+        .unwrap()
         .unwrap();
 
         let TriggeredOperation::Mint { quantity, .. } = result else {
@@ -512,7 +498,7 @@ mod tests {
         // This is within the 40%-60% threshold, so no imbalance is detected.
         // But the LEFTOVER (the sub-9-decimal precision) is preserved in the totals.
         assert!(
-            remaining_imbalance.is_none(),
+            remaining_imbalance.unwrap().is_none(),
             "After minting truncated amount, small leftover shouldn't trigger (within threshold)"
         );
     }
@@ -547,6 +533,7 @@ mod tests {
             &vault_ratio,
         )
         .await
+        .unwrap()
         .unwrap();
 
         let TriggeredOperation::Mint { quantity: qty1, .. } = result1 else {
@@ -613,7 +600,7 @@ mod tests {
         .await;
 
         // Should trigger again (we added significant new imbalance)
-        let TriggeredOperation::Mint { quantity: qty2, .. } = result2.unwrap() else {
+        let TriggeredOperation::Mint { quantity: qty2, .. } = result2.unwrap().unwrap() else {
             panic!("Expected Mint after adding more offchain shares");
         };
 
@@ -631,20 +618,19 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_alpaca_returns_error_when_precision_lost() {
+    fn truncate_for_alpaca_truncates_excess_precision() {
         let symbol = Symbol::new("TEST").unwrap();
         let original = precise_shares("1.12345678901234567890");
-        let loss = truncate_for_alpaca(&symbol, original).unwrap_err();
+        let truncated = truncate_for_alpaca(&symbol, original);
 
-        assert_eq!(loss.truncated.inner(), dec!(1.123456789));
-        assert_eq!(loss.original, original);
+        assert_eq!(truncated.inner(), dec!(1.123456789));
     }
 
     #[test]
-    fn truncate_for_alpaca_returns_ok_when_no_precision_lost() {
+    fn truncate_for_alpaca_preserves_value_within_limit() {
         let symbol = Symbol::new("TEST").unwrap();
         let original = precise_shares("1.123");
-        let result = truncate_for_alpaca(&symbol, original).unwrap();
+        let result = truncate_for_alpaca(&symbol, original);
 
         assert_eq!(result, original);
     }

@@ -1262,7 +1262,6 @@ enum TokenizedEquityMintCommand {
     /// Transition: calls tokenizer.poll_mint_until_complete(),
     /// emits TokensReceived (or MintAcceptanceFailed).
     Poll,
-    RejectMint { reason },
     WrapTokens { wrap_tx_hash, wrapped_shares },
     DepositToVault { vault_deposit_tx_hash },
 }

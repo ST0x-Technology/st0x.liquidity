@@ -800,8 +800,9 @@ impl EventSourced for TokenizedEquityMint {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
-    use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
     use std::sync::Arc;
+
+    use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
