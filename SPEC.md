@@ -1443,14 +1443,12 @@ enum EquityRedemptionEvent {
         withdrawn_at: DateTime<Utc>,
     },
 
+    // Unwrap failures are signaled via EquityRedemptionError::UnwrapFailed
+    // (no event emitted), keeping the aggregate in WithdrawnFromRaindex for retry.
     TokensUnwrapped {
-        unwrap_tx: TxHash,
-        underlying_amount: U256,
+        unwrap_tx_hash: TxHash,
+        unwrapped_amount: U256,
         unwrapped_at: DateTime<Utc>,
-    },
-    UnwrapFailed {
-        reason: String,
-        failed_at: DateTime<Utc>,
     },
 
     TokensSent {
@@ -1934,7 +1932,6 @@ know about cross-venue inventory.
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - No balance change (conversion
   between wrapped/unwrapped forms)
-- `EquityRedemptionEvent::UnwrapFailed` - No balance change (tokens await retry)
 - `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
 - `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
 - `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)

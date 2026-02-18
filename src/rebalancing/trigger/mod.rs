@@ -742,6 +742,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
+    use tokio::sync::mpsc::error::TryRecvError;
     use uuid::{Uuid, uuid};
 
     use super::*;
@@ -1596,7 +1597,7 @@ mod tests {
         // Now check: inflight should block imbalance detection
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inflight from MintAccepted should block imbalance detection"
         );
     }
@@ -1646,7 +1647,7 @@ mod tests {
         trigger.clear_equity_in_progress(&symbol);
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inventory should be balanced after mint transfer (50/50)"
         );
     }
@@ -2046,7 +2047,7 @@ mod tests {
         // 40/60 = 66.7% -> within threshold (30%-70%), no trigger
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "66.7% onchain ratio should be within threshold (30%-70%)"
         );
     }
@@ -2104,7 +2105,7 @@ mod tests {
         // After snapshot: 20 onchain, 20 offchain = balanced
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "50% ratio should be balanced after offchain equity snapshot"
         );
     }
@@ -2153,7 +2154,7 @@ mod tests {
         // Inflight should block imbalance detection
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inflight from WithdrawnFromRaindex should block imbalance detection"
         );
     }
@@ -2197,7 +2198,7 @@ mod tests {
         // New state: 50 onchain, 50 offchain = balanced
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inventory should be balanced after redemption completion (50/50)"
         );
     }
@@ -2233,7 +2234,7 @@ mod tests {
         // Inflight should block USDC imbalance detection
         trigger.check_and_trigger_usdc().await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inflight from Initiated(AlpacaToBase) should block USDC imbalance detection"
         );
     }
@@ -2267,7 +2268,7 @@ mod tests {
         // Inflight should block USDC imbalance detection
         trigger.check_and_trigger_usdc().await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inflight from Initiated(BaseToAlpaca) should block USDC imbalance detection"
         );
     }
@@ -2288,7 +2289,10 @@ mod tests {
 
         // Balanced initially -> no trigger
         trigger.check_and_trigger_usdc().await;
-        assert!(receiver.try_recv().is_err(), "Should be balanced initially");
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Should be balanced initially"
+        );
 
         // Snapshot says onchain is actually 900 -> creates imbalance
         harness
@@ -2311,7 +2315,7 @@ mod tests {
         // the inventory. Let me verify by setting up an initial imbalance.
         trigger.check_and_trigger_usdc().await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "64% ratio within 50% +/- 30% threshold"
         );
     }
@@ -2354,7 +2358,7 @@ mod tests {
         // Now 900 onchain, 900 offchain = balanced -> no trigger
         trigger.check_and_trigger_usdc().await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Should be balanced after offchain cash snapshot reconciled to 900"
         );
     }
@@ -3490,7 +3494,7 @@ mod tests {
 
         // No trigger yet - only one venue has data
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "should not trigger with only onchain data"
         );
 

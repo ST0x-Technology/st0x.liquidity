@@ -121,9 +121,12 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to modify a failed mint operation
     #[error("Already failed")]
     AlreadyFailed,
-    /// Tokenizer API failed to submit the mint request
-    #[error("Mint request failed")]
-    RequestFailed,
+    /// Tokenizer API failed to submit the mint request.
+    /// Tokenizer errors can't be wrapped with #[from] because they may
+    /// contain types that don't implement Serialize/Deserialize (required
+    /// by DomainError).
+    #[error("Mint request failed: {error_message}")]
+    RequestFailed { error_message: String },
     /// Completed mint response missing tx_hash
     #[error("Missing tx_hash in completed mint response")]
     MissingTxHash,
@@ -642,6 +645,10 @@ impl EventSourced for TokenizedEquityMint {
             return Err(TokenizedEquityMintError::NotInitialized);
         };
 
+        if quantity.is_sign_negative() {
+            return Err(TokenizedEquityMintError::NegativeQuantity { value: quantity });
+        }
+
         let now = Utc::now();
         let mint_requested = MintRequested {
             symbol: symbol.clone(),
@@ -662,8 +669,9 @@ impl EventSourced for TokenizedEquityMint {
         {
             Ok(req) => req,
             Err(error) => {
-                warn!(%error, "Mint request failed");
-                return Err(TokenizedEquityMintError::RequestFailed);
+                return Err(TokenizedEquityMintError::RequestFailed {
+                    error_message: error.to_string(),
+                });
             }
         };
 
@@ -791,10 +799,9 @@ impl EventSourced for TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use rust_decimal_macros::dec;
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
+    use std::sync::Arc;
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
@@ -1133,7 +1140,7 @@ mod tests {
             matches!(
                 error,
                 AggregateError::UserError(LifecycleError::Apply(
-                    TokenizedEquityMintError::RequestFailed
+                    TokenizedEquityMintError::RequestFailed { .. }
                 ))
             ),
             "Expected RequestFailed, got: {error:?}"
