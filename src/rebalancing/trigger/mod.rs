@@ -228,6 +228,177 @@ impl RebalancingTrigger {
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    /// Process a snapshot event under normal operation.
+    async fn on_snapshot(
+        &self,
+        event: InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        let now = Utc::now();
+        let mut inventory = self.inventory.write().await;
+
+        use InventorySnapshotEvent::*;
+        let updated =
+            match &event {
+                OnchainEquity { balances, .. } => balances.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(Venue::MarketMaking, *snapshot_balance),
+                            now,
+                        )
+                    },
+                ),
+
+                OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
+                    Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance),
+                    now,
+                ),
+
+                OffchainEquity { positions, .. } => positions.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(Venue::Hedging, *snapshot_balance),
+                            now,
+                        )
+                    },
+                ),
+
+                OffchainCash {
+                    cash_balance_cents, ..
+                } => {
+                    let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
+                        InventoryViewError::CashBalanceConversion(*cash_balance_cents),
+                    )?;
+                    inventory
+                        .clone()
+                        .update_usdc(Inventory::on_snapshot(Venue::Hedging, usdc), now)
+                }
+            }?;
+
+        *inventory = updated;
+        drop(inventory);
+
+        debug!("Applied inventory snapshot event");
+
+        self.check_and_trigger_after_snapshot(&event).await
+    }
+
+    /// Reprocess a snapshot event after the normal handler failed.
+    ///
+    /// Resets the inventory, then force-applies the snapshot —
+    /// bypassing inflight guards that may have caused the
+    /// original failure.
+    async fn on_snapshot_recovery(
+        &self,
+        error: RebalancingTriggerError,
+        event: InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        let inventory_error = match error {
+            RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
+            other => return Err(other),
+        };
+
+        warn!(
+            ?inventory_error,
+            "Resetting inventory and force-applying snapshot to recover"
+        );
+
+        let now = Utc::now();
+        let mut inventory = self.inventory.write().await;
+        *inventory = InventoryView::default();
+
+        use InventorySnapshotEvent::*;
+        let updated =
+            match &event {
+                OnchainEquity { balances, .. } => balances.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::MarketMaking,
+                                *snapshot_balance,
+                                inventory_error.clone(),
+                            ),
+                            now,
+                        )
+                    },
+                ),
+
+                OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
+                    Inventory::force_on_snapshot(
+                        Venue::MarketMaking,
+                        *usdc_balance,
+                        inventory_error.clone(),
+                    ),
+                    now,
+                ),
+
+                OffchainEquity { positions, .. } => positions.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::Hedging,
+                                *snapshot_balance,
+                                inventory_error.clone(),
+                            ),
+                            now,
+                        )
+                    },
+                ),
+
+                OffchainCash {
+                    cash_balance_cents, ..
+                } => {
+                    let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
+                        InventoryViewError::CashBalanceConversion(*cash_balance_cents),
+                    )?;
+                    inventory.clone().update_usdc(
+                        Inventory::force_on_snapshot(Venue::Hedging, usdc, inventory_error),
+                        now,
+                    )
+                }
+            }?;
+
+        *inventory = updated;
+        drop(inventory);
+
+        debug!("Force-applied inventory snapshot after recovery");
+
+        self.check_and_trigger_after_snapshot(&event).await
+    }
+
+    /// Trigger rebalancing checks after a snapshot event.
+    async fn check_and_trigger_after_snapshot(
+        &self,
+        event: &InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        use InventorySnapshotEvent::*;
+
+        match event {
+            OnchainEquity { balances, .. } => {
+                for symbol in balances.keys() {
+                    self.check_and_trigger_equity(symbol).await?;
+                }
+            }
+            OffchainEquity { positions, .. } => {
+                for symbol in positions.keys() {
+                    self.check_and_trigger_equity(symbol).await?;
+                }
+            }
+            OnchainCash { .. } | OffchainCash { .. } => {
+                self.check_and_trigger_usdc().await;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 deps!(
@@ -311,74 +482,10 @@ impl Reactor for RebalancingTrigger {
 
                 Ok::<(), RebalancingTriggerError>(())
             })
-            .on(|_id, event| async move {
-                let now = Utc::now();
-                let mut inventory = self.inventory.write().await;
-
-                use InventorySnapshotEvent::*;
-                let updated = match &event {
-                    OnchainEquity { balances, .. } => balances.iter().try_fold(
-                        inventory.clone(),
-                        |view, (symbol, snapshot_balance)| {
-                            view.update_equity(
-                                symbol,
-                                Inventory::on_snapshot(Venue::MarketMaking, *snapshot_balance),
-                                now,
-                            )
-                        },
-                    ),
-
-                    OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
-                        Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance),
-                        now,
-                    ),
-
-                    OffchainEquity { positions, .. } => positions.iter().try_fold(
-                        inventory.clone(),
-                        |view, (symbol, snapshot_balance)| {
-                            view.update_equity(
-                                symbol,
-                                Inventory::on_snapshot(Venue::Hedging, *snapshot_balance),
-                                now,
-                            )
-                        },
-                    ),
-
-                    OffchainCash {
-                        cash_balance_cents, ..
-                    } => {
-                        let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
-                            InventoryViewError::CashBalanceConversion(*cash_balance_cents),
-                        )?;
-                        inventory
-                            .clone()
-                            .update_usdc(Inventory::on_snapshot(Venue::Hedging, usdc), now)
-                    }
-                }?;
-
-                *inventory = updated;
-                drop(inventory);
-
-                debug!("Applied inventory snapshot event");
-
-                match &event {
-                    OnchainEquity { balances, .. } => {
-                        for symbol in balances.keys() {
-                            self.check_and_trigger_equity(symbol).await?;
-                        }
-                    }
-                    OffchainEquity { positions, .. } => {
-                        for symbol in positions.keys() {
-                            self.check_and_trigger_equity(symbol).await?;
-                        }
-                    }
-                    OnchainCash { .. } | OffchainCash { .. } => {
-                        self.check_and_trigger_usdc().await;
-                    }
-                }
-
-                Ok::<(), RebalancingTriggerError>(())
-            })
+            .on_with_fallback(
+                |_id, event| async move { self.on_snapshot(event).await },
+                |error, _id, event| async move { self.on_snapshot_recovery(error, event).await },
+            )
             .exhaustive()
             .await
     }

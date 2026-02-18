@@ -115,6 +115,40 @@ impl<Id, Event, Tail> OneOf<(Id, Event), Tail> {
             Self::There(tail) => Fold::Remaining(tail),
         }
     }
+
+    /// Like [`on`](Self::on), but with a recovery path.
+    ///
+    /// Runs `handler` first. If it returns `Err(error)`,
+    /// runs `fallback` with the same `(Id, Event)` plus the
+    /// error, allowing it to reprocess the event starting
+    /// from the errored state.
+    pub fn on_with_fallback<'a, O, E, F, Fut, G, GFut>(
+        self,
+        handler: F,
+        fallback: G,
+    ) -> Fold<BoxFuture<'a, Result<O, E>>, Tail>
+    where
+        Id: Clone + Send + 'a,
+        Event: Clone + Send + 'a,
+        F: FnOnce(Id, Event) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<O, E>> + Send + 'a,
+        G: FnOnce(E, Id, Event) -> GFut + Send + 'a,
+        GFut: Future<Output = Result<O, E>> + Send + 'a,
+        O: Send + 'a,
+        E: Send + 'a,
+    {
+        match self {
+            Self::Here((id, event)) => Fold::Done(Box::pin(async move {
+                let id_clone = id.clone();
+                let event_clone = event.clone();
+                match handler(id, event).await {
+                    Ok(ok) => Ok(ok),
+                    Err(error) => fallback(error, id_clone, event_clone).await,
+                }
+            })),
+            Self::There(tail) => Fold::Remaining(tail),
+        }
+    }
 }
 
 impl<A> OneOf<A, Never> {
@@ -159,6 +193,45 @@ impl<'a, T, Id, Event, Tail> Fold<BoxFuture<'a, T>, OneOf<(Id, Event), Tail>> {
             Fold::Done(fut) => Fold::Done(fut),
             Fold::Remaining(one_of) => match one_of {
                 OneOf::Here((id, event)) => Fold::Done(Box::pin(handler(id, event))),
+                OneOf::There(tail) => Fold::Remaining(tail),
+            },
+        }
+    }
+}
+
+impl<'a, O: Send + 'a, E: Send + 'a, Id, Event, Tail>
+    Fold<BoxFuture<'a, Result<O, E>>, OneOf<(Id, Event), Tail>>
+{
+    /// Like [`on`](Fold::on), but with a recovery path.
+    ///
+    /// Runs `handler` first. If it returns `Err(error)`,
+    /// runs `fallback` with the same `(Id, Event)` plus the
+    /// error, allowing it to reprocess the event starting
+    /// from the errored state.
+    pub fn on_with_fallback<F, Fut, G, GFut>(
+        self,
+        handler: F,
+        fallback: G,
+    ) -> Fold<BoxFuture<'a, Result<O, E>>, Tail>
+    where
+        Id: Clone + Send + 'a,
+        Event: Clone + Send + 'a,
+        F: FnOnce(Id, Event) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<O, E>> + Send + 'a,
+        G: FnOnce(E, Id, Event) -> GFut + Send + 'a,
+        GFut: Future<Output = Result<O, E>> + Send + 'a,
+    {
+        match self {
+            Fold::Done(fut) => Fold::Done(fut),
+            Fold::Remaining(one_of) => match one_of {
+                OneOf::Here((id, event)) => Fold::Done(Box::pin(async move {
+                    let id_clone = id.clone();
+                    let event_clone = event.clone();
+                    match handler(id, event).await {
+                        Ok(ok) => Ok(ok),
+                        Err(error) => fallback(error, id_clone, event_clone).await,
+                    }
+                })),
                 OneOf::There(tail) => Fold::Remaining(tail),
             },
         }
@@ -464,5 +537,54 @@ mod tests {
             .await;
 
         assert_eq!(result, "beta:b1:Spawned");
+    }
+
+    #[tokio::test]
+    async fn on_with_fallback_uses_normal_handler_on_success() {
+        let event = <TwoEntityList as HasEntity<Alpha>>::inject("a1".to_string(), AlphaEvent::Born);
+
+        let result: Result<String, String> = event
+            .on_with_fallback(
+                |id, _event| async move { Ok(format!("normal:{id}")) },
+                |_error, _id, _event| async move { unreachable!("fallback should not run") },
+            )
+            .on(|_id, _event| async { Ok("beta".to_string()) })
+            .exhaustive()
+            .await;
+
+        assert_eq!(result.unwrap(), "normal:a1");
+    }
+
+    #[tokio::test]
+    async fn on_with_fallback_runs_fallback_with_event_and_error() {
+        let event = <TwoEntityList as HasEntity<Alpha>>::inject("a1".to_string(), AlphaEvent::Born);
+
+        let result: Result<String, String> = event
+            .on_with_fallback(
+                |_id, _event| async { Err("handler failed".to_string()) },
+                |error, id, _event| async move { Ok(format!("recovered:{id}:{error}")) },
+            )
+            .on(|_id, _event| async { Ok("beta".to_string()) })
+            .exhaustive()
+            .await;
+
+        assert_eq!(result.unwrap(), "recovered:a1:handler failed");
+    }
+
+    #[tokio::test]
+    async fn on_with_fallback_on_fold_runs_fallback_with_event_and_error() {
+        let event =
+            <TwoEntityList as HasEntity<Beta>>::inject("b1".to_string(), BetaEvent::Spawned);
+
+        let result: Result<String, String> = event
+            .on(|_id, _event| async { Ok("alpha".to_string()) })
+            .on_with_fallback(
+                |_id, _event| async { Err("beta failed".to_string()) },
+                |error, id, _event| async move { Ok(format!("recovered:{id}:{error}")) },
+            )
+            .exhaustive()
+            .await;
+
+        assert_eq!(result.unwrap(), "recovered:b1:beta failed");
     }
 }

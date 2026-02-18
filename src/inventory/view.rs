@@ -13,7 +13,7 @@ use crate::threshold::Usdc;
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
 /// Error type for inventory view operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum InventoryViewError {
     #[error(transparent)]
     Equity(#[from] InventoryError<FractionalShares>),
@@ -393,6 +393,30 @@ where
                 .get_venue(venue)
                 .unwrap_or_default()
                 .apply_snapshot(snapshot_balance);
+
+            Ok(inventory.set_venue(venue, Some(balance)))
+        })
+    }
+
+    /// Force-apply a venue snapshot, clearing inflight and ignoring
+    /// the normal inflight guard.
+    ///
+    /// Used for recovery when reactor state is corrupted. The
+    /// snapshot represents actual venue reality, so we trust it
+    /// unconditionally and discard any tracked inflight.
+    ///
+    /// Takes the triggering error as a witness to prevent blind
+    /// usage — callers must have an error in hand.
+    pub(crate) fn force_on_snapshot<E: std::fmt::Debug + Send + 'static>(
+        venue: Venue,
+        snapshot_balance: T,
+        recovering_from: E,
+    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory| {
+            let balance = inventory
+                .get_venue(venue)
+                .unwrap_or_default()
+                .force_apply_snapshot(snapshot_balance, &recovering_from);
 
             Ok(inventory.set_venue(venue, Some(balance)))
         })
