@@ -445,15 +445,12 @@ mod tests {
         let vault_registry_projection = Arc::new(
             Projection::<VaultRegistry>::sqlite(crate::test_utils::setup_test_db().await).unwrap(),
         );
-        let raindex = Arc::new(
-            RaindexService::new(
-                base_provider,
-                TEST_ORDERBOOK,
-                vault_registry_projection,
-                owner,
-            )
-            .with_required_confirmations(1),
-        );
+        let raindex = Arc::new(RaindexService::new(
+            base_provider,
+            TEST_ORDERBOOK,
+            vault_registry_projection,
+            owner,
+        ));
 
         let services = Services {
             broker,

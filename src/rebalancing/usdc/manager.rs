@@ -1112,8 +1112,7 @@ mod tests {
             ORDERBOOK_ADDRESS,
             vault_registry_projection,
             owner,
-        )
-        .with_required_confirmations(1);
+        );
 
         (cctp_bridge, vault_service)
     }
