@@ -69,10 +69,7 @@ pub(super) async fn vault_deposit_command<
     writeln!(stdout, "   Decimals: {decimals}")?;
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
-    let chain_id = base_provider.get_chain_id().await?;
-    let caller = rebalancing_ctx.fireblocks_caller(chain_id, base_provider.clone())?;
-    let sender_address = caller.fetch_vault_address().await?;
+    let sender_address = rebalancing_ctx.base_caller().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
@@ -89,9 +86,12 @@ pub(super) async fn vault_deposit_command<
         vault_registry_projection,
         sender_address,
     )
-    .with_caller(Arc::new(caller));
+    .with_caller(rebalancing_ctx.base_caller().clone());
 
-    writeln!(stdout, "   Depositing to vault (approve + deposit via Fireblocks)...")?;
+    writeln!(
+        stdout,
+        "   Depositing to vault (approve + deposit via Fireblocks)..."
+    )?;
     let deposit_tx = raindex_service
         .deposit(token, RaindexVaultId(vault_id), amount_u256, decimals)
         .await?;
@@ -116,10 +116,7 @@ pub(super) async fn vault_withdraw_command<
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
-    let chain_id = base_provider.get_chain_id().await?;
-    let caller = rebalancing_ctx.fireblocks_caller(chain_id, base_provider.clone())?;
-    let sender_address = caller.fetch_vault_address().await?;
+    let sender_address = rebalancing_ctx.base_caller().address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
@@ -133,7 +130,7 @@ pub(super) async fn vault_withdraw_command<
         vault_registry_projection,
         sender_address,
     )
-    .with_caller(Arc::new(caller));
+    .with_caller(rebalancing_ctx.base_caller().clone());
 
     let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id);
 

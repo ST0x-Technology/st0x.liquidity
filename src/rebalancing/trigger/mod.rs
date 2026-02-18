@@ -4,7 +4,7 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
-use alloy::providers::{Provider, RootProvider};
+use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -19,8 +19,8 @@ use url::Url;
 
 use st0x_contract_caller::ContractCaller;
 use st0x_contract_caller::fireblocks::{
-    ChainAssetIds, FireblocksApiUserId, FireblocksCaller, FireblocksCtx,
-    FireblocksEnvironment, FireblocksError, FireblocksVaultAccountId,
+    ChainAssetIds, FireblocksApiUserId, FireblocksCaller, FireblocksCtx, FireblocksEnvironment,
+    FireblocksError, FireblocksVaultAccountId,
 };
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
@@ -57,10 +57,6 @@ pub enum RebalancingCtxError {
     FireblocksSecretRead(#[from] std::io::Error),
     #[error("failed to build Fireblocks caller: {0}")]
     FireblocksCaller(#[from] FireblocksCallerError),
-    #[error("failed to resolve vault address from Fireblocks: {0}")]
-    VaultAddressResolution(FireblocksError),
-    #[error("RPC error during rebalancing initialization: {0}")]
-    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -92,13 +88,15 @@ pub(crate) struct RebalancingConfig {
     pub(crate) fireblocks_environment: FireblocksEnvironment,
 }
 
-
 /// Runtime configuration for rebalancing operations.
 ///
 /// Constructed asynchronously from `RebalancingConfig` + `RebalancingSecrets`
-/// + broker auth + base chain RPC URL. During construction, Fireblocks callers
-/// are pre-built for both chains (each resolving the vault address from the
-/// Fireblocks API). After construction, all fields are immutable.
+/// + broker auth. During construction, Fireblocks callers are pre-built for
+/// both chains (each resolving the vault address from the Fireblocks API).
+/// After construction, all fields are immutable.
+///
+/// Read-only provider access for either chain is available via
+/// `base_caller().provider()` and `ethereum_caller().provider()`.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
@@ -131,8 +129,7 @@ impl RebalancingCtx {
     ) -> Result<Self, RebalancingCtxError> {
         let fireblocks_secret = std::fs::read(&secrets.fireblocks_secret_path)?;
 
-        let base_provider =
-            RootProvider::new(crate::onchain::http_client_with_retry(base_rpc_url));
+        let base_provider = RootProvider::new(crate::onchain::http_client_with_retry(base_rpc_url));
         let base_chain_id = base_provider.get_chain_id().await?;
 
         let ethereum_provider = Arc::new(RootProvider::new(
@@ -172,8 +169,34 @@ impl RebalancingCtx {
             equities: config.equities,
             base_caller: Arc::new(base_caller),
             ethereum_caller: Arc::new(ethereum_caller),
-            ethereum_provider,
         })
+    }
+
+    async fn build_caller(
+        config: &RebalancingConfig,
+        fireblocks_secret: &[u8],
+        api_user_id: &FireblocksApiUserId,
+        rpc_url: Url,
+    ) -> Result<FireblocksCaller<alloy::providers::RootProvider>, FireblocksCallerError> {
+        let provider =
+            alloy::providers::RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
+        let chain_id = provider.get_chain_id().await?;
+
+        let asset_id = config
+            .fireblocks_chain_asset_ids
+            .get(chain_id)
+            .cloned()
+            .ok_or(FireblocksCallerError::MissingChainAssetId { chain_id })?;
+
+        Ok(FireblocksCaller::new(FireblocksCtx {
+            api_user_id: api_user_id.clone(),
+            secret: fireblocks_secret.to_vec(),
+            vault_account_id: config.fireblocks_vault_account_id.clone(),
+            environment: config.fireblocks_environment,
+            asset_id,
+            provider,
+        })
+        .await?)
     }
 
     pub(crate) fn base_caller(&self) -> &Arc<dyn ContractCaller> {
@@ -183,40 +206,14 @@ impl RebalancingCtx {
     pub(crate) fn ethereum_caller(&self) -> &Arc<dyn ContractCaller> {
         &self.ethereum_caller
     }
-
-    pub(crate) fn ethereum_provider(&self) -> &Arc<RootProvider> {
-        &self.ethereum_provider
-    }
-}
-
-async fn build_fireblocks_caller<P: Provider + Clone + Send + Sync>(
-    config: &RebalancingConfig,
-    secrets: &RebalancingSecrets,
-    fireblocks_secret: &[u8],
-    chain_id: u64,
-    provider: P,
-) -> Result<FireblocksCaller<P>, FireblocksCallerError> {
-    let asset_id = config
-        .fireblocks_chain_asset_ids
-        .get(chain_id)
-        .cloned()
-        .ok_or(FireblocksCallerError::MissingChainAssetId { chain_id })?;
-
-    Ok(FireblocksCaller::new(FireblocksCtx {
-        api_user_id: secrets.fireblocks_api_user_id.clone(),
-        secret: fireblocks_secret.to_vec(),
-        vault_account_id: config.fireblocks_vault_account_id.clone(),
-        environment: config.fireblocks_environment,
-        asset_id,
-        provider,
-    })
-    .await?)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum FireblocksCallerError {
     #[error(transparent)]
     Fireblocks(#[from] FireblocksError),
+    #[error("RPC error: {0}")]
+    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
     #[error("no Fireblocks asset ID configured for chain {chain_id}")]
     MissingChainAssetId { chain_id: u64 },
 }
@@ -230,7 +227,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("equities", &self.equities)
-            .field("wallet_address", &self.wallet_address)
+            .field("wallet", &self.base_caller.address())
             .finish()
     }
 }

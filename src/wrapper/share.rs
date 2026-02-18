@@ -1,7 +1,6 @@
 //! WrapperService implementation for ERC-4626 token wrapping/unwrapping.
 
 use alloy::primitives::{Address, Bytes, TxHash, U256};
-use alloy::providers::Provider;
 use alloy::sol_types::{SolCall, SolEvent};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -26,32 +25,20 @@ pub struct EquityTokenAddresses {
 }
 
 /// Service for managing ERC-4626 token wrapping/unwrapping operations.
-pub(crate) struct WrapperService<Node>
-where
-    Node: Provider + Clone,
-{
-    provider: Node,
+///
+/// Uses the caller's embedded provider for read-only view calls (ratio
+/// queries) and the caller itself for write transactions (deposit/redeem).
+pub(crate) struct WrapperService {
     caller: Arc<dyn ContractCaller>,
-    owner: Address,
     config: HashMap<Symbol, EquityTokenAddresses>,
 }
 
-impl<Node> WrapperService<Node>
-where
-    Node: Provider + Clone,
-{
+impl WrapperService {
     pub(crate) fn new(
-        provider: Node,
         caller: Arc<dyn ContractCaller>,
-        owner: Address,
         config: HashMap<Symbol, EquityTokenAddresses>,
     ) -> Self {
-        Self {
-            provider,
-            caller,
-            owner,
-            config,
-        }
+        Self { caller, config }
     }
 
     /// Fetches the current conversion ratio for a wrapped token.
@@ -59,7 +46,7 @@ where
         &self,
         wrapped_token: Address,
     ) -> Result<UnderlyingPerWrapped, WrapperError> {
-        let vault = IERC4626::new(wrapped_token, &self.provider);
+        let vault = IERC4626::new(wrapped_token, self.caller.provider());
         let assets_per_share = vault.convertToAssets(RATIO_QUERY_AMOUNT).call().await?;
 
         UnderlyingPerWrapped::new(assets_per_share).map_err(Into::into)
@@ -72,10 +59,7 @@ where
 }
 
 #[async_trait]
-impl<Node> Wrapper for WrapperService<Node>
-where
-    Node: Provider + Clone + Send + Sync,
-{
+impl Wrapper for WrapperService {
     async fn get_ratio_for_symbol(
         &self,
         symbol: &Symbol,
@@ -180,6 +164,6 @@ where
     }
 
     fn owner(&self) -> Address {
-        self.owner
+        self.caller.address()
     }
 }

@@ -32,31 +32,28 @@ use crate::usdc_rebalance::{
 ///
 /// # Type Parameters
 ///
-/// * `EthereumNode` - Ethereum provider type
-/// * `BaseNode` - Base provider type
-pub(crate) struct CrossVenueCashTransfer<EthereumNode, BaseNode>
+/// * `BaseNode` - Base provider type (for `RaindexService`)
+pub(crate) struct CrossVenueCashTransfer<BaseNode>
 where
-    EthereumNode: Provider + Clone,
     BaseNode: Provider + Clone,
 {
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
-    cctp_bridge: Arc<CctpBridge<EthereumNode, BaseNode>>,
+    cctp_bridge: Arc<CctpBridge>,
     raindex: Arc<RaindexService<BaseNode>>,
     cqrs: Arc<Store<UsdcRebalance>>,
     market_maker_wallet: Address,
     vault_id: RaindexVaultId,
 }
 
-impl<EthereumNode, BaseNode> CrossVenueCashTransfer<EthereumNode, BaseNode>
+impl<BaseNode> CrossVenueCashTransfer<BaseNode>
 where
-    EthereumNode: Provider + Clone + Send + Sync + 'static,
     BaseNode: Provider + Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
-        cctp_bridge: Arc<CctpBridge<EthereumNode, BaseNode>>,
+        cctp_bridge: Arc<CctpBridge>,
         raindex: Arc<RaindexService<BaseNode>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
@@ -846,10 +843,9 @@ fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
 /// Alpaca -> Base (hedging -> market-making): convert USD to USDC,
 /// withdraw, bridge via CCTP, deposit to vault.
 #[async_trait]
-impl<EthereumNode, BaseNode> CrossVenueTransfer<HedgingVenue, MarketMakingVenue>
-    for CrossVenueCashTransfer<EthereumNode, BaseNode>
+impl<BaseNode> CrossVenueTransfer<HedgingVenue, MarketMakingVenue>
+    for CrossVenueCashTransfer<BaseNode>
 where
-    EthereumNode: Provider + Clone + Send + Sync + 'static,
     BaseNode: Provider + Clone + Send + Sync + 'static,
 {
     type Asset = Usdc;
@@ -864,10 +860,9 @@ where
 /// Base -> Alpaca (market-making -> hedging): withdraw from vault,
 /// bridge via CCTP, deposit USDC, convert to USD.
 #[async_trait]
-impl<EthereumNode, BaseNode> CrossVenueTransfer<MarketMakingVenue, HedgingVenue>
-    for CrossVenueCashTransfer<EthereumNode, BaseNode>
+impl<BaseNode> CrossVenueTransfer<MarketMakingVenue, HedgingVenue>
+    for CrossVenueCashTransfer<BaseNode>
 where
-    EthereumNode: Provider + Clone + Send + Sync + 'static,
     BaseNode: Provider + Clone + Send + Sync + 'static,
 {
     type Asset = Usdc;

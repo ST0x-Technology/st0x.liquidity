@@ -1,7 +1,7 @@
 //! Single-chain CCTP operations.
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use alloy::providers::Provider;
+use alloy::providers::RootProvider;
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
 use std::sync::Arc;
@@ -22,16 +22,12 @@ sol!(
 
 /// EVM chain connection with contract instances for CCTP operations.
 ///
-/// Retains a read-only provider for view calls (e.g. allowance checks).
-/// All write operations are submitted through the `ContractCaller` abstraction.
-pub(crate) struct Evm<P>
-where
-    P: Provider + Clone,
-{
-    /// Address of the account that owns tokens and signs transactions
-    owner: Address,
+/// The caller's embedded provider is used for read-only view calls
+/// (e.g. allowance checks). All write operations are submitted through
+/// the `ContractCaller` abstraction.
+pub(crate) struct Evm {
     /// USDC token contract instance (used for read-only view calls)
-    usdc: IERC20::IERC20Instance<P>,
+    usdc: IERC20::IERC20Instance<RootProvider>,
     /// USDC token address
     usdc_address: Address,
     /// TokenMessengerV2 contract address
@@ -39,35 +35,30 @@ where
     /// MessageTransmitterV2 contract address
     message_transmitter_address: Address,
     /// Read-only TokenMessengerV2 instance for decoding events
-    token_messenger: TokenMessengerV2::TokenMessengerV2Instance<P>,
+    token_messenger: TokenMessengerV2::TokenMessengerV2Instance<RootProvider>,
     /// Caller abstraction for submitting write transactions
     caller: Arc<dyn ContractCaller>,
 }
 
-impl<P> Evm<P>
-where
-    P: Provider + Clone,
-{
-    /// Creates a new EVM chain connection with the given provider and contract addresses.
+impl Evm {
+    /// Creates a new EVM chain connection from a caller and contract addresses.
     ///
-    /// The `owner` address should be the account that will sign transactions.
-    /// The `caller` handles signing and submission of write transactions.
-    /// The `provider` is retained for read-only view calls.
+    /// The caller's provider is used for read-only view calls.
+    /// The caller itself handles signing and submission of write transactions.
     pub(crate) fn new(
-        provider: P,
-        owner: Address,
         usdc: Address,
         token_messenger: Address,
         message_transmitter: Address,
         caller: Arc<dyn ContractCaller>,
     ) -> Self {
+        let provider = caller.provider().clone();
+
         Self {
-            owner,
             usdc: IERC20::new(usdc, provider.clone()),
             usdc_address: usdc,
             token_messenger_address: token_messenger,
             message_transmitter_address: message_transmitter,
-            token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
+            token_messenger: TokenMessengerV2::new(token_messenger, provider),
             caller,
         }
     }
@@ -75,7 +66,7 @@ where
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
         let allowance = self
             .usdc
-            .allowance(self.owner, self.token_messenger_address)
+            .allowance(self.caller.address(), self.token_messenger_address)
             .call()
             .await?;
 
@@ -185,16 +176,18 @@ where
 
     #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
-        self.owner
+        self.caller.address()
     }
 
     #[cfg(test)]
-    pub(super) fn usdc(&self) -> &IERC20::IERC20Instance<P> {
+    pub(super) fn usdc(&self) -> &IERC20::IERC20Instance<RootProvider> {
         &self.usdc
     }
 
     #[cfg(test)]
-    pub(super) fn token_messenger(&self) -> &TokenMessengerV2::TokenMessengerV2Instance<P> {
+    pub(super) fn token_messenger(
+        &self,
+    ) -> &TokenMessengerV2::TokenMessengerV2Instance<RootProvider> {
         &self.token_messenger
     }
 }

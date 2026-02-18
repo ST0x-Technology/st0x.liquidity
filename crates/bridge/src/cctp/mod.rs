@@ -32,11 +32,10 @@
 //!
 //! ```rust,ignore
 //! let bridge = CctpBridge::try_from_ctx(CctpCtx {
-//!     ethereum_provider,
-//!     base_provider,
-//!     owner,
 //!     usdc_ethereum,
 //!     usdc_base,
+//!     ethereum_caller,
+//!     base_caller,
 //! })?;
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
@@ -64,7 +63,6 @@ use std::mem::size_of;
 use std::time::Duration;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
-use alloy::providers::Provider;
 use alloy::sol;
 use async_trait::async_trait;
 use backon::Retryable;
@@ -228,14 +226,9 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 ///
 /// Provides the minimal set of values needed to construct the bridge.
 /// CCTP contract addresses are hardcoded internally since they're the
-/// same on all supported chains.
-pub struct CctpCtx<EP, BP> {
-    /// Ethereum read-only provider for view calls
-    pub ethereum_provider: EP,
-    /// Base read-only provider for view calls
-    pub base_provider: BP,
-    /// Wallet address that owns tokens and signs transactions
-    pub owner: Address,
+/// same on all supported chains. Providers are obtained from the callers
+/// via [`ContractCaller::provider()`].
+pub struct CctpCtx {
     /// USDC token address on Ethereum
     pub usdc_ethereum: Address,
     /// USDC token address on Base
@@ -248,32 +241,22 @@ pub struct CctpCtx<EP, BP> {
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
 ///
-/// # Type Parameters
-///
-/// * `EP` - Ethereum provider type implementing [`Provider`] + [`Clone`]
-/// * `BP` - Base provider type implementing [`Provider`] + [`Clone`]
-///
 /// # Example
 ///
 /// ```rust,ignore
 /// let bridge = CctpBridge::try_from_ctx(CctpCtx {
-///     ethereum_provider: eth_provider,
-///     base_provider,
-///     owner,
 ///     usdc_ethereum: USDC_ETHEREUM,
 ///     usdc_base: USDC_BASE,
+///     ethereum_caller,
+///     base_caller,
 /// })?;
 ///
 /// let amount = U256::from(1_000_000); // 1 USDC
 /// let receipt = bridge.burn(BridgeDirection::EthereumToBase, amount, recipient).await?;
 /// ```
-pub struct CctpBridge<EP, BP>
-where
-    EP: Provider + Clone,
-    BP: Provider + Clone,
-{
-    ethereum: Evm<EP>,
-    base: Evm<BP>,
+pub struct CctpBridge {
+    ethereum: Evm,
+    base: Evm,
     http_client: reqwest::Client,
     circle_api_base: String,
 }
@@ -345,16 +328,10 @@ struct FeeEntry {
     minimum_fee: Decimal,
 }
 
-impl<EP, BP> CctpBridge<EP, BP>
-where
-    EP: Provider + Clone,
-    BP: Provider + Clone,
-{
+impl CctpBridge {
     /// Constructs a `CctpBridge` from a runtime context.
-    pub fn try_from_ctx(ctx: CctpCtx<EP, BP>) -> Result<Self, CctpError> {
+    pub fn try_from_ctx(ctx: CctpCtx) -> Result<Self, CctpError> {
         let ethereum = Evm::new(
-            ctx.ethereum_provider,
-            ctx.owner,
             ctx.usdc_ethereum,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -362,8 +339,6 @@ where
         );
 
         let base = Evm::new(
-            ctx.base_provider,
-            ctx.owner,
             ctx.usdc_base,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -373,7 +348,7 @@ where
         Self::new(ethereum, base)
     }
 
-    fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Result<Self, CctpError> {
+    fn new(ethereum: Evm, base: Evm) -> Result<Self, CctpError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -584,11 +559,7 @@ where
 }
 
 #[async_trait]
-impl<EP, BP> crate::Bridge for CctpBridge<EP, BP>
-where
-    EP: Provider + Clone + Send + Sync + 'static,
-    BP: Provider + Clone + Send + Sync + 'static,
-{
+impl crate::Bridge for CctpBridge {
     type Error = CctpError;
     type Attestation = AttestationResponse;
 
@@ -666,10 +637,8 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<CctpBridge, Box<dyn std::error::Error>> {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let owner = signer.address();
         let wallet = EthereumWallet::from(signer);
 
         let ethereum_provider = ProviderBuilder::new()
@@ -683,13 +652,10 @@ mod tests {
             .await?;
 
         let ethereum_caller: Arc<dyn ContractCaller> =
-            Arc::new(LocalCaller::new(ethereum_provider.clone(), 1));
-        let base_caller: Arc<dyn ContractCaller> =
-            Arc::new(LocalCaller::new(base_provider.clone(), 1));
+            Arc::new(LocalCaller::new(ethereum_provider, 1));
+        let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(base_provider, 1));
 
         let ethereum = Evm::new(
-            ethereum_provider,
-            owner,
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -697,8 +663,6 @@ mod tests {
         );
 
         let base = Evm::new(
-            base_provider,
-            owner,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -1018,10 +982,8 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         base_usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<CctpBridge, Box<dyn std::error::Error>> {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let owner = signer.address();
         let wallet = EthereumWallet::from(signer);
 
         let ethereum_provider = ProviderBuilder::new()
@@ -1035,13 +997,10 @@ mod tests {
             .await?;
 
         let ethereum_caller: Arc<dyn ContractCaller> =
-            Arc::new(LocalCaller::new(ethereum_provider.clone(), 1));
-        let base_caller: Arc<dyn ContractCaller> =
-            Arc::new(LocalCaller::new(base_provider.clone(), 1));
+            Arc::new(LocalCaller::new(ethereum_provider, 1));
+        let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(base_provider, 1));
 
         let ethereum = Evm::new(
-            ethereum_provider,
-            owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -1049,8 +1008,6 @@ mod tests {
         );
 
         let base = Evm::new(
-            base_provider,
-            owner,
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -1550,14 +1507,8 @@ mod tests {
             Ok(())
         }
 
-        async fn create_bridge(
-            &self,
-        ) -> Result<
-            CctpBridge<impl Provider + Clone, impl Provider + Clone>,
-            Box<dyn std::error::Error>,
-        > {
+        async fn create_bridge(&self) -> Result<CctpBridge, Box<dyn std::error::Error>> {
             let signer = PrivateKeySigner::from_bytes(&self.deployer_key)?;
-            let owner = signer.address();
             let wallet = EthereumWallet::from(signer);
 
             let ethereum_provider = ProviderBuilder::new()
@@ -1571,13 +1522,10 @@ mod tests {
                 .await?;
 
             let ethereum_caller: Arc<dyn ContractCaller> =
-                Arc::new(LocalCaller::new(ethereum_provider.clone(), 1));
-            let base_caller: Arc<dyn ContractCaller> =
-                Arc::new(LocalCaller::new(base_provider.clone(), 1));
+                Arc::new(LocalCaller::new(ethereum_provider, 1));
+            let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(base_provider, 1));
 
             let ethereum = Evm::new(
-                ethereum_provider,
-                owner,
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
@@ -1585,8 +1533,6 @@ mod tests {
             );
 
             let base = Evm::new(
-                base_provider,
-                owner,
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,

@@ -326,9 +326,9 @@ pub struct CliEnv {
 
 impl CliEnv {
     /// Parse CLI arguments, load config from file, and return with subcommand.
-    pub fn parse_and_convert() -> anyhow::Result<(Ctx, Commands)> {
+    pub async fn parse_and_convert() -> anyhow::Result<(Ctx, Commands)> {
         let cli_env = Self::parse();
-        let ctx = Ctx::load_files(&cli_env.env.config, &cli_env.env.secrets)?;
+        let ctx = Ctx::load_files(&cli_env.env.config, &cli_env.env.secrets).await?;
         Ok((ctx, cli_env.command))
     }
 }
@@ -631,14 +631,14 @@ async fn run_provider_command<W: Write>(
             vault::vault_withdraw_command(stdout, amount, ctx, pool, provider).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
-            cctp::cctp_bridge_command(stdout, amount, all, from, ctx, provider).await
+            cctp::cctp_bridge_command(stdout, amount, all, from, ctx).await
         }
         ProviderCommand::CctpRecover {
             burn_tx,
             source_chain,
-        } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, ctx, provider).await,
+        } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, ctx).await,
         ProviderCommand::ResetAllowance { chain } => {
-            cctp::reset_allowance_command(stdout, chain, ctx, provider).await
+            cctp::reset_allowance_command(stdout, chain, ctx).await
         }
         ProviderCommand::AlpacaTokenize {
             symbol,
@@ -1836,12 +1836,8 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
-        let mock_data = create_mock_blockchain_data(
-            TEST_ORDERBOOK,
-            tx_hash,
-            "5000000000000000000",
-            50_000_000,
-        );
+        let mock_data =
+            create_mock_blockchain_data(TEST_ORDERBOOK, tx_hash, "5000000000000000000", 50_000_000);
 
         let ctx = create_test_ctx_for_cli(&server, mock_data.order_owner);
         let pool = setup_test_db().await;

@@ -167,10 +167,9 @@ where
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
         let raindex_service = Arc::new(RaindexService::new(
-            self.common.provider.clone(),
+            self.common.ctx.rebalancing_caller(),
             self.common.ctx.evm.orderbook,
             self.common.frameworks.vault_registry_projection.clone(),
-            order_owner,
         ));
         let inventory_poller = Some(spawn_inventory_poller(
             raindex_service,

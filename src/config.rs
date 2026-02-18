@@ -21,7 +21,9 @@ use st0x_execution::{
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
-use crate::rebalancing::{RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets};
+use crate::rebalancing::{
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
+};
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 
@@ -317,7 +319,11 @@ impl Ctx {
 
         let evm = EvmCtx::new(&config.evm, secrets.evm);
 
-        let trading_mode = match (config.rebalancing, secrets.rebalancing, config.evm.order_owner) {
+        let trading_mode = match (
+            config.rebalancing,
+            secrets.rebalancing,
+            config.evm.order_owner,
+        ) {
             (Some(rebalancing_config), Some(rebalancing_secrets), None) => {
                 let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &broker else {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
@@ -327,7 +333,7 @@ impl Ctx {
                         rebalancing_config,
                         rebalancing_secrets,
                         alpaca_auth.clone(),
-                        evm.ws_rpc_url.clone(),
+                        &evm,
                     )
                     .await?,
                 )
@@ -1023,5 +1029,4 @@ pub(crate) mod tests {
             "Expected TOML parse error for unknown broker field, got {err:?}"
         );
     }
-
 }

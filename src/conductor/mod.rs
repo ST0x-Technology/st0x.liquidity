@@ -184,7 +184,8 @@ impl Conductor {
 
         let (position, position_projection, snapshot, rebalancer, order_owner) =
             if let Ok(rebalancing_ctx) = ctx.rebalancing_ctx() {
-                let (infra, market_maker_wallet) = spawn_rebalancing_infrastructure(
+                let market_maker_wallet = rebalancing_ctx.base_caller().address();
+                let infra = spawn_rebalancing_infrastructure(
                     rebalancing_ctx,
                     pool,
                     ctx,
@@ -316,17 +317,11 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
     vault_registry: Arc<Store<VaultRegistry>>,
-) -> anyhow::Result<(RebalancingInfrastructure, Address)> {
+) -> anyhow::Result<RebalancingInfrastructure> {
     info!("Initializing rebalancing infrastructure");
 
-    let base_chain_id = provider.get_chain_id().await?;
-    let base_fireblocks_caller =
-        rebalancing_ctx.fireblocks_caller(base_chain_id, provider.clone())?;
-
-    let market_maker_wallet = base_fireblocks_caller.fetch_vault_address().await?;
-    info!(%market_maker_wallet, "Resolved market maker wallet from Fireblocks");
-
-    let base_caller: Arc<dyn ContractCaller> = Arc::new(base_fireblocks_caller);
+    let market_maker_wallet = rebalancing_ctx.base_caller().address();
+    let base_caller = rebalancing_ctx.base_caller().clone();
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -390,14 +385,9 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         usdc: Arc::new(built.usdc),
     };
 
-    let ethereum_provider = ProviderBuilder::new()
-        .connect_client(crate::onchain::http_client_with_retry(
-            rebalancing_ctx.ethereum_rpc_url.clone(),
-        ));
-
     let handle = spawn_rebalancer(
         rebalancing_ctx,
-        ethereum_provider,
+        rebalancing_ctx.ethereum_caller().provider().clone(),
         provider.clone(),
         market_maker_wallet,
         operation_receiver,
@@ -407,14 +397,12 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     )
     .await?;
 
-    let infra = RebalancingInfrastructure {
+    Ok(RebalancingInfrastructure {
         position: Arc::new(built.position),
         position_projection: Arc::new(wired.position_view),
         snapshot: built.snapshot,
         rebalancer: handle,
-    };
-
-    Ok((infra, market_maker_wallet))
+    })
 }
 
 async fn wait_for_infrastructure(

@@ -12,7 +12,7 @@
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
-use alloy::providers::Provider;
+use alloy::providers::RootProvider;
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use rain_math_float::Float;
@@ -55,16 +55,18 @@ pub(crate) enum RaindexError {
     VaultNotFound(Address),
     #[error("Token not found for symbol {0}")]
     TokenNotFound(Symbol),
-    #[error("No contract caller configured (read-only mode)")]
-    NoCaller,
 }
 
 /// Service for managing Rain OrderBook vault operations.
 ///
+/// Uses a `ContractCaller` for both read operations (via `caller.provider()`)
+/// and write operations (via `caller.call_contract()`). The owner address
+/// is derived from `caller.address()`.
+///
 /// # Example
 ///
 /// ```ignore
-/// let service = RaindexService::new(provider, orderbook_address, vault_registry_projection, owner);
+/// let service = RaindexService::new(caller, orderbook_address, vault_registry_projection);
 ///
 /// // Lookup vault ID for a token
 /// let vault_id = service.lookup_vault_id(token_address).await?;
@@ -76,52 +78,37 @@ pub(crate) enum RaindexError {
 /// // Withdraw USDC from vault
 /// service.withdraw_usdc(vault_id, amount).await?;
 /// ```
-pub(crate) struct RaindexService<P>
-where
-    P: Provider + Clone,
-{
-    provider: P,
-    orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
+pub(crate) struct RaindexService {
+    orderbook: IOrderBookV5::IOrderBookV5Instance<RootProvider>,
     orderbook_address: Address,
     vault_registry_projection: Arc<VaultRegistryProjection>,
-    owner: Address,
-    caller: Option<Arc<dyn ContractCaller>>,
+    caller: Arc<dyn ContractCaller>,
 }
 
-impl<P> RaindexService<P>
-where
-    P: Provider + Clone,
-{
+impl RaindexService {
     pub(crate) fn new(
-        provider: P,
+        caller: Arc<dyn ContractCaller>,
         orderbook: Address,
         vault_registry_projection: Arc<VaultRegistryProjection>,
-        owner: Address,
     ) -> Self {
+        let provider = caller.provider().clone();
+
         Self {
-            orderbook: IOrderBookV5::new(orderbook, provider.clone()),
-            provider,
+            orderbook: IOrderBookV5::new(orderbook, provider),
             orderbook_address: orderbook,
             vault_registry_projection,
-            owner,
-            caller: None,
+            caller,
         }
     }
 
-    /// Sets the contract caller for write operations.
-    pub(crate) fn with_caller(mut self, caller: Arc<dyn ContractCaller>) -> Self {
-        self.caller = Some(caller);
-        self
-    }
-
-    fn require_caller(&self) -> Result<&dyn ContractCaller, RaindexError> {
-        self.caller.as_deref().ok_or(RaindexError::NoCaller)
+    fn owner(&self) -> Address {
+        self.caller.address()
     }
 
     async fn load_registry(&self) -> Result<VaultRegistry, RaindexError> {
         let aggregate_id = VaultRegistryId {
             orderbook: self.orderbook_address,
-            owner: self.owner,
+            owner: self.owner(),
         };
 
         self.vault_registry_projection
@@ -167,8 +154,6 @@ where
         token: Address,
         amount: U256,
     ) -> Result<(), RaindexError> {
-        let caller = self.require_caller()?;
-
         debug!(%token, %amount, spender = %self.orderbook_address, "Sending ERC20 approve");
 
         let calldata = IERC20::approveCall {
@@ -177,7 +162,8 @@ where
         };
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
-        let receipt = caller
+        let receipt = self
+            .caller
             .call_contract(token, encoded, "ERC20 approve for orderbook")
             .await?;
 
@@ -192,7 +178,6 @@ where
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        let caller = self.require_caller()?;
         let amount_float = Float::from_fixed_decimal(amount, decimals)?;
 
         debug!(%token, ?vault_id, %amount, "Sending deposit3");
@@ -205,7 +190,8 @@ where
         };
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
-        let receipt = caller
+        let receipt = self
+            .caller
             .call_contract(self.orderbook_address, encoded, "deposit3 to vault")
             .await?;
 
@@ -329,10 +315,7 @@ pub(crate) trait Raindex: Send + Sync {
 }
 
 #[async_trait]
-impl<P> Raindex for RaindexService<P>
-where
-    P: Provider + Clone + Send + Sync,
-{
+impl Raindex for RaindexService {
     async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError> {
         let registry = self.load_registry().await?;
         registry
@@ -376,7 +359,6 @@ where
             return Err(RaindexError::ZeroAmount);
         }
 
-        let caller = self.require_caller()?;
         let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
 
         let calldata = IOrderBookV5::withdraw3Call {
@@ -387,7 +369,8 @@ where
         };
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
-        let receipt = caller
+        let receipt = self
+            .caller
             .call_contract(self.orderbook_address, encoded, "withdraw3 from vault")
             .await?;
 
@@ -556,18 +539,19 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
-    async fn create_test_raindex_service(local_evm: &LocalEvm) -> RaindexService<LocalEvmProvider> {
+    async fn create_test_raindex_service(local_evm: &LocalEvm) -> RaindexService {
         let pool = crate::test_utils::setup_test_db().await;
         let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
 
+        let caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(local_evm.provider.clone(), 1));
+
         RaindexService::new(
-            local_evm.provider.clone(),
+            caller,
             local_evm.orderbook_address,
             vault_registry_projection,
-            local_evm.signer.address(),
         )
-        .with_caller(Arc::new(LocalCaller::new(local_evm.provider.clone(), 1)))
     }
 
     #[tokio::test]

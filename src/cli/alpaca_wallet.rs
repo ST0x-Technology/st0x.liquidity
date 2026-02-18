@@ -2,7 +2,6 @@
 //! transfers, convert).
 
 use alloy::primitives::{Address, Bytes};
-use alloy::providers::ProviderBuilder;
 use alloy::sol_types::SolCall;
 use rust_decimal::Decimal;
 use std::io::Write;
@@ -31,13 +30,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
-    let ethereum_provider = ProviderBuilder::new()
-        .connect_http(rebalancing_ctx.ethereum_rpc_url.clone());
-
-    let chain_id = ethereum_provider.get_chain_id().await?;
-    let caller = rebalancing_ctx.fireblocks_caller(chain_id, ethereum_provider.clone())?;
-    let sender_address = caller.fetch_vault_address().await?;
+    let sender_address = rebalancing_ctx.base_caller().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
 
@@ -51,7 +44,9 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
     let usdc_symbol = TokenSymbol::new("USDC");
     let ethereum = Network::new("ethereum");
-    let deposit_address = alpaca_wallet.get_wallet_address(&usdc_symbol, &ethereum).await?;
+    let deposit_address = alpaca_wallet
+        .get_wallet_address(&usdc_symbol, &ethereum)
+        .await?;
     writeln!(stdout, "   Alpaca deposit address: {deposit_address}")?;
 
     let amount_u256 = amount.to_u256_6_decimals()?;
@@ -64,7 +59,8 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     };
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
-    let usdc_contract = IERC20::IERC20Instance::new(usdc_address, &ethereum_provider);
+    let usdc_contract =
+        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_caller().provider());
 
     let balance = usdc_contract.balanceOf(sender_address).call().await?;
     writeln!(stdout, "   Current USDC balance: {balance}")?;
@@ -79,7 +75,8 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
         amount: amount_u256,
     };
     let encoded = Bytes::from(SolCall::abi_encode(&calldata));
-    let tx_receipt = caller
+    let tx_receipt = rebalancing_ctx
+        .ethereum_caller()
         .call_contract(usdc_address, encoded, "USDC transfer to Alpaca")
         .await?;
 
@@ -126,13 +123,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
-    let ethereum_provider = ProviderBuilder::new()
-        .connect_http(rebalancing_ctx.ethereum_rpc_url.clone());
-
-    let chain_id = ethereum_provider.get_chain_id().await?;
-    let caller = rebalancing_ctx.fireblocks_caller(chain_id, ethereum_provider.clone())?;
-    let sender_address = caller.fetch_vault_address().await?;
+    let sender_address = rebalancing_ctx.base_caller().address();
 
     let destination = to_address.unwrap_or(sender_address);
     writeln!(stdout, "   Destination address: {destination}")?;
@@ -144,7 +135,8 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     };
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
-    let usdc = IERC20::IERC20Instance::new(usdc_address, &ethereum_provider);
+    let usdc =
+        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_caller().provider());
 
     let balance_before = usdc.balanceOf(destination).call().await?;
     writeln!(stdout, "   Balance before: {balance_before}")?;
@@ -222,10 +214,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
-    let caller = rebalancing_ctx.fireblocks_caller(1, ())?;
-    let sender_address = caller.fetch_vault_address().await?;
-    let target_address = address.unwrap_or(sender_address);
+    let target_address = address.unwrap_or_else(|| rebalancing_ctx.base_caller().address());
 
     writeln!(stdout, "Whitelisting address for Alpaca withdrawals")?;
     writeln!(stdout, "   Address: {target_address}")?;

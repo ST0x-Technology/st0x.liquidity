@@ -3,7 +3,7 @@
 //! vault management.
 
 use alloy::primitives::ruint::FromUintError;
-use alloy::primitives::{address, Address};
+use alloy::primitives::{Address, address};
 use alloy::rpc::client::RpcClient;
 use alloy::transports::layers::RetryBackoffLayer;
 use alloy::transports::{RpcError, TransportErrorKind};
