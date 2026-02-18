@@ -21,6 +21,9 @@ jobs:
           submodules: recursive
 
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: accept-flake-config = true
+
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build Solidity artifacts
@@ -43,6 +46,9 @@ jobs:
           submodules: recursive
 
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: accept-flake-config = true
+
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build Solidity artifacts
@@ -68,6 +74,9 @@ jobs:
           submodules: recursive
 
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: accept-flake-config = true
+
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build Solidity artifacts
