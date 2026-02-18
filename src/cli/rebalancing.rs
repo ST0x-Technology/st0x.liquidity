@@ -330,12 +330,11 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
         anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
     })?;
 
-    let receiving_wallet = match recipient {
-        Some(address) => address,
-        None => {
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-            signer.address()
-        }
+    let receiving_wallet = if let Some(address) = recipient {
+        address
+    } else {
+        let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
+        signer.address()
     };
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
