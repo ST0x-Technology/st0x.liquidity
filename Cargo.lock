@@ -6613,6 +6613,7 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "st0x-contract-caller",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

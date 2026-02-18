@@ -68,11 +68,13 @@ use alloy::providers::Provider;
 use alloy::sol;
 use async_trait::async_trait;
 use backon::Retryable;
-use rain_error_decoding::AbiDecodedErrorType;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+use st0x_contract_caller::{ContractCallError, ContractCaller};
 
 use crate::BridgeDirection;
 
@@ -228,9 +230,9 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 /// CCTP contract addresses are hardcoded internally since they're the
 /// same on all supported chains.
 pub struct CctpCtx<EP, BP> {
-    /// Ethereum provider (must be wallet-enabled for signing transactions)
+    /// Ethereum read-only provider for view calls
     pub ethereum_provider: EP,
-    /// Base provider (must be wallet-enabled for signing transactions)
+    /// Base read-only provider for view calls
     pub base_provider: BP,
     /// Wallet address that owns tokens and signs transactions
     pub owner: Address,
@@ -238,6 +240,10 @@ pub struct CctpCtx<EP, BP> {
     pub usdc_ethereum: Address,
     /// USDC token address on Base
     pub usdc_base: Address,
+    /// Caller for submitting transactions on Ethereum
+    pub ethereum_caller: Arc<dyn ContractCaller>,
+    /// Caller for submitting transactions on Base
+    pub base_caller: Arc<dyn ContractCaller>,
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
@@ -275,12 +281,10 @@ where
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
-    #[error("Contract error: {0}")]
+    #[error("Contract call error: {0}")]
+    ContractCall(#[from] ContractCallError),
+    #[error("Contract view error: {0}")]
     Contract(#[from] alloy::contract::Error),
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -354,6 +358,7 @@ where
             ctx.usdc_ethereum,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
+            ctx.ethereum_caller,
         );
 
         let base = Evm::new(
@@ -362,6 +367,7 @@ where
             ctx.usdc_base,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
+            ctx.base_caller,
         );
 
         Self::new(ethereum, base)
@@ -640,6 +646,9 @@ mod tests {
 
     use alloy::primitives::address;
 
+    use st0x_contract_caller::ContractCaller;
+    use st0x_contract_caller::local::LocalCaller;
+
     use super::*;
 
     const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
@@ -673,14 +682,19 @@ mod tests {
             .connect(base_endpoint)
             .await?;
 
+        let ethereum_caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(ethereum_provider.clone(), 1));
+        let base_caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(base_provider.clone(), 1));
+
         let ethereum = Evm::new(
             ethereum_provider,
             owner,
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            ethereum_caller,
+        );
 
         let base = Evm::new(
             base_provider,
@@ -688,8 +702,8 @@ mod tests {
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            base_caller,
+        );
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -1020,14 +1034,19 @@ mod tests {
             .connect(base_endpoint)
             .await?;
 
+        let ethereum_caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(ethereum_provider.clone(), 1));
+        let base_caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(base_provider.clone(), 1));
+
         let ethereum = Evm::new(
             ethereum_provider,
             owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            ethereum_caller,
+        );
 
         let base = Evm::new(
             base_provider,
@@ -1035,8 +1054,8 @@ mod tests {
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            base_caller,
+        );
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -1551,14 +1570,19 @@ mod tests {
                 .connect(&self.base_endpoint)
                 .await?;
 
+            let ethereum_caller: Arc<dyn ContractCaller> =
+                Arc::new(LocalCaller::new(ethereum_provider.clone(), 1));
+            let base_caller: Arc<dyn ContractCaller> =
+                Arc::new(LocalCaller::new(base_provider.clone(), 1));
+
             let ethereum = Evm::new(
                 ethereum_provider,
                 owner,
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
-            )
-            .with_required_confirmations(1);
+                ethereum_caller,
+            );
 
             let base = Evm::new(
                 base_provider,
@@ -1566,8 +1590,8 @@ mod tests {
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
-            )
-            .with_required_confirmations(1);
+                base_caller,
+            );
 
             Ok(CctpBridge::new(ethereum, base)?
                 .with_circle_api_base(self.fee_mock_server.base_url()))
@@ -1868,8 +1892,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_)),
-            "expected CctpError::Revert, got: {err:?}"
+            matches!(err, CctpError::ContractCall(_)),
+            "expected CctpError::ContractCall, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),
@@ -1907,8 +1931,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_)),
-            "expected CctpError::Revert, got: {err:?}"
+            matches!(err, CctpError::ContractCall(_)),
+            "expected CctpError::ContractCall, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),

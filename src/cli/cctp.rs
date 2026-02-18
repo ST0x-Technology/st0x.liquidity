@@ -7,14 +7,17 @@ use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 
+use std::sync::Arc;
+
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
+use st0x_contract_caller::ContractCaller;
+use st0x_contract_caller::local::LocalCaller;
 
 use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
-use crate::onchain::http_client_with_retry;
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
+use crate::onchain::{REQUIRED_CONFIRMATIONS, USDC_BASE, USDC_ETHEREUM, http_client_with_retry};
 use crate::rebalancing::RebalancingCtx;
 use crate::threshold::Usdc;
 
@@ -125,12 +128,23 @@ fn build_cctp_bridge<BP: Provider + Clone + 'static>(
         .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
 
+    let ethereum_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+        ethereum_provider.clone(),
+        REQUIRED_CONFIRMATIONS,
+    ));
+    let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+        base_provider.clone(),
+        REQUIRED_CONFIRMATIONS,
+    ));
+
     CctpBridge::try_from_ctx(CctpCtx {
         ethereum_provider,
         base_provider,
         owner,
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
+        ethereum_caller,
+        base_caller,
     })
 }
 

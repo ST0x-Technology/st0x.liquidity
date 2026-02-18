@@ -22,6 +22,8 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
+use st0x_contract_caller::ContractCaller;
+use st0x_contract_caller::local::LocalCaller;
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
@@ -331,12 +333,17 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         market_maker_wallet,
     ));
 
+    let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+        provider.clone(),
+        crate::onchain::REQUIRED_CONFIRMATIONS,
+    ));
+
     let tokenization = Arc::new(AlpacaTokenizationService::new(
         rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_broker_auth.account_id,
         rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
         rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
-        provider.clone(),
+        base_caller,
         rebalancing_ctx.redemption_wallet,
     ));
 

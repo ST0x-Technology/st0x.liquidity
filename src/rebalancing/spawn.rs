@@ -13,6 +13,8 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
+use st0x_contract_caller::ContractCaller;
+use st0x_contract_caller::local::LocalCaller;
 use st0x_event_sorcery::Store;
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Executor};
 
@@ -21,8 +23,8 @@ use super::usdc::CrossVenueCashTransfer;
 use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::equity_redemption::EquityRedemption;
-use crate::onchain::http_client_with_retry;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
+use crate::onchain::{REQUIRED_CONFIRMATIONS, http_client_with_retry};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -154,12 +156,23 @@ where
             broker_auth.api_secret.clone(),
         ));
 
+        let ethereum_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+            ethereum_provider.clone(),
+            REQUIRED_CONFIRMATIONS,
+        ));
+        let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+            base_provider.clone(),
+            REQUIRED_CONFIRMATIONS,
+        ));
+
         let cctp = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
             ethereum_provider,
             base_provider: base_provider.clone(),
             owner,
             usdc_ethereum: USDC_ETHEREUM,
             usdc_base: USDC_BASE,
+            ethereum_caller,
+            base_caller,
         })?);
 
         let wrapper = Arc::new(WrapperService::new(
@@ -379,12 +392,15 @@ mod tests {
             .wallet(ethereum_wallet)
             .connect_http(rebalancing_ctx.ethereum_rpc_url.clone());
 
+        let tokenization_caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(base_provider.clone(), 1));
+
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             server.base_url(),
             rebalancing_ctx.alpaca_broker_auth.account_id,
             "test_key".into(),
             "test_secret".into(),
-            base_provider.clone(),
+            tokenization_caller,
             rebalancing_ctx.redemption_wallet,
         ));
 
@@ -425,6 +441,11 @@ mod tests {
 
         let owner = signer.address();
 
+        let ethereum_caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(ethereum_provider.clone(), 1));
+        let base_caller: Arc<dyn ContractCaller> =
+            Arc::new(LocalCaller::new(base_provider.clone(), 1));
+
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
                 ethereum_provider,
@@ -432,6 +453,8 @@ mod tests {
                 owner,
                 usdc_ethereum: USDC_ETHEREUM,
                 usdc_base: USDC_BASE,
+                ethereum_caller,
+                base_caller,
             })
             .unwrap(),
         );

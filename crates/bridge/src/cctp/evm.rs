@@ -3,14 +3,16 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::Provider;
 use alloy::sol;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
+use std::sync::Arc;
 use tracing::{info, trace};
+
+use st0x_contract_caller::{ContractCallError, ContractCaller};
 
 use super::{
     CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
 };
 use crate::BridgeDirection;
-use crate::error_decoding::handle_contract_error;
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -18,26 +20,28 @@ sol!(
     IERC20, "../../lib/forge-std/out/IERC20.sol/IERC20.json"
 );
 
-/// Default number of confirmations to wait for approval transactions.
-/// Higher values help with load-balanced RPC providers like dRPC.
-const REQUIRED_CONFIRMATIONS: u64 = 3;
-
 /// EVM chain connection with contract instances for CCTP operations.
+///
+/// Retains a read-only provider for view calls (e.g. allowance checks).
+/// All write operations are submitted through the `ContractCaller` abstraction.
 pub(crate) struct Evm<P>
 where
     P: Provider + Clone,
 {
     /// Address of the account that owns tokens and signs transactions
     owner: Address,
-    /// USDC token contract instance
+    /// USDC token contract instance (used for read-only view calls)
     usdc: IERC20::IERC20Instance<P>,
-    /// TokenMessengerV2 contract instance for CCTP burns
+    /// USDC token address
+    usdc_address: Address,
+    /// TokenMessengerV2 contract address
+    token_messenger_address: Address,
+    /// MessageTransmitterV2 contract address
+    message_transmitter_address: Address,
+    /// Read-only TokenMessengerV2 instance for decoding events
     token_messenger: TokenMessengerV2::TokenMessengerV2Instance<P>,
-    /// MessageTransmitterV2 contract instance for CCTP mints
-    message_transmitter: MessageTransmitterV2::MessageTransmitterV2Instance<P>,
-    /// Number of confirmations to wait for approval transactions.
-    /// Higher values help with load-balanced RPC providers like dRPC.
-    required_confirmations: u64,
+    /// Caller abstraction for submitting write transactions
+    caller: Arc<dyn ContractCaller>,
 }
 
 impl<P> Evm<P>
@@ -46,51 +50,46 @@ where
 {
     /// Creates a new EVM chain connection with the given provider and contract addresses.
     ///
-    /// The `owner` address should be the account that will sign transactions
-    /// (typically obtained from a signer via `.address()`).
-    ///
-    /// Uses 3 confirmations by default for approval transactions to handle
-    /// load-balanced RPC providers. Use `with_required_confirmations` to override.
+    /// The `owner` address should be the account that will sign transactions.
+    /// The `caller` handles signing and submission of write transactions.
+    /// The `provider` is retained for read-only view calls.
     pub(crate) fn new(
         provider: P,
         owner: Address,
         usdc: Address,
         token_messenger: Address,
         message_transmitter: Address,
+        caller: Arc<dyn ContractCaller>,
     ) -> Self {
         Self {
             owner,
             usdc: IERC20::new(usdc, provider.clone()),
+            usdc_address: usdc,
+            token_messenger_address: token_messenger,
+            message_transmitter_address: message_transmitter,
             token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
-            message_transmitter: MessageTransmitterV2::new(message_transmitter, provider),
-            required_confirmations: REQUIRED_CONFIRMATIONS,
+            caller,
         }
     }
 
-    /// Sets the number of confirmations to wait for approval transactions.
-    #[cfg(test)]
-    pub(crate) fn with_required_confirmations(mut self, confirmations: u64) -> Self {
-        self.required_confirmations = confirmations;
-        self
-    }
-
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
-        let spender = *self.token_messenger.address();
-        let allowance = self.usdc.allowance(self.owner, spender).call().await?;
+        let allowance = self
+            .usdc
+            .allowance(self.owner, self.token_messenger_address)
+            .call()
+            .await?;
 
         trace!(%allowance, %amount, "Checking USDC allowance");
 
         if allowance < amount {
-            let pending = match self.usdc.approve(spender, amount).send().await {
-                Ok(pending) => pending,
-                Err(error) => return Err(handle_contract_error(error).await),
+            let calldata = IERC20::approveCall {
+                spender: self.token_messenger_address,
+                amount,
             };
+            let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
-            // Wait for multiple confirmations to ensure state propagates across
-            // load-balanced RPC nodes before the subsequent burn transaction
-            pending
-                .with_required_confirmations(self.required_confirmations)
-                .get_receipt()
+            self.caller
+                .call_contract(self.usdc_address, encoded, "USDC approve for CCTP")
                 .await?;
         }
 
@@ -112,27 +111,20 @@ where
         // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
         let destination_caller = FixedBytes::<32>::ZERO;
 
-        let pending = match self
-            .token_messenger
-            .depositForBurn(
-                amount,
-                direction.dest_domain(),
-                recipient_bytes32,
-                *self.usdc.address(),
-                destination_caller,
-                max_fee,
-                FAST_TRANSFER_THRESHOLD,
-            )
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(error) => return Err(handle_contract_error(error).await),
+        let calldata = TokenMessengerV2::depositForBurnCall {
+            amount,
+            destinationDomain: direction.dest_domain(),
+            mintRecipient: recipient_bytes32,
+            burnToken: self.usdc_address,
+            destinationCaller: destination_caller,
+            maxFee: max_fee,
+            minFinalityThreshold: FAST_TRANSFER_THRESHOLD,
         };
+        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
+        let receipt = self
+            .caller
+            .call_contract(self.token_messenger_address, encoded, "depositForBurn")
             .await?;
 
         if !receipt
@@ -160,19 +152,15 @@ where
         message: Bytes,
         attestation: Bytes,
     ) -> Result<MintReceipt, CctpError> {
-        let pending = match self
-            .message_transmitter
-            .receiveMessage(message, attestation)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(error) => return Err(handle_contract_error(error).await),
+        let calldata = MessageTransmitterV2::receiveMessageCall {
+            message: message.clone(),
+            attestation,
         };
+        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
+        let receipt = self
+            .caller
+            .call_contract(self.message_transmitter_address, encoded, "receiveMessage")
             .await?;
 
         let mint_event = receipt

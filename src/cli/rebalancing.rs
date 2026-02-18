@@ -9,6 +9,8 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+use st0x_contract_caller::ContractCaller;
+use st0x_contract_caller::local::LocalCaller;
 use st0x_event_sorcery::{Projection, StoreBuilder};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
@@ -20,7 +22,7 @@ use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
+use crate::onchain::{REQUIRED_CONFIRMATIONS, USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::CrossVenueCashTransfer;
@@ -61,24 +63,29 @@ pub(super) async fn transfer_equity_command<W: Write>(
     let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
     let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
 
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let wallet = signer.address();
+    let provider_with_wallet = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect_provider(base_provider);
+
+    let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+        provider_with_wallet.clone(),
+        REQUIRED_CONFIRMATIONS,
+    ));
+
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        base_provider.clone(),
+        base_caller,
         rebalancing_config.redemption_wallet,
     ));
 
     match direction {
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
-
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let wallet = signer.address();
-            let provider_with_wallet = ProviderBuilder::new()
-                .wallet(EthereumWallet::from(signer))
-                .connect_provider(base_provider);
 
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
@@ -134,17 +141,11 @@ pub(super) async fn transfer_equity_command<W: Write>(
         TransferDirection::ToAlpaca => {
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let owner = signer.address();
-            let provider_with_wallet = ProviderBuilder::new()
-                .wallet(EthereumWallet::from(signer))
-                .connect_provider(base_provider);
-
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
             let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
                 provider_with_wallet.clone(),
-                owner,
+                wallet,
                 rebalancing_config.equities.clone(),
             ));
 
@@ -152,7 +153,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 provider_with_wallet,
                 ctx.evm.orderbook,
                 vault_registry_projection,
-                owner,
+                wallet,
             ));
 
             let services = EquityTransferServices {
@@ -172,7 +173,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
                 raindex,
                 tokenization_service,
                 wrapper,
-                owner,
+                wallet,
                 mint_store,
                 redemption_store,
             );
@@ -257,12 +258,23 @@ where
 
     let owner = signer.address();
 
+    let ethereum_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+        ethereum_provider.clone(),
+        REQUIRED_CONFIRMATIONS,
+    ));
+    let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+        base_provider_with_wallet.clone(),
+        REQUIRED_CONFIRMATIONS,
+    ));
+
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
         ethereum_provider,
         base_provider: base_provider_with_wallet.clone(),
         owner,
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
+        ethereum_caller,
+        base_caller,
     })?);
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
     let vault_service = Arc::new(RaindexService::new(
@@ -308,7 +320,7 @@ where
 }
 
 /// Isolated tokenization command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
+pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'static>(
     stdout: &mut W,
     symbol: Symbol,
     quantity: FractionalShares,
@@ -341,12 +353,15 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
     let expected_final = initial_balance + expected_amount;
     writeln!(stdout, "   Expected final balance: {expected_final}")?;
 
+    let caller: Arc<dyn ContractCaller> =
+        Arc::new(LocalCaller::new(provider.clone(), REQUIRED_CONFIRMATIONS));
+
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        provider.clone(),
+        caller,
         rebalancing_config.redemption_wallet,
     );
 
@@ -416,7 +431,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 }
 
 /// Isolated redemption command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
+pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone + 'static>(
     stdout: &mut W,
     symbol: Symbol,
     quantity: FractionalShares,
@@ -445,12 +460,17 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
         .wallet(EthereumWallet::from(signer))
         .connect_provider(provider);
 
+    let caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(
+        provider_with_wallet,
+        REQUIRED_CONFIRMATIONS,
+    ));
+
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        provider_with_wallet,
+        caller,
         redemption_wallet,
     );
 
@@ -494,7 +514,10 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
 }
 
 /// List all Alpaca tokenization requests.
-pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider + Clone>(
+pub(super) async fn alpaca_tokenization_requests_command<
+    W: Write,
+    P: Provider + Clone + 'static,
+>(
     stdout: &mut W,
     ctx: &Ctx,
     provider: P,
@@ -511,12 +534,15 @@ pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider +
         )
     })?;
 
+    let caller: Arc<dyn ContractCaller> =
+        Arc::new(LocalCaller::new(provider, REQUIRED_CONFIRMATIONS));
+
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_config.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        provider,
+        caller,
         rebalancing_config.redemption_wallet,
     );
 

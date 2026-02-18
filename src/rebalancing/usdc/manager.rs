@@ -919,6 +919,8 @@ mod tests {
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
 
     use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+    use st0x_contract_caller::ContractCaller;
+    use st0x_contract_caller::local::LocalCaller;
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError};
@@ -1093,12 +1095,16 @@ mod tests {
     ) {
         let owner = signer.address();
 
+        let caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(provider.clone(), 1));
+
         let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
             ethereum_provider: provider.clone(),
             base_provider: provider.clone(),
             owner,
             usdc_ethereum: USDC_ADDRESS,
             usdc_base: USDC_ADDRESS,
+            ethereum_caller: caller.clone(),
+            base_caller: caller,
         })
         .unwrap();
 

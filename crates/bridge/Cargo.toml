@@ -12,6 +12,7 @@ cctp = [
   "dep:rust_decimal",
   "dep:serde",
   "dep:serde_json",
+  "dep:st0x-contract-caller",
   "dep:thiserror",
   "dep:tokio",
   "dep:tracing",
@@ -28,6 +29,7 @@ reqwest = { workspace = true, optional = true }
 rust_decimal = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+st0x-contract-caller = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
@@ -40,6 +42,7 @@ rust_decimal_macros = "1.38.0"
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 rand.workspace = true
+st0x-contract-caller = { workspace = true, features = ["local-signer"] }
 
 [lints]
 workspace = true
