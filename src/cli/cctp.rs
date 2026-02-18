@@ -259,10 +259,12 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
+
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
     use super::*;
     use crate::config::{BrokerCtx, LogLevel};
@@ -271,7 +273,6 @@ mod tests {
     use crate::rebalancing::RebalancingCtx;
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
-    use std::collections::HashMap;
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {

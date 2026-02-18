@@ -154,12 +154,11 @@ fn truncate_for_alpaca(symbol: &Symbol, quantity: FractionalShares) -> Fractiona
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use alloy::primitives::{U256, address};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use std::str::FromStr;
 
     use st0x_execution::FractionalShares;
 

@@ -387,7 +387,7 @@ The system provides two top-level capabilities:
 │  └─ Queue processing                   └─ CQRS aggregates               │
 │                                                                         │
 │  depends on: execution                 depends on: tokenization,        │
-│                                                    bridge, vault        │
+│                                                    bridge, raindex      │
 │                                                                         │
 └──────────────────────────────────┬──────────────────────────────────────┘
                                    │
