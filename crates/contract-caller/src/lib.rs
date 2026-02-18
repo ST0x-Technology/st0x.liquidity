@@ -8,6 +8,8 @@ use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 
+pub mod error_decoding;
+
 #[cfg(feature = "local-signer")]
 pub mod local;
 

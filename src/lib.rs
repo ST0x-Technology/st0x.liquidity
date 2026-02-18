@@ -23,7 +23,6 @@ mod conductor;
 pub mod config;
 pub(crate) mod dashboard;
 mod equity_redemption;
-mod error_decoding;
 mod inventory;
 mod offchain;
 mod offchain_order;

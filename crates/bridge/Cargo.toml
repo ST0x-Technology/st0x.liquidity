@@ -7,7 +7,6 @@ edition = "2024"
 default = []
 cctp = [
   "dep:backon",
-  "dep:rain-error-decoding",
   "dep:reqwest",
   "dep:rust_decimal",
   "dep:serde",
@@ -24,7 +23,6 @@ async-trait.workspace = true
 
 # Optional deps gated behind cctp feature
 backon = { workspace = true, optional = true }
-rain-error-decoding = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rust_decimal = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

@@ -11,7 +11,7 @@ use tracing::debug;
 ///
 /// If the error contains revert data and decoding succeeds, converts via
 /// `From<AbiDecodedErrorType>`. Otherwise converts via `From<alloy::contract::Error>`.
-pub(crate) async fn handle_contract_error<E>(err: alloy::contract::Error) -> E
+pub async fn handle_contract_error<E>(err: alloy::contract::Error) -> E
 where
     E: From<AbiDecodedErrorType> + From<alloy::contract::Error>,
 {
@@ -22,7 +22,7 @@ where
 ///
 /// This variant allows injecting a mock registry for testing without making
 /// live HTTP requests to the OpenChain selector registry.
-pub(crate) async fn handle_contract_error_with<E>(
+pub async fn handle_contract_error_with<E>(
     err: alloy::contract::Error,
     registry: Option<&dyn ErrorRegistry>,
 ) -> E
@@ -107,12 +107,12 @@ mod tests {
 
     #[tokio::test]
     async fn returns_contract_error_when_no_revert_data() {
-        let err = alloy::contract::Error::TransportError(TransportError::local_usage_str(
+        let error = alloy::contract::Error::TransportError(TransportError::local_usage_str(
             "connection refused",
         ));
         let registry = MockRegistry::empty();
 
-        let result: TestError = handle_contract_error_with(err, Some(&registry)).await;
+        let result: TestError = handle_contract_error_with(error, Some(&registry)).await;
 
         assert!(matches!(result, TestError::Contract(_)));
     }
@@ -125,10 +125,10 @@ mod tests {
             }
             .abi_encode(),
         );
-        let err = create_error_with_revert_data(&revert_data);
+        let error = create_error_with_revert_data(&revert_data);
         let registry = MockRegistry::with_error("Error(string)");
 
-        let result: TestError = handle_contract_error_with(err, Some(&registry)).await;
+        let result: TestError = handle_contract_error_with(error, Some(&registry)).await;
 
         let TestError::Decoded(decoded) = result else {
             panic!("expected Decoded, got {result:?}");
@@ -147,24 +147,24 @@ mod tests {
     #[tokio::test]
     async fn returns_contract_error_when_revert_data_malformed() {
         let too_short = Bytes::from(vec![0x12, 0x34]);
-        let err = create_error_with_revert_data(&too_short);
+        let error = create_error_with_revert_data(&too_short);
         let registry = MockRegistry::empty();
 
-        let result: TestError = handle_contract_error_with(err, Some(&registry)).await;
+        let result: TestError = handle_contract_error_with(error, Some(&registry)).await;
 
-        let TestError::Contract(contract_err) = result else {
+        let TestError::Contract(contract_error) = result else {
             panic!("expected Contract, got {result:?}");
         };
-        assert!(contract_err.to_string().contains("execution reverted"));
+        assert!(contract_error.to_string().contains("execution reverted"));
     }
 
     #[tokio::test]
     async fn returns_decoded_unknown_for_unrecognized_selector() {
         let unknown_selector = Bytes::from(vec![0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00]);
-        let err = create_error_with_revert_data(&unknown_selector);
+        let error = create_error_with_revert_data(&unknown_selector);
         let registry = MockRegistry::empty();
 
-        let result: TestError = handle_contract_error_with(err, Some(&registry)).await;
+        let result: TestError = handle_contract_error_with(error, Some(&registry)).await;
 
         let TestError::Decoded(decoded) = result else {
             panic!("expected Decoded, got {result:?}");

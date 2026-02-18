@@ -15,7 +15,6 @@ use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
-use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -42,8 +41,6 @@ pub(crate) enum RaindexError {
     ContractCall(#[from] ContractCallError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
     #[error("Decimal parse error: {0}")]

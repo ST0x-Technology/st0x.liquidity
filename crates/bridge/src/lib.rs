@@ -9,8 +9,6 @@ use async_trait::async_trait;
 
 #[cfg(feature = "cctp")]
 pub mod cctp;
-#[cfg(feature = "cctp")]
-mod error_decoding;
 
 /// Direction of a bridge transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
