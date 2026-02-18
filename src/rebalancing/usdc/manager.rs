@@ -1113,12 +1113,15 @@ mod tests {
         let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
 
+        let vault_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(provider.clone(), 1));
+
         let vault_service = RaindexService::new(
             provider,
             ORDERBOOK_ADDRESS,
             vault_registry_projection,
             owner,
-        );
+        )
+        .with_caller(vault_caller);
 
         (cctp_bridge, vault_service)
     }

@@ -7,8 +7,13 @@
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
+#[cfg(feature = "fireblocks")]
+use fireblocks_sdk::apis::transactions_api::CreateTransactionError;
 
 pub mod error_decoding;
+
+#[cfg(feature = "fireblocks")]
+pub mod fireblocks;
 
 #[cfg(feature = "local-signer")]
 pub mod local;
@@ -18,12 +23,34 @@ pub mod local;
 pub enum ContractCallError {
     #[error("transaction error: {0}")]
     Transaction(#[from] alloy::providers::PendingTransactionError),
-
     #[error("transport error: {0}")]
     Transport(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
-
     #[error("transaction reverted: {tx_hash}")]
     Reverted { tx_hash: alloy::primitives::TxHash },
+    #[cfg(feature = "fireblocks")]
+    #[error("Fireblocks error: {0}")]
+    Fireblocks(#[from] fireblocks::FireblocksError),
+}
+
+#[cfg(feature = "fireblocks")]
+impl From<fireblocks_sdk::FireblocksError> for ContractCallError {
+    fn from(error: fireblocks_sdk::FireblocksError) -> Self {
+        Self::Fireblocks(fireblocks::FireblocksError::from(error))
+    }
+}
+
+#[cfg(feature = "fireblocks")]
+impl From<fireblocks_sdk::apis::Error<CreateTransactionError>> for ContractCallError {
+    fn from(error: fireblocks_sdk::apis::Error<CreateTransactionError>) -> Self {
+        Self::Fireblocks(fireblocks::FireblocksError::from(error))
+    }
+}
+
+#[cfg(feature = "fireblocks")]
+impl From<alloy::hex::FromHexError> for ContractCallError {
+    fn from(error: alloy::hex::FromHexError) -> Self {
+        Self::Fireblocks(fireblocks::FireblocksError::from(error))
+    }
 }
 
 /// Abstraction for submitting contract calls to the blockchain.

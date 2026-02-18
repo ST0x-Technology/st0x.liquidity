@@ -766,6 +766,20 @@ assert!(matches!(error, SomeError::SpecificVariant { .. }));
 
 **FORBIDDEN**: `assert!(x.is_err())`, `assert!(x.is_ok())`
 
+#### Prefer exhaustive `match` over `matches!` in production code
+
+Outside of test assertions, always use a proper exhaustive `match` instead of
+the `matches!` macro. Exhaustive matches force you to handle new variants when
+enums change, preventing silent bugs. `matches!` hides unhandled variants behind
+a catch-all `_ => false`.
+
+**Test code**: `matches!` is fine for concise assertions (e.g.,
+`assert!(matches!(error, MyError::Specific { .. }))`).
+
+**Production code**: Use exhaustive `match` with explicit arms for every
+variant. When adding a new variant to an enum, the compiler will flag every
+match site that needs updating.
+
 #### Assertions must be specific
 
 Check for exact expected behavior. Never use `||` in assertions to accept
