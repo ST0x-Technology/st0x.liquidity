@@ -13,16 +13,15 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
-          extra-conf: accept-flake-config = true
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
@@ -38,16 +37,15 @@ jobs:
   dashboard:
     runs-on: ubuntu-latest
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
-          extra-conf: accept-flake-config = true
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
@@ -63,24 +61,18 @@ jobs:
       - name: Dashboard
         run: nix build --impure .#st0x-dashboard
 
-  flake-check:
+  pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
-          extra-conf: accept-flake-config = true
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build Solidity artifacts
-        run: nix run .#prepSolArtifacts
-
-      - name: Flake checks
-        run: nix flake check --impure
+      - name: pre-commit hooks
+        run: nix develop -c pre-commit run --all-files
