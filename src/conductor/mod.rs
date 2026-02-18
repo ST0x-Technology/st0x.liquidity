@@ -22,9 +22,9 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_contract_caller::ContractCaller;
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
+use st0x_evm::Wallet;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
@@ -184,14 +184,15 @@ impl Conductor {
 
         let (position, position_projection, snapshot, rebalancer, order_owner) =
             if let Ok(rebalancing_ctx) = ctx.rebalancing_ctx() {
-                let market_maker_wallet = rebalancing_ctx.base_caller().address();
+                let market_maker_wallet = rebalancing_ctx.base_wallet().address();
                 let infra = spawn_rebalancing_infrastructure(
                     rebalancing_ctx,
+                    rebalancing_ctx.ethereum_wallet().clone(),
+                    rebalancing_ctx.base_wallet().clone(),
                     pool,
                     ctx,
                     &inventory,
                     event_sender,
-                    &provider,
                     vault_registry.clone(),
                 )
                 .await?;
@@ -309,19 +310,19 @@ struct RebalancingInfrastructure {
     rebalancer: JoinHandle<()>,
 }
 
-async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
+async fn spawn_rebalancing_infrastructure<W: Wallet + Clone>(
     rebalancing_ctx: &RebalancingCtx,
+    ethereum_wallet: W,
+    base_wallet: W,
     pool: &SqlitePool,
     ctx: &Ctx,
     inventory: &Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
-    provider: &P,
     vault_registry: Arc<Store<VaultRegistry>>,
 ) -> anyhow::Result<RebalancingInfrastructure> {
     info!("Initializing rebalancing infrastructure");
 
-    let market_maker_wallet = rebalancing_ctx.base_caller().address();
-    let base_caller = rebalancing_ctx.base_caller().clone();
+    let market_maker_wallet = base_wallet.address();
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -329,10 +330,9 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = Arc::new(RaindexService::new(
-        provider.clone(),
+        base_wallet.clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
-        market_maker_wallet,
     ));
 
     let tokenization = Arc::new(AlpacaTokenizationService::new(
@@ -340,16 +340,14 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         rebalancing_ctx.alpaca_broker_auth.account_id,
         rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
         rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
-        base_caller.clone(),
+        base_wallet.clone(),
         rebalancing_ctx.redemption_wallet,
     ));
 
     let tokenizer: Arc<dyn Tokenizer> = tokenization;
 
     let wrapper = Arc::new(WrapperService::new(
-        provider.clone(),
-        base_caller,
-        market_maker_wallet,
+        base_wallet.clone(),
         rebalancing_ctx.equities.clone(),
     ));
 
@@ -387,8 +385,8 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let handle = spawn_rebalancer(
         rebalancing_ctx,
-        rebalancing_ctx.ethereum_caller().provider().clone(),
-        provider.clone(),
+        ethereum_wallet,
+        base_wallet,
         market_maker_wallet,
         operation_receiver,
         frameworks,

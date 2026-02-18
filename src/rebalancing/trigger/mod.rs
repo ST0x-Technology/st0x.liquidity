@@ -4,7 +4,7 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
-use alloy::providers::Provider;
+use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -17,12 +17,12 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use st0x_contract_caller::ContractCaller;
-use st0x_contract_caller::fireblocks::{
-    ChainAssetIds, FireblocksApiUserId, FireblocksCaller, FireblocksCtx, FireblocksEnvironment,
-    FireblocksError, FireblocksVaultAccountId,
-};
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
+use st0x_evm::Wallet;
+use st0x_evm::fireblocks::{
+    ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment, FireblocksError,
+    FireblocksVaultAccountId, FireblocksWallet,
+};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
@@ -55,8 +55,8 @@ pub enum RebalancingCtxError {
     NotAlpacaBroker,
     #[error("failed to read Fireblocks secret file: {0}")]
     FireblocksSecretRead(#[from] std::io::Error),
-    #[error("failed to build Fireblocks caller: {0}")]
-    FireblocksCaller(#[from] FireblocksCallerError),
+    #[error("failed to build Fireblocks wallet: {0}")]
+    FireblocksWallet(#[from] FireblocksWalletError),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -107,20 +107,20 @@ pub(crate) struct RebalancingCtx {
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Registry of wrapped token configurations for ERC-4626 vault operations.
     pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
-    /// Pre-built contract caller for the base chain (e.g. Base mainnet).
-    base_caller: Arc<dyn ContractCaller>,
-    /// Pre-built contract caller for Ethereum mainnet.
-    ethereum_caller: Arc<dyn ContractCaller>,
-    /// Pre-built HTTP provider for Ethereum read-only calls (balances, allowances).
-    ethereum_provider: Arc<RootProvider>,
+    /// Pre-built wallet for the base chain (e.g. Base mainnet).
+    base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    /// Pre-built wallet for Ethereum mainnet.
+    ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
 }
 
 impl RebalancingCtx {
     /// Construct from config, secrets, broker auth, and base chain RPC URL.
     ///
-    /// Reads the Fireblocks RSA secret, builds async callers for both
-    /// chains (resolving the vault address), and stores an Ethereum
-    /// read provider. After construction, everything is immutable.
+    /// Reads the Fireblocks RSA secret, builds wallets for both chains
+    /// (resolving the vault address from the Fireblocks API), and
+    /// stores them immutably. Read-only provider access for either
+    /// chain is available via `base_wallet().provider()` and
+    /// `ethereum_wallet().provider()`.
     pub(crate) async fn new(
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
@@ -129,34 +129,24 @@ impl RebalancingCtx {
     ) -> Result<Self, RebalancingCtxError> {
         let fireblocks_secret = std::fs::read(&secrets.fireblocks_secret_path)?;
 
-        let base_provider = RootProvider::new(crate::onchain::http_client_with_retry(base_rpc_url));
-        let base_chain_id = base_provider.get_chain_id().await?;
-
-        let ethereum_provider = Arc::new(RootProvider::new(
-            crate::onchain::http_client_with_retry(secrets.ethereum_rpc_url),
-        ));
-        let ethereum_chain_id = ethereum_provider.get_chain_id().await?;
-
-        let base_caller = build_fireblocks_caller(
+        let base_wallet = Self::build_wallet(
             &config,
-            &secrets,
             &fireblocks_secret,
-            base_chain_id,
-            base_provider,
+            &secrets.fireblocks_api_user_id,
+            base_rpc_url,
         )
         .await?;
 
-        let ethereum_caller = build_fireblocks_caller(
+        let ethereum_wallet = Self::build_wallet(
             &config,
-            &secrets,
             &fireblocks_secret,
-            ethereum_chain_id,
-            ethereum_provider.clone(),
+            &secrets.fireblocks_api_user_id,
+            secrets.ethereum_rpc_url,
         )
         .await?;
 
         info!(
-            wallet = %base_caller.address(),
+            wallet = %base_wallet.address(),
             "Resolved market maker wallet from Fireblocks"
         );
 
@@ -167,28 +157,27 @@ impl RebalancingCtx {
             usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
             equities: config.equities,
-            base_caller: Arc::new(base_caller),
-            ethereum_caller: Arc::new(ethereum_caller),
+            base_wallet: Arc::new(base_wallet),
+            ethereum_wallet: Arc::new(ethereum_wallet),
         })
     }
 
-    async fn build_caller(
+    async fn build_wallet(
         config: &RebalancingConfig,
         fireblocks_secret: &[u8],
         api_user_id: &FireblocksApiUserId,
         rpc_url: Url,
-    ) -> Result<FireblocksCaller<alloy::providers::RootProvider>, FireblocksCallerError> {
-        let provider =
-            alloy::providers::RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
+    ) -> Result<FireblocksWallet<RootProvider>, FireblocksWalletError> {
+        let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
         let chain_id = provider.get_chain_id().await?;
 
         let asset_id = config
             .fireblocks_chain_asset_ids
             .get(chain_id)
             .cloned()
-            .ok_or(FireblocksCallerError::MissingChainAssetId { chain_id })?;
+            .ok_or(FireblocksWalletError::MissingChainAssetId { chain_id })?;
 
-        Ok(FireblocksCaller::new(FireblocksCtx {
+        Ok(FireblocksWallet::new(FireblocksCtx {
             api_user_id: api_user_id.clone(),
             secret: fireblocks_secret.to_vec(),
             vault_account_id: config.fireblocks_vault_account_id.clone(),
@@ -199,17 +188,17 @@ impl RebalancingCtx {
         .await?)
     }
 
-    pub(crate) fn base_caller(&self) -> &Arc<dyn ContractCaller> {
-        &self.base_caller
+    pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+        &self.base_wallet
     }
 
-    pub(crate) fn ethereum_caller(&self) -> &Arc<dyn ContractCaller> {
-        &self.ethereum_caller
+    pub(crate) fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+        &self.ethereum_wallet
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum FireblocksCallerError {
+pub enum FireblocksWalletError {
     #[error(transparent)]
     Fireblocks(#[from] FireblocksError),
     #[error("RPC error: {0}")]
@@ -227,7 +216,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("equities", &self.equities)
-            .field("wallet", &self.base_caller.address())
+            .field("wallet", &self.base_wallet.address())
             .finish()
     }
 }

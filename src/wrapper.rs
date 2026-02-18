@@ -10,7 +10,7 @@ use alloy::contract::Error as ContractError;
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 
-use st0x_contract_caller::ContractCallError;
+use st0x_evm::EvmError;
 use st0x_execution::Symbol;
 
 pub(crate) use ratio::{RatioError, UnderlyingPerWrapped};
@@ -29,7 +29,7 @@ pub(crate) enum WrapperError {
     #[error("Missing Withdraw event in transaction receipt")]
     MissingWithdrawEvent,
     #[error("Contract call error: {0}")]
-    ContractCall(#[from] ContractCallError),
+    Evm(#[from] EvmError),
     #[error("Contract view error: {0}")]
     Contract(#[from] ContractError),
     #[error("Ratio error: {0}")]

@@ -1,14 +1,14 @@
 //! WrapperService implementation for ERC-4626 token wrapping/unwrapping.
 
 use alloy::primitives::{Address, Bytes, TxHash, U256};
+use alloy::providers::Provider;
 use alloy::sol_types::{SolCall, SolEvent};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::info;
 
-use st0x_contract_caller::ContractCaller;
+use st0x_evm::Wallet;
 use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
@@ -26,19 +26,16 @@ pub struct EquityTokenAddresses {
 
 /// Service for managing ERC-4626 token wrapping/unwrapping operations.
 ///
-/// Uses the caller's embedded provider for read-only view calls (ratio
-/// queries) and the caller itself for write transactions (deposit/redeem).
-pub(crate) struct WrapperService {
-    caller: Arc<dyn ContractCaller>,
+/// Uses the wallet's embedded provider for read-only view calls (ratio
+/// queries) and the wallet itself for write transactions (deposit/redeem).
+pub(crate) struct WrapperService<W: Wallet> {
+    wallet: W,
     config: HashMap<Symbol, EquityTokenAddresses>,
 }
 
-impl WrapperService {
-    pub(crate) fn new(
-        caller: Arc<dyn ContractCaller>,
-        config: HashMap<Symbol, EquityTokenAddresses>,
-    ) -> Self {
-        Self { caller, config }
+impl<W: Wallet> WrapperService<W> {
+    pub(crate) fn new(wallet: W, config: HashMap<Symbol, EquityTokenAddresses>) -> Self {
+        Self { wallet, config }
     }
 
     /// Fetches the current conversion ratio for a wrapped token.
@@ -46,7 +43,7 @@ impl WrapperService {
         &self,
         wrapped_token: Address,
     ) -> Result<UnderlyingPerWrapped, WrapperError> {
-        let vault = IERC4626::new(wrapped_token, self.caller.provider());
+        let vault = IERC4626::new(wrapped_token, self.wallet.provider().clone());
         let assets_per_share = vault.convertToAssets(RATIO_QUERY_AMOUNT).call().await?;
 
         UnderlyingPerWrapped::new(assets_per_share).map_err(Into::into)
@@ -59,7 +56,7 @@ impl WrapperService {
 }
 
 #[async_trait]
-impl Wrapper for WrapperService {
+impl<W: Wallet> Wrapper for WrapperService<W> {
     async fn get_ratio_for_symbol(
         &self,
         symbol: &Symbol,
@@ -100,8 +97,8 @@ impl Wrapper for WrapperService {
 
         info!("Sending ERC4626 deposit to {wrapped_token}");
         let receipt = self
-            .caller
-            .call_contract(
+            .wallet
+            .send(
                 wrapped_token,
                 Bytes::from(SolCall::abi_encode(&calldata)),
                 "ERC4626 deposit",
@@ -139,8 +136,8 @@ impl Wrapper for WrapperService {
 
         info!("Sending ERC4626 redeem to {wrapped_token}");
         let receipt = self
-            .caller
-            .call_contract(
+            .wallet
+            .send(
                 wrapped_token,
                 Bytes::from(SolCall::abi_encode(&calldata)),
                 "ERC4626 redeem",
@@ -164,6 +161,6 @@ impl Wrapper for WrapperService {
     }
 
     fn owner(&self) -> Address {
-        self.caller.address()
+        self.wallet.address()
     }
 }

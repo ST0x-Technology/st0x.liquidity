@@ -246,7 +246,7 @@ impl<P> FireblocksWallet<P> {
 #[async_trait]
 impl<P> Evm for FireblocksWallet<P>
 where
-    P: Provider + Clone + Send + Sync,
+    P: Provider + Clone + Send + Sync + 'static,
 {
     type Provider = P;
 
@@ -258,7 +258,7 @@ where
 #[async_trait]
 impl<P> Wallet for FireblocksWallet<P>
 where
-    P: Provider + Clone + Send + Sync,
+    P: Provider + Clone + Send + Sync + 'static,
 {
     fn address(&self) -> Address {
         self.address
@@ -298,9 +298,9 @@ where
             .create_transaction(params)
             .await?;
 
-        let tx_id = create_response.id.ok_or(EvmError::Fireblocks(
-            FireblocksError::MissingTransactionId,
-        ))?;
+        let tx_id = create_response
+            .id
+            .ok_or(EvmError::Fireblocks(FireblocksError::MissingTransactionId))?;
 
         info!(
             fireblocks_tx_id = %tx_id,
@@ -328,12 +328,10 @@ where
                     "Polling timed out but transaction may still confirm on-chain"
                 );
             }
-            return Err(EvmError::Fireblocks(
-                FireblocksError::TransactionFailed {
-                    tx_id,
-                    status: result.status,
-                },
-            ));
+            return Err(EvmError::Fireblocks(FireblocksError::TransactionFailed {
+                tx_id,
+                status: result.status,
+            }));
         }
 
         let tx_hash_str = result.tx_hash.ok_or_else(|| {
@@ -355,9 +353,7 @@ where
             .provider
             .get_transaction_receipt(tx_hash)
             .await?
-            .ok_or_else(|| {
-                EvmError::Fireblocks(FireblocksError::MissingReceipt { tx_hash })
-            })?;
+            .ok_or_else(|| EvmError::Fireblocks(FireblocksError::MissingReceipt { tx_hash }))?;
 
         if !receipt.status() {
             return Err(EvmError::Reverted {

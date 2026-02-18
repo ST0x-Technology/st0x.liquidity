@@ -77,7 +77,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     let encoded = Bytes::from(SolCall::abi_encode(&calldata));
     let tx_receipt = rebalancing_ctx
         .ethereum_caller()
-        .call_contract(usdc_address, encoded, "USDC transfer to Alpaca")
+        .send(usdc_address, encoded, "USDC transfer to Alpaca")
         .await?;
 
     let tx_hash = tx_receipt.transaction_hash;

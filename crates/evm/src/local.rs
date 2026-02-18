@@ -1,47 +1,83 @@
 //! Local signer implementation for test environments (anvil).
 //!
-//! `RawPrivateKeyWallet` wraps an alloy provider with an embedded `EthereumWallet`
-//! and submits transactions directly. This is only compiled when the
-//! `local-signer` feature is enabled and should only be used in tests.
+//! `RawPrivateKeyWallet` takes a private key and a base provider, wraps the
+//! provider with a [`WalletFiller`] internally, and submits transactions
+//! directly. This is only compiled when the `local-signer` feature is enabled
+//! and should only be used in tests.
 
-use alloy::primitives::{Address, Bytes};
-use alloy::providers::{Provider, WalletProvider};
+use alloy::network::{Ethereum, EthereumWallet};
+use alloy::primitives::{Address, B256, Bytes};
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+};
+use alloy::providers::{Identity, Provider, ProviderBuilder, WalletProvider};
 use alloy::rpc::types::TransactionReceipt;
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use tracing::info;
 
 use crate::{Evm, EvmError, Wallet};
 
+/// Provider type produced by wrapping a base provider with default fillers
+/// and a [`WalletFiller`].
+type SignerProvider<P> = FillProvider<
+    JoinFill<
+        JoinFill<
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+        >,
+        WalletFiller<EthereumWallet>,
+    >,
+    P,
+    Ethereum,
+>;
+
 /// Local wallet that signs and submits transactions directly.
 ///
-/// Wraps a provider that includes a wallet filler (e.g., built with
-/// `ProviderBuilder::new().wallet(wallet).connect_http(...)`).
+/// Takes a raw private key and a base provider (without wallet filler),
+/// wraps the provider with signing capabilities internally.
 ///
-/// The wallet address is derived from the provider's default signer —
-/// no separate address parameter is needed.
-pub struct RawPrivateKeyWallet<P> {
-    provider: P,
+/// `P` is the **base** provider type (e.g., from
+/// `ProviderBuilder::new().connect_http(url)`). The wallet-equipped provider
+/// is derived internally and exposed via [`Evm::provider()`].
+pub struct RawPrivateKeyWallet<P: Provider> {
+    provider: SignerProvider<P>,
     required_confirmations: u64,
 }
 
-impl<P> RawPrivateKeyWallet<P> {
-    /// Creates a new `RawPrivateKeyWallet` with the given provider and confirmation count.
-    pub fn new(provider: P, required_confirmations: u64) -> Self {
-        Self {
-            provider,
+impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
+    /// Creates a new `RawPrivateKeyWallet` from a private key and base provider.
+    ///
+    /// The base provider is wrapped with gas, nonce, chain ID, and wallet
+    /// fillers. Use [`Evm::provider()`] to access the signing provider for
+    /// contract deployments in tests.
+    pub fn new(
+        private_key: &B256,
+        provider: P,
+        required_confirmations: u64,
+    ) -> Result<Self, EvmError> {
+        let signer = PrivateKeySigner::from_bytes(private_key)?;
+        let eth_wallet = EthereumWallet::from(signer);
+
+        let signing_provider = ProviderBuilder::new()
+            .wallet(eth_wallet)
+            .connect_provider(provider);
+
+        Ok(Self {
+            provider: signing_provider,
             required_confirmations,
-        }
+        })
     }
 }
 
 #[async_trait]
 impl<P> Evm for RawPrivateKeyWallet<P>
 where
-    P: Provider + WalletProvider + Clone + Send + Sync,
+    P: Provider + Clone + Send + Sync + 'static,
 {
-    type Provider = P;
+    type Provider = SignerProvider<P>;
 
-    fn provider(&self) -> &P {
+    fn provider(&self) -> &SignerProvider<P> {
         &self.provider
     }
 }
@@ -49,7 +85,7 @@ where
 #[async_trait]
 impl<P> Wallet for RawPrivateKeyWallet<P>
 where
-    P: Provider + WalletProvider + Clone + Send + Sync,
+    P: Provider + Clone + Send + Sync + 'static,
 {
     fn address(&self) -> Address {
         self.provider.default_signer_address()
@@ -90,11 +126,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::network::EthereumWallet;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, U256};
-    use alloy::providers::ProviderBuilder;
-    use alloy::signers::local::PrivateKeySigner;
+    use alloy::primitives::U256;
     use alloy::sol;
     use alloy::sol_types::SolCall;
 
@@ -112,24 +145,17 @@ mod tests {
         "../../lib/forge-std/out/IERC20.sol/IERC20.json"
     );
 
-    async fn setup_anvil_with_token() -> (
-        RawPrivateKeyWallet<impl Provider + WalletProvider + Clone>,
-        impl Provider + Clone,
-        Address,
-        Address,
-    ) {
+    async fn setup_anvil_with_token()
+    -> (RawPrivateKeyWallet<impl Provider + Clone>, Address, Address) {
         let anvil = Box::leak(Box::new(Anvil::new().spawn()));
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
 
-        let private_key_bytes = anvil.keys()[0].to_bytes();
-        let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes)).unwrap();
-        let signer_address = signer.address();
-        let wallet = EthereumWallet::from(signer);
+        let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
 
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(anvil.endpoint().parse().unwrap());
+        let wallet = RawPrivateKeyWallet::new(&private_key, base_provider, 1).unwrap();
+        let signer_address = wallet.address();
 
-        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token = TestERC20::deploy(wallet.provider()).await.unwrap();
         let token_address = *token.address();
 
         let mint_amount = U256::from(1_000_000) * U256::from(10).pow(U256::from(18));
@@ -142,14 +168,12 @@ mod tests {
             .await
             .unwrap();
 
-        let caller = RawPrivateKeyWallet::new(provider.clone(), 1);
-
-        (caller, provider, token_address, signer_address)
+        (wallet, token_address, signer_address)
     }
 
     #[tokio::test]
     async fn send_submits_and_returns_receipt() {
-        let (caller, _provider, token_address, _signer) = setup_anvil_with_token().await;
+        let (wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
         let amount = U256::from(1000);
@@ -159,7 +183,7 @@ mod tests {
         }
         .abi_encode();
 
-        let receipt = caller
+        let receipt = wallet
             .send(token_address, Bytes::from(calldata), "ERC20 transfer")
             .await
             .unwrap();
@@ -170,12 +194,12 @@ mod tests {
 
     #[tokio::test]
     async fn send_state_change_persists() {
-        let (caller, provider, token_address, _signer) = setup_anvil_with_token().await;
+        let (wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
         let amount = U256::from(1000);
 
-        let token = IERC20::new(token_address, &provider);
+        let token = IERC20::new(token_address, wallet.provider());
         let before = token.balanceOf(recipient).call().await.unwrap();
         assert_eq!(before, U256::ZERO);
 
@@ -185,7 +209,7 @@ mod tests {
         }
         .abi_encode();
 
-        caller
+        wallet
             .send(token_address, Bytes::from(calldata), "ERC20 transfer")
             .await
             .unwrap();
@@ -196,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_detects_revert() {
-        let (caller, _provider, token_address, _signer) = setup_anvil_with_token().await;
+        let (wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         // Transfer more than balance to trigger revert
         let recipient = Address::random();
@@ -208,7 +232,7 @@ mod tests {
         }
         .abi_encode();
 
-        let result = caller
+        let result = wallet
             .send(token_address, Bytes::from(calldata), "should revert")
             .await;
 

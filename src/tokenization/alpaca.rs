@@ -32,12 +32,11 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, trace, warn};
 
-use st0x_contract_caller::{ContractCallError, ContractCaller};
+use st0x_evm::{EvmError, Wallet};
 use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
 
 use super::{Tokenizer, TokenizerError};
@@ -49,19 +48,19 @@ use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 /// High-level service for Alpaca tokenization operations.
 ///
 /// Wraps `AlpacaTokenizationClient` with default polling configuration.
-pub(crate) struct AlpacaTokenizationService {
-    client: AlpacaTokenizationClient,
+pub(crate) struct AlpacaTokenizationService<W: Wallet> {
+    client: AlpacaTokenizationClient<W>,
     polling_config: PollingConfig,
 }
 
-impl AlpacaTokenizationService {
+impl<W: Wallet> AlpacaTokenizationService<W> {
     /// Create a new tokenization service.
     pub(crate) fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
-        caller: Arc<dyn ContractCaller>,
+        wallet: W,
         redemption_wallet: Address,
     ) -> Self {
         let client = AlpacaTokenizationClient::new(
@@ -69,7 +68,7 @@ impl AlpacaTokenizationService {
             account_id,
             api_key,
             api_secret,
-            caller,
+            wallet,
             redemption_wallet,
         );
 
@@ -334,8 +333,8 @@ pub(crate) enum AlpacaTokenizationError {
     #[error("Request not found: {id}")]
     RequestNotFound { id: TokenizationRequestId },
 
-    #[error("Contract call error: {0}")]
-    ContractCall(#[from] ContractCallError),
+    #[error("EVM error: {0}")]
+    Evm(#[from] EvmError),
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
@@ -369,23 +368,23 @@ fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> Alpaca
 }
 
 /// Client for Alpaca's tokenization API and redemption transfers.
-struct AlpacaTokenizationClient {
+struct AlpacaTokenizationClient<W: Wallet> {
     http_client: Client,
     base_url: String,
     account_id: AlpacaAccountId,
     api_key: String,
     api_secret: String,
-    caller: Arc<dyn ContractCaller>,
+    wallet: W,
     redemption_wallet: Address,
 }
 
-impl AlpacaTokenizationClient {
+impl<W: Wallet> AlpacaTokenizationClient<W> {
     fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
-        caller: Arc<dyn ContractCaller>,
+        wallet: W,
         redemption_wallet: Address,
     ) -> Self {
         Self {
@@ -394,7 +393,7 @@ impl AlpacaTokenizationClient {
             account_id,
             api_key,
             api_secret,
-            caller,
+            wallet,
             redemption_wallet,
         }
     }
@@ -405,7 +404,7 @@ impl AlpacaTokenizationClient {
         account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
-        caller: Arc<dyn ContractCaller>,
+        wallet: W,
         redemption_wallet: Address,
     ) -> Self {
         Self {
@@ -414,7 +413,7 @@ impl AlpacaTokenizationClient {
             account_id,
             api_key,
             api_secret,
-            caller,
+            wallet,
             redemption_wallet,
         }
     }
@@ -592,8 +591,8 @@ impl AlpacaTokenizationClient {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .caller
-            .call_contract(token, encoded, "ERC20 transfer for redemption")
+            .wallet
+            .send(token, encoded, "ERC20 transfer for redemption")
             .await?;
 
         Ok(receipt.transaction_hash)
@@ -695,7 +694,7 @@ impl AlpacaTokenizationClient {
 }
 
 #[async_trait]
-impl Tokenizer for AlpacaTokenizationService {
+impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
     async fn request_mint(
         &self,
         symbol: Symbol,
@@ -742,11 +741,9 @@ impl Tokenizer for AlpacaTokenizationService {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{Address, B256, address, fixed_bytes};
     use alloy::providers::ProviderBuilder;
-    use alloy::signers::local::PrivateKeySigner;
     use httpmock::MockServer;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
@@ -754,7 +751,8 @@ pub(crate) mod tests {
     use std::time::Duration;
     use uuid::uuid;
 
-    use st0x_contract_caller::local::LocalCaller;
+    use st0x_evm::Evm;
+    use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
     use crate::bindings::TestERC20;
@@ -785,29 +783,27 @@ pub(crate) mod tests {
         anvil_endpoint: &str,
         private_key: &B256,
         redemption_wallet: Address,
-    ) -> AlpacaTokenizationClient {
-        let signer = PrivateKeySigner::from_bytes(private_key).unwrap();
-        let wallet = EthereumWallet::from(signer);
-
+    ) -> AlpacaTokenizationClient<impl Wallet> {
         let provider = ProviderBuilder::new()
-            .wallet(wallet)
             .connect(anvil_endpoint)
             .await
             .unwrap();
 
-        let caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(provider, 1));
+        let wallet = RawPrivateKeyWallet::new(private_key, provider, 1).unwrap();
 
         AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
-            caller,
+            wallet,
             redemption_wallet,
         )
     }
 
-    fn create_test_service(client: AlpacaTokenizationClient) -> AlpacaTokenizationService {
+    fn create_test_service(
+        client: AlpacaTokenizationClient<impl Wallet>,
+    ) -> AlpacaTokenizationService<impl Wallet> {
         let config = PollingConfig {
             interval: Duration::from_millis(10),
             timeout: Duration::from_secs(5),
@@ -823,7 +819,7 @@ pub(crate) mod tests {
         anvil_endpoint: &str,
         private_key: &B256,
         redemption_wallet: Address,
-    ) -> AlpacaTokenizationService {
+    ) -> AlpacaTokenizationService<impl Wallet> {
         let client =
             create_test_client(server, anvil_endpoint, private_key, redemption_wallet).await;
         create_test_service(client)
@@ -1118,21 +1114,19 @@ pub(crate) mod tests {
     async fn test_send_tokens_for_redemption_success() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer.clone());
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
 
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&endpoint)
-            .await
-            .unwrap();
-
-        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token = TestERC20::deploy(wallet.provider()).await.unwrap();
         let token_address = *token.address();
 
         let mint_amount = U256::from(1_000_000_000u64);
         token
-            .mint(signer.address(), mint_amount)
+            .mint(wallet.address(), mint_amount)
             .send()
             .await
             .unwrap()
@@ -1140,14 +1134,12 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(provider.clone(), 1));
-
         let client = AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
-            caller,
+            wallet,
             TEST_REDEMPTION_WALLET,
         );
 
@@ -1172,25 +1164,22 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_send_tokens_for_redemption_insufficient_balance() {
         let (_anvil, endpoint, key) = setup_anvil();
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer);
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
 
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&endpoint)
-            .await
-            .unwrap();
-
-        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token = TestERC20::deploy(wallet.provider()).await.unwrap();
         let token_address = *token.address();
-        let caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(provider, 1));
 
         let client = AlpacaTokenizationClient::new_with_base_url(
             "http://unused".to_string(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
-            caller,
+            wallet,
             TEST_REDEMPTION_WALLET,
         );
 
@@ -1201,8 +1190,8 @@ pub(crate) mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, AlpacaTokenizationError::ContractCall(_)),
-            "expected ContractCall error variant, got: {err:?}"
+            matches!(err, AlpacaTokenizationError::Evm(_)),
+            "expected Evm error variant, got: {err:?}"
         );
     }
 

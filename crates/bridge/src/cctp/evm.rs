@@ -1,13 +1,11 @@
 //! Single-chain CCTP operations.
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use alloy::providers::RootProvider;
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
-use std::sync::Arc;
 use tracing::{info, trace};
 
-use st0x_evm::{Evm, EvmError};
+use st0x_evm::Wallet;
 
 use super::{
     CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
@@ -20,14 +18,13 @@ sol!(
     IERC20, "../../lib/forge-std/out/IERC20.sol/IERC20.json"
 );
 
-/// EVM chain connection with contract instances for CCTP operations.
+/// Single-chain CCTP endpoint with contract instances for cross-chain operations.
 ///
-/// The caller's embedded provider is used for read-only view calls
-/// (e.g. allowance checks). All write operations are submitted through
-/// the `ContractCaller` abstraction.
-pub(crate) struct Evm {
+/// The wallet's provider is used for read-only view calls (e.g. allowance
+/// checks). All write operations are submitted through the [`Wallet`] trait.
+pub(crate) struct CctpEndpoint<W: Wallet> {
     /// USDC token contract instance (used for read-only view calls)
-    usdc: IERC20::IERC20Instance<RootProvider>,
+    usdc: IERC20::IERC20Instance<W::Provider>,
     /// USDC token address
     usdc_address: Address,
     /// TokenMessengerV2 contract address
@@ -35,23 +32,23 @@ pub(crate) struct Evm {
     /// MessageTransmitterV2 contract address
     message_transmitter_address: Address,
     /// Read-only TokenMessengerV2 instance for decoding events
-    token_messenger: TokenMessengerV2::TokenMessengerV2Instance<RootProvider>,
-    /// Caller abstraction for submitting write transactions
-    caller: Arc<dyn ContractCaller>,
+    token_messenger: TokenMessengerV2::TokenMessengerV2Instance<W::Provider>,
+    /// Wallet for submitting write transactions
+    wallet: W,
 }
 
-impl Evm {
-    /// Creates a new EVM chain connection from a caller and contract addresses.
+impl<W: Wallet> CctpEndpoint<W> {
+    /// Creates a new CCTP endpoint from a wallet and contract addresses.
     ///
-    /// The caller's provider is used for read-only view calls.
-    /// The caller itself handles signing and submission of write transactions.
+    /// The wallet's provider is used for read-only view calls.
+    /// The wallet itself handles signing and submission of write transactions.
     pub(crate) fn new(
         usdc: Address,
         token_messenger: Address,
         message_transmitter: Address,
-        caller: Arc<dyn ContractCaller>,
+        wallet: W,
     ) -> Self {
-        let provider = caller.provider().clone();
+        let provider = wallet.provider().clone();
 
         Self {
             usdc: IERC20::new(usdc, provider.clone()),
@@ -59,14 +56,14 @@ impl Evm {
             token_messenger_address: token_messenger,
             message_transmitter_address: message_transmitter,
             token_messenger: TokenMessengerV2::new(token_messenger, provider),
-            caller,
+            wallet,
         }
     }
 
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
         let allowance = self
             .usdc
-            .allowance(self.caller.address(), self.token_messenger_address)
+            .allowance(self.wallet.address(), self.token_messenger_address)
             .call()
             .await?;
 
@@ -79,8 +76,8 @@ impl Evm {
             };
             let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
-            self.caller
-                .call_contract(self.usdc_address, encoded, "USDC approve for CCTP")
+            self.wallet
+                .send(self.usdc_address, encoded, "USDC approve for CCTP")
                 .await?;
         }
 
@@ -114,8 +111,8 @@ impl Evm {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .caller
-            .call_contract(self.token_messenger_address, encoded, "depositForBurn")
+            .wallet
+            .send(self.token_messenger_address, encoded, "depositForBurn")
             .await?;
 
         if !receipt
@@ -150,8 +147,8 @@ impl Evm {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .caller
-            .call_contract(self.message_transmitter_address, encoded, "receiveMessage")
+            .wallet
+            .send(self.message_transmitter_address, encoded, "receiveMessage")
             .await?;
 
         let mint_event = receipt
@@ -176,18 +173,18 @@ impl Evm {
 
     #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
-        self.caller.address()
+        self.wallet.address()
     }
 
     #[cfg(test)]
-    pub(super) fn usdc(&self) -> &IERC20::IERC20Instance<RootProvider> {
+    pub(super) fn usdc(&self) -> &IERC20::IERC20Instance<W::Provider> {
         &self.usdc
     }
 
     #[cfg(test)]
     pub(super) fn token_messenger(
         &self,
-    ) -> &TokenMessengerV2::TokenMessengerV2Instance<RootProvider> {
+    ) -> &TokenMessengerV2::TokenMessengerV2Instance<W::Provider> {
         &self.token_messenger
     }
 }

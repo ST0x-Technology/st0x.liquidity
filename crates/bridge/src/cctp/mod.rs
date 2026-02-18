@@ -34,8 +34,8 @@
 //! let bridge = CctpBridge::try_from_ctx(CctpCtx {
 //!     usdc_ethereum,
 //!     usdc_base,
-//!     ethereum_caller,
-//!     base_caller,
+//!     ethereum_wallet,
+//!     base_wallet,
 //! })?;
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
@@ -57,7 +57,7 @@
 
 mod evm;
 
-pub(crate) use evm::Evm;
+pub(crate) use evm::CctpEndpoint;
 
 use std::mem::size_of;
 use std::time::Duration;
@@ -69,10 +69,9 @@ use backon::Retryable;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use st0x_contract_caller::{ContractCallError, ContractCaller};
+use st0x_evm::{EvmError, Wallet};
 
 use crate::BridgeDirection;
 
@@ -226,17 +225,17 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 ///
 /// Provides the minimal set of values needed to construct the bridge.
 /// CCTP contract addresses are hardcoded internally since they're the
-/// same on all supported chains. Providers are obtained from the callers
-/// via [`ContractCaller::provider()`].
-pub struct CctpCtx {
+/// same on all supported chains. Providers are obtained from the wallets
+/// via [`Wallet::provider()`].
+pub struct CctpCtx<EthWallet, BaseWallet> {
     /// USDC token address on Ethereum
     pub usdc_ethereum: Address,
     /// USDC token address on Base
     pub usdc_base: Address,
-    /// Caller for submitting transactions on Ethereum
-    pub ethereum_caller: Arc<dyn ContractCaller>,
-    /// Caller for submitting transactions on Base
-    pub base_caller: Arc<dyn ContractCaller>,
+    /// Wallet for submitting transactions on Ethereum
+    pub ethereum_wallet: EthWallet,
+    /// Wallet for submitting transactions on Base
+    pub base_wallet: BaseWallet,
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
@@ -254,9 +253,9 @@ pub struct CctpCtx {
 /// let amount = U256::from(1_000_000); // 1 USDC
 /// let receipt = bridge.burn(BridgeDirection::EthereumToBase, amount, recipient).await?;
 /// ```
-pub struct CctpBridge {
-    ethereum: Evm,
-    base: Evm,
+pub struct CctpBridge<EthWallet: Wallet, BaseWallet: Wallet> {
+    ethereum: CctpEndpoint<EthWallet>,
+    base: CctpEndpoint<BaseWallet>,
     http_client: reqwest::Client,
     circle_api_base: String,
 }
@@ -264,8 +263,8 @@ pub struct CctpBridge {
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
-    #[error("Contract call error: {0}")]
-    ContractCall(#[from] ContractCallError),
+    #[error("EVM error: {0}")]
+    Evm(#[from] EvmError),
     #[error("Contract view error: {0}")]
     Contract(#[from] alloy::contract::Error),
     #[error("HTTP error: {0}")]
@@ -328,27 +327,30 @@ struct FeeEntry {
     minimum_fee: Decimal,
 }
 
-impl CctpBridge {
+impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Constructs a `CctpBridge` from a runtime context.
-    pub fn try_from_ctx(ctx: CctpCtx) -> Result<Self, CctpError> {
-        let ethereum = Evm::new(
+    pub fn try_from_ctx(ctx: CctpCtx<EthWallet, BaseWallet>) -> Result<Self, CctpError> {
+        let ethereum = CctpEndpoint::new(
             ctx.usdc_ethereum,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-            ctx.ethereum_caller,
+            ctx.ethereum_wallet,
         );
 
-        let base = Evm::new(
+        let base = CctpEndpoint::new(
             ctx.usdc_base,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-            ctx.base_caller,
+            ctx.base_wallet,
         );
 
         Self::new(ethereum, base)
     }
 
-    fn new(ethereum: Evm, base: Evm) -> Result<Self, CctpError> {
+    fn new(
+        ethereum: CctpEndpoint<EthWallet>,
+        base: CctpEndpoint<BaseWallet>,
+    ) -> Result<Self, CctpError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -559,7 +561,11 @@ impl CctpBridge {
 }
 
 #[async_trait]
-impl crate::Bridge for CctpBridge {
+impl<EthWallet, BaseWallet> crate::Bridge for CctpBridge<EthWallet, BaseWallet>
+where
+    EthWallet: Wallet,
+    BaseWallet: Wallet,
+{
     type Error = CctpError;
     type Attestation = AttestationResponse;
 
@@ -606,7 +612,7 @@ mod tests {
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{B256, b256, keccak256};
-    use alloy::providers::ProviderBuilder;
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
@@ -617,8 +623,8 @@ mod tests {
 
     use alloy::primitives::address;
 
-    use st0x_contract_caller::ContractCaller;
-    use st0x_contract_caller::local::LocalCaller;
+    use st0x_evm::Wallet;
+    use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
 
@@ -637,36 +643,32 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         usdc_address: Address,
-    ) -> Result<CctpBridge, Box<dyn std::error::Error>> {
-        let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let wallet = EthereumWallet::from(signer);
+    ) -> Result<
+        CctpBridge<
+            RawPrivateKeyWallet<impl Provider + Clone>,
+            RawPrivateKeyWallet<impl Provider + Clone>,
+        >,
+        Box<dyn std::error::Error>,
+    > {
+        let ethereum_provider = ProviderBuilder::new().connect(ethereum_endpoint).await?;
 
-        let ethereum_provider = ProviderBuilder::new()
-            .wallet(wallet.clone())
-            .connect(ethereum_endpoint)
-            .await?;
+        let base_provider = ProviderBuilder::new().connect(base_endpoint).await?;
 
-        let base_provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(base_endpoint)
-            .await?;
+        let ethereum_wallet = RawPrivateKeyWallet::new(private_key, ethereum_provider, 1)?;
+        let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
-        let ethereum_caller: Arc<dyn ContractCaller> =
-            Arc::new(LocalCaller::new(ethereum_provider, 1));
-        let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(base_provider, 1));
-
-        let ethereum = Evm::new(
+        let ethereum = CctpEndpoint::new(
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-            ethereum_caller,
+            ethereum_wallet,
         );
 
-        let base = Evm::new(
+        let base = CctpEndpoint::new(
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-            base_caller,
+            base_wallet,
         );
 
         Ok(CctpBridge::new(ethereum, base)?)
@@ -982,36 +984,32 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         base_usdc_address: Address,
-    ) -> Result<CctpBridge, Box<dyn std::error::Error>> {
-        let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let wallet = EthereumWallet::from(signer);
+    ) -> Result<
+        CctpBridge<
+            RawPrivateKeyWallet<impl Provider + Clone>,
+            RawPrivateKeyWallet<impl Provider + Clone>,
+        >,
+        Box<dyn std::error::Error>,
+    > {
+        let ethereum_provider = ProviderBuilder::new().connect(ethereum_endpoint).await?;
 
-        let ethereum_provider = ProviderBuilder::new()
-            .wallet(wallet.clone())
-            .connect(ethereum_endpoint)
-            .await?;
+        let base_provider = ProviderBuilder::new().connect(base_endpoint).await?;
 
-        let base_provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(base_endpoint)
-            .await?;
+        let ethereum_wallet = RawPrivateKeyWallet::new(private_key, ethereum_provider, 1)?;
+        let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
-        let ethereum_caller: Arc<dyn ContractCaller> =
-            Arc::new(LocalCaller::new(ethereum_provider, 1));
-        let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(base_provider, 1));
-
-        let ethereum = Evm::new(
+        let ethereum = CctpEndpoint::new(
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-            ethereum_caller,
+            ethereum_wallet,
         );
 
-        let base = Evm::new(
+        let base = CctpEndpoint::new(
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-            base_caller,
+            base_wallet,
         );
 
         Ok(CctpBridge::new(ethereum, base)?)
@@ -1507,36 +1505,37 @@ mod tests {
             Ok(())
         }
 
-        async fn create_bridge(&self) -> Result<CctpBridge, Box<dyn std::error::Error>> {
-            let signer = PrivateKeySigner::from_bytes(&self.deployer_key)?;
-            let wallet = EthereumWallet::from(signer);
-
+        async fn create_bridge(
+            &self,
+        ) -> Result<
+            CctpBridge<
+                RawPrivateKeyWallet<impl Provider + Clone>,
+                RawPrivateKeyWallet<impl Provider + Clone>,
+            >,
+            Box<dyn std::error::Error>,
+        > {
             let ethereum_provider = ProviderBuilder::new()
-                .wallet(wallet.clone())
                 .connect(&self.ethereum_endpoint)
                 .await?;
 
-            let base_provider = ProviderBuilder::new()
-                .wallet(wallet)
-                .connect(&self.base_endpoint)
-                .await?;
+            let base_provider = ProviderBuilder::new().connect(&self.base_endpoint).await?;
 
-            let ethereum_caller: Arc<dyn ContractCaller> =
-                Arc::new(LocalCaller::new(ethereum_provider, 1));
-            let base_caller: Arc<dyn ContractCaller> = Arc::new(LocalCaller::new(base_provider, 1));
+            let ethereum_wallet =
+                RawPrivateKeyWallet::new(&self.deployer_key, ethereum_provider, 1)?;
+            let base_wallet = RawPrivateKeyWallet::new(&self.deployer_key, base_provider, 1)?;
 
-            let ethereum = Evm::new(
+            let ethereum = CctpEndpoint::new(
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
-                ethereum_caller,
+                ethereum_wallet,
             );
 
-            let base = Evm::new(
+            let base = CctpEndpoint::new(
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
-                base_caller,
+                base_wallet,
             );
 
             Ok(CctpBridge::new(ethereum, base)?
@@ -1838,8 +1837,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::ContractCall(_)),
-            "expected CctpError::ContractCall, got: {err:?}"
+            matches!(err, CctpError::Evm(_)),
+            "expected CctpError::Evm, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),
@@ -1877,8 +1876,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::ContractCall(_)),
-            "expected CctpError::ContractCall, got: {err:?}"
+            matches!(err, CctpError::Evm(_)),
+            "expected CctpError::Evm, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),

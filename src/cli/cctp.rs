@@ -197,7 +197,7 @@ pub(super) async fn reset_allowance_command<W: Write>(
     };
     let encoded = Bytes::from(SolCall::abi_encode(&calldata));
     let receipt = caller
-        .call_contract(usdc_address, encoded, "Reset USDC allowance")
+        .send(usdc_address, encoded, "Reset USDC allowance")
         .await?;
     writeln!(stdout, "   Tx: {}", receipt.transaction_hash)?;
 

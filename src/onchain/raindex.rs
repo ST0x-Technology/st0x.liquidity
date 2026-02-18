@@ -12,16 +12,15 @@
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
-use alloy::providers::RootProvider;
+use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
-use std::sync::Arc;
 use tracing::{debug, info};
 
-use st0x_contract_caller::{ContractCallError, ContractCaller};
 use st0x_event_sorcery::ProjectionError;
+use st0x_evm::{EvmError, Wallet};
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::bindings::{IERC20, IOrderBookV5};
@@ -37,8 +36,8 @@ pub(crate) struct RaindexVaultId(pub(crate) B256);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RaindexError {
-    #[error("Contract call error: {0}")]
-    ContractCall(#[from] ContractCallError),
+    #[error("EVM error: {0}")]
+    Evm(#[from] EvmError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
     #[error("Float error: {0}")]
@@ -59,9 +58,9 @@ pub(crate) enum RaindexError {
 
 /// Service for managing Rain OrderBook vault operations.
 ///
-/// Uses a `ContractCaller` for both read operations (via `caller.provider()`)
-/// and write operations (via `caller.call_contract()`). The owner address
-/// is derived from `caller.address()`.
+/// Uses a [`Wallet`] for both read operations (via `wallet.provider()`)
+/// and write operations (via `wallet.send()`). The owner address
+/// is derived from `wallet.address()`.
 ///
 /// # Example
 ///
@@ -78,31 +77,31 @@ pub(crate) enum RaindexError {
 /// // Withdraw USDC from vault
 /// service.withdraw_usdc(vault_id, amount).await?;
 /// ```
-pub(crate) struct RaindexService {
-    orderbook: IOrderBookV5::IOrderBookV5Instance<RootProvider>,
+pub(crate) struct RaindexService<W: Wallet> {
+    orderbook: IOrderBookV5::IOrderBookV5Instance<W::Provider>,
     orderbook_address: Address,
     vault_registry_projection: Arc<VaultRegistryProjection>,
-    caller: Arc<dyn ContractCaller>,
+    wallet: W,
 }
 
-impl RaindexService {
+impl<W: Wallet> RaindexService<W> {
     pub(crate) fn new(
-        caller: Arc<dyn ContractCaller>,
+        wallet: W,
         orderbook: Address,
         vault_registry_projection: Arc<VaultRegistryProjection>,
     ) -> Self {
-        let provider = caller.provider().clone();
+        let provider = wallet.provider().clone();
 
         Self {
             orderbook: IOrderBookV5::new(orderbook, provider),
             orderbook_address: orderbook,
             vault_registry_projection,
-            caller,
+            wallet,
         }
     }
 
     fn owner(&self) -> Address {
-        self.caller.address()
+        self.wallet.address()
     }
 
     async fn load_registry(&self) -> Result<VaultRegistry, RaindexError> {
@@ -163,8 +162,8 @@ impl RaindexService {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .caller
-            .call_contract(token, encoded, "ERC20 approve for orderbook")
+            .wallet
+            .send(token, encoded, "ERC20 approve for orderbook")
             .await?;
 
         info!(tx_hash = %receipt.transaction_hash, "Approve confirmed");
@@ -191,8 +190,8 @@ impl RaindexService {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .caller
-            .call_contract(self.orderbook_address, encoded, "deposit3 to vault")
+            .wallet
+            .send(self.orderbook_address, encoded, "deposit3 to vault")
             .await?;
 
         info!(tx_hash = %receipt.transaction_hash, "deposit3 confirmed");
@@ -315,7 +314,7 @@ pub(crate) trait Raindex: Send + Sync {
 }
 
 #[async_trait]
-impl Raindex for RaindexService {
+impl<W: Wallet> Raindex for RaindexService<W> {
     async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError> {
         let registry = self.load_registry().await?;
         registry
@@ -370,8 +369,8 @@ impl Raindex for RaindexService {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .caller
-            .call_contract(self.orderbook_address, encoded, "withdraw3 from vault")
+            .wallet
+            .send(self.orderbook_address, encoded, "withdraw3 from vault")
             .await?;
 
         info!(tx_hash = %receipt.transaction_hash, "withdraw3 confirmed");
@@ -381,41 +380,38 @@ impl Raindex for RaindexService {
 
 #[cfg(test)]
 mod tests {
-    use alloy::network::{Ethereum, EthereumWallet};
+    use alloy::network::Ethereum;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{B256, b256};
     use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
-    use alloy::signers::local::PrivateKeySigner;
     use alloy::transports::{RpcError, TransportErrorKind};
     use proptest::prelude::*;
     use tracing_test::traced_test;
 
-    use st0x_contract_caller::local::LocalCaller;
+    use st0x_evm::Evm;
+    use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
 
-    type LocalEvmProvider = FillProvider<
+    type BaseProvider = FillProvider<
         JoinFill<
-            JoinFill<
-                Identity,
-                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-            >,
-            WalletFiller<EthereumWallet>,
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
         >,
         RootProvider<Ethereum>,
         Ethereum,
     >;
 
     struct LocalEvm {
-        _anvil: AnvilInstance,
-        provider: LocalEvmProvider,
-        signer: PrivateKeySigner,
+        anvil: AnvilInstance,
+        wallet: RawPrivateKeyWallet<BaseProvider>,
+        private_key: B256,
         orderbook_address: Address,
         token_address: Address,
     }
@@ -425,24 +421,21 @@ mod tests {
             let anvil = Anvil::new().spawn();
             let endpoint = anvil.endpoint();
 
-            let private_key_bytes = anvil.keys()[0].to_bytes();
-            let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes))?;
+            let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
 
-            let wallet = EthereumWallet::from(signer.clone());
-            let provider = ProviderBuilder::new()
-                .wallet(wallet)
-                .connect_http(endpoint.parse()?);
+            let base_provider = ProviderBuilder::new().connect_http(endpoint.parse()?);
+            let wallet = RawPrivateKeyWallet::new(&private_key, base_provider, 1)?;
 
-            Self::deploy_tofu_decimals(&provider).await?;
+            Self::deploy_tofu_decimals(wallet.provider()).await?;
 
-            let orderbook_address = Self::deploy_orderbook(&provider).await?;
+            let orderbook_address = Self::deploy_orderbook(wallet.provider()).await?;
 
-            let token_address = Self::deploy_token(&provider, signer.address()).await?;
+            let token_address = Self::deploy_token(wallet.provider(), wallet.address()).await?;
 
             Ok(Self {
-                _anvil: anvil,
-                provider,
-                signer,
+                anvil,
+                wallet,
+                private_key,
                 orderbook_address,
                 token_address,
             })
@@ -492,7 +485,7 @@ mod tests {
             spender: Address,
             amount: U256,
         ) -> Result<(), LocalEvmError> {
-            let token_contract = TestERC20::new(token, &self.provider);
+            let token_contract = TestERC20::new(token, self.wallet.provider());
 
             token_contract
                 .approve(spender, amount)
@@ -509,10 +502,10 @@ mod tests {
             token: Address,
             vault_id: B256,
         ) -> Result<B256, LocalEvmError> {
-            let orderbook = IOrderBookV5::new(self.orderbook_address, &self.provider);
+            let orderbook = IOrderBookV5::new(self.orderbook_address, self.wallet.provider());
 
             let balance = orderbook
-                .vaultBalance2(self.signer.address(), token, vault_id)
+                .vaultBalance2(self.wallet.address(), token, vault_id)
                 .call()
                 .await?;
 
@@ -522,8 +515,8 @@ mod tests {
 
     #[derive(Debug, thiserror::Error)]
     enum LocalEvmError {
-        #[error("Invalid private key")]
-        InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+        #[error("EVM error")]
+        Evm(#[from] EvmError),
         #[error("Contract error")]
         Contract(#[from] alloy::contract::Error),
         #[error("Provider error")]
@@ -539,16 +532,20 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
-    async fn create_test_raindex_service(local_evm: &LocalEvm) -> RaindexService {
+    async fn create_test_raindex_service(
+        local_evm: &LocalEvm,
+    ) -> RaindexService<RawPrivateKeyWallet<BaseProvider>> {
         let pool = crate::test_utils::setup_test_db().await;
         let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
 
-        let caller: Arc<dyn ContractCaller> =
-            Arc::new(LocalCaller::new(local_evm.provider.clone(), 1));
+        let base_provider =
+            ProviderBuilder::new().connect_http(local_evm.anvil.endpoint().parse().unwrap());
+
+        let wallet = RawPrivateKeyWallet::new(&local_evm.private_key, base_provider, 1).unwrap();
 
         RaindexService::new(
-            caller,
+            wallet,
             local_evm.orderbook_address,
             vault_registry_projection,
         )
@@ -751,7 +748,7 @@ mod tests {
 
         let balance = service
             .get_equity_balance(
-                local_evm.signer.address(),
+                local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
             )
@@ -790,7 +787,7 @@ mod tests {
 
         let balance = service
             .get_equity_balance(
-                local_evm.signer.address(),
+                local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
             )
@@ -844,7 +841,7 @@ mod tests {
 
         let balance = service
             .get_equity_balance(
-                local_evm.signer.address(),
+                local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
             )

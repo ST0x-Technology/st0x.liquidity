@@ -22,9 +22,9 @@ use alloy::primitives::{Address, Bytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
-use rain_error_decoding::AbiDecodedErrorType;
 #[cfg(feature = "fireblocks")]
 use fireblocks_sdk::apis::transactions_api::CreateTransactionError;
+use rain_error_decoding::AbiDecodedErrorType;
 
 pub mod error_decoding;
 
@@ -47,6 +47,8 @@ pub enum EvmError {
     DecodedRevert(AbiDecodedErrorType),
     #[error("transaction reverted: {tx_hash}")]
     Reverted { tx_hash: alloy::primitives::TxHash },
+    #[error("invalid private key: {0}")]
+    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
     #[cfg(feature = "fireblocks")]
     #[error("Fireblocks error: {0}")]
     Fireblocks(#[from] fireblocks::FireblocksError),
@@ -82,7 +84,7 @@ impl From<alloy::hex::FromHexError> for EvmError {
 /// Implementations only need to supply the provider — `call` has a
 /// default implementation that handles error decoding.
 #[async_trait]
-pub trait Evm: Send + Sync {
+pub trait Evm: Send + Sync + 'static {
     /// The provider type used for chain access.
     type Provider: Provider + Clone + Send + Sync;
 
@@ -94,11 +96,7 @@ pub trait Evm: Send + Sync {
     /// Runs `eth_call` against the given contract and calldata. On
     /// revert, attempts to decode the Solidity error via the OpenChain
     /// selector registry before returning.
-    async fn call(
-        &self,
-        contract: Address,
-        calldata: Bytes,
-    ) -> Result<Bytes, EvmError> {
+    async fn call(&self, contract: Address, calldata: Bytes) -> Result<Bytes, EvmError> {
         let tx = alloy::rpc::types::TransactionRequest::default()
             .to(contract)
             .input(calldata.into());
@@ -107,16 +105,14 @@ pub trait Evm: Send + Sync {
             Ok(result) => Ok(result),
             Err(rpc_err) => {
                 // Wrap in alloy::contract::Error to reuse its revert data extraction
-                let contract_err =
-                    alloy::contract::Error::TransportError(rpc_err);
+                let contract_err = alloy::contract::Error::TransportError(rpc_err);
 
                 if let Some(revert_data) = contract_err.as_revert_data() {
-                    if let Ok(decoded) =
-                        AbiDecodedErrorType::selector_registry_abi_decode(
-                            revert_data.as_ref(),
-                            None,
-                        )
-                        .await
+                    if let Ok(decoded) = AbiDecodedErrorType::selector_registry_abi_decode(
+                        revert_data.as_ref(),
+                        None,
+                    )
+                    .await
                     {
                         return Err(EvmError::DecodedRevert(decoded));
                     }
@@ -164,11 +160,7 @@ impl<T: Evm> Evm for Arc<T> {
         (**self).provider()
     }
 
-    async fn call(
-        &self,
-        contract: Address,
-        calldata: Bytes,
-    ) -> Result<Bytes, EvmError> {
+    async fn call(&self, contract: Address, calldata: Bytes) -> Result<Bytes, EvmError> {
         (**self).call(contract, calldata).await
     }
 }
