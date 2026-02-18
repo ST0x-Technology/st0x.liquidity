@@ -12,7 +12,6 @@
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
-use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use rain_math_float::Float;
@@ -384,6 +383,7 @@ mod tests {
     use alloy::network::Ethereum;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{B256, b256};
+    use alloy::providers::Provider;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };

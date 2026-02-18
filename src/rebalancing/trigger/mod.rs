@@ -195,6 +195,33 @@ impl RebalancingCtx {
     pub(crate) fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.ethereum_wallet
     }
+
+    /// Test constructor that creates a `RebalancingCtx` with stub wallets.
+    ///
+    /// The wallets panic on `send` — use only in tests that don't submit
+    /// transactions through the rebalancing wallet.
+    #[cfg(test)]
+    pub(crate) fn stub(
+        equity: ImbalanceThreshold,
+        usdc: UsdcRebalancing,
+        redemption_wallet: Address,
+        usdc_vault_id: B256,
+        alpaca_broker_auth: AlpacaBrokerApiCtx,
+        equities: HashMap<Symbol, EquityTokenAddresses>,
+    ) -> Self {
+        let wallet = StubWallet::new(Address::ZERO);
+
+        Self {
+            equity,
+            usdc,
+            redemption_wallet,
+            usdc_vault_id,
+            alpaca_broker_auth,
+            equities,
+            base_wallet: wallet.clone(),
+            ethereum_wallet: wallet,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -808,7 +835,6 @@ impl RebalancingTrigger {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
-    use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -2753,6 +2779,12 @@ mod tests {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equities]
 
@@ -2769,8 +2801,10 @@ mod tests {
 
     fn valid_rebalancing_secrets_toml() -> &'static str {
         r#"
+            base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            fireblocks_api_user_id = "test-api-user"
+            fireblocks_secret_path = "/tmp/test-fireblocks.key"
         "#
     }
 
@@ -2879,15 +2913,16 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_evm_private_key_fails() {
+    fn deserialize_missing_fireblocks_fields_fails() {
         let toml_str = r#"
+            base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
         "#;
 
         let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
         assert!(
-            error.message().contains("evm_private_key"),
-            "Expected missing evm_private_key error, got: {error}"
+            error.message().contains("fireblocks_api_user_id"),
+            "Expected missing fireblocks_api_user_id error, got: {error}"
         );
     }
 
@@ -3724,52 +3759,6 @@ mod tests {
         assert!(
             logs_contain("Triggered equity rebalancing"),
             "Should trigger rebalancing once both venues have data"
-        );
-    }
-
-    #[test]
-    fn new_derives_market_maker_wallet_from_private_key() {
-        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
-        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
-
-        let expected_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
-            .unwrap()
-            .address();
-
-        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
-
-        assert_eq!(ctx.market_maker_wallet, expected_wallet);
-    }
-
-    #[test]
-    fn new_rejects_identical_market_maker_and_redemption_wallets() {
-        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
-        let derived_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
-            .unwrap()
-            .address();
-
-        let config_toml = format!(
-            r#"
-            redemption_wallet = "{derived_wallet}"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-
-            [equities]
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            mode = "disabled"
-        "#
-        );
-        let config: RebalancingConfig = toml::from_str(&config_toml).unwrap();
-
-        let error = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap_err();
-
-        assert!(
-            matches!(error, RebalancingCtxError::WalletsMatch(addr) if addr == derived_wallet),
-            "Expected WalletsMatch with {derived_wallet}, got: {error:?}"
         );
     }
 }

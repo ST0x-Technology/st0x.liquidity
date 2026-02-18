@@ -1,7 +1,6 @@
 //! WrapperService implementation for ERC-4626 token wrapping/unwrapping.
 
 use alloy::primitives::{Address, Bytes, TxHash, U256};
-use alloy::providers::Provider;
 use alloy::sol_types::{SolCall, SolEvent};
 use async_trait::async_trait;
 use serde::Deserialize;

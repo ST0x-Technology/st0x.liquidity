@@ -42,46 +42,11 @@ pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) usdc: Arc<Store<UsdcRebalance>>,
 }
 
-/// Spawns the rebalancing infrastructure.
-///
-/// All CQRS frameworks are created in the conductor and passed here to ensure
-/// single-instance initialization with all required query processors.
-pub(crate) async fn spawn_rebalancer<Chain: Wallet + Clone>(
-    ctx: &RebalancingCtx,
-    ethereum_wallet: Chain,
-    base_wallet: Chain,
-    market_maker_wallet: Address,
-    operation_receiver: mpsc::Receiver<TriggeredOperation>,
-    frameworks: RebalancingCqrsFrameworks,
-    raindex_service: Arc<RaindexService<Chain>>,
-    tokenizer: Arc<dyn Tokenizer>,
-) -> Result<JoinHandle<()>, SpawnRebalancerError> {
-    let services = Services::new(
-        ctx,
-        ethereum_wallet,
-        base_wallet,
-        market_maker_wallet,
-        raindex_service,
-        tokenizer,
-    )
-    .await?;
-
-    let rebalancer =
-        services.into_rebalancer(ctx, market_maker_wallet, operation_receiver, frameworks);
-
-    let handle = tokio::spawn(async move {
-        rebalancer.run().await;
-    });
-
-    info!("Rebalancing infrastructure initialized");
-    Ok(handle)
-}
-
 /// External service clients for rebalancing operations.
 ///
 /// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
 /// Providers for both chains are obtained from the wallets on `RebalancingCtx`.
-struct Services<Chain: Wallet> {
+pub(crate) struct RebalancerServices<Chain: Wallet> {
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<Chain, Chain>>,
@@ -90,55 +55,16 @@ struct Services<Chain: Wallet> {
     wrapper: Arc<WrapperService<Chain>>,
 }
 
-impl<Chain: Wallet> Services<Chain> {
-    /// Converts Services into a configured Rebalancer.
-    fn into_rebalancer(
-        self,
-        ctx: &RebalancingCtx,
-        market_maker_wallet: Address,
-        operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        frameworks: RebalancingCqrsFrameworks,
-    ) -> Rebalancer {
-        let equity = Arc::new(CrossVenueEquityTransfer::new(
-            self.raindex.clone(),
-            self.tokenizer,
-            self.wrapper,
-            market_maker_wallet,
-            frameworks.mint,
-            frameworks.redemption,
-        ));
-
-        let usdc = Arc::new(CrossVenueCashTransfer::new(
-            self.broker,
-            self.wallet,
-            self.cctp,
-            self.raindex,
-            frameworks.usdc,
-            market_maker_wallet,
-            RaindexVaultId(ctx.usdc_vault_id),
-        ));
-
-        Rebalancer::new(
-            Arc::clone(&equity) as _,
-            equity as _,
-            Arc::clone(&usdc) as _,
-            usdc as _,
-            operation_receiver,
-        )
-    }
-}
-
-impl<Chain: Wallet + Clone> Services<Chain> {
+impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// Creates the services needed for rebalancing.
     ///
     /// RaindexService is passed in rather than created here because it is
     /// needed for CQRS framework initialization in the conductor, which
-    /// must happen before spawn_rebalancer is called.
-    async fn new(
+    /// must happen before this constructor is called.
+    pub(crate) async fn new(
         ctx: &RebalancingCtx,
         ethereum_wallet: Chain,
         base_wallet: Chain,
-        market_maker_wallet: Address,
         raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
@@ -171,6 +97,51 @@ impl<Chain: Wallet + Clone> Services<Chain> {
             wrapper,
         })
     }
+
+    /// Spawns the rebalancer as a background task.
+    ///
+    /// All CQRS frameworks are created in the conductor and passed here to
+    /// ensure single-instance initialization with all required query
+    /// processors.
+    pub(crate) fn spawn(
+        self,
+        ctx: &RebalancingCtx,
+        market_maker_wallet: Address,
+        operation_receiver: mpsc::Receiver<TriggeredOperation>,
+        frameworks: RebalancingCqrsFrameworks,
+    ) -> JoinHandle<()> {
+        let equity = Arc::new(CrossVenueEquityTransfer::new(
+            self.raindex.clone(),
+            self.tokenizer,
+            self.wrapper,
+            market_maker_wallet,
+            frameworks.mint,
+            frameworks.redemption,
+        ));
+
+        let usdc = Arc::new(CrossVenueCashTransfer::new(
+            self.broker,
+            self.wallet,
+            self.cctp,
+            self.raindex,
+            frameworks.usdc,
+            market_maker_wallet,
+            RaindexVaultId(ctx.usdc_vault_id),
+        ));
+
+        let rebalancer = Rebalancer::new(
+            Arc::clone(&equity) as _,
+            equity as _,
+            Arc::clone(&usdc) as _,
+            usdc as _,
+            operation_receiver,
+        );
+
+        info!("Rebalancing infrastructure initialized");
+        tokio::spawn(async move {
+            rebalancer.run().await;
+        })
+    }
 }
 
 #[cfg(test)]
@@ -194,9 +165,6 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::{Projection, test_store};
-    use st0x_evm::fireblocks::{
-        FireblocksApiUserId, FireblocksEnvironment, FireblocksVaultAccountId,
-    };
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
@@ -223,20 +191,18 @@ mod tests {
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_ctx() -> RebalancingCtx {
-        RebalancingCtx {
-            equity: ImbalanceThreshold {
+        RebalancingCtx::stub(
+            ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: UsdcRebalancing::Enabled {
+            UsdcRebalancing::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
-            redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
-            usdc_vault_id: b256!(
-                "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            ),
-            alpaca_broker_auth: AlpacaBrokerApiCtx {
+            address!("0x1234567890123456789012345678901234567890"),
+            b256!("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
                 account_id: AlpacaAccountId::new(Uuid::nil()),
@@ -244,16 +210,8 @@ mod tests {
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
             },
-            equities: HashMap::new(),
-            fireblocks_api_user_id: FireblocksApiUserId::new("test-user"),
-            fireblocks_secret: vec![0u8; 32],
-            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
-            fireblocks_environment: FireblocksEnvironment::Sandbox,
-            fireblocks_chain_asset_ids: serde_json::from_value(
-                serde_json::json!({"1": "ETH", "8453": "BASECHAIN_ETH"}),
-            )
-            .unwrap(),
-        }
+            HashMap::new(),
+        )
     }
 
     #[test]
@@ -301,7 +259,10 @@ mod tests {
 
     async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
-    ) -> (Services<RawPrivateKeyWallet<BaseProvider>>, RebalancingCtx) {
+    ) -> (
+        RebalancerServices<RawPrivateKeyWallet<BaseProvider>>,
+        RebalancingCtx,
+    ) {
         let anvil = Anvil::new().spawn();
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
@@ -384,7 +345,7 @@ mod tests {
             owner,
         ));
 
-        let services = Services {
+        let services = RebalancerServices {
             broker,
             wallet,
             cctp,
@@ -428,7 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn into_rebalancer_dispatches_mint_operation() {
+    async fn spawn_dispatches_mint_operation() {
         let server = MockServer::start();
         let (services, config) = make_services_with_mock_wallet(&server).await;
 
@@ -451,7 +412,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let rebalancer = services.into_rebalancer(&config, Address::random(), rx, frameworks);
+        let handle = services.spawn(&config, Address::random(), rx, frameworks);
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -461,6 +422,6 @@ mod tests {
         .unwrap();
 
         drop(tx);
-        rebalancer.run().await;
+        handle.await.unwrap();
     }
 }

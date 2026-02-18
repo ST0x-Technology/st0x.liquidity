@@ -13,8 +13,11 @@ service_name = "st0x-hedge"
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 fireblocks_vault_account_id = "0"
-fireblocks_chain_asset_ids = "1:ETH,8453:BASECHAIN_ETH"
 fireblocks_environment = "sandbox"
+
+[rebalancing.fireblocks_chain_asset_ids]
+1 = "ETH"
+8453 = "BASECHAIN_ETH"
 
 [rebalancing.equities.tEXAMPLE]
 unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

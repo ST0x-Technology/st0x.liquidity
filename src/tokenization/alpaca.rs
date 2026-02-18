@@ -151,7 +151,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
     }
 
     #[cfg(test)]
-    fn new_with_client(client: AlpacaTokenizationClient, polling_config: PollingConfig) -> Self {
+    fn new_with_client(client: AlpacaTokenizationClient<W>, polling_config: PollingConfig) -> Self {
         Self {
             client,
             polling_config,
@@ -1121,7 +1121,8 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let token = TestERC20::deploy(wallet.provider()).await.unwrap();
+        let provider = wallet.provider().clone();
+        let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
         let mint_amount = U256::from(1_000_000_000u64);
@@ -1171,7 +1172,8 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let token = TestERC20::deploy(wallet.provider()).await.unwrap();
+        let provider = wallet.provider().clone();
+        let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
         let client = AlpacaTokenizationClient::new_with_base_url(

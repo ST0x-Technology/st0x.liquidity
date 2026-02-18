@@ -8,7 +8,7 @@ use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{error, info, info_span, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
@@ -90,14 +90,11 @@ fn spawn_bot_task(
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> JoinHandle<()> {
-    tokio::spawn(
-        async move {
-            if let Err(error) = run(ctx, pool, event_sender).await {
-                error!("Bot failed: {error}");
-            }
+    tokio::spawn(async move {
+        if let Err(error) = run(ctx, pool, event_sender).await {
+            error!("Bot failed: {error}");
         }
-        .instrument(info_span!("bot_task")),
-    )
+    })
 }
 
 async fn await_shutdown(
@@ -189,48 +186,37 @@ async fn run_bot_session(
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
-    match &ctx.broker {
+    match ctx.broker.clone() {
         BrokerCtx::DryRun => {
             info!("Initializing test executor for dry-run mode");
             let executor = MockExecutorCtx.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            run_with_executor(ctx, pool, executor, event_sender).await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
         BrokerCtx::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let executor = schwab_ctx.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            run_with_executor(ctx, pool, executor, event_sender).await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             info!("Initializing Alpaca Trading API executor");
-            let executor = alpaca_auth.clone().try_into_executor().await?;
+            let executor = alpaca_auth.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            run_with_executor(ctx, pool, executor, event_sender).await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             info!("Initializing Alpaca Broker API executor");
-            let executor = alpaca_auth.clone().try_into_executor().await?;
+            let executor = alpaca_auth.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            run_with_executor(ctx, pool, executor, event_sender).await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
     }
-}
-
-async fn run_with_executor<E>(
-    ctx: Ctx,
-    pool: SqlitePool,
-    executor: E,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    conductor::EventProcessingError: From<E::Error>,
-{
-    let executor_maintenance = executor.run_executor_maintenance().await;
-
-    conductor::run_market_hours_loop(executor, ctx, pool, executor_maintenance, event_sender).await
 }
 
 #[cfg(test)]

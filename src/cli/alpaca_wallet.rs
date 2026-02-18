@@ -521,18 +521,15 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
-            trading_mode: TradingMode::Rebalancing(RebalancingCtx {
-                evm_private_key: B256::ZERO,
-                ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                usdc_vault_id: B256::ZERO,
-                redemption_wallet: Address::ZERO,
-                market_maker_wallet: Address::ZERO,
-                equity: ImbalanceThreshold {
+            trading_mode: TradingMode::Rebalancing(RebalancingCtx::stub(
+                ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc: UsdcRebalancing::Disabled,
-                alpaca_broker_auth: AlpacaBrokerApiCtx {
+                UsdcRebalancing::Disabled,
+                Address::ZERO,
+                B256::ZERO,
+                AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
                     account_id: alpaca_account_id,
@@ -540,8 +537,8 @@ mod tests {
                     asset_cache_ttl: std::time::Duration::from_secs(3600),
                     time_in_force: TimeInForce::default(),
                 },
-                equities: HashMap::new(),
-            }),
+                HashMap::new(),
+            )),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

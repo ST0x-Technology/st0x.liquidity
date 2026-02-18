@@ -40,6 +40,7 @@ type SignerProvider<P> = FillProvider<
 /// `P` is the **base** provider type (e.g., from
 /// `ProviderBuilder::new().connect_http(url)`). The wallet-equipped provider
 /// is derived internally and exposed via [`Evm::provider()`].
+#[derive(Clone)]
 pub struct RawPrivateKeyWallet<P: Provider> {
     provider: SignerProvider<P>,
     required_confirmations: u64,

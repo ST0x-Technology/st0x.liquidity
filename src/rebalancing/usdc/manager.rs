@@ -1048,8 +1048,10 @@ mod tests {
         let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
 
+        let owner = wallet.address();
+
         let vault_service =
-            RaindexService::new(wallet, ORDERBOOK_ADDRESS, vault_registry_projection);
+            RaindexService::new(wallet, ORDERBOOK_ADDRESS, vault_registry_projection, owner);
 
         (cctp_bridge, vault_service)
     }

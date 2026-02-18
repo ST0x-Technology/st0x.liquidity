@@ -1,13 +1,11 @@
 //! CCTP bridge and recovery CLI commands.
 
 use alloy::primitives::{B256, Bytes, U256};
-use alloy::providers::RootProvider;
 use alloy::sol_types::SolCall;
 use rust_decimal::Decimal;
 use std::io::Write;
-use std::sync::Arc;
 
-use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
+use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
 use st0x_evm::Wallet;
 
@@ -15,7 +13,6 @@ use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::rebalancing::RebalancingCtx;
 use crate::threshold::Usdc;
 
 impl CctpChain {
@@ -78,7 +75,12 @@ pub(super) async fn cctp_bridge_command<W: Write>(
     )?;
     writeln!(stdout, "   Wallet: {wallet}")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing_ctx)?;
+    let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
+        usdc_ethereum: USDC_ETHEREUM,
+        usdc_base: USDC_BASE,
+        ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
+        base_wallet: rebalancing_ctx.base_wallet().clone(),
+    })?;
 
     let direction = from.to_bridge_direction();
 
@@ -105,20 +107,6 @@ pub(super) async fn cctp_bridge_command<W: Write>(
     Ok(())
 }
 
-fn build_cctp_bridge(
-    rebalancing: &RebalancingCtx,
-) -> Result<
-    CctpBridge<Arc<dyn Wallet<Provider = RootProvider>>, Arc<dyn Wallet<Provider = RootProvider>>>,
-    CctpError,
-> {
-    CctpBridge::try_from_ctx(CctpCtx {
-        usdc_ethereum: USDC_ETHEREUM,
-        usdc_base: USDC_BASE,
-        ethereum_wallet: rebalancing.ethereum_wallet().clone(),
-        base_wallet: rebalancing.base_wallet().clone(),
-    })
-}
-
 pub(super) async fn cctp_recover_command<W: Write>(
     stdout: &mut W,
     burn_tx: B256,
@@ -139,7 +127,12 @@ pub(super) async fn cctp_recover_command<W: Write>(
     writeln!(stdout, "   Destination chain: {dest_chain:?}")?;
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing_ctx)?;
+    let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
+        usdc_ethereum: USDC_ETHEREUM,
+        usdc_base: USDC_BASE,
+        ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
+        base_wallet: rebalancing_ctx.base_wallet().clone(),
+    })?;
 
     // Use the V2 API which returns both message and attestation from tx hash
     let response = cctp_bridge.poll_attestation(direction, burn_tx).await?;
@@ -218,12 +211,9 @@ pub(super) async fn reset_allowance_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, address};
-    use alloy::providers::Provider;
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use std::str::FromStr;
     use url::Url;
-    use uuid::uuid;
 
     use super::*;
     use crate::config::{BrokerCtx, LogLevel, TradingMode};
