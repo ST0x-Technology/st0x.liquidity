@@ -74,6 +74,17 @@
             st0x-dto = st0xRust.dto;
           };
 
+          ci = rainix.mkTask.${system} {
+            name = "ci";
+            body = ''
+              set -euxo pipefail
+              cargo check --workspace
+              cargo test --workspace -q
+              cargo clippy --workspace --all-targets --all-features
+              cargo fmt
+            '';
+          };
+
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
