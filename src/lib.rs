@@ -17,9 +17,6 @@ use crate::config::{BrokerCtx, Ctx};
 
 mod alpaca_wallet;
 pub mod api;
-#[cfg(not(any(test, feature = "test-support")))]
-mod bindings;
-#[cfg(any(test, feature = "test-support"))]
 pub mod bindings;
 pub mod cli;
 mod conductor;

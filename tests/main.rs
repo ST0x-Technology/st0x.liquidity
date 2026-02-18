@@ -5,7 +5,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use alloy::providers::Provider;
 
-use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 use st0x_hedge::config::{BrokerCtx, Ctx, EvmCtx, LogLevel};
 use st0x_hedge::launch;
 
@@ -113,6 +113,8 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
         account_id: alpaca_broker::TEST_ACCOUNT_ID.to_owned(),
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
+        asset_cache_ttl: Duration::from_secs(3600),
+        time_in_force: TimeInForce::Day,
     });
     let execution_threshold = broker_ctx.execution_threshold()?;
 
