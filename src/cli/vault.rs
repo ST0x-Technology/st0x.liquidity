@@ -1,7 +1,6 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::Provider;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
@@ -47,15 +46,11 @@ fn decimal_to_u256(amount: Decimal, decimals: u8) -> Result<U256, VaultCliError>
     Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
 }
 
-pub(super) async fn vault_deposit_command<
-    W: Write,
-    BP: Provider + Clone + Send + Sync + 'static,
->(
+pub(super) async fn vault_deposit_command<W: Write>(
     stdout: &mut W,
     deposit: Deposit,
     ctx: &Ctx,
     pool: &SqlitePool,
-    base_provider: BP,
 ) -> anyhow::Result<()> {
     let Deposit {
         amount,
@@ -69,7 +64,7 @@ pub(super) async fn vault_deposit_command<
     writeln!(stdout, "   Decimals: {decimals}")?;
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_caller().address();
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
@@ -81,12 +76,11 @@ pub(super) async fn vault_deposit_command<
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
-        base_provider,
+        rebalancing_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
-    )
-    .with_caller(rebalancing_ctx.base_caller().clone());
+    );
 
     writeln!(
         stdout,
@@ -102,21 +96,17 @@ pub(super) async fn vault_deposit_command<
     Ok(())
 }
 
-pub(super) async fn vault_withdraw_command<
-    W: Write,
-    BP: Provider + Clone + Send + Sync + 'static,
->(
+pub(super) async fn vault_withdraw_command<W: Write>(
     stdout: &mut W,
     amount: Usdc,
     ctx: &Ctx,
     pool: &SqlitePool,
-    base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_caller().address();
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
@@ -125,12 +115,11 @@ pub(super) async fn vault_withdraw_command<
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
-        base_provider,
+        rebalancing_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
-    )
-    .with_caller(rebalancing_ctx.base_caller().clone());
+    );
 
     let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id);
 
@@ -148,8 +137,7 @@ pub(super) async fn vault_withdraw_command<
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
-    use alloy::providers::mock::Asserter;
+    use alloy::primitives::{Address, address, b256};
     use rust_decimal_macros::dec;
     use std::str::FromStr;
     use url::Url;
@@ -180,11 +168,6 @@ mod tests {
         }
     }
 
-    fn create_mock_provider() -> impl Provider + Clone + 'static {
-        let asserter = Asserter::new();
-        ProviderBuilder::new().connect_mocked_client(asserter)
-    }
-
     const TEST_TOKEN: Address = address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913");
     const TEST_VAULT_ID: B256 =
         b256!("0000000000000000000000000000000000000000000000000000000000000001");
@@ -192,7 +175,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_deposit_requires_rebalancing_config() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
         let amount = Decimal::from_str("100").unwrap();
 
         let mut stdout = Vec::new();
@@ -207,7 +189,6 @@ mod tests {
             deposit,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await;
 
@@ -221,7 +202,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_config() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
@@ -230,7 +210,6 @@ mod tests {
             amount,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await;
 
@@ -244,7 +223,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_deposit_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
 
         let mut stdout = Vec::new();
         let deposit = Deposit {
@@ -258,7 +236,6 @@ mod tests {
             deposit,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await
         .unwrap_err();
@@ -273,7 +250,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
@@ -282,7 +258,6 @@ mod tests {
             amount,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await
         .unwrap_err();

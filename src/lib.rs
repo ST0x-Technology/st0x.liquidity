@@ -8,7 +8,7 @@ use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{error, info, info_span, warn};
+use tracing::{Instrument, error, info, info_span, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
@@ -90,14 +90,14 @@ fn spawn_bot_task(
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let bot_span = info_span!("bot_task");
-        let _enter = bot_span.enter();
-
-        if let Err(error) = Box::pin(run(ctx, pool, event_sender)).await {
-            error!("Bot failed: {error}");
+    tokio::spawn(
+        async move {
+            if let Err(error) = run(ctx, pool, event_sender).await {
+                error!("Bot failed: {error}");
+            }
         }
-    })
+        .instrument(info_span!("bot_task")),
+    )
 }
 
 async fn await_shutdown(
@@ -157,7 +157,7 @@ async fn run(
     const RERUN_DELAY_SECS: u64 = 10;
 
     loop {
-        let result = Box::pin(run_bot_session(&ctx, &pool, event_sender.clone())).await;
+        let result = run_bot_session(ctx.clone(), pool.clone(), event_sender.clone()).await;
 
         match result {
             Ok(()) => {
@@ -185,8 +185,8 @@ async fn run(
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 async fn run_bot_session(
-    ctx: &Ctx,
-    pool: &SqlitePool,
+    ctx: Ctx,
+    pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     match &ctx.broker {
@@ -194,50 +194,26 @@ async fn run_bot_session(
             info!("Initializing test executor for dry-run mode");
             let executor = MockExecutorCtx.try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            run_with_executor(ctx, pool, executor, event_sender).await
         }
         BrokerCtx::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let executor = schwab_ctx.try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            run_with_executor(ctx, pool, executor, event_sender).await
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             info!("Initializing Alpaca Trading API executor");
             let executor = alpaca_auth.clone().try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            run_with_executor(ctx, pool, executor, event_sender).await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             info!("Initializing Alpaca Broker API executor");
             let executor = alpaca_auth.clone().try_into_executor().await?;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            run_with_executor(ctx, pool, executor, event_sender).await
         }
     }
 }

@@ -611,7 +611,7 @@ async fn run_provider_command<W: Write>(
             .await
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
-            rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool, provider).await
+            rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
         }
         ProviderCommand::VaultDeposit {
             amount,
@@ -625,10 +625,10 @@ async fn run_provider_command<W: Write>(
                 vault_id,
                 decimals,
             };
-            vault::vault_deposit_command(stdout, deposit, ctx, pool, provider).await
+            vault::vault_deposit_command(stdout, deposit, ctx, pool).await
         }
         ProviderCommand::VaultWithdraw { amount } => {
-            vault::vault_withdraw_command(stdout, amount, ctx, pool, provider).await
+            vault::vault_withdraw_command(stdout, amount, ctx, pool).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command(stdout, amount, all, from, ctx).await

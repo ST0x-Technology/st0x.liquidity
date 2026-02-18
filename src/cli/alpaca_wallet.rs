@@ -30,7 +30,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_caller().address();
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
 
@@ -60,7 +60,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
     let usdc_contract =
-        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_caller().provider());
+        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_wallet().provider());
 
     let balance = usdc_contract.balanceOf(sender_address).call().await?;
     writeln!(stdout, "   Current USDC balance: {balance}")?;
@@ -76,7 +76,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     };
     let encoded = Bytes::from(SolCall::abi_encode(&calldata));
     let tx_receipt = rebalancing_ctx
-        .ethereum_caller()
+        .ethereum_wallet()
         .send(usdc_address, encoded, "USDC transfer to Alpaca")
         .await?;
 
@@ -123,7 +123,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_caller().address();
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     let destination = to_address.unwrap_or(sender_address);
     writeln!(stdout, "   Destination address: {destination}")?;
@@ -136,7 +136,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
     let usdc =
-        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_caller().provider());
+        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_wallet().provider());
 
     let balance_before = usdc.balanceOf(destination).call().await?;
     writeln!(stdout, "   Balance before: {balance_before}")?;
@@ -214,7 +214,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let target_address = address.unwrap_or_else(|| rebalancing_ctx.base_caller().address());
+    let target_address = address.unwrap_or_else(|| rebalancing_ctx.base_wallet().address());
 
     writeln!(stdout, "Whitelisting address for Alpaca withdrawals")?;
     writeln!(stdout, "   Address: {target_address}")?;

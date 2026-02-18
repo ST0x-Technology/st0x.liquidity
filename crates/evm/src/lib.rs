@@ -153,7 +153,7 @@ pub trait Wallet: Evm {
 }
 
 #[async_trait]
-impl<T: Evm> Evm for Arc<T> {
+impl<T: Evm + ?Sized> Evm for Arc<T> {
     type Provider = T::Provider;
 
     fn provider(&self) -> &Self::Provider {
@@ -166,7 +166,7 @@ impl<T: Evm> Evm for Arc<T> {
 }
 
 #[async_trait]
-impl<T: Wallet> Wallet for Arc<T> {
+impl<T: Wallet + ?Sized> Wallet for Arc<T> {
     fn address(&self) -> Address {
         (**self).address()
     }
@@ -178,5 +178,32 @@ impl<T: Wallet> Wallet for Arc<T> {
         note: &str,
     ) -> Result<TransactionReceipt, EvmError> {
         (**self).send(contract, calldata, note).await
+    }
+}
+
+/// Read-only EVM access wrapping a bare [`Provider`].
+///
+/// Use this when you need an [`Evm`] implementation but don't have
+/// (or need) signing capabilities. Wraps any `Provider` into an `Evm`
+/// with the default error-decoded `call` implementation.
+pub struct ReadOnlyEvm<P> {
+    provider: P,
+}
+
+impl<P> ReadOnlyEvm<P> {
+    pub fn new(provider: P) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl<P> Evm for ReadOnlyEvm<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    type Provider = P;
+
+    fn provider(&self) -> &P {
+        &self.provider
     }
 }

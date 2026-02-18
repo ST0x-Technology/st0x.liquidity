@@ -7,7 +7,7 @@ mod builder;
 mod manifest;
 
 use alloy::primitives::{Address, IntoLogData};
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
@@ -310,10 +310,10 @@ struct RebalancingInfrastructure {
     rebalancer: JoinHandle<()>,
 }
 
-async fn spawn_rebalancing_infrastructure<W: Wallet + Clone>(
+async fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: &RebalancingCtx,
-    ethereum_wallet: W,
-    base_wallet: W,
+    ethereum_wallet: Chain,
+    base_wallet: Chain,
     pool: &SqlitePool,
     ctx: &Ctx,
     inventory: &Arc<RwLock<InventoryView>>,
@@ -333,6 +333,7 @@ async fn spawn_rebalancing_infrastructure<W: Wallet + Clone>(
         base_wallet.clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
+        market_maker_wallet,
     ));
 
     let tokenization = Arc::new(AlpacaTokenizationService::new(
@@ -390,7 +391,7 @@ async fn spawn_rebalancing_infrastructure<W: Wallet + Clone>(
         market_maker_wallet,
         operation_receiver,
         frameworks,
-        raindex_service.clone(),
+        raindex_service,
         tokenizer,
     )
     .await?;
@@ -610,17 +611,17 @@ where
     })
 }
 
-fn spawn_inventory_poller<P, E>(
-    raindex_service: Arc<RaindexService<P>>,
-    executor: E,
+fn spawn_inventory_poller<Chain, Exe>(
+    raindex_service: Arc<RaindexService<Chain>>,
+    executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
     snapshot: Store<InventorySnapshot>,
 ) -> JoinHandle<()>
 where
-    P: Provider + Clone + Send + 'static,
-    E: Executor + Clone + Send + 'static,
+    Chain: st0x_evm::Evm,
+    Exe: Executor + Clone + Send + 'static,
 {
     info!("Starting inventory poller");
 

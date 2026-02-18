@@ -70,6 +70,7 @@ pub(crate) enum UsdcRebalancing {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
+    pub(crate) base_rpc_url: Url,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
     pub(crate) fireblocks_secret_path: PathBuf,
@@ -114,7 +115,7 @@ pub(crate) struct RebalancingCtx {
 }
 
 impl RebalancingCtx {
-    /// Construct from config, secrets, broker auth, and base chain RPC URL.
+    /// Construct from config, secrets, and broker auth.
     ///
     /// Reads the Fireblocks RSA secret, builds wallets for both chains
     /// (resolving the vault address from the Fireblocks API), and
@@ -125,7 +126,6 @@ impl RebalancingCtx {
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
-        base_rpc_url: Url,
     ) -> Result<Self, RebalancingCtxError> {
         let fireblocks_secret = std::fs::read(&secrets.fireblocks_secret_path)?;
 
@@ -133,7 +133,7 @@ impl RebalancingCtx {
             &config,
             &fireblocks_secret,
             &secrets.fireblocks_api_user_id,
-            base_rpc_url,
+            secrets.base_rpc_url,
         )
         .await?;
 

@@ -1,6 +1,7 @@
 //! Transfer equity and USDC rebalancing CLI commands.
 
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::primitives::Address;
+use alloy::providers::Provider;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -51,11 +52,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let wallet = rebalancing_ctx.base_caller().address();
-    let base_caller = rebalancing_ctx.base_caller().clone();
-
-    let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
-    let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
+    let wallet = rebalancing_ctx.base_wallet().address();
+    let base_caller = rebalancing_ctx.base_wallet().clone();
 
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
@@ -78,7 +76,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             ));
 
             let raindex = Arc::new(RaindexService::new(
-                base_provider,
+                base_caller.clone(),
                 ctx.evm.orderbook,
                 vault_registry_projection.clone(),
                 wallet,
@@ -126,14 +124,12 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let vault_registry_projection =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
             let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-                base_provider.clone(),
-                base_caller,
-                wallet,
+                base_caller.clone(),
                 rebalancing_ctx.equities.clone(),
             ));
 
             let raindex = Arc::new(RaindexService::new(
-                base_provider,
+                base_caller.clone(),
                 ctx.evm.orderbook,
                 vault_registry_projection,
                 wallet,
@@ -177,17 +173,13 @@ pub(super) async fn transfer_equity_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn transfer_usdc_command<W: Write, BP>(
+pub(super) async fn transfer_usdc_command<W: Write>(
     stdout: &mut W,
     direction: TransferDirection,
     amount: Usdc,
     ctx: &Ctx,
     pool: &SqlitePool,
-    base_provider: BP,
-) -> anyhow::Result<()>
-where
-    BP: Provider + Clone + Send + Sync + 'static,
-{
+) -> anyhow::Result<()> {
     let dir = match direction {
         TransferDirection::ToRaindex => "Alpaca -> Raindex",
         TransferDirection::ToAlpaca => "Raindex -> Alpaca",
@@ -199,7 +191,7 @@ where
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let owner = rebalancing_ctx.base_caller().address();
+    let owner = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
 
@@ -230,20 +222,17 @@ where
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
-        ethereum_caller: rebalancing_ctx.ethereum_caller().clone(),
-        base_caller: rebalancing_ctx.base_caller().clone(),
+        ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
+        base_wallet: rebalancing_ctx.base_wallet().clone(),
     })?);
 
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
-    let vault_service = Arc::new(
-        RaindexService::new(
-            base_provider,
-            ctx.evm.orderbook,
-            vault_registry_projection,
-            owner,
-        )
-        .with_caller(rebalancing_ctx.base_caller().clone()),
-    );
+    let vault_service = Arc::new(RaindexService::new(
+        rebalancing_ctx.base_wallet().clone(),
+        ctx.evm.orderbook,
+        vault_registry_projection,
+        owner,
+    ));
     let usdc_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
 
     let rebalance_manager = CrossVenueCashTransfer::new(
@@ -300,7 +289,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'sta
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let receiving_wallet = rebalancing_ctx.base_caller().address();
+    let receiving_wallet = rebalancing_ctx.base_wallet().address();
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
     let erc20 = IERC20::new(token, provider.clone());
@@ -316,7 +305,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'sta
         rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        rebalancing_ctx.base_caller().clone(),
+        rebalancing_ctx.base_wallet().clone(),
         rebalancing_ctx.redemption_wallet,
     );
 
@@ -413,7 +402,7 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone + 'stati
         rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        rebalancing_ctx.base_caller().clone(),
+        rebalancing_ctx.base_wallet().clone(),
         redemption_wallet,
     );
 
@@ -478,7 +467,7 @@ pub(super) async fn alpaca_tokenization_requests_command<
         rebalancing_ctx.alpaca_broker_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        rebalancing_ctx.base_caller().clone(),
+        rebalancing_ctx.base_wallet().clone(),
         rebalancing_ctx.redemption_wallet,
     );
 
@@ -541,8 +530,6 @@ fn format_tokenization_request<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
-    use alloy::providers::ProviderBuilder;
-    use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use std::str::FromStr;
@@ -587,11 +574,6 @@ mod tests {
             time_in_force: TimeInForce::default(),
         });
         ctx
-    }
-
-    fn create_mock_provider() -> impl Provider + Clone + 'static {
-        let asserter = Asserter::new();
-        ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
     #[tokio::test]
@@ -648,7 +630,6 @@ mod tests {
     async fn test_transfer_usdc_requires_alpaca_broker() {
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
@@ -658,7 +639,6 @@ mod tests {
             amount,
             &ctx,
             &pool,
-            provider,
         )
         .await;
 
@@ -673,7 +653,6 @@ mod tests {
     async fn test_transfer_usdc_requires_rebalancing_config() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
@@ -683,7 +662,6 @@ mod tests {
             amount,
             &ctx,
             &pool,
-            provider,
         )
         .await;
 
@@ -698,7 +676,6 @@ mod tests {
     async fn test_transfer_usdc_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
@@ -708,7 +685,6 @@ mod tests {
             amount,
             &ctx,
             &pool,
-            provider,
         )
         .await
         .unwrap_err();

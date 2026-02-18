@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_event_sorcery::{Projection, Store};
+use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
 use super::{
@@ -166,11 +167,14 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
+        let evm = ReadOnlyEvm::new(self.common.provider.clone());
         let raindex_service = Arc::new(RaindexService::new(
-            self.common.ctx.rebalancing_caller(),
+            evm,
             self.common.ctx.evm.orderbook,
             self.common.frameworks.vault_registry_projection.clone(),
+            order_owner,
         ));
+
         let inventory_poller = Some(spawn_inventory_poller(
             raindex_service,
             self.common.executor.clone(),

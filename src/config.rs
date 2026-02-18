@@ -333,7 +333,6 @@ impl Ctx {
                         rebalancing_config,
                         rebalancing_secrets,
                         alpaca_auth.clone(),
-                        &evm,
                     )
                     .await?,
                 )

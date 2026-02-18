@@ -46,14 +46,14 @@ pub(crate) struct RebalancingCqrsFrameworks {
 ///
 /// All CQRS frameworks are created in the conductor and passed here to ensure
 /// single-instance initialization with all required query processors.
-pub(crate) async fn spawn_rebalancer<W: Wallet + Clone>(
+pub(crate) async fn spawn_rebalancer<Chain: Wallet + Clone>(
     ctx: &RebalancingCtx,
-    ethereum_wallet: W,
-    base_wallet: W,
+    ethereum_wallet: Chain,
+    base_wallet: Chain,
     market_maker_wallet: Address,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
-    raindex_service: Arc<RaindexService<W>>,
+    raindex_service: Arc<RaindexService<Chain>>,
     tokenizer: Arc<dyn Tokenizer>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError> {
     let services = Services::new(
@@ -81,16 +81,16 @@ pub(crate) async fn spawn_rebalancer<W: Wallet + Clone>(
 ///
 /// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
 /// Providers for both chains are obtained from the wallets on `RebalancingCtx`.
-struct Services<W: Wallet> {
+struct Services<Chain: Wallet> {
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
-    cctp: Arc<CctpBridge<W, W>>,
-    raindex: Arc<RaindexService<W>>,
+    cctp: Arc<CctpBridge<Chain, Chain>>,
+    raindex: Arc<RaindexService<Chain>>,
     tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<WrapperService<W>>,
+    wrapper: Arc<WrapperService<Chain>>,
 }
 
-impl<W: Wallet> Services<W> {
+impl<Chain: Wallet> Services<Chain> {
     /// Converts Services into a configured Rebalancer.
     fn into_rebalancer(
         self,
@@ -128,19 +128,18 @@ impl<W: Wallet> Services<W> {
     }
 }
 
-impl<W: Wallet + Clone> Services<W> {
+impl<Chain: Wallet + Clone> Services<Chain> {
     /// Creates the services needed for rebalancing.
     ///
-    /// Wallets are passed explicitly to keep this function generic over
-    /// the wallet implementation. RaindexService is passed in rather than
-    /// created here because it is needed for CQRS framework initialization
-    /// in the conductor, which must happen before spawn_rebalancer is called.
+    /// RaindexService is passed in rather than created here because it is
+    /// needed for CQRS framework initialization in the conductor, which
+    /// must happen before spawn_rebalancer is called.
     async fn new(
         ctx: &RebalancingCtx,
-        ethereum_wallet: W,
-        base_wallet: W,
+        ethereum_wallet: Chain,
+        base_wallet: Chain,
         market_maker_wallet: Address,
-        raindex: Arc<RaindexService<W>>,
+        raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
         let broker_auth = &ctx.alpaca_broker_auth;
@@ -377,10 +376,12 @@ mod tests {
         let vault_registry_projection = Arc::new(
             Projection::<VaultRegistry>::sqlite(crate::test_utils::setup_test_db().await).unwrap(),
         );
+        let owner = base_wallet.address();
         let raindex = Arc::new(RaindexService::new(
             base_wallet,
             TEST_ORDERBOOK,
             vault_registry_projection,
+            owner,
         ));
 
         let services = Services {

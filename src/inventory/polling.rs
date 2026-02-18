@@ -7,13 +7,13 @@
 //! tracked inventory.
 
 use alloy::primitives::Address;
-use alloy::providers::Provider;
 use futures_util::future::try_join_all;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
 use st0x_event_sorcery::{SendError, Store};
+use st0x_evm::Evm;
 use st0x_execution::{Executor, InventoryResult};
 
 use crate::inventory::snapshot::{
@@ -41,26 +41,26 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
 }
 
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
-pub(crate) struct InventoryPollingService<P, E>
+pub(crate) struct InventoryPollingService<Chain, Exe>
 where
-    P: Provider + Clone,
+    Chain: Evm,
 {
-    raindex_service: Arc<RaindexService<P>>,
-    executor: E,
+    raindex_service: Arc<RaindexService<Chain>>,
+    executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
     snapshot: Store<InventorySnapshot>,
 }
 
-impl<P, E> InventoryPollingService<P, E>
+impl<Chain, Exe> InventoryPollingService<Chain, Exe>
 where
-    P: Provider + Clone,
-    E: Executor,
+    Chain: Evm,
+    Exe: Executor,
 {
     pub(crate) fn new(
-        raindex_service: Arc<RaindexService<P>>,
-        executor: E,
+        raindex_service: Arc<RaindexService<Chain>>,
+        executor: Exe,
         vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         order_owner: Address,
@@ -84,7 +84,7 @@ where
     /// 4. Emits InventorySnapshot events via corresponding commands
     ///
     /// Registered queries are dispatched when commands are executed.
-    pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<E::Error>> {
+    pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<Exe::Error>> {
         let snapshot_id = InventorySnapshotId {
             orderbook: self.orderbook,
             owner: self.order_owner,
@@ -99,7 +99,7 @@ where
     async fn poll_onchain(
         &self,
         snapshot_id: &InventorySnapshotId,
-    ) -> Result<(), InventoryPollingError<E::Error>> {
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let vault_registry = self.load_vault_registry().await?;
 
         let Some(registry) = vault_registry else {
@@ -115,7 +115,7 @@ where
 
     async fn load_vault_registry(
         &self,
-    ) -> Result<Option<VaultRegistry>, InventoryPollingError<E::Error>> {
+    ) -> Result<Option<VaultRegistry>, InventoryPollingError<Exe::Error>> {
         let vault_registry_id = VaultRegistryId {
             orderbook: self.orderbook,
             owner: self.order_owner,
@@ -128,7 +128,7 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
-    ) -> Result<(), InventoryPollingError<E::Error>> {
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
             debug!("No equity vaults discovered, skipping onchain equity polling");
             return Ok(());
@@ -177,7 +177,7 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
-    ) -> Result<(), InventoryPollingError<E::Error>> {
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(usdc_vault) = &registry.usdc_vault else {
             debug!("No USDC vault discovered, skipping onchain cash polling");
             return Ok(());
@@ -201,7 +201,7 @@ where
     async fn poll_offchain(
         &self,
         snapshot_id: &InventorySnapshotId,
-    ) -> Result<(), InventoryPollingError<E::Error>> {
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let inventory_result = self
             .executor
             .get_inventory()
@@ -242,11 +242,12 @@ where
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, TxHash, address, b256};
-    use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::providers::{Provider, ProviderBuilder};
     use rust_decimal::Decimal;
     use sqlx::{Row, SqlitePool};
 
+    use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use st0x_event_sorcery::test_store;
@@ -283,13 +284,13 @@ mod tests {
 
     fn create_test_raindex_service(
         pool: &SqlitePool,
-        provider: impl Provider + Clone,
-    ) -> Arc<RaindexService<impl Provider + Clone>> {
+        provider: impl Provider + Clone + Send + Sync + 'static,
+    ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + Send + Sync + 'static>>> {
         let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(VaultRegistryProjection::sqlite(pool.clone()).unwrap());
 
         Arc::new(RaindexService::new(
-            provider,
+            ReadOnlyEvm::new(provider),
             Address::ZERO,
             vault_registry_projection,
             Address::ZERO,

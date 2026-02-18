@@ -17,10 +17,11 @@ use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 use st0x_event_sorcery::ProjectionError;
-use st0x_evm::{EvmError, Wallet};
+use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::bindings::{IERC20, IOrderBookV5};
@@ -58,56 +59,52 @@ pub(crate) enum RaindexError {
 
 /// Service for managing Rain OrderBook vault operations.
 ///
-/// Uses a [`Wallet`] for both read operations (via `wallet.provider()`)
-/// and write operations (via `wallet.send()`). The owner address
-/// is derived from `wallet.address()`.
+/// Parameterized by [`Evm`] for read operations (balance queries, vault
+/// lookups) and additionally requires [`Wallet`] for write operations
+/// (deposits, withdrawals).
 ///
 /// # Example
 ///
 /// ```ignore
-/// let service = RaindexService::new(caller, orderbook_address, vault_registry_projection);
+/// let service = RaindexService::new(wallet, orderbook_address, projection, owner);
 ///
-/// // Lookup vault ID for a token
+/// // Lookup vault ID for a token (read-only, needs Evm)
 /// let vault_id = service.lookup_vault_id(token_address).await?;
 ///
-/// // Deposit USDC to vault
+/// // Deposit USDC to vault (needs Wallet)
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
 /// service.deposit_usdc(vault_id, amount).await?;
-///
-/// // Withdraw USDC from vault
-/// service.withdraw_usdc(vault_id, amount).await?;
 /// ```
-pub(crate) struct RaindexService<W: Wallet> {
-    orderbook: IOrderBookV5::IOrderBookV5Instance<W::Provider>,
+pub(crate) struct RaindexService<E: Evm> {
+    orderbook: IOrderBookV5::IOrderBookV5Instance<E::Provider>,
     orderbook_address: Address,
     vault_registry_projection: Arc<VaultRegistryProjection>,
-    wallet: W,
+    evm: E,
+    owner: Address,
 }
 
-impl<W: Wallet> RaindexService<W> {
+impl<E: Evm> RaindexService<E> {
     pub(crate) fn new(
-        wallet: W,
+        evm: E,
         orderbook: Address,
         vault_registry_projection: Arc<VaultRegistryProjection>,
+        owner: Address,
     ) -> Self {
-        let provider = wallet.provider().clone();
+        let provider = evm.provider().clone();
 
         Self {
             orderbook: IOrderBookV5::new(orderbook, provider),
             orderbook_address: orderbook,
             vault_registry_projection,
-            wallet,
+            evm,
+            owner,
         }
-    }
-
-    fn owner(&self) -> Address {
-        self.wallet.address()
     }
 
     async fn load_registry(&self) -> Result<VaultRegistry, RaindexError> {
         let aggregate_id = VaultRegistryId {
             orderbook: self.orderbook_address,
-            owner: self.owner(),
+            owner: self.owner,
         };
 
         self.vault_registry_projection
@@ -115,7 +112,10 @@ impl<W: Wallet> RaindexService<W> {
             .await?
             .ok_or(RaindexError::RegistryNotFound(aggregate_id))
     }
+}
 
+/// Write operations that require a [`Wallet`] for transaction signing.
+impl<W: Wallet> RaindexService<W> {
     /// Deposits tokens to a Rain OrderBook vault.
     ///
     /// # Parameters
@@ -129,8 +129,7 @@ impl<W: Wallet> RaindexService<W> {
     ///
     /// Returns `RaindexError::ZeroAmount` if amount is zero.
     /// Returns `RaindexError::Float` if amount cannot be converted to float format.
-    /// Returns `RaindexError::ContractCall` for transaction errors.
-    /// Returns `RaindexError::NoCaller` if no contract caller is configured.
+    /// Returns `RaindexError::Evm` for transaction errors.
     pub(crate) async fn deposit(
         &self,
         token: Address,
@@ -162,7 +161,7 @@ impl<W: Wallet> RaindexService<W> {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .wallet
+            .evm
             .send(token, encoded, "ERC20 approve for orderbook")
             .await?;
 
@@ -190,7 +189,7 @@ impl<W: Wallet> RaindexService<W> {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .wallet
+            .evm
             .send(self.orderbook_address, encoded, "deposit3 to vault")
             .await?;
 
@@ -231,8 +230,10 @@ impl<W: Wallet> RaindexService<W> {
         self.withdraw(USDC_BASE, vault_id, target_amount, USDC_DECIMALS)
             .await
     }
+}
 
-    /// Gets the current equity balance of a tokenized equity vault.
+/// Read operations that only need chain access (no signing).
+impl<E: Evm> RaindexService<E> {
     pub(crate) async fn get_equity_balance(
         &self,
         owner: Address,
@@ -369,7 +370,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
-            .wallet
+            .evm
             .send(self.orderbook_address, encoded, "withdraw3 from vault")
             .await?;
 
@@ -391,7 +392,7 @@ mod tests {
     use proptest::prelude::*;
     use tracing_test::traced_test;
 
-    use st0x_evm::Evm;
+    use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
@@ -544,10 +545,13 @@ mod tests {
 
         let wallet = RawPrivateKeyWallet::new(&local_evm.private_key, base_provider, 1).unwrap();
 
+        let owner = wallet.address();
+
         RaindexService::new(
             wallet,
             local_evm.orderbook_address,
             vault_registry_projection,
+            owner,
         )
     }
 
