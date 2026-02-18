@@ -300,7 +300,6 @@ mod tests {
             ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
             redemption_wallet: Address::ZERO,
-            market_maker_wallet: Address::ZERO,
             equity: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),

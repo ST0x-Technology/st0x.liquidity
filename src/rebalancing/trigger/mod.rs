@@ -86,8 +86,6 @@ pub(crate) struct RebalancingCtx {
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    /// Derived once from `evm_private_key` during construction.
-    pub(crate) market_maker_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
@@ -116,13 +114,19 @@ impl RebalancingCtx {
             equity: config.equity,
             usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
-            market_maker_wallet,
             ethereum_rpc_url: secrets.ethereum_rpc_url,
             evm_private_key: secrets.evm_private_key,
             usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
             equities: config.equities,
         })
+    }
+
+    /// Derives the market maker wallet address from the EVM private key.
+    pub(crate) fn market_maker_wallet(
+        &self,
+    ) -> Result<Address, alloy::signers::k256::ecdsa::Error> {
+        Ok(PrivateKeySigner::from_bytes(&self.evm_private_key)?.address())
     }
 }
 
@@ -132,7 +136,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("market_maker_wallet", &self.market_maker_wallet)
+            .field("market_maker_wallet", &self.market_maker_wallet())
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
@@ -378,7 +382,7 @@ impl RebalancingTrigger {
             symbol.clone(),
             Arc::clone(&self.equity_in_progress),
         ) else {
-            debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
+            debug!(%symbol, "Skipped equity trigger: already in progress");
             return;
         };
 
@@ -387,11 +391,11 @@ impl RebalancingTrigger {
         };
 
         if let Err(error) = self.sender.try_send(operation.clone()) {
-            warn!(error = %error, "Failed to send triggered operation");
+            warn!(%error, "Failed to send triggered operation");
             return;
         }
 
-        debug!(symbol = %symbol, operation = ?operation, "Triggered equity rebalancing");
+        debug!(%symbol, ?operation, "Triggered equity rebalancing");
         guard.defuse();
     }
 
@@ -415,8 +419,8 @@ impl RebalancingTrigger {
     fn load_unwrapped_token_for_trigger(&self, symbol: &Symbol) -> Option<Address> {
         match self.wrapper.lookup_unwrapped(symbol) {
             Ok(addr) => Some(addr),
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to get unwrapped token address");
+            Err(error) => {
+                error!(%symbol, %error, "Failed to get unwrapped token address");
                 None
             }
         }
@@ -428,11 +432,11 @@ impl RebalancingTrigger {
             Ok(None) => {
                 // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
                 // tokenized equities and won't be in the vault registry.
-                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
+                debug!(%symbol, "Skipped equity trigger: token not in vault registry");
                 None
             }
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
+            Err(error) => {
+                error!(%symbol, %error, "Failed to load vault registry");
                 None
             }
         }
@@ -441,8 +445,8 @@ impl RebalancingTrigger {
     async fn load_vault_ratio_for_trigger(&self, symbol: &Symbol) -> Option<UnderlyingPerWrapped> {
         match self.wrapper.get_ratio_for_symbol(symbol).await {
             Ok(ratio) => Some(ratio),
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to fetch vault ratio");
+            Err(error) => {
+                error!(%symbol, %error, "Failed to fetch vault ratio");
                 None
             }
         }
@@ -486,11 +490,11 @@ impl RebalancingTrigger {
         };
 
         if let Err(error) = self.sender.try_send(operation.clone()) {
-            warn!(error = %error, "Failed to send USDC triggered operation");
+            warn!(%error, "Failed to send USDC triggered operation");
             return;
         }
 
-        debug!(operation = ?operation, "Triggered USDC rebalancing");
+        debug!(?operation, "Triggered USDC rebalancing");
         guard.defuse();
     }
 
@@ -563,7 +567,7 @@ impl RebalancingTrigger {
         if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+            debug!(%symbol, "Cleared equity in-progress flag after mint terminal event");
 
             self.check_and_trigger_usdc().await;
         }
@@ -634,7 +638,7 @@ impl RebalancingTrigger {
             self.redemption_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
             debug!(
-                symbol = %symbol,
+                %symbol,
                 "Cleared equity in-progress flag after redemption terminal event"
             );
 
@@ -3659,7 +3663,7 @@ mod tests {
 
         let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
 
-        assert_eq!(ctx.market_maker_wallet, expected_wallet);
+        assert_eq!(ctx.market_maker_wallet().unwrap(), expected_wallet);
     }
 
     #[test]

@@ -263,9 +263,6 @@ mod tests {
     fn make_ctx() -> RebalancingCtx {
         let evm_private_key =
             b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-        let market_maker_wallet = PrivateKeySigner::from_bytes(&evm_private_key)
-            .unwrap()
-            .address();
 
         RebalancingCtx {
             equity: ImbalanceThreshold {
@@ -277,7 +274,6 @@ mod tests {
                 deviation: dec!(0.15),
             },
             redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
-            market_maker_wallet,
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
             evm_private_key,
             usdc_vault_id: b256!(

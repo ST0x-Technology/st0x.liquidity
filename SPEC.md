@@ -1918,7 +1918,7 @@ know about cross-venue inventory.
   available
 - `TokenizedEquityMintEvent::TokensWrapped` - No balance change (conversion
   between wrapped/unwrapped forms)
-- `TokenizedEquityMintEvent::WrapFailed` - No balance change (tokens await
+- `TokenizedEquityMintEvent::WrappingFailed` - No balance change (tokens await
   retry)
 - `TokenizedEquityMintEvent::DepositedIntoRaindex` - No balance change
   (completes transfer to Raindex, already counted at TokensReceived)

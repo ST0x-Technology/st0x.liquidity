@@ -6,9 +6,11 @@
 mod builder;
 mod manifest;
 
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
@@ -317,7 +319,13 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 )> {
     info!("Initializing rebalancing infrastructure");
 
-    let market_maker_wallet = rebalancing_ctx.market_maker_wallet;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
+    let evm_wallet = EthereumWallet::from(signer);
+    let base_provider = ProviderBuilder::new()
+        .wallet(evm_wallet)
+        .connect_provider(provider.clone());
+
+    let market_maker_wallet = rebalancing_ctx.market_maker_wallet()?;
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -325,7 +333,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = Arc::new(RaindexService::new(
-        provider.clone(),
+        base_provider.clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         market_maker_wallet,
@@ -336,14 +344,14 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         rebalancing_ctx.alpaca_broker_auth.account_id,
         rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
         rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
-        provider.clone(),
+        base_provider.clone(),
         rebalancing_ctx.redemption_wallet,
     ));
 
     let tokenizer: Arc<dyn Tokenizer> = tokenization;
 
     let wrapper = Arc::new(WrapperService::new(
-        provider.clone(),
+        base_provider.clone(),
         market_maker_wallet,
         rebalancing_ctx.equities.clone(),
     ));
@@ -382,7 +390,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let handle = spawn_rebalancer(
         rebalancing_ctx,
-        provider.clone(),
+        base_provider,
         market_maker_wallet,
         operation_receiver,
         frameworks,
