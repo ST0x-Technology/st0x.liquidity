@@ -19,7 +19,7 @@ impl CctpAttestationMock {
         let server = MockServer::start_async().await;
 
         server.mock(|when, then| {
-            when.method(GET).path_contains("/v2/burn/USDC/fees/");
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -49,7 +49,7 @@ impl CctpAttestationMock {
 
         self.server.mock(|when, then| {
             when.method(GET)
-                .path_contains("/v2/messages/")
+                .path_includes("/v2/messages/")
                 .query_param("transactionHash", &tx_hash);
             then.status(200)
                 .header("content-type", "application/json")
@@ -69,7 +69,7 @@ impl CctpAttestationMock {
 
         self.server.mock(|when, then| {
             when.method(GET)
-                .path_contains("/v2/messages/")
+                .path_includes("/v2/messages/")
                 .query_param("transactionHash", &tx_hash);
             then.status(200)
                 .header("content-type", "application/json")

@@ -1964,7 +1964,7 @@ mod tests {
         let conversion_mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body_partial(r#"{"symbol":"USDCUSD"}"#);
+                .json_body_includes(r#"{"symbol":"USDCUSD"}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -1997,7 +1997,7 @@ mod tests {
 
         // Conversion MUST be called before withdrawal
         assert!(
-            conversion_mock.hits() >= 1,
+            conversion_mock.calls() >= 1,
             "execute_alpaca_to_base MUST call USD-to-USDC conversion \
              before withdrawal"
         );
@@ -2034,7 +2034,7 @@ mod tests {
         let conversion_mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body_partial(r#"{"symbol":"USDCUSD"}"#);
+                .json_body_includes(r#"{"symbol":"USDCUSD"}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -2067,7 +2067,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            conversion_mock.hits() >= 1,
+            conversion_mock.calls() >= 1,
             "execute_base_to_alpaca MUST call USDC-to-USD conversion \
              after deposit confirmation"
         );
@@ -2199,7 +2199,7 @@ mod tests {
 
         // Verify no order was placed - CQRS failure should prevent side effects
         assert_eq!(
-            order_mock.hits(),
+            order_mock.calls(),
             0,
             "Order API should not be called when InitiateConversion fails"
         );

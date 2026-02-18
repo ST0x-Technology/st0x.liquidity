@@ -448,6 +448,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
     // (single INSERT per trade) to avoid blocking the main bot.
     let options: SqliteConnectOptions = database_url
         .parse::<SqliteConnectOptions>()?
+        .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_secs(10));
 

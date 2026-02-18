@@ -29,7 +29,18 @@ const ORDERBOOK_BASE: Address = address!("52CEB8eBEf648744fFDDE89F7Bc9C3aC359447
 /// Circle FiatTokenV2 `balances` mapping storage slot.
 const USDC_BALANCES_SLOT: u8 = 9;
 
+/// Result of a successful `take_order` call, providing both the tx hash
+/// and the vault/token details needed for on-chain assertions.
+pub struct TakeOrderResult {
+    pub tx_hash: B256,
+    pub input_vault_id: B256,
+    pub output_vault_id: B256,
+    pub input_token: Address,
+    pub output_token: Address,
+}
+
 /// Direction of the take-order from the order owner's perspective.
+#[derive(Clone, Copy)]
 pub enum TakeDirection {
     /// Owner's order sells equity for USDC. The taker buys equity.
     /// Bot hedge: BUY on broker (inverse of onchain sell).
@@ -150,7 +161,8 @@ impl<P: Provider + Clone> BaseChain<P> {
         Ok(addr)
     }
 
-    /// Creates an order on the OrderBook, takes it, and returns the tx hash.
+    /// Creates an order on the OrderBook, takes it, and returns the result
+    /// including tx hash and vault/token details for on-chain assertions.
     ///
     /// The order is created with the owner account and immediately taken by
     /// the same account. This emits a `TakeOrderV3` event that the bot
@@ -160,7 +172,7 @@ impl<P: Provider + Clone> BaseChain<P> {
         symbol: &str,
         amount: &str,
         direction: TakeDirection,
-    ) -> anyhow::Result<B256> {
+    ) -> anyhow::Result<TakeOrderResult> {
         let equity_addr = *self
             .equity_tokens
             .get(symbol)
@@ -319,7 +331,13 @@ impl<P: Provider + Clone> BaseChain<P> {
             .find(|log| log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
             .ok_or_else(|| anyhow::anyhow!("TakeOrderV3 event not found"))?;
 
-        Ok(take_log.transaction_hash.unwrap_or_default())
+        Ok(TakeOrderResult {
+            tx_hash: take_log.transaction_hash.unwrap_or_default(),
+            input_vault_id,
+            output_vault_id,
+            input_token,
+            output_token,
+        })
     }
 }
 

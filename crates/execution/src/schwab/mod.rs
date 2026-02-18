@@ -188,8 +188,8 @@ mod tests {
                     "Basic dGVzdF9hcHBfa2V5OnRlc3RfYXBwX3NlY3JldA==",
                 )
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body_contains("grant_type=authorization_code")
-                .body_contains("code=invalid_code");
+                .body_includes("grant_type=authorization_code")
+                .body_includes("code=invalid_code");
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({"error": "invalid_grant"}));

@@ -360,7 +360,7 @@ mod tests {
         let server = MockServer::start();
 
         let _account_mock = server.mock(|when, then| {
-            when.method(GET).path_contains("/trading/accounts/");
+            when.method(GET).path_includes("/trading/accounts/");
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({"message": "Invalid API credentials"}));

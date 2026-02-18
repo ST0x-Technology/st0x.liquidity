@@ -965,8 +965,8 @@ mod tests {
         let token_refresh_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/oauth/token")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=valid_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=valid_refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -1581,8 +1581,8 @@ mod tests {
         let token_refresh_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/oauth/token")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=valid_but_rejected_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=valid_but_rejected_refresh_token");
             then.status(400)
                 .header("content-type", "application/json")
                 .json_body(
@@ -1632,8 +1632,8 @@ mod tests {
         let token_refresh_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/oauth/token")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=valid_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=valid_refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -2090,8 +2090,8 @@ mod tests {
         assert!(stdout_str2.contains("Processing trade with TradeAccumulator"));
         assert!(stdout_str2.contains("Trade accumulated but did not trigger execution yet"));
 
-        account_mock.assert_hits(1);
-        order_mock.assert_hits(1);
+        account_mock.assert_calls(1);
+        order_mock.assert_calls(1);
     }
 
     #[test]

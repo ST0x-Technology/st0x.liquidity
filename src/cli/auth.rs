@@ -181,7 +181,7 @@ mod tests {
         let refresh_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/oauth/token")
-                .body_contains("grant_type=refresh_token");
+                .body_includes("grant_type=refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

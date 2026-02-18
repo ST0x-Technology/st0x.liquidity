@@ -25,10 +25,10 @@ pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
 mod offchain;
-mod offchain_order;
+pub mod offchain_order;
 mod onchain;
 mod onchain_trade;
-mod position;
+pub mod position;
 mod queue;
 mod rebalancing;
 mod shares;
@@ -41,6 +41,8 @@ mod usdc_rebalance;
 mod vault_registry;
 mod wrapper;
 
+pub use offchain_order::{Dollars, OffchainOrder, OffchainOrderId};
+pub use position::Position;
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 
 #[cfg(any(test, feature = "test-support"))]
