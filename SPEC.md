@@ -1311,14 +1311,8 @@ redemption, and receiving shares at Alpaca.
 
 **Services**:
 `EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
-Arc<dyn Tokenizer> }`
+Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 -- shared with `TokenizedEquityMint`.
-
-**Services**:
-`EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
-Arc<dyn Tokenizer> }`
--- shared by both equity transfer aggregates. Commands invoke domain traits
-directly (no intermediate wrapper trait).
 
 ##### State Flow
 
@@ -1488,12 +1482,13 @@ The aggregate uses domain service traits directly as its Services:
 struct EquityTransferServices {
     raindex: Arc<dyn Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn Wrapper>,
 }
 ```
 
 Both equity transfer aggregates share the same services type. Commands invoke
-`Raindex` methods for vault operations and `Tokenizer` methods for tokenization
-and redemption polling. No intermediate wrapper trait is needed.
+`Raindex` methods for vault operations, `Tokenizer` methods for tokenization and
+redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 
 ##### Business Rules
 

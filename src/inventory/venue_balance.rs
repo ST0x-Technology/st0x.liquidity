@@ -193,7 +193,7 @@ where
     /// it unconditionally and discard any tracked inflight.
     ///
     /// Takes the triggering error as a witness to prevent blind
-    /// usage — callers must have an error in hand to justify
+    /// usage -- callers must have an error in hand to justify
     /// bypassing the normal inflight guard.
     pub(super) fn force_apply_snapshot<E: std::fmt::Debug>(
         self,
