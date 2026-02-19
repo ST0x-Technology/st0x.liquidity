@@ -29,9 +29,7 @@ use common::{
 use services::alpaca_broker::AlpacaBrokerMock;
 use services::base_chain::{self, TakeDirection};
 
-/// Single-asset happy path hedging
 #[tokio::test]
-#[serial]
 async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     let scenario = E2eScenario {
         symbol: "AAPL",
@@ -43,7 +41,10 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         expected_net: "0",
     };
 
-    let mut chain = base_chain::BaseChain::start("https://mainnet.base.org").await?;
+    let mut chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
     chain.deploy_equity_token(scenario.symbol).await?;
 
     let broker = AlpacaBrokerMock::start()
@@ -59,13 +60,13 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     let ctx = build_ctx(&chain, &broker, &db_path, current_block)?;
     let bot = spawn_bot(ctx);
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let take_result = chain
         .take_order(scenario.symbol, scenario.amount, scenario.direction)
         .await?;
 
-    wait_for_processing(&bot, 10).await;
+    wait_for_processing(&bot, 8).await;
 
     assert_full_pipeline(
         &[scenario],
@@ -82,12 +83,12 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Scenario 2: Multi-asset sustained load ─────────────────────────
-
 #[tokio::test]
-#[serial]
 async fn multi_asset_sustained_load() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start("https://developer-access-mainnet.base.org").await?;
+    let mut chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
     chain.deploy_equity_token("AAPL").await?;
     chain.deploy_equity_token("TSLA").await?;
     chain.deploy_equity_token("MSFT").await?;
@@ -107,7 +108,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     let ctx = build_ctx(&chain, &broker, &db_path, current_block)?;
     let bot = spawn_bot(ctx);
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let scenarios = [
         E2eScenario {
@@ -148,10 +149,10 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
                 .take_order(scenario.symbol, "1.0", scenario.direction)
                 .await?,
         );
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    wait_for_processing(&bot, 20).await;
+    wait_for_processing(&bot, 12).await;
 
     assert_full_pipeline(
         &scenarios,
@@ -168,12 +169,12 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Scenario 3: Backfilling ────────────────────────────────────────
-
 #[tokio::test]
-#[serial]
 async fn backfilling() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start("https://base-rpc.publicnode.com").await?;
+    let mut chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
     chain.deploy_equity_token("AAPL").await?;
 
     let broker = AlpacaBrokerMock::start()
@@ -209,7 +210,10 @@ async fn backfilling() -> anyhow::Result<()> {
     // 1 offchain order is placed initially (the bot won't place a second
     // while the first is pending). After the first fill, the remaining net
     // needs the position checker's cycle (2s in tests) to detect and hedge.
-    wait_for_processing(&bot, 10).await;
+    // Backfilled trades arrive at once, so the bot needs multiple poll cycles:
+    // place order #1 -> poll fill -> position checker detects remaining net
+    // -> place order #2 -> poll fill.
+    wait_for_processing(&bot, 12).await;
 
     // Verify all historical events were picked up via backfill
     let pool = connect_db(&db_path).await?;
@@ -248,12 +252,12 @@ async fn backfilling() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Scenario 4: Resumption after graceful shutdown ─────────────────
-
 #[tokio::test]
-#[serial]
 async fn resumption_after_shutdown() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start("https://base.drpc.org").await?;
+    let mut chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
     chain.deploy_equity_token("AAPL").await?;
 
     let broker = AlpacaBrokerMock::start()
@@ -269,13 +273,13 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     // Phase 1: Start bot, process 1 trade, wait for fill
     let ctx = build_ctx(&chain, &broker, &db_path, current_block)?;
     let bot = spawn_bot(ctx);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let take1 = chain
         .take_order("AAPL", "1.0", TakeDirection::SellEquity)
         .await?;
 
-    wait_for_processing(&bot, 15).await;
+    wait_for_processing(&bot, 10).await;
 
     // Snapshot DB state before shutdown
     let pool = connect_db(&db_path).await?;
@@ -296,7 +300,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     let bot2 = spawn_bot(ctx2);
 
     // Wait for backfill to pick up missed events + processing
-    wait_for_processing(&bot2, 20).await;
+    wait_for_processing(&bot2, 12).await;
 
     // Verify no duplicate CQRS events
     let pool = connect_db(&db_path).await?;
@@ -334,10 +338,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Scenario 5: Crash recovery with eventual consistency ───────────
-
 #[tokio::test]
-#[serial]
 async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     let trade_sequence: Vec<(&str, &str, TakeDirection)> = vec![
         ("AAPL", "1.0", TakeDirection::SellEquity),
@@ -367,7 +368,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // ── Reference run: uninterrupted ────────────────────────────────
 
-    let mut ref_chain = base_chain::BaseChain::start("https://base.public.blockpi.network/v1/rpc/public").await?;
+    let mut ref_chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
     ref_chain.deploy_equity_token("AAPL").await?;
     ref_chain.deploy_equity_token("TSLA").await?;
 
@@ -382,15 +386,15 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     let ref_database_url = ref_db_path.display().to_string();
     let ref_ctx = build_ctx(&ref_chain, &ref_broker, &ref_db_path, ref_block)?;
     let ref_bot = spawn_bot(ref_ctx);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut ref_take_results = Vec::new();
     for (symbol, amount, direction) in &trade_sequence {
         ref_take_results.push(ref_chain.take_order(symbol, amount, *direction).await?);
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    wait_for_processing(&ref_bot, 15).await;
+    wait_for_processing(&ref_bot, 10).await;
 
     // Assert reference run passes full pipeline
     assert_full_pipeline(
@@ -412,7 +416,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // ── Crash run: same trades, with interruption ───────────────────
 
-    let mut crash_chain = base_chain::BaseChain::start("https://base.public.blockpi.network/v1/rpc/public").await?;
+    let mut crash_chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
     crash_chain.deploy_equity_token("AAPL").await?;
     crash_chain.deploy_equity_token("TSLA").await?;
 
@@ -429,7 +436,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     // Phase 1: process first trade, then crash
     let ctx1 = build_ctx(&crash_chain, &crash_broker, &crash_db_path, crash_block)?;
     let bot1 = spawn_bot(ctx1);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let crash_take1 = crash_chain
         .take_order(
@@ -438,7 +445,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
             trade_sequence[0].2,
         )
         .await?;
-    wait_for_processing(&bot1, 15).await;
+    wait_for_processing(&bot1, 10).await;
     bot1.abort();
     let _ = bot1.await;
 
@@ -454,7 +461,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     let ctx2 = build_ctx(&crash_chain, &crash_broker, &crash_db_path, crash_block)?;
     let bot2 = spawn_bot(ctx2);
 
-    wait_for_processing(&bot2, 20).await;
+    wait_for_processing(&bot2, 12).await;
 
     // Assert crash run also passes full pipeline (convergence)
     assert_full_pipeline(
@@ -485,12 +492,12 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Scenario 6: Market hours transitions ───────────────────────────
-
 #[tokio::test]
-#[serial]
 async fn market_hours_transitions() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start("https://endpoints.omniatech.io/v1/base/mainnet/public").await?;
+    let mut chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
     chain.deploy_equity_token("AAPL").await?;
 
     // Start with market CLOSED
@@ -507,7 +514,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     let ctx = build_ctx(&chain, &broker, &db_path, current_block)?;
     let bot = spawn_bot(ctx);
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Execute take-order — events enqueue and positions accumulate
     let take_result = chain
@@ -515,7 +522,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         .await?;
 
     // Wait for event processing but not order placement (market closed)
-    wait_for_processing(&bot, 10).await;
+    wait_for_processing(&bot, 8).await;
 
     // Assert: position accumulated but NO offchain orders placed
     let pool = connect_db(&db_path).await?;
@@ -549,7 +556,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
 
     // Wait for the position checker's periodic cycle (2s in tests) plus processing.
     // The checker detects the pending position and places orders.
-    wait_for_processing(&bot, 10).await;
+    wait_for_processing(&bot, 8).await;
 
     // Full pipeline assertions after market opens
     let scenario = E2eScenario {
@@ -607,7 +614,6 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
 // ── Scenario 8: Chain reorganization (stub) ────────────────────────
 
 #[tokio::test]
-#[serial]
 #[ignore = "Requires Anvil reorg support (removed=true WebSocket notifications)"]
 async fn chain_reorganization() -> anyhow::Result<()> {
     // TODO: Anvil's evm_snapshot/evm_revert don't generate proper reorg
