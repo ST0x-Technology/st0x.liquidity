@@ -101,6 +101,9 @@ pub(crate) struct RebalancingConfig {
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
     pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
     pub(crate) fireblocks_environment: FireblocksEnvironment,
+    /// Override the Fireblocks API base URL. When absent, determined
+    /// by `fireblocks_environment`.
+    pub(crate) fireblocks_base_url: Option<Url>,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -201,7 +204,7 @@ impl RebalancingCtx {
             asset_id,
             provider,
             required_confirmations: REQUIRED_CONFIRMATIONS,
-            base_url: None,
+            base_url: config.fireblocks_base_url.clone(),
         })
         .await?)
     }
@@ -917,8 +920,12 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
     use chrono::Utc;
+    use httpmock::MockServer;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
@@ -927,8 +934,8 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce,
     };
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, LazyLock};
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::{Uuid, uuid};
@@ -946,6 +953,15 @@ mod tests {
     use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
     use crate::vault_registry::VaultRegistryCommand;
     use crate::wrapper::mock::MockWrapper;
+
+    /// RSA private key generated at test time for Fireblocks JWT
+    /// signing. The mock server does not validate signatures.
+    static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        pem.as_bytes().to_vec()
+    });
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
@@ -3878,8 +3894,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_wallet_returns_missing_chain_asset_id_for_unknown_chain() {
-        use alloy::node_bindings::Anvil;
-
         let anvil = Anvil::new().spawn();
         let rpc_url: Url = anvil.endpoint().parse().unwrap();
 
@@ -3891,12 +3905,13 @@ mod tests {
             usdc: UsdcRebalancing::Disabled,
             redemption_wallet: Address::ZERO,
             usdc_vault_id: fixed_bytes!(
-                "0000000000000000000000000000000000000000000000000000000000000001"
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
             ),
             equities: HashMap::new(),
             fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
             fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
             fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: None,
         };
 
         let error = RebalancingCtx::build_wallet(
@@ -3915,5 +3930,58 @@ mod tests {
             ),
             "Expected MissingChainAssetId for Anvil's default chain 31337, got: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_wallet_resolves_address_from_fireblocks() {
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+        let server = MockServer::start();
+        let expected_address = address!("0x1111111111111111111111111111111111111111");
+
+        server.mock(|when, then| {
+            when.method("GET")
+                .path("/vault/accounts/0/ETH/addresses_paginated");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "addresses": [{
+                        "assetId": "ETH",
+                        "address": expected_address
+                    }]
+                }));
+        });
+
+        // Anvil's default chain ID is 31337
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            usdc_vault_id: fixed_bytes!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            equities: HashMap::new(),
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({
+                "31337": "ETH"
+            }))
+            .unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: Some(server.base_url().parse().unwrap()),
+        };
+
+        let wallet = RebalancingCtx::build_wallet(
+            &config,
+            &TEST_RSA_PEM,
+            &FireblocksApiUserId::new("test-api-key"),
+            rpc_url,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(wallet.address(), expected_address);
     }
 }

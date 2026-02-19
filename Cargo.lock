@@ -6933,6 +6933,7 @@ dependencies = [
  "reqwest 0.12.24",
  "rocket",
  "rocket_ws",
+ "rsa",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
