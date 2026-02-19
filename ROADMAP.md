@@ -2,6 +2,12 @@
 
 ## Current Development Focus
 
+### Fireblocks Contract Calls
+
+- [ ] [#297 Harden wallet management with Fireblocks contract calls](https://github.com/ST0x-Technology/st0x.liquidity/issues/297)
+  - PR:
+    [#300 add fireblocks integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/300)
+
 ### Live testing of auto-rebalancing on the Alpaca instance
 
 **Wrapped Token Handling:**
