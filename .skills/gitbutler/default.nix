@@ -57,7 +57,8 @@ else
     inherit version meta;
     src = pkgs.fetchurl { inherit (source) url hash; };
     sourceRoot = ".";
-    nativeBuildInputs = [ pkgs.dpkg ];
+    nativeBuildInputs = [ pkgs.dpkg pkgs.autoPatchelfHook ];
+    buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.openssl ];
     unpackPhase = "dpkg-deb -x $src .";
     installPhase = ''
       mkdir -p $out/bin
