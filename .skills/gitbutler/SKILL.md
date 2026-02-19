@@ -15,8 +15,12 @@ Use GitButler CLI (`but`) as the default version-control interface.
    `git cherry-pick`.
 2. Start every write/history-edit task with `but status`.
 3. For mutation commands, always add `--status-after`.
-4. Use CLI IDs from `but status` / `but diff` / `but show`; do not hardcode IDs
-   and do not switch branches with `git checkout`.
+4. **Always reference branches and commits by semantic name, not short CLI
+   IDs.** Short IDs (e.g., `ch`, `at`, `lq`) are ephemeral and unreadable. Use
+   the branch name (`chore/gitbutler-cli-nix`) or commit message context
+   instead. For example: `but push chore/gitbutler-cli-nix`, not `but push ch`.
+   The only exception is `--changes` file IDs, which have no semantic
+   alternative. Do not switch branches with `git checkout`.
 5. After a successful mutation with `--status-after`, do not run a redundant
    `but status` unless needed for new IDs.
 6. If the user says a `git` write command (for example "git push"), translate it
@@ -53,7 +57,7 @@ but <mutation> ... --status-after
 - Amend into a known commit: `but amend <file-id> <commit-id> --status-after`
 - Reorder commits:
   `but move <source-commit-id> <target-commit-id> --status-after`
-- Push: `but push` or `but push <branch-id>`
+- Push: `but push` or `but push <branch-name>`
 - Pull update safety flow: `but pull --check` then `but pull --status-after`
 
 ## Task Recipes
@@ -72,7 +76,7 @@ but <mutation> ... --status-after
 
 ### User says "git push"
 
-Interpret as GitButler push. Run `but push` (or `but push <branch-id>`)
+Interpret as GitButler push. Run `but push` (or `but push <branch-name>`)
 immediately. Do not run `git push`, even if `but push` reports nothing to push.
 
 ### Check mergeability, then update branches
@@ -137,9 +141,6 @@ For chained PRs, include the caution block at the top of the PR body:
 
 ## Notes
 
-- **Use branch/commit names over short CLI IDs when possible.** For example, use
-  `fix/broken-cd` instead of `fi`, `add-gitbutler-skill` instead of `gi`. Short
-  IDs change on every rewrite; names are stable and readable.
 - Prefer explicit IDs over file paths for mutations.
 - `--changes` is the safe default for precise commits.
 - `--changes` accepts one argument per flag. For multiple IDs, use
