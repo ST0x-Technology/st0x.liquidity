@@ -23,14 +23,13 @@
 //! 2. Poll `list_requests` for Alpaca's detection
 //! 3. Poll until status is `Completed` or `Rejected`
 
-use std::time::Duration;
-
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, trace, warn};

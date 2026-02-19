@@ -24,18 +24,30 @@ impl CctpChain {
     }
 }
 
-pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, W: Write>(
-    stdout: &mut W,
+pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Write>(
+    stdout: &mut Writer,
     amount: Option<Usdc>,
     all: bool,
     from: CctpChain,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let wallet = rebalancing_ctx.base_wallet().address();
+
+    let (source_wallet, recipient_wallet) = match from {
+        CctpChain::Ethereum => (
+            rebalancing_ctx.ethereum_wallet().address(),
+            rebalancing_ctx.base_wallet().address(),
+        ),
+        CctpChain::Base => (
+            rebalancing_ctx.base_wallet().address(),
+            rebalancing_ctx.ethereum_wallet().address(),
+        ),
+    };
 
     let amount_u256 = if all {
-        let balance_call = IERC20::balanceOfCall { account: wallet };
+        let balance_call = IERC20::balanceOfCall {
+            account: source_wallet,
+        };
         let balance = match from {
             CctpChain::Ethereum => {
                 rebalancing_ctx
@@ -70,7 +82,8 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, W: Write>(
         stdout,
         "CCTP Bridge: {from:?} -> {dest:?}, Amount: {amount_display} USDC"
     )?;
-    writeln!(stdout, "   Wallet: {wallet}")?;
+    writeln!(stdout, "   Source wallet: {source_wallet}")?;
+    writeln!(stdout, "   Recipient wallet: {recipient_wallet}")?;
 
     let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
         usdc_ethereum: USDC_ETHEREUM,
@@ -82,7 +95,9 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, W: Write>(
     let direction = from.to_bridge_direction();
 
     writeln!(stdout, "\n1. Burning USDC on {from:?}...")?;
-    let burn = cctp_bridge.burn(direction, amount_u256, wallet).await?;
+    let burn = cctp_bridge
+        .burn(direction, amount_u256, recipient_wallet)
+        .await?;
     writeln!(stdout, "   Burn tx: {}, Amount: {}", burn.tx, burn.amount)?;
 
     writeln!(stdout, "\n2. Polling for attestation...")?;
@@ -104,8 +119,8 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, W: Write>(
     Ok(())
 }
 
-pub(super) async fn cctp_recover_command<W: Write>(
-    stdout: &mut W,
+pub(super) async fn cctp_recover_command<Writer: Write>(
+    stdout: &mut Writer,
     burn_tx: B256,
     source_chain: CctpChain,
     ctx: &Ctx,
@@ -151,8 +166,8 @@ pub(super) async fn cctp_recover_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, W: Write>(
-    stdout: &mut W,
+pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer: Write>(
+    stdout: &mut Writer,
     chain: CctpChain,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {

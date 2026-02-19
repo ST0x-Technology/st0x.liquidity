@@ -298,11 +298,9 @@ pub(super) async fn alpaca_whitelist_list_command<W: Write>(
         anyhow::bail!("alpaca-whitelist-list requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
+        alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -340,14 +338,12 @@ pub(super) async fn alpaca_unwhitelist_command<W: Write>(
         anyhow::bail!("alpaca-unwhitelist requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
     writeln!(stdout, "Removing address from Alpaca whitelist")?;
     writeln!(stdout, "   Address: {address}")?;
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
+        alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -373,21 +369,15 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
         anyhow::bail!("alpaca-transfers requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
+        alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
-    writeln!(
-        stdout,
-        "   Account: {}",
-        rebalancing_ctx.alpaca_broker_auth.account_id
-    )?;
+    writeln!(stdout, "   Account: {}", alpaca_auth.account_id)?;
 
     let transfers = alpaca_wallet.list_all_transfers().await?;
 
@@ -622,21 +612,6 @@ mod tests {
 
         let mut stdout = Vec::new();
         let err_msg = alpaca_whitelist_command(&mut stdout, None, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_transfers_requires_rebalancing_ctx() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
-
-        let mut stdout = Vec::new();
-        let err_msg = alpaca_transfers_command(&mut stdout, &ctx)
             .await
             .unwrap_err()
             .to_string();

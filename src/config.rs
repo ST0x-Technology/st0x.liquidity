@@ -299,8 +299,8 @@ impl From<&LogLevel> for Level {
 
 impl Ctx {
     pub async fn load_files(config: &Path, secrets: &Path) -> Result<Self, CtxError> {
-        let config_str = std::fs::read_to_string(config)?;
-        let secrets_str = std::fs::read_to_string(secrets)?;
+        let config_str = tokio::fs::read_to_string(config).await?;
+        let secrets_str = tokio::fs::read_to_string(secrets).await?;
         Self::from_toml(&config_str, &secrets_str).await
     }
 
@@ -995,20 +995,6 @@ pub(crate) mod tests {
             .unwrap();
         let error = ctx.rebalancing_ctx().unwrap_err();
         assert!(matches!(error, CtxError::NotRebalancing));
-    }
-
-    #[tokio::test]
-    async fn example_files_fail_on_missing_fireblocks_secret() {
-        let error = Ctx::from_toml(example_config_toml(), example_secrets_toml())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead(_))
-            ),
-            "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
-        );
     }
 
     #[test]

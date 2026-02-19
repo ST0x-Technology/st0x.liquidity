@@ -35,7 +35,7 @@ impl IntoErrorRegistry for OpenChainErrorRegistry {
     }
 }
 
-/// Noop registry for tests — never makes HTTP calls. Errors decode
+/// Noop registry for tests -- never makes HTTP calls. Errors decode
 /// as "unknown" since no candidates are returned.
 pub struct NoOpErrorRegistry;
 

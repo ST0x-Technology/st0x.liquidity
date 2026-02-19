@@ -305,7 +305,11 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
 
     writeln!(stdout, "   Initial balance: {initial_balance}")?;
     let expected_amount = quantity.to_u256_18_decimals()?;
-    let expected_final = initial_balance + expected_amount;
+    let expected_final = initial_balance
+        .checked_add(expected_amount)
+        .ok_or_else(|| {
+            anyhow::anyhow!("balance overflow: {initial_balance} + {expected_amount}")
+        })?;
     writeln!(stdout, "   Expected final balance: {expected_final}")?;
 
     let tokenization_service = AlpacaTokenizationService::new(

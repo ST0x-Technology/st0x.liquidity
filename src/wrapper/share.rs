@@ -11,7 +11,7 @@ use st0x_evm::{IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
-use crate::bindings::IERC4626;
+use crate::bindings::{IERC20, IERC4626};
 
 /// One unit with 18 decimals for ratio queries.
 const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -52,7 +52,7 @@ impl<W: Wallet> WrapperService<W> {
             )
             .await?;
 
-        UnderlyingPerWrapped::new(assets_per_share).map_err(Into::into)
+        Ok(UnderlyingPerWrapped::new(assets_per_share)?)
     }
 
     /// Gets the token addresses for a symbol.
@@ -97,6 +97,44 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         underlying_amount: U256,
         receiver: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
+        let underlying_token: Address = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {})
+            .await?;
+
+        let owner = self.wallet.address();
+
+        let current_allowance: U256 = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(
+                underlying_token,
+                IERC20::allowanceCall {
+                    owner,
+                    spender: wrapped_token,
+                },
+            )
+            .await?;
+
+        if current_allowance < underlying_amount {
+            info!(
+                %underlying_token,
+                %wrapped_token,
+                %underlying_amount,
+                "Approving ERC-4626 vault to spend underlying tokens"
+            );
+
+            self.wallet
+                .submit::<OpenChainErrorRegistry, _>(
+                    underlying_token,
+                    IERC20::approveCall {
+                        spender: wrapped_token,
+                        amount: underlying_amount,
+                    },
+                    "ERC20 approve for ERC4626 deposit",
+                )
+                .await?;
+        }
+
         info!("Sending ERC4626 deposit to {wrapped_token}");
         let receipt = self
             .wallet
@@ -165,5 +203,122 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
 
     fn owner(&self) -> Address {
         self.wallet.address()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::Address;
+    use std::collections::HashMap;
+
+    use st0x_execution::Symbol;
+
+    use super::*;
+    use crate::test_utils::StubWallet;
+
+    fn test_addresses() -> EquityTokenAddresses {
+        EquityTokenAddresses {
+            wrapped: Address::random(),
+            unwrapped: Address::random(),
+        }
+    }
+
+    fn service_with_symbol(
+        symbol: &str,
+        addresses: EquityTokenAddresses,
+    ) -> WrapperService<impl Wallet> {
+        let wallet = StubWallet::stub(Address::random());
+        let mut config = HashMap::new();
+        config.insert(symbol.parse::<Symbol>().unwrap(), addresses);
+        WrapperService::new(wallet, config)
+    }
+
+    #[test]
+    fn lookup_equity_returns_configured_symbol() {
+        let addresses = test_addresses();
+        let service = service_with_symbol("tAAPL", addresses.clone());
+
+        let result = service.lookup_equity(&"tAAPL".parse().unwrap());
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().wrapped, addresses.wrapped);
+        assert_eq!(result.unwrap().unwrapped, addresses.unwrapped);
+    }
+
+    #[test]
+    fn lookup_equity_returns_none_for_unconfigured() {
+        let service = service_with_symbol("tAAPL", test_addresses());
+
+        let result = service.lookup_equity(&"tTSLA".parse().unwrap());
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_wrapped_returns_vault_address() {
+        let addresses = test_addresses();
+        let expected = addresses.wrapped;
+        let service = service_with_symbol("tAAPL", addresses);
+
+        let result = service.lookup_wrapped(&"tAAPL".parse().unwrap()).unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn lookup_unwrapped_returns_underlying_address() {
+        let addresses = test_addresses();
+        let expected = addresses.unwrapped;
+        let service = service_with_symbol("tAAPL", addresses);
+
+        let result = service.lookup_unwrapped(&"tAAPL".parse().unwrap()).unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn lookup_wrapped_errors_on_unconfigured_symbol() {
+        let service = service_with_symbol("tAAPL", test_addresses());
+
+        let error = service
+            .lookup_wrapped(&"tMSFT".parse().unwrap())
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WrapperError::SymbolNotConfigured(ref symbol)
+                    if symbol.to_string() == "tMSFT"
+            ),
+            "expected SymbolNotConfigured for tMSFT, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn owner_returns_wallet_address() {
+        let wallet_address = Address::random();
+        let wallet = StubWallet::stub(wallet_address);
+        let service = WrapperService::new(wallet, HashMap::new());
+
+        assert_eq!(service.owner(), wallet_address);
+    }
+
+    #[tokio::test]
+    async fn get_ratio_for_symbol_errors_on_unconfigured() {
+        let service = service_with_symbol("tAAPL", test_addresses());
+
+        let error = service
+            .get_ratio_for_symbol(&"tXYZ".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WrapperError::SymbolNotConfigured(ref symbol)
+                    if symbol.to_string() == "tXYZ"
+            ),
+            "expected SymbolNotConfigured for tXYZ, got: {error:?}"
+        );
     }
 }

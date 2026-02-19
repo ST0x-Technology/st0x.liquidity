@@ -289,15 +289,7 @@ abstractions.
 - Supported implementations: SchwabExecutor, AlpacaTradingApi, AlpacaBrokerApi,
   MockExecutor
 
-**Benefits**:
-
-- Zero changes to core bot logic when adding new implementations
-- Type safety via compile-time verification
-- Independent testing per implementation
-- Zero-cost abstractions via generics (no dynamic dispatch)
-
-For detailed implementation requirements and module organization, see
-@crates/execution/AGENTS.md
+For detailed implementation requirements, see @crates/execution/AGENTS.md
 
 ### Core Flow
 
@@ -389,26 +381,17 @@ is the source of truth for terminology and naming conventions.
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
   `OffchainOrder`/`OrderPlacer`
 - **Type Modeling**: Make invalid states unrepresentable through the type
-  system. Use algebraic data types (ADTs) and enums to encode business rules and
-  state transitions directly in types rather than relying on runtime validation.
-  Examples:
-  - Use enum variants to represent mutually exclusive states instead of multiple
-    boolean flags
-  - Encode state-specific data within enum variants rather than using nullable
-    fields
-  - Use newtypes for domain concepts to prevent mixing incompatible values
-  - Leverage the type system to enforce invariants at compile time
+  system. Use ADTs and enums to encode business rules and state transitions
+  directly in types rather than runtime validation. See "Type modeling" in Code
+  Style for details
 - **Schema Design**: Avoid database columns that can contradict each other. Use
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where
   possible
-- **No Denormalized Columns**: Never store values that can be computed from
-  other columns. Denormalized data inevitably becomes stale when the source
-  columns are updated but the derived column is forgotten. Always compute
-  derived values on-demand in queries (e.g., use
-  `ABS(accumulated_long - accumulated_short) >= 1.0` instead of storing a
-  separate `net_position` column). If performance requires caching, use database
-  views or generated columns that auto-update, never manually-maintained columns
+- **No Denormalized Columns**: Never store values computable from other columns
+  -- they inevitably become stale. Compute derived values on-demand in queries.
+  If performance requires caching, use database views or generated columns,
+  never manually-maintained columns
 - **Functional Programming Patterns**: Favor FP and ADT patterns over OOP
   patterns. Avoid unnecessary encapsulation, inheritance hierarchies, or
   getter/setter patterns that don't make sense with Rust's algebraic data types.

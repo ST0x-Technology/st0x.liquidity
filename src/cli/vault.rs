@@ -23,7 +23,7 @@ pub(super) struct Deposit {
 }
 
 #[derive(Debug, Error)]
-pub enum VaultCliError {
+pub(crate) enum VaultCliError {
     #[error("negative amount: {0}")]
     NegativeAmount(Decimal),
 
@@ -47,8 +47,8 @@ fn decimal_to_u256(amount: Decimal, decimals: u8) -> Result<U256, VaultCliError>
     Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
 }
 
-pub(super) async fn vault_deposit_command<W: Write>(
-    stdout: &mut W,
+pub(super) async fn vault_deposit_command<Writer: Write>(
+    stdout: &mut Writer,
     deposit: Deposit,
     ctx: &Ctx,
     pool: &SqlitePool,
@@ -97,8 +97,8 @@ pub(super) async fn vault_deposit_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn vault_withdraw_command<W: Write>(
-    stdout: &mut W,
+pub(super) async fn vault_withdraw_command<Writer: Write>(
+    stdout: &mut Writer,
     amount: Usdc,
     ctx: &Ctx,
     pool: &SqlitePool,

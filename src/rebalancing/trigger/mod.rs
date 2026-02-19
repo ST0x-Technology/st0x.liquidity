@@ -65,8 +65,12 @@ pub enum RebalancingCtxError {
     NotAlpacaBroker,
     #[error("failed to read Fireblocks secret file: {0}")]
     FireblocksSecretRead(#[from] std::io::Error),
-    #[error("failed to build Fireblocks wallet: {0}")]
-    FireblocksWallet(#[from] FireblocksWalletError),
+    #[error(transparent)]
+    Fireblocks(#[from] FireblocksError),
+    #[error("RPC error during wallet setup: {0}")]
+    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
+    #[error("no Fireblocks asset ID configured for chain {chain_id}")]
+    MissingChainAssetId { chain_id: u64 },
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -107,7 +111,7 @@ pub(crate) struct RebalancingConfig {
 /// After construction, all fields are immutable.
 ///
 /// Read-only provider access for either chain is available via
-/// `base_caller().provider()` and `ethereum_caller().provider()`.
+/// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
@@ -137,7 +141,7 @@ impl RebalancingCtx {
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
-        let fireblocks_secret = std::fs::read(&secrets.fireblocks_secret_path)?;
+        let fireblocks_secret = tokio::fs::read(&secrets.fireblocks_secret_path).await?;
 
         let base_wallet = Self::build_wallet(
             &config,
@@ -177,7 +181,7 @@ impl RebalancingCtx {
         fireblocks_secret: &[u8],
         api_user_id: &FireblocksApiUserId,
         rpc_url: Url,
-    ) -> Result<FireblocksWallet<RootProvider>, FireblocksWalletError> {
+    ) -> Result<FireblocksWallet<RootProvider>, RebalancingCtxError> {
         let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
         let chain_id = provider.get_chain_id().await?;
 
@@ -185,7 +189,7 @@ impl RebalancingCtx {
             .fireblocks_chain_asset_ids
             .get(chain_id)
             .cloned()
-            .ok_or(FireblocksWalletError::MissingChainAssetId { chain_id })?;
+            .ok_or(RebalancingCtxError::MissingChainAssetId { chain_id })?;
 
         Ok(FireblocksWallet::new(FireblocksCtx {
             api_user_id: api_user_id.clone(),
@@ -209,7 +213,7 @@ impl RebalancingCtx {
 
     /// Test constructor that creates a `RebalancingCtx` with stub wallets.
     ///
-    /// The wallets panic on `send` — use only in tests that don't submit
+    /// The wallets panic on `send` -- use only in tests that don't submit
     /// transactions through the rebalancing wallet.
     #[cfg(test)]
     pub(crate) fn stub(
@@ -233,16 +237,6 @@ impl RebalancingCtx {
             ethereum_wallet: wallet,
         }
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum FireblocksWalletError {
-    #[error(transparent)]
-    Fireblocks(#[from] FireblocksError),
-    #[error("RPC error: {0}")]
-    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
-    #[error("no Fireblocks asset ID configured for chain {chain_id}")]
-    MissingChainAssetId { chain_id: u64 },
 }
 
 impl std::fmt::Debug for RebalancingCtx {
@@ -393,7 +387,7 @@ impl RebalancingTrigger {
 
     /// Reprocess a snapshot event after the normal handler failed.
     ///
-    /// Resets the inventory, then force-applies the snapshot —
+    /// Resets the inventory, then force-applies the snapshot --
     /// bypassing inflight guards that may have caused the
     /// original failure.
     async fn on_snapshot_recovery(

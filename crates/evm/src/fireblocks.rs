@@ -114,9 +114,9 @@ pub enum FireblocksEnvironment {
     Sandbox,
 }
 
-/// Construction context for `FireblocksCaller`.
+/// Construction context for `FireblocksWallet`.
 ///
-/// Contains everything needed to construct a caller: Fireblocks API
+/// Contains everything needed to construct a wallet: Fireblocks API
 /// credentials, chain-specific asset ID, and a read-only provider
 /// for fetching receipts. The main crate assembles this from its own
 /// config/secrets split.

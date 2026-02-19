@@ -57,7 +57,7 @@
 
 mod evm;
 
-pub(crate) use evm::CctpEndpoint;
+use evm::CctpEndpoint;
 
 use std::mem::size_of;
 use std::time::Duration;

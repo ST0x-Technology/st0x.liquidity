@@ -156,9 +156,9 @@ pub struct OnchainTrade {
 
 impl OnchainTrade {
     /// Core parsing logic for converting blockchain events to trades
-    pub(crate) async fn try_from_order_and_fill_details<E: Evm>(
+    pub(crate) async fn try_from_order_and_fill_details<EvmImpl: Evm>(
         cache: &SymbolCache,
-        evm: &E,
+        evm: &EvmImpl,
         order: OrderV4,
         fill: OrderFill,
         log: Log,
@@ -262,9 +262,9 @@ impl OnchainTrade {
 
     /// Attempts to create an OnchainTrade from a transaction hash by looking up
     /// the transaction receipt and parsing relevant orderbook events.
-    pub async fn try_from_tx_hash<E: Evm>(
+    pub async fn try_from_tx_hash<EvmImpl: Evm>(
         tx_hash: TxHash,
-        evm: &E,
+        evm: &EvmImpl,
         cache: &SymbolCache,
         ctx: &EvmCtx,
         feed_id_cache: &FeedIdCache,
@@ -317,9 +317,9 @@ pub(crate) struct OrderFill {
     pub output_amount: B256,
 }
 
-async fn try_convert_log_to_onchain_trade<E: Evm>(
+async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     log: &Log,
-    evm: &E,
+    evm: &EvmImpl,
     cache: &SymbolCache,
     ctx: &EvmCtx,
     feed_id_cache: &FeedIdCache,

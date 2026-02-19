@@ -2,12 +2,12 @@
 //!
 //! This crate provides two traits for interacting with EVM chains:
 //!
-//! - [`Evm`] — read-only chain access with error-decoded view calls.
+//! - [`Evm`] -- read-only chain access with error-decoded view calls.
 //!   Provides the underlying provider and a `call` method that
 //!   automatically decodes Solidity revert data via the OpenChain
 //!   selector registry.
 //!
-//! - [`Wallet`] — extends `Evm` with a signing identity and
+//! - [`Wallet`] -- extends `Evm` with a signing identity and
 //!   transaction submission. Implementations handle key management
 //!   and signing (Fireblocks MPC in production,
 //!   `RawPrivateKeyWallet` in tests).
@@ -87,7 +87,7 @@ impl From<alloy::hex::FromHexError> for EvmError {
 /// checks, block subscriptions, etc.) and a [`call`](Evm::call) method
 /// that executes `eth_call` with automatic Solidity revert decoding.
 ///
-/// Implementations only need to supply the provider — `call` has a
+/// Implementations only need to supply the provider -- `call` has a
 /// default implementation that handles error decoding.
 #[async_trait]
 pub trait Evm: Send + Sync + 'static {
@@ -134,7 +134,7 @@ pub trait Wallet: Evm {
     /// Send raw calldata as a signed transaction.
     ///
     /// Implementations handle signing, submission, and waiting for the
-    /// receipt. They should NOT check `receipt.status()` — the default
+    /// receipt. They should NOT check `receipt.status()` -- the default
     /// [`submit`](Wallet::submit) handles revert detection and decoding.
     async fn send(
         &self,
@@ -172,8 +172,8 @@ pub trait Wallet: Evm {
 }
 
 #[async_trait]
-impl<T: Evm + ?Sized> Evm for Arc<T> {
-    type Provider = T::Provider;
+impl<Inner: Evm + ?Sized> Evm for Arc<Inner> {
+    type Provider = Inner::Provider;
 
     fn provider(&self) -> &Self::Provider {
         (**self).provider()
@@ -192,7 +192,7 @@ impl<T: Evm + ?Sized> Evm for Arc<T> {
 }
 
 #[async_trait]
-impl<T: Wallet + ?Sized> Wallet for Arc<T> {
+impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
     fn address(&self) -> Address {
         (**self).address()
     }
@@ -230,7 +230,7 @@ impl<T: Wallet + ?Sized> Wallet for Arc<T> {
 
 /// Execute a typed view call with automatic revert decoding.
 ///
-/// Shared logic for `Evm::call` — encodes via `SolCall`, runs
+/// Shared logic for `Evm::call` -- encodes via `SolCall`, runs
 /// `eth_call`, decodes returns on success, decodes revert via the
 /// selector registry on failure.
 async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
@@ -273,5 +273,125 @@ where
 
     fn provider(&self) -> &P {
         &self.provider
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::network::EthereumWallet;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{Address, U256};
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol;
+    use std::sync::Arc;
+
+    use super::*;
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        TestERC20,
+        "../../lib/rain.orderbook/out/ArbTest.sol/Token.json"
+    );
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        IERC20,
+        "../../lib/forge-std/out/IERC20.sol/IERC20.json"
+    );
+
+    fn anvil_signer(anvil: &AnvilInstance) -> EthereumWallet {
+        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+        EthereumWallet::from(signer)
+    }
+
+    #[tokio::test]
+    async fn read_only_evm_call_returns_view_result() {
+        let anvil = Anvil::new().spawn();
+        let url = anvil.endpoint_url();
+        let deploy_provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(url.clone());
+
+        let token = TestERC20::deploy(&deploy_provider).await.unwrap();
+        let token_address = *token.address();
+
+        let read_only = ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(url),
+        );
+
+        let total_supply: U256 = read_only
+            .call::<NoOpErrorRegistry, _>(token_address, IERC20::totalSupplyCall {})
+            .await
+            .unwrap();
+
+        assert_eq!(total_supply, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn read_only_evm_call_decodes_revert_on_failure() {
+        let anvil = Anvil::new().spawn();
+        let read_only = ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(anvil.endpoint_url()),
+        );
+
+        let error = read_only
+            .call::<NoOpErrorRegistry, _>(
+                Address::random(),
+                IERC20::balanceOfCall {
+                    account: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, EvmError::AbiDecode(_)),
+            "expected AbiDecode error for call to non-contract address \
+             (empty return data), got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arc_evm_delegates_call() {
+        let anvil = Anvil::new().spawn();
+        let url = anvil.endpoint_url();
+        let deploy_provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(url.clone());
+
+        let token = TestERC20::deploy(&deploy_provider).await.unwrap();
+        let token_address = *token.address();
+
+        let read_only = Arc::new(ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(url),
+        ));
+
+        let total_supply: U256 = read_only
+            .call::<NoOpErrorRegistry, _>(token_address, IERC20::totalSupplyCall {})
+            .await
+            .unwrap();
+
+        assert_eq!(total_supply, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn arc_evm_exposes_provider() {
+        let anvil = Anvil::new().spawn();
+        let read_only = Arc::new(ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(anvil.endpoint_url()),
+        ));
+
+        let block_number = read_only.provider().get_block_number().await.unwrap();
+
+        assert_eq!(block_number, 0);
     }
 }

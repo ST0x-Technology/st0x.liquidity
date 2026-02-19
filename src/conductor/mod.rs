@@ -30,7 +30,7 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
-use crate::config::Ctx;
+use crate::config::{Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
@@ -183,7 +183,11 @@ impl Conductor {
                     .await?,
             );
 
-            let rebalancing = ctx.rebalancing_ctx().ok().cloned();
+            let rebalancing = match ctx.rebalancing_ctx() {
+                Ok(ctx) => Some(ctx.clone()),
+                Err(CtxError::NotRebalancing) => None,
+                Err(error) => return Err(error.into()),
+            };
 
             let (position, position_projection, snapshot, rebalancer) =
                 if let Some(rebalancing_ctx) = rebalancing {

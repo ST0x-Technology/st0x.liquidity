@@ -250,10 +250,9 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::{Row, SqlitePool};
 
+    use st0x_event_sorcery::test_store;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
-
-    use st0x_event_sorcery::test_store;
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;

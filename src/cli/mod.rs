@@ -681,11 +681,10 @@ mod tests {
     use std::str::FromStr;
     use url::Url;
 
+    use st0x_event_sorcery::{Column, Projection};
     use st0x_execution::{
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
-
-    use st0x_event_sorcery::{Column, Projection};
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -1759,9 +1758,8 @@ mod tests {
 
         let stdout_str = String::from_utf8(stdout).unwrap();
         assert!(
-            stdout_str.contains("order")
-                || stdout_str.contains("error")
-                || stdout_str.contains("400")
+            stdout_str.contains("order"),
+            "Expected order-related output, got: {stdout_str}"
         );
     }
 
