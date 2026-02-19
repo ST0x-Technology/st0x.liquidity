@@ -2268,4 +2268,99 @@ mod tests {
             "Expected Io error, got: {error:?}"
         );
     }
+
+    #[tokio::test]
+    async fn load_files_succeeds_with_valid_standalone_config() {
+        let config_dir = tempfile::tempdir().unwrap();
+
+        let config_path = config_dir.path().join("config.toml");
+        let secrets_path = config_dir.path().join("secrets.toml");
+
+        tokio::fs::write(
+            &config_path,
+            r#"
+                database_url = ":memory:"
+                [evm]
+                orderbook = "0x1111111111111111111111111111111111111111"
+                deployment_block = 1
+                order_owner = "0x2222222222222222222222222222222222222222"
+            "#,
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::write(
+            &secrets_path,
+            r#"
+                [evm]
+                ws_rpc_url = "ws://localhost:8545"
+                [broker]
+                type = "dry-run"
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let ctx = Ctx::load_files(&config_path, &secrets_path).await.unwrap();
+
+        assert_eq!(ctx.database_url, ":memory:");
+        assert!(
+            matches!(ctx.trading_mode, TradingMode::Standalone { order_owner }
+                if order_owner == address!("0x2222222222222222222222222222222222222222")),
+            "Expected Standalone mode, got: {:?}",
+            ctx.trading_mode
+        );
+        assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+    }
+
+    #[tokio::test]
+    async fn parse_and_load_round_trips_through_temp_files() {
+        let config_dir = tempfile::tempdir().unwrap();
+
+        let config_path = config_dir.path().join("config.toml");
+        let secrets_path = config_dir.path().join("secrets.toml");
+
+        tokio::fs::write(
+            &config_path,
+            r#"
+                database_url = ":memory:"
+                [evm]
+                orderbook = "0x1111111111111111111111111111111111111111"
+                deployment_block = 1
+                order_owner = "0x2222222222222222222222222222222222222222"
+            "#,
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::write(
+            &secrets_path,
+            r#"
+                [evm]
+                ws_rpc_url = "ws://localhost:8545"
+                [broker]
+                type = "dry-run"
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let cli_env = CliEnv::try_parse_from([
+            "cli",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--secrets",
+            secrets_path.to_str().unwrap(),
+            "auth",
+        ])
+        .unwrap();
+
+        let ctx = Ctx::load_files(&cli_env.env.config, &cli_env.env.secrets)
+            .await
+            .unwrap();
+
+        assert!(matches!(cli_env.command, Commands::Auth));
+        assert_eq!(ctx.database_url, ":memory:");
+        assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+    }
 }

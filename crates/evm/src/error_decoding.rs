@@ -146,10 +146,15 @@ pub(crate) async fn decode_reverted_receipt<Registry: IntoErrorRegistry>(
 mod tests {
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::json_abi::Error as AlloyError;
+    use alloy::network::EthereumWallet;
+    use alloy::network::TransactionBuilder;
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{Bloom, Bytes, TxHash, hex};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::json_rpc::ErrorPayload;
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolError;
     use alloy::transports::TransportError;
     use async_trait::async_trait;
@@ -405,6 +410,80 @@ mod tests {
         assert!(
             matches!(error, EvmError::Reverted { tx_hash: hash } if hash == tx_hash),
             "expected Reverted with matching hash, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_reverted_receipt_decodes_revert_when_replay_fails() {
+        let anvil = Anvil::new().spawn();
+        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+        let wallet = EthereumWallet::from(signer);
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_http(anvil.endpoint_url());
+
+        // Deploy a contract whose runtime code is PUSH0 PUSH0 REVERT (0x5f5ffd).
+        // Init code copies the 3-byte runtime from bytecode offset 10 into memory
+        // and returns it.
+        let deploy_tx =
+            TransactionRequest::default().with_deploy_code(hex!("0x6003600a5f3960035ff35f5ffd"));
+        let deploy_receipt = provider
+            .send_transaction(deploy_tx)
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        let reverting_address = deploy_receipt.contract_address.unwrap();
+        let block_number = deploy_receipt.block_number.unwrap();
+
+        let receipt = reverted_receipt(Some(block_number));
+
+        let error = decode_reverted_receipt::<NoOpErrorRegistry>(
+            &provider,
+            Address::ZERO,
+            reverting_address,
+            Bytes::new(),
+            receipt,
+        )
+        .await
+        .unwrap_err();
+
+        // The replay call hits the reverting contract, producing an RPC error
+        // that gets decoded via decode_rpc_revert (empty revert data ->
+        // Contract variant since NoOpErrorRegistry returns no candidates).
+        assert!(
+            matches!(error, EvmError::Contract(_)),
+            "expected Contract from decoded RPC revert, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_reverted_receipt_returns_reverted_when_replay_succeeds() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        // Calling an address with no code succeeds (returns empty bytes),
+        // exercising the Ok(_) branch that logs a warning and falls through
+        // to EvmError::Reverted.
+        let receipt = reverted_receipt(Some(0));
+        let tx_hash = receipt.transaction_hash;
+
+        let error = decode_reverted_receipt::<NoOpErrorRegistry>(
+            &provider,
+            Address::ZERO,
+            Address::ZERO,
+            Bytes::new(),
+            receipt,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, EvmError::Reverted { tx_hash: hash } if hash == tx_hash),
+            "expected Reverted with matching tx_hash, got {error:?}"
         );
     }
 }
