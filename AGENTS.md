@@ -713,6 +713,13 @@ conventional iterator variables in very short closures where the type makes the
 meaning unambiguous (e.g., `|event| event.payload`), but even then prefer a
 descriptive name.
 
+**Generic type parameters**: Single-letter type variables (`T`, `P`, `R`, `C`,
+etc.) are forbidden whenever there is more than one type variable in a given
+context (function, impl block, trait definition). Use descriptive names that
+convey the role: `Call`, `Registry`, `Wallet` instead of `C`, `R`, `W`. A lone
+type variable on a simple generic (e.g., `ReadOnlyEvm<P>`) is acceptable only
+when the meaning is unambiguous from context.
+
 #### Module Organization
 
 Organize code within modules by importance to the reader, not by when it was
