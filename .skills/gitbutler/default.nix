@@ -58,7 +58,19 @@ else
     src = pkgs.fetchurl { inherit (source) url hash; };
     sourceRoot = ".";
     nativeBuildInputs = [ pkgs.dpkg pkgs.autoPatchelfHook ];
-    buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.openssl ];
+    buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.openssl pkgs.zlib pkgs.dbus ];
+    autoPatchelfIgnoreMissingDeps = [
+      "libgdk-3.so.0"
+      "libgdk_pixbuf-2.0.so.0"
+      "libcairo.so.2"
+      "libgobject-2.0.so.0"
+      "libglib-2.0.so.0"
+      "libwebkit2gtk-4.1.so.0"
+      "libgtk-3.so.0"
+      "libsoup-3.0.so.0"
+      "libgio-2.0.so.0"
+      "libjavascriptcoregtk-4.1.so.0"
+    ];
     unpackPhase = "dpkg-deb -x $src .";
     installPhase = ''
       mkdir -p $out/bin
