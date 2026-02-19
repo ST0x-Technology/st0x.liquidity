@@ -399,26 +399,6 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         }
     }
 
-    #[cfg(test)]
-    fn new_with_base_url(
-        base_url: String,
-        account_id: AlpacaAccountId,
-        api_key: String,
-        api_secret: String,
-        wallet: W,
-        redemption_wallet: Address,
-    ) -> Self {
-        Self {
-            http_client: Client::new(),
-            base_url,
-            account_id,
-            api_key,
-            api_secret,
-            wallet,
-            redemption_wallet,
-        }
-    }
-
     /// Request a mint operation to convert offchain shares to onchain tokens.
     ///
     /// # Errors
@@ -577,9 +557,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     ///
     /// # Errors
     ///
-    /// - `RedemptionTransferFailed` if the contract call fails
-    /// - `Revert` if the contract reverts with a decoded error
-    /// - `Transaction` if the transaction fails to confirm
+    /// - `Evm(EvmError)` if the ERC20 transfer transaction fails
     async fn send_tokens_for_redemption<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
@@ -793,7 +771,7 @@ pub(crate) mod tests {
 
         let wallet = RawPrivateKeyWallet::new(private_key, provider, 1).unwrap();
 
-        AlpacaTokenizationClient::new_with_base_url(
+        AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
@@ -1137,7 +1115,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let client = AlpacaTokenizationClient::new_with_base_url(
+        let client = AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
@@ -1178,7 +1156,7 @@ pub(crate) mod tests {
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
-        let client = AlpacaTokenizationClient::new_with_base_url(
+        let client = AlpacaTokenizationClient::new(
             "http://unused".to_string(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),

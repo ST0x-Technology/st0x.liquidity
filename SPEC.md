@@ -334,11 +334,14 @@ All SSH keys centralized in `keys.nix` with role-based access:
 `os.nix` imports `roles.ssh` for `authorizedKeys`. CI uses its key (stored as
 `SSH_KEY` GitHub secret) for both deployment and terraform state decryption.
 
-### Wallet Management (Fireblocks)
+### Wallet Management
 
-All onchain write operations are submitted through Fireblocks MPC-based key
-management via the `Wallet` trait abstraction in the `st0x-evm` crate. See
-[crates/evm/](crates/evm/) for the implementation.
+All onchain write operations use the `Wallet` trait abstraction from the
+`st0x-evm` crate. The production implementation submits transactions through
+Fireblocks MPC-based key management (`fireblocks` feature). A local-signer
+implementation is available for development and testing (`local-signer`
+feature). Domain logic is decoupled from the signing backend. See
+[crates/evm/](crates/evm/) for implementation details.
 
 ## Crate Architecture
 

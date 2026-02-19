@@ -1882,8 +1882,8 @@ mod tests {
 
         let stdout_str = String::from_utf8(stdout).unwrap();
         assert!(
-            stdout_str.contains("order"),
-            "Expected order-related output, got: {stdout_str}"
+            stdout_str.contains("Failed to place order"),
+            "Expected failure message in output, got: {stdout_str}"
         );
     }
 
@@ -2213,6 +2213,61 @@ mod tests {
             result.is_ok(),
             "transfer-usdc to-alpaca should succeed: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn cli_env_parses_config_secrets_and_subcommand() {
+        let cli_env = CliEnv::try_parse_from([
+            "cli",
+            "--config",
+            "config.toml",
+            "--secrets",
+            "secrets.toml",
+            "auth",
+        ])
+        .unwrap();
+
+        assert!(matches!(cli_env.command, Commands::Auth));
+    }
+
+    #[test]
+    fn cli_env_rejects_missing_config_flag() {
+        let error =
+            CliEnv::try_parse_from(["cli", "--secrets", "secrets.toml", "auth"]).unwrap_err();
+
+        assert!(
+            error.to_string().contains("--config"),
+            "Expected error about --config, got: {error}"
+        );
+    }
+
+    #[test]
+    fn cli_env_rejects_missing_subcommand() {
+        let error = CliEnv::try_parse_from(["cli", "--config", "c.toml", "--secrets", "s.toml"])
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("subcommand"),
+            "Expected error about subcommand, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_files_returns_io_error_for_missing_config() {
+        use crate::config::CtxError;
+        use std::path::Path;
+
+        let error = Ctx::load_files(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/secrets.toml"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::Io(_)),
+            "Expected Io error, got: {error:?}"
         );
     }
 }

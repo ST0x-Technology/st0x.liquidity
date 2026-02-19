@@ -143,21 +143,20 @@ impl RebalancingCtx {
     ) -> Result<Self, RebalancingCtxError> {
         let fireblocks_secret = tokio::fs::read(&secrets.fireblocks_secret_path).await?;
 
-        let base_wallet = Self::build_wallet(
-            &config,
-            &fireblocks_secret,
-            &secrets.fireblocks_api_user_id,
-            secrets.base_rpc_url,
-        )
-        .await?;
-
-        let ethereum_wallet = Self::build_wallet(
-            &config,
-            &fireblocks_secret,
-            &secrets.fireblocks_api_user_id,
-            secrets.ethereum_rpc_url,
-        )
-        .await?;
+        let (base_wallet, ethereum_wallet) = tokio::try_join!(
+            Self::build_wallet(
+                &config,
+                &fireblocks_secret,
+                &secrets.fireblocks_api_user_id,
+                secrets.base_rpc_url,
+            ),
+            Self::build_wallet(
+                &config,
+                &fireblocks_secret,
+                &secrets.fireblocks_api_user_id,
+                secrets.ethereum_rpc_url,
+            ),
+        )?;
 
         info!(
             wallet = %base_wallet.address(),
@@ -189,7 +188,10 @@ impl RebalancingCtx {
             .fireblocks_chain_asset_ids
             .get(chain_id)
             .cloned()
-            .ok_or(RebalancingCtxError::MissingChainAssetId { chain_id })?;
+            .ok_or_else(|| {
+                warn!(chain_id, "No Fireblocks asset ID configured for chain");
+                RebalancingCtxError::MissingChainAssetId { chain_id }
+            })?;
 
         Ok(FireblocksWallet::new(FireblocksCtx {
             api_user_id: api_user_id.clone(),
@@ -3871,6 +3873,47 @@ mod tests {
         assert!(
             logs_contain("Triggered equity rebalancing"),
             "Should trigger rebalancing once both venues have data"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_wallet_returns_missing_chain_asset_id_for_unknown_chain() {
+        use alloy::node_bindings::Anvil;
+
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            usdc_vault_id: fixed_bytes!(
+                "0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            equities: HashMap::new(),
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+        };
+
+        let error = RebalancingCtx::build_wallet(
+            &config,
+            b"fake-rsa-key",
+            &FireblocksApiUserId::new("test-user"),
+            rpc_url,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::MissingChainAssetId { chain_id: 31337 }
+            ),
+            "Expected MissingChainAssetId for Anvil's default chain 31337, got: {error:?}"
         );
     }
 }

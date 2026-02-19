@@ -57,8 +57,6 @@
 
 mod evm;
 
-use evm::CctpEndpoint;
-
 use std::mem::size_of;
 use std::time::Duration;
 
@@ -74,6 +72,7 @@ use tracing::{debug, info, warn};
 use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 
 use crate::BridgeDirection;
+use evm::CctpEndpoint;
 
 // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
 sol!(
@@ -792,8 +791,8 @@ mod tests {
             "Expected AttestationError::NotYetAvailable with status 404"
         );
         assert!(
-            mock.hits() >= 3,
-            "Expected at least 3 attempts with retries"
+            mock.hits() == 4,
+            "Expected exactly 4 attempts (1 initial + 3 retries)"
         );
     }
 

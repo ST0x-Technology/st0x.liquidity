@@ -445,10 +445,24 @@ fn build_contract_call_request(
     }
 }
 
+const EXTERNAL_TX_ID_MAX_LEN: usize = 255;
+const ELLIPSIS: &str = "...";
+
 fn generate_external_tx_id(note: &str) -> String {
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let uuid = uuid::Uuid::new_v4();
-    format!("{timestamp}-{note}-{uuid}")
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let separator_count = 2;
+    let available_for_note =
+        EXTERNAL_TX_ID_MAX_LEN - timestamp.len() - uuid.len() - separator_count;
+
+    let truncated_note = if note.len() <= available_for_note {
+        note.to_string()
+    } else {
+        let truncation_point = available_for_note - ELLIPSIS.len();
+        format!("{}{ELLIPSIS}", &note[..truncation_point])
+    };
+
+    format!("{timestamp}-{truncated_note}-{uuid}")
 }
 
 /// Returns `true` if the transaction is still in a non-terminal state
@@ -814,6 +828,35 @@ mod tests {
     }
 
     #[test]
+    fn generate_external_tx_id_truncates_long_note() {
+        let long_note = "a".repeat(300);
+        let tx_id = generate_external_tx_id(&long_note);
+
+        assert!(
+            tx_id.len() <= EXTERNAL_TX_ID_MAX_LEN,
+            "Expected tx_id length <= {EXTERNAL_TX_ID_MAX_LEN}, got: {}",
+            tx_id.len()
+        );
+        assert_eq!(tx_id.len(), EXTERNAL_TX_ID_MAX_LEN);
+        assert!(
+            tx_id.contains(ELLIPSIS),
+            "Expected ellipsis in truncated tx_id, got: {tx_id}"
+        );
+    }
+
+    #[test]
+    fn generate_external_tx_id_does_not_truncate_short_note() {
+        let short_note = "ERC20 approve";
+        let tx_id = generate_external_tx_id(short_note);
+
+        assert!(
+            tx_id.contains(short_note),
+            "Expected full note in tx_id, got: {tx_id}"
+        );
+        assert!(!tx_id.contains(ELLIPSIS));
+    }
+
+    #[test]
     fn build_contract_call_request_sets_operation() {
         let request = build_contract_call_request(
             "ETH",
@@ -864,33 +907,34 @@ mod tests {
     }
 
     #[test]
-    fn is_still_pending_for_submitted() {
-        assert!(is_still_pending(TransactionStatus::Submitted));
-    }
+    fn is_still_pending_matches_expected_statuses() {
+        use TransactionStatus::*;
 
-    #[test]
-    fn is_still_pending_for_confirming() {
-        assert!(is_still_pending(TransactionStatus::Confirming));
-    }
+        let pending = [
+            Submitted,
+            PendingAmlScreening,
+            PendingEnrichment,
+            PendingAuthorization,
+            Queued,
+            PendingSignature,
+            Pending3RdPartyManualApproval,
+            Pending3RdParty,
+            Broadcasting,
+            Confirming,
+        ];
 
-    #[test]
-    fn is_not_pending_for_completed() {
-        assert!(!is_still_pending(TransactionStatus::Completed));
-    }
+        let terminal = [Completed, Cancelling, Cancelled, Blocked, Rejected, Failed];
 
-    #[test]
-    fn is_not_pending_for_failed() {
-        assert!(!is_still_pending(TransactionStatus::Failed));
-    }
+        for status in pending {
+            assert!(is_still_pending(status), "{status:?} should be pending");
+        }
 
-    #[test]
-    fn is_not_pending_for_cancelled() {
-        assert!(!is_still_pending(TransactionStatus::Cancelled));
-    }
-
-    #[test]
-    fn is_not_pending_for_rejected() {
-        assert!(!is_still_pending(TransactionStatus::Rejected));
+        for status in terminal {
+            assert!(
+                !is_still_pending(status),
+                "{status:?} should not be pending"
+            );
+        }
     }
 
     #[test]
