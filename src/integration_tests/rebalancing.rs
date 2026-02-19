@@ -29,6 +29,7 @@ use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::onchain::mock::MockRaindex;
+use crate::wrapper::mock::MockWrapper;
 use crate::position::{Position, PositionCommand};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
@@ -120,7 +121,7 @@ async fn build_position_cqrs_with_trigger(
     pool: &SqlitePool,
     trigger: &Arc<RebalancingTrigger>,
 ) -> Arc<Store<Position>> {
-    let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+    let projection = Arc::new(Projection::<Position>::sqlite(pool.clone()).unwrap());
 
     Arc::new(
         StoreBuilder::<Position>::new(pool.clone())
@@ -155,6 +156,8 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
 
+    let wrapper = Arc::new(MockWrapper::new());
+
     let trigger = Arc::new(RebalancingTrigger::new(
         test_trigger_config(),
         vault_registry,
@@ -162,6 +165,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
         sender,
+        wrapper,
     ));
 
     let position_cqrs = build_position_cqrs_with_trigger(&pool, &trigger).await;
@@ -343,9 +347,12 @@ fn build_equity_transfer(
     raindex: Arc<dyn crate::onchain::raindex::Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
 ) -> Arc<CrossVenueEquityTransfer> {
+    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(MockWrapper::new());
+
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
         tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -358,6 +365,7 @@ fn build_equity_transfer(
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
         tokenizer,
+        wrapper,
         Address::ZERO,
         mint_store,
         redemption_store,
@@ -526,12 +534,12 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExpectedEvent::new(
                 "TokenizedEquityMint",
                 &mint_agg_id,
-                "TokenizedEquityMintEvent::VaultDeposited",
+                "TokenizedEquityMintEvent::TokensWrapped",
             ),
             ExpectedEvent::new(
                 "TokenizedEquityMint",
                 &mint_agg_id,
-                "TokenizedEquityMintEvent::MintCompleted",
+                "TokenizedEquityMintEvent::DepositedIntoRaindex",
             ),
         ],
     )
@@ -719,7 +727,12 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "EquityRedemption",
                 &redemption_agg_id,
-                "EquityRedemptionEvent::VaultWithdrawn",
+                "EquityRedemptionEvent::WithdrawnFromRaindex",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
+                "EquityRedemptionEvent::TokensUnwrapped",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
@@ -741,21 +754,21 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
 
     assert_eq!(
-        events[6].payload["VaultWithdrawn"]["symbol"]
+        events[6].payload["WithdrawnFromRaindex"]["symbol"]
             .as_str()
             .unwrap(),
         "AAPL",
-        "VaultWithdrawn should target the correct symbol"
+        "WithdrawnFromRaindex should target the correct symbol"
     );
     assert_eq!(
-        events[7].payload["TokensSent"]["redemption_tx"]
+        events[8].payload["TokensSent"]["redemption_tx"]
             .as_str()
             .unwrap(),
         format!("{expected_tx_hash:#x}"),
         "TokensSent redemption_tx should match the deterministic Anvil hash"
     );
     assert_eq!(
-        events[8].payload["Detected"]["tokenization_request_id"]
+        events[9].payload["Detected"]["tokenization_request_id"]
             .as_str()
             .unwrap(),
         "redeem_int_test",
@@ -790,6 +803,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let (sender, receiver) = mpsc::channel(10);
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingTrigger::new(
         test_trigger_config(),
@@ -798,6 +812,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
         sender,
+        wrapper,
     );
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -863,6 +878,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     let (sender, receiver) = mpsc::channel(10);
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingTrigger::new(
         test_trigger_config(),
@@ -871,6 +887,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
         sender,
+        wrapper,
     );
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -1079,6 +1096,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             },
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+        let wrapper = Arc::new(MockWrapper::new());
         let trigger = RebalancingTrigger::new(
             wide_config,
             vault_registry,
@@ -1086,6 +1104,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TEST_ORDER_OWNER,
             Arc::clone(&inventory),
             sender,
+            wrapper,
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -1123,6 +1142,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             },
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+        let wrapper = Arc::new(MockWrapper::new());
         let trigger = RebalancingTrigger::new(
             tight_config,
             vault_registry,
@@ -1130,6 +1150,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TEST_ORDER_OWNER,
             Arc::clone(&inventory),
             sender,
+            wrapper,
         );
 
         trigger.check_and_trigger_usdc().await;
