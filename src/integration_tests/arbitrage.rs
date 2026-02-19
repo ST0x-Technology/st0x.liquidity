@@ -12,8 +12,8 @@ use alloy::node_bindings::AnvilInstance;
 use alloy::primitives::{
     Address, B256, Bytes, LogData, U256, address, keccak256, utils::parse_units,
 };
-use alloy::providers::ProviderBuilder;
 use alloy::providers::ext::AnvilApi as _;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
+use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Symbol};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
@@ -302,7 +303,7 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
 }
 
 #[bon::bon]
-impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
+impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
     /// Deploys an equity token for the given symbol if one doesn't already exist.
     /// Returns the token address (newly deployed or cached from a previous call).
     async fn ensure_equity_token(&mut self, symbol: &str) -> Address {
@@ -349,9 +350,10 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             removed: false,
         };
 
+        let evm = ReadOnlyEvm::new(self.provider.clone());
         let trade = OnchainTrade::try_from_take_order_if_target_owner(
             &self.symbol_cache,
-            &self.provider,
+            &evm,
             take_event,
             log_metadata,
             order_owner,

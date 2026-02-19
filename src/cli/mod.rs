@@ -747,6 +747,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::path::Path;
     use std::str::FromStr;
     use url::Url;
 
@@ -758,7 +759,7 @@ mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-    use crate::config::{BrokerCtx, LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{BrokerCtx, CtxError, LogLevel, SchwabAuth, TradingMode};
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
@@ -2255,9 +2256,6 @@ mod tests {
 
     #[tokio::test]
     async fn load_files_returns_io_error_for_missing_config() {
-        use crate::config::CtxError;
-        use std::path::Path;
-
         let error = Ctx::load_files(
             Path::new("/nonexistent/config.toml"),
             Path::new("/nonexistent/secrets.toml"),
