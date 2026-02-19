@@ -41,7 +41,10 @@
         pkgs = import rainix.inputs.nixpkgs {
           inherit system;
           config.allowUnfreePredicate = pkg:
-            builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
+            builtins.elem (pkgs.lib.getName pkg) [
+              "terraform"
+              "gitbutler-cli"
+            ];
         };
 
         craneLib =
@@ -57,12 +60,18 @@
               localSystem = system;
             };
 
+          gitbutler-cli = import ./.skills/gitbutler {
+            inherit pkgs;
+            inherit (pkgs) lib;
+          };
+
           st0xRust = pkgs.callPackage ./rust.nix {
             inherit craneLib;
             inherit (pkgs) sqlx-cli;
             sol-build-inputs = rainix.sol-build-inputs.${system};
           };
         in rainixPkgs // deployPkgs // {
+          inherit gitbutler-cli;
           inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
           st0x-dto = st0xRust.dto;
@@ -206,6 +215,7 @@
               packages.deployNixos
               packages.deployService
               packages.deployAll
+              packages.gitbutler-cli
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
