@@ -67,6 +67,7 @@ struct Secrets {
 /// Deserialized from the `[broker]` section of the secrets TOML.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)] // isn't relevant for a brief startup step
 enum BrokerSecrets {
     Schwab {
         app_key: String,
