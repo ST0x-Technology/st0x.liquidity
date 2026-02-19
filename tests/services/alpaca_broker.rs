@@ -57,6 +57,19 @@ pub struct CalendarEntry {
     pub close: String,
 }
 
+/// A mock tokenization request tracked in shared state.
+struct MockTokenizationRequest {
+    tokenization_request_id: String,
+    issuer_request_id: String,
+    underlying_symbol: String,
+    qty: String,
+    wallet_address: String,
+    status: String,
+    poll_count: usize,
+    /// Number of polls before transitioning from "pending" to "completed".
+    polls_until_complete: usize,
+}
+
 struct MockState {
     account: MockAccount,
     orders: HashMap<String, MockOrder>,
@@ -66,6 +79,10 @@ struct MockState {
     mode: MockMode,
     /// Dynamic calendar entries. The endpoint reads from this on each request.
     calendar_entries: Vec<CalendarEntry>,
+    /// Tokenization requests created via the mint endpoint.
+    tokenization_requests: Vec<MockTokenizationRequest>,
+    /// Number of polls before mint requests transition to "completed".
+    tokenization_polls_until_complete: usize,
 }
 
 /// Snapshot of a placed order, returned by [`AlpacaBrokerMock::orders`].
@@ -177,6 +194,8 @@ impl AlpacaBrokerMockBuilder {
             symbol_fill_prices: self.symbol_fill_prices,
             mode: self.mode,
             calendar_entries,
+            tokenization_requests: Vec::new(),
+            tokenization_polls_until_complete: 2,
         }));
 
         let server = MockServer::start_async().await;
@@ -209,6 +228,18 @@ impl AlpacaBrokerMock {
 
     pub fn base_url(&self) -> String {
         self.server.base_url()
+    }
+
+    /// Exposes the underlying mock server for registering additional
+    /// endpoints (e.g., tokenization or wallet endpoints) in tests that
+    /// need Alpaca services beyond the core broker API.
+    ///
+    /// The conductor resolves all Alpaca services (broker, tokenization,
+    /// wallet) from `AlpacaBrokerApiCtx.base_url()`, which points at this
+    /// mock server in e2e tests. Rebalancing tests will need to register
+    /// tokenization endpoints here once ERC-4626 infrastructure is ready.
+    pub fn server(&self) -> &MockServer {
+        &self.server
     }
 
     /// Changes the default fill price for subsequent order fills.
@@ -268,6 +299,19 @@ impl AlpacaBrokerMock {
             cash: state.account.cash.to_string(),
             buying_power: state.account.buying_power.to_string(),
         }
+    }
+
+    /// Registers tokenization API endpoints (mint + request polling) on
+    /// this mock server. Call after `build()` for tests that exercise the
+    /// equity rebalancing pipeline.
+    ///
+    /// Endpoints registered:
+    /// - `POST /v1/accounts/{id}/tokenization/mint` → creates a pending request
+    /// - `GET /v1/accounts/{id}/tokenization/requests` → returns all requests,
+    ///   transitioning pending requests to "completed" after N polls
+    pub fn register_tokenization_endpoints(&self) {
+        register_mint_endpoint(&self.server, &self.state);
+        register_tokenization_requests_endpoint(&self.server, &self.state);
     }
 
     /// Returns a snapshot of all current positions.
@@ -592,6 +636,121 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price_str: 
             position.market_value -= qty * fill_price;
         }
     }
+}
+
+// ── Tokenization endpoints ───────────────────────────────────────────
+
+fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(POST)
+            .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/mint"));
+        then.respond_with(move |request: &HttpMockRequest| {
+            let body: Value = serde_json::from_slice(request.body().as_ref()).unwrap_or(json!({}));
+
+            let underlying_symbol = body["underlying_symbol"]
+                .as_str()
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let qty = body["qty"].as_str().unwrap_or("0").to_string();
+            let wallet_address = body["wallet_address"].as_str().unwrap_or("").to_string();
+            let issuer_request_id = body["issuer_request_id"].as_str().unwrap_or("").to_string();
+
+            let tokenization_request_id = Uuid::new_v4().to_string();
+
+            {
+                let mut state = lock(&state);
+                let polls_until_complete = state.tokenization_polls_until_complete;
+
+                state.tokenization_requests.push(MockTokenizationRequest {
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying_symbol: underlying_symbol.clone(),
+                    qty: qty.clone(),
+                    wallet_address: wallet_address.clone(),
+                    status: "pending".to_string(),
+                    poll_count: 0,
+                    polls_until_complete,
+                });
+            }
+
+            json_response(
+                200,
+                &json!({
+                    "tokenization_request_id": tokenization_request_id,
+                    "type": "mint",
+                    "status": "pending",
+                    "underlying_symbol": underlying_symbol,
+                    "token_symbol": format!("t{underlying_symbol}"),
+                    "qty": qty,
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": wallet_address,
+                    "issuer_request_id": issuer_request_id,
+                    "tx_hash": "",
+                    "created_at": Utc::now().to_rfc3339(),
+                }),
+            )
+        });
+    });
+}
+
+fn register_tokenization_requests_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(GET).path(format!(
+            "/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/requests"
+        ));
+        then.respond_with(move |_request: &HttpMockRequest| {
+            let requests: Vec<Value> = {
+                let mut state = lock(&state);
+
+                // Advance each pending request's poll count and transition
+                // to "completed" once the threshold is reached.
+                for request in &mut state.tokenization_requests {
+                    if request.status == "pending" {
+                        request.poll_count += 1;
+                        if request.poll_count >= request.polls_until_complete {
+                            request.status = "completed".to_string();
+                        }
+                    }
+                }
+
+                state
+                    .tokenization_requests
+                    .iter()
+                    .map(|request| {
+                        // Completed mint requests include a fake tx_hash to
+                        // represent the onchain token transfer from Alpaca.
+                        let tx_hash = if request.status == "completed" {
+                            format!("0x{}", "ab".repeat(32))
+                        } else {
+                            String::new()
+                        };
+
+                        json!({
+                            "tokenization_request_id": request.tokenization_request_id,
+                            "type": "mint",
+                            "status": request.status,
+                            "underlying_symbol": request.underlying_symbol,
+                            "token_symbol": format!("t{}", request.underlying_symbol),
+                            "qty": request.qty,
+                            "issuer": "st0x",
+                            "network": "base",
+                            "wallet_address": request.wallet_address,
+                            "issuer_request_id": request.issuer_request_id,
+                            "tx_hash": tx_hash,
+                            "created_at": "2025-01-01T00:00:00Z",
+                        })
+                    })
+                    .collect()
+            };
+
+            json_response(200, &Value::Array(requests))
+        });
+    });
 }
 
 /// Builds an `HttpMockResponse` with JSON content-type and serialized body.

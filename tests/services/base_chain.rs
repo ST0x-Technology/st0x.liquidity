@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use url::Url;
 
 pub use st0x_hedge::USDC_BASE;
-pub use st0x_hedge::bindings::{DeployableERC20, IERC20};
+pub use st0x_hedge::bindings::{DeployableERC20, IERC20, TestVault};
 
 use st0x_hedge::bindings::IOrderBookV5::{self, TakeOrderV3};
 use st0x_hedge::bindings::{Deployer, Interpreter, Parser, Store as RainStore, TOFUTokenDecimals};
@@ -49,6 +49,10 @@ pub enum TakeDirection {
     /// Owner's order buys equity with USDC. The taker sells equity.
     /// Bot hedge: SELL on broker (inverse of onchain buy).
     BuyEquity,
+
+    /// Opposing trades cancelled out, resulting in net zero exposure.
+    /// No offchain hedge is expected.
+    NetZero,
 }
 
 /// A forked Base chain running locally via Anvil, with the real Raindex
@@ -58,6 +62,10 @@ pub struct BaseChain<P> {
     anvil: AnvilInstance,
     pub provider: P,
     pub owner: Address,
+    /// Private key for the owner account (first Anvil key). Needed by
+    /// rebalancing tests where `Ctx::order_owner()` derives the address
+    /// from `RebalancingSecrets.evm_private_key` instead of `evm.order_owner`.
+    pub owner_key: B256,
     pub orderbook_addr: Address,
     deployer_addr: Address,
     interpreter_addr: Address,
@@ -120,6 +128,7 @@ impl BaseChain<()> {
             anvil,
             provider,
             owner,
+            owner_key: key,
             orderbook_addr: ORDERBOOK_BASE,
             deployer_addr,
             interpreter_addr,
@@ -159,19 +168,121 @@ impl<P: Provider + Clone> BaseChain<P> {
         mint_usdc(&self.provider, recipient, amount).await
     }
 
-    /// Deploys a test ERC20 with `t{symbol}` name, 18 decimals, and 1M
-    /// tokens minted to the owner. Caches the address for `take_order()`.
-    pub async fn deploy_equity_token(&mut self, symbol: &str) -> anyhow::Result<Address> {
+    /// Deploys a test ERC20 + ERC-4626 vault wrapper for an equity symbol.
+    ///
+    /// The vault has a 1:1 asset ratio (fresh, no appreciation). Half the
+    /// underlying supply is deposited into the vault so the owner has vault
+    /// shares available for orderbook deposits in `take_order()`. The vault
+    /// address is stored in `equity_tokens` so orders trade vault shares.
+    ///
+    /// Returns `(vault_address, underlying_token_address)` where:
+    /// - `vault_address` = the ERC-4626 wrapper (used as `wrapped` in config)
+    /// - `underlying_token_address` = the plain ERC20 (used as `unwrapped`)
+    pub async fn deploy_equity_vault(
+        &mut self,
+        symbol: &str,
+    ) -> anyhow::Result<(Address, Address)> {
         let name = format!("t{symbol}");
         let supply: U256 = parse_units("1000000", 18)?.into();
 
-        let token =
-            DeployableERC20::deploy(&self.provider, name.clone(), name, 18, self.owner, supply)
-                .await?;
+        let underlying = DeployableERC20::deploy(
+            &self.provider,
+            name.clone(),
+            name.clone(),
+            18,
+            self.owner,
+            supply,
+        )
+        .await?;
+        let underlying_addr = *underlying.address();
 
-        let addr = *token.address();
-        self.equity_tokens.insert(symbol.to_string(), addr);
-        Ok(addr)
+        let vault = TestVault::deploy(&self.provider, name.clone(), name, underlying_addr).await?;
+        let vault_addr = *vault.address();
+
+        // Approve unlimited so both the initial deposit and later wrapping
+        // steps (during the mint flow) can spend underlying tokens.
+        underlying
+            .approve(vault_addr, U256::MAX)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        // Deposit half the supply into the vault so the owner has vault
+        // shares for orderbook orders. The remaining underlying stays
+        // available for the wrapping step after tokenization mints.
+        let half_supply = supply / U256::from(2);
+        vault
+            .deposit(half_supply, self.owner)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        // Store vault address so take_order() trades vault shares
+        self.equity_tokens.insert(symbol.to_string(), vault_addr);
+
+        Ok((vault_addr, underlying_addr))
+    }
+
+    /// Funds the market maker wallet (derived from `[1u8; 32]`) with ETH
+    /// for gas and returns its address.
+    pub async fn fund_market_maker(&self) -> anyhow::Result<Address> {
+        let market_maker_key = B256::from([1u8; 32]);
+        let market_maker_signer = PrivateKeySigner::from_bytes(&market_maker_key)?;
+        let market_maker_addr = market_maker_signer.address();
+
+        let hundred_eth: U256 = parse_units("100", 18)?.into();
+        self.provider
+            .anvil_set_balance(market_maker_addr, hundred_eth)
+            .await?;
+
+        Ok(market_maker_addr)
+    }
+
+    /// Transfers underlying tokens to the market maker wallet and approves
+    /// the vault to spend them. This prepares the market maker for the
+    /// wrapping step of the mint flow (ERC-4626 `deposit()`).
+    ///
+    /// Uses Anvil account impersonation to approve from the market maker
+    /// address without needing a separate provider.
+    pub async fn prepare_market_maker_for_wrapping(
+        &self,
+        market_maker: Address,
+        underlying: Address,
+        vault: Address,
+        amount: U256,
+    ) -> anyhow::Result<()> {
+        // Transfer underlying tokens from owner to market maker
+        DeployableERC20::new(underlying, &self.provider)
+            .transfer(market_maker, amount)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        // Impersonate market maker to approve vault for wrapping
+        self.provider
+            .anvil_impersonate_account(market_maker)
+            .await?;
+
+        let unsigned_provider = ProviderBuilder::new()
+            .connect(&self.anvil.endpoint())
+            .await?;
+
+        IERC20::new(underlying, &unsigned_provider)
+            .approve(vault, U256::MAX)
+            .from(market_maker)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        self.provider
+            .anvil_stop_impersonating_account(market_maker)
+            .await?;
+
+        Ok(())
     }
 
     /// Creates an order on the OrderBook, takes it, and returns the result
@@ -212,14 +323,17 @@ impl<P: Provider + Clone> BaseChain<P> {
         };
 
         // Rain expression: maxAmount (output in base units) and ioRatio
-        // Sell: maxAmount = shares in 18-dec, ioRatio = price
-        // Buy: maxAmount = USDC in 6-dec, ioRatio = 1/price (only price=1 supported)
+        // Sell: output = equity, input = USDC, ioRatio = price (USDC per equity)
+        // Buy:  output = USDC, input = equity, ioRatio = 1/price (equity per USDC)
+        // Rain's parser supports decimal literals (e.g. "0.01"), so we compute
+        // the reciprocal price as a decimal string.
         let (max_amount_base, io_ratio_str) = if is_sell {
             let base: U256 = parse_units(&amount_str, 18)?.into();
             (base, price.to_string())
         } else {
             let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            (base, "1".to_string())
+            let reciprocal = 1.0 / f64::from(price);
+            (base, format!("{reciprocal}"))
         };
         let expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
 

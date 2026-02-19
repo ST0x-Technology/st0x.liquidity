@@ -41,9 +41,14 @@ mod usdc_rebalance;
 mod vault_registry;
 mod wrapper;
 
+pub use inventory::ImbalanceThreshold;
 pub use offchain_order::{Dollars, OffchainOrder, OffchainOrderId};
 pub use position::Position;
+pub use rebalancing::{
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, UsdcRebalancing,
+};
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
+pub use wrapper::EquityTokenAddresses;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use onchain::USDC_BASE;

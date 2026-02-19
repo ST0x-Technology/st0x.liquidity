@@ -1,11 +1,11 @@
-//! E2E scenario tests exercising the full bot lifecycle.
+//! E2E hedging tests exercising the full bot lifecycle.
 //!
-//! Each scenario starts a real Anvil fork, a mock broker, and launches the
-//! bot via `launch()`. The tests verify that the entire pipeline — from
-//! onchain event detection through CQRS processing to offchain order fills —
-//! works correctly under various conditions.
+//! Each test starts a real Anvil fork, a mock broker, and launches the bot
+//! via `launch()`. Tests verify that the entire pipeline -- from onchain
+//! event detection through CQRS processing to offchain order fills -- works
+//! correctly under various hedging conditions.
 //!
-//! Every test calls `assert_full_pipeline` which checks broker state,
+//! Every hedging test calls `assert_full_pipeline` which checks broker state,
 //! onchain vault balances, and all CQRS events/views comprehensively.
 
 mod common;
@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use alloy::providers::Provider;
 use rust_decimal::Decimal;
-use serial_test::serial;
 
 use st0x_event_sorcery::Projection;
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_hedge::config::ExecutionThreshold;
 use st0x_hedge::{OffchainOrder, Position};
 
 use common::{
@@ -33,11 +33,11 @@ use services::base_chain::{self, TakeDirection};
 async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     let scenario = E2eScenario {
         symbol: "AAPL",
-        amount: "1.0",
+        amount: "10.75",
         direction: TakeDirection::SellEquity,
         fill_price: "150.25",
         expected_accumulated_long: "0",
-        expected_accumulated_short: "1.0",
+        expected_accumulated_short: "10.75",
         expected_net: "0",
     };
 
@@ -45,7 +45,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
     )
     .await?;
-    chain.deploy_equity_token(scenario.symbol).await?;
+    chain.deploy_equity_vault(scenario.symbol).await?;
 
     let broker = AlpacaBrokerMock::start()
         .with_fill_price(scenario.fill_price)
@@ -89,9 +89,9 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
         "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
     )
     .await?;
-    chain.deploy_equity_token("AAPL").await?;
-    chain.deploy_equity_token("TSLA").await?;
-    chain.deploy_equity_token("MSFT").await?;
+    chain.deploy_equity_vault("AAPL").await?;
+    chain.deploy_equity_vault("TSLA").await?;
+    chain.deploy_equity_vault("MSFT").await?;
 
     let broker = AlpacaBrokerMock::start()
         .with_symbol_fill_price("AAPL", "185.50")
@@ -113,29 +113,29 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     let scenarios = [
         E2eScenario {
             symbol: "AAPL",
-            amount: "1.0",
+            amount: "5.25",
             direction: TakeDirection::SellEquity,
             fill_price: "185.50",
             expected_accumulated_long: "0",
-            expected_accumulated_short: "1.0",
+            expected_accumulated_short: "5.25",
             expected_net: "0",
         },
         E2eScenario {
             symbol: "TSLA",
-            amount: "1.0",
+            amount: "5.25",
             direction: TakeDirection::SellEquity,
             fill_price: "245.00",
             expected_accumulated_long: "0",
-            expected_accumulated_short: "1.0",
+            expected_accumulated_short: "5.25",
             expected_net: "0",
         },
         E2eScenario {
             symbol: "MSFT",
-            amount: "1.0",
+            amount: "5.25",
             direction: TakeDirection::SellEquity,
             fill_price: "410.75",
             expected_accumulated_long: "0",
-            expected_accumulated_short: "1.0",
+            expected_accumulated_short: "5.25",
             expected_net: "0",
         },
     ];
@@ -146,7 +146,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     for scenario in &scenarios {
         take_results.push(
             chain
-                .take_order(scenario.symbol, "1.0", scenario.direction)
+                .take_order(scenario.symbol, scenario.amount, scenario.direction)
                 .await?,
         );
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -175,7 +175,7 @@ async fn backfilling() -> anyhow::Result<()> {
         "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
     )
     .await?;
-    chain.deploy_equity_token("AAPL").await?;
+    chain.deploy_equity_vault("AAPL").await?;
 
     let broker = AlpacaBrokerMock::start()
         .with_fill_price("150.00")
@@ -191,7 +191,7 @@ async fn backfilling() -> anyhow::Result<()> {
     for _ in 0..trade_count {
         take_results.push(
             chain
-                .take_order("AAPL", "1.0", TakeDirection::SellEquity)
+                .take_order("AAPL", "4.5", TakeDirection::SellEquity)
                 .await?,
         );
     }
@@ -226,14 +226,14 @@ async fn backfilling() -> anyhow::Result<()> {
     assert_eq!(processed, queued, "All queued events should be processed");
     pool.close().await;
 
-    // Full pipeline: 3 sells, each hedged -> net = 0
+    // Full pipeline: 3 sells of 4.5 each, all hedged -> net = 0
     let scenario = E2eScenario {
         symbol: "AAPL",
-        amount: "3.0",
+        amount: "13.5",
         direction: TakeDirection::SellEquity,
         fill_price: "150.00",
         expected_accumulated_long: "0",
-        expected_accumulated_short: "3.0",
+        expected_accumulated_short: "13.5",
         expected_net: "0",
     };
 
@@ -258,7 +258,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
     )
     .await?;
-    chain.deploy_equity_token("AAPL").await?;
+    chain.deploy_equity_vault("AAPL").await?;
 
     let broker = AlpacaBrokerMock::start()
         .with_fill_price("150.00")
@@ -276,7 +276,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let take1 = chain
-        .take_order("AAPL", "1.0", TakeDirection::SellEquity)
+        .take_order("AAPL", "8.3", TakeDirection::SellEquity)
         .await?;
 
     wait_for_processing(&bot, 10).await;
@@ -292,7 +292,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
 
     // Phase 2: Execute 1 more take-order while bot is down
     let take2 = chain
-        .take_order("AAPL", "1.0", TakeDirection::SellEquity)
+        .take_order("AAPL", "8.3", TakeDirection::SellEquity)
         .await?;
 
     // Restart bot with same db_path
@@ -312,14 +312,14 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     );
     pool.close().await;
 
-    // Full pipeline: 2 sells total (1 pre + 1 post shutdown), both hedged
+    // Full pipeline: 2 sells of 8.3 each, both hedged
     let scenario = E2eScenario {
         symbol: "AAPL",
-        amount: "2.0",
+        amount: "16.6",
         direction: TakeDirection::SellEquity,
         fill_price: "150.00",
         expected_accumulated_long: "0",
-        expected_accumulated_short: "2.0",
+        expected_accumulated_short: "16.6",
         expected_net: "0",
     };
 
@@ -341,27 +341,27 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
 #[tokio::test]
 async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     let trade_sequence: Vec<(&str, &str, TakeDirection)> = vec![
-        ("AAPL", "1.0", TakeDirection::SellEquity),
-        ("TSLA", "1.0", TakeDirection::SellEquity),
+        ("AAPL", "6.75", TakeDirection::SellEquity),
+        ("TSLA", "6.75", TakeDirection::SellEquity),
     ];
 
     let scenarios = [
         E2eScenario {
             symbol: "AAPL",
-            amount: "1.0",
+            amount: "6.75",
             direction: TakeDirection::SellEquity,
             fill_price: "150.00",
             expected_accumulated_long: "0",
-            expected_accumulated_short: "1.0",
+            expected_accumulated_short: "6.75",
             expected_net: "0",
         },
         E2eScenario {
             symbol: "TSLA",
-            amount: "1.0",
+            amount: "6.75",
             direction: TakeDirection::SellEquity,
             fill_price: "150.00",
             expected_accumulated_long: "0",
-            expected_accumulated_short: "1.0",
+            expected_accumulated_short: "6.75",
             expected_net: "0",
         },
     ];
@@ -372,8 +372,8 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
     )
     .await?;
-    ref_chain.deploy_equity_token("AAPL").await?;
-    ref_chain.deploy_equity_token("TSLA").await?;
+    ref_chain.deploy_equity_vault("AAPL").await?;
+    ref_chain.deploy_equity_vault("TSLA").await?;
 
     let ref_broker = AlpacaBrokerMock::start()
         .with_fill_price("150.00")
@@ -420,8 +420,8 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
     )
     .await?;
-    crash_chain.deploy_equity_token("AAPL").await?;
-    crash_chain.deploy_equity_token("TSLA").await?;
+    crash_chain.deploy_equity_vault("AAPL").await?;
+    crash_chain.deploy_equity_vault("TSLA").await?;
 
     let crash_broker = AlpacaBrokerMock::start()
         .with_fill_price("150.00")
@@ -498,7 +498,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
     )
     .await?;
-    chain.deploy_equity_token("AAPL").await?;
+    chain.deploy_equity_vault("AAPL").await?;
 
     // Start with market CLOSED
     let broker = AlpacaBrokerMock::start()
@@ -516,9 +516,9 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Execute take-order — events enqueue and positions accumulate
+    // Execute take-order -- events enqueue and positions accumulate
     let take_result = chain
-        .take_order("AAPL", "1.0", TakeDirection::SellEquity)
+        .take_order("AAPL", "12.5", TakeDirection::SellEquity)
         .await?;
 
     // Wait for event processing but not order placement (market closed)
@@ -532,7 +532,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         .expect("Position should exist even when market is closed");
     assert_eq!(
         position.accumulated_short,
-        FractionalShares::new(Decimal::new(1, 0)),
+        FractionalShares::new(Decimal::new(125, 1)),
         "Should accumulate short even when market closed"
     );
 
@@ -561,11 +561,11 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     // Full pipeline assertions after market opens
     let scenario = E2eScenario {
         symbol: "AAPL",
-        amount: "1.0",
+        amount: "12.5",
         direction: TakeDirection::SellEquity,
         fill_price: "150.00",
         expected_accumulated_long: "0",
-        expected_accumulated_short: "1.0",
+        expected_accumulated_short: "12.5",
         expected_net: "0",
     };
 
@@ -594,24 +594,80 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Scenario 7: Inventory auto-rebalancing ─────────────────────────
-// Requires constructing RebalancingCtx which has pub(crate) fields.
-// Since integration tests can't access pub(crate) internals, this test
-// uses Ctx::from_toml() with TOML strings that enable rebalancing.
-// TODO: Implement when the rebalancing e2e infrastructure is ready.
-// The rebalancing flow requires:
-// 1. AlpacaBrokerMock + AlpacaTokenizationMock + CctpAttestationMock
-// 2. A fresh signer for market_maker_wallet (different from redemption_wallet)
-// 3. Onchain wallet funding and vault setup
-// 4. Aggressive imbalance thresholds to trigger rebalancing quickly
-// 5. The 60s inventory poller cycle
-//
-// This is deferred because:
-// - RebalancingCtx::new() is pub(crate), requiring Ctx::from_toml()
-// - The bot needs real onchain wallet state for rebalancing checks
-// - Mock services need to coordinate mint/redeem flows end-to-end
+/// Opposing trades cancel out, so no offchain hedge is placed.
+///
+/// Uses a high execution threshold so individual trades don't trigger
+/// hedging. After a SellEquity and BuyEquity of equal size, net = 0
+/// and no offchain orders should exist.
+#[tokio::test]
+async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
+    let scenario = E2eScenario {
+        symbol: "AAPL",
+        amount: "0",
+        direction: TakeDirection::NetZero,
+        fill_price: "150.00",
+        expected_accumulated_long: "14.75",
+        expected_accumulated_short: "14.75",
+        expected_net: "0",
+    };
 
-// ── Scenario 8: Chain reorganization (stub) ────────────────────────
+    let mut chain = base_chain::BaseChain::start(
+        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
+    )
+    .await?;
+    chain.deploy_equity_vault(scenario.symbol).await?;
+
+    let broker = AlpacaBrokerMock::start()
+        .with_fill_price(scenario.fill_price)
+        .build()
+        .await;
+
+    let current_block = chain.provider.get_block_number().await?;
+    let db_dir = tempfile::tempdir()?;
+    let db_path = db_dir.path().join("e2e.sqlite");
+    let database_url = db_path.display().to_string();
+
+    let mut ctx = build_ctx(&chain, &broker, &db_path, current_block)?;
+
+    // High threshold: 200 shares = $20,000 at $100/share -- well above
+    // any single trade, so individual trades won't trigger hedging.
+    let high_threshold =
+        Positive::<FractionalShares>::new(FractionalShares::new(Decimal::new(200, 0)))?;
+    ctx.execution_threshold = ExecutionThreshold::Shares(high_threshold);
+
+    let bot = spawn_bot(ctx);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // SellEquity 14.75 shares ($1,475) -- below 200-share threshold
+    let take_result_sell = chain
+        .take_order(scenario.symbol, "14.75", TakeDirection::SellEquity)
+        .await?;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // BuyEquity 14.75 shares ($1,475) -- net goes to 0
+    let take_result_buy = chain
+        .take_order(scenario.symbol, "14.75", TakeDirection::BuyEquity)
+        .await?;
+
+    wait_for_processing(&bot, 8).await;
+
+    assert_full_pipeline(
+        &[scenario],
+        &[take_result_sell, take_result_buy],
+        &chain.provider,
+        chain.orderbook_addr,
+        chain.owner,
+        &broker,
+        &database_url,
+    )
+    .await?;
+
+    bot.abort();
+    Ok(())
+}
+
+// ── Chain reorganization (stub) ──────────────────────────────────────
 
 #[tokio::test]
 #[ignore = "Requires Anvil reorg support (removed=true WebSocket notifications)"]

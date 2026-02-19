@@ -51,6 +51,17 @@ sol!(
     DeployableERC20, "lib/rain.orderbook/lib/rain.interpreter/out/TestERC20.sol/TestERC20.json"
 );
 
+// ERC-4626 vault with configurable name/symbol and 1:1 asset ratio.
+// Constructor takes `(name, symbol, underlying_address)`. Used in e2e
+// tests so the vault reports a "t"-prefixed symbol that the bot's
+// trade validation accepts, while providing a real `convertToAssets()`.
+#[cfg(any(test, feature = "test-support"))]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    TestVault, "out/TestVault.sol/TestVault.json"
+);
+
 #[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]

@@ -12,7 +12,7 @@ pub(crate) mod usdc;
 
 pub(crate) use rebalancer::Rebalancer;
 pub(crate) use spawn::{RebalancerServices, RebalancingCqrsFrameworks};
-pub(crate) use trigger::{
-    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, RebalancingTrigger,
-    RebalancingTriggerConfig, TriggeredOperation,
+pub use trigger::{
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, UsdcRebalancing,
 };
+pub(crate) use trigger::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};

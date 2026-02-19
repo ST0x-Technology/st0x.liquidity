@@ -14,7 +14,8 @@ use st0x_evm::EvmError;
 use st0x_execution::Symbol;
 
 pub(crate) use ratio::{RatioError, UnderlyingPerWrapped};
-pub(crate) use share::{EquityTokenAddresses, WrapperService};
+pub use share::EquityTokenAddresses;
+pub(crate) use share::WrapperService;
 
 #[cfg(test)]
 pub(crate) use ratio::RATIO_ONE;

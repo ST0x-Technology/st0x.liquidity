@@ -20,7 +20,7 @@ async fn smoke_test_base_fork() -> anyhow::Result<()> {
         chain.orderbook_addr
     );
 
-    let equity_addr = chain.deploy_equity_token("AAPL").await?;
+    let (equity_addr, _) = chain.deploy_equity_vault("AAPL").await?;
     let equity_code = chain.provider.get_code_at(equity_addr).await?;
     assert!(
         !equity_code.is_empty(),

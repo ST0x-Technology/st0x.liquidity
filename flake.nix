@@ -95,6 +95,7 @@
               (cd lib/rain.orderbook/lib/rain.interpreter/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
+              forge build
             '';
           };
 

@@ -1,8 +1,9 @@
 //! Shared helpers for e2e test scenarios.
 //!
 //! Provides the `E2eScenario` struct, DB assertion utilities, and bot
-//! lifecycle helpers used across `scenarios.rs` and `main.rs`.
+//! lifecycle helpers used across `hedging.rs`, `rebalancing.rs`, and `main.rs`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
@@ -19,7 +20,10 @@ use st0x_execution::{
 };
 use st0x_hedge::bindings::IOrderBookV5;
 use st0x_hedge::config::{BrokerCtx, Ctx, EvmCtx, LogLevel};
-use st0x_hedge::{Dollars, OffchainOrder, Position, launch};
+use st0x_hedge::{
+    Dollars, EquityTokenAddresses, ImbalanceThreshold, OffchainOrder, Position, RebalancingConfig,
+    RebalancingSecrets, UsdcRebalancing, launch,
+};
 
 use super::services::alpaca_broker::{
     self, AlpacaBrokerMock, MockOrderSnapshot, MockPositionSnapshot,
@@ -43,18 +47,33 @@ pub struct E2eScenario {
 }
 
 impl E2eScenario {
+    /// Whether this scenario expects an offchain hedge to be placed.
+    /// `NetZero` means opposing trades cancelled out and no hedge is needed.
+    pub fn expects_hedge(&self) -> bool {
+        !matches!(self.direction, TakeDirection::NetZero)
+    }
+
     /// The hedge direction is the inverse of the onchain direction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a `NetZero` scenario (no hedge direction exists).
     pub fn expected_hedge_direction(&self) -> Direction {
         match self.direction {
             TakeDirection::SellEquity => Direction::Buy,
             TakeDirection::BuyEquity => Direction::Sell,
+            TakeDirection::NetZero => panic!("NetZero scenario has no hedge direction"),
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if called on a `NetZero` scenario (no broker side exists).
     pub fn expected_broker_side(&self) -> &'static str {
         match self.direction {
             TakeDirection::SellEquity => "buy",
             TakeDirection::BuyEquity => "sell",
+            TakeDirection::NetZero => panic!("NetZero scenario has no broker side"),
         }
     }
 }
@@ -104,6 +123,90 @@ pub fn build_ctx<P: Provider + Clone>(
         broker: broker_ctx,
         telemetry: None,
         rebalancing: None,
+        execution_threshold,
+    })
+}
+
+/// Builds a `Ctx` with rebalancing enabled.
+///
+/// Uses the same broker/chain setup as `build_ctx`, but adds a
+/// `RebalancingCtx` with aggressive equity thresholds (target=0.5,
+/// deviation=0.1) and the given USDC rebalancing configuration.
+///
+/// All Alpaca services (broker, tokenization, wallet) are pointed at
+/// the broker mock's URL since the conductor resolves all three from
+/// `AlpacaBrokerApiCtx.base_url()`.
+///
+/// `equity_tokens` is a slice of `(symbol, vault_address, underlying_address)`
+/// tuples. Each entry deploys an ERC-4626 vault wrapping the underlying
+/// ERC20, required for equity rebalancing triggers (`convertToAssets()`).
+pub fn build_rebalancing_ctx<P: Provider + Clone>(
+    chain: &base_chain::BaseChain<P>,
+    broker: &AlpacaBrokerMock,
+    db_path: &std::path::Path,
+    deployment_block: u64,
+    equity_tokens: &[(&str, Address, Address)],
+    usdc_rebalancing: UsdcRebalancing,
+) -> anyhow::Result<Ctx> {
+    let alpaca_auth = AlpacaBrokerApiCtx {
+        api_key: alpaca_broker::TEST_API_KEY.to_owned(),
+        api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
+        account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+        mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
+        asset_cache_ttl: Duration::from_secs(3600),
+        time_in_force: TimeInForce::Day,
+    };
+    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
+    let execution_threshold = broker_ctx.execution_threshold()?;
+
+    let equities: HashMap<Symbol, EquityTokenAddresses> = equity_tokens
+        .iter()
+        .map(|&(symbol, wrapped, unwrapped)| {
+            Ok((
+                Symbol::new(symbol)?,
+                EquityTokenAddresses { wrapped, unwrapped },
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    let config = RebalancingConfig {
+        equity: ImbalanceThreshold {
+            target: Decimal::new(5, 1),
+            deviation: Decimal::new(1, 1),
+        },
+        usdc: usdc_rebalancing,
+        redemption_wallet: Address::random(),
+        usdc_vault_id: B256::random(),
+        equities,
+    };
+
+    // Use the chain owner's private key so that `Ctx::order_owner()`
+    // (which derives the address from this key when rebalancing is
+    // enabled) matches the account that places orders in tests.
+    let secrets = RebalancingSecrets {
+        ethereum_rpc_url: chain.ws_endpoint()?,
+        evm_private_key: chain.owner_key,
+    };
+
+    let rebalancing_ctx = st0x_hedge::RebalancingCtx::new(config, secrets, alpaca_auth)?;
+
+    Ok(Ctx {
+        database_url: db_path.display().to_string(),
+        log_level: LogLevel::Debug,
+        server_port: 0,
+        evm: EvmCtx {
+            ws_rpc_url: chain.ws_endpoint()?,
+            orderbook: chain.orderbook_addr,
+            order_owner: Some(chain.owner),
+            deployment_block,
+        },
+        order_polling_interval: 1,
+        order_polling_max_jitter: 0,
+        position_check_interval: 2,
+        inventory_poll_interval: 2,
+        broker: broker_ctx,
+        telemetry: None,
+        rebalancing: Some(rebalancing_ctx),
         execution_threshold,
     })
 }
@@ -222,6 +325,22 @@ pub fn assert_broker_state(scenarios: &[E2eScenario], broker: &AlpacaBrokerMock)
     let positions = broker.positions();
 
     for scenario in scenarios {
+        if !scenario.expects_hedge() {
+            let symbol_orders: Vec<&MockOrderSnapshot> = orders
+                .iter()
+                .filter(|order| order.symbol == scenario.symbol)
+                .collect();
+
+            assert!(
+                symbol_orders.is_empty(),
+                "Expected no broker orders for {} (net zero), got {}",
+                scenario.symbol,
+                symbol_orders.len()
+            );
+
+            continue;
+        }
+
         let symbol_orders: Vec<&MockOrderSnapshot> = orders
             .iter()
             .filter(|order| order.symbol == scenario.symbol)
@@ -378,13 +497,6 @@ fn assert_position_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
             })
             .collect();
 
-        assert!(
-            pos_events.len() >= 3,
-            "Expected at least 3 Position events for {}, got {}",
-            scenario.symbol,
-            pos_events.len()
-        );
-
         // First event is always Initialized
         assert_eq!(
             pos_events[0].event_type, "PositionEvent::Initialized",
@@ -396,7 +508,6 @@ fn assert_position_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
             "Position aggregate_id should be the symbol"
         );
 
-        // Must have at least one of each key event type
         let event_types: Vec<&str> = pos_events
             .iter()
             .map(|event| event.event_type.as_str())
@@ -407,31 +518,64 @@ fn assert_position_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
             "Missing PositionEvent::OnChainOrderFilled for {}",
             scenario.symbol
         );
-        assert!(
-            event_types.contains(&"PositionEvent::OffChainOrderPlaced"),
-            "Missing PositionEvent::OffChainOrderPlaced for {}",
-            scenario.symbol
-        );
-        assert!(
-            event_types.contains(&"PositionEvent::OffChainOrderFilled"),
-            "Missing PositionEvent::OffChainOrderFilled for {}",
-            scenario.symbol
-        );
+
+        if scenario.expects_hedge() {
+            assert!(
+                pos_events.len() >= 3,
+                "Expected at least 3 Position events for {}, got {}",
+                scenario.symbol,
+                pos_events.len()
+            );
+
+            assert!(
+                event_types.contains(&"PositionEvent::OffChainOrderPlaced"),
+                "Missing PositionEvent::OffChainOrderPlaced for {}",
+                scenario.symbol
+            );
+            assert!(
+                event_types.contains(&"PositionEvent::OffChainOrderFilled"),
+                "Missing PositionEvent::OffChainOrderFilled for {}",
+                scenario.symbol
+            );
+        } else {
+            assert!(
+                !event_types.contains(&"PositionEvent::OffChainOrderPlaced"),
+                "Unexpected PositionEvent::OffChainOrderPlaced for net-zero {}",
+                scenario.symbol
+            );
+            assert!(
+                !event_types.contains(&"PositionEvent::OffChainOrderFilled"),
+                "Unexpected PositionEvent::OffChainOrderFilled for net-zero {}",
+                scenario.symbol
+            );
+        }
     }
 }
 
 fn assert_offchain_order_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
+    let hedged_scenarios: Vec<&E2eScenario> =
+        scenarios.iter().filter(|s| s.expects_hedge()).collect();
+
     let offchain_events: Vec<&StoredEvent> = events
         .iter()
         .filter(|event| event.aggregate_type == "OffchainOrder")
         .collect();
 
-    // At least 3 events per symbol (Placed, Submitted, Filled for at
-    // least one offchain order aggregate per symbol)
+    if hedged_scenarios.is_empty() {
+        assert!(
+            offchain_events.is_empty(),
+            "Expected no OffchainOrder events for net-zero scenarios, got {}",
+            offchain_events.len()
+        );
+
+        return;
+    }
+
+    // At least 3 events per hedged symbol (Placed, Submitted, Filled)
     assert!(
-        offchain_events.len() >= 3 * scenarios.len(),
+        offchain_events.len() >= 3 * hedged_scenarios.len(),
         "Expected at least {} OffchainOrder events, got {}",
-        3 * scenarios.len(),
+        3 * hedged_scenarios.len(),
         offchain_events.len()
     );
 
@@ -517,6 +661,21 @@ async fn assert_offchain_order_views(
     let all_orders = projection.load_all().await?;
 
     for scenario in scenarios {
+        if !scenario.expects_hedge() {
+            let expected_symbol = Symbol::new(scenario.symbol)?;
+            let has_orders = all_orders
+                .iter()
+                .any(|(_, order)| matches!(order, OffchainOrder::Filled { symbol, .. } if symbol == &expected_symbol));
+
+            assert!(
+                !has_orders,
+                "Expected no offchain orders for net-zero {}, but found some",
+                scenario.symbol
+            );
+
+            continue;
+        }
+
         let expected_symbol = Symbol::new(scenario.symbol)?;
         let expected_amount: Decimal = scenario.amount.parse()?;
         let expected_price: Decimal = scenario.fill_price.parse()?;

@@ -1,4 +1,7 @@
-# Marks e2e tests slow after 80s instead of the 60s default
+# E2e tests fork Base mainnet via Anvil, which can time out if the RPC
+# endpoint is slow under parallel load. Retry once with exponential
+# backoff so a transient fork timeout doesn't fail the whole suite.
 [[profile.default.overrides]]
 filter = "kind(test)"
 slow-timeout = { period = "80s" }
+retries = { backoff = "exponential", count = 2, delay = "5s", jitter = true }
