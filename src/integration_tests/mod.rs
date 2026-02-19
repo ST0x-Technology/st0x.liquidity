@@ -49,7 +49,7 @@ async fn assert_events(pool: &SqlitePool, expected: &[ExpectedEvent]) -> Vec<Sto
     let events = fetch_events(pool).await;
     let actual: Vec<ExpectedEvent> = events
         .iter()
-        .map(|e| ExpectedEvent::new(&e.aggregate_type, &e.aggregate_id, &e.event_type))
+        .map(|event| ExpectedEvent::new(&event.aggregate_type, &event.aggregate_id, &event.event_type))
         .collect();
     assert_eq!(actual, expected);
     events

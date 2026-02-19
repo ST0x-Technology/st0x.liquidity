@@ -477,7 +477,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let events = fetch_events(&pool).await;
     let mint_agg_id = events
         .iter()
-        .find(|e| e.aggregate_type == "TokenizedEquityMint")
+        .find(|event| event.aggregate_type == "TokenizedEquityMint")
         .expect("Expected at least one TokenizedEquityMint event")
         .aggregate_id
         .clone();
@@ -685,7 +685,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     let events = fetch_events(&pool).await;
     let redemption_agg_id = events
         .iter()
-        .find(|e| e.aggregate_type == "EquityRedemption")
+        .find(|event| event.aggregate_type == "EquityRedemption")
         .expect("Expected at least one EquityRedemption event")
         .aggregate_id
         .clone();
@@ -1156,12 +1156,12 @@ async fn threshold_config_controls_trigger_sensitivity() {
         trigger.check_and_trigger_usdc().await;
         drop(trigger);
 
-        let op = receiver
+        let operation = receiver
             .try_recv()
             .expect("Tight threshold (40%-60%) should trigger at 35% onchain ratio");
 
         // Excess = target_onchain - actual_onchain = 500 - 350 = $150
-        match op {
+        match operation {
             TriggeredOperation::UsdcAlpacaToBase { amount } => {
                 assert_eq!(
                     amount,
