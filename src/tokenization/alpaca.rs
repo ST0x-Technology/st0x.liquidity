@@ -276,7 +276,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
+    opt.filter(|symbol_str| !symbol_str.is_empty())
+        .map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -1632,5 +1633,25 @@ pub(crate) mod tests {
         );
 
         mint_mock.assert();
+    }
+
+    #[test]
+    fn test_deserialize_tokenization_request_with_empty_token_symbol() {
+        let json = json!({
+            "tokenization_request_id": "tok_req_empty",
+            "status": "pending",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "",
+            "qty": "10",
+            "issuer": "alpaca",
+            "network": "base",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            request.token_symbol, None,
+            "Empty token_symbol string should deserialize as None"
+        );
     }
 }
