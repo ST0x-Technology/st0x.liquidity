@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use st0x_event_sorcery::{SendError, Store};
-use st0x_evm::Evm;
+use st0x_evm::{Evm, OpenChainErrorRegistry};
 use st0x_execution::{Executor, InventoryResult};
 
 use crate::inventory::snapshot::{
@@ -138,7 +138,7 @@ where
 
         let balance_futures = registry.equity_vaults.values().map(|vault| async {
             self.raindex_service
-                .get_equity_balance(
+                .get_equity_balance::<OpenChainErrorRegistry>(
                     self.order_owner,
                     vault.token,
                     RaindexVaultId(vault.vault_id),
@@ -185,7 +185,10 @@ where
 
         let usdc_balance = self
             .raindex_service
-            .get_usdc_balance(self.order_owner, RaindexVaultId(usdc_vault.vault_id))
+            .get_usdc_balance::<OpenChainErrorRegistry>(
+                self.order_owner,
+                RaindexVaultId(usdc_vault.vault_id),
+            )
             .await?;
 
         self.snapshot

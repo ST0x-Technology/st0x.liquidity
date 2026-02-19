@@ -7,6 +7,8 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::{debug, info};
 
+use st0x_evm::Evm;
+
 use super::OnChainError;
 use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
 use crate::onchain::trade::TradeValidationError;
@@ -20,10 +22,10 @@ use crate::symbol::cache::SymbolCache;
 impl OnchainTrade {
     /// Creates OnchainTrade directly from ClearV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
-    pub async fn try_from_clear_v3<P: Provider>(
+    pub async fn try_from_clear_v3<E: Evm>(
         evm_ctx: &EvmCtx,
         cache: &SymbolCache,
-        provider: P,
+        evm: &E,
         event: ClearV3,
         log: Log,
         feed_id_cache: &FeedIdCache,
@@ -64,7 +66,7 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        let after_clear = fetch_after_clear_event(&provider, evm_ctx, &log).await?;
+        let after_clear = fetch_after_clear_event(evm, evm_ctx, &log).await?;
 
         let ClearStateChangeV2 {
             aliceOutput,
@@ -91,15 +93,9 @@ impl OnchainTrade {
             (bob_order, fill)
         };
 
-        let result = Self::try_from_order_and_fill_details(
-            cache,
-            &provider,
-            order,
-            fill,
-            log,
-            feed_id_cache,
-        )
-        .await;
+        let result =
+            Self::try_from_order_and_fill_details(cache, evm, order, fill, log, feed_id_cache)
+                .await;
 
         if let Ok(Some(ref trade)) = result {
             info!(
@@ -128,8 +124,8 @@ impl OnchainTrade {
 /// fails to find the AfterClearV2, we fall back to extracting it directly from the
 /// transaction receipt. This was discovered during backfill operations where `get_logs`
 /// returned 0 AfterClearV2 logs, but `get_transaction_receipt` showed both logs present.
-async fn fetch_after_clear_event<P: Provider>(
-    provider: &P,
+async fn fetch_after_clear_event(
+    evm: &impl Evm,
     evm_ctx: &EvmCtx,
     log: &Log,
 ) -> Result<AfterClearV2, OnChainError> {
@@ -144,7 +140,7 @@ async fn fetch_after_clear_event<P: Provider>(
         .address(evm_ctx.orderbook)
         .event_signature(AfterClearV2::SIGNATURE_HASH);
 
-    let after_clear_logs = provider.get_logs(&filter).await?;
+    let after_clear_logs = evm.provider().get_logs(&filter).await?;
 
     if let Some(after_clear_log) = after_clear_logs.iter().find(|after_clear_log| {
         after_clear_log.transaction_hash == log.transaction_hash
@@ -156,7 +152,7 @@ async fn fetch_after_clear_event<P: Provider>(
     // Fallback: extract from tx receipt when get_logs returns incomplete data.
     // Some RPC nodes fail to return logs via eth_getLogs for historical blocks,
     // but the logs are present in the transaction receipt.
-    let receipt = provider.get_transaction_receipt(tx_hash).await?;
+    let receipt = evm.provider().get_transaction_receipt(tx_hash).await?;
     let Some(tx_receipt) = receipt else {
         return Err(TradeValidationError::NodeReceiptMissing {
             block_number,
@@ -237,6 +233,7 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
+    use st0x_evm::ReadOnlyEvm;
     use st0x_execution::FractionalShares;
 
     use super::*;
@@ -373,13 +370,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"tAAPL".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -454,13 +451,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -496,13 +493,13 @@ mod tests {
         let clear_log = get_test_log();
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -532,13 +529,13 @@ mod tests {
         clear_log.block_number = None; // Missing block number
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -587,13 +584,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // No after clear logs found
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -659,13 +656,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong transaction hash
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -729,13 +726,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong log index ordering
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -804,13 +801,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"tAAPL".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -956,13 +953,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"tAAPL".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1026,13 +1023,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log_equal_index])); // get_logs returns log with equal index (not valid)
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt has no logs
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1101,13 +1098,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"tAAPL".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1170,13 +1167,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"tAAPL".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1245,13 +1242,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"tAAPL".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1299,13 +1296,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has log but wrong contract address
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1352,13 +1349,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has AfterClearV2 but log_index < clear's
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1401,13 +1398,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has ClearV3 but no AfterClearV2
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1457,13 +1454,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has log but unrecognized event signature
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,
@@ -1529,13 +1526,13 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"tAAPL".to_string(),
         ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
             &cache,
-            provider,
+            &evm,
             clear_event,
             clear_log,
             &feed_id_cache,

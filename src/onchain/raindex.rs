@@ -74,7 +74,6 @@ pub(crate) enum RaindexError {
 /// service.deposit_usdc(vault_id, amount).await?;
 /// ```
 pub(crate) struct RaindexService<E: Evm> {
-    orderbook: IOrderBookV5::IOrderBookV5Instance<E::Provider>,
     orderbook_address: Address,
     vault_registry_projection: Arc<VaultRegistryProjection>,
     evm: E,
@@ -88,10 +87,7 @@ impl<E: Evm> RaindexService<E> {
         vault_registry_projection: Arc<VaultRegistryProjection>,
         owner: Address,
     ) -> Self {
-        let provider = evm.provider().clone();
-
         Self {
-            orderbook: IOrderBookV5::new(orderbook, provider),
             orderbook_address: orderbook,
             vault_registry_projection,
             evm,
@@ -233,36 +229,46 @@ impl<W: Wallet> RaindexService<W> {
 
 /// Read operations that only need chain access (no signing).
 impl<E: Evm> RaindexService<E> {
-    pub(crate) async fn get_equity_balance(
+    pub(crate) async fn get_equity_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         token: Address,
         vault_id: RaindexVaultId,
     ) -> Result<FractionalShares, RaindexError> {
-        let decimal = self.get_vault_balance(owner, token, vault_id).await?;
+        let decimal = self
+            .get_vault_balance::<Registry>(owner, token, vault_id)
+            .await?;
         Ok(FractionalShares::new(decimal))
     }
 
     /// Gets the USDC balance of a vault on Base.
-    pub(crate) async fn get_usdc_balance(
+    pub(crate) async fn get_usdc_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         vault_id: RaindexVaultId,
     ) -> Result<Usdc, RaindexError> {
-        let decimal = self.get_vault_balance(owner, USDC_BASE, vault_id).await?;
+        let decimal = self
+            .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id)
+            .await?;
         Ok(Usdc(decimal))
     }
 
-    async fn get_vault_balance(
+    async fn get_vault_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         token: Address,
         vault_id: RaindexVaultId,
     ) -> Result<Decimal, RaindexError> {
         let balance_float = self
-            .orderbook
-            .vaultBalance2(owner, token, vault_id.0)
-            .call()
+            .evm
+            .call::<Registry, _>(
+                self.orderbook_address,
+                IOrderBookV5::vaultBalance2Call {
+                    owner,
+                    token,
+                    vaultId: vault_id.0,
+                },
+            )
             .await?;
 
         float_to_decimal(balance_float)
@@ -505,11 +511,16 @@ mod tests {
             token: Address,
             vault_id: B256,
         ) -> Result<B256, LocalEvmError> {
-            let orderbook = IOrderBookV5::new(self.orderbook_address, self.wallet.provider());
-
-            let balance = orderbook
-                .vaultBalance2(self.wallet.address(), token, vault_id)
-                .call()
+            let balance = self
+                .wallet
+                .call::<NoOpErrorRegistry, _>(
+                    self.orderbook_address,
+                    IOrderBookV5::vaultBalance2Call {
+                        owner: self.wallet.address(),
+                        token,
+                        vaultId: vault_id,
+                    },
+                )
                 .await?;
 
             Ok(balance)
@@ -753,7 +764,7 @@ mod tests {
         let service = create_test_raindex_service(&local_evm).await;
 
         let balance = service
-            .get_equity_balance(
+            .get_equity_balance::<NoOpErrorRegistry>(
                 local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
@@ -792,7 +803,7 @@ mod tests {
             .unwrap();
 
         let balance = service
-            .get_equity_balance(
+            .get_equity_balance::<NoOpErrorRegistry>(
                 local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
@@ -846,7 +857,7 @@ mod tests {
             .unwrap();
 
         let balance = service
-            .get_equity_balance(
+            .get_equity_balance::<NoOpErrorRegistry>(
                 local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,

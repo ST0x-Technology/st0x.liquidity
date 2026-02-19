@@ -24,7 +24,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
-use st0x_evm::Wallet;
+use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
@@ -577,6 +577,7 @@ where
     let ctx_clone = ctx.clone();
     let pool_clone = pool.clone();
     let cache_clone = cache.clone();
+    let evm = ReadOnlyEvm::new(provider);
 
     tokio::spawn(async move {
         run_queue_processor(
@@ -584,7 +585,7 @@ where
             &ctx_clone,
             &pool_clone,
             &cache_clone,
-            provider,
+            &evm,
             &cqrs,
             &vault_registry,
         )
@@ -788,16 +789,15 @@ async fn process_live_event(
     Ok(())
 }
 
-async fn run_queue_processor<P, E>(
+async fn run_queue_processor<E>(
     executor: &E,
     ctx: &Ctx,
     pool: &SqlitePool,
     cache: &SymbolCache,
-    provider: P,
+    evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     vault_registry: &Store<VaultRegistry>,
 ) where
-    P: Provider + Clone,
     E: Executor + Clone,
     EventProcessingError: From<E::Error>,
 {
@@ -816,7 +816,7 @@ async fn run_queue_processor<P, E>(
     };
 
     loop {
-        let delay = process_queue_step(ctx, pool, &provider, cqrs, &queue_context).await;
+        let delay = process_queue_step(ctx, pool, evm, cqrs, &queue_context).await;
         sleep(delay).await;
     }
 }
@@ -831,14 +831,14 @@ async fn log_unprocessed_count(pool: &SqlitePool) {
     }
 }
 
-async fn process_queue_step<P: Provider + Clone, E: Executor>(
+async fn process_queue_step<E: Executor>(
     ctx: &Ctx,
     pool: &SqlitePool,
-    provider: &P,
+    evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingCtx<'_, E>,
 ) -> Duration {
-    match process_next_queued_event(ctx, pool, provider, cqrs, queue_context).await {
+    match process_next_queued_event(ctx, pool, evm, cqrs, queue_context).await {
         Ok(Some(offchain_order_id)) => {
             info!(%offchain_order_id, "Offchain order placed successfully");
             std::time::Duration::ZERO
@@ -861,10 +861,10 @@ struct QueueProcessingCtx<'a, E> {
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
+async fn process_next_queued_event<E: Executor>(
     ctx: &Ctx,
     pool: &SqlitePool,
-    provider: &P,
+    evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingCtx<'_, E>,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
@@ -880,7 +880,7 @@ async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
     let onchain_trade = convert_event_to_trade(
         ctx,
         queue_context.cache,
-        provider,
+        evm,
         &queued_event,
         queue_context.feed_id_cache,
         queue_context.order_owner,
@@ -991,10 +991,10 @@ pub(super) async fn discover_vaults_for_trade(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn convert_event_to_trade<P: Provider + Clone>(
+async fn convert_event_to_trade(
     ctx: &Ctx,
     cache: &SymbolCache,
-    provider: &P,
+    evm: &impl Evm,
     queued_event: &QueuedEvent,
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
@@ -1006,7 +1006,7 @@ async fn convert_event_to_trade<P: Provider + Clone>(
             OnchainTrade::try_from_clear_v3(
                 &ctx.evm,
                 cache,
-                provider,
+                evm,
                 *clear_event.clone(),
                 reconstructed_log,
                 feed_id_cache,
@@ -1017,7 +1017,7 @@ async fn convert_event_to_trade<P: Provider + Clone>(
         TradeEvent::TakeOrderV3(take_event) => {
             OnchainTrade::try_from_take_order_if_target_owner(
                 cache,
-                provider,
+                evm,
                 *take_event.clone(),
                 reconstructed_log,
                 order_owner,
@@ -1611,7 +1611,14 @@ mod tests {
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        let result = process_next_queued_event(&ctx, &pool, &provider, &cqrs, &queue_context).await;
+        let result = process_next_queued_event(
+            &ctx,
+            &pool,
+            &ReadOnlyEvm::new(provider),
+            &cqrs,
+            &queue_context,
+        )
+        .await;
 
         assert_eq!(result.unwrap(), None);
 
@@ -1663,9 +1670,15 @@ mod tests {
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        process_next_queued_event(&ctx, &pool, &provider, &cqrs, &queue_context)
-            .await
-            .unwrap();
+        process_next_queued_event(
+            &ctx,
+            &pool,
+            &ReadOnlyEvm::new(provider),
+            &cqrs,
+            &queue_context,
+        )
+        .await
+        .unwrap();
 
         assert!(logs_contain("Event filtered out"));
     }
@@ -1714,9 +1727,15 @@ mod tests {
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        process_next_queued_event(&ctx, &pool, &provider, &cqrs, &queue_context)
-            .await
-            .unwrap();
+        process_next_queued_event(
+            &ctx,
+            &pool,
+            &ReadOnlyEvm::new(provider),
+            &cqrs,
+            &queue_context,
+        )
+        .await
+        .unwrap();
 
         assert!(logs_contain("ClearV3"));
     }

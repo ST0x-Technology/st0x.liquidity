@@ -669,6 +669,7 @@ async fn run_provider_command<W: Write>(
 mod tests {
     use alloy::hex;
     use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::providers::Provider;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
     use clap::CommandFactory;
@@ -1262,7 +1263,7 @@ mod tests {
         mock_data: &MockBlockchainData,
         input_symbol: &str,
         output_symbol: &str,
-    ) -> impl alloy::providers::Provider + Clone {
+    ) -> impl Provider + Clone + 'static {
         let asserter = Asserter::new();
         asserter.push_success(&mock_data.receipt_json);
         asserter.push_success(&json!([mock_data.after_clear_log]));

@@ -1,6 +1,6 @@
 //! Transfer equity and USDC rebalancing CLI commands.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::{Projection, StoreBuilder};
+use st0x_evm::{Evm, OpenChainErrorRegistry, ReadOnlyEvm};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
     TimeInForce,
@@ -292,10 +293,17 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     let receiving_wallet = rebalancing_ctx.base_wallet().address();
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
-    let erc20 = IERC20::new(token, provider.clone());
-    let initial_balance = erc20.balanceOf(receiving_wallet).call().await?;
-    writeln!(stdout, "   Initial balance: {initial_balance}")?;
+    let read_evm = ReadOnlyEvm::new(provider.clone());
+    let initial_balance: U256 = read_evm
+        .call::<OpenChainErrorRegistry, _>(
+            token,
+            IERC20::balanceOfCall {
+                account: receiving_wallet,
+            },
+        )
+        .await?;
 
+    writeln!(stdout, "   Initial balance: {initial_balance}")?;
     let expected_amount = quantity.to_u256_18_decimals()?;
     let expected_final = initial_balance + expected_amount;
     writeln!(stdout, "   Expected final balance: {expected_final}")?;
@@ -349,7 +357,14 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     let max_attempts = 60; // 5 minutes max
 
     for attempt in 1..=max_attempts {
-        let current_balance = erc20.balanceOf(receiving_wallet).call().await?;
+        let current_balance: U256 = read_evm
+            .call::<OpenChainErrorRegistry, _>(
+                token,
+                IERC20::balanceOfCall {
+                    account: receiving_wallet,
+                },
+            )
+            .await?;
 
         if current_balance >= expected_final {
             writeln!(stdout, "   Final balance: {current_balance}")?;
@@ -367,7 +382,15 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
         tokio::time::sleep(poll_interval).await;
     }
 
-    let final_balance = erc20.balanceOf(receiving_wallet).call().await?;
+    let final_balance: U256 = read_evm
+        .call::<OpenChainErrorRegistry, _>(
+            token,
+            IERC20::balanceOfCall {
+                account: receiving_wallet,
+            },
+        )
+        .await?;
+
     writeln!(stdout, "   Final balance: {final_balance}")?;
     writeln!(stdout, "⏳ Timed out waiting for tokens (may still arrive)")?;
 

@@ -3,14 +3,16 @@
 //! Prevents repeated RPC calls by caching the mapping from token addresses
 //! to their symbol strings.
 
-use alloy::{primitives::Address, providers::Provider};
+use alloy::primitives::Address;
 use backon::{ExponentialBuilder, Retryable};
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock},
 };
 
-use crate::bindings::{IERC20::IERC20Instance, IOrderBookV5::IOV2};
+use st0x_evm::{Evm, OpenChainErrorRegistry};
+
+use crate::bindings::{IERC20, IOrderBookV5::IOV2};
 use crate::onchain::OnChainError;
 
 #[derive(Debug, Default, Clone)]
@@ -19,11 +21,7 @@ pub(crate) struct SymbolCache {
 }
 
 impl SymbolCache {
-    pub async fn get_io_symbol<P: Provider>(
-        &self,
-        provider: P,
-        io: &IOV2,
-    ) -> Result<String, OnChainError> {
+    pub async fn get_io_symbol<E: Evm>(&self, evm: &E, io: &IOV2) -> Result<String, OnChainError> {
         let maybe_symbol = {
             let read_guard = match self.map.read() {
                 Ok(guard) => guard,
@@ -38,10 +36,13 @@ impl SymbolCache {
 
         const SYMBOL_FETCH_MAX_RETRIES: usize = 3;
 
-        let erc20 = IERC20Instance::new(io.token, provider);
-        let symbol = (|| async { erc20.symbol().call().await })
-            .retry(ExponentialBuilder::new().with_max_times(SYMBOL_FETCH_MAX_RETRIES))
-            .await?;
+        let token = io.token;
+        let symbol: String = (|| async {
+            evm.call::<OpenChainErrorRegistry, _>(token, IERC20::symbolCall {})
+                .await
+        })
+        .retry(ExponentialBuilder::new().with_max_times(SYMBOL_FETCH_MAX_RETRIES))
+        .await?;
 
         match self.map.write() {
             Ok(mut guard) => guard.insert(io.token, symbol.clone()),
@@ -54,9 +55,12 @@ impl SymbolCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::primitives::{B256, address};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
+
+    use st0x_evm::ReadOnlyEvm;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_symbol_cache_hit() {
@@ -75,8 +79,8 @@ mod tests {
         };
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        assert_eq!(cache.get_io_symbol(provider, &io).await.unwrap(), "TEST");
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+        assert_eq!(cache.get_io_symbol(&evm, &io).await.unwrap(), "TEST");
     }
 
     #[tokio::test]
@@ -91,10 +95,10 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure");
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         assert!(matches!(
-            cache.get_io_symbol(provider, &io).await.unwrap_err(),
-            OnChainError::ContractCall(_)
+            cache.get_io_symbol(&evm, &io).await.unwrap_err(),
+            OnChainError::Evm(_)
         ));
     }
 }

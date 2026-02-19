@@ -88,8 +88,8 @@ pub(crate) enum OnChainError {
     Persistence(#[from] PersistenceError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Contract call error: {0}")]
-    ContractCall(#[from] alloy::contract::Error),
+    #[error("EVM error: {0}")]
+    Evm(#[from] st0x_evm::EvmError),
     #[error("Sol type error: {0}")]
     SolType(#[from] alloy::sol_types::Error),
     #[error("RPC transport error: {0}")]
