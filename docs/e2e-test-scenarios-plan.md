@@ -154,8 +154,8 @@ Add `CalendarEntry` struct and `set_calendar()` method. Change `register_calenda
 
 ```
 cargo check
-cargo test --test main -q
-cargo test --test scenarios -q
+cargo nextest run --test main
+cargo nextest run --test scenarios
 cargo clippy --workspace --all-targets --all-features
 cargo fmt
 ```
