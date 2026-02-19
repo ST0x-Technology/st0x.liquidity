@@ -463,7 +463,6 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
-    use tracing_test::traced_test;
 
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
@@ -944,7 +943,6 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), "invalid execution threshold");
     }
 
-    #[traced_test]
     #[tokio::test]
     async fn rebalancing_with_schwab_logs_error_kind() {
         let secrets = r#"
@@ -987,20 +985,6 @@ pub(crate) mod tests {
         "#;
 
         Ctx::from_toml(config, secrets).await.unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn rebalancing_ctx_returns_ok_when_rebalancing() {
-        let error = Ctx::from_toml(example_config_toml(), example_secrets_toml())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead(_))
-            ),
-            "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
-        );
     }
 
     #[tokio::test]

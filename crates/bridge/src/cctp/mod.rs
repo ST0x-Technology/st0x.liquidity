@@ -246,8 +246,8 @@ pub struct CctpCtx<EthWallet, BaseWallet> {
 /// let bridge = CctpBridge::try_from_ctx(CctpCtx {
 ///     usdc_ethereum: USDC_ETHEREUM,
 ///     usdc_base: USDC_BASE,
-///     ethereum_caller,
-///     base_caller,
+///     ethereum_wallet,
+///     base_wallet,
 /// })?;
 ///
 /// let amount = U256::from(1_000_000); // 1 USDC
@@ -611,17 +611,17 @@ where
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::address;
     use alloy::primitives::{B256, b256, keccak256};
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
     use httpmock::prelude::*;
+    use itertools::Itertools;
     use proptest::prelude::*;
     use rand::Rng;
     use rust_decimal_macros::dec;
-
-    use alloy::primitives::address;
 
     use st0x_evm::local::RawPrivateKeyWallet;
 
@@ -1885,8 +1885,6 @@ mod tests {
     }
 
     fn build_nonce_message(header: &[u8], nonce: [u8; 32], trailer: &[u8]) -> Vec<u8> {
-        use itertools::Itertools;
-
         header
             .iter()
             .copied()

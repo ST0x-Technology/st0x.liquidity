@@ -32,23 +32,23 @@ use crate::usdc_rebalance::{
 ///
 /// # Type Parameters
 ///
-/// * `W` - Wallet type used for both Ethereum and Base chains
-pub(crate) struct CrossVenueCashTransfer<W: Wallet> {
+/// * `Chain` - Wallet type used for both Ethereum and Base chains
+pub(crate) struct CrossVenueCashTransfer<Chain: Wallet> {
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
-    cctp_bridge: Arc<CctpBridge<W, W>>,
-    raindex: Arc<RaindexService<W>>,
+    cctp_bridge: Arc<CctpBridge<Chain, Chain>>,
+    raindex: Arc<RaindexService<Chain>>,
     cqrs: Arc<Store<UsdcRebalance>>,
     market_maker_wallet: Address,
     vault_id: RaindexVaultId,
 }
 
-impl<W: Wallet> CrossVenueCashTransfer<W> {
+impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     pub(crate) fn new(
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
-        cctp_bridge: Arc<CctpBridge<W, W>>,
-        raindex: Arc<RaindexService<W>>,
+        cctp_bridge: Arc<CctpBridge<Chain, Chain>>,
+        raindex: Arc<RaindexService<Chain>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
         vault_id: RaindexVaultId,
@@ -837,7 +837,9 @@ fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
 /// Alpaca -> Base (hedging -> market-making): convert USD to USDC,
 /// withdraw, bridge via CCTP, deposit to vault.
 #[async_trait]
-impl<W: Wallet> CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueCashTransfer<W> {
+impl<Chain: Wallet> CrossVenueTransfer<HedgingVenue, MarketMakingVenue>
+    for CrossVenueCashTransfer<Chain>
+{
     type Asset = Usdc;
     type Error = UsdcTransferError;
 
@@ -850,7 +852,9 @@ impl<W: Wallet> CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVen
 /// Base -> Alpaca (market-making -> hedging): withdraw from vault,
 /// bridge via CCTP, deposit USDC, convert to USD.
 #[async_trait]
-impl<W: Wallet> CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueCashTransfer<W> {
+impl<Chain: Wallet> CrossVenueTransfer<MarketMakingVenue, HedgingVenue>
+    for CrossVenueCashTransfer<Chain>
+{
     type Asset = Usdc;
     type Error = UsdcTransferError;
 
@@ -1032,9 +1036,9 @@ mod tests {
         RawPrivateKeyWallet::new(private_key, base_provider, 1).unwrap()
     }
 
-    async fn create_test_onchain_services<W: Wallet + Clone>(
-        wallet: W,
-    ) -> (CctpBridge<W, W>, RaindexService<W>) {
+    async fn create_test_onchain_services<Chain: Wallet + Clone>(
+        wallet: Chain,
+    ) -> (CctpBridge<Chain, Chain>, RaindexService<Chain>) {
         let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
             usdc_ethereum: USDC_ADDRESS,
             usdc_base: USDC_ADDRESS,

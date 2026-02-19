@@ -160,7 +160,6 @@ pub(super) async fn reset_allowance_command<W: Write>(
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let owner = rebalancing_ctx.base_wallet().address();
 
     let (usdc_address, spender, chain_name, caller) = match chain {
         CctpChain::Ethereum => (
@@ -176,6 +175,8 @@ pub(super) async fn reset_allowance_command<W: Write>(
             rebalancing_ctx.base_wallet(),
         ),
     };
+
+    let owner = caller.address();
 
     writeln!(stdout, "Resetting USDC allowance on {chain_name}")?;
     writeln!(stdout, "   Owner: {owner}")?;
@@ -216,7 +217,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{BrokerCtx, LogLevel, TradingMode};
+    use crate::config::{BrokerCtx, CtxError, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -247,13 +248,16 @@ mod tests {
         let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
 
         let mut stdout = Vec::new();
-        let result =
-            cctp_bridge_command(&mut stdout, amount, false, CctpChain::Ethereum, &ctx).await;
+        let error = cctp_bridge_command(&mut stdout, amount, false, CctpChain::Ethereum, &ctx)
+            .await
+            .unwrap_err();
 
-        let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            matches!(
+                error.downcast_ref::<CtxError>(),
+                Some(CtxError::NotRebalancing)
+            ),
+            "Expected CtxError::NotRebalancing, got: {error:?}"
         );
     }
 
@@ -263,12 +267,16 @@ mod tests {
         let burn_tx = B256::ZERO;
 
         let mut stdout = Vec::new();
-        let result = cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &ctx).await;
+        let error = cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &ctx)
+            .await
+            .unwrap_err();
 
-        let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            matches!(
+                error.downcast_ref::<CtxError>(),
+                Some(CtxError::NotRebalancing)
+            ),
+            "Expected CtxError::NotRebalancing, got: {error:?}"
         );
     }
 
@@ -277,12 +285,16 @@ mod tests {
         let ctx = create_ctx_without_rebalancing();
 
         let mut stdout = Vec::new();
-        let result = reset_allowance_command(&mut stdout, CctpChain::Ethereum, &ctx).await;
+        let error = reset_allowance_command(&mut stdout, CctpChain::Ethereum, &ctx)
+            .await
+            .unwrap_err();
 
-        let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            matches!(
+                error.downcast_ref::<CtxError>(),
+                Some(CtxError::NotRebalancing)
+            ),
+            "Expected CtxError::NotRebalancing, got: {error:?}"
         );
     }
 }

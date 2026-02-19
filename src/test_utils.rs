@@ -60,7 +60,7 @@ impl Wallet for StubWallet {
         _calldata: Bytes,
         _note: &str,
     ) -> Result<TransactionReceipt, EvmError> {
-        panic!("StubWallet::send called — use a real wallet in tests that need transactions")
+        panic!("StubWallet::send called - use a real wallet in tests that need transactions")
     }
 }
 

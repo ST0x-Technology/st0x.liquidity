@@ -44,7 +44,7 @@ mod wrapper;
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 
 #[cfg(test)]
-pub mod test_utils;
+mod test_utils;
 
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     let launch_span = info_span!("launch");

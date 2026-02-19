@@ -30,8 +30,8 @@ use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 
-pub(super) async fn transfer_equity_command<W: Write>(
-    stdout: &mut W,
+pub(super) async fn transfer_equity_command<Writer: Write>(
+    stdout: &mut Writer,
     direction: TransferDirection,
     symbol: &Symbol,
     quantity: FractionalShares,
@@ -173,8 +173,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn transfer_usdc_command<W: Write>(
-    stdout: &mut W,
+pub(super) async fn transfer_usdc_command<Writer: Write>(
+    stdout: &mut Writer,
     direction: TransferDirection,
     amount: Usdc,
     ctx: &Ctx,
@@ -270,13 +270,13 @@ pub(super) async fn transfer_usdc_command<W: Write>(
 }
 
 /// Isolated tokenization command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'static>(
-    stdout: &mut W,
+pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clone + 'static>(
+    stdout: &mut Writer,
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
     ctx: &Ctx,
-    provider: P,
+    provider: Prov,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting tokenization via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
@@ -375,8 +375,8 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'sta
 }
 
 /// Isolated redemption command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_redeem_command<W: Write>(
-    stdout: &mut W,
+pub(super) async fn alpaca_redeem_command<Writer: Write>(
+    stdout: &mut Writer,
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
@@ -445,8 +445,8 @@ pub(super) async fn alpaca_redeem_command<W: Write>(
 }
 
 /// List all Alpaca tokenization requests.
-pub(super) async fn alpaca_tokenization_requests_command<W: Write>(
-    stdout: &mut W,
+pub(super) async fn alpaca_tokenization_requests_command<Writer: Write>(
+    stdout: &mut Writer,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "📋 Listing Alpaca tokenization requests")?;
@@ -483,8 +483,8 @@ pub(super) async fn alpaca_tokenization_requests_command<W: Write>(
     Ok(())
 }
 
-fn format_tokenization_request<W: Write>(
-    stdout: &mut W,
+fn format_tokenization_request<Writer: Write>(
+    stdout: &mut Writer,
     request: &TokenizationRequest,
 ) -> io::Result<()> {
     let type_str = request.r#type.map_or_else(
