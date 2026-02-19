@@ -224,28 +224,8 @@ resolution and feature selection.
 
 ## Version Control
 
-Use `but` (GitButler CLI) for all write operations. Never use `git add`,
-`git commit`, `git push`, `git checkout`, `git merge`, `git rebase`, or
-`git stash`. Read-only git commands (`git log`, `git blame`, `git diff`) are
-fine. See `.skills/gitbutler/` for full command reference.
-
-### Pull Requests
-
-**All PRs must follow `.github/PULL_REQUEST_TEMPLATE.md`.** This applies whether
-creating via `but pr`, `gh pr create`, or editing via `gh pr edit`. The template
-has three sections: Motivation, Solution, and Checks.
-
-The Checks section is a confirmation: "By submitting this for review, I'm
-confirming I've done the following." Mark all checks as `[x]` — inapplicable
-checks are considered satisfied (e.g., screenshots only apply to dashboard
-changes; if no dashboard changes, that check is done).
-
-For chained PRs, include the caution block at the top:
-
-```markdown
-> [!CAUTION]
-> Chained to #PR
-```
+See `.skills/gitbutler/` for version control workflow and
+`.github/PULL_REQUEST_TEMPLATE.md` for PR format requirements.
 
 ## Development Workflow Notes
 

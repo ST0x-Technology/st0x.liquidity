@@ -122,6 +122,19 @@ just introduced). Remember: `but amend` skips pre-commit hooks.
   (snapshot uncommitted work to a new branch)
 - `git cherry-pick` -> `but pick`
 
+## Pull Requests
+
+**All PRs must follow `.github/PULL_REQUEST_TEMPLATE.md`.** This applies whether
+creating via `but pr`, `gh pr create`, or editing via `gh pr edit`.
+
+The Checks section is a confirmation: "By submitting this for review, I'm
+confirming I've done the following." Mark all checks as `[x]` — inapplicable
+checks are considered satisfied (e.g., screenshots only apply to dashboard
+changes; if no dashboard changes, that check is done).
+
+For chained PRs, include the caution block at the top of the PR body:
+`> [!CAUTION]` / `> Chained to #PR`
+
 ## Notes
 
 - **Use branch/commit names over short CLI IDs when possible.** For example, use
