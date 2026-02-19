@@ -18,7 +18,7 @@ use thiserror::Error;
 use tracing::info;
 
 use st0x_evm::OpenChainErrorRegistry;
-use st0x_execution::{Direction, FractionalShares, Symbol};
+use st0x_execution::{Direction, FractionalShares, Symbol, TimeInForce};
 
 use crate::config::{Ctx, Env};
 use crate::offchain_order::OrderPlacer;
@@ -77,6 +77,9 @@ pub enum Commands {
         /// Number of shares to buy (whole shares only)
         #[arg(short = 'q', long = "quantity")]
         quantity: u64,
+        /// Time-in-force for the order (day, market-on-close)
+        #[arg(long = "time-in-force")]
+        time_in_force: Option<TimeInForce>,
     },
     /// Sell shares of a stock
     Sell {
@@ -86,6 +89,9 @@ pub enum Commands {
         /// Number of shares to sell (whole shares only)
         #[arg(short = 'q', long = "quantity")]
         quantity: u64,
+        /// Time-in-force for the order (day, market-on-close)
+        #[arg(long = "time-in-force")]
+        time_in_force: Option<TimeInForce>,
     },
     /// Process a transaction hash to execute opposite-side trade
     ProcessTx {
@@ -267,6 +273,9 @@ pub enum Commands {
         /// Token contract address (to verify balance after tokenization)
         #[arg(short = 't', long = "token")]
         token: Address,
+        /// Recipient wallet address (defaults to rebalancing signer address)
+        #[arg(short = 'r', long = "recipient")]
+        recipient: Option<Address>,
     },
 
     /// Request redemption of tokenized shares via Alpaca (isolated test command)
@@ -349,6 +358,7 @@ async fn execute_order<W: Write>(
     symbol: Symbol,
     quantity: u64,
     direction: Direction,
+    time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -357,7 +367,16 @@ async fn execute_order<W: Write>(
         return Err(CliError::InvalidQuantity { value: quantity }.into());
     }
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
-    trading::execute_order_with_writers(symbol, quantity, direction, ctx, pool, stdout).await
+    trading::execute_order_with_writers(
+        symbol,
+        quantity,
+        direction,
+        time_in_force,
+        ctx,
+        pool,
+        stdout,
+    )
+    .await
 }
 
 /// Commands that don't require a WebSocket provider.
@@ -365,10 +384,12 @@ enum SimpleCommand {
     Buy {
         symbol: Symbol,
         quantity: u64,
+        time_in_force: Option<TimeInForce>,
     },
     Sell {
         symbol: Symbol,
         quantity: u64,
+        time_in_force: Option<TimeInForce>,
     },
     Auth,
     TransferEquity {
@@ -434,6 +455,7 @@ enum ProviderCommand {
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
+        recipient: Option<Address>,
     },
     AlpacaRedeem {
         symbol: Symbol,
@@ -463,8 +485,24 @@ async fn run_command_with_writers<W: Write>(
 
 fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
-        Commands::Buy { symbol, quantity } => Ok(SimpleCommand::Buy { symbol, quantity }),
-        Commands::Sell { symbol, quantity } => Ok(SimpleCommand::Sell { symbol, quantity }),
+        Commands::Buy {
+            symbol,
+            quantity,
+            time_in_force,
+        } => Ok(SimpleCommand::Buy {
+            symbol,
+            quantity,
+            time_in_force,
+        }),
+        Commands::Sell {
+            symbol,
+            quantity,
+            time_in_force,
+        } => Ok(SimpleCommand::Sell {
+            symbol,
+            quantity,
+            time_in_force,
+        }),
         Commands::Auth => Ok(SimpleCommand::Auth),
         Commands::TransferEquity {
             direction,
@@ -518,10 +556,12 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
             token,
+            recipient,
         } => Err(ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
             token,
+            recipient,
         }),
         Commands::AlpacaRedeem {
             symbol,
@@ -543,11 +583,37 @@ async fn run_simple_command<W: Write>(
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     match command {
-        SimpleCommand::Buy { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Buy, ctx, pool, stdout).await
+        SimpleCommand::Buy {
+            symbol,
+            quantity,
+            time_in_force,
+        } => {
+            execute_order(
+                symbol,
+                quantity,
+                Direction::Buy,
+                time_in_force,
+                ctx,
+                pool,
+                stdout,
+            )
+            .await
         }
-        SimpleCommand::Sell { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Sell, ctx, pool, stdout).await
+        SimpleCommand::Sell {
+            symbol,
+            quantity,
+            time_in_force,
+        } => {
+            execute_order(
+                symbol,
+                quantity,
+                Direction::Sell,
+                time_in_force,
+                ctx,
+                pool,
+                stdout,
+            )
+            .await
         }
         SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
         SimpleCommand::TransferEquity {
@@ -650,9 +716,12 @@ async fn run_provider_command<W: Write>(
             symbol,
             quantity,
             token,
+            recipient,
         } => {
-            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, token, ctx, provider)
-                .await
+            rebalancing::alpaca_tokenize_command(
+                stdout, symbol, quantity, token, recipient, ctx, provider,
+            )
+            .await
         }
         ProviderCommand::AlpacaRedeem {
             symbol,
@@ -738,6 +807,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -781,6 +851,7 @@ mod tests {
             Symbol::new("TSLA").unwrap(),
             50,
             Direction::Sell,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -825,6 +896,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -856,6 +928,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -925,6 +998,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -978,6 +1052,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1018,6 +1093,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1065,6 +1141,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1339,8 +1416,47 @@ mod tests {
             .unwrap();
 
         let _matches = cmd
+            .clone()
             .try_get_matches_from(vec!["schwab", "sell", "-s", "TSLA", "-q", "50"])
             .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "schwab",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "day",
+            ])
+            .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "schwab",
+                "sell",
+                "-s",
+                "TSLA",
+                "-q",
+                "50",
+                "--time-in-force",
+                "market-on-close",
+            ])
+            .unwrap();
+
+        cmd.try_get_matches_from(vec![
+            "schwab",
+            "buy",
+            "-s",
+            "AAPL",
+            "-q",
+            "100",
+            "--time-in-force",
+            "invalid",
+        ])
+        .unwrap_err();
     }
 
     #[tokio::test]
@@ -1376,6 +1492,7 @@ mod tests {
         let buy_command = Commands::Buy {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: 100,
+            time_in_force: None,
         };
 
         let result = run_command_with_writers(ctx, buy_command, &pool, &mut stdout).await;
@@ -1424,6 +1541,7 @@ mod tests {
         let sell_command = Commands::Sell {
             symbol: Symbol::new("TSLA").unwrap(),
             quantity: 50,
+            time_in_force: None,
         };
 
         let result = run_command_with_writers(ctx, sell_command, &pool, &mut stdout).await;
@@ -1474,6 +1592,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1548,6 +1667,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1582,6 +1702,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1618,6 +1739,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout2,
@@ -1653,6 +1775,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1743,6 +1866,7 @@ mod tests {
             Symbol::new("INVALID").unwrap(),
             999_999,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,

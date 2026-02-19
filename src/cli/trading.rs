@@ -14,7 +14,7 @@ use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
-    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
+    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 
 use super::auth::ensure_schwab_authentication;
@@ -43,7 +43,7 @@ impl OrderPlacer for CliOrderPlacer {
         order: MarketOrder,
     ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
         let placement =
-            execute_broker_order(&self.ctx, &self.pool, order, &mut std::io::sink()).await?;
+            execute_broker_order(&self.ctx, &self.pool, order, None, &mut std::io::sink()).await?;
         Ok(ExecutorOrderId::new(&placement.order_id))
     }
 }
@@ -138,6 +138,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
     quantity: u64,
     direction: Direction,
+    time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -150,7 +151,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 
     info!("Created order: symbol={symbol}, direction={direction:?}, quantity={quantity}");
 
-    match execute_broker_order(ctx, pool, market_order, stdout).await {
+    match execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await {
         Ok(placement) => {
             info!(
                 symbol = %symbol,
@@ -237,12 +238,19 @@ pub(super) async fn execute_broker_order<W: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
     market_order: MarketOrder,
+    time_in_force: Option<TimeInForce>,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &ctx.broker {
         BrokerCtx::Schwab(schwab_auth) => {
             ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
             writeln!(stdout, "🔄 Executing Schwab order...")?;
+            if time_in_force.is_some() {
+                writeln!(
+                    stdout,
+                    "⚠️  --time-in-force is ignored for Schwab (only supported by Alpaca Broker API)"
+                )?;
+            }
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let broker = schwab_ctx.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
@@ -255,6 +263,13 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Trading API order...")?;
+            if time_in_force.is_some() {
+                writeln!(
+                    stdout,
+                    "⚠️  --time-in-force is ignored for Alpaca Trading API \
+                     (only supported by Alpaca Broker API)"
+                )?;
+            }
             let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
@@ -266,7 +281,11 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
-            let broker = alpaca_auth.clone().try_into_executor().await?;
+            let mut auth = alpaca_auth.clone();
+            if let Some(tif) = time_in_force {
+                auth.time_in_force = tif;
+            }
+            let broker = auth.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -277,6 +296,13 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerCtx::DryRun => {
             writeln!(stdout, "🔄 Executing dry-run order...")?;
+            if time_in_force.is_some() {
+                writeln!(
+                    stdout,
+                    "⚠️  --time-in-force is ignored for dry-run \
+                     (only supported by Alpaca Broker API)"
+                )?;
+            }
             let broker = MockExecutorCtx.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
@@ -556,6 +582,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -580,6 +607,7 @@ mod tests {
             Symbol::new("TSLA").unwrap(),
             50,
             Direction::Sell,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -621,6 +649,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -643,6 +672,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -686,6 +716,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -696,6 +727,35 @@ mod tests {
         assert!(
             output.contains("❌ Failed to place order"),
             "Expected failure message, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_time_in_force_warning_for_schwab() {
+        let server = MockServer::start();
+        let ctx = create_schwab_test_ctx(&server);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
+
+        setup_schwab_order_mocks(&server);
+
+        let mut stdout_buffer = Vec::new();
+        execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            100,
+            Direction::Buy,
+            Some(TimeInForce::Day),
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(
+            output.contains("--time-in-force is ignored"),
+            "Expected warning about ignored --time-in-force, got: {output}"
         );
     }
 }

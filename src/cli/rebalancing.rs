@@ -276,6 +276,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
+    recipient: Option<Address>,
     ctx: &Ctx,
     provider: Prov,
 ) -> anyhow::Result<()> {
@@ -290,7 +291,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let receiving_wallet = rebalancing_ctx.base_wallet().address();
+    let receiving_wallet = recipient.unwrap_or_else(|| rebalancing_ctx.base_wallet().address());
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
     let read_evm = ReadOnlyEvm::new(provider.clone());
