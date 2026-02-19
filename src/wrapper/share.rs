@@ -1,13 +1,13 @@
 //! WrapperService implementation for ERC-4626 token wrapping/unwrapping.
 
-use alloy::primitives::{Address, Bytes, TxHash, U256};
-use alloy::sol_types::{SolCall, SolEvent};
+use alloy::primitives::{Address, TxHash, U256};
+use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::info;
 
-use st0x_evm::Wallet;
+use st0x_evm::{Evm, Wallet};
 use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
@@ -42,8 +42,15 @@ impl<W: Wallet> WrapperService<W> {
         &self,
         wrapped_token: Address,
     ) -> Result<UnderlyingPerWrapped, WrapperError> {
-        let vault = IERC4626::new(wrapped_token, self.wallet.provider().clone());
-        let assets_per_share = vault.convertToAssets(RATIO_QUERY_AMOUNT).call().await?;
+        let assets_per_share = self
+            .wallet
+            .call(
+                wrapped_token,
+                IERC4626::convertToAssetsCall {
+                    shares: RATIO_QUERY_AMOUNT,
+                },
+            )
+            .await?;
 
         UnderlyingPerWrapped::new(assets_per_share).map_err(Into::into)
     }
@@ -89,17 +96,15 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         underlying_amount: U256,
         receiver: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
-        let calldata = IERC4626::depositCall {
-            assets: underlying_amount,
-            receiver,
-        };
-
         info!("Sending ERC4626 deposit to {wrapped_token}");
         let receipt = self
             .wallet
-            .send(
+            .submit(
                 wrapped_token,
-                Bytes::from(SolCall::abi_encode(&calldata)),
+                IERC4626::depositCall {
+                    assets: underlying_amount,
+                    receiver,
+                },
                 "ERC4626 deposit",
             )
             .await?;
@@ -127,18 +132,16 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         receiver: Address,
         owner: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
-        let calldata = IERC4626::redeemCall {
-            shares: wrapped_amount,
-            receiver,
-            owner,
-        };
-
         info!("Sending ERC4626 redeem to {wrapped_token}");
         let receipt = self
             .wallet
-            .send(
+            .submit(
                 wrapped_token,
-                Bytes::from(SolCall::abi_encode(&calldata)),
+                IERC4626::redeemCall {
+                    shares: wrapped_amount,
+                    receiver,
+                    owner,
+                },
                 "ERC4626 redeem",
             )
             .await?;

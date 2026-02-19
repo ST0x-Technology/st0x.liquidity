@@ -11,7 +11,7 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, WalletProvider};
-use alloy::rpc::types::TransactionReceipt;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use tracing::info;
@@ -100,7 +100,7 @@ where
     ) -> Result<TransactionReceipt, EvmError> {
         info!(%contract, note, "Submitting local contract call");
 
-        let tx = alloy::rpc::types::TransactionRequest::default()
+        let tx = TransactionRequest::default()
             .to(contract)
             .input(calldata.into());
 
@@ -113,12 +113,6 @@ where
             .get_receipt()
             .await?;
 
-        if !receipt.status() {
-            return Err(EvmError::Reverted {
-                tx_hash: receipt.transaction_hash,
-            });
-        }
-
         info!(tx_hash = %receipt.transaction_hash, note, "Transaction confirmed");
 
         Ok(receipt)
@@ -130,7 +124,6 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::primitives::U256;
     use alloy::sol;
-    use alloy::sol_types::SolCall;
 
     use super::*;
 
@@ -173,19 +166,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_submits_and_returns_receipt() {
+    async fn submit_returns_receipt() {
         let (wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
         let amount = U256::from(1000);
-        let calldata = IERC20::transferCall {
-            to: recipient,
-            amount,
-        }
-        .abi_encode();
 
         let receipt = wallet
-            .send(token_address, Bytes::from(calldata), "ERC20 transfer")
+            .submit(
+                token_address,
+                IERC20::transferCall {
+                    to: recipient,
+                    amount,
+                },
+                "ERC20 transfer",
+            )
             .await
             .unwrap();
 
@@ -194,52 +189,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_state_change_persists() {
+    async fn submit_state_change_persists() {
         let (wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
         let amount = U256::from(1000);
 
-        let token = IERC20::new(token_address, wallet.provider());
-        let before = token.balanceOf(recipient).call().await.unwrap();
+        let before: U256 = wallet
+            .call(token_address, IERC20::balanceOfCall { account: recipient })
+            .await
+            .unwrap();
         assert_eq!(before, U256::ZERO);
 
-        let calldata = IERC20::transferCall {
-            to: recipient,
-            amount,
-        }
-        .abi_encode();
-
         wallet
-            .send(token_address, Bytes::from(calldata), "ERC20 transfer")
+            .submit(
+                token_address,
+                IERC20::transferCall {
+                    to: recipient,
+                    amount,
+                },
+                "ERC20 transfer",
+            )
             .await
             .unwrap();
 
-        let after = token.balanceOf(recipient).call().await.unwrap();
+        let after: U256 = wallet
+            .call(token_address, IERC20::balanceOfCall { account: recipient })
+            .await
+            .unwrap();
         assert_eq!(after, amount);
     }
 
     #[tokio::test]
-    async fn send_detects_revert() {
+    async fn submit_detects_revert() {
         let (wallet, token_address, _signer) = setup_anvil_with_token().await;
 
-        // Transfer more than balance to trigger revert
         let recipient = Address::random();
         let excessive_amount = U256::from(999_999_999) * U256::from(10).pow(U256::from(18));
 
-        let calldata = IERC20::transferCall {
-            to: recipient,
-            amount: excessive_amount,
-        }
-        .abi_encode();
-
-        let result = wallet
-            .send(token_address, Bytes::from(calldata), "should revert")
-            .await;
+        let error = wallet
+            .submit(
+                token_address,
+                IERC20::transferCall {
+                    to: recipient,
+                    amount: excessive_amount,
+                },
+                "should revert",
+            )
+            .await
+            .unwrap_err();
 
         assert!(
-            result.is_err(),
-            "expected error for transfer exceeding balance, got: {result:?}"
+            matches!(
+                error,
+                EvmError::DecodedRevert(_) | EvmError::Contract(_) | EvmError::Reverted { .. }
+            ),
+            "expected revert-related error, got: {error:?}"
         );
     }
 }

@@ -13,18 +13,21 @@
 //!   `RawPrivateKeyWallet` in tests).
 //!
 //! Error decoding is built into both `Evm::call` (view calls) and
-//! `Wallet::send` (write transactions), so consumers get
+//! `Wallet::submit` (write transactions), so consumers get
 //! human-readable revert reasons without manual wiring.
 
 use std::sync::Arc;
 
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::Provider;
-use alloy::rpc::types::TransactionReceipt;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 #[cfg(feature = "fireblocks")]
 use fireblocks_sdk::apis::transactions_api::CreateTransactionError;
 use rain_error_decoding::AbiDecodedErrorType;
+use tracing::warn;
 
 pub mod error_decoding;
 
@@ -43,6 +46,8 @@ pub enum EvmError {
     Transport(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
     #[error("contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
+    #[error("ABI decode error: {0}")]
+    AbiDecode(#[from] alloy::sol_types::Error),
     #[error("decoded contract error: {0}")]
     DecodedRevert(AbiDecodedErrorType),
     #[error("transaction reverted: {tx_hash}")]
@@ -91,18 +96,23 @@ pub trait Evm: Send + Sync + 'static {
     /// Returns the underlying provider for direct chain queries.
     fn provider(&self) -> &Self::Provider;
 
-    /// Execute a view call with automatic revert decoding.
+    /// Execute a typed view call with automatic revert decoding.
     ///
-    /// Runs `eth_call` against the given contract and calldata. On
-    /// revert, attempts to decode the Solidity error via the OpenChain
-    /// selector registry before returning.
-    async fn call(&self, contract: Address, calldata: Bytes) -> Result<Bytes, EvmError> {
-        let tx = alloy::rpc::types::TransactionRequest::default()
+    /// Encodes the call via `SolCall::abi_encode()`, runs `eth_call`,
+    /// decodes the return value on success, and decodes the Solidity
+    /// error via the OpenChain selector registry on revert.
+    async fn call<C: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: C,
+    ) -> Result<C::Return, EvmError> {
+        let calldata = call.abi_encode();
+        let tx = TransactionRequest::default()
             .to(contract)
             .input(calldata.into());
 
         match self.provider().call(tx).await {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok(C::abi_decode_returns(result.as_ref())?),
             Err(rpc_err) => {
                 // Wrap in alloy::contract::Error to reuse its revert data extraction
                 let contract_err = alloy::contract::Error::TransportError(rpc_err);
@@ -126,8 +136,11 @@ pub trait Evm: Send + Sync + 'static {
 /// Signing wallet on an EVM chain.
 ///
 /// Extends [`Evm`] with a wallet identity (address) and transaction
-/// submission. The `send` method submits a signed transaction and
-/// waits for a receipt. Implementations handle key management:
+/// submission. Implementations provide [`send`](Wallet::send)
+/// (raw calldata submission), while [`submit`](Wallet::submit) wraps
+/// it with typed encoding and revert decoding.
+///
+/// Key management varies by implementation:
 /// [`FireblocksWallet`](fireblocks::FireblocksWallet) uses MPC-based
 /// signing via the Fireblocks API, while
 /// [`RawPrivateKeyWallet`](local::RawPrivateKeyWallet) signs locally
@@ -137,18 +150,78 @@ pub trait Wallet: Evm {
     /// Returns the address this wallet signs transactions from.
     fn address(&self) -> Address;
 
-    /// Submit a signed contract call transaction.
+    /// Send raw calldata as a signed transaction.
     ///
-    /// - `contract` — target contract address
-    /// - `calldata` — ABI-encoded function call
-    /// - `note` — human-readable operation description (used for
-    ///   logging and, in `FireblocksWallet`, the Fireblocks dashboard)
+    /// Implementations handle signing, submission, and waiting for the
+    /// receipt. They should NOT check `receipt.status()` — the default
+    /// [`submit`](Wallet::submit) handles revert detection and decoding.
     async fn send(
         &self,
         contract: Address,
         calldata: Bytes,
         note: &str,
     ) -> Result<TransactionReceipt, EvmError>;
+
+    /// Submit a typed contract call with automatic revert decoding.
+    ///
+    /// Encodes the call via `SolCall::abi_encode()`, delegates to
+    /// [`send`](Wallet::send), then if the transaction reverted,
+    /// replays as `eth_call` at the reverted block to extract and
+    /// decode the revert reason.
+    async fn submit<C: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: C,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError> {
+        let calldata = Bytes::from(call.abi_encode());
+        let receipt = self.send(contract, calldata.clone(), note).await?;
+
+        if !receipt.status() {
+            if let Some(block_number) = receipt.block_number {
+                let tx = TransactionRequest::default()
+                    .to(contract)
+                    .from(self.address())
+                    .input(calldata.into());
+
+                let replay = self
+                    .provider()
+                    .call(tx)
+                    .block(BlockId::number(block_number));
+
+                match replay.await {
+                    Err(rpc_err) => {
+                        let contract_err = alloy::contract::Error::TransportError(rpc_err);
+
+                        if let Some(revert_data) = contract_err.as_revert_data()
+                            && let Ok(decoded) = AbiDecodedErrorType::selector_registry_abi_decode(
+                                revert_data.as_ref(),
+                                None,
+                            )
+                            .await
+                        {
+                            return Err(EvmError::DecodedRevert(decoded));
+                        }
+
+                        return Err(EvmError::Contract(contract_err));
+                    }
+                    Ok(_) => {
+                        warn!(
+                            tx_hash = %receipt.transaction_hash,
+                            "Transaction reverted but replay succeeded -- \
+                             state may have changed between blocks"
+                        );
+                    }
+                }
+            }
+
+            return Err(EvmError::Reverted {
+                tx_hash: receipt.transaction_hash,
+            });
+        }
+
+        Ok(receipt)
+    }
 }
 
 #[async_trait]
@@ -159,8 +232,12 @@ impl<T: Evm + ?Sized> Evm for Arc<T> {
         (**self).provider()
     }
 
-    async fn call(&self, contract: Address, calldata: Bytes) -> Result<Bytes, EvmError> {
-        (**self).call(contract, calldata).await
+    async fn call<C: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: C,
+    ) -> Result<C::Return, EvmError> {
+        (**self).call(contract, call).await
     }
 }
 

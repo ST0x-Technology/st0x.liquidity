@@ -11,8 +11,7 @@
 //! OrderBook V5 uses a custom float format (B256) for amounts. All conversions between
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
-use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
-use alloy::sol_types::SolCall;
+use alloy::primitives::{Address, B256, TxHash, U256, address};
 use async_trait::async_trait;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
@@ -153,15 +152,16 @@ impl<W: Wallet> RaindexService<W> {
     ) -> Result<(), RaindexError> {
         debug!(%token, %amount, spender = %self.orderbook_address, "Sending ERC20 approve");
 
-        let calldata = IERC20::approveCall {
-            spender: self.orderbook_address,
-            amount,
-        };
-        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
-
         let receipt = self
             .evm
-            .send(token, encoded, "ERC20 approve for orderbook")
+            .submit(
+                token,
+                IERC20::approveCall {
+                    spender: self.orderbook_address,
+                    amount,
+                },
+                "ERC20 approve for orderbook",
+            )
             .await?;
 
         info!(tx_hash = %receipt.transaction_hash, "Approve confirmed");
@@ -185,11 +185,10 @@ impl<W: Wallet> RaindexService<W> {
             depositAmount: amount_float.get_inner(),
             tasks: Vec::new(),
         };
-        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
 
         let receipt = self
             .evm
-            .send(self.orderbook_address, encoded, "deposit3 to vault")
+            .submit(self.orderbook_address, calldata, "deposit3 to vault")
             .await?;
 
         info!(tx_hash = %receipt.transaction_hash, "deposit3 confirmed");
@@ -360,17 +359,18 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
         let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
 
-        let calldata = IOrderBookV5::withdraw3Call {
-            token,
-            vaultId: vault_id.0,
-            targetAmount: amount_float.get_inner(),
-            tasks: Vec::new(),
-        };
-        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
-
         let receipt = self
             .evm
-            .send(self.orderbook_address, encoded, "withdraw3 from vault")
+            .submit(
+                self.orderbook_address,
+                IOrderBookV5::withdraw3Call {
+                    token,
+                    vaultId: vault_id.0,
+                    targetAmount: amount_float.get_inner(),
+                    tasks: Vec::new(),
+                },
+                "withdraw3 from vault",
+            )
             .await?;
 
         info!(tx_hash = %receipt.transaction_hash, "withdraw3 confirmed");

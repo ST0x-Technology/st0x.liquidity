@@ -1,11 +1,11 @@
 //! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist,
 //! transfers, convert).
 
-use alloy::primitives::{Address, Bytes};
-use alloy::sol_types::SolCall;
+use alloy::primitives::Address;
 use rust_decimal::Decimal;
 use std::io::Write;
 
+use st0x_evm::Evm;
 use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor, Positive};
 
 use super::ConvertDirection;
@@ -59,10 +59,15 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     };
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
-    let usdc_contract =
-        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_wallet().provider());
-
-    let balance = usdc_contract.balanceOf(sender_address).call().await?;
+    let balance = rebalancing_ctx
+        .ethereum_wallet()
+        .call(
+            usdc_address,
+            IERC20::balanceOfCall {
+                account: sender_address,
+            },
+        )
+        .await?;
     writeln!(stdout, "   Current USDC balance: {balance}")?;
 
     if balance < amount_u256 {
@@ -70,14 +75,16 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     }
 
     writeln!(stdout, "   Sending USDC transfer via Fireblocks...")?;
-    let calldata = IERC20::transferCall {
-        to: deposit_address,
-        amount: amount_u256,
-    };
-    let encoded = Bytes::from(SolCall::abi_encode(&calldata));
     let tx_receipt = rebalancing_ctx
         .ethereum_wallet()
-        .send(usdc_address, encoded, "USDC transfer to Alpaca")
+        .submit(
+            usdc_address,
+            IERC20::transferCall {
+                to: deposit_address,
+                amount: amount_u256,
+            },
+            "USDC transfer to Alpaca",
+        )
         .await?;
 
     let tx_hash = tx_receipt.transaction_hash;
@@ -133,14 +140,21 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     } else {
         (USDC_ETHEREUM, "Ethereum Mainnet")
     };
+
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
-    let usdc =
-        IERC20::IERC20Instance::new(usdc_address, rebalancing_ctx.ethereum_wallet().provider());
 
-    let balance_before = usdc.balanceOf(destination).call().await?;
+    let balance_before = rebalancing_ctx
+        .ethereum_wallet()
+        .call(
+            usdc_address,
+            IERC20::balanceOfCall {
+                account: destination,
+            },
+        )
+        .await?;
+
     writeln!(stdout, "   Balance before: {balance_before}")?;
-
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_broker_auth.account_id,
@@ -174,9 +188,17 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
                 writeln!(stdout, "   Transaction hash: {tx_hash}")?;
             }
 
-            let balance_after = usdc.balanceOf(destination).call().await?;
-            writeln!(stdout, "   Balance after: {balance_after}")?;
+            let balance_after = rebalancing_ctx
+                .ethereum_wallet()
+                .call(
+                    usdc_address,
+                    IERC20::balanceOfCall {
+                        account: destination,
+                    },
+                )
+                .await?;
 
+            writeln!(stdout, "   Balance after: {balance_after}")?;
             let expected_increase = amount.to_u256_6_decimals()?;
             if balance_after >= balance_before + expected_increase {
                 writeln!(stdout, "   Balance increased as expected!")?;

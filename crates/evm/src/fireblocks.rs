@@ -356,12 +356,6 @@ where
             .get_receipt()
             .await?;
 
-        if !receipt.status() {
-            return Err(EvmError::Reverted {
-                tx_hash: receipt.transaction_hash,
-            });
-        }
-
         info!(
             %tx_hash,
             note,

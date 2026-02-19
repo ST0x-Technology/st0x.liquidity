@@ -25,8 +25,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{Address, Bytes, TxHash, U256};
-use alloy::sol_types::SolCall;
+use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
@@ -584,15 +583,16 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         token: Address,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
-        let calldata = IERC20::transferCall {
-            to: self.redemption_wallet,
-            amount,
-        };
-        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
-
         let receipt = self
             .wallet
-            .send(token, encoded, "ERC20 transfer for redemption")
+            .submit(
+                token,
+                IERC20::transferCall {
+                    to: self.redemption_wallet,
+                    amount,
+                },
+                "ERC20 transfer for redemption",
+            )
             .await?;
 
         Ok(receipt.transaction_hash)

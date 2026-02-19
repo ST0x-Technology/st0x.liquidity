@@ -2,10 +2,10 @@
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::sol;
-use alloy::sol_types::{SolCall, SolEvent};
+use alloy::sol_types::SolEvent;
 use tracing::{info, trace};
 
-use st0x_evm::Wallet;
+use st0x_evm::{Evm, Wallet};
 
 use super::{
     CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
@@ -23,8 +23,6 @@ sol!(
 /// The wallet's provider is used for read-only view calls (e.g. allowance
 /// checks). All write operations are submitted through the [`Wallet`] trait.
 pub(crate) struct CctpEndpoint<W: Wallet> {
-    /// USDC token contract instance (used for read-only view calls)
-    usdc: IERC20::IERC20Instance<W::Provider>,
     /// USDC token address
     usdc_address: Address,
     /// TokenMessengerV2 contract address
@@ -46,10 +44,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         message_transmitter: Address,
         wallet: W,
     ) -> Self {
-        let provider = wallet.provider().clone();
-
         Self {
-            usdc: IERC20::new(usdc, provider),
             usdc_address: usdc,
             token_messenger_address: token_messenger,
             message_transmitter_address: message_transmitter,
@@ -59,22 +54,28 @@ impl<W: Wallet> CctpEndpoint<W> {
 
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
         let allowance = self
-            .usdc
-            .allowance(self.wallet.address(), self.token_messenger_address)
-            .call()
+            .wallet
+            .call(
+                self.usdc_address,
+                IERC20::allowanceCall {
+                    owner: self.wallet.address(),
+                    spender: self.token_messenger_address,
+                },
+            )
             .await?;
 
-        trace!(%allowance, %amount, "Checking USDC allowance");
+        trace!(?allowance, %amount, "Checking USDC allowance");
 
-        if allowance < amount {
-            let calldata = IERC20::approveCall {
-                spender: self.token_messenger_address,
-                amount,
-            };
-            let encoded = Bytes::from(SolCall::abi_encode(&calldata));
-
+        if allowance._0 < amount {
             self.wallet
-                .send(self.usdc_address, encoded, "USDC approve for CCTP")
+                .submit(
+                    self.usdc_address,
+                    IERC20::approveCall {
+                        spender: self.token_messenger_address,
+                        amount,
+                    },
+                    "USDC approve for CCTP",
+                )
                 .await?;
         }
 
@@ -96,20 +97,21 @@ impl<W: Wallet> CctpEndpoint<W> {
         // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
         let destination_caller = FixedBytes::<32>::ZERO;
 
-        let calldata = TokenMessengerV2::depositForBurnCall {
-            amount,
-            destinationDomain: direction.dest_domain(),
-            mintRecipient: recipient_bytes32,
-            burnToken: self.usdc_address,
-            destinationCaller: destination_caller,
-            maxFee: max_fee,
-            minFinalityThreshold: FAST_TRANSFER_THRESHOLD,
-        };
-        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
-
         let receipt = self
             .wallet
-            .send(self.token_messenger_address, encoded, "depositForBurn")
+            .submit(
+                self.token_messenger_address,
+                TokenMessengerV2::depositForBurnCall {
+                    amount,
+                    destinationDomain: direction.dest_domain(),
+                    mintRecipient: recipient_bytes32,
+                    burnToken: self.usdc_address,
+                    destinationCaller: destination_caller,
+                    maxFee: max_fee,
+                    minFinalityThreshold: FAST_TRANSFER_THRESHOLD,
+                },
+                "depositForBurn",
+            )
             .await?;
 
         if !receipt
@@ -137,15 +139,16 @@ impl<W: Wallet> CctpEndpoint<W> {
         message: Bytes,
         attestation: Bytes,
     ) -> Result<MintReceipt, CctpError> {
-        let calldata = MessageTransmitterV2::receiveMessageCall {
-            message: message.clone(),
-            attestation,
-        };
-        let encoded = Bytes::from(SolCall::abi_encode(&calldata));
-
         let receipt = self
             .wallet
-            .send(self.message_transmitter_address, encoded, "receiveMessage")
+            .submit(
+                self.message_transmitter_address,
+                MessageTransmitterV2::receiveMessageCall {
+                    message: message.clone(),
+                    attestation,
+                },
+                "receiveMessage",
+            )
             .await?;
 
         let mint_event = receipt
@@ -171,11 +174,6 @@ impl<W: Wallet> CctpEndpoint<W> {
     #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
         self.wallet.address()
-    }
-
-    #[cfg(test)]
-    pub(super) fn usdc(&self) -> &IERC20::IERC20Instance<W::Provider> {
-        &self.usdc
     }
 
     #[cfg(test)]

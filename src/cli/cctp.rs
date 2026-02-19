@@ -1,13 +1,12 @@
 //! CCTP bridge and recovery CLI commands.
 
-use alloy::primitives::{B256, Bytes, U256};
-use alloy::sol_types::SolCall;
+use alloy::primitives::{B256, U256};
 use rust_decimal::Decimal;
 use std::io::Write;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
-use st0x_evm::Wallet;
+use st0x_evm::{Evm, Wallet};
 
 use super::CctpChain;
 use crate::bindings::IERC20;
@@ -36,20 +35,18 @@ pub(super) async fn cctp_bridge_command<W: Write>(
     let wallet = rebalancing_ctx.base_wallet().address();
 
     let amount_u256 = if all {
+        let balance_call = IERC20::balanceOfCall { account: wallet };
         let balance = match from {
             CctpChain::Ethereum => {
-                IERC20::IERC20Instance::new(
-                    USDC_ETHEREUM,
-                    rebalancing_ctx.ethereum_wallet().provider(),
-                )
-                .balanceOf(wallet)
-                .call()
-                .await?
+                rebalancing_ctx
+                    .ethereum_wallet()
+                    .call(USDC_ETHEREUM, balance_call)
+                    .await?
             }
             CctpChain::Base => {
-                IERC20::IERC20Instance::new(USDC_BASE, rebalancing_ctx.base_wallet().provider())
-                    .balanceOf(wallet)
-                    .call()
+                rebalancing_ctx
+                    .base_wallet()
+                    .call(USDC_BASE, balance_call)
                     .await?
             }
         };
@@ -183,27 +180,32 @@ pub(super) async fn reset_allowance_command<W: Write>(
     writeln!(stdout, "   Spender (orderbook): {spender}")?;
     writeln!(stdout, "   USDC: {usdc_address}")?;
 
-    let usdc = IERC20::IERC20Instance::new(usdc_address, caller.provider());
-    let allowance = usdc.allowance(owner, spender).call().await?;
-    writeln!(stdout, "   Current allowance: {allowance}")?;
+    let allowance = caller
+        .call(usdc_address, IERC20::allowanceCall { owner, spender })
+        .await?;
 
+    writeln!(stdout, "   Current allowance: {allowance}")?;
     if allowance.is_zero() {
         writeln!(stdout, "Allowance already zero, nothing to reset")?;
         return Ok(());
     }
 
     writeln!(stdout, "   Sending approval tx via Fireblocks...")?;
-    let calldata = IERC20::approveCall {
-        spender,
-        amount: U256::ZERO,
-    };
-    let encoded = Bytes::from(SolCall::abi_encode(&calldata));
     let receipt = caller
-        .send(usdc_address, encoded, "Reset USDC allowance")
+        .submit(
+            usdc_address,
+            IERC20::approveCall {
+                spender,
+                amount: U256::ZERO,
+            },
+            "Reset USDC allowance",
+        )
         .await?;
     writeln!(stdout, "   Tx: {}", receipt.transaction_hash)?;
 
-    let new_allowance = usdc.allowance(owner, spender).call().await?;
+    let new_allowance = caller
+        .call(usdc_address, IERC20::allowanceCall { owner, spender })
+        .await?;
     writeln!(stdout, "Allowance reset to: {new_allowance}")?;
 
     Ok(())
