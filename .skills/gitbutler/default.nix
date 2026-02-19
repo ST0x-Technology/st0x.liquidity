@@ -46,7 +46,9 @@ in if pkgs.stdenv.hostPlatform.isDarwin then
       cp GitButler.app/Contents/MacOS/gitbutler-tauri $out/bin/but
       cp GitButler.app/Contents/MacOS/gitbutler-git-askpass $out/bin/
       cp GitButler.app/Contents/MacOS/gitbutler-git-setsid $out/bin/
-      codesign -f -s - $out/bin/but
+      # Use GitButler's bundle identifier so macOS keychain ACLs persist
+      # across nix store path changes (rebuilds, version bumps)
+      codesign -f -s - --identifier com.gitbutler.app $out/bin/but
       codesign -f -s - $out/bin/gitbutler-git-askpass
       codesign -f -s - $out/bin/gitbutler-git-setsid
     '';

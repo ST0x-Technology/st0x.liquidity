@@ -215,6 +215,7 @@
               packages.deployNixos
               packages.deployService
               packages.deployAll
+              packages.gitbutler-cli
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
