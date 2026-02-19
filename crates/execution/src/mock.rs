@@ -23,6 +23,7 @@ pub struct MockExecutor {
     should_fail: bool,
     failure_message: String,
     inventory_result: InventoryResult,
+    order_status_override: Option<OrderState>,
     market_open: bool,
 }
 
@@ -33,6 +34,7 @@ impl MockExecutor {
             should_fail: false,
             failure_message: String::new(),
             inventory_result: InventoryResult::Unimplemented,
+            order_status_override: None,
             market_open: true,
         }
     }
@@ -43,6 +45,7 @@ impl MockExecutor {
             should_fail: true,
             failure_message: message.into(),
             inventory_result: InventoryResult::Unimplemented,
+            order_status_override: None,
             market_open: true,
         }
     }
@@ -51,6 +54,13 @@ impl MockExecutor {
     #[must_use]
     pub fn with_inventory(mut self, inventory: Inventory) -> Self {
         self.inventory_result = InventoryResult::Fetched(inventory);
+        self
+    }
+
+    /// Configures the executor to return the specified order state from `get_order_status()`.
+    #[must_use]
+    pub fn with_order_status(mut self, status: OrderState) -> Self {
+        self.order_status_override = Some(status);
         self
     }
 
@@ -120,6 +130,12 @@ impl Executor for MockExecutor {
             return Err(ExecutionError::OrderNotFound {
                 order_id: order_id.clone(),
             });
+        }
+
+        if let Some(ref override_state) = self.order_status_override {
+            warn!("[TEST] Checking status for order: {}", order_id);
+            warn!("[TEST] Returning overridden status: {:?}", override_state);
+            return Ok(override_state.clone());
         }
 
         warn!("[TEST] Checking status for order: {}", order_id);

@@ -8,5 +8,6 @@ node_modules/
 *.db-wal
 tarpaulin-report.html
 .pre-commit-config.yaml
-.sqlx/
 .claude/
+.sqlx/
+.idea/

@@ -74,14 +74,25 @@
             st0x-dto = st0xRust.dto;
           };
 
+          ci = rainix.mkTask.${system} {
+            name = "ci";
+            body = ''
+              set -euxo pipefail
+              cargo check --workspace
+              cargo test --workspace -q
+              cargo clippy --workspace --all-targets --all-features
+              cargo fmt
+            '';
+          };
+
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
             body = ''
               set -euxo pipefail
-
               (cd lib/rain.orderbook/ && forge build)
               (cd lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
+              (cd lib/rain.orderbook/lib/rain.interpreter/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
             '';
@@ -189,6 +200,7 @@
               cargo-chef
               terraform
               ragenix.packages.${system}.default
+              packages.ci
               packages.prepSolArtifacts
               packages.remote
               packages.deployNixos

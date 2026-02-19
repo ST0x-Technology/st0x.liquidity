@@ -67,12 +67,12 @@ use self::manifest::QueryManifest;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
-struct TradeProcessingCqrs {
-    onchain_trade: Arc<Store<OnChainTrade>>,
-    position: Arc<Store<Position>>,
-    position_projection: Arc<Projection<Position>>,
-    offchain_order: Arc<Store<OffchainOrder>>,
-    execution_threshold: ExecutionThreshold,
+pub(crate) struct TradeProcessingCqrs {
+    pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
+    pub(crate) position: Arc<Store<Position>>,
+    pub(crate) position_projection: Arc<Projection<Position>>,
+    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) execution_threshold: ExecutionThreshold,
 }
 
 pub(crate) struct Conductor {
@@ -134,10 +134,10 @@ where
 }
 
 /// Context for vault discovery operations during trade processing.
-pub(super) struct VaultDiscoveryCtx<'a> {
-    vault_registry: &'a Store<VaultRegistry>,
-    orderbook: Address,
-    order_owner: Address,
+pub(crate) struct VaultDiscoveryCtx<'a> {
+    pub(crate) vault_registry: &'a Store<VaultRegistry>,
+    pub(crate) orderbook: Address,
+    pub(crate) order_owner: Address,
 }
 
 impl Conductor {
@@ -908,7 +908,7 @@ async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
 /// Vaults are classified as:
 /// - USDC vault: token == USDC_BASE
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
-pub(super) async fn discover_vaults_for_trade(
+pub(crate) async fn discover_vaults_for_trade(
     queued_event: &QueuedEvent,
     trade: &OnchainTrade,
     context: &VaultDiscoveryCtx<'_>,
@@ -1136,7 +1136,7 @@ async fn execute_acknowledge_fill(
     }
 }
 
-async fn process_queued_trade<E: Executor>(
+pub(crate) async fn process_queued_trade<E: Executor>(
     executor: &E,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
@@ -1306,7 +1306,7 @@ fn reconstruct_log_from_queued_event(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn check_and_execute_accumulated_positions<E>(
+pub(crate) async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
     position: &Store<Position>,
     position_projection: &Projection<Position>,
