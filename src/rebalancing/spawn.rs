@@ -62,21 +62,19 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// needed for CQRS framework initialization in the conductor, which
     /// must happen before this constructor is called.
     pub(crate) async fn new(
-        ctx: &RebalancingCtx,
+        ctx: RebalancingCtx,
         ethereum_wallet: Chain,
         base_wallet: Chain,
         raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
-        let broker_auth = &ctx.alpaca_broker_auth;
-
-        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
+        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(ctx.alpaca_broker_auth.clone()).await?);
 
         let wallet = Arc::new(AlpacaWalletService::new(
-            broker_auth.base_url().to_string(),
+            ctx.alpaca_broker_auth.base_url().to_string(),
             ctx.alpaca_broker_auth.account_id,
-            broker_auth.api_key.clone(),
-            broker_auth.api_secret.clone(),
+            ctx.alpaca_broker_auth.api_key.clone(),
+            ctx.alpaca_broker_auth.api_secret.clone(),
         ));
 
         let cctp = Arc::new(CctpBridge::try_from_ctx(CctpCtx {

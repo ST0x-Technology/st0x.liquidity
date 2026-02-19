@@ -30,6 +30,7 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
     ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, TransferOp, Venue,
 };
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{
@@ -91,8 +92,8 @@ pub(crate) struct RebalancingConfig {
 
 /// Runtime configuration for rebalancing operations.
 ///
-/// Constructed asynchronously from `RebalancingConfig` + `RebalancingSecrets`
-/// + broker auth. During construction, Fireblocks callers are pre-built for
+/// Constructed asynchronously from `RebalancingConfig`, `RebalancingSecrets`,
+/// and broker auth. During construction, Fireblocks wallets are pre-built for
 /// both chains (each resolving the vault address from the Fireblocks API).
 /// After construction, all fields are immutable.
 ///
@@ -184,6 +185,7 @@ impl RebalancingCtx {
             environment: config.fireblocks_environment,
             asset_id,
             provider,
+            required_confirmations: REQUIRED_CONFIRMATIONS,
         })
         .await?)
     }
@@ -209,7 +211,7 @@ impl RebalancingCtx {
         alpaca_broker_auth: AlpacaBrokerApiCtx,
         equities: HashMap<Symbol, EquityTokenAddresses>,
     ) -> Self {
-        let wallet = crate::test_utils::StubWallet::new(Address::ZERO);
+        let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
 
         Self {
             equity,
@@ -244,7 +246,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("equities", &self.equities)
             .field("wallet", &self.base_wallet.address())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

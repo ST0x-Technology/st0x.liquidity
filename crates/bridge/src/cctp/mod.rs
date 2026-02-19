@@ -623,7 +623,6 @@ mod tests {
 
     use alloy::primitives::address;
 
-    use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
@@ -842,7 +841,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         let initial_allowance = bridge
             .ethereum
@@ -886,7 +885,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         bridge
             .ethereum
@@ -941,7 +940,7 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         bridge
             .ethereum
@@ -1033,7 +1032,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         let initial_allowance = bridge
             .base
@@ -1075,7 +1074,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         bridge
             .base
@@ -1128,7 +1127,7 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         bridge
             .base
@@ -2008,7 +2007,7 @@ mod tests {
 
         let recipient = bridge.base.owner();
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         // Check initial allowance is 0
         let initial_allowance = bridge

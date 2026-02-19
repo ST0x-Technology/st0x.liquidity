@@ -107,15 +107,14 @@ pub trait Evm: Send + Sync + 'static {
                 // Wrap in alloy::contract::Error to reuse its revert data extraction
                 let contract_err = alloy::contract::Error::TransportError(rpc_err);
 
-                if let Some(revert_data) = contract_err.as_revert_data() {
-                    if let Ok(decoded) = AbiDecodedErrorType::selector_registry_abi_decode(
+                if let Some(revert_data) = contract_err.as_revert_data()
+                    && let Ok(decoded) = AbiDecodedErrorType::selector_registry_abi_decode(
                         revert_data.as_ref(),
                         None,
                     )
                     .await
-                    {
-                        return Err(EvmError::DecodedRevert(decoded));
-                    }
+                {
+                    return Err(EvmError::DecodedRevert(decoded));
                 }
 
                 Err(EvmError::Contract(contract_err))

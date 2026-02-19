@@ -284,8 +284,8 @@ mod tests {
 
     fn create_test_raindex_service(
         pool: &SqlitePool,
-        provider: impl Provider + Clone + Send + Sync + 'static,
-    ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + Send + Sync + 'static>>> {
+        provider: impl Provider + Clone + 'static,
+    ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + 'static>>> {
         let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(VaultRegistryProjection::sqlite(pool.clone()).unwrap());
 

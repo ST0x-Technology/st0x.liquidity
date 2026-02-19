@@ -652,11 +652,9 @@ async fn run_provider_command<W: Write>(
             symbol,
             quantity,
             token,
-        } => {
-            rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, ctx, provider).await
-        }
+        } => rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, ctx).await,
         ProviderCommand::AlpacaTokenizationRequests => {
-            rebalancing::alpaca_tokenization_requests_command(stdout, ctx, provider).await
+            rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
         }
     }
 }

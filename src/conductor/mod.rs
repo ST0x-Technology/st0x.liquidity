@@ -185,20 +185,21 @@ impl Conductor {
 
             let rebalancing = ctx.rebalancing_ctx().ok().cloned();
 
-            let (position, position_projection, snapshot, rebalancer, order_owner) =
+            let (position, position_projection, snapshot, rebalancer) =
                 if let Some(rebalancing_ctx) = rebalancing {
-                    let market_maker_wallet = rebalancing_ctx.base_wallet().address();
                     let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
                     let base_wallet = rebalancing_ctx.base_wallet().clone();
                     let infra = spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
                         ethereum_wallet,
                         base_wallet,
-                        pool.clone(),
-                        ctx.clone(),
-                        inventory.clone(),
-                        event_sender,
-                        vault_registry.clone(),
+                        RebalancingDeps {
+                            pool: pool.clone(),
+                            ctx: ctx.clone(),
+                            inventory: inventory.clone(),
+                            event_sender,
+                            vault_registry: vault_registry.clone(),
+                        },
                     )
                     .await?;
 
@@ -207,15 +208,13 @@ impl Conductor {
                         infra.position_projection,
                         infra.snapshot,
                         Some(infra.rebalancer),
-                        market_maker_wallet,
                     )
                 } else {
-                    let order_owner = ctx.order_owner()?;
                     let (position, position_projection) = build_position_cqrs(&pool).await?;
                     let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                         .build(())
                         .await?;
-                    (position, position_projection, snapshot, None, order_owner)
+                    (position, position_projection, snapshot, None)
                 };
 
             let order_placer: Arc<dyn OrderPlacer> =
@@ -257,7 +256,7 @@ impl Conductor {
                 builder = builder.with_rebalancer(rebalancer_handle);
             }
 
-            Ok(builder.spawn(order_owner))
+            Ok(builder.spawn())
         })
     }
 }
@@ -317,15 +316,20 @@ struct RebalancingInfrastructure {
     rebalancer: JoinHandle<()>,
 }
 
-fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
-    rebalancing_ctx: RebalancingCtx,
-    ethereum_wallet: Chain,
-    base_wallet: Chain,
+/// Shared infrastructure dependencies needed to spawn rebalancing.
+struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
     inventory: Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
     vault_registry: Arc<Store<VaultRegistry>>,
+}
+
+fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
+    rebalancing_ctx: RebalancingCtx,
+    ethereum_wallet: Chain,
+    base_wallet: Chain,
+    deps: RebalancingDeps,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
 > {
@@ -338,11 +342,11 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
         let vault_registry_projection =
-            Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+            Arc::new(Projection::<VaultRegistry>::sqlite(deps.pool.clone())?);
 
         let raindex_service = Arc::new(RaindexService::new(
             base_wallet.clone(),
-            ctx.evm.orderbook,
+            deps.ctx.evm.orderbook,
             vault_registry_projection,
             market_maker_wallet,
         ));
@@ -374,19 +378,19 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc.clone(),
             },
-            vault_registry,
-            ctx.evm.orderbook,
+            deps.vault_registry,
+            deps.ctx.evm.orderbook,
             market_maker_wallet,
-            inventory.clone(),
+            deps.inventory.clone(),
             operation_sender,
             wrapper,
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender));
+        let event_broadcaster = Arc::new(EventBroadcaster::new(deps.event_sender));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let (built, wired) = manifest
-            .build(pool.clone(), equity_transfer_services)
+            .build(deps.pool.clone(), equity_transfer_services)
             .await?;
 
         let frameworks = RebalancingCqrsFrameworks {
@@ -396,7 +400,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         };
 
         let services = RebalancerServices::new(
-            &rebalancing_ctx,
+            rebalancing_ctx.clone(),
             ethereum_wallet,
             base_wallet,
             raindex_service,
@@ -563,7 +567,6 @@ fn spawn_queue_processor<P, E>(
     provider: P,
     cqrs: TradeProcessingCqrs,
     vault_registry: Arc<Store<VaultRegistry>>,
-    order_owner: Address,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -584,7 +587,6 @@ where
             provider,
             &cqrs,
             &vault_registry,
-            order_owner,
         )
         .await;
     })
@@ -794,7 +796,6 @@ async fn run_queue_processor<P, E>(
     provider: P,
     cqrs: &TradeProcessingCqrs,
     vault_registry: &Store<VaultRegistry>,
-    order_owner: Address,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -811,7 +812,7 @@ async fn run_queue_processor<P, E>(
         feed_id_cache: &feed_id_cache,
         vault_registry,
         executor,
-        order_owner,
+        order_owner: ctx.order_owner(),
     };
 
     loop {
@@ -1605,7 +1606,7 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
-            order_owner: ctx.order_owner().unwrap(),
+            order_owner: ctx.order_owner(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -1657,7 +1658,7 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
-            order_owner: ctx.order_owner().unwrap(),
+            order_owner: ctx.order_owner(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -1708,7 +1709,7 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
-            order_owner: ctx.order_owner().unwrap(),
+            order_owner: ctx.order_owner(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -1745,7 +1746,7 @@ mod tests {
         )
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
-        .spawn(Address::ZERO);
+        .spawn();
 
         conductor.abort_all();
     }
@@ -1775,7 +1776,7 @@ mod tests {
         )
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
-        .spawn(Address::ZERO);
+        .spawn();
 
         let tasks = conductor.trading_tasks.as_ref().unwrap();
         tasks.order_poller.abort();
@@ -1810,7 +1811,7 @@ mod tests {
         )
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
-        .spawn(Address::ZERO);
+        .spawn();
 
         let tasks = conductor.trading_tasks.as_ref().unwrap();
         assert!(!tasks.order_poller.is_finished());
@@ -1846,7 +1847,7 @@ mod tests {
         )
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
-        .spawn(Address::ZERO);
+        .spawn();
 
         assert!(conductor.rebalancer.is_none());
 
@@ -1885,7 +1886,7 @@ mod tests {
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
         .with_rebalancer(fake_rebalancer)
-        .spawn(Address::ZERO);
+        .spawn();
 
         assert!(conductor.rebalancer.is_some());
 
@@ -1924,7 +1925,7 @@ mod tests {
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
         .with_rebalancer(fake_rebalancer)
-        .spawn(Address::ZERO);
+        .spawn();
 
         let rebalancer_handle = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_handle.is_finished());
@@ -1964,7 +1965,7 @@ mod tests {
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
         .with_rebalancer(fake_rebalancer)
-        .spawn(Address::ZERO);
+        .spawn();
 
         conductor.abort_trading_tasks();
 
@@ -2004,7 +2005,7 @@ mod tests {
         )
         .with_executor_maintenance(None)
         .with_dex_event_streams(clear_stream, take_stream)
-        .spawn(Address::ZERO);
+        .spawn();
 
         // Capture handles before abort
         let order_poller = conductor

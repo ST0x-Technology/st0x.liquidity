@@ -375,13 +375,12 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone + 'sta
 }
 
 /// Isolated redemption command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone + 'static>(
+pub(super) async fn alpaca_redeem_command<W: Write>(
     stdout: &mut W,
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
     ctx: &Ctx,
-    provider: P,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
@@ -446,13 +445,9 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone + 'stati
 }
 
 /// List all Alpaca tokenization requests.
-pub(super) async fn alpaca_tokenization_requests_command<
-    W: Write,
-    P: Provider + Clone + 'static,
->(
+pub(super) async fn alpaca_tokenization_requests_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,
-    provider: P,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "📋 Listing Alpaca tokenization requests")?;
 
@@ -667,8 +662,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing config"),
-            "Expected rebalancing config error, got: {err_msg}"
+            err_msg.contains("requires rebalancing mode"),
+            "Expected rebalancing mode error, got: {err_msg}"
         );
     }
 

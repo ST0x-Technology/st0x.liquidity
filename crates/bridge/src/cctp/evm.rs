@@ -31,8 +31,6 @@ pub(crate) struct CctpEndpoint<W: Wallet> {
     token_messenger_address: Address,
     /// MessageTransmitterV2 contract address
     message_transmitter_address: Address,
-    /// Read-only TokenMessengerV2 instance for decoding events
-    token_messenger: TokenMessengerV2::TokenMessengerV2Instance<W::Provider>,
     /// Wallet for submitting write transactions
     wallet: W,
 }
@@ -51,11 +49,10 @@ impl<W: Wallet> CctpEndpoint<W> {
         let provider = wallet.provider().clone();
 
         Self {
-            usdc: IERC20::new(usdc, provider.clone()),
+            usdc: IERC20::new(usdc, provider),
             usdc_address: usdc,
             token_messenger_address: token_messenger,
             message_transmitter_address: message_transmitter,
-            token_messenger: TokenMessengerV2::new(token_messenger, provider),
             wallet,
         }
     }
@@ -182,9 +179,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     }
 
     #[cfg(test)]
-    pub(super) fn token_messenger(
-        &self,
-    ) -> &TokenMessengerV2::TokenMessengerV2Instance<W::Provider> {
-        &self.token_messenger
+    pub(super) fn token_messenger_address(&self) -> Address {
+        self.token_messenger_address
     }
 }

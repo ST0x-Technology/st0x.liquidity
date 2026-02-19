@@ -29,7 +29,7 @@ pub(crate) struct StubWallet {
 }
 
 impl StubWallet {
-    pub(crate) fn new(address: Address) -> Arc<dyn Wallet<Provider = RootProvider>> {
+    pub(crate) fn stub(address: Address) -> Arc<dyn Wallet<Provider = RootProvider>> {
         Arc::new(Self {
             address,
             provider: RootProvider::new(

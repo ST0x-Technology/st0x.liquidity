@@ -191,7 +191,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
 ) -> anyhow::Result<()> {
     let evm = &ctx.evm;
     let feed_id_cache = FeedIdCache::new();
-    let order_owner = ctx.order_owner()?;
+    let order_owner = ctx.order_owner();
 
     match OnchainTrade::try_from_tx_hash(tx_hash, provider, cache, evm, &feed_id_cache, order_owner)
         .await

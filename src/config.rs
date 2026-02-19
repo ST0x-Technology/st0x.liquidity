@@ -97,7 +97,7 @@ enum BrokerSecrets {
 #[derive(Clone, Debug)]
 pub(crate) enum TradingMode {
     Standalone { order_owner: Address },
-    Rebalancing(RebalancingCtx),
+    Rebalancing(Box<RebalancingCtx>),
 }
 
 /// Combined runtime context for the server. Assembled from plaintext config,
@@ -328,14 +328,14 @@ impl Ctx {
                 let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &broker else {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
                 };
-                TradingMode::Rebalancing(
+                TradingMode::Rebalancing(Box::new(
                     RebalancingCtx::new(
                         rebalancing_config,
                         rebalancing_secrets,
                         alpaca_auth.clone(),
                     )
                     .await?,
-                )
+                ))
             }
             (Some(_), Some(_), Some(configured)) => {
                 return Err(CtxError::OrderOwnerConflictsWithFireblocks { configured });
@@ -380,14 +380,15 @@ impl Ctx {
         }
     }
 
-    /// Returns the statically-known order owner address from config.
+    /// Returns the wallet address that owns orders on the orderbook.
     ///
-    /// Only available in `Standalone` mode. In `Rebalancing` mode the
-    /// address is resolved from Fireblocks at conductor spawn time.
-    pub(crate) fn order_owner(&self) -> Result<Address, CtxError> {
+    /// In `Standalone` mode this is the statically-configured order owner.
+    /// In `Rebalancing` mode this is the Fireblocks wallet address resolved
+    /// during async construction.
+    pub(crate) fn order_owner(&self) -> Address {
         match &self.trading_mode {
-            TradingMode::Standalone { order_owner } => Ok(*order_owner),
-            TradingMode::Rebalancing(_) => Err(CtxError::NotStandalone),
+            TradingMode::Standalone { order_owner } => *order_owner,
+            TradingMode::Rebalancing(ctx) => ctx.base_wallet().address(),
         }
     }
 }
@@ -408,8 +409,6 @@ pub enum CtxError {
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
-    #[error("order owner address not available in rebalancing mode")]
-    NotStandalone,
     #[error("rebalancing config present in config but rebalancing secrets missing")]
     RebalancingSecretsMissing,
     #[error("rebalancing secrets present but rebalancing config missing in config")]
@@ -427,7 +426,6 @@ impl CtxError {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::NotRebalancing => "operation requires rebalancing mode",
-            Self::NotStandalone => "order owner not available in rebalancing mode",
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
             Self::Io(_) => "failed to read config file",
             Self::Toml(_) => "failed to parse TOML",
@@ -721,7 +719,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            ctx.order_owner().unwrap(),
+            ctx.order_owner(),
             address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }

@@ -6,7 +6,7 @@
 //! module is only compiled when the `fireblocks` feature is enabled.
 
 use alloy::primitives::{Address, Bytes, TxHash};
-use alloy::providers::Provider;
+use alloy::providers::{PendingTransactionBuilder, Provider};
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
@@ -127,6 +127,7 @@ pub struct FireblocksCtx<P> {
     pub environment: FireblocksEnvironment,
     pub asset_id: AssetId,
     pub provider: P,
+    pub required_confirmations: u64,
 }
 
 impl<P> std::fmt::Debug for FireblocksCtx<P> {
@@ -178,8 +179,6 @@ pub enum FireblocksError {
     },
     #[error("Fireblocks transaction {tx_id} did not include a transaction hash")]
     MissingTxHash { tx_id: String },
-    #[error("transaction {tx_hash} has no receipt after confirmation")]
-    MissingReceipt { tx_hash: TxHash },
     #[error("no deposit address found for vault {vault_account_id} asset {asset_id}")]
     NoDepositAddress {
         vault_account_id: FireblocksVaultAccountId,
@@ -194,6 +193,7 @@ pub struct FireblocksWallet<P> {
     asset_id: AssetId,
     provider: P,
     address: Address,
+    required_confirmations: u64,
 }
 
 impl<P> FireblocksWallet<P> {
@@ -239,6 +239,7 @@ impl<P> FireblocksWallet<P> {
             asset_id: ctx.asset_id,
             provider: ctx.provider,
             address,
+            required_confirmations: ctx.required_confirmations,
         })
     }
 }
@@ -321,7 +322,7 @@ where
             .await?;
 
         if result.status != TransactionStatus::Completed {
-            if is_still_pending(&result.status) {
+            if is_still_pending(result.status) {
                 warn!(
                     fireblocks_tx_id = %tx_id,
                     status = ?result.status,
@@ -346,14 +347,14 @@ where
             fireblocks_tx_id = %tx_id,
             %tx_hash,
             note,
-            "Fireblocks transaction completed, fetching receipt"
+            required_confirmations = self.required_confirmations,
+            "Fireblocks transaction completed, waiting for confirmations"
         );
 
-        let receipt = self
-            .provider
-            .get_transaction_receipt(tx_hash)
-            .await?
-            .ok_or_else(|| EvmError::Fireblocks(FireblocksError::MissingReceipt { tx_hash }))?;
+        let receipt = PendingTransactionBuilder::new(self.provider.root().clone(), tx_hash)
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
 
         if !receipt.status() {
             return Err(EvmError::Reverted {
@@ -440,7 +441,7 @@ fn generate_external_tx_id(note: &str) -> String {
 
 /// Returns `true` if the transaction is still in a non-terminal state
 /// and may eventually confirm on-chain.
-fn is_still_pending(status: &TransactionStatus) -> bool {
+fn is_still_pending(status: TransactionStatus) -> bool {
     use TransactionStatus::*;
 
     match status {
@@ -542,32 +543,32 @@ mod tests {
 
     #[test]
     fn is_still_pending_for_submitted() {
-        assert!(is_still_pending(&TransactionStatus::Submitted));
+        assert!(is_still_pending(TransactionStatus::Submitted));
     }
 
     #[test]
     fn is_still_pending_for_confirming() {
-        assert!(is_still_pending(&TransactionStatus::Confirming));
+        assert!(is_still_pending(TransactionStatus::Confirming));
     }
 
     #[test]
     fn is_not_pending_for_completed() {
-        assert!(!is_still_pending(&TransactionStatus::Completed));
+        assert!(!is_still_pending(TransactionStatus::Completed));
     }
 
     #[test]
     fn is_not_pending_for_failed() {
-        assert!(!is_still_pending(&TransactionStatus::Failed));
+        assert!(!is_still_pending(TransactionStatus::Failed));
     }
 
     #[test]
     fn is_not_pending_for_cancelled() {
-        assert!(!is_still_pending(&TransactionStatus::Cancelled));
+        assert!(!is_still_pending(TransactionStatus::Cancelled));
     }
 
     #[test]
     fn is_not_pending_for_rejected() {
-        assert!(!is_still_pending(&TransactionStatus::Rejected));
+        assert!(!is_still_pending(TransactionStatus::Rejected));
     }
 
     #[test]

@@ -521,7 +521,7 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
-            trading_mode: TradingMode::Rebalancing(RebalancingCtx::stub(
+            trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
                 ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
@@ -538,7 +538,7 @@ mod tests {
                     time_in_force: TimeInForce::default(),
                 },
                 HashMap::new(),
-            )),
+            ))),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

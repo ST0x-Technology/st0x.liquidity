@@ -1,6 +1,5 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
-use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
@@ -158,7 +157,7 @@ where
         self
     }
 
-    pub(crate) fn spawn(self, order_owner: Address) -> Conductor {
+    pub(crate) fn spawn(self) -> Conductor {
         info!("Starting conductor orchestration");
 
         let executor_maintenance = self.state.executor_maintenance;
@@ -167,6 +166,7 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
+        let order_owner = self.common.ctx.order_owner();
         let evm = ReadOnlyEvm::new(self.common.provider.clone());
         let raindex_service = Arc::new(RaindexService::new(
             evm,
@@ -221,7 +221,6 @@ where
             self.common.provider,
             trade_cqrs,
             self.common.frameworks.vault_registry,
-            order_owner,
         );
 
         Conductor {
