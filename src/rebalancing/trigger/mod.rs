@@ -199,6 +199,7 @@ impl RebalancingCtx {
             asset_id,
             provider,
             required_confirmations: REQUIRED_CONFIRMATIONS,
+            base_url: None,
         })
         .await?)
     }

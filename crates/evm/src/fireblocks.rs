@@ -20,6 +20,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::{Evm, EvmError, Wallet};
 
@@ -128,6 +129,9 @@ pub struct FireblocksCtx<P> {
     pub asset_id: AssetId,
     pub provider: P,
     pub required_confirmations: u64,
+    /// Override the Fireblocks API base URL. When `None`, the URL is
+    /// determined by [`FireblocksEnvironment`] (production or sandbox).
+    pub base_url: Option<Url>,
 }
 
 impl<P> std::fmt::Debug for FireblocksCtx<P> {
@@ -145,9 +149,13 @@ impl<P> std::fmt::Debug for FireblocksCtx<P> {
 impl<P> FireblocksCtx<P> {
     fn build_client(&self) -> Result<Client, FireblocksError> {
         let mut builder = ClientBuilder::new(self.api_user_id.as_str(), &self.secret);
-        if self.environment == FireblocksEnvironment::Sandbox {
+
+        if let Some(ref url) = self.base_url {
+            builder = builder.with_url(url.as_str().trim_end_matches('/'));
+        } else if self.environment == FireblocksEnvironment::Sandbox {
             builder = builder.use_sandbox();
         }
+
         Ok(builder.build()?)
     }
 }
@@ -194,6 +202,17 @@ pub struct FireblocksWallet<P> {
     provider: P,
     address: Address,
     required_confirmations: u64,
+}
+
+impl<P> std::fmt::Debug for FireblocksWallet<P> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FireblocksWallet")
+            .field("vault_account_id", &self.vault_account_id)
+            .field("asset_id", &self.asset_id)
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<P> FireblocksWallet<P> {
@@ -310,9 +329,8 @@ where
             "Fireblocks transaction created, polling for completion"
         );
 
-        let result = self
-            .client
-            .poll_transaction(&tx_id, POLL_TIMEOUT, POLL_INTERVAL, |tx| {
+        let result =
+            Client::poll_transaction(&self.client, &tx_id, POLL_TIMEOUT, POLL_INTERVAL, |tx| {
                 debug!(
                     fireblocks_tx_id = %tx_id,
                     status = ?tx.status,
@@ -456,7 +474,318 @@ fn is_still_pending(status: TransactionStatus) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use alloy::network::EthereumWallet;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::providers::ProviderBuilder;
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::signers::local::PrivateKeySigner;
+    use httpmock::MockServer;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
+    use std::sync::LazyLock;
+
     use super::*;
+
+    /// RSA private key generated at test time for Fireblocks JWT
+    /// signing. The mock server does not validate signatures.
+    static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        pem.as_bytes().to_vec()
+    });
+
+    fn anvil_signer(anvil: &AnvilInstance) -> EthereumWallet {
+        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+        EthereumWallet::from(signer)
+    }
+
+    /// Build a Fireblocks [`Client`] that sends requests to the mock
+    /// server instead of the real Fireblocks API.
+    fn mock_client(server: &MockServer) -> Client {
+        ClientBuilder::new("test-api-key", &TEST_RSA_PEM)
+            .with_url(&server.base_url())
+            .build()
+            .unwrap()
+    }
+
+    fn test_ctx<P>(server: &MockServer, provider: P) -> FireblocksCtx<P> {
+        FireblocksCtx {
+            api_user_id: FireblocksApiUserId::new("test-api-key"),
+            secret: TEST_RSA_PEM.to_vec(),
+            vault_account_id: FireblocksVaultAccountId::new("0"),
+            environment: FireblocksEnvironment::Sandbox,
+            asset_id: AssetId("ETH".to_string()),
+            provider,
+            required_confirmations: 1,
+            base_url: Some(server.base_url().parse().unwrap()),
+        }
+    }
+
+    /// Build a wallet using a pre-built mock client, bypassing
+    /// `FireblocksWallet::new` (which calls `build_client` internally).
+    /// This lets tests control the mock server URL.
+    fn build_wallet<P>(client: Client, address: Address, provider: P) -> FireblocksWallet<P> {
+        FireblocksWallet {
+            client,
+            vault_account_id: FireblocksVaultAccountId::new("0"),
+            asset_id: AssetId("ETH".to_string()),
+            provider,
+            address,
+            required_confirmations: 1,
+        }
+    }
+
+    // -- FireblocksWallet::new tests --
+
+    #[tokio::test]
+    async fn new_resolves_address_from_vault() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        server.mock(|when, then| {
+            when.method("GET")
+                .path("/vault/accounts/0/ETH/addresses_paginated");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "addresses": [{
+                        "assetId": "ETH",
+                        "address": "0x1111111111111111111111111111111111111111"
+                    }]
+                }));
+        });
+
+        let ctx = test_ctx(&server, provider);
+
+        let wallet = FireblocksWallet::new(ctx).await.unwrap();
+
+        assert_eq!(
+            wallet.address(),
+            "0x1111111111111111111111111111111111111111"
+                .parse::<Address>()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn new_returns_no_deposit_address_when_empty() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        server.mock(|when, then| {
+            when.method("GET")
+                .path("/vault/accounts/0/ETH/addresses_paginated");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "addresses": []
+                }));
+        });
+
+        let ctx = test_ctx(&server, provider);
+
+        let error = FireblocksWallet::new(ctx).await.unwrap_err();
+
+        assert!(
+            matches!(error, FireblocksError::NoDepositAddress { .. }),
+            "expected NoDepositAddress, got: {error:?}"
+        );
+    }
+
+    // -- FireblocksWallet::send tests --
+
+    #[tokio::test]
+    async fn send_returns_missing_transaction_id_when_none() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        server.mock(|when, then| {
+            when.method("POST").path("/transactions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({}));
+        });
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let error = wallet
+            .send(Address::ZERO, Bytes::new(), "test")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EvmError::Fireblocks(FireblocksError::MissingTransactionId)
+            ),
+            "expected MissingTransactionId, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_returns_transaction_failed_on_non_completed_status() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        server.mock(|when, then| {
+            when.method("POST").path("/transactions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-123",
+                    "status": "SUBMITTED"
+                }));
+        });
+
+        server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-123");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-123",
+                    "status": "FAILED",
+                    "assetId": "ETH"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let error = wallet
+            .send(Address::ZERO, Bytes::new(), "test")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EvmError::Fireblocks(FireblocksError::TransactionFailed {
+                    ref tx_id,
+                    status: TransactionStatus::Failed,
+                }) if tx_id == "tx-123"
+            ),
+            "expected TransactionFailed with Failed status, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_returns_missing_tx_hash_when_completed_without_hash() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        server.mock(|when, then| {
+            when.method("POST").path("/transactions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-456",
+                    "status": "SUBMITTED"
+                }));
+        });
+
+        server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-456");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-456",
+                    "status": "COMPLETED",
+                    "assetId": "ETH"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let error = wallet
+            .send(Address::ZERO, Bytes::new(), "test")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EvmError::Fireblocks(FireblocksError::MissingTxHash { ref tx_id })
+                    if tx_id == "tx-456"
+            ),
+            "expected MissingTxHash, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_happy_path_returns_receipt() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let url = anvil.endpoint_url();
+        let signer = anvil_signer(&anvil);
+        let signer_address = signer.clone().default_signer().address();
+
+        let signing_provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(url.clone());
+
+        // Create a real transaction on anvil to get a valid tx hash.
+        let tx = TransactionRequest::default()
+            .to(signer_address)
+            .value(alloy::primitives::U256::ZERO);
+
+        let pending = signing_provider.send_transaction(tx).await.unwrap();
+        let receipt = pending.get_receipt().await.unwrap();
+        let tx_hash = receipt.transaction_hash;
+
+        server.mock(|when, then| {
+            when.method("POST").path("/transactions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-789",
+                    "status": "SUBMITTED"
+                }));
+        });
+
+        server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-789");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-789",
+                    "status": "COMPLETED",
+                    "txHash": format!("{tx_hash}"),
+                    "assetId": "ETH"
+                }));
+        });
+
+        let bare_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(url);
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, bare_provider);
+
+        let result = wallet
+            .send(Address::ZERO, Bytes::new(), "test")
+            .await
+            .unwrap();
+
+        assert_eq!(result.transaction_hash, tx_hash);
+    }
 
     #[test]
     fn generate_external_tx_id_contains_note() {
@@ -470,7 +799,6 @@ mod tests {
     #[test]
     fn generate_external_tx_id_contains_timestamp() {
         let tx_id = generate_external_tx_id("test");
-        // Should contain a timestamp-like pattern YYYYMMDD
         let year = chrono::Utc::now().format("%Y").to_string();
         assert!(
             tx_id.contains(&year),
