@@ -337,9 +337,13 @@ pub struct CliEnv {
 impl CliEnv {
     /// Parse CLI arguments, load config from file, and return with subcommand.
     pub async fn parse_and_convert() -> anyhow::Result<(Ctx, Commands)> {
-        let cli_env = Self::parse();
-        let ctx = Ctx::load_files(&cli_env.env.config, &cli_env.env.secrets).await?;
-        Ok((ctx, cli_env.command))
+        Self::parse().load().await
+    }
+
+    /// Load config and secrets from the file paths parsed from CLI arguments.
+    pub(crate) async fn load(self) -> anyhow::Result<(Ctx, Commands)> {
+        let ctx = Ctx::load_files(&self.env.config, &self.env.secrets).await?;
+        Ok((ctx, self.command))
     }
 }
 
@@ -747,7 +751,6 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use std::path::Path;
     use std::str::FromStr;
     use url::Url;
 
@@ -759,7 +762,7 @@ mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-    use crate::config::{BrokerCtx, CtxError, LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{BrokerCtx, LogLevel, SchwabAuth, TradingMode};
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
@@ -2255,22 +2258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_files_returns_io_error_for_missing_config() {
-        let error = Ctx::load_files(
-            Path::new("/nonexistent/config.toml"),
-            Path::new("/nonexistent/secrets.toml"),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            matches!(error, CtxError::Io(_)),
-            "Expected Io error, got: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_files_succeeds_with_valid_standalone_config() {
+    async fn parse_and_convert_succeeds_with_valid_config() {
         let config_dir = tempfile::tempdir().unwrap();
 
         let config_path = config_dir.path().join("config.toml");
@@ -2301,8 +2289,20 @@ mod tests {
         .await
         .unwrap();
 
-        let ctx = Ctx::load_files(&config_path, &secrets_path).await.unwrap();
+        let (ctx, command) = CliEnv::try_parse_from([
+            "cli",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--secrets",
+            secrets_path.to_str().unwrap(),
+            "auth",
+        ])
+        .unwrap()
+        .load()
+        .await
+        .unwrap();
 
+        assert!(matches!(command, Commands::Auth));
         assert_eq!(ctx.database_url, ":memory:");
         assert!(
             matches!(ctx.trading_mode, TradingMode::Standalone { order_owner }
@@ -2314,53 +2314,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_and_load_round_trips_through_temp_files() {
-        let config_dir = tempfile::tempdir().unwrap();
-
-        let config_path = config_dir.path().join("config.toml");
-        let secrets_path = config_dir.path().join("secrets.toml");
-
-        tokio::fs::write(
-            &config_path,
-            r#"
-                database_url = ":memory:"
-                [evm]
-                orderbook = "0x1111111111111111111111111111111111111111"
-                deployment_block = 1
-                order_owner = "0x2222222222222222222222222222222222222222"
-            "#,
-        )
-        .await
-        .unwrap();
-
-        tokio::fs::write(
-            &secrets_path,
-            r#"
-                [evm]
-                ws_rpc_url = "ws://localhost:8545"
-                [broker]
-                type = "dry-run"
-            "#,
-        )
-        .await
-        .unwrap();
-
-        let cli_env = CliEnv::try_parse_from([
+    async fn parse_and_convert_fails_with_missing_files() {
+        let error = CliEnv::try_parse_from([
             "cli",
             "--config",
-            config_path.to_str().unwrap(),
+            "/nonexistent/config.toml",
             "--secrets",
-            secrets_path.to_str().unwrap(),
+            "/nonexistent/secrets.toml",
             "auth",
         ])
-        .unwrap();
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
 
-        let ctx = Ctx::load_files(&cli_env.env.config, &cli_env.env.secrets)
-            .await
-            .unwrap();
-
-        assert!(matches!(cli_env.command, Commands::Auth));
-        assert_eq!(ctx.database_url, ":memory:");
-        assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+        assert!(
+            error.to_string().contains("failed to read config file"),
+            "Expected config file read error, got: {error}"
+        );
     }
 }
