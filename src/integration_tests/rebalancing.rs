@@ -29,7 +29,6 @@ use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::onchain::mock::MockRaindex;
-use crate::wrapper::mock::MockWrapper;
 use crate::position::{Position, PositionCommand};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
@@ -47,6 +46,7 @@ use crate::tokenization::alpaca::tests::{
 };
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+use crate::wrapper::mock::MockWrapper;
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");

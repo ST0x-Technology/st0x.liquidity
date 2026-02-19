@@ -1002,7 +1002,13 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let initial_events = fetch_events(&pool).await;
     let actual_initial: Vec<ExpectedEvent> = initial_events[..6]
         .iter()
-        .map(|event| ExpectedEvent::new(&event.aggregate_type, &event.aggregate_id, &event.event_type))
+        .map(|event| {
+            ExpectedEvent::new(
+                &event.aggregate_type,
+                &event.aggregate_id,
+                &event.event_type,
+            )
+        })
         .collect();
 
     let concurrent_set = [
@@ -1382,7 +1388,8 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.seed_and_submit(&pool, &cqrs)
+    trade1
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("Threshold crossed");
     poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
