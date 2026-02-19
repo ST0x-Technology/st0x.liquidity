@@ -121,9 +121,7 @@ export const tryCatch = <T>(fn: () => T): Result<T, unknown> => {
  * so we cannot guarantee the error type at compile time. Use type guards
  * or instanceof checks before accessing error-specific properties.
  */
-export const tryCatchAsync = async <T>(
-  fn: () => Promise<T>
-): Promise<Result<T, unknown>> => {
+export const tryCatchAsync = async <T>(fn: () => Promise<T>): Promise<Result<T, unknown>> => {
   try {
     return ok(await fn())
   } catch (e: unknown) {
