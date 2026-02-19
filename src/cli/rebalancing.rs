@@ -526,10 +526,11 @@ fn format_tokenization_request<Writer: Write>(
 mod tests {
     use alloy::primitives::{Address, address};
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
+
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
     use super::*;
     use crate::config::{LogLevel, TradingMode};
@@ -597,7 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transfer_equity_requires_rebalancing_config() {
+    async fn test_transfer_equity_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -645,7 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transfer_usdc_requires_rebalancing_config() {
+    async fn test_transfer_usdc_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let amount = Usdc(Decimal::from_str("100").unwrap());

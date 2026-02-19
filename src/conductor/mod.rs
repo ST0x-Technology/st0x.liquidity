@@ -3452,6 +3452,7 @@ mod tests {
                 .read()
                 .await
                 .check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
+                .unwrap()
                 .is_none(),
             "50/50 inventory should be balanced (no imbalance detected)"
         );

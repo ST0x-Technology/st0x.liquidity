@@ -211,7 +211,7 @@ pub(super) async fn reset_allowance_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, address};
+    use alloy::primitives::{Address, address};
     use rust_decimal::Decimal;
     use std::str::FromStr;
     use url::Url;
@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cctp_bridge_requires_rebalancing_config() {
+    async fn test_cctp_bridge_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
 
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cctp_recover_requires_rebalancing_config() {
+    async fn test_cctp_recover_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let burn_tx = B256::ZERO;
 
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reset_allowance_requires_rebalancing_config() {
+    async fn test_reset_allowance_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
 
         let mut stdout = Vec::new();

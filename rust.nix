@@ -8,6 +8,14 @@ let
     name = "lib";
   };
 
+  # Cargo manifests only -- deps derivation hash changes only when dependencies change
+  depsSrc = pkgs.lib.cleanSourceWith {
+    src = ./.;
+    filter = path: type:
+      let base = builtins.baseNameOf path;
+      in type == "directory" || base == "Cargo.toml" || base == "Cargo.lock";
+  };
+
   # Vendor cargo deps with git dependency hashes
   baseVendorDir = craneLib.vendorCargoDeps {
     src = ./.;
@@ -73,7 +81,7 @@ let
   };
 
   # Build only dependencies (cached separately from source changes)
-  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+  cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { src = depsSrc; });
 
   # sqlx needs DATABASE_URL at compile time for query checking
   # Only needed for final build and clippy, not deps

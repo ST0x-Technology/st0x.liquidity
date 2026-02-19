@@ -394,7 +394,7 @@ The system provides two top-level capabilities:
 │  └─ Queue processing                   └─ CQRS aggregates               │
 │                                                                         │
 │  depends on: execution                 depends on: tokenization,        │
-│                                                    bridge, vault        │
+│                                                    bridge, raindex      │
 │                                                                         │
 └──────────────────────────────────┬──────────────────────────────────────┘
                                    │
@@ -1271,7 +1271,6 @@ enum TokenizedEquityMintCommand {
     /// Transition: calls tokenizer.poll_mint_until_complete(),
     /// emits TokensReceived (or MintAcceptanceFailed).
     Poll,
-    RejectMint { reason },
     WrapTokens { wrap_tx_hash, wrapped_shares },
     DepositToVault { vault_deposit_tx_hash },
 }
@@ -1321,14 +1320,8 @@ redemption, and receiving shares at Alpaca.
 
 **Services**:
 `EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
-Arc<dyn Tokenizer> }`
+Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 -- shared with `TokenizedEquityMint`.
-
-**Services**:
-`EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
-Arc<dyn Tokenizer> }`
--- shared by both equity transfer aggregates. Commands invoke domain traits
-directly (no intermediate wrapper trait).
 
 ##### State Flow
 
@@ -1372,8 +1365,9 @@ enum EquityRedemption {
         quantity: Decimal,
         token: Address,
         raindex_withdraw_tx: TxHash,
-        unwrap_tx: TxHash,
-        underlying_amount: U256,
+        unwrap_tx_hash: TxHash,
+        unwrapped_amount: U256,
+        withdrawn_at: DateTime<Utc>,
         unwrapped_at: DateTime<Utc>,
     },
     TokensSent {
@@ -1381,7 +1375,7 @@ enum EquityRedemption {
         quantity: Decimal,
         token: Address,
         raindex_withdraw_tx: TxHash,
-        unwrap_tx: TxHash,
+        unwrap_tx_hash: Option<TxHash>,
         redemption_wallet: Address,
         redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
@@ -1405,7 +1399,6 @@ enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         raindex_withdraw_tx: Option<TxHash>,
-        unwrap_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
         failed_at: DateTime<Utc>,
@@ -1498,12 +1491,13 @@ The aggregate uses domain service traits directly as its Services:
 struct EquityTransferServices {
     raindex: Arc<dyn Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn Wrapper>,
 }
 ```
 
 Both equity transfer aggregates share the same services type. Commands invoke
-`Raindex` methods for vault operations and `Tokenizer` methods for tokenization
-and redemption polling. No intermediate wrapper trait is needed.
+`Raindex` methods for vault operations, `Tokenizer` methods for tokenization and
+redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 
 ##### Business Rules
 
@@ -1927,7 +1921,7 @@ know about cross-venue inventory.
   available
 - `TokenizedEquityMintEvent::TokensWrapped` - No balance change (conversion
   between wrapped/unwrapped forms)
-- `TokenizedEquityMintEvent::WrapFailed` - No balance change (tokens await
+- `TokenizedEquityMintEvent::WrappingFailed` - No balance change (tokens await
   retry)
 - `TokenizedEquityMintEvent::DepositedIntoRaindex` - No balance change
   (completes transfer to Raindex, already counted at TokensReceived)

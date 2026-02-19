@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Sub};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use st0x_execution::{ArithmeticError, HasZero};
 
@@ -181,6 +181,34 @@ where
         Self {
             available: snapshot_balance,
             inflight: self.inflight,
+        }
+    }
+
+    /// Force-apply a snapshot, clearing inflight and setting
+    /// available to the snapshot balance.
+    ///
+    /// Used for recovery when reactor state is corrupted (e.g.,
+    /// stuck inflight from a failed transfer that never completed).
+    /// The snapshot represents actual venue reality, so we trust
+    /// it unconditionally and discard any tracked inflight.
+    ///
+    /// Takes the triggering error as a witness to prevent blind
+    /// usage -- callers must have an error in hand to justify
+    /// bypassing the normal inflight guard.
+    pub(super) fn force_apply_snapshot<E: std::fmt::Debug>(
+        self,
+        snapshot_balance: T,
+        recovering_from: &E,
+    ) -> Self {
+        warn!(
+            ?recovering_from,
+            inflight = ?self.inflight,
+            "Force-applying snapshot to recover from error, clearing inflight"
+        );
+
+        Self {
+            available: snapshot_balance,
+            inflight: T::ZERO,
         }
     }
 }
@@ -373,6 +401,53 @@ mod tests {
         let snapshot_balance = Usdc(Decimal::from(950));
 
         let result = balance.apply_snapshot(snapshot_balance);
+
+        assert_eq!(result.available().0, Decimal::from(950));
+        assert_eq!(result.inflight().0, Decimal::ZERO);
+    }
+
+    #[derive(Debug)]
+    struct TestError {
+        _reason: &'static str,
+    }
+
+    #[test]
+    fn force_apply_snapshot_clears_inflight() {
+        let balance = equity_balance(90, 10);
+        let snapshot_balance = FractionalShares::new(Decimal::from(95));
+        let error = TestError {
+            _reason: "stuck inflight",
+        };
+
+        let result = balance.force_apply_snapshot(snapshot_balance, &error);
+
+        assert_eq!(result.available().inner(), Decimal::from(95));
+        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn force_apply_snapshot_works_when_inflight_zero() {
+        let balance = equity_balance(100, 0);
+        let snapshot_balance = FractionalShares::new(Decimal::from(75));
+        let error = TestError {
+            _reason: "recovery",
+        };
+
+        let result = balance.force_apply_snapshot(snapshot_balance, &error);
+
+        assert_eq!(result.available().inner(), Decimal::from(75));
+        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn force_apply_snapshot_works_with_usdc() {
+        let balance = usdc_balance(1000, 200);
+        let snapshot_balance = Usdc(Decimal::from(950));
+        let error = TestError {
+            _reason: "usdc corruption",
+        };
+
+        let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
         assert_eq!(result.available().0, Decimal::from(950));
         assert_eq!(result.inflight().0, Decimal::ZERO);

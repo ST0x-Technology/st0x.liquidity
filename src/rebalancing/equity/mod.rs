@@ -15,7 +15,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
@@ -69,6 +69,15 @@ pub(crate) enum MintError {
     EntityNotFound {
         issuer_request_id: IssuerRequestId,
         expected_state: &'static str,
+    },
+    #[error(
+        "Unexpected mint state for {issuer_request_id}: expected \
+         {expected_state}, got {entity:?}"
+    )]
+    UnexpectedState {
+        issuer_request_id: IssuerRequestId,
+        expected_state: &'static str,
+        entity: Box<TokenizedEquityMint>,
     },
 }
 
@@ -152,13 +161,11 @@ impl CrossVenueEquityTransfer {
 
         match entity {
             TokenizedEquityMint::TokensReceived { shares_minted, .. } => Ok(shares_minted),
-            other => {
-                error!(?other, "Expected TokensReceived after Poll");
-                Err(MintError::EntityNotFound {
-                    issuer_request_id: issuer_request_id.clone(),
-                    expected_state: "TokensReceived",
-                })
-            }
+            other => Err(MintError::UnexpectedState {
+                issuer_request_id: issuer_request_id.clone(),
+                expected_state: "TokensReceived",
+                entity: Box::new(other),
+            }),
         }
     }
 
@@ -211,10 +218,7 @@ impl CrossVenueEquityTransfer {
         match entity {
             EquityRedemption::TokensSent { redemption_tx, .. } => Ok(redemption_tx),
             entity @ EquityRedemption::Failed { .. } => Err(RedemptionError::SendFailed { entity }),
-            entity => {
-                error!(?entity, "Unexpected entity after SendTokens command");
-                Err(RedemptionError::UnexpectedEntity { entity })
-            }
+            entity => Err(RedemptionError::UnexpectedEntity { entity }),
         }
     }
 

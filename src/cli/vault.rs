@@ -173,7 +173,7 @@ mod tests {
         b256!("0000000000000000000000000000000000000000000000000000000000000001");
 
     #[tokio::test]
-    async fn test_vault_deposit_requires_rebalancing_config() {
+    async fn test_vault_deposit_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let amount = Decimal::from_str("100").unwrap();
 
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vault_withdraw_requires_rebalancing_config() {
+    async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 

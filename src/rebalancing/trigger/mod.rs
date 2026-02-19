@@ -38,11 +38,20 @@ use crate::tokenized_equity_mint::{
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use crate::wrapper::{EquityTokenAddresses, UnderlyingPerWrapped, Wrapper};
+use crate::wrapper::{EquityTokenAddresses, Wrapper};
+
+/// Why the rebalancing trigger reactor failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RebalancingTriggerError {
+    #[error(transparent)]
+    Inventory(#[from] InventoryViewError),
+    #[error(transparent)]
+    EquityTrigger(#[from] equity::EquityTriggerError),
+}
 
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
-enum TokenAddressError {
+pub(crate) enum TokenAddressError {
     #[error("vault registry aggregate not initialized")]
     Uninitialized,
     #[error(transparent)]
@@ -323,6 +332,177 @@ impl RebalancingTrigger {
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    /// Process a snapshot event under normal operation.
+    async fn on_snapshot(
+        &self,
+        event: InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        let now = Utc::now();
+        let mut inventory = self.inventory.write().await;
+
+        use InventorySnapshotEvent::*;
+        let updated =
+            match &event {
+                OnchainEquity { balances, .. } => balances.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(Venue::MarketMaking, *snapshot_balance),
+                            now,
+                        )
+                    },
+                ),
+
+                OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
+                    Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance),
+                    now,
+                ),
+
+                OffchainEquity { positions, .. } => positions.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(Venue::Hedging, *snapshot_balance),
+                            now,
+                        )
+                    },
+                ),
+
+                OffchainCash {
+                    cash_balance_cents, ..
+                } => {
+                    let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
+                        InventoryViewError::CashBalanceConversion(*cash_balance_cents),
+                    )?;
+                    inventory
+                        .clone()
+                        .update_usdc(Inventory::on_snapshot(Venue::Hedging, usdc), now)
+                }
+            }?;
+
+        *inventory = updated;
+        drop(inventory);
+
+        debug!("Applied inventory snapshot event");
+
+        self.check_and_trigger_after_snapshot(&event).await
+    }
+
+    /// Reprocess a snapshot event after the normal handler failed.
+    ///
+    /// Resets the inventory, then force-applies the snapshot —
+    /// bypassing inflight guards that may have caused the
+    /// original failure.
+    async fn on_snapshot_recovery(
+        &self,
+        error: RebalancingTriggerError,
+        event: InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        let inventory_error = match error {
+            RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
+            other @ RebalancingTriggerError::EquityTrigger(_) => return Err(other),
+        };
+
+        warn!(
+            ?inventory_error,
+            "Resetting inventory and force-applying snapshot to recover"
+        );
+
+        let now = Utc::now();
+        let mut inventory = self.inventory.write().await;
+        *inventory = InventoryView::default();
+
+        use InventorySnapshotEvent::*;
+        let updated =
+            match &event {
+                OnchainEquity { balances, .. } => balances.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::MarketMaking,
+                                *snapshot_balance,
+                                inventory_error.clone(),
+                            ),
+                            now,
+                        )
+                    },
+                ),
+
+                OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
+                    Inventory::force_on_snapshot(
+                        Venue::MarketMaking,
+                        *usdc_balance,
+                        inventory_error.clone(),
+                    ),
+                    now,
+                ),
+
+                OffchainEquity { positions, .. } => positions.iter().try_fold(
+                    inventory.clone(),
+                    |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::Hedging,
+                                *snapshot_balance,
+                                inventory_error.clone(),
+                            ),
+                            now,
+                        )
+                    },
+                ),
+
+                OffchainCash {
+                    cash_balance_cents, ..
+                } => {
+                    let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
+                        InventoryViewError::CashBalanceConversion(*cash_balance_cents),
+                    )?;
+                    inventory.clone().update_usdc(
+                        Inventory::force_on_snapshot(Venue::Hedging, usdc, inventory_error),
+                        now,
+                    )
+                }
+            }?;
+
+        *inventory = updated;
+        drop(inventory);
+
+        debug!("Force-applied inventory snapshot after recovery");
+
+        self.check_and_trigger_after_snapshot(&event).await
+    }
+
+    /// Trigger rebalancing checks after a snapshot event.
+    async fn check_and_trigger_after_snapshot(
+        &self,
+        event: &InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        use InventorySnapshotEvent::*;
+
+        match event {
+            OnchainEquity { balances, .. } => {
+                for symbol in balances.keys() {
+                    self.check_and_trigger_equity(symbol).await?;
+                }
+            }
+            OffchainEquity { positions, .. } => {
+                for symbol in positions.keys() {
+                    self.check_and_trigger_equity(symbol).await?;
+                }
+            }
+            OnchainCash { .. } | OffchainCash { .. } => {
+                self.check_and_trigger_usdc().await;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 deps!(
@@ -338,7 +518,7 @@ deps!(
 
 #[async_trait]
 impl Reactor for RebalancingTrigger {
-    type Error = InventoryViewError;
+    type Error = RebalancingTriggerError;
 
     async fn react(
         &self,
@@ -376,9 +556,9 @@ impl Reactor for RebalancingTrigger {
                     .update_equity(&symbol, update, timestamp)?;
                 drop(inventory);
 
-                self.check_and_trigger_equity(&symbol).await;
+                self.check_and_trigger_equity(&symbol).await?;
 
-                Ok(())
+                Ok::<(), RebalancingTriggerError>(())
             })
             .on(|id, event| async move { self.on_mint(id, event).await })
             .on(|id, event| async move { self.on_redemption(id, event).await })
@@ -404,76 +584,12 @@ impl Reactor for RebalancingTrigger {
                     self.check_and_trigger_usdc().await;
                 }
 
-                Ok(())
+                Ok::<(), RebalancingTriggerError>(())
             })
-            .on(|_id, event| async move {
-                let now = Utc::now();
-                let mut inventory = self.inventory.write().await;
-
-                use InventorySnapshotEvent::*;
-                let updated = match &event {
-                    OnchainEquity { balances, .. } => balances.iter().try_fold(
-                        inventory.clone(),
-                        |view, (symbol, snapshot_balance)| {
-                            view.update_equity(
-                                symbol,
-                                Inventory::on_snapshot(Venue::MarketMaking, *snapshot_balance),
-                                now,
-                            )
-                        },
-                    ),
-
-                    OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
-                        Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance),
-                        now,
-                    ),
-
-                    OffchainEquity { positions, .. } => positions.iter().try_fold(
-                        inventory.clone(),
-                        |view, (symbol, snapshot_balance)| {
-                            view.update_equity(
-                                symbol,
-                                Inventory::on_snapshot(Venue::Hedging, *snapshot_balance),
-                                now,
-                            )
-                        },
-                    ),
-
-                    OffchainCash {
-                        cash_balance_cents, ..
-                    } => {
-                        let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
-                            InventoryViewError::CashBalanceConversion(*cash_balance_cents),
-                        )?;
-                        inventory
-                            .clone()
-                            .update_usdc(Inventory::on_snapshot(Venue::Hedging, usdc), now)
-                    }
-                }?;
-
-                *inventory = updated;
-                drop(inventory);
-
-                debug!("Applied inventory snapshot event");
-
-                match &event {
-                    OnchainEquity { balances, .. } => {
-                        for symbol in balances.keys() {
-                            self.check_and_trigger_equity(symbol).await;
-                        }
-                    }
-                    OffchainEquity { positions, .. } => {
-                        for symbol in positions.keys() {
-                            self.check_and_trigger_equity(symbol).await;
-                        }
-                    }
-                    OnchainCash { .. } | OffchainCash { .. } => {
-                        self.check_and_trigger_usdc().await;
-                    }
-                }
-
-                Ok(())
-            })
+            .on_with_fallback(
+                |_id, event| async move { self.on_snapshot(event).await },
+                |error, _id, event| async move { self.on_snapshot_recovery(error, event).await },
+            )
             .exhaustive()
             .await
     }
@@ -481,34 +597,27 @@ impl Reactor for RebalancingTrigger {
 
 impl RebalancingTrigger {
     /// Checks inventory for equity imbalance and triggers operation if needed.
-    pub(crate) async fn check_and_trigger_equity(&self, symbol: &Symbol) {
+    pub(crate) async fn check_and_trigger_equity(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<(), equity::EquityTriggerError> {
         let Some(guard) = equity::InProgressGuard::try_claim(
             symbol.clone(),
             Arc::clone(&self.equity_in_progress),
         ) else {
-            debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
-            return;
+            debug!(%symbol, "Skipped equity trigger: already in progress");
+            return Ok(());
         };
 
-        let Some(operation) = self.try_build_equity_operation(symbol).await else {
-            return;
-        };
+        let wrapped_token = self
+            .load_token_address(symbol)
+            .await?
+            .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
 
-        if let Err(error) = self.sender.try_send(operation.clone()) {
-            warn!(error = %error, "Failed to send triggered operation");
-            return;
-        }
+        let unwrapped_token = self.wrapper.lookup_unwrapped(symbol)?;
+        let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
-        debug!(symbol = %symbol, operation = ?operation, "Triggered equity rebalancing");
-        guard.defuse();
-    }
-
-    async fn try_build_equity_operation(&self, symbol: &Symbol) -> Option<TriggeredOperation> {
-        let wrapped_token = self.load_token_address_for_trigger(symbol).await?;
-        let unwrapped_token = self.load_unwrapped_token_for_trigger(symbol)?;
-        let vault_ratio = self.load_vault_ratio_for_trigger(symbol).await?;
-
-        equity::check_imbalance_and_build_operation(
+        let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
             &self.inventory,
@@ -516,44 +625,19 @@ impl RebalancingTrigger {
             unwrapped_token,
             &vault_ratio,
         )
-        .await
-        .ok()
-    }
+        .await?
+        else {
+            return Ok(());
+        };
 
-    fn load_unwrapped_token_for_trigger(&self, symbol: &Symbol) -> Option<Address> {
-        match self.wrapper.lookup_unwrapped(symbol) {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to get unwrapped token address");
-                None
-            }
+        if let Err(error) = self.sender.try_send(operation.clone()) {
+            warn!(%error, "Failed to send triggered operation");
+            return Ok(());
         }
-    }
 
-    async fn load_token_address_for_trigger(&self, symbol: &Symbol) -> Option<Address> {
-        match self.load_token_address(symbol).await {
-            Ok(Some(addr)) => Some(addr),
-            Ok(None) => {
-                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
-                // tokenized equities and won't be in the vault registry.
-                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
-                None
-            }
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
-                None
-            }
-        }
-    }
-
-    async fn load_vault_ratio_for_trigger(&self, symbol: &Symbol) -> Option<UnderlyingPerWrapped> {
-        match self.wrapper.get_ratio_for_symbol(symbol).await {
-            Ok(ratio) => Some(ratio),
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to fetch vault ratio");
-                None
-            }
-        }
+        debug!(%symbol, ?operation, "Triggered equity rebalancing");
+        guard.defuse();
+        Ok(())
     }
 
     async fn load_token_address(
@@ -594,11 +678,11 @@ impl RebalancingTrigger {
         };
 
         if let Err(error) = self.sender.try_send(operation.clone()) {
-            warn!(error = %error, "Failed to send USDC triggered operation");
+            warn!(%error, "Failed to send USDC triggered operation");
             return;
         }
 
-        debug!(operation = ?operation, "Triggered USDC rebalancing");
+        debug!(?operation, "Triggered USDC rebalancing");
         guard.defuse();
     }
 
@@ -620,7 +704,7 @@ impl RebalancingTrigger {
         &self,
         id: IssuerRequestId,
         event: TokenizedEquityMintEvent,
-    ) -> Result<(), InventoryViewError> {
+    ) -> Result<(), RebalancingTriggerError> {
         if let Some((symbol, quantity)) = Self::extract_mint_info(&event) {
             self.mint_tracking
                 .write()
@@ -671,7 +755,7 @@ impl RebalancingTrigger {
         if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+            debug!(%symbol, "Cleared equity in-progress flag after mint terminal event");
 
             self.check_and_trigger_usdc().await;
         }
@@ -683,7 +767,7 @@ impl RebalancingTrigger {
         &self,
         id: RedemptionAggregateId,
         event: EquityRedemptionEvent,
-    ) -> Result<(), InventoryViewError> {
+    ) -> Result<(), RebalancingTriggerError> {
         if let Some((symbol, quantity)) = Self::extract_redemption_info(&event) {
             self.redemption_tracking
                 .write()
@@ -742,7 +826,7 @@ impl RebalancingTrigger {
             self.redemption_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
             debug!(
-                symbol = %symbol,
+                %symbol,
                 "Cleared equity in-progress flag after redemption terminal event"
             );
 
@@ -909,7 +993,7 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(
                 receiver.try_recv().unwrap_err(),
@@ -997,10 +1081,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_balanced_inventory_does_not_trigger() {
-        let (trigger, mut receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         trigger.check_and_trigger_usdc().await;
 
         assert!(
@@ -1237,7 +1323,8 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(trigger.clone());
 
         // Apply onchain buy - should add to onchain available.
@@ -1258,7 +1345,7 @@ mod tests {
         // Drain any previous triggered operations.
         while receiver.try_recv().is_ok() {}
 
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(
                 receiver.try_recv().unwrap_err(),
@@ -1286,7 +1373,8 @@ mod tests {
             )
             .unwrap();
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(trigger.clone());
 
         // Apply a small buy that maintains balance (5 shares onchain).
@@ -1368,7 +1456,7 @@ mod tests {
         let (trigger, mut receiver) =
             make_trigger_with_inventory_registry_and_wrapper(inventory, &symbol, wrapper).await;
 
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
         let triggered = receiver.try_recv();
         assert!(
@@ -1472,7 +1560,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
         // Initially, trigger should detect imbalance (too much offchain).
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         let initial_check = receiver.try_recv();
         assert!(
             matches!(initial_check, Ok(TriggeredOperation::Mint { .. })),
@@ -1497,7 +1585,7 @@ mod tests {
         }
 
         // With inflight, imbalance detection should not trigger anything.
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(
                 receiver.try_recv().unwrap_err(),
@@ -1683,7 +1771,7 @@ mod tests {
         let id = IssuerRequestId::new("mint-blocks");
 
         // Verify imbalance triggers before reactor events
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
             "Should trigger Mint before reactor events"
@@ -1702,7 +1790,7 @@ mod tests {
             .unwrap();
 
         // Now check: inflight should block imbalance detection
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inflight from MintAccepted should block imbalance detection"
@@ -1752,7 +1840,7 @@ mod tests {
         // After TokensReceived: 30 moved from offchain to onchain
         // New state: 50 onchain, 50 offchain = balanced
         trigger.clear_equity_in_progress(&symbol);
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inventory should be balanced after mint transfer (50/50)"
@@ -1800,7 +1888,7 @@ mod tests {
             .unwrap();
 
         // After cancellation, inflight is cleared, imbalance should trigger again
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
             "Imbalance should re-trigger after MintAcceptanceFailed cancels inflight"
@@ -2152,7 +2240,7 @@ mod tests {
 
         // After snapshot: 40 onchain (reconciled), 20 offchain
         // 40/60 = 66.7% -> within threshold (30%-70%), no trigger
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "66.7% onchain ratio should be within threshold (30%-70%)"
@@ -2187,7 +2275,7 @@ mod tests {
         };
 
         // Verify initial imbalance triggers
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
             "20% ratio should trigger Mint"
@@ -2210,7 +2298,7 @@ mod tests {
             .unwrap();
 
         // After snapshot: 20 onchain, 20 offchain = balanced
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "50% ratio should be balanced after offchain equity snapshot"
@@ -2242,7 +2330,7 @@ mod tests {
         let id = RedemptionAggregateId::new("redemption-blocks");
 
         // Verify imbalance triggers before reactor events
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(
                 receiver.try_recv(),
@@ -2259,7 +2347,7 @@ mod tests {
             .unwrap();
 
         // Inflight should block imbalance detection
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inflight from WithdrawnFromRaindex should block imbalance detection"
@@ -2303,7 +2391,7 @@ mod tests {
 
         // After Completed: 30 moved from onchain to offchain
         // New state: 50 onchain, 50 offchain = balanced
-        trigger.check_and_trigger_equity(&symbol).await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "Inventory should be balanced after redemption completion (50/50)"
@@ -2530,16 +2618,22 @@ mod tests {
             )
             .unwrap();
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
-        // With inflight, imbalance detection should not trigger anything.
-        trigger.check_and_trigger_equity(&symbol).await;
+        // First trigger detects the imbalance and sends a redemption.
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        let first = receiver.try_recv().unwrap();
+        assert!(matches!(first, TriggeredOperation::Redemption { .. }));
+
+        // With in-progress guard held, second trigger should not send anything.
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
             matches!(
                 receiver.try_recv().unwrap_err(),
                 mpsc::error::TryRecvError::Empty
             ),
-            "Expected no operation due to inflight"
+            "Expected no operation while in-progress guard is held"
         );
     }
 
