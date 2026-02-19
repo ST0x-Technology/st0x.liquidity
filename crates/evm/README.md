@@ -1,27 +1,27 @@
-# st0x-contract-caller
+# st0x-evm
 
-Contract call submission abstraction for the st0x liquidity system.
+EVM wallet abstraction for the st0x liquidity system.
 
 ## Overview
 
 All onchain write operations (token approvals, vault deposits/withdrawals,
 bridge burns/mints, ERC-4626 wrap/unwrap, ERC-20 transfers) are submitted
-through this crate's `ContractCaller` trait rather than calling `.send().await`
-directly on contract instances.
+through this crate's `Wallet` trait rather than calling `.send().await` directly
+on contract instances.
 
 This separates "what to call" (calldata construction, owned by each consumer)
 from "how to sign and submit" (key management, owned by this crate).
 
 ## Implementations
 
-### `FireblocksCaller` (production, `fireblocks` feature)
+### `FireblocksWallet` (production)
 
 Wraps the Fireblocks SDK client. Builds a `CONTRACT_CALL` transaction request,
 submits it to the Fireblocks API, polls for completion, and fetches the receipt
 from a read-only RPC provider. Uses MPC-based key management -- the private key
 never exists in a single location.
 
-### `LocalCaller` (tests only, `local-signer` feature)
+### `RawPrivateKeyWallet` (tests only)
 
 Wraps an alloy provider with an embedded `EthereumWallet` for anvil-based
 testing. Not compiled in production builds.
@@ -42,14 +42,4 @@ interface (per `docs/domain.md`).
 | `fireblocks_environment`      | config   | `production` or `sandbox`                      |
 
 The market maker wallet address is derived from the Fireblocks vault account at
-startup via the Fireblocks API, replacing the previous derivation from a local
-private key.
-
-## Consumers
-
-Five services use `ContractCaller`:
-
-- **RaindexService** -- `approve`, `deposit3`, `withdraw3`
-- **CCTP bridge Evm** -- `approve`, `depositForBurn`, `receiveMessage`
-- **AlpacaTokenizationService** -- ERC-20 `transfer` for redemptions
-- **WrapperService** -- ERC-4626 `deposit`, `redeem`
+startup via the Fireblocks API.
