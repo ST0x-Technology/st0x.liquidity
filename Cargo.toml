@@ -152,6 +152,7 @@ st0x-evm = { workspace = true, features = ["local-signer"] }
 st0x-execution = { path = "crates/execution", features = ["mock"] }
 tempfile = "3.24.0"
 tracing-test = "0.2.5"
+bon = "3.9.0"
 
 [lints]
 workspace = true

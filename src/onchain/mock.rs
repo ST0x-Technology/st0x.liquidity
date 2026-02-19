@@ -34,6 +34,11 @@ impl MockRaindex {
             deposit_fails: true,
         }
     }
+
+    pub(crate) fn with_token(mut self, token: Address) -> Self {
+        self.token = token;
+        self
+    }
 }
 
 #[async_trait]
