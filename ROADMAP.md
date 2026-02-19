@@ -112,6 +112,15 @@ Extract hedging logic and create application binary:
 
 ---
 
+## Backlog: Quant Research Data
+
+Ensure the event store captures all data needed for quantitative research —
+execution timing, market conditions, and operational metrics.
+
+- [ ] [#303 Audit external integrations: record start/end timestamps for all calls in event store](https://github.com/ST0x-Technology/st0x.liquidity/issues/303)
+
+---
+
 ## Backlog: Testing
 
 - [ ] [#292 Work Plan: E2E Test Infrastructure while liquidity bot stabilizes](https://github.com/ST0x-Technology/st0x.liquidity/issues/292)
