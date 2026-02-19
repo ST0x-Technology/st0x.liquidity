@@ -2655,58 +2655,39 @@ POST /api/circuit-breaker/reset
 
 ### Dashboard Layout
 
-Single-page dashboard with live-updating panels, each expandable to full-screen.
-Supports two bot instances (Schwab and Alpaca) via broker selector in header.
-
-#### Broker-specific features
-
-- **Schwab**: OAuth flow management (weekly re-authentication)
-- **Alpaca**: Automated rebalancing panel (minting, redemption, USDC bridging)
+Single-page dashboard with live-updating panels.
 
 #### Header Bar
 
-- Broker selector (Schwab / Alpaca) - switches entire dashboard context
-- Auth status indicator with expiry countdown (Schwab only)
 - Circuit breaker status toggle
 - WebSocket connection status
 
-#### Panels
+#### KPI Strip
 
-1. **Performance Metrics**: Live-updating key metrics with timeframe selector
-   (1h, 1d, 1w, 1m, all-time):
-   - AUM (assets under management across both venues)
-   - P&L (absolute and percentage return)
-   - Volume (total traded value in USD)
-   - Trade count
-   - Sharpe ratio
-   - Sortino ratio
-   - Max drawdown
-   - Hedge lag (average time between onchain trade and offchain hedge execution)
-   - Uptime (% of market hours the bot was operational)
+Always visible, compact horizontal bar showing key metrics using "all" timeframe
+from PerformanceMetrics:
 
-2. **Inventory**: Current holdings across both venues (onchain tokens vs
-   offchain shares per symbol, USDC balances). Shows imbalance ratios and
-   proximity to rebalancing thresholds.
+- P&L
+- Volume
+- Trade count
+- Hedge lag
+- Uptime
+- Sharpe ratio
 
-3. **Spreads**: Live spread visualization using TradingView Lightweight Charts:
-   - Overview table showing last realized spreads per asset (buy price, sell
-     price, Pyth reference, spread bps)
-   - Asset selector to view detailed chart for a specific symbol
-   - Chart shows buy/sell execution prices vs Pyth oracle price over time
-   - All chart lines (buy/sell/pyth) are toggleable via legend
+#### Middle Row
 
-4. **Trade History**: Live list of trades with toggle switches for
-   onchain/offchain/both (default: both). Shows symbol, direction, amount,
-   price, timestamp, venue.
+- **Spreads** (~2/3 width): Table showing last realized spreads per symbol (buy
+  price, sell price, Pyth reference, spread bps). Future: TradingView
+  Lightweight Charts for historical visualization.
+- **Trade Log** (~1/3 width): Scrollable list of recent trades showing symbol,
+  direction, amount, price, timestamp.
 
-5. **Rebalancing** (Alpaca only): Active rebalancing operations with live status
-   updates (CrossVenueEquityTransfer, CrossVenueCashTransfer). Below that,
-   recent completed/failed rebalances.
+#### Bottom Row
 
-6. **Live Events**: Real-time stream of domain events as they occur
-   (aggregate_type, aggregate_id, sequence, event_type, timestamp). Payloads
-   excluded to avoid exposing full database records. Starts empty on page load,
-   populates as new events arrive via WebSocket.
+- **Inventory** (50%): Current holdings across both venues (onchain tokens vs
+  offchain shares per symbol, USDC balances).
+- **Rebalancing** (50%): Active rebalancing operations with progress, recent
+  completed/failed rebalances below.
 
 ### Architecture
 

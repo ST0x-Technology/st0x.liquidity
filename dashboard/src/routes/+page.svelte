@@ -2,26 +2,20 @@
   import { useQueryClient } from '@tanstack/svelte-query'
   import { onMount } from 'svelte'
   import HeaderBar from '$lib/components/header-bar.svelte'
-  import PlaceholderPanel from '$lib/components/placeholder-panel.svelte'
-  import LiveEventsPanel from '$lib/components/live-events-panel.svelte'
-  import { brokerStore } from '$lib/stores/broker.svelte'
-  import { getWebSocketUrl, type Broker } from '$lib/env'
+  import KpiStrip from '$lib/components/kpi-strip.svelte'
+  import SpreadsPanel from '$lib/components/spreads-panel.svelte'
+  import TradeLogPanel from '$lib/components/trade-log-panel.svelte'
+  import InventoryPanel from '$lib/components/inventory-panel.svelte'
+  import RebalancingPanel from '$lib/components/rebalancing-panel.svelte'
+  import { getWebSocketUrl } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
   import { createWebSocket, type WebSocketConnection } from '$lib/websocket.svelte'
 
   const queryClient = useQueryClient()
   const ws = reactive<WebSocketConnection | null>(null)
 
-  const handleBrokerChange = (broker: Broker) => {
-    ws.current?.disconnect()
-    queryClient.clear()
-    brokerStore.set(broker)
-    ws.update(() => createWebSocket(getWebSocketUrl(broker), queryClient))
-    ws.current?.connect()
-  }
-
   onMount(() => {
-    ws.update(() => createWebSocket(getWebSocketUrl(brokerStore.value), queryClient))
+    ws.update(() => createWebSocket(getWebSocketUrl(), queryClient))
     ws.current?.connect()
 
     return () => {
@@ -34,33 +28,30 @@
 </script>
 
 <div class="flex h-screen flex-col bg-background">
-  <HeaderBar
-    broker={brokerStore.value}
-    onBrokerChange={handleBrokerChange}
-    connectionStatus={connectionState === 'error' ? 'disconnected' : connectionState}
-  />
+  <HeaderBar connectionStatus={connectionState === 'error' ? 'disconnected' : connectionState} />
 
   {#if errorContext}
     <div
       class="mx-2 mt-2 rounded-md border border-destructive bg-destructive/10
         px-4 py-2 text-sm text-destructive md:mx-4"
     >
-      Connection error. Reconnecting in {Math.round(errorContext.nextRetryMs / 1000)}s
-      (attempt {errorContext.attempts})...
+      Connection error. Reconnecting in {Math.round(errorContext.nextRetryMs / 1000)}s (attempt {errorContext.attempts})...
     </div>
   {/if}
 
   <main class="flex-1 overflow-auto p-2 md:overflow-hidden md:p-4">
-    <div
-      class="grid h-full grid-cols-1 gap-2 md:grid-cols-2
-        md:grid-rows-[1fr_1fr_1fr] md:gap-4 lg:grid-cols-3 lg:grid-rows-[1fr_1fr]"
-    >
-      <PlaceholderPanel title="Performance Metrics" />
-      <PlaceholderPanel title="Trade Log" />
-      <PlaceholderPanel title="Spreads" />
-      <PlaceholderPanel title="Inventory" />
-      <PlaceholderPanel title="Rebalancing" />
-      <LiveEventsPanel />
+    <div class="flex h-full flex-col gap-2 md:gap-4">
+      <KpiStrip />
+
+      <div class="grid min-h-0 flex-1 grid-cols-1 gap-2 md:grid-cols-[2fr_1fr] md:gap-4">
+        <SpreadsPanel />
+        <TradeLogPanel />
+      </div>
+
+      <div class="grid min-h-0 flex-1 grid-cols-1 gap-2 md:grid-cols-2 md:gap-4">
+        <InventoryPanel />
+        <RebalancingPanel />
+      </div>
     </div>
   </main>
 </div>
