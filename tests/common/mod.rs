@@ -14,8 +14,8 @@ use tokio::task::JoinHandle;
 
 use st0x_event_sorcery::Projection;
 use st0x_execution::{
-    AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Direction, FractionalShares, SupportedExecutor,
-    Symbol, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Direction, FractionalShares,
+    SupportedExecutor, Symbol, TimeInForce,
 };
 use st0x_hedge::bindings::IOrderBookV5;
 use st0x_hedge::config::{BrokerCtx, Ctx, EvmCtx, LogLevel};
@@ -80,7 +80,9 @@ pub fn build_ctx<P: Provider + Clone>(
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         api_key: alpaca_broker::TEST_API_KEY.to_owned(),
         api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
-        account_id: alpaca_broker::TEST_ACCOUNT_ID.to_owned(),
+        account_id: AlpacaAccountId::new(
+            uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"),
+        ),
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
