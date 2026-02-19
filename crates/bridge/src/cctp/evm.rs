@@ -66,7 +66,7 @@ impl<W: Wallet> CctpEndpoint<W> {
 
         trace!(?allowance, %amount, "Checking USDC allowance");
 
-        if allowance._0 < amount {
+        if allowance < amount {
             self.wallet
                 .submit(
                     self.usdc_address,

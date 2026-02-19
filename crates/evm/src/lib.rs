@@ -18,7 +18,6 @@
 
 use std::sync::Arc;
 
-use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
@@ -27,9 +26,11 @@ use async_trait::async_trait;
 #[cfg(feature = "fireblocks")]
 use fireblocks_sdk::apis::transactions_api::CreateTransactionError;
 use rain_error_decoding::AbiDecodedErrorType;
-use tracing::warn;
 
 pub mod error_decoding;
+
+pub use error_decoding::{IntoErrorRegistry, LiveErrorRegistry, NoOpErrorRegistry};
+use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 
 #[cfg(feature = "fireblocks")]
 pub mod fireblocks;
@@ -49,7 +50,7 @@ pub enum EvmError {
     #[error("ABI decode error: {0}")]
     AbiDecode(#[from] alloy::sol_types::Error),
     #[error("decoded contract error: {0}")]
-    DecodedRevert(AbiDecodedErrorType),
+    DecodedRevert(#[from] AbiDecodedErrorType),
     #[error("transaction reverted: {tx_hash}")]
     Reverted { tx_hash: alloy::primitives::TxHash },
     #[error("invalid private key: {0}")]
@@ -101,35 +102,15 @@ pub trait Evm: Send + Sync + 'static {
     /// Encodes the call via `SolCall::abi_encode()`, runs `eth_call`,
     /// decodes the return value on success, and decodes the Solidity
     /// error via the OpenChain selector registry on revert.
-    async fn call<C: SolCall + Send>(
+    async fn call<Registry: IntoErrorRegistry, Call: SolCall + Send>(
         &self,
         contract: Address,
-        call: C,
-    ) -> Result<C::Return, EvmError> {
-        let calldata = call.abi_encode();
-        let tx = TransactionRequest::default()
-            .to(contract)
-            .input(calldata.into());
-
-        match self.provider().call(tx).await {
-            Ok(result) => Ok(C::abi_decode_returns(result.as_ref())?),
-            Err(rpc_err) => {
-                // Wrap in alloy::contract::Error to reuse its revert data extraction
-                let contract_err = alloy::contract::Error::TransportError(rpc_err);
-
-                if let Some(revert_data) = contract_err.as_revert_data()
-                    && let Ok(decoded) = AbiDecodedErrorType::selector_registry_abi_decode(
-                        revert_data.as_ref(),
-                        None,
-                    )
-                    .await
-                {
-                    return Err(EvmError::DecodedRevert(decoded));
-                }
-
-                Err(EvmError::Contract(contract_err))
-            }
-        }
+        call: Call,
+    ) -> Result<Call::Return, EvmError>
+    where
+        Self: Sized,
+    {
+        execute_call::<Registry, Call>(self.provider(), contract, call).await
     }
 }
 
@@ -168,59 +149,25 @@ pub trait Wallet: Evm {
     /// [`send`](Wallet::send), then if the transaction reverted,
     /// replays as `eth_call` at the reverted block to extract and
     /// decode the revert reason.
-    async fn submit<C: SolCall + Send>(
+    async fn submit<Registry: IntoErrorRegistry, Call: SolCall + Send>(
         &self,
         contract: Address,
-        call: C,
+        call: Call,
         note: &str,
-    ) -> Result<TransactionReceipt, EvmError> {
+    ) -> Result<TransactionReceipt, EvmError>
+    where
+        Self: Sized,
+    {
         let calldata = Bytes::from(call.abi_encode());
         let receipt = self.send(contract, calldata.clone(), note).await?;
-
-        if !receipt.status() {
-            if let Some(block_number) = receipt.block_number {
-                let tx = TransactionRequest::default()
-                    .to(contract)
-                    .from(self.address())
-                    .input(calldata.into());
-
-                let replay = self
-                    .provider()
-                    .call(tx)
-                    .block(BlockId::number(block_number));
-
-                match replay.await {
-                    Err(rpc_err) => {
-                        let contract_err = alloy::contract::Error::TransportError(rpc_err);
-
-                        if let Some(revert_data) = contract_err.as_revert_data()
-                            && let Ok(decoded) = AbiDecodedErrorType::selector_registry_abi_decode(
-                                revert_data.as_ref(),
-                                None,
-                            )
-                            .await
-                        {
-                            return Err(EvmError::DecodedRevert(decoded));
-                        }
-
-                        return Err(EvmError::Contract(contract_err));
-                    }
-                    Ok(_) => {
-                        warn!(
-                            tx_hash = %receipt.transaction_hash,
-                            "Transaction reverted but replay succeeded -- \
-                             state may have changed between blocks"
-                        );
-                    }
-                }
-            }
-
-            return Err(EvmError::Reverted {
-                tx_hash: receipt.transaction_hash,
-            });
-        }
-
-        Ok(receipt)
+        decode_reverted_receipt::<Registry>(
+            self.provider(),
+            self.address(),
+            contract,
+            calldata,
+            receipt,
+        )
+        .await
     }
 }
 
@@ -232,12 +179,15 @@ impl<T: Evm + ?Sized> Evm for Arc<T> {
         (**self).provider()
     }
 
-    async fn call<C: SolCall + Send>(
+    async fn call<Registry: IntoErrorRegistry, Call: SolCall + Send>(
         &self,
         contract: Address,
-        call: C,
-    ) -> Result<C::Return, EvmError> {
-        (**self).call(contract, call).await
+        call: Call,
+    ) -> Result<Call::Return, EvmError>
+    where
+        Self: Sized,
+    {
+        execute_call::<Registry, Call>(self.provider(), contract, call).await
     }
 }
 
@@ -254,6 +204,48 @@ impl<T: Wallet + ?Sized> Wallet for Arc<T> {
         note: &str,
     ) -> Result<TransactionReceipt, EvmError> {
         (**self).send(contract, calldata, note).await
+    }
+
+    async fn submit<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: Call,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError>
+    where
+        Self: Sized,
+    {
+        let calldata = Bytes::from(call.abi_encode());
+        let receipt = self.send(contract, calldata.clone(), note).await?;
+        decode_reverted_receipt::<Registry>(
+            self.provider(),
+            self.address(),
+            contract,
+            calldata,
+            receipt,
+        )
+        .await
+    }
+}
+
+/// Execute a typed view call with automatic revert decoding.
+///
+/// Shared logic for `Evm::call` — encodes via `SolCall`, runs
+/// `eth_call`, decodes returns on success, decodes revert via the
+/// selector registry on failure.
+async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
+    provider: &(impl Provider + Send + Sync),
+    contract: Address,
+    call: Call,
+) -> Result<Call::Return, EvmError> {
+    let calldata = call.abi_encode();
+    let tx = TransactionRequest::default()
+        .to(contract)
+        .input(calldata.into());
+
+    match provider.call(tx).await {
+        Ok(result) => Ok(Call::abi_decode_returns(result.as_ref())?),
+        Err(rpc_err) => Err(decode_rpc_revert::<Registry>(rpc_err).await),
     }
 }
 

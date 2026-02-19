@@ -125,6 +125,8 @@ mod tests {
     use alloy::primitives::U256;
     use alloy::sol;
 
+    use crate::NoOpErrorRegistry;
+
     use super::*;
 
     sol!(
@@ -173,7 +175,7 @@ mod tests {
         let amount = U256::from(1000);
 
         let receipt = wallet
-            .submit(
+            .submit::<NoOpErrorRegistry, _>(
                 token_address,
                 IERC20::transferCall {
                     to: recipient,
@@ -196,13 +198,16 @@ mod tests {
         let amount = U256::from(1000);
 
         let before: U256 = wallet
-            .call(token_address, IERC20::balanceOfCall { account: recipient })
+            .call::<_, NoOpErrorRegistry>(
+                token_address,
+                IERC20::balanceOfCall { account: recipient },
+            )
             .await
             .unwrap();
         assert_eq!(before, U256::ZERO);
 
         wallet
-            .submit(
+            .submit::<NoOpErrorRegistry, _>(
                 token_address,
                 IERC20::transferCall {
                     to: recipient,
@@ -214,7 +219,10 @@ mod tests {
             .unwrap();
 
         let after: U256 = wallet
-            .call(token_address, IERC20::balanceOfCall { account: recipient })
+            .call::<_, NoOpErrorRegistry>(
+                token_address,
+                IERC20::balanceOfCall { account: recipient },
+            )
             .await
             .unwrap();
         assert_eq!(after, amount);
@@ -228,7 +236,7 @@ mod tests {
         let excessive_amount = U256::from(999_999_999) * U256::from(10).pow(U256::from(18));
 
         let error = wallet
-            .submit(
+            .submit::<NoOpErrorRegistry, _>(
                 token_address,
                 IERC20::transferCall {
                     to: recipient,

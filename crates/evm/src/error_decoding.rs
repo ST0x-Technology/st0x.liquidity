@@ -1,16 +1,67 @@
 //! Contract error decoding utilities.
 //!
-//! Provides helpers to decode Solidity revert data into
-//! human-readable error messages using the OpenChain selector
-//! registry.
+//! Provides type-level error registry injection for decoding Solidity
+//! revert data. Production code uses [`LiveErrorRegistry`] (backed by
+//! the OpenChain selector API). Tests use [`NoOpErrorRegistry`] to
+//! avoid HTTP calls.
 
-use rain_error_decoding::{AbiDecodedErrorType, ErrorRegistry};
-use tracing::debug;
+use alloy::eips::BlockId;
+use alloy::primitives::{Address, Bytes};
+use alloy::providers::Provider;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::transports::{RpcError, TransportErrorKind};
+use async_trait::async_trait;
+use rain_error_decoding::{AbiDecodedErrorType, DEFAULT_REGISTRY, ErrorRegistry};
+use tracing::{debug, warn};
+
+use crate::EvmError;
+
+/// Type-level selector for which error registry to use.
+///
+/// Implemented by zero-sized marker types ([`LiveErrorRegistry`],
+/// [`NoOpErrorRegistry`]) so callers choose the registry at the type
+/// level without passing values.
+pub trait IntoErrorRegistry: Send + Sync {
+    fn error_registry() -> &'static dyn ErrorRegistry;
+}
+
+/// Uses the live OpenChain selector registry API via the static
+/// `DEFAULT_REGISTRY` instance from `rain_error_decoding`.
+pub struct LiveErrorRegistry;
+
+impl IntoErrorRegistry for LiveErrorRegistry {
+    fn error_registry() -> &'static dyn ErrorRegistry {
+        &*DEFAULT_REGISTRY
+    }
+}
+
+/// Noop registry for tests — never makes HTTP calls. Errors decode
+/// as "unknown" since no candidates are returned.
+pub struct NoOpErrorRegistry;
+
+impl IntoErrorRegistry for NoOpErrorRegistry {
+    fn error_registry() -> &'static dyn ErrorRegistry {
+        &NoOpRegistryImpl
+    }
+}
+
+struct NoOpRegistryImpl;
+
+#[async_trait]
+impl ErrorRegistry for NoOpRegistryImpl {
+    async fn lookup(
+        &self,
+        _selector: [u8; 4],
+    ) -> Result<Vec<alloy::json_abi::Error>, rain_error_decoding::AbiDecodeFailedErrors> {
+        Ok(vec![])
+    }
+}
 
 /// Handles a contract error by attempting to decode revert data.
 ///
 /// If the error contains revert data and decoding succeeds, converts via
-/// `From<AbiDecodedErrorType>`. Otherwise converts via `From<alloy::contract::Error>`.
+/// `From<AbiDecodedErrorType>`. Otherwise converts via
+/// `From<alloy::contract::Error>`.
 pub async fn handle_contract_error<E>(err: alloy::contract::Error) -> E
 where
     E: From<AbiDecodedErrorType> + From<alloy::contract::Error>,
@@ -20,8 +71,8 @@ where
 
 /// Handles a contract error using an optional custom registry.
 ///
-/// This variant allows injecting a mock registry for testing without making
-/// live HTTP requests to the OpenChain selector registry.
+/// This variant allows injecting a mock registry for testing without
+/// making live HTTP requests to the OpenChain selector registry.
 pub async fn handle_contract_error_with<E>(
     err: alloy::contract::Error,
     registry: Option<&dyn ErrorRegistry>,
@@ -41,10 +92,62 @@ where
     err.into()
 }
 
+/// Decode a Solidity revert from an RPC error. Falls back to
+/// wrapping as a contract error if decoding fails.
+pub(crate) async fn decode_rpc_revert<Registry: IntoErrorRegistry>(
+    rpc_err: RpcError<TransportErrorKind>,
+) -> EvmError {
+    let contract_err = alloy::contract::Error::TransportError(rpc_err);
+    handle_contract_error_with(contract_err, Some(Registry::error_registry())).await
+}
+
+/// Check a transaction receipt for revert, and if reverted, replay
+/// the call at the reverted block to extract and decode the revert
+/// reason. Returns the receipt unchanged on success.
+pub(crate) async fn decode_reverted_receipt<Registry: IntoErrorRegistry>(
+    provider: &(impl Provider + Send + Sync),
+    from: Address,
+    contract: Address,
+    calldata: Bytes,
+    receipt: TransactionReceipt,
+) -> Result<TransactionReceipt, EvmError> {
+    if !receipt.status() {
+        if let Some(block_number) = receipt.block_number {
+            let tx = TransactionRequest::default()
+                .to(contract)
+                .from(from)
+                .input(calldata.into());
+
+            let replay = provider.call(tx).block(BlockId::number(block_number));
+
+            match replay.await {
+                Err(rpc_err) => {
+                    return Err(decode_rpc_revert::<Registry>(rpc_err).await);
+                }
+                Ok(_) => {
+                    warn!(
+                        tx_hash = %receipt.transaction_hash,
+                        "Transaction reverted but replay succeeded -- \
+                         state may have changed between blocks"
+                    );
+                }
+            }
+        }
+
+        return Err(EvmError::Reverted {
+            tx_hash: receipt.transaction_hash,
+        });
+    }
+
+    Ok(receipt)
+}
+
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::json_abi::Error as AlloyError;
-    use alloy::primitives::{Bytes, hex};
+    use alloy::primitives::{Bytes, TxHash, hex};
+    use alloy::providers::mock::Mock;
     use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::sol_types::SolError;
     use alloy::transports::TransportError;
@@ -67,7 +170,6 @@ mod tests {
         Contract(#[from] alloy::contract::Error),
     }
 
-    /// Mock registry that returns configurable error candidates.
     struct MockRegistry {
         candidates: Vec<AlloyError>,
     }
@@ -105,8 +207,69 @@ mod tests {
         alloy::contract::Error::TransportError(TransportError::ErrorResp(payload))
     }
 
+    fn create_rpc_error_with_revert_data(data: &Bytes) -> RpcError<TransportErrorKind> {
+        let hex = hex::encode_prefixed(data);
+        let raw = serde_json::value::to_raw_value(&hex).expect("valid json");
+        let payload = ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: Some(raw),
+        };
+        TransportError::ErrorResp(payload)
+    }
+
+    fn successful_receipt() -> TransactionReceipt {
+        TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: true.into(),
+                    cumulative_gas_used: 0,
+                    logs: vec![],
+                },
+                logs_bloom: Default::default(),
+            }),
+            transaction_hash: TxHash::ZERO,
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number: Some(42),
+            gas_used: 21000,
+            effective_gas_price: 1,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+            authorization_list: None,
+        }
+    }
+
+    fn reverted_receipt(block_number: Option<u64>) -> TransactionReceipt {
+        TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: false.into(),
+                    cumulative_gas_used: 0,
+                    logs: vec![],
+                },
+                logs_bloom: Default::default(),
+            }),
+            transaction_hash: TxHash::random(),
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number,
+            gas_used: 21000,
+            effective_gas_price: 1,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+            authorization_list: None,
+        }
+    }
+
     #[tokio::test]
-    async fn returns_contract_error_when_no_revert_data() {
+    async fn handle_contract_error_returns_contract_when_no_revert_data() {
         let error = alloy::contract::Error::TransportError(TransportError::local_usage_str(
             "connection refused",
         ));
@@ -118,7 +281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_decoded_error_when_revert_data_decodes() {
+    async fn handle_contract_error_decodes_known_revert() {
         let revert_data = Bytes::from(
             Error {
                 message: "insufficient balance".into(),
@@ -145,7 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_contract_error_when_revert_data_malformed() {
+    async fn handle_contract_error_returns_contract_when_malformed() {
         let too_short = Bytes::from(vec![0x12, 0x34]);
         let error = create_error_with_revert_data(&too_short);
         let registry = MockRegistry::empty();
@@ -159,7 +322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_decoded_unknown_for_unrecognized_selector() {
+    async fn handle_contract_error_decodes_unknown_selector() {
         let unknown_selector = Bytes::from(vec![0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00]);
         let error = create_error_with_revert_data(&unknown_selector);
         let registry = MockRegistry::empty();
@@ -177,6 +340,70 @@ mod tests {
         assert!(
             msg.contains("12345678"),
             "expected raw selector in message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_rpc_revert_returns_contract_for_non_revert() {
+        let rpc_err = TransportError::local_usage_str("connection refused");
+
+        let result = decode_rpc_revert::<NoOpErrorRegistry>(rpc_err).await;
+
+        assert!(
+            matches!(result, EvmError::Contract(_)),
+            "expected Contract, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_rpc_revert_returns_decoded_for_revert_data() {
+        let revert_data = Bytes::from(vec![0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00]);
+        let rpc_err = create_rpc_error_with_revert_data(&revert_data);
+
+        let result = decode_rpc_revert::<NoOpErrorRegistry>(rpc_err).await;
+
+        assert!(
+            matches!(result, EvmError::DecodedRevert(_)),
+            "expected DecodedRevert, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_reverted_receipt_passes_through_successful() {
+        let receipt = successful_receipt();
+        let tx_hash = receipt.transaction_hash;
+
+        let result = decode_reverted_receipt::<NoOpErrorRegistry>(
+            &Mock::new(),
+            Address::ZERO,
+            Address::ZERO,
+            Bytes::new(),
+            receipt,
+        )
+        .await;
+
+        let returned = result.unwrap();
+        assert_eq!(returned.transaction_hash, tx_hash);
+    }
+
+    #[tokio::test]
+    async fn decode_reverted_receipt_returns_reverted_without_block() {
+        let receipt = reverted_receipt(None);
+        let tx_hash = receipt.transaction_hash;
+
+        let result = decode_reverted_receipt::<NoOpErrorRegistry>(
+            &Mock::new(),
+            Address::ZERO,
+            Address::ZERO,
+            Bytes::new(),
+            receipt,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, EvmError::Reverted { tx_hash: hash } if hash == tx_hash),
+            "expected Reverted with matching hash, got {error:?}"
         );
     }
 }
