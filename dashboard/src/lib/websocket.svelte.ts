@@ -1,6 +1,5 @@
 import { FiniteStateMachine } from 'runed'
 import type { QueryClient } from '@tanstack/svelte-query'
-import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
 import type { ServerMessage } from '$lib/api/ServerMessage'
 import { matcher } from '$lib/fp'
 import { reactive } from '$lib/frp.svelte'
@@ -10,10 +9,7 @@ type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 
 const RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 30000
-const MAX_EVENTS = 100
-
-const isObject = (v: unknown): v is Record<string, unknown> =>
-  typeof v === 'object' && v !== null
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null
 
 const isEventStoreEntry = (v: unknown): boolean => {
   if (!isObject(v)) return false
@@ -71,7 +67,6 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
   const handleMessage = (msg: ServerMessage) => {
     matchMessage(msg, {
       initial: ({ data }) => {
-        queryClient.setQueryData<EventStoreEntry[]>(['events'], [])
         queryClient.setQueryData(['trades'], data.recentTrades)
         queryClient.setQueryData(['inventory'], data.inventory)
         queryClient.setQueryData(['metrics'], data.metrics)
@@ -82,10 +77,8 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         queryClient.setQueryData(['circuitBreaker'], data.circuitBreaker)
       },
 
-      event: ({ data }) => {
-        queryClient.setQueryData<EventStoreEntry[]>(['events'], (old) =>
-          [data, ...(old ?? [])].slice(0, MAX_EVENTS)
-        )
+      event: () => {
+        // Individual event updates will be handled per-panel as DTOs are expanded
       }
     })
   }
@@ -144,7 +137,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     cancelReconnect()
     const delay = getReconnectDelay(reconnectAttempts.current)
     error.update(() => ({ attempts: reconnectAttempts.current + 1, nextRetryMs: delay }))
-    reconnectAttempts.update(n => n + 1)
+    reconnectAttempts.update((n) => n + 1)
     reconnectTimeoutId = setTimeout(() => fsm.send('connect'), delay)
   }
 

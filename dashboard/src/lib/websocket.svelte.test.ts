@@ -1,7 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { createWebSocket } from './websocket.svelte'
 import type { QueryClient } from '@tanstack/svelte-query'
-import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
 import type { InitialState } from '$lib/api/InitialState'
 import type { ServerMessage } from '$lib/api/ServerMessage'
 
@@ -158,65 +157,12 @@ describe('createWebSocket', () => {
 
     MockWebSocket.getInstance(0).simulateMessage(initialMessage)
 
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['events'], [])
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['trades'], [])
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['inventory'], initialState.inventory)
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['auth'], { status: 'not_configured' })
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['circuitBreaker'], { status: 'active' })
-  })
-
-  it('prepends events and caps at 100', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const existingEvents: EventStoreEntry[] = Array.from({ length: 99 }, (_, i) => ({
-      aggregate_type: 'Position',
-      aggregate_id: `existing-${String(i)}`,
-      sequence: i,
-      event_type: 'Created',
-      timestamp: '2024-01-01T00:00:00Z'
-    }))
-
-    queryClient.setQueryDataSpy.mockImplementation(
-      (key: unknown[], updater: unknown): EventStoreEntry[] | undefined => {
-        if (JSON.stringify(key) === '["events"]' && typeof updater === 'function') {
-          const result = (updater as (old: EventStoreEntry[] | undefined) => EventStoreEntry[])(
-            existingEvents
-          )
-          queryClient.cache.set(JSON.stringify(key), result)
-          return result
-        }
-        return undefined
-      }
-    )
-
-    const newEvent: EventStoreEntry = {
-      aggregate_type: 'Position',
-      aggregate_id: 'new-event',
-      sequence: 1,
-      event_type: 'Updated',
-      timestamp: '2024-01-02T00:00:00Z'
-    }
-
-    MockWebSocket.getInstance(0).simulateMessage({ type: 'event', data: newEvent })
-
-    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
-    const eventsCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["events"]'
-    )
-
-    expect(eventsCall).toBeDefined()
-    if (eventsCall === undefined) {
-      throw new Error('eventsCall should be defined')
-    }
-    const updater = eventsCall[1] as (old: EventStoreEntry[] | undefined) => EventStoreEntry[]
-    const result = updater(existingEvents)
-
-    expect(result.length).toBe(100)
-    expect(result[0]).toEqual(newEvent)
+    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['circuitBreaker'], {
+      status: 'active'
+    })
   })
 
   it('schedules reconnect on close with exponential backoff', () => {
@@ -294,40 +240,6 @@ describe('createWebSocket', () => {
 
     expect(ws1.state).toBe('connected')
     expect(ws2.state).toBe('connected')
-  })
-
-  it('handles event messages by prepending to events list', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const event: EventStoreEntry = {
-      aggregate_type: 'TokenizedEquityMint',
-      aggregate_id: 'mint-123',
-      sequence: 1,
-      event_type: 'MintRequested',
-      timestamp: '2024-01-01T00:00:00Z'
-    }
-
-    MockWebSocket.getInstance(0).simulateMessage({ type: 'event', data: event })
-
-    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
-    const eventsCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["events"]'
-    )
-
-    expect(eventsCall).toBeDefined()
-    if (eventsCall === undefined) {
-      throw new Error('eventsCall should be defined')
-    }
-
-    const updater = eventsCall[1] as (old: EventStoreEntry[] | undefined) => EventStoreEntry[]
-    const result = updater([])
-
-    expect(result.length).toBe(1)
-    expect(result[0]).toEqual(event)
   })
 
   it('handles error by closing socket', () => {
@@ -464,9 +376,7 @@ describe('createWebSocket', () => {
     ws.connect()
     MockWebSocket.getInstance(0).simulateOpen()
 
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({ type: 'unknown', data: {} })
-    )
+    MockWebSocket.getInstance(0).simulateRawMessage(JSON.stringify({ type: 'unknown', data: {} }))
 
     expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
     expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
