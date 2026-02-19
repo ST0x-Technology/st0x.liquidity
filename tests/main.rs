@@ -11,7 +11,7 @@ use services::cctp_attestation::CctpAttestationMock;
 
 #[tokio::test]
 async fn smoke_test_base_fork() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start().await?;
+    let mut chain = base_chain::BaseChain::start("https://mainnet.base.org").await?;
 
     let orderbook_code = chain.provider.get_code_at(chain.orderbook_addr).await?;
     assert!(

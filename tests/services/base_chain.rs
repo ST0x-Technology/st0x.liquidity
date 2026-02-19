@@ -66,15 +66,10 @@ pub struct BaseChain<P> {
 }
 
 impl BaseChain<()> {
-    /// Forks Base mainnet, mints initial USDC, and deploys the Rain
-    /// expression stack (Interpreter, Store, Parser, Deployer).
-    ///
-    /// Uses `BASE_RPC_URL` env var if set, otherwise defaults to the
-    /// public Base RPC endpoint.
-    pub async fn start() -> anyhow::Result<BaseChain<impl Provider + Clone>> {
-        let rpc_url = std::env::var("BASE_RPC_URL")
-            .unwrap_or_else(|_| "https://mainnet.base.org".to_string());
-
+    /// Forks Base mainnet using the given RPC URL, mints initial USDC,
+    /// and deploys the Rain expression stack (Interpreter, Store, Parser,
+    /// Deployer).
+    pub async fn start(rpc_url: &str) -> anyhow::Result<BaseChain<impl Provider + Clone>> {
         let anvil = Anvil::new().fork(rpc_url).spawn();
 
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());

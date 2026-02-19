@@ -135,6 +135,8 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::Schwab(schwab_auth.clone()),
             telemetry: None,
             trading_mode: TradingMode::Standalone {

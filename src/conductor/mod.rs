@@ -603,6 +603,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     position_projection: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
+    check_interval: std::time::Duration,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -611,9 +612,7 @@ where
     info!("Starting periodic accumulated position checker");
 
     tokio::spawn(async move {
-        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+        let mut interval = tokio::time::interval(check_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -641,6 +640,7 @@ fn spawn_inventory_poller<Chain, Exe>(
     orderbook: Address,
     order_owner: Address,
     snapshot: Store<InventorySnapshot>,
+    poll_interval: std::time::Duration,
 ) -> JoinHandle<()>
 where
     Chain: st0x_evm::Evm,
@@ -658,9 +658,7 @@ where
     );
 
     tokio::spawn(async move {
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        let mut interval = tokio::time::interval(poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {

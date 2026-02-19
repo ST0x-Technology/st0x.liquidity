@@ -29,8 +29,7 @@ use common::{
 use services::alpaca_broker::AlpacaBrokerMock;
 use services::base_chain::{self, TakeDirection};
 
-// ── Scenario 1: Single-asset happy path (moved from main.rs) ──────
-
+/// Single-asset happy path hedging
 #[tokio::test]
 #[serial]
 async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
@@ -44,7 +43,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         expected_net: "0",
     };
 
-    let mut chain = base_chain::BaseChain::start().await?;
+    let mut chain = base_chain::BaseChain::start("https://mainnet.base.org").await?;
     chain.deploy_equity_token(scenario.symbol).await?;
 
     let broker = AlpacaBrokerMock::start()
@@ -88,7 +87,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial]
 async fn multi_asset_sustained_load() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start().await?;
+    let mut chain = base_chain::BaseChain::start("https://developer-access-mainnet.base.org").await?;
     chain.deploy_equity_token("AAPL").await?;
     chain.deploy_equity_token("TSLA").await?;
     chain.deploy_equity_token("MSFT").await?;
@@ -174,7 +173,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial]
 async fn backfilling() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start().await?;
+    let mut chain = base_chain::BaseChain::start("https://base-rpc.publicnode.com").await?;
     chain.deploy_equity_token("AAPL").await?;
 
     let broker = AlpacaBrokerMock::start()
@@ -209,8 +208,8 @@ async fn backfilling() -> anyhow::Result<()> {
     // Wait for backfill + processing. With 3 rapid backfilled trades, only
     // 1 offchain order is placed initially (the bot won't place a second
     // while the first is pending). After the first fill, the remaining net
-    // needs the position checker's 60s cycle to detect and hedge.
-    wait_for_processing(&bot, 75).await;
+    // needs the position checker's cycle (2s in tests) to detect and hedge.
+    wait_for_processing(&bot, 10).await;
 
     // Verify all historical events were picked up via backfill
     let pool = connect_db(&db_path).await?;
@@ -254,7 +253,7 @@ async fn backfilling() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial]
 async fn resumption_after_shutdown() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start().await?;
+    let mut chain = base_chain::BaseChain::start("https://base.drpc.org").await?;
     chain.deploy_equity_token("AAPL").await?;
 
     let broker = AlpacaBrokerMock::start()
@@ -368,7 +367,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // ── Reference run: uninterrupted ────────────────────────────────
 
-    let mut ref_chain = base_chain::BaseChain::start().await?;
+    let mut ref_chain = base_chain::BaseChain::start("https://base.public.blockpi.network/v1/rpc/public").await?;
     ref_chain.deploy_equity_token("AAPL").await?;
     ref_chain.deploy_equity_token("TSLA").await?;
 
@@ -413,7 +412,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // ── Crash run: same trades, with interruption ───────────────────
 
-    let mut crash_chain = base_chain::BaseChain::start().await?;
+    let mut crash_chain = base_chain::BaseChain::start("https://base.public.blockpi.network/v1/rpc/public").await?;
     crash_chain.deploy_equity_token("AAPL").await?;
     crash_chain.deploy_equity_token("TSLA").await?;
 
@@ -491,7 +490,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial]
 async fn market_hours_transitions() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start().await?;
+    let mut chain = base_chain::BaseChain::start("https://endpoints.omniatech.io/v1/base/mainnet/public").await?;
     chain.deploy_equity_token("AAPL").await?;
 
     // Start with market CLOSED
@@ -548,9 +547,9 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     // Switch calendar to market OPEN
     broker.set_market_open();
 
-    // Wait for the position checker's periodic cycle (60s) plus processing.
+    // Wait for the position checker's periodic cycle (2s in tests) plus processing.
     // The checker detects the pending position and places orders.
-    wait_for_processing(&bot, 70).await;
+    wait_for_processing(&bot, 10).await;
 
     // Full pipeline assertions after market opens
     let scenario = E2eScenario {

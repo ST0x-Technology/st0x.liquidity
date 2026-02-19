@@ -80,9 +80,7 @@ pub fn build_ctx<P: Provider + Clone>(
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         api_key: alpaca_broker::TEST_API_KEY.to_owned(),
         api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
-        account_id: AlpacaAccountId::new(
-            uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"),
-        ),
+        account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
@@ -101,6 +99,8 @@ pub fn build_ctx<P: Provider + Clone>(
         },
         order_polling_interval: 1,
         order_polling_max_jitter: 0,
+        position_check_interval: 2,
+        inventory_poll_interval: 2,
         broker: broker_ctx,
         telemetry: None,
         rebalancing: None,
