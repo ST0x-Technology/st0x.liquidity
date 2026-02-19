@@ -8,6 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use st0x_event_sorcery::Projection;
+use st0x_evm::OpenChainErrorRegistry;
 
 use crate::config::Ctx;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
@@ -87,7 +88,7 @@ pub(super) async fn vault_deposit_command<W: Write>(
         "   Depositing to vault (approve + deposit via Fireblocks)..."
     )?;
     let deposit_tx = raindex_service
-        .deposit(token, RaindexVaultId(vault_id), amount_u256, decimals)
+        .deposit::<OpenChainErrorRegistry>(token, RaindexVaultId(vault_id), amount_u256, decimals)
         .await?;
     writeln!(stdout, "   Deposit tx: {deposit_tx}")?;
 

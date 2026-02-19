@@ -198,7 +198,7 @@ mod tests {
         let amount = U256::from(1000);
 
         let before: U256 = wallet
-            .call::<_, NoOpErrorRegistry>(
+            .call::<NoOpErrorRegistry, _>(
                 token_address,
                 IERC20::balanceOfCall { account: recipient },
             )
@@ -219,7 +219,7 @@ mod tests {
             .unwrap();
 
         let after: U256 = wallet
-            .call::<_, NoOpErrorRegistry>(
+            .call::<NoOpErrorRegistry, _>(
                 token_address,
                 IERC20::balanceOfCall { account: recipient },
             )
@@ -248,11 +248,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(
-                error,
-                EvmError::DecodedRevert(_) | EvmError::Contract(_) | EvmError::Reverted { .. }
-            ),
-            "expected revert-related error, got: {error:?}"
+            matches!(error, EvmError::Transport(_)),
+            "expected Transport error from Anvil pre-simulation revert, got: {error:?}"
         );
     }
 }

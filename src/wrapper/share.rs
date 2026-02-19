@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::info;
 
-use st0x_evm::{Evm, Wallet};
+use st0x_evm::{IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
@@ -38,13 +38,13 @@ impl<W: Wallet> WrapperService<W> {
     }
 
     /// Fetches the current conversion ratio for a wrapped token.
-    async fn get_ratio(
+    async fn get_ratio<Registry: IntoErrorRegistry>(
         &self,
         wrapped_token: Address,
     ) -> Result<UnderlyingPerWrapped, WrapperError> {
         let assets_per_share = self
             .wallet
-            .call(
+            .call::<Registry, _>(
                 wrapped_token,
                 IERC4626::convertToAssetsCall {
                     shares: RATIO_QUERY_AMOUNT,
@@ -71,7 +71,8 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        self.get_ratio(addresses.wrapped).await
+        self.get_ratio::<OpenChainErrorRegistry>(addresses.wrapped)
+            .await
     }
 
     fn lookup_unwrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
@@ -99,7 +100,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         info!("Sending ERC4626 deposit to {wrapped_token}");
         let receipt = self
             .wallet
-            .submit(
+            .submit::<OpenChainErrorRegistry, _>(
                 wrapped_token,
                 IERC4626::depositCall {
                     assets: underlying_amount,
@@ -135,7 +136,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         info!("Sending ERC4626 redeem to {wrapped_token}");
         let receipt = self
             .wallet
-            .submit(
+            .submit::<OpenChainErrorRegistry, _>(
                 wrapped_token,
                 IERC4626::redeemCall {
                     shares: wrapped_amount,

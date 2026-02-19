@@ -35,7 +35,7 @@ use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, trace, warn};
 
-use st0x_evm::{EvmError, Wallet};
+use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
 
 use super::{Tokenizer, TokenizerError};
@@ -112,12 +112,14 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
     }
 
     /// Send tokens to the redemption wallet to initiate a redemption.
-    pub(crate) async fn send_for_redemption(
+    pub(crate) async fn send_for_redemption<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
-        self.client.send_tokens_for_redemption(token, amount).await
+        self.client
+            .send_tokens_for_redemption::<Registry>(token, amount)
+            .await
     }
 
     /// Poll until Alpaca detects a redemption transfer.
@@ -578,14 +580,14 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     /// - `RedemptionTransferFailed` if the contract call fails
     /// - `Revert` if the contract reverts with a decoded error
     /// - `Transaction` if the transaction fails to confirm
-    async fn send_tokens_for_redemption(
+    async fn send_tokens_for_redemption<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
         let receipt = self
             .wallet
-            .submit(
+            .submit::<Registry, _>(
                 token,
                 IERC20::transferCall {
                     to: self.redemption_wallet,
@@ -721,7 +723,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         token: Address,
         amount: U256,
     ) -> Result<TxHash, TokenizerError> {
-        Ok(Self::send_for_redemption(self, token, amount).await?)
+        Ok(Self::send_for_redemption::<OpenChainErrorRegistry>(self, token, amount).await?)
     }
 
     async fn poll_for_redemption(
@@ -751,8 +753,8 @@ pub(crate) mod tests {
     use std::time::Duration;
     use uuid::uuid;
 
-    use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{Evm, OpenChainErrorRegistry};
 
     use super::*;
     use crate::bindings::TestERC20;
@@ -1147,7 +1149,7 @@ pub(crate) mod tests {
         let transfer_amount = U256::from(100_000u64);
 
         client
-            .send_tokens_for_redemption(token_address, transfer_amount)
+            .send_tokens_for_redemption::<OpenChainErrorRegistry>(token_address, transfer_amount)
             .await
             .unwrap();
 
@@ -1187,7 +1189,7 @@ pub(crate) mod tests {
 
         let transfer_amount = U256::from(100_000u64);
         let err = client
-            .send_tokens_for_redemption(token_address, transfer_amount)
+            .send_tokens_for_redemption::<OpenChainErrorRegistry>(token_address, transfer_amount)
             .await
             .unwrap_err();
 

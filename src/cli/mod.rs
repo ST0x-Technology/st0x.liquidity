@@ -17,6 +17,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
+use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{Direction, FractionalShares, Symbol};
 
 use crate::config::{Ctx, Env};
@@ -558,7 +559,8 @@ async fn run_simple_command<W: Write>(
                 .await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
-            alpaca_wallet::alpaca_deposit_command(stdout, amount, ctx).await
+            alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
+                .await
         }
         SimpleCommand::AlpacaWhitelist { address } => {
             alpaca_wallet::alpaca_whitelist_command(stdout, address, ctx).await
@@ -570,7 +572,10 @@ async fn run_simple_command<W: Write>(
             alpaca_wallet::alpaca_unwhitelist_command(stdout, address, ctx).await
         }
         SimpleCommand::AlpacaWithdraw { amount, to_address } => {
-            alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, ctx).await
+            alpaca_wallet::alpaca_withdraw_command::<OpenChainErrorRegistry, _>(
+                stdout, amount, to_address, ctx,
+            )
+            .await
         }
         SimpleCommand::AlpacaTransfers => {
             alpaca_wallet::alpaca_transfers_command(stdout, ctx).await
@@ -631,14 +636,15 @@ async fn run_provider_command<W: Write>(
             vault::vault_withdraw_command(stdout, amount, ctx, pool).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
-            cctp::cctp_bridge_command(stdout, amount, all, from, ctx).await
+            cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)
+                .await
         }
         ProviderCommand::CctpRecover {
             burn_tx,
             source_chain,
         } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, ctx).await,
         ProviderCommand::ResetAllowance { chain } => {
-            cctp::reset_allowance_command(stdout, chain, ctx).await
+            cctp::reset_allowance_command::<OpenChainErrorRegistry, _>(stdout, chain, ctx).await
         }
         ProviderCommand::AlpacaTokenize {
             symbol,

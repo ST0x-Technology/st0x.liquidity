@@ -71,7 +71,7 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use st0x_evm::{EvmError, Wallet};
+use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 
 use crate::BridgeDirection;
 
@@ -513,7 +513,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
-    async fn burn_internal(
+    async fn burn_internal<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         amount: U256,
@@ -523,15 +523,17 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         match direction {
             BridgeDirection::EthereumToBase => {
-                self.ethereum.ensure_usdc_approval(amount).await?;
                 self.ethereum
-                    .deposit_for_burn(amount, recipient, direction, max_fee)
+                    .ensure_usdc_approval::<Registry>(amount)
+                    .await?;
+                self.ethereum
+                    .deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
                     .await
             }
             BridgeDirection::BaseToEthereum => {
-                self.base.ensure_usdc_approval(amount).await?;
+                self.base.ensure_usdc_approval::<Registry>(amount).await?;
                 self.base
-                    .deposit_for_burn(amount, recipient, direction, max_fee)
+                    .deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
                     .await
             }
         }
@@ -541,15 +543,19 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     ///
     /// Returns the actual minted amount and fee collected from the `MintAndWithdraw` event.
     /// This is the source of truth for what the recipient actually received after fee deduction.
-    async fn mint_internal(
+    async fn mint_internal<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         message: Bytes,
         attestation: Bytes,
     ) -> Result<MintReceipt, CctpError> {
         match direction {
-            BridgeDirection::EthereumToBase => self.base.claim(message, attestation).await,
-            BridgeDirection::BaseToEthereum => self.ethereum.claim(message, attestation).await,
+            BridgeDirection::EthereumToBase => {
+                self.base.claim::<Registry>(message, attestation).await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.ethereum.claim::<Registry>(message, attestation).await
+            }
         }
     }
 
@@ -575,7 +581,8 @@ where
         amount: U256,
         recipient: Address,
     ) -> Result<crate::BurnReceipt, Self::Error> {
-        self.burn_internal(direction, amount, recipient).await
+        self.burn_internal::<OpenChainErrorRegistry>(direction, amount, recipient)
+            .await
     }
 
     async fn poll_attestation(
@@ -592,7 +599,7 @@ where
         attestation: &Self::Attestation,
     ) -> Result<crate::MintReceipt, Self::Error> {
         let internal = self
-            .mint_internal(
+            .mint_internal::<OpenChainErrorRegistry>(
                 direction,
                 attestation.message.clone(),
                 attestation.attestation.clone(),
@@ -623,6 +630,7 @@ mod tests {
     use rand::Rng;
     use rust_decimal_macros::dec;
 
+    use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
@@ -852,7 +860,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, U256::ZERO);
 
-        bridge.ethereum.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .ethereum
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .ethereum
@@ -907,7 +919,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, higher_amount);
 
-        bridge.ethereum.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .ethereum
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .ethereum
@@ -964,7 +980,7 @@ mod tests {
 
         bridge
             .ethereum
-            .ensure_usdc_approval(required_amount)
+            .ensure_usdc_approval::<NoOpErrorRegistry>(required_amount)
             .await
             .unwrap();
 
@@ -1043,7 +1059,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, U256::ZERO);
 
-        bridge.base.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .base
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .base
@@ -1096,7 +1116,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, higher_amount);
 
-        bridge.base.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .base
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .base
@@ -1151,7 +1175,7 @@ mod tests {
 
         bridge
             .base
-            .ensure_usdc_approval(required_amount)
+            .ensure_usdc_approval::<NoOpErrorRegistry>(required_amount)
             .await
             .unwrap();
 
@@ -1623,7 +1647,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1646,7 +1670,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1669,7 +1693,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1681,7 +1705,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 message_with_nonce,
                 attestation,
@@ -1702,7 +1726,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1714,7 +1738,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 attestation,
@@ -1735,7 +1759,7 @@ mod tests {
         let amount = U256::from(2_500_000u64); // 2.5 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1749,7 +1773,7 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .base
-            .claim(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
             .await
             .unwrap();
 
@@ -1774,7 +1798,7 @@ mod tests {
         let amount = U256::from(7_500_000u64); // 7.5 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1788,7 +1812,7 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .ethereum
-            .claim(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
             .await
             .unwrap();
 
@@ -1813,7 +1837,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1827,7 +1851,7 @@ mod tests {
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 invalid_attestation,
@@ -1854,7 +1878,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1866,7 +1890,7 @@ mod tests {
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 message,
                 invalid_attestation,
@@ -2024,7 +2048,11 @@ mod tests {
         // First burn sets allowance to 1 USDC
         let small_amount = U256::from(1_000_000u64); // 1 USDC
         bridge
-            .burn_internal(BridgeDirection::EthereumToBase, small_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                small_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2045,7 +2073,11 @@ mod tests {
         // Second burn with larger amount should update allowance and succeed
         let large_amount = U256::from(100_000_000u64); // 100 USDC
         let receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, large_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                large_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2062,7 +2094,11 @@ mod tests {
         let burn_amount = U256::from(1_000_000u64); // 1 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, burn_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                burn_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2074,7 +2110,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 message_with_nonce,
                 attestation,
@@ -2110,7 +2146,11 @@ mod tests {
         let burn_amount = U256::from(5_000_000u64); // 5 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, burn_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                burn_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2122,7 +2162,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 attestation,
@@ -2152,7 +2192,11 @@ mod tests {
 
         for i in 1..=5 {
             let receipt = bridge
-                .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                )
                 .await
                 .unwrap();
 

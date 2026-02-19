@@ -5,7 +5,7 @@ use alloy::primitives::Address;
 use rust_decimal::Decimal;
 use std::io::Write;
 
-use st0x_evm::Evm;
+use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
 use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor, Positive};
 
 use super::ConvertDirection;
@@ -17,7 +17,7 @@ use crate::config::{BrokerCtx, Ctx};
 use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 use crate::threshold::Usdc;
 
-pub(super) async fn alpaca_deposit_command<W: Write>(
+pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
     amount: Usdc,
     ctx: &Ctx,
@@ -61,7 +61,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
     let balance = rebalancing_ctx
         .ethereum_wallet()
-        .call(
+        .call::<Registry, _>(
             usdc_address,
             IERC20::balanceOfCall {
                 account: sender_address,
@@ -75,9 +75,9 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     }
 
     writeln!(stdout, "   Sending USDC transfer via Fireblocks...")?;
-    let tx_receipt = rebalancing_ctx
-        .ethereum_wallet()
-        .submit(
+    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+    let tx_receipt = ethereum_wallet
+        .submit::<Registry, _>(
             usdc_address,
             IERC20::transferCall {
                 to: deposit_address,
@@ -116,7 +116,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn alpaca_withdraw_command<W: Write>(
+pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
     amount: Usdc,
     to_address: Option<Address>,
@@ -146,7 +146,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
 
     let balance_before = rebalancing_ctx
         .ethereum_wallet()
-        .call(
+        .call::<Registry, _>(
             usdc_address,
             IERC20::balanceOfCall {
                 account: destination,
@@ -190,7 +190,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
 
             let balance_after = rebalancing_ctx
                 .ethereum_wallet()
-                .call(
+                .call::<Registry, _>(
                     usdc_address,
                     IERC20::balanceOfCall {
                         account: destination,
@@ -476,6 +476,7 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
+    use st0x_evm::NoOpErrorRegistry;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
     use super::*;
@@ -571,7 +572,7 @@ mod tests {
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = alpaca_deposit_command(&mut stdout, amount, &ctx)
+        let err_msg = alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
             .await
             .unwrap_err()
             .to_string();
@@ -587,7 +588,7 @@ mod tests {
         let amount = Usdc(dec!(500.50));
 
         let mut stdout = Vec::new();
-        alpaca_deposit_command(&mut stdout, amount, &ctx)
+        alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
             .await
             .unwrap_err();
 
@@ -604,10 +605,11 @@ mod tests {
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = alpaca_withdraw_command(&mut stdout, amount, None, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err_msg =
+            alpaca_withdraw_command::<NoOpErrorRegistry, _>(&mut stdout, amount, None, &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
         assert!(
             err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"

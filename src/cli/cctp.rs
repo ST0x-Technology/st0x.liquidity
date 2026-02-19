@@ -6,7 +6,7 @@ use std::io::Write;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
-use st0x_evm::{Evm, Wallet};
+use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
 
 use super::CctpChain;
 use crate::bindings::IERC20;
@@ -24,7 +24,7 @@ impl CctpChain {
     }
 }
 
-pub(super) async fn cctp_bridge_command<W: Write>(
+pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
     amount: Option<Usdc>,
     all: bool,
@@ -40,13 +40,13 @@ pub(super) async fn cctp_bridge_command<W: Write>(
             CctpChain::Ethereum => {
                 rebalancing_ctx
                     .ethereum_wallet()
-                    .call(USDC_ETHEREUM, balance_call)
+                    .call::<Registry, _>(USDC_ETHEREUM, balance_call)
                     .await?
             }
             CctpChain::Base => {
                 rebalancing_ctx
                     .base_wallet()
-                    .call(USDC_BASE, balance_call)
+                    .call::<Registry, _>(USDC_BASE, balance_call)
                     .await?
             }
         };
@@ -151,7 +151,7 @@ pub(super) async fn cctp_recover_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn reset_allowance_command<W: Write>(
+pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
     chain: CctpChain,
     ctx: &Ctx,
@@ -181,7 +181,7 @@ pub(super) async fn reset_allowance_command<W: Write>(
     writeln!(stdout, "   USDC: {usdc_address}")?;
 
     let allowance = caller
-        .call(usdc_address, IERC20::allowanceCall { owner, spender })
+        .call::<Registry, _>(usdc_address, IERC20::allowanceCall { owner, spender })
         .await?;
 
     writeln!(stdout, "   Current allowance: {allowance}")?;
@@ -192,7 +192,7 @@ pub(super) async fn reset_allowance_command<W: Write>(
 
     writeln!(stdout, "   Sending approval tx via Fireblocks...")?;
     let receipt = caller
-        .submit(
+        .submit::<Registry, _>(
             usdc_address,
             IERC20::approveCall {
                 spender,
@@ -204,7 +204,7 @@ pub(super) async fn reset_allowance_command<W: Write>(
     writeln!(stdout, "   Tx: {}", receipt.transaction_hash)?;
 
     let new_allowance = caller
-        .call(usdc_address, IERC20::allowanceCall { owner, spender })
+        .call::<Registry, _>(usdc_address, IERC20::allowanceCall { owner, spender })
         .await?;
     writeln!(stdout, "Allowance reset to: {new_allowance}")?;
 
@@ -217,6 +217,8 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
     use url::Url;
+
+    use st0x_evm::OpenChainErrorRegistry;
 
     use super::*;
     use crate::config::{BrokerCtx, CtxError, LogLevel, TradingMode};
@@ -250,9 +252,15 @@ mod tests {
         let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
 
         let mut stdout = Vec::new();
-        let error = cctp_bridge_command(&mut stdout, amount, false, CctpChain::Ethereum, &ctx)
-            .await
-            .unwrap_err();
+        let error = cctp_bridge_command::<OpenChainErrorRegistry, _>(
+            &mut stdout,
+            amount,
+            false,
+            CctpChain::Ethereum,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -287,9 +295,13 @@ mod tests {
         let ctx = create_ctx_without_rebalancing();
 
         let mut stdout = Vec::new();
-        let error = reset_allowance_command(&mut stdout, CctpChain::Ethereum, &ctx)
-            .await
-            .unwrap_err();
+        let error = reset_allowance_command::<OpenChainErrorRegistry, _>(
+            &mut stdout,
+            CctpChain::Ethereum,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(

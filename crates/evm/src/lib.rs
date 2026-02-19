@@ -29,7 +29,7 @@ use rain_error_decoding::AbiDecodedErrorType;
 
 pub mod error_decoding;
 
-pub use error_decoding::{IntoErrorRegistry, LiveErrorRegistry, NoOpErrorRegistry};
+pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
 use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 
 #[cfg(feature = "fireblocks")]
@@ -234,7 +234,7 @@ impl<T: Wallet + ?Sized> Wallet for Arc<T> {
 /// `eth_call`, decodes returns on success, decodes revert via the
 /// selector registry on failure.
 async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
-    provider: &(impl Provider + Send + Sync),
+    provider: &impl Provider,
     contract: Address,
     call: Call,
 ) -> Result<Call::Return, EvmError> {

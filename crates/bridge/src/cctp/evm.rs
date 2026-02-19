@@ -5,7 +5,9 @@ use alloy::sol;
 use alloy::sol_types::SolEvent;
 use tracing::{info, trace};
 
-use st0x_evm::{Evm, Wallet};
+#[cfg(test)]
+use st0x_evm::Evm;
+use st0x_evm::{IntoErrorRegistry, Wallet};
 
 use super::{
     CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
@@ -52,10 +54,13 @@ impl<W: Wallet> CctpEndpoint<W> {
         }
     }
 
-    pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
+    pub(super) async fn ensure_usdc_approval<Registry: IntoErrorRegistry>(
+        &self,
+        amount: U256,
+    ) -> Result<(), CctpError> {
         let allowance = self
             .wallet
-            .call(
+            .call::<Registry, _>(
                 self.usdc_address,
                 IERC20::allowanceCall {
                     owner: self.wallet.address(),
@@ -68,7 +73,7 @@ impl<W: Wallet> CctpEndpoint<W> {
 
         if allowance < amount {
             self.wallet
-                .submit(
+                .submit::<Registry, _>(
                     self.usdc_address,
                     IERC20::approveCall {
                         spender: self.token_messenger_address,
@@ -82,7 +87,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(())
     }
 
-    pub(super) async fn deposit_for_burn(
+    pub(super) async fn deposit_for_burn<Registry: IntoErrorRegistry>(
         &self,
         amount: U256,
         recipient: Address,
@@ -99,7 +104,7 @@ impl<W: Wallet> CctpEndpoint<W> {
 
         let receipt = self
             .wallet
-            .submit(
+            .submit::<Registry, _>(
                 self.token_messenger_address,
                 TokenMessengerV2::depositForBurnCall {
                     amount,
@@ -134,14 +139,14 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// Parses the `MintAndWithdraw` event from the transaction receipt to extract
     /// the actual minted amount and fee collected. This is the source of truth
     /// for what the recipient actually received.
-    pub(super) async fn claim(
+    pub(super) async fn claim<Registry: IntoErrorRegistry>(
         &self,
         message: Bytes,
         attestation: Bytes,
     ) -> Result<MintReceipt, CctpError> {
         let receipt = self
             .wallet
-            .submit(
+            .submit::<Registry, _>(
                 self.message_transmitter_address,
                 MessageTransmitterV2::receiveMessageCall {
                     message: message.clone(),
@@ -169,6 +174,11 @@ impl<W: Wallet> CctpEndpoint<W> {
             amount: mint_event.amount,
             fee_collected: mint_event.feeCollected,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn usdc(&self) -> IERC20::IERC20Instance<&<W as Evm>::Provider> {
+        IERC20::new(self.usdc_address, self.wallet.provider())
     }
 
     #[cfg(test)]

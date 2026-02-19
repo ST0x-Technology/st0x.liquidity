@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use st0x_event_sorcery::ProjectionError;
-use st0x_evm::{Evm, EvmError, Wallet};
+use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::bindings::{IERC20, IOrderBookV5};
@@ -128,7 +128,7 @@ impl<W: Wallet> RaindexService<W> {
     /// Returns `RaindexError::ZeroAmount` if amount is zero.
     /// Returns `RaindexError::Float` if amount cannot be converted to float format.
     /// Returns `RaindexError::Evm` for transaction errors.
-    pub(crate) async fn deposit(
+    pub(crate) async fn deposit<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
@@ -139,13 +139,14 @@ impl<W: Wallet> RaindexService<W> {
             return Err(RaindexError::ZeroAmount);
         }
 
-        self.approve_for_orderbook(token, amount).await?;
+        self.approve_for_orderbook::<Registry>(token, amount)
+            .await?;
 
-        self.deposit3_to_vault(token, vault_id, amount, decimals)
+        self.deposit3_to_vault::<Registry>(token, vault_id, amount, decimals)
             .await
     }
 
-    async fn approve_for_orderbook(
+    async fn approve_for_orderbook<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         amount: U256,
@@ -154,7 +155,7 @@ impl<W: Wallet> RaindexService<W> {
 
         let receipt = self
             .evm
-            .submit(
+            .submit::<Registry, _>(
                 token,
                 IERC20::approveCall {
                     spender: self.orderbook_address,
@@ -168,7 +169,7 @@ impl<W: Wallet> RaindexService<W> {
         Ok(())
     }
 
-    async fn deposit3_to_vault(
+    async fn deposit3_to_vault<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
@@ -188,7 +189,7 @@ impl<W: Wallet> RaindexService<W> {
 
         let receipt = self
             .evm
-            .submit(self.orderbook_address, calldata, "deposit3 to vault")
+            .submit::<Registry, _>(self.orderbook_address, calldata, "deposit3 to vault")
             .await?;
 
         info!(tx_hash = %receipt.transaction_hash, "deposit3 confirmed");
@@ -208,7 +209,7 @@ impl<W: Wallet> RaindexService<W> {
         vault_id: RaindexVaultId,
         amount: U256,
     ) -> Result<TxHash, RaindexError> {
-        self.deposit(USDC_BASE, vault_id, amount, USDC_DECIMALS)
+        self.deposit::<OpenChainErrorRegistry>(USDC_BASE, vault_id, amount, USDC_DECIMALS)
             .await
     }
 
@@ -343,7 +344,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        Self::deposit(self, token, vault_id, amount, decimals).await
+        Self::deposit::<OpenChainErrorRegistry>(self, token, vault_id, amount, decimals).await
     }
 
     async fn withdraw(
@@ -361,7 +362,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
         let receipt = self
             .evm
-            .submit(
+            .submit::<OpenChainErrorRegistry, _>(
                 self.orderbook_address,
                 IOrderBookV5::withdraw3Call {
                     token,
@@ -392,6 +393,7 @@ mod tests {
     use proptest::prelude::*;
     use tracing_test::traced_test;
 
+    use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
 
@@ -562,7 +564,7 @@ mod tests {
         let service = create_test_raindex_service(&local_evm).await;
 
         let result = service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 U256::ZERO,
@@ -601,7 +603,7 @@ mod tests {
         assert!(vault_balance_before.is_zero());
 
         let tx_hash = service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 vault_id,
                 deposit_amount,
@@ -655,7 +657,7 @@ mod tests {
         assert!(vault_balance_before.is_zero());
 
         let tx_hash = service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 vault_id,
                 deposit_amount,
@@ -715,7 +717,7 @@ mod tests {
         let service = create_test_raindex_service(&local_evm).await;
 
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 vault_id,
                 deposit_amount,
@@ -780,7 +782,7 @@ mod tests {
         let service = create_test_raindex_service(&local_evm).await;
 
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 deposit_amount,
@@ -824,7 +826,7 @@ mod tests {
         let service = create_test_raindex_service(&local_evm).await;
 
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 deposit_amount,
@@ -942,7 +944,7 @@ mod tests {
 
         // This should succeed - the approve inside deposit() should cover the transferFrom amount
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 deposit_amount,

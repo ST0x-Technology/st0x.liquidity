@@ -1,7 +1,7 @@
 //! Contract error decoding utilities.
 //!
 //! Provides type-level error registry injection for decoding Solidity
-//! revert data. Production code uses [`LiveErrorRegistry`] (backed by
+//! revert data. Production code uses [`OpenChainErrorRegistry`] (backed by
 //! the OpenChain selector API). Tests use [`NoOpErrorRegistry`] to
 //! avoid HTTP calls.
 
@@ -18,18 +18,18 @@ use crate::EvmError;
 
 /// Type-level selector for which error registry to use.
 ///
-/// Implemented by zero-sized marker types ([`LiveErrorRegistry`],
+/// Implemented by zero-sized marker types ([`OpenChainErrorRegistry`],
 /// [`NoOpErrorRegistry`]) so callers choose the registry at the type
 /// level without passing values.
 pub trait IntoErrorRegistry: Send + Sync {
     fn error_registry() -> &'static dyn ErrorRegistry;
 }
 
-/// Uses the live OpenChain selector registry API via the static
+/// Uses the OpenChain selector registry API via the static
 /// `DEFAULT_REGISTRY` instance from `rain_error_decoding`.
-pub struct LiveErrorRegistry;
+pub struct OpenChainErrorRegistry;
 
-impl IntoErrorRegistry for LiveErrorRegistry {
+impl IntoErrorRegistry for OpenChainErrorRegistry {
     fn error_registry() -> &'static dyn ErrorRegistry {
         &*DEFAULT_REGISTRY
     }
@@ -105,7 +105,7 @@ pub(crate) async fn decode_rpc_revert<Registry: IntoErrorRegistry>(
 /// the call at the reverted block to extract and decode the revert
 /// reason. Returns the receipt unchanged on success.
 pub(crate) async fn decode_reverted_receipt<Registry: IntoErrorRegistry>(
-    provider: &(impl Provider + Send + Sync),
+    provider: &impl Provider,
     from: Address,
     contract: Address,
     calldata: Bytes,
@@ -146,8 +146,9 @@ pub(crate) async fn decode_reverted_receipt<Registry: IntoErrorRegistry>(
 mod tests {
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::json_abi::Error as AlloyError;
-    use alloy::primitives::{Bytes, TxHash, hex};
-    use alloy::providers::mock::Mock;
+    use alloy::primitives::{Bloom, Bytes, TxHash, hex};
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::sol_types::SolError;
     use alloy::transports::TransportError;
@@ -226,7 +227,7 @@ mod tests {
                     cumulative_gas_used: 0,
                     logs: vec![],
                 },
-                logs_bloom: Default::default(),
+                logs_bloom: Bloom::default(),
             }),
             transaction_hash: TxHash::ZERO,
             transaction_index: Some(0),
@@ -239,7 +240,6 @@ mod tests {
             from: Address::ZERO,
             to: Some(Address::ZERO),
             contract_address: None,
-            authorization_list: None,
         }
     }
 
@@ -251,7 +251,7 @@ mod tests {
                     cumulative_gas_used: 0,
                     logs: vec![],
                 },
-                logs_bloom: Default::default(),
+                logs_bloom: Bloom::default(),
             }),
             transaction_hash: TxHash::random(),
             transaction_index: Some(0),
@@ -264,7 +264,6 @@ mod tests {
             from: Address::ZERO,
             to: Some(Address::ZERO),
             contract_address: None,
-            authorization_list: None,
         }
     }
 
@@ -370,11 +369,12 @@ mod tests {
 
     #[tokio::test]
     async fn decode_reverted_receipt_passes_through_successful() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let receipt = successful_receipt();
         let tx_hash = receipt.transaction_hash;
 
         let result = decode_reverted_receipt::<NoOpErrorRegistry>(
-            &Mock::new(),
+            &provider,
             Address::ZERO,
             Address::ZERO,
             Bytes::new(),
@@ -388,11 +388,12 @@ mod tests {
 
     #[tokio::test]
     async fn decode_reverted_receipt_returns_reverted_without_block() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let receipt = reverted_receipt(None);
         let tx_hash = receipt.transaction_hash;
 
         let result = decode_reverted_receipt::<NoOpErrorRegistry>(
-            &Mock::new(),
+            &provider,
             Address::ZERO,
             Address::ZERO,
             Bytes::new(),
