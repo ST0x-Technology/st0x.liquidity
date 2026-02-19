@@ -841,6 +841,12 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [rebalancing.fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [rebalancing.equities]
 

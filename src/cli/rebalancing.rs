@@ -621,7 +621,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing configuration"),
+            err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"
         );
     }

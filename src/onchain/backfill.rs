@@ -289,7 +289,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -367,7 +366,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -432,7 +430,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -502,7 +499,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -559,7 +555,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -589,7 +584,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50,
         };
 
@@ -660,7 +654,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -733,7 +726,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1000,
         };
 
@@ -764,7 +756,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 500,
         };
 
@@ -803,7 +794,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -841,7 +831,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 100,
         };
 
@@ -866,7 +855,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -900,7 +888,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 200,
         };
 
@@ -924,7 +911,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1050,7 +1036,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1114,7 +1099,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1140,7 +1124,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1168,7 +1151,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1209,7 +1191,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1254,7 +1235,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 42,
         };
 
@@ -1279,7 +1259,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1320,7 +1299,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1342,7 +1320,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1392,7 +1369,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1441,7 +1417,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1473,7 +1448,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 100,
         };
 
@@ -1495,7 +1469,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 
@@ -1580,7 +1553,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50, // Earlier than processed block
         };
 
@@ -1604,7 +1576,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50,
         };
 
@@ -1638,7 +1609,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 50,
         };
 
@@ -1674,7 +1644,6 @@ mod tests {
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             deployment_block: 1,
         };
 

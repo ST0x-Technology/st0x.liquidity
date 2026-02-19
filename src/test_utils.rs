@@ -3,6 +3,7 @@
 
 use alloy::primitives::{Address, B256, Bytes, LogData, address, bytes, fixed_bytes};
 use alloy::providers::RootProvider;
+use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::{Log, TransactionReceipt};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -31,7 +32,9 @@ impl StubWallet {
     pub(crate) fn new(address: Address) -> Arc<dyn Wallet<Provider = RootProvider>> {
         Arc::new(Self {
             address,
-            provider: RootProvider::new(Http::new("http://stub.invalid".parse().unwrap())),
+            provider: RootProvider::new(
+                RpcClient::builder().http("http://stub.invalid".parse().unwrap()),
+            ),
         })
     }
 }

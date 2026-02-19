@@ -599,7 +599,6 @@ mod tests {
         let ctx = EvmCtx {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
-            order_owner: Some(Address::ZERO),
             deployment_block: 0,
         };
 

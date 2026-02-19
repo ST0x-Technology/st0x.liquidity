@@ -1026,7 +1026,7 @@ mod tests {
     fn create_test_wallet(
         endpoint: &str,
         private_key: &B256,
-    ) -> RawPrivateKeyWallet<impl alloy::providers::Provider + Clone> {
+    ) -> RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>> {
         let base_provider = ProviderBuilder::new().connect_http(endpoint.parse().unwrap());
 
         RawPrivateKeyWallet::new(private_key, base_provider, 1).unwrap()

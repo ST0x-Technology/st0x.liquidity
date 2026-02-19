@@ -252,7 +252,6 @@ mod tests {
         EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: Some(get_test_order().owner),
             deployment_block: 1,
         }
     }
@@ -384,7 +383,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -465,7 +464,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -507,7 +506,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -543,7 +542,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -598,7 +597,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -670,7 +669,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -740,7 +739,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -815,7 +814,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -967,7 +966,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -1037,7 +1036,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -1112,7 +1111,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -1181,7 +1180,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -1256,7 +1255,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();
@@ -1310,7 +1309,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -1363,7 +1362,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -1412,7 +1411,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -1468,7 +1467,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await;
 
@@ -1540,7 +1539,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
-            ctx.order_owner.unwrap(),
+            get_test_order().owner,
         )
         .await
         .unwrap();

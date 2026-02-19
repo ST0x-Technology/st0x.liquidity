@@ -209,7 +209,7 @@ impl RebalancingCtx {
         alpaca_broker_auth: AlpacaBrokerApiCtx,
         equities: HashMap<Symbol, EquityTokenAddresses>,
     ) -> Self {
-        let wallet = StubWallet::new(Address::ZERO);
+        let wallet = crate::test_utils::StubWallet::new(Address::ZERO);
 
         Self {
             equity,
@@ -2843,18 +2843,18 @@ mod tests {
             toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
     }
 
-    #[test]
-    fn new_constructs_ctx() {
+    #[tokio::test]
+    async fn new_fails_when_secret_file_missing() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
         let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
+        let error = RebalancingCtx::new(config, secrets, test_broker_auth())
+            .await
+            .unwrap_err();
 
-        assert_eq!(ctx.alpaca_broker_auth.api_key, "test_key");
-        assert_eq!(ctx.alpaca_broker_auth.api_secret, "test_secret");
-        assert_eq!(
-            ctx.alpaca_broker_auth.account_id,
-            AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"))
+        assert!(
+            matches!(error, RebalancingCtxError::FireblocksSecretRead(_)),
+            "Expected FireblocksSecretRead error, got {error:?}"
         );
     }
 
@@ -2864,6 +2864,12 @@ mod tests {
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equities]
 
@@ -2878,14 +2884,11 @@ mod tests {
         "#,
         )
         .unwrap();
-        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
+        assert_eq!(config.equity.target, dec!(0.6));
+        assert_eq!(config.equity.deviation, dec!(0.1));
 
-        assert_eq!(ctx.equity.target, dec!(0.6));
-        assert_eq!(ctx.equity.deviation, dec!(0.1));
-
-        let UsdcRebalancing::Enabled { target, deviation } = ctx.usdc else {
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
             panic!("expected enabled");
         };
         assert_eq!(target, dec!(0.4));
@@ -2896,6 +2899,12 @@ mod tests {
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equity]
             target = "0.5"
@@ -2931,6 +2940,12 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [usdc]
             mode = "disabled"
@@ -2948,6 +2963,12 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equities]
 

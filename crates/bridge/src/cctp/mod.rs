@@ -645,8 +645,8 @@ mod tests {
         usdc_address: Address,
     ) -> Result<
         CctpBridge<
-            RawPrivateKeyWallet<impl Provider + Clone>,
-            RawPrivateKeyWallet<impl Provider + Clone>,
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
         >,
         Box<dyn std::error::Error>,
     > {
@@ -986,8 +986,8 @@ mod tests {
         base_usdc_address: Address,
     ) -> Result<
         CctpBridge<
-            RawPrivateKeyWallet<impl Provider + Clone>,
-            RawPrivateKeyWallet<impl Provider + Clone>,
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
         >,
         Box<dyn std::error::Error>,
     > {
@@ -1509,8 +1509,8 @@ mod tests {
             &self,
         ) -> Result<
             CctpBridge<
-                RawPrivateKeyWallet<impl Provider + Clone>,
-                RawPrivateKeyWallet<impl Provider + Clone>,
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
             >,
             Box<dyn std::error::Error>,
         > {
