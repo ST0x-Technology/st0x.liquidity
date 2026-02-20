@@ -1,7 +1,8 @@
-# E2e tests fork Base mainnet via Anvil, which can time out if the RPC
-# endpoint is slow under parallel load. Retry once with exponential
-# backoff so a transient fork timeout doesn't fail the whole suite.
+
+# E2e tests deploy contracts on local Anvil instances and run async bot
+# pipelines that can occasionally be slow. Retry once with exponential
+# backoff so a transient timeout doesn't fail the whole suite.
 [[profile.default.overrides]]
 filter = "kind(test)"
-slow-timeout = { period = "80s" }
-#retries = { backoff = "exponential", count = 2, delay = "5s", jitter = true }
+slow-timeout = { period = "60s" }
+retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }

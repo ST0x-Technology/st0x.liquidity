@@ -1,10 +1,10 @@
-//! Base chain fork infrastructure for e2e testing.
+//! Local Anvil chain infrastructure for e2e testing.
 //!
-//! Forks Base mainnet via Anvil so all Rain/Raindex contracts are live at
-//! their production addresses, then uses Anvil cheat codes to mint tokens
-//! for test accounts. Deploys a fresh Rain expression stack (Interpreter,
-//! Store, Parser, Deployer) for compiling order expressions used in
-//! `take_order()`.
+//! Deploys all contracts fresh on a plain Anvil instance (no mainnet fork),
+//! including the OrderBook, USDC (placed at the canonical `USDC_BASE`
+//! address via `anvil_set_code`), and the Rain expression stack
+//! (Interpreter, Store, Parser, Deployer) for compiling order expressions
+//! used in `take_order()`.
 
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -23,13 +23,16 @@ pub use st0x_hedge::USDC_BASE;
 pub use st0x_hedge::bindings::{DeployableERC20, IERC20, TestVault};
 
 use st0x_hedge::bindings::IOrderBookV5::{self, TakeOrderV3};
-use st0x_hedge::bindings::{Deployer, Interpreter, Parser, Store as RainStore, TOFUTokenDecimals};
+use st0x_hedge::bindings::{
+    Deployer, Interpreter, OrderBook, Parser, Store as RainStore, TOFUTokenDecimals,
+};
 
-/// Raindex OrderBook on Base mainnet.
-const ORDERBOOK_BASE: Address = address!("52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775");
-
-/// Circle FiatTokenV2 `balances` mapping storage slot.
-const USDC_BALANCES_SLOT: u8 = 9;
+/// OpenZeppelin ERC20 `_balances` mapping storage slot.
+///
+/// When USDC is deployed fresh via `DeployableERC20` bytecode (not forked
+/// from Circle's FiatTokenV2), the balances mapping lives at slot 0
+/// (standard OpenZeppelin ERC20 layout) instead of slot 9.
+const USDC_BALANCES_SLOT: u8 = 0;
 
 /// Result of a successful `take_order` call, providing both the tx hash
 /// and the vault/token details needed for on-chain assertions.
@@ -68,9 +71,8 @@ pub struct PreparedOrder {
     pub output_token: Address,
 }
 
-/// A forked Base chain running locally via Anvil, with the real Raindex
-/// OrderBook and a freshly deployed Rain expression stack for compiling
-/// order expressions.
+/// A local Anvil chain with a freshly deployed OrderBook, USDC, and Rain
+/// expression stack for compiling order expressions. No mainnet fork.
 pub struct BaseChain<P> {
     anvil: AnvilInstance,
     pub provider: P,
@@ -93,14 +95,14 @@ pub struct BaseChain<P> {
 }
 
 impl BaseChain<()> {
-    /// Forks Base mainnet using the given RPC URL, mints initial USDC,
-    /// and deploys the Rain expression stack (Interpreter, Store, Parser,
-    /// Deployer).
-    pub async fn start(rpc_url: &str) -> anyhow::Result<BaseChain<impl Provider + Clone>> {
+    /// Deploys all contracts fresh on a plain Anvil instance (no mainnet
+    /// fork): OrderBook, USDC at `USDC_BASE`, and the Rain expression
+    /// stack (Interpreter, Store, Parser, Deployer).
+    pub async fn start() -> anyhow::Result<BaseChain<impl Provider + Clone>> {
         // Auto-mine a block every second so that onchain transactions
         // requiring multiple confirmations (e.g., REQUIRED_CONFIRMATIONS=3
         // in ShareWrapper) complete on Anvil instead of hanging forever.
-        let anvil = Anvil::new().fork(rpc_url).block_time(1).spawn();
+        let anvil = Anvil::new().block_time(1).spawn();
 
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let signer = PrivateKeySigner::from_bytes(&key)?;
@@ -112,14 +114,14 @@ impl BaseChain<()> {
             .connect(&anvil.endpoint())
             .await?;
 
-        // Mint 1M USDC to owner via storage slot manipulation
-        let million_usdc: U256 = parse_units("1000000", 6)?.into();
-        mint_usdc(&provider, owner, million_usdc).await?;
+        // Deploy OrderBook fresh instead of forking from Base mainnet
+        let orderbook = OrderBook::deploy(&provider).await?;
+        let orderbook_addr = *orderbook.address();
 
-        // Deploy Rain expression stack for compiling order expressions.
-        // The production Rain contracts exist on Base but we deploy our
-        // own set because addOrder3 accepts any interpreter/store in the
-        // order config.
+        // Place USDC contract at the canonical USDC_BASE address so vault
+        // discovery and all downstream code recognizes it.
+        deploy_usdc_at_base(&provider, owner).await?;
+
         provider
             .anvil_set_code(
                 address!("4f1C29FAAB7EDdF8D7794695d8259996734Cc665"),
@@ -173,7 +175,7 @@ impl BaseChain<()> {
             owner_key: key,
             taker,
             taker_provider,
-            orderbook_addr: ORDERBOOK_BASE,
+            orderbook_addr,
             deployer_addr,
             interpreter_addr,
             store_addr,
@@ -208,7 +210,7 @@ impl<P: Provider + Clone> BaseChain<P> {
     }
 
     /// Sets `recipient`'s USDC balance to `amount` (6-decimal raw units)
-    /// by writing directly to Circle's FiatToken `balances` storage slot.
+    /// by writing directly to the OpenZeppelin ERC20 `_balances` storage slot.
     pub async fn mint_usdc(&self, recipient: Address, amount: U256) -> anyhow::Result<()> {
         mint_usdc(&self.provider, recipient, amount).await
     }
@@ -425,8 +427,7 @@ impl<P: Provider + Clone> BaseChain<P> {
 
         let orderbook =
             IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.provider);
-        let deployer_instance =
-            Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
+        let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
         let usdc_total = amount * price;
@@ -785,8 +786,57 @@ impl<P: Provider + Clone> BaseChain<P> {
     }
 }
 
-/// Sets `recipient`'s USDC balance by writing directly to Circle's
-/// FiatToken `balances` storage slot.
+/// Deploys a USDC ERC20 at the canonical `USDC_BASE` address using
+/// `anvil_set_code` with `DeployableERC20` bytecode, then initialises
+/// OpenZeppelin storage slots (totalSupply, name, symbol, decimals) and
+/// gives the owner 1B USDC.
+async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) -> anyhow::Result<()> {
+    let total_supply = U256::from(1_000_000_000_000u64);
+
+    provider
+        .anvil_set_code(USDC_BASE, DeployableERC20::DEPLOYED_BYTECODE.clone())
+        .await?;
+
+    // Slot 2: _totalSupply
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(2), total_supply.into())
+        .await?;
+
+    // Slot 3: _name = "USD Coin" (Solidity short-string: data left-aligned,
+    // len*2 in last byte)
+    let mut name_bytes = [0u8; 32];
+    name_bytes[..8].copy_from_slice(b"USD Coin");
+    name_bytes[31] = 16;
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(3), B256::from(name_bytes))
+        .await?;
+
+    // Slot 4: _symbol = "USDC" (Solidity short-string encoding)
+    let mut symbol_bytes = [0u8; 32];
+    symbol_bytes[..4].copy_from_slice(b"USDC");
+    symbol_bytes[31] = 8;
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(4), B256::from(symbol_bytes))
+        .await?;
+
+    // Slot 5: _decimals = 6
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(5), U256::from(6).into())
+        .await?;
+
+    // _balances[owner] at slot 0 (OpenZeppelin ERC20 layout)
+    let mut slot_key = [0u8; 64];
+    slot_key[12..32].copy_from_slice(owner.as_slice());
+    let balance_slot = U256::from_be_bytes(keccak256(slot_key).0);
+    provider
+        .anvil_set_storage_at(USDC_BASE, balance_slot, total_supply.into())
+        .await?;
+
+    Ok(())
+}
+
+/// Sets `recipient`'s USDC balance by writing directly to the
+/// OpenZeppelin ERC20 `_balances` storage slot.
 async fn mint_usdc<P: Provider>(
     provider: &P,
     recipient: Address,

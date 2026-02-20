@@ -1105,19 +1105,13 @@ where
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
-        Arc::new(TestWallet::new(
-            &base_chain.owner_key,
-            base_chain.endpoint().parse()?,
-            1,
-        ));
+    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(
+        TestWallet::new(&base_chain.owner_key, base_chain.endpoint().parse()?, 1),
+    );
 
-    let ethereum_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
-        Arc::new(TestWallet::new(
-            &base_chain.owner_key,
-            ethereum_chain.endpoint().parse()?,
-            1,
-        ));
+    let ethereum_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(
+        TestWallet::new(&base_chain.owner_key, ethereum_chain.endpoint().parse()?, 1),
+    );
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets(
         ImbalanceThreshold {

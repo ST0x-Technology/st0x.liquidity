@@ -69,12 +69,6 @@ impl MockWrapper {
             unwrap_fails: true,
         }
     }
-
-    /// Configures the address returned by `lookup_unwrapped`.
-    pub(crate) fn with_unwrapped_token(mut self, address: Address) -> Self {
-        self.unwrapped_token = address;
-        self
-    }
 }
 
 #[async_trait]
