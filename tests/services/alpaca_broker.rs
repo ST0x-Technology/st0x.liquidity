@@ -5,14 +5,27 @@
 //! (happy path, rejected, placement fails) and optionally set initial account
 //! state via the builder — no per-request mock setup needed.
 
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use alloy::primitives::Address;
+use alloy::providers::Provider;
+use alloy::sol;
+use alloy::sol_types::SolEvent;
 use chrono::Utc;
 use httpmock::prelude::*;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+// ERC-20 Transfer event for the redemption watcher.
+sol! {
+    #[sol(all_derives = true)]
+    event Transfer(address indexed from, address indexed to, uint256 value);
+}
 
 pub const TEST_ACCOUNT_ID: &str = "904837e3-3b76-47ec-b432-046db621571b";
 pub const TEST_API_KEY: &str = "e2e_test_key";
@@ -57,6 +70,21 @@ pub struct CalendarEntry {
     pub close: String,
 }
 
+/// A mock wallet transfer tracked in shared state.
+struct MockWalletTransfer {
+    transfer_id: String,
+    direction: String,
+    amount: String,
+    asset: String,
+    from_address: String,
+    to_address: String,
+    status: String,
+    tx_hash: String,
+    poll_count: usize,
+    /// Number of polls before transitioning from "pending" to "complete".
+    polls_until_complete: usize,
+}
+
 /// A mock tokenization request tracked in shared state.
 struct MockTokenizationRequest {
     tokenization_request_id: String,
@@ -68,6 +96,10 @@ struct MockTokenizationRequest {
     poll_count: usize,
     /// Number of polls before transitioning from "pending" to "completed".
     polls_until_complete: usize,
+    /// "mint" or "redeem"
+    request_type: String,
+    /// Transaction hash (for redemption detection).
+    tx_hash: String,
 }
 
 struct MockState {
@@ -83,6 +115,21 @@ struct MockState {
     tokenization_requests: Vec<MockTokenizationRequest>,
     /// Number of polls before mint requests transition to "completed".
     tokenization_polls_until_complete: usize,
+    /// Wallet transfers (withdrawals and deposits).
+    wallet_transfers: Vec<MockWalletTransfer>,
+    /// Alpaca deposit wallet address for incoming USDC.
+    alpaca_deposit_address: String,
+    /// Whitelisted withdrawal addresses.
+    whitelisted_addresses: Vec<WhitelistEntry>,
+}
+
+/// A whitelisted address entry in the mock state.
+struct WhitelistEntry {
+    id: String,
+    address: String,
+    asset: String,
+    chain: String,
+    status: String,
 }
 
 /// Snapshot of a placed order, returned by [`AlpacaBrokerMock::orders`].
@@ -107,6 +154,26 @@ pub struct MockPositionSnapshot {
     pub symbol: String,
     pub qty: String,
     pub market_value: String,
+}
+
+/// Snapshot of a wallet transfer, returned by
+/// [`AlpacaBrokerMock::wallet_transfers`].
+pub struct MockWalletTransferSnapshot {
+    pub transfer_id: String,
+    pub direction: String,
+    pub amount: String,
+    pub asset: String,
+    pub status: String,
+}
+
+/// Snapshot of a tokenization request, returned by
+/// [`AlpacaBrokerMock::tokenization_requests`].
+pub struct MockTokenizationRequestSnapshot {
+    pub request_id: String,
+    pub request_type: String,
+    pub symbol: String,
+    pub qty: String,
+    pub status: String,
 }
 
 /// Builder for configuring initial broker state before starting the mock.
@@ -196,6 +263,9 @@ impl AlpacaBrokerMockBuilder {
             calendar_entries,
             tokenization_requests: Vec::new(),
             tokenization_polls_until_complete: 2,
+            wallet_transfers: Vec::new(),
+            alpaca_deposit_address: String::new(),
+            whitelisted_addresses: Vec::new(),
         }));
 
         let server = MockServer::start_async().await;
@@ -312,6 +382,185 @@ impl AlpacaBrokerMock {
     pub fn register_tokenization_endpoints(&self) {
         register_mint_endpoint(&self.server, &self.state);
         register_tokenization_requests_endpoint(&self.server, &self.state);
+    }
+
+    /// Registers wallet API endpoints (whitelist, transfers, deposit address)
+    /// on this mock server. Call after `build()` for tests that exercise the
+    /// USDC rebalancing pipeline.
+    ///
+    /// `owner_address` is the market maker's Ethereum address, pre-approved
+    /// in the whitelist for USDC withdrawals.
+    pub fn register_wallet_endpoints(&self, owner_address: Address) {
+        let owner_hex = format!("{owner_address:#x}");
+
+        // Pre-populate whitelist with the owner address as approved
+        {
+            let mut state = lock(&self.state);
+            state.alpaca_deposit_address = format!("{:#x}", Address::random());
+            state.whitelisted_addresses.push(WhitelistEntry {
+                id: Uuid::new_v4().to_string(),
+                address: owner_hex,
+                asset: "USDC".to_string(),
+                chain: "ETH".to_string(),
+                status: "approved".to_string(),
+            });
+        }
+
+        register_whitelist_get_endpoint(&self.server, &self.state);
+        register_whitelist_post_endpoint(&self.server, &self.state);
+        register_wallet_address_endpoint(&self.server, &self.state);
+        register_wallet_transfers_post_endpoint(&self.server, &self.state);
+        register_wallet_transfers_get_endpoint(&self.server, &self.state);
+    }
+
+    /// Registers tokenization endpoints that also support redemption queries.
+    ///
+    /// Unlike `register_tokenization_endpoints`, this version filters by
+    /// `type` query param (mint vs redeem) and supports adding redemption
+    /// entries externally.
+    pub fn register_redemption_tokenization_endpoints(&self) {
+        register_mint_endpoint(&self.server, &self.state);
+        register_tokenization_requests_with_filter_endpoint(&self.server, &self.state);
+    }
+
+    /// Adds a redemption tokenization request to the mock state.
+    ///
+    /// Called by test infrastructure when it detects tokens sent to the
+    /// redemption wallet, simulating Alpaca's detection of the transfer.
+    pub fn add_redemption_request(
+        &self,
+        tx_hash: &str,
+        symbol: &str,
+        qty: &str,
+        wallet_address: &str,
+    ) {
+        let mut state = lock(&self.state);
+        let polls_until_complete = state.tokenization_polls_until_complete;
+
+        state.tokenization_requests.push(MockTokenizationRequest {
+            tokenization_request_id: Uuid::new_v4().to_string(),
+            issuer_request_id: String::new(),
+            underlying_symbol: symbol.to_string(),
+            qty: qty.to_string(),
+            wallet_address: wallet_address.to_string(),
+            status: "pending".to_string(),
+            poll_count: 0,
+            polls_until_complete,
+            request_type: "redeem".to_string(),
+            tx_hash: tx_hash.to_string(),
+        });
+    }
+
+    /// Starts a background task that monitors the Base chain for ERC-20
+    /// Transfer events to the `redemption_wallet` address. When detected,
+    /// adds a redemption tokenization request to the mock state so the
+    /// bot's `poll_for_redemption` call finds a matching entry.
+    pub fn start_redemption_watcher<P: Provider + Clone + Send + Sync + 'static>(
+        &self,
+        provider: P,
+        redemption_wallet: Address,
+    ) -> JoinHandle<()> {
+        let state = Arc::clone(&self.state);
+
+        tokio::spawn(async move {
+            let mut last_block = provider.get_block_number().await.unwrap_or(0);
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                let Ok(current) = provider.get_block_number().await else {
+                    continue;
+                };
+
+                if current <= last_block {
+                    continue;
+                }
+
+                for block_num in (last_block + 1)..=current {
+                    let Ok(Some(block)) =
+                        provider.get_block_by_number(block_num.into()).full().await
+                    else {
+                        continue;
+                    };
+
+                    for tx_hash in block.transactions.hashes() {
+                        let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await
+                        else {
+                            continue;
+                        };
+
+                        for log in receipt.inner.logs() {
+                            if log.topic0() != Some(&Transfer::SIGNATURE_HASH) {
+                                continue;
+                            }
+
+                            // topic2 = `to` (second indexed parameter)
+                            let Some(to_topic) = log.topics().get(2) else {
+                                continue;
+                            };
+                            let to_addr = Address::from_word(*to_topic);
+
+                            if to_addr != redemption_wallet {
+                                continue;
+                            }
+
+                            let tx_hash_hex = format!("{tx_hash:#x}");
+                            let wallet_hex = format!("{redemption_wallet:#x}");
+
+                            let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+                            let polls_until_complete = guard.tokenization_polls_until_complete;
+
+                            guard.tokenization_requests.push(MockTokenizationRequest {
+                                tokenization_request_id: Uuid::new_v4().to_string(),
+                                issuer_request_id: String::new(),
+                                underlying_symbol: "AAPL".to_string(),
+                                qty: "1.0".to_string(),
+                                wallet_address: wallet_hex,
+                                status: "pending".to_string(),
+                                poll_count: 0,
+                                polls_until_complete,
+                                request_type: "redeem".to_string(),
+                                tx_hash: tx_hash_hex,
+                            });
+                        }
+                    }
+                }
+
+                last_block = current;
+            }
+        })
+    }
+
+    /// Returns a snapshot of all wallet transfers.
+    pub fn wallet_transfers(&self) -> Vec<MockWalletTransferSnapshot> {
+        let state = lock(&self.state);
+        state
+            .wallet_transfers
+            .iter()
+            .map(|transfer| MockWalletTransferSnapshot {
+                transfer_id: transfer.transfer_id.clone(),
+                direction: transfer.direction.clone(),
+                amount: transfer.amount.clone(),
+                asset: transfer.asset.clone(),
+                status: transfer.status.clone(),
+            })
+            .collect()
+    }
+
+    /// Returns a snapshot of all tokenization requests (mint + redeem).
+    pub fn tokenization_requests(&self) -> Vec<MockTokenizationRequestSnapshot> {
+        let state = lock(&self.state);
+        state
+            .tokenization_requests
+            .iter()
+            .map(|request| MockTokenizationRequestSnapshot {
+                request_id: request.tokenization_request_id.clone(),
+                request_type: request.request_type.clone(),
+                symbol: request.underlying_symbol.clone(),
+                qty: request.qty.clone(),
+                status: request.status.clone(),
+            })
+            .collect()
     }
 
     /// Returns a snapshot of all current positions.
@@ -672,6 +921,8 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
                     status: "pending".to_string(),
                     poll_count: 0,
                     polls_until_complete,
+                    request_type: "mint".to_string(),
+                    tx_hash: String::new(),
                 });
             }
 
@@ -721,34 +972,290 @@ fn register_tokenization_requests_endpoint(server: &MockServer, state: &Arc<Mute
                 state
                     .tokenization_requests
                     .iter()
-                    .map(|request| {
-                        // Completed mint requests include a fake tx_hash to
-                        // represent the onchain token transfer from Alpaca.
-                        let tx_hash = if request.status == "completed" {
-                            format!("0x{}", "ab".repeat(32))
-                        } else {
-                            String::new()
-                        };
+                    .map(|request| tokenization_request_to_json(request))
+                    .collect()
+            };
 
+            json_response(200, &Value::Array(requests))
+        });
+    });
+}
+
+/// Converts a `MockTokenizationRequest` to its JSON representation.
+fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
+    // Completed requests include a tx_hash. For mints, generate a fake one
+    // if the request didn't already have one (from redemption detection).
+    let tx_hash = if request.status == "completed" && request.tx_hash.is_empty() {
+        format!("0x{}", "ab".repeat(32))
+    } else {
+        request.tx_hash.clone()
+    };
+
+    json!({
+        "tokenization_request_id": request.tokenization_request_id,
+        "type": request.request_type,
+        "status": request.status,
+        "underlying_symbol": request.underlying_symbol,
+        "token_symbol": format!("t{}", request.underlying_symbol),
+        "qty": request.qty,
+        "issuer": "st0x",
+        "network": "base",
+        "wallet_address": request.wallet_address,
+        "issuer_request_id": request.issuer_request_id,
+        "tx_hash": tx_hash,
+        "created_at": "2025-01-01T00:00:00Z",
+    })
+}
+
+/// Tokenization requests endpoint with `type` query param filtering.
+fn register_tokenization_requests_with_filter_endpoint(
+    server: &MockServer,
+    state: &Arc<Mutex<MockState>>,
+) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(GET).path(format!(
+            "/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/requests"
+        ));
+        then.respond_with(move |request: &HttpMockRequest| {
+            let uri = request.uri();
+            let query = uri.query().unwrap_or("");
+            let type_filter = query
+                .split('&')
+                .find_map(|param| param.strip_prefix("type="))
+                .unwrap_or("");
+
+            let requests: Vec<Value> = {
+                let mut state = lock(&state);
+
+                // Advance pending requests
+                for req in &mut state.tokenization_requests {
+                    if req.status == "pending" {
+                        req.poll_count += 1;
+                        if req.poll_count >= req.polls_until_complete {
+                            req.status = "completed".to_string();
+                        }
+                    }
+                }
+
+                state
+                    .tokenization_requests
+                    .iter()
+                    .filter(|req| type_filter.is_empty() || req.request_type == type_filter)
+                    .map(|req| tokenization_request_to_json(req))
+                    .collect()
+            };
+
+            json_response(200, &Value::Array(requests))
+        });
+    });
+}
+
+// ── Wallet endpoints ─────────────────────────────────────────────────
+
+fn register_whitelist_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
+        then.respond_with(move |_request: &HttpMockRequest| {
+            let entries: Vec<Value> = {
+                let state = lock(&state);
+                state
+                    .whitelisted_addresses
+                    .iter()
+                    .map(|entry| {
                         json!({
-                            "tokenization_request_id": request.tokenization_request_id,
-                            "type": "mint",
-                            "status": request.status,
-                            "underlying_symbol": request.underlying_symbol,
-                            "token_symbol": format!("t{}", request.underlying_symbol),
-                            "qty": request.qty,
-                            "issuer": "st0x",
-                            "network": "base",
-                            "wallet_address": request.wallet_address,
-                            "issuer_request_id": request.issuer_request_id,
-                            "tx_hash": tx_hash,
-                            "created_at": "2025-01-01T00:00:00Z",
+                            "id": entry.id,
+                            "address": entry.address,
+                            "asset": entry.asset,
+                            "chain": entry.chain,
+                            "status": entry.status,
+                            "created_at": "2025-01-01T00:00:00Z"
                         })
                     })
                     .collect()
             };
 
-            json_response(200, &Value::Array(requests))
+            json_response(200, &Value::Array(entries))
+        });
+    });
+}
+
+fn register_whitelist_post_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(POST)
+            .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
+        then.respond_with(move |request: &HttpMockRequest| {
+            let body: Value = serde_json::from_slice(request.body().as_ref()).unwrap_or(json!({}));
+
+            let address = body["address"].as_str().unwrap_or("").to_string();
+            let asset = body["asset"].as_str().unwrap_or("USDC").to_string();
+            let entry_id = Uuid::new_v4().to_string();
+
+            {
+                let mut state = lock(&state);
+                state.whitelisted_addresses.push(WhitelistEntry {
+                    id: entry_id.clone(),
+                    address: address.clone(),
+                    asset: asset.clone(),
+                    chain: "ETH".to_string(),
+                    status: "approved".to_string(),
+                });
+            }
+
+            json_response(
+                200,
+                &json!({
+                    "id": entry_id,
+                    "address": address,
+                    "asset": asset,
+                    "chain": "ETH",
+                    "status": "approved",
+                    "created_at": "2025-01-01T00:00:00Z"
+                }),
+            )
+        });
+    });
+}
+
+fn register_wallet_address_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(GET)
+            .path_prefix(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets"));
+        then.respond_with(move |request: &HttpMockRequest| {
+            let path = request.uri().path().to_string();
+
+            // Don't match transfer or whitelist sub-paths
+            if path.contains("transfers") || path.contains("whitelists") {
+                return json_response(404, &json!({"message": "not found"}));
+            }
+
+            let deposit_addr = lock(&state).alpaca_deposit_address.clone();
+
+            json_response(
+                200,
+                &json!({
+                    "asset_id": "00000000-0000-0000-0000-000000000000",
+                    "address": deposit_addr,
+                    "created_at": "2025-01-01T00:00:00Z"
+                }),
+            )
+        });
+    });
+}
+
+fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(POST)
+            .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+        then.respond_with(move |request: &HttpMockRequest| {
+            let body: Value = serde_json::from_slice(request.body().as_ref()).unwrap_or(json!({}));
+
+            let amount = body["amount"].as_str().unwrap_or("0").to_string();
+            let asset = body["asset"].as_str().unwrap_or("USDC").to_string();
+            let to_address = body["address"].as_str().unwrap_or("").to_string();
+            let transfer_id = Uuid::new_v4().to_string();
+
+            {
+                let mut state = lock(&state);
+                let from_address = state.alpaca_deposit_address.clone();
+
+                state.wallet_transfers.push(MockWalletTransfer {
+                    transfer_id: transfer_id.clone(),
+                    direction: "OUTGOING".to_string(),
+                    amount: amount.clone(),
+                    asset: asset.clone(),
+                    from_address,
+                    to_address: to_address.clone(),
+                    status: "PENDING".to_string(),
+                    tx_hash: String::new(),
+                    poll_count: 0,
+                    polls_until_complete: 2,
+                });
+            }
+
+            json_response(
+                200,
+                &json!({
+                    "id": transfer_id,
+                    "direction": "OUTGOING",
+                    "amount": amount,
+                    "usd_value": amount,
+                    "asset": asset,
+                    "chain": "ETH",
+                    "from_address": "",
+                    "to_address": to_address,
+                    "status": "PENDING",
+                    "tx_hash": "",
+                    "created_at": Utc::now().to_rfc3339(),
+                    "network_fee": "0",
+                    "fees": "0"
+                }),
+            )
+        });
+    });
+}
+
+fn register_wallet_transfers_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+        then.respond_with(move |_request: &HttpMockRequest| {
+            let transfers: Vec<Value> = {
+                let mut state = lock(&state);
+
+                // Advance pending transfers toward completion
+                for transfer in &mut state.wallet_transfers {
+                    if transfer.status == "PENDING" || transfer.status == "PROCESSING" {
+                        transfer.poll_count += 1;
+
+                        if transfer.poll_count >= transfer.polls_until_complete {
+                            transfer.status = "COMPLETE".to_string();
+                            // Generate a fake tx_hash for completed transfers
+                            if transfer.tx_hash.is_empty() {
+                                transfer.tx_hash = format!("0x{}", "cd".repeat(32));
+                            }
+                        } else {
+                            transfer.status = "PROCESSING".to_string();
+                        }
+                    }
+                }
+
+                state
+                    .wallet_transfers
+                    .iter()
+                    .map(|transfer| {
+                        json!({
+                            "id": transfer.transfer_id,
+                            "direction": transfer.direction,
+                            "amount": transfer.amount,
+                            "usd_value": transfer.amount,
+                            "asset": transfer.asset,
+                            "chain": "ETH",
+                            "from_address": transfer.from_address,
+                            "to_address": transfer.to_address,
+                            "status": transfer.status,
+                            "tx_hash": transfer.tx_hash,
+                            "created_at": "2025-01-01T00:00:00Z",
+                            "network_fee": "0",
+                            "fees": "0"
+                        })
+                    })
+                    .collect()
+            };
+
+            json_response(200, &Value::Array(transfers))
         });
     });
 }

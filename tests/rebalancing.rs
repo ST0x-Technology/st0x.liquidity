@@ -29,12 +29,27 @@ mod services;
 
 use std::time::Duration;
 
+use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::Provider;
+use alloy::signers::local::PrivateKeySigner;
 
-use common::{build_rebalancing_ctx, connect_db, count_events, spawn_bot, wait_for_processing};
+use common::{
+    E2eScenario, assert_event_subsequence, assert_full_pipeline, assert_single_clean_aggregate,
+    build_rebalancing_ctx, build_usdc_rebalancing_ctx, connect_db, count_events,
+    fetch_events_by_type, spawn_bot, wait_for_processing,
+};
 use services::alpaca_broker::AlpacaBrokerMock;
-use services::base_chain::{self, TakeDirection};
+use services::base_chain::{self, IERC20, TakeDirection, USDC_BASE};
+use services::cctp_attestation::CctpAttestationMock;
+use services::cctp_attester;
+use services::ethereum_chain;
 use st0x_hedge::UsdcRebalancing;
+use st0x_hedge::bindings::IOrderBookV5;
+
+const BASE_RPC_URL: &str =
+    "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF";
+const ETHEREUM_RPC_URL: &str =
+    "https://api.developer.coinbase.com/rpc/v1/ethereum/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF";
 
 /// Processes several one-directional SellEquity trades to create an
 /// inventory imbalance (offchain accumulates hedged equity while onchain
@@ -42,10 +57,7 @@ use st0x_hedge::UsdcRebalancing;
 /// `InventorySnapshot` events.
 #[tokio::test]
 async fn inventory_snapshot_events_emitted() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start(
-        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
-    )
-    .await?;
+    let mut chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
     let (vault_addr, underlying_addr) = chain.deploy_equity_vault("AAPL").await?;
 
     let broker = AlpacaBrokerMock::start()
@@ -64,6 +76,7 @@ async fn inventory_snapshot_events_emitted() -> anyhow::Result<()> {
         current_block,
         &[("AAPL", vault_addr, underlying_addr)],
         UsdcRebalancing::Disabled,
+        None,
     )?;
     let bot = spawn_bot(ctx);
 
@@ -113,16 +126,13 @@ async fn inventory_snapshot_events_emitted() -> anyhow::Result<()> {
 /// endpoints are mocked on the broker server (the conductor resolves
 /// all Alpaca services from the same base URL).
 ///
-/// We assert the first stages of the mint pipeline fire (MintRequested,
-/// MintAccepted, TokensReceived). The downstream wrapping and Raindex
-/// deposit may or may not complete depending on timing, but the trigger
-/// + tokenization request is the critical path under test.
+/// We assert the full mint pipeline fires: MintRequested, MintAccepted,
+/// TokensReceived, TokensWrapped, and DepositedIntoRaindex. This
+/// verifies the complete flow from tokenization request through
+/// ERC-4626 wrapping and Raindex vault deposit.
 #[tokio::test]
 async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
-    let mut chain = base_chain::BaseChain::start(
-        "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF",
-    )
-    .await?;
+    let mut chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
 
     // Deploy ERC-4626 vault for AAPL. The owner already has underlying
     // tokens + unlimited vault approval from deploy_equity_vault(), so
@@ -140,6 +150,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     let current_block = chain.provider.get_block_number().await?;
     let db_dir = tempfile::tempdir()?;
     let db_path = db_dir.path().join("e2e.sqlite");
+    let database_url = db_path.display().to_string();
 
     let ctx = build_rebalancing_ctx(
         &chain,
@@ -148,6 +159,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         current_block,
         &[("AAPL", vault_addr, underlying_addr)],
         UsdcRebalancing::Disabled,
+        None,
     )?;
     let bot = spawn_bot(ctx);
 
@@ -155,10 +167,13 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
 
     // Process several SellEquity trades to create offchain-heavy imbalance.
     // Each sell depletes the onchain vault and accumulates offchain equity.
+    let mut take_results = Vec::new();
     for _ in 0..3 {
-        chain
-            .take_order("AAPL", "7.5", TakeDirection::SellEquity)
-            .await?;
+        take_results.push(
+            chain
+                .take_order("AAPL", "7.5", TakeDirection::SellEquity)
+                .await?,
+        );
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
@@ -166,30 +181,71 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     // tokenization request + polling (2 polls at 10s each)
     wait_for_processing(&bot, 40).await;
 
+    // ── Layer 1: Full hedging pipeline (broker + vaults + CQRS) ──────
+    let scenario = E2eScenario {
+        symbol: "AAPL",
+        amount: "22.5",
+        direction: TakeDirection::SellEquity,
+        fill_price: "150.00",
+        expected_accumulated_long: "0",
+        expected_accumulated_short: "22.5",
+        expected_net: "0",
+    };
+
+    assert_full_pipeline(
+        &[scenario],
+        &take_results,
+        &chain.provider,
+        chain.orderbook_addr,
+        chain.owner,
+        &broker,
+        &database_url,
+    )
+    .await?;
+
+    // ── Layer 2: Inventory snapshots ─────────────────────────────────
     let pool = connect_db(&db_path).await?;
 
-    // Verify trades were detected
-    let onchain_events = count_events(&pool, "OnChainTrade").await?;
-    assert!(
-        onchain_events >= 3,
-        "Expected at least 3 OnChainTrade events, got {onchain_events}"
-    );
-
-    // Verify inventory snapshots were emitted
     let inventory_events = count_events(&pool, "InventorySnapshot").await?;
     assert!(
         inventory_events >= 1,
         "Expected at least 1 InventorySnapshot event, got {inventory_events}"
     );
 
-    // Verify the mint pipeline was triggered. At minimum MintRequested
-    // should be emitted; MintAccepted and TokensReceived follow if the
-    // mock API responds in time.
-    let mint_events = count_events(&pool, "TokenizedEquityMint").await?;
+    // ── Layer 3: Mint pipeline (events) ──────────────────────────────
+    let mint_events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
     assert!(
-        mint_events >= 1,
-        "Expected at least 1 TokenizedEquityMint event (mint trigger fired), \
-         got {mint_events}"
+        !mint_events.is_empty(),
+        "Expected at least 1 TokenizedEquityMint event (mint trigger fired), got 0"
+    );
+
+    assert_event_subsequence(
+        &mint_events,
+        &[
+            "TokenizedEquityMintEvent::MintRequested",
+            "TokenizedEquityMintEvent::MintAccepted",
+            "TokenizedEquityMintEvent::TokensReceived",
+            "TokenizedEquityMintEvent::TokensWrapped",
+            "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        ],
+    );
+
+    assert_single_clean_aggregate(&mint_events, &["Failed", "Rejected"]);
+
+    // ── Layer 3: Mint pipeline (broker state) ────────────────────────
+    let mint_requests: Vec<_> = broker
+        .tokenization_requests()
+        .into_iter()
+        .filter(|req| req.request_type == "mint" && req.symbol == "AAPL")
+        .collect();
+    assert!(
+        !mint_requests.is_empty(),
+        "Expected at least 1 mint tokenization request for AAPL on the broker"
+    );
+    assert!(
+        mint_requests.iter().any(|req| req.status == "completed"),
+        "Expected at least one completed mint request, got: {:?}",
+        mint_requests.iter().map(|r| &r.status).collect::<Vec<_>>()
     );
 
     pool.close().await;
@@ -212,8 +268,167 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
 /// Raindex vault with sufficient balance for withdrawal, and tokenization
 /// API mock endpoints for redemption detection/completion polling.
 #[tokio::test]
-#[ignore = "Requires Raindex vault pre-funded with wrapped tokens for withdrawal + redemption mock endpoints"]
 async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
+    let mut chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
+    let (vault_addr, underlying_addr) = chain.deploy_equity_vault("AAPL").await?;
+
+    let broker = AlpacaBrokerMock::start()
+        .with_fill_price("150.00")
+        .build()
+        .await;
+    broker.register_redemption_tokenization_endpoints();
+
+    // Create a known redemption wallet so the watcher can detect
+    // ERC-20 transfers to it and auto-add redemption requests.
+    let redemption_wallet = Address::random();
+    let _watcher = broker.start_redemption_watcher(chain.provider.clone(), redemption_wallet);
+
+    let current_block = chain.provider.get_block_number().await?;
+    let db_dir = tempfile::tempdir()?;
+    let db_path = db_dir.path().join("e2e.sqlite");
+    let database_url = db_path.display().to_string();
+
+    let ctx = build_rebalancing_ctx(
+        &chain,
+        &broker,
+        &db_path,
+        current_block,
+        &[("AAPL", vault_addr, underlying_addr)],
+        UsdcRebalancing::Disabled,
+        Some(redemption_wallet),
+    )?;
+    let bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // BuyEquity trades: equity accumulates onchain while the bot sells
+    // offchain to hedge, creating TooMuchOnchain equity imbalance.
+    let mut take_results = Vec::new();
+    for _ in 0..3 {
+        take_results.push(
+            chain
+                .take_order("AAPL", "7.5", TakeDirection::BuyEquity)
+                .await?,
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Wait for: hedging + inventory poller + trigger evaluation +
+    // redemption pipeline (withdraw + unwrap + send + detection + completion)
+    wait_for_processing(&bot, 40).await;
+
+    // ── Layer 1: Full hedging pipeline (broker + vaults + CQRS) ──────
+    let scenario = E2eScenario {
+        symbol: "AAPL",
+        amount: "22.5",
+        direction: TakeDirection::BuyEquity,
+        fill_price: "150.00",
+        expected_accumulated_long: "22.5",
+        expected_accumulated_short: "0",
+        expected_net: "0",
+    };
+
+    assert_full_pipeline(
+        &[scenario],
+        &take_results,
+        &chain.provider,
+        chain.orderbook_addr,
+        chain.owner,
+        &broker,
+        &database_url,
+    )
+    .await?;
+
+    // ── Layer 2: Inventory snapshots ─────────────────────────────────
+    let pool = connect_db(&db_path).await?;
+
+    let inventory_events = count_events(&pool, "InventorySnapshot").await?;
+    assert!(
+        inventory_events >= 1,
+        "Expected at least 1 InventorySnapshot event, got {inventory_events}"
+    );
+
+    // ── Layer 3: Redemption pipeline (events) ────────────────────────
+    let redemption_events = fetch_events_by_type(&pool, "EquityRedemption").await?;
+    assert!(
+        !redemption_events.is_empty(),
+        "Expected at least 1 EquityRedemption event (redemption trigger fired), got 0"
+    );
+
+    assert_event_subsequence(
+        &redemption_events,
+        &[
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            "EquityRedemptionEvent::TokensUnwrapped",
+            "EquityRedemptionEvent::TokensSent",
+            "EquityRedemptionEvent::Detected",
+            "EquityRedemptionEvent::Completed",
+        ],
+    );
+
+    assert_single_clean_aggregate(&redemption_events, &["Failed", "Rejected"]);
+
+    // Verify the first event's payload contains the correct symbol.
+    let first_payload = &redemption_events[0].payload;
+    assert_eq!(
+        first_payload
+            .get("WithdrawnFromRaindex")
+            .and_then(|val| val.get("symbol"))
+            .and_then(|val| val.as_str()),
+        Some("AAPL"),
+        "First redemption event should be for AAPL, got: {first_payload}"
+    );
+
+    // ── Layer 3: Redemption pipeline (onchain) ───────────────────────
+    // The redemption pipeline sends underlying tokens to the redemption
+    // wallet. Verify the wallet received tokens.
+    let underlying_balance = IERC20::new(underlying_addr, &chain.provider)
+        .balanceOf(redemption_wallet)
+        .call()
+        .await?;
+    assert!(
+        underlying_balance > U256::ZERO,
+        "Redemption wallet should hold underlying tokens after redemption"
+    );
+
+    // ── Layer 3: Redemption pipeline (broker state) ──────────────────
+    let redeem_requests: Vec<_> = broker
+        .tokenization_requests()
+        .into_iter()
+        .filter(|req| req.request_type == "redeem")
+        .collect();
+    assert!(
+        !redeem_requests.is_empty(),
+        "Expected at least 1 redeem tokenization request on the broker"
+    );
+    assert!(
+        redeem_requests.iter().any(|req| req.status == "completed"),
+        "Expected at least one completed redeem request, got: {:?}",
+        redeem_requests
+            .iter()
+            .map(|r| &r.status)
+            .collect::<Vec<_>>(),
+    );
+
+    // ── Layer 3: Redemption pipeline (CQRS projection) ──────────────
+    // The equity_redemption_view projection stores the aggregate state.
+    // By this point the pipeline should have reached Completed.
+    let (payload_json,): (String,) =
+        sqlx::query_as("SELECT payload FROM equity_redemption_view LIMIT 1")
+            .fetch_one(&pool)
+            .await?;
+    let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+    let completed = payload.get("Completed").unwrap_or_else(|| {
+        panic!("equity_redemption_view payload should be Completed, got: {payload}")
+    });
+    assert_eq!(
+        completed.get("symbol").and_then(|val| val.as_str()),
+        Some("AAPL"),
+        "Completed redemption should be for AAPL, got: {completed}"
+    );
+
+    pool.close().await;
+    bot.abort();
     Ok(())
 }
 
@@ -230,12 +445,236 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 ///   -> BridgeAttestationReceived -> Bridged -> DepositInitiated
 ///   -> DepositConfirmed
 ///
-/// Requires: CCTP MessageTransmitter and TokenMessenger contracts on both
-/// Ethereum and Base Anvil forks, plus a mock attestation service for
-/// cross-chain message verification.
+/// Infrastructure: Forks both Base and Ethereum mainnet via Anvil so CCTP
+/// contracts are live at production addresses. Adds a test attester to
+/// `MessageTransmitterV2` on both chains and runs a background watcher
+/// that auto-signs attestations for `MessageSent` events.
 #[tokio::test]
-#[ignore = "Requires CCTP bridge contracts and attestation mock for cross-chain USDC flow"]
 async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
+    // Fork both chains
+    let mut base_chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
+    let ethereum_chain = ethereum_chain::EthereumChain::start(ETHEREUM_RPC_URL).await?;
+
+    let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault("AAPL").await?;
+
+    // Set up test attester on both chains' MessageTransmitterV2
+    let attester_key = B256::random();
+    let attester_signer = PrivateKeySigner::from_bytes(&attester_key)?;
+    let attester_address = attester_signer.address();
+
+    cctp_attester::setup_test_attester(&base_chain.provider, attester_address).await?;
+    cctp_attester::setup_test_attester(&ethereum_chain.provider, attester_address).await?;
+
+    // Start CCTP attestation mock with background watcher
+    let attestation_mock = CctpAttestationMock::start().await;
+    let _attestation_watcher = attestation_mock.start_watcher(
+        ethereum_chain.provider.clone(),
+        base_chain.provider.clone(),
+        attester_key,
+    );
+
+    // Start broker mock with wallet + tokenization endpoints
+    let broker = AlpacaBrokerMock::start()
+        .with_fill_price("150.00")
+        .build()
+        .await;
+    broker.register_tokenization_endpoints();
+    broker.register_wallet_endpoints(base_chain.owner);
+
+    // Create a USDC vault on Raindex (deposit destination for bridged USDC)
+    let usdc_amount: U256 = parse_units("10000", 6)?.into();
+    let usdc_vault_id = base_chain.create_usdc_vault(usdc_amount).await?;
+
+    let current_block = base_chain.provider.get_block_number().await?;
+    let db_dir = tempfile::tempdir()?;
+    let db_path = db_dir.path().join("e2e.sqlite");
+    let database_url = db_path.display().to_string();
+
+    let ctx = build_usdc_rebalancing_ctx(
+        &base_chain,
+        &ethereum_chain,
+        &broker,
+        &attestation_mock.base_url(),
+        &db_path,
+        current_block,
+        &[("AAPL", vault_addr, underlying_addr)],
+        usdc_vault_id,
+    )?;
+    let bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // BuyEquity trades: bot spends USDC onchain (to buy equity), receives
+    // USDC offchain (from selling equity on broker). Creates TooMuchOffchain
+    // USDC imbalance triggering AlpacaToBase direction.
+    let mut take_results = Vec::new();
+    for _ in 0..3 {
+        take_results.push(
+            base_chain
+                .take_order("AAPL", "7.5", TakeDirection::BuyEquity)
+                .await?,
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Wait for: hedging + inventory poller + trigger + full USDC pipeline
+    // (conversion + withdrawal + bridge + deposit)
+    wait_for_processing(&bot, 60).await;
+
+    // ── Layer 1: Full hedging pipeline (broker + vaults + CQRS) ──────
+    let scenario = E2eScenario {
+        symbol: "AAPL",
+        amount: "22.5",
+        direction: TakeDirection::BuyEquity,
+        fill_price: "150.00",
+        expected_accumulated_long: "22.5",
+        expected_accumulated_short: "0",
+        expected_net: "0",
+    };
+
+    assert_full_pipeline(
+        &[scenario],
+        &take_results,
+        &base_chain.provider,
+        base_chain.orderbook_addr,
+        base_chain.owner,
+        &broker,
+        &database_url,
+    )
+    .await?;
+
+    // ── Layer 2: Inventory snapshots ─────────────────────────────────
+    let pool = connect_db(&db_path).await?;
+
+    let inventory_events = count_events(&pool, "InventorySnapshot").await?;
+    assert!(
+        inventory_events >= 1,
+        "Expected at least 1 InventorySnapshot event, got {inventory_events}"
+    );
+
+    // ── Layer 3: USDC rebalance pipeline (events) ────────────────────
+    let usdc_events = fetch_events_by_type(&pool, "UsdcRebalance").await?;
+    assert!(
+        !usdc_events.is_empty(),
+        "Expected at least 1 UsdcRebalance event (USDC trigger fired), got 0"
+    );
+
+    // Verify the AlpacaToBase pipeline stages fired in order.
+    // Conversion happens first (USD -> USDC), then withdrawal + bridge + deposit.
+    assert_event_subsequence(
+        &usdc_events,
+        &[
+            "UsdcRebalanceEvent::ConversionInitiated",
+            "UsdcRebalanceEvent::ConversionConfirmed",
+            "UsdcRebalanceEvent::Initiated",
+            "UsdcRebalanceEvent::WithdrawalConfirmed",
+            "UsdcRebalanceEvent::BridgingInitiated",
+            "UsdcRebalanceEvent::BridgeAttestationReceived",
+            "UsdcRebalanceEvent::Bridged",
+            "UsdcRebalanceEvent::DepositInitiated",
+            "UsdcRebalanceEvent::DepositConfirmed",
+        ],
+    );
+
+    assert_single_clean_aggregate(&usdc_events, &["Failed"]);
+
+    // Verify the Initiated event payload records AlpacaToBase direction.
+    let initiated_event = usdc_events
+        .iter()
+        .find(|event| event.event_type == "UsdcRebalanceEvent::Initiated")
+        .expect("Missing Initiated event");
+    let initiated_payload = initiated_event
+        .payload
+        .get("Initiated")
+        .expect("Initiated event payload missing Initiated wrapper");
+    assert_eq!(
+        initiated_payload
+            .get("direction")
+            .and_then(|val| val.as_str()),
+        Some("AlpacaToBase"),
+        "Initiated event should record AlpacaToBase direction, got: {initiated_payload}"
+    );
+
+    // Verify the Bridged event records a nonzero amount received.
+    let bridged_event = usdc_events
+        .iter()
+        .find(|event| event.event_type == "UsdcRebalanceEvent::Bridged")
+        .expect("Missing Bridged event");
+    let bridged_payload = bridged_event
+        .payload
+        .get("Bridged")
+        .expect("Bridged event payload missing Bridged wrapper");
+    let amount_received = bridged_payload
+        .get("amount_received")
+        .and_then(|val| val.as_str())
+        .expect("Bridged event missing amount_received");
+    assert_ne!(
+        amount_received, "0",
+        "Bridged amount_received should be nonzero"
+    );
+
+    // ── Layer 3: USDC rebalance pipeline (broker state) ──────────────
+    // AlpacaToBase conversion: USD -> USDC = buy USDCUSD.
+    let usdcusd_orders: Vec<_> = broker
+        .orders()
+        .into_iter()
+        .filter(|order| order.symbol == "USDCUSD")
+        .collect();
+    assert!(
+        !usdcusd_orders.is_empty(),
+        "Expected a USDCUSD conversion order on the broker"
+    );
+    assert!(
+        usdcusd_orders.iter().any(|order| order.side == "buy"),
+        "AlpacaToBase conversion should be a buy (USD -> USDC), got sides: {:?}",
+        usdcusd_orders.iter().map(|o| &o.side).collect::<Vec<_>>(),
+    );
+
+    // AlpacaToBase direction: bot requests withdrawal from Alpaca wallet.
+    let wallet_transfers = broker.wallet_transfers();
+    let outgoing_transfers: Vec<_> = wallet_transfers
+        .iter()
+        .filter(|transfer| transfer.direction == "OUTGOING")
+        .collect();
+    assert!(
+        !outgoing_transfers.is_empty(),
+        "Expected at least 1 OUTGOING wallet transfer (Alpaca withdrawal)"
+    );
+    assert!(
+        outgoing_transfers
+            .iter()
+            .all(|transfer| transfer.status == "COMPLETE"),
+        "All OUTGOING wallet transfers should be COMPLETE, got: {:?}",
+        outgoing_transfers
+            .iter()
+            .map(|t| &t.status)
+            .collect::<Vec<_>>(),
+    );
+
+    // AlpacaToBase should NOT have any incoming transfers.
+    assert!(
+        !wallet_transfers
+            .iter()
+            .any(|transfer| transfer.direction == "INCOMING"),
+        "AlpacaToBase should not have INCOMING wallet transfers"
+    );
+
+    // ── Layer 3: USDC rebalance pipeline (onchain) ───────────────────
+    // The USDC vault on Raindex should reflect the bridge deposit.
+    let orderbook =
+        IOrderBookV5::IOrderBookV5Instance::new(base_chain.orderbook_addr, &base_chain.provider);
+    let vault_balance = orderbook
+        .vaultBalance2(base_chain.owner, USDC_BASE, usdc_vault_id)
+        .call()
+        .await?;
+    assert_ne!(
+        vault_balance,
+        B256::ZERO,
+        "USDC vault should have a nonzero balance after AlpacaToBase rebalance"
+    );
+
+    pool.close().await;
+    bot.abort();
     Ok(())
 }
 
@@ -251,9 +690,237 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 ///   -> BridgeAttestationReceived -> Bridged -> DepositInitiated
 ///   -> DepositConfirmed -> ConversionInitiated -> ConversionConfirmed
 ///
-/// Requires: Same CCTP infrastructure as `usdc_imbalance_triggers_alpaca_to_base`.
+/// Infrastructure: Same as `usdc_imbalance_triggers_alpaca_to_base` but the
+/// Raindex USDC vault is pre-funded so the bot can withdraw from it.
 #[tokio::test]
-#[ignore = "Requires CCTP bridge contracts and attestation mock for cross-chain USDC flow"]
 async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
+    // Fork both chains
+    let mut base_chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
+    let ethereum_chain = ethereum_chain::EthereumChain::start(ETHEREUM_RPC_URL).await?;
+
+    let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault("AAPL").await?;
+
+    // Set up test attester on both chains' MessageTransmitterV2
+    let attester_key = B256::random();
+    let attester_signer = PrivateKeySigner::from_bytes(&attester_key)?;
+    let attester_address = attester_signer.address();
+
+    cctp_attester::setup_test_attester(&base_chain.provider, attester_address).await?;
+    cctp_attester::setup_test_attester(&ethereum_chain.provider, attester_address).await?;
+
+    // Start CCTP attestation mock with background watcher
+    let attestation_mock = CctpAttestationMock::start().await;
+    let _attestation_watcher = attestation_mock.start_watcher(
+        ethereum_chain.provider.clone(),
+        base_chain.provider.clone(),
+        attester_key,
+    );
+
+    // Start broker mock with wallet + tokenization endpoints
+    let broker = AlpacaBrokerMock::start()
+        .with_fill_price("150.00")
+        .build()
+        .await;
+    broker.register_tokenization_endpoints();
+    broker.register_wallet_endpoints(base_chain.owner);
+
+    // Pre-fund the USDC vault so the bot can withdraw from it.
+    // BaseToAlpaca direction: bot withdraws USDC from Raindex, bridges to
+    // Ethereum, deposits to Alpaca.
+    let usdc_amount: U256 = parse_units("100000", 6)?.into();
+    let usdc_vault_id = base_chain.create_usdc_vault(usdc_amount).await?;
+
+    let current_block = base_chain.provider.get_block_number().await?;
+    let db_dir = tempfile::tempdir()?;
+    let db_path = db_dir.path().join("e2e.sqlite");
+    let database_url = db_path.display().to_string();
+
+    let ctx = build_usdc_rebalancing_ctx(
+        &base_chain,
+        &ethereum_chain,
+        &broker,
+        &attestation_mock.base_url(),
+        &db_path,
+        current_block,
+        &[("AAPL", vault_addr, underlying_addr)],
+        usdc_vault_id,
+    )?;
+    let bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // SellEquity trades: bot receives USDC onchain (from selling equity),
+    // spends USDC offchain (buying equity on broker to hedge). Creates
+    // TooMuchOnchain USDC imbalance triggering BaseToAlpaca direction.
+    let mut take_results = Vec::new();
+    for _ in 0..3 {
+        take_results.push(
+            base_chain
+                .take_order("AAPL", "7.5", TakeDirection::SellEquity)
+                .await?,
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Wait for: hedging + inventory poller + trigger + full USDC pipeline
+    // (withdraw from Raindex + bridge + deposit to Alpaca + conversion)
+    wait_for_processing(&bot, 60).await;
+
+    // ── Layer 1: Full hedging pipeline (broker + vaults + CQRS) ──────
+    let scenario = E2eScenario {
+        symbol: "AAPL",
+        amount: "22.5",
+        direction: TakeDirection::SellEquity,
+        fill_price: "150.00",
+        expected_accumulated_long: "0",
+        expected_accumulated_short: "22.5",
+        expected_net: "0",
+    };
+
+    assert_full_pipeline(
+        &[scenario],
+        &take_results,
+        &base_chain.provider,
+        base_chain.orderbook_addr,
+        base_chain.owner,
+        &broker,
+        &database_url,
+    )
+    .await?;
+
+    // ── Layer 2: Inventory snapshots ─────────────────────────────────
+    let pool = connect_db(&db_path).await?;
+
+    let inventory_events = count_events(&pool, "InventorySnapshot").await?;
+    assert!(
+        inventory_events >= 1,
+        "Expected at least 1 InventorySnapshot event, got {inventory_events}"
+    );
+
+    // ── Layer 3: USDC rebalance pipeline (events) ────────────────────
+    let usdc_events = fetch_events_by_type(&pool, "UsdcRebalance").await?;
+    assert!(
+        !usdc_events.is_empty(),
+        "Expected at least 1 UsdcRebalance event (USDC trigger fired), got 0"
+    );
+
+    // Verify the BaseToAlpaca pipeline stages fired in order.
+    // Withdrawal + bridge happen first, then conversion (USDC -> USD) at the end.
+    assert_event_subsequence(
+        &usdc_events,
+        &[
+            "UsdcRebalanceEvent::Initiated",
+            "UsdcRebalanceEvent::WithdrawalConfirmed",
+            "UsdcRebalanceEvent::BridgingInitiated",
+            "UsdcRebalanceEvent::BridgeAttestationReceived",
+            "UsdcRebalanceEvent::Bridged",
+            "UsdcRebalanceEvent::DepositInitiated",
+            "UsdcRebalanceEvent::DepositConfirmed",
+            "UsdcRebalanceEvent::ConversionInitiated",
+            "UsdcRebalanceEvent::ConversionConfirmed",
+        ],
+    );
+
+    assert_single_clean_aggregate(&usdc_events, &["Failed"]);
+
+    // Verify the Initiated event payload records BaseToAlpaca direction.
+    let initiated_event = usdc_events
+        .iter()
+        .find(|event| event.event_type == "UsdcRebalanceEvent::Initiated")
+        .expect("Missing Initiated event");
+    let initiated_payload = initiated_event
+        .payload
+        .get("Initiated")
+        .expect("Initiated event payload missing Initiated wrapper");
+    assert_eq!(
+        initiated_payload
+            .get("direction")
+            .and_then(|val| val.as_str()),
+        Some("BaseToAlpaca"),
+        "Initiated event should record BaseToAlpaca direction, got: {initiated_payload}"
+    );
+
+    // Verify the Bridged event records a nonzero amount received.
+    let bridged_event = usdc_events
+        .iter()
+        .find(|event| event.event_type == "UsdcRebalanceEvent::Bridged")
+        .expect("Missing Bridged event");
+    let bridged_payload = bridged_event
+        .payload
+        .get("Bridged")
+        .expect("Bridged event payload missing Bridged wrapper");
+    let amount_received = bridged_payload
+        .get("amount_received")
+        .and_then(|val| val.as_str())
+        .expect("Bridged event missing amount_received");
+    assert_ne!(
+        amount_received, "0",
+        "Bridged amount_received should be nonzero"
+    );
+
+    // ── Layer 3: USDC rebalance pipeline (broker state) ──────────────
+    // BaseToAlpaca conversion: USDC -> USD = sell USDCUSD.
+    let usdcusd_orders: Vec<_> = broker
+        .orders()
+        .into_iter()
+        .filter(|order| order.symbol == "USDCUSD")
+        .collect();
+    assert!(
+        !usdcusd_orders.is_empty(),
+        "Expected a USDCUSD conversion order on the broker"
+    );
+    assert!(
+        usdcusd_orders.iter().any(|order| order.side == "sell"),
+        "BaseToAlpaca conversion should be a sell (USDC -> USD), got sides: {:?}",
+        usdcusd_orders.iter().map(|o| &o.side).collect::<Vec<_>>(),
+    );
+
+    // BaseToAlpaca direction: bot deposits USDC into Alpaca wallet.
+    let wallet_transfers = broker.wallet_transfers();
+    let incoming_transfers: Vec<_> = wallet_transfers
+        .iter()
+        .filter(|transfer| transfer.direction == "INCOMING")
+        .collect();
+    assert!(
+        !incoming_transfers.is_empty(),
+        "Expected at least 1 INCOMING wallet transfer (Alpaca deposit)"
+    );
+    assert!(
+        incoming_transfers
+            .iter()
+            .all(|transfer| transfer.status == "COMPLETE"),
+        "All INCOMING wallet transfers should be COMPLETE, got: {:?}",
+        incoming_transfers
+            .iter()
+            .map(|t| &t.status)
+            .collect::<Vec<_>>(),
+    );
+
+    // BaseToAlpaca should NOT have any outgoing transfers.
+    assert!(
+        !wallet_transfers
+            .iter()
+            .any(|transfer| transfer.direction == "OUTGOING"),
+        "BaseToAlpaca should not have OUTGOING wallet transfers"
+    );
+
+    // ── Layer 3: USDC rebalance pipeline (onchain) ───────────────────
+    // BaseToAlpaca direction: USDC was withdrawn from the Raindex vault,
+    // so the balance should be less than the initial deposit. We verify
+    // the vault still has some balance (not fully drained).
+    let orderbook =
+        IOrderBookV5::IOrderBookV5Instance::new(base_chain.orderbook_addr, &base_chain.provider);
+    let vault_balance = orderbook
+        .vaultBalance2(base_chain.owner, USDC_BASE, usdc_vault_id)
+        .call()
+        .await?;
+    assert_ne!(
+        vault_balance,
+        B256::ZERO,
+        "USDC vault should still have some balance (not fully drained)"
+    );
+
+    pool.close().await;
+    bot.abort();
     Ok(())
 }

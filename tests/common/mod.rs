@@ -29,6 +29,7 @@ use super::services::alpaca_broker::{
     self, AlpacaBrokerMock, MockOrderSnapshot, MockPositionSnapshot,
 };
 use super::services::base_chain::{self, TakeDirection, TakeOrderResult};
+use super::services::ethereum_chain;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -147,6 +148,7 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
     deployment_block: u64,
     equity_tokens: &[(&str, Address, Address)],
     usdc_rebalancing: UsdcRebalancing,
+    redemption_wallet: Option<Address>,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: alpaca_broker::TEST_API_KEY.to_owned(),
@@ -175,9 +177,11 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
             deviation: Decimal::new(1, 1),
         },
         usdc: usdc_rebalancing,
-        redemption_wallet: Address::random(),
+        redemption_wallet: redemption_wallet.unwrap_or_else(Address::random),
         usdc_vault_id: B256::random(),
         equities,
+        circle_api_base: None,
+        required_confirmations: None,
     };
 
     // Use the chain owner's private key so that `Ctx::order_owner()`
@@ -738,4 +742,185 @@ async fn assert_offchain_order_views(
     }
 
     Ok(())
+}
+
+// ── Rebalancing helpers ─────────────────────────────────────────────
+
+/// Fetches events for a specific aggregate type, ordered by insertion.
+pub async fn fetch_events_by_type(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+) -> anyhow::Result<Vec<StoredEvent>> {
+    let events: Vec<StoredEvent> = sqlx::query_as(
+        "SELECT aggregate_type, aggregate_id, event_type, payload \
+         FROM events \
+         WHERE aggregate_type = ? \
+         ORDER BY rowid ASC",
+    )
+    .bind(aggregate_type)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(events)
+}
+
+/// Asserts that events contain the expected event types as an ordered
+/// subsequence (types appear in order, but gaps are allowed between them).
+///
+/// # Panics
+///
+/// Panics if the expected sequence is not found in the events.
+pub fn assert_event_subsequence(events: &[StoredEvent], expected_types: &[&str]) {
+    let mut expected_iter = expected_types.iter().peekable();
+
+    for event in events {
+        if let Some(expected) = expected_iter.peek() {
+            if event.event_type == **expected {
+                expected_iter.next();
+            }
+        }
+    }
+
+    let remaining: Vec<&&str> = expected_iter.collect();
+    assert!(
+        remaining.is_empty(),
+        "Event subsequence not found.\n  Expected types: {expected_types:?}\n  \
+         Actual event types: {:?}\n  Missing: {remaining:?}",
+        events
+            .iter()
+            .map(|event| &event.event_type)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Asserts that exactly one rebalancing aggregate exists for the given type
+/// and that no error events were emitted.
+///
+/// This catches two classes of bugs:
+/// - **Duplicate triggers**: If the trigger fires twice, two aggregates are
+///   created. The subsequence check on combined events could hide the second
+///   aggregate's failure.
+/// - **Silent errors**: If the pipeline produces error events alongside
+///   success events (e.g. a retry that fails then succeeds), the subsequence
+///   check passes but the error goes unnoticed.
+///
+/// `error_substrings` are patterns that indicate error event types
+/// (e.g. "Failed", "Rejected").
+pub fn assert_single_clean_aggregate(events: &[StoredEvent], error_substrings: &[&str]) {
+    // Exactly one distinct aggregate ID
+    let aggregate_ids: std::collections::HashSet<&str> = events
+        .iter()
+        .map(|event| event.aggregate_id.as_str())
+        .collect();
+    assert_eq!(
+        aggregate_ids.len(),
+        1,
+        "Expected exactly 1 rebalancing aggregate, got {}: {aggregate_ids:?}",
+        aggregate_ids.len(),
+    );
+
+    // No error events
+    let error_events: Vec<&StoredEvent> = events
+        .iter()
+        .filter(|event| {
+            error_substrings
+                .iter()
+                .any(|sub| event.event_type.contains(sub))
+        })
+        .collect();
+    assert!(
+        error_events.is_empty(),
+        "Expected no error events, found: {:?}",
+        error_events
+            .iter()
+            .map(|event| &event.event_type)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Builds a `Ctx` with USDC rebalancing enabled and both chain endpoints.
+///
+/// Key differences from `build_rebalancing_ctx`:
+/// - `RebalancingSecrets.ethereum_rpc_url` points to the Ethereum fork
+/// - `UsdcRebalancing::Enabled` with aggressive thresholds for testing
+/// - `circle_api_base` overridden to point at the attestation mock
+/// - `required_confirmations` set to 1 for Anvil single-node chains
+/// - `usdc_vault_id` from parameter (must match a real Raindex vault)
+pub fn build_usdc_rebalancing_ctx<BP, EP>(
+    base_chain: &base_chain::BaseChain<BP>,
+    ethereum_chain: &ethereum_chain::EthereumChain<EP>,
+    broker: &AlpacaBrokerMock,
+    attestation_base_url: &str,
+    db_path: &std::path::Path,
+    deployment_block: u64,
+    equity_tokens: &[(&str, Address, Address)],
+    usdc_vault_id: B256,
+) -> anyhow::Result<Ctx>
+where
+    BP: Provider + Clone,
+    EP: Provider + Clone,
+{
+    let alpaca_auth = AlpacaBrokerApiCtx {
+        api_key: alpaca_broker::TEST_API_KEY.to_owned(),
+        api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
+        account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+        mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
+        asset_cache_ttl: Duration::from_secs(3600),
+        time_in_force: TimeInForce::Day,
+    };
+    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
+    let execution_threshold = broker_ctx.execution_threshold()?;
+
+    let equities: HashMap<Symbol, EquityTokenAddresses> = equity_tokens
+        .iter()
+        .map(|&(symbol, wrapped, unwrapped)| {
+            Ok((
+                Symbol::new(symbol)?,
+                EquityTokenAddresses { wrapped, unwrapped },
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    let config = RebalancingConfig {
+        equity: ImbalanceThreshold {
+            target: Decimal::new(5, 1),
+            deviation: Decimal::new(1, 1),
+        },
+        usdc: UsdcRebalancing::Enabled {
+            target: Decimal::new(5, 1),
+            deviation: Decimal::new(1, 1),
+        },
+        redemption_wallet: Address::random(),
+        usdc_vault_id,
+        equities,
+        circle_api_base: Some(attestation_base_url.to_string()),
+        required_confirmations: Some(1),
+    };
+
+    let secrets = RebalancingSecrets {
+        ethereum_rpc_url: ethereum_chain.ws_endpoint()?,
+        evm_private_key: base_chain.owner_key,
+    };
+
+    let rebalancing_ctx = st0x_hedge::RebalancingCtx::new(config, secrets, alpaca_auth)?;
+
+    Ok(Ctx {
+        database_url: db_path.display().to_string(),
+        log_level: LogLevel::Debug,
+        server_port: 0,
+        evm: EvmCtx {
+            ws_rpc_url: base_chain.ws_endpoint()?,
+            orderbook: base_chain.orderbook_addr,
+            order_owner: Some(base_chain.owner),
+            deployment_block,
+        },
+        order_polling_interval: 1,
+        order_polling_max_jitter: 0,
+        position_check_interval: 2,
+        inventory_poll_interval: 2,
+        broker: broker_ctx,
+        telemetry: None,
+        rebalancing: Some(rebalancing_ctx),
+        execution_threshold,
+    })
 }

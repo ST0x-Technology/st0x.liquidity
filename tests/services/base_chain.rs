@@ -225,6 +225,43 @@ impl<P: Provider + Clone> BaseChain<P> {
         Ok((vault_addr, underlying_addr))
     }
 
+    /// Returns the HTTP endpoint URL for the Anvil node.
+    pub fn endpoint(&self) -> String {
+        self.anvil.endpoint()
+    }
+
+    /// Creates a USDC vault on the Raindex OrderBook and returns the vault ID.
+    ///
+    /// Deposits `amount` USDC (6-decimal raw units) into a fresh vault.
+    /// Used by USDC rebalancing tests so the bot has a known vault to
+    /// withdraw from (BaseToAlpaca) or deposit into (AlpacaToBase).
+    pub async fn create_usdc_vault(&self, amount: U256) -> anyhow::Result<B256> {
+        let orderbook =
+            IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.provider);
+        let vault_id = B256::random();
+
+        // Over-approve for Rain float precision rounding
+        IERC20::new(USDC_BASE, &self.provider)
+            .approve(*orderbook.address(), amount * U256::from(2))
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        let deposit_float = Float::from_fixed_decimal_lossy(amount, 6)
+            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+            .get_inner();
+
+        orderbook
+            .deposit3(USDC_BASE, vault_id, deposit_float, vec![])
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(vault_id)
+    }
+
     /// Funds the market maker wallet (derived from `[1u8; 32]`) with ETH
     /// for gas and returns its address.
     pub async fn fund_market_maker(&self) -> anyhow::Result<Address> {
