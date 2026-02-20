@@ -16,6 +16,7 @@ pub(crate) struct MockWrapper {
     ratio: U256,
     wrap_fails: bool,
     unwrap_fails: bool,
+    lookup_fails: bool,
 }
 
 impl MockWrapper {
@@ -28,6 +29,7 @@ impl MockWrapper {
             ratio: RATIO_ONE,
             wrap_fails: false,
             unwrap_fails: false,
+            lookup_fails: false,
         }
     }
 
@@ -41,7 +43,14 @@ impl MockWrapper {
             ratio,
             wrap_fails: false,
             unwrap_fails: false,
+            lookup_fails: false,
         }
+    }
+
+    /// Sets the address returned by `lookup_unwrapped`.
+    pub(crate) fn with_unwrapped_token(mut self, token: Address) -> Self {
+        self.unwrapped_token = token;
+        self
     }
 
     /// Creates a mock wrapper that fails on wrap operations.
@@ -54,6 +63,7 @@ impl MockWrapper {
             ratio: RATIO_ONE,
             wrap_fails: true,
             unwrap_fails: false,
+            lookup_fails: false,
         }
     }
 
@@ -67,6 +77,21 @@ impl MockWrapper {
             ratio: RATIO_ONE,
             wrap_fails: false,
             unwrap_fails: true,
+            lookup_fails: false,
+        }
+    }
+
+    /// Creates a mock wrapper that fails on underlying token lookup.
+    pub(crate) fn failing_lookup() -> Self {
+        Self {
+            owner: Address::random(),
+            unwrap_tx: TxHash::random(),
+            unwrapped_token: Address::random(),
+            wrapped_token: Address::random(),
+            ratio: RATIO_ONE,
+            wrap_fails: false,
+            unwrap_fails: false,
+            lookup_fails: true,
         }
     }
 }
@@ -80,7 +105,10 @@ impl Wrapper for MockWrapper {
         Ok(UnderlyingPerWrapped::new(self.ratio).expect("ratio is non-zero"))
     }
 
-    fn lookup_unwrapped(&self, _symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_unwrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+        if self.lookup_fails {
+            return Err(WrapperError::SymbolNotConfigured(symbol.clone()));
+        }
         Ok(self.unwrapped_token)
     }
 

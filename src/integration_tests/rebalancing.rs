@@ -348,7 +348,16 @@ fn build_equity_transfer(
     raindex: Arc<dyn Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
 ) -> Arc<CrossVenueEquityTransfer> {
-    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(MockWrapper::new());
+    build_equity_transfer_with_wrapper(pool, raindex, tokenizer, MockWrapper::new())
+}
+
+fn build_equity_transfer_with_wrapper(
+    pool: &SqlitePool,
+    raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    tokenizer: Arc<dyn Tokenizer>,
+    mock_wrapper: MockWrapper,
+) -> Arc<CrossVenueEquityTransfer> {
+    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
 
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
@@ -619,7 +628,9 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new().with_token(token_address));
-    let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer);
+    let wrapper = MockWrapper::new().with_unwrapped_token(token_address);
+    let equity_transfer =
+        build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper);
 
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
