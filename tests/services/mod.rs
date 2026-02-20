@@ -1,13 +1,13 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
 use rust_decimal::Decimal;
 use st0x_execution::Symbol;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use crate::services::alpaca_broker::AlpacaBrokerMock;
-use crate::services::alpaca_tokenization::AlpacaTokenizationMock;
-use crate::services::base_chain::BaseChain;
+use crate::services::alpaca_broker::{AlpacaBrokerMock, MockPosition};
+use crate::services::alpaca_tokenization::{AlpacaTokenizationMock, REDEMPTION_WALLET};
+use crate::services::base_chain::{BaseChain, DeployableERC20};
 use crate::services::cctp_attestation::CctpAttestationMock;
 use crate::services::ethereum_chain::EthereumChain;
 
@@ -37,30 +37,56 @@ pub struct TestInfra<P1, P2> {
 
 impl TestInfra<(), ()> {
     pub async fn start(
-        equities: Vec<(&str, Decimal)>,
+        equity_prices: Vec<(&str, Decimal)>,
+        equity_positions: Vec<(&str, Decimal)>,
     ) -> anyhow::Result<TestInfra<impl Provider + Clone, impl Provider + Clone>> {
         let db_dir = tempfile::tempdir()?;
         let db_path = db_dir.path().join("e2e.sqlite");
 
         let mut base_chain = BaseChain::start(BASE_RPC_URL).await?;
         let mut equity_addresses = Vec::new();
-        for (symbol, _price) in &equities {
+        for (symbol, _price) in &equity_prices {
             let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
             equity_addresses.push(((*symbol).to_owned(), vault_addr, underlying_addr));
         }
 
+        // Fund taker with equity vault shares so it can take BuyEquity
+        // orders (where the taker pays equity tokens to the order).
+        let taker_equity: U256 = parse_units("100000", 18)?.into();
+        for (_symbol, vault_addr, _underlying_addr) in &equity_addresses {
+            DeployableERC20::new(*vault_addr, &base_chain.provider)
+                .transfer(base_chain.taker, taker_equity)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+        }
+
         let ethereum_chain = EthereumChain::start(ETHEREUM_RPC_URL).await?;
 
-        let symbol_prices: Vec<(Symbol, Decimal)> = equities
+        let symbol_prices: Vec<(Symbol, Decimal)> = equity_prices
             .iter()
             .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
             .collect::<anyhow::Result<_>>()?;
 
+        let symbol_positions: Vec<MockPosition> = equity_positions
+            .iter()
+            .enumerate()
+            .map(|(i, (symbol, qty))| MockPosition {
+                symbol: Symbol::new(*symbol).expect("valid symbol"),
+                qty: *qty,
+                market_value: qty * symbol_prices[i].1,
+            })
+            .collect();
+
         let broker_service = AlpacaBrokerMock::start()
             .symbol_fill_prices(symbol_prices)
+            .symbol_positions(symbol_positions)
             .call()
             .await;
-        let tokenization_service = AlpacaTokenizationMock::start(broker_service.server());
+        let mut tokenization_service = AlpacaTokenizationMock::start(broker_service.server());
+        tokenization_service
+            .start_redemption_watcher(base_chain.provider.clone(), REDEMPTION_WALLET)?;
         let attestation_service = CctpAttestationMock::start().await;
 
         Ok(TestInfra {

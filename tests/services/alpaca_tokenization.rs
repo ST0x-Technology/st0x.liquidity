@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, address};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
@@ -29,6 +29,8 @@ sol! {
     #[sol(all_derives = true)]
     event Transfer(address indexed from, address indexed to, uint256 value);
 }
+
+pub const REDEMPTION_WALLET: Address = address!("0x1234567890123456789012345678901234567890");
 
 /// A mock tokenization request tracked in shared state.
 struct MockTokenizationRequest {
@@ -68,6 +70,7 @@ pub struct MockTokenizationRequestSnapshot {
 /// which updates as mint/redeem requests are created and polled.
 pub struct AlpacaTokenizationMock {
     state: Arc<Mutex<TokenizationState>>,
+    redemption_watcher: Option<JoinHandle<()>>,
 }
 
 impl AlpacaTokenizationMock {
@@ -80,19 +83,12 @@ impl AlpacaTokenizationMock {
         }));
 
         register_mint_endpoint(server, &state);
-        register_tokenization_requests_endpoint(server, &state);
+        register_tokenization_requests_with_filter_endpoint(server, &state);
 
-        Self { state }
-    }
-
-    /// Registers tokenization endpoints that also support redemption queries.
-    ///
-    /// Unlike the default endpoints from `start()`, this version filters by
-    /// `type` query param (mint vs redeem) and supports adding redemption
-    /// entries externally.
-    pub fn register_redemption_tokenization_endpoints(&self, server: &MockServer) {
-        register_mint_endpoint(server, &self.state);
-        register_tokenization_requests_with_filter_endpoint(server, &self.state);
+        Self {
+            state,
+            redemption_watcher: None,
+        }
     }
 
     /// Adds a redemption tokenization request to the mock state.
@@ -128,13 +124,13 @@ impl AlpacaTokenizationMock {
     /// adds a redemption tokenization request to the mock state so the
     /// bot's `poll_for_redemption` call finds a matching entry.
     pub fn start_redemption_watcher<P: Provider + Clone + Send + Sync + 'static>(
-        &self,
+        &mut self,
         provider: P,
         redemption_wallet: Address,
-    ) -> JoinHandle<()> {
-        let state = Arc::clone(&self.state);
+    ) -> anyhow::Result<()> {
+        let state = self.state.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut last_block = provider.get_block_number().await.unwrap_or(0);
 
             loop {
@@ -200,7 +196,9 @@ impl AlpacaTokenizationMock {
 
                 last_block = current;
             }
-        })
+        });
+        self.redemption_watcher = Some(handle);
+        Ok(())
     }
 
     /// Returns a snapshot of all tokenization requests (mint + redeem).

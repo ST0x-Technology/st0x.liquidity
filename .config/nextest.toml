@@ -4,4 +4,4 @@
 [[profile.default.overrides]]
 filter = "kind(test)"
 slow-timeout = { period = "80s" }
-retries = { backoff = "exponential", count = 2, delay = "5s", jitter = true }
+#retries = { backoff = "exponential", count = 2, delay = "5s", jitter = true }

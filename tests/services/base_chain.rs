@@ -57,6 +57,17 @@ pub enum TakeDirection {
     NetZero,
 }
 
+/// An order that has been placed on the OrderBook and funded, ready to be
+/// taken by a separate account. Created by `setup_order()`, consumed by
+/// `take_prepared_order()`.
+pub struct PreparedOrder {
+    pub order: IOrderBookV5::OrderV4,
+    pub input_vault_id: B256,
+    pub output_vault_id: B256,
+    pub input_token: Address,
+    pub output_token: Address,
+}
+
 /// A forked Base chain running locally via Anvil, with the real Raindex
 /// OrderBook and a freshly deployed Rain expression stack for compiling
 /// order expressions.
@@ -68,6 +79,11 @@ pub struct BaseChain<P> {
     /// rebalancing tests where `Ctx::order_owner()` derives the address
     /// from `RebalancingSecrets.evm_private_key` instead of `evm.order_owner`.
     pub owner_key: B256,
+    /// Separate taker account (Anvil account #1) with its own provider
+    /// and nonce management. Used by rebalancing tests to avoid nonce
+    /// collisions with the bot's concurrent transactions from the owner.
+    pub taker: Address,
+    taker_provider: P,
     pub orderbook_addr: Address,
     deployer_addr: Address,
     interpreter_addr: Address,
@@ -130,11 +146,33 @@ impl BaseChain<()> {
 
         let deployer_addr = *deployer.address();
 
+        // Taker account (Anvil #1): separate wallet + provider so
+        // takeOrders3 calls don't share nonces with the owner.
+        let taker_key = B256::from_slice(&anvil.keys()[1].to_bytes());
+        let taker_signer = PrivateKeySigner::from_bytes(&taker_key)?;
+        let taker = taker_signer.address();
+        let taker_wallet = EthereumWallet::from(taker_signer);
+
+        let taker_provider = ProviderBuilder::new()
+            .wallet(taker_wallet)
+            .connect(&anvil.endpoint())
+            .await?;
+
+        // Fund taker with ETH for gas
+        let hundred_eth: U256 = parse_units("100", 18)?.into();
+        provider.anvil_set_balance(taker, hundred_eth).await?;
+
+        // Fund taker with USDC (for SellEquity takes where taker pays USDC)
+        let million_usdc: U256 = parse_units("1000000", 6)?.into();
+        mint_usdc(&provider, taker, million_usdc).await?;
+
         Ok(BaseChain {
             anvil,
             provider,
             owner,
             owner_key: key,
+            taker,
+            taker_provider,
             orderbook_addr: ORDERBOOK_BASE,
             deployer_addr,
             interpreter_addr,
@@ -292,7 +330,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get_receipt()
             .await?;
 
-        let deposit_float = Float::from_fixed_decimal_lossy(amount, decimals)
+        let deposit_float = Float::from_fixed_decimal(amount, decimals)
             .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
             .get_inner();
 
@@ -364,6 +402,199 @@ impl<P: Provider + Clone> BaseChain<P> {
             .await?;
 
         Ok(())
+    }
+
+    /// Creates and funds an order on the OrderBook without taking it.
+    ///
+    /// All transactions (addOrder3, approve, deposit3) are submitted from
+    /// the owner account. The returned `PreparedOrder` can later be taken
+    /// via `take_prepared_order()` from the taker account, avoiding nonce
+    /// collisions when the bot is also transacting from the owner.
+    #[builder]
+    pub async fn setup_order(
+        &self,
+        symbol: &str,
+        amount: Decimal,
+        price: Decimal,
+        direction: TakeDirection,
+    ) -> anyhow::Result<PreparedOrder> {
+        let equity_vault_addr = *self
+            .equity_tokens
+            .get(symbol)
+            .ok_or_else(|| anyhow::anyhow!("Equity token for {symbol} not deployed"))?;
+
+        let orderbook =
+            IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.provider);
+        let deployer_instance =
+            Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
+
+        let is_sell = matches!(direction, TakeDirection::SellEquity);
+        let usdc_total = amount * price;
+        let amount_str = format!("{amount:.6}");
+        let usdc_total_str = format!("{usdc_total:.6}");
+
+        let (input_token, output_token) = if is_sell {
+            (USDC_BASE, equity_vault_addr)
+        } else {
+            (equity_vault_addr, USDC_BASE)
+        };
+
+        let (max_amount_base, io_ratio_str) = if is_sell {
+            let base: U256 = parse_units(&amount_str, 18)?.into();
+            (base, price.to_string())
+        } else {
+            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
+            let reciprocal = dec!(1.0) / price;
+            (base, format!("{reciprocal}"))
+        };
+        let expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
+
+        let parsed_bytecode = deployer_instance
+            .parse2(Bytes::copy_from_slice(expression.as_bytes()))
+            .call()
+            .await?
+            .0;
+
+        let input_vault_id = B256::random();
+        let output_vault_id = B256::random();
+
+        let order_config = IOrderBookV5::OrderConfigV4 {
+            evaluable: IOrderBookV5::EvaluableV4 {
+                interpreter: self.interpreter_addr,
+                store: self.store_addr,
+                bytecode: Bytes::from(parsed_bytecode),
+            },
+            validInputs: vec![IOrderBookV5::IOV2 {
+                token: input_token,
+                vaultId: input_vault_id,
+            }],
+            validOutputs: vec![IOrderBookV5::IOV2 {
+                token: output_token,
+                vaultId: output_vault_id,
+            }],
+            nonce: B256::random(),
+            secret: B256::ZERO,
+            meta: Bytes::new(),
+        };
+
+        let add_receipt = orderbook
+            .addOrder3(order_config, vec![])
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        let add_event = add_receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| log.log_decode::<IOrderBookV5::AddOrderV3>().ok())
+            .ok_or_else(|| anyhow::anyhow!("AddOrderV3 event not found"))?;
+        let order = add_event.data().order.clone();
+
+        // Deposit output token into the order's output vault
+        let deposit_amount_str = if is_sell {
+            &amount_str
+        } else {
+            &usdc_total_str
+        };
+        let deposit_micro: U256 = parse_units(deposit_amount_str, 6)?.into();
+        let deposit_float = Float::from_fixed_decimal_lossy(deposit_micro, 6)
+            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+            .get_inner();
+
+        let deposit_approve: U256 = if is_sell {
+            let base: U256 = parse_units(&amount_str, 18)?.into();
+            base * U256::from(2)
+        } else {
+            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
+            base * U256::from(2)
+        };
+
+        DeployableERC20::new(output_token, &self.provider)
+            .approve(*orderbook.address(), deposit_approve)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        orderbook
+            .deposit3(output_token, output_vault_id, deposit_float, vec![])
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(PreparedOrder {
+            order,
+            input_vault_id,
+            output_vault_id,
+            input_token,
+            output_token,
+        })
+    }
+
+    /// Takes a previously prepared order using the taker account.
+    ///
+    /// All transactions (approve, takeOrders3) are submitted from the
+    /// taker account, which has its own provider and nonce management.
+    /// This avoids nonce collisions with the owner account that the bot
+    /// uses for concurrent rebalancing transactions.
+    pub async fn take_prepared_order(
+        &self,
+        prepared: &PreparedOrder,
+    ) -> anyhow::Result<TakeOrderResult> {
+        let orderbook =
+            IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.taker_provider);
+
+        // Approve taker's input token payment (taker pays input_token)
+        DeployableERC20::new(prepared.input_token, &self.taker_provider)
+            .approve(*orderbook.address(), U256::MAX / U256::from(2))
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        let take_config = IOrderBookV5::TakeOrdersConfigV4 {
+            minimumInput: B256::ZERO,
+            maximumInput: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
+                .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+                .get_inner(),
+            maximumIORatio: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
+                .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+                .get_inner(),
+            orders: vec![IOrderBookV5::TakeOrderConfigV4 {
+                order: prepared.order.clone(),
+                inputIOIndex: U256::from(0),
+                outputIOIndex: U256::from(0),
+                signedContext: vec![],
+            }],
+            data: Bytes::new(),
+        };
+
+        let take_receipt = orderbook
+            .takeOrders3(take_config)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        anyhow::ensure!(take_receipt.status(), "takeOrders3 reverted");
+
+        let take_log = take_receipt
+            .inner
+            .logs()
+            .iter()
+            .find(|log| log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
+            .ok_or_else(|| anyhow::anyhow!("TakeOrderV3 event not found"))?;
+
+        Ok(TakeOrderResult {
+            tx_hash: take_log.transaction_hash.unwrap_or_default(),
+            input_vault_id: prepared.input_vault_id,
+            output_vault_id: prepared.output_vault_id,
+            input_token: prepared.input_token,
+            output_token: prepared.output_token,
+        })
     }
 
     /// Creates an order on the OrderBook, takes it, and returns the result

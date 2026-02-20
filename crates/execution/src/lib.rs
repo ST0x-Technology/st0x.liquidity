@@ -99,6 +99,12 @@ impl Symbol {
         }
         Ok(Self(symbol))
     }
+    pub fn inner(&self) -> String {
+        self.0.clone()
+    }
+    pub fn force_new(symbol: String) -> Self {
+        Self(symbol)
+    }
 }
 
 impl<'de> Deserialize<'de> for Symbol {

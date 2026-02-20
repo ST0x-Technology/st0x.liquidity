@@ -346,9 +346,8 @@ fn build_equity_transfer(
     pool: &SqlitePool,
     raindex: Arc<dyn crate::onchain::raindex::Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn crate::wrapper::Wrapper>,
 ) -> Arc<CrossVenueEquityTransfer> {
-    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(MockWrapper::new());
-
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
         tokenizer: Arc::clone(&tokenizer),
@@ -409,7 +408,8 @@ async fn equity_offchain_imbalance_triggers_mint() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn crate::onchain::raindex::Raindex> = Arc::new(MockRaindex::new());
-    let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer);
+    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(MockWrapper::new());
+    let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer, wrapper);
 
     // json_body_includes acts as an implicit assertion: the mock only matches if
     // the request contains these exact fields. mint_mock.assert() below then
@@ -619,7 +619,9 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     );
     let raindex: Arc<dyn crate::onchain::raindex::Raindex> =
         Arc::new(MockRaindex::new().with_token(token_address));
-    let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer);
+    let wrapper: Arc<dyn crate::wrapper::Wrapper> =
+        Arc::new(MockWrapper::new().with_unwrapped_token(token_address));
+    let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer, wrapper);
 
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
@@ -963,7 +965,8 @@ async fn mint_api_failure_produces_rejected_event() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn crate::onchain::raindex::Raindex> = Arc::new(MockRaindex::new());
-    let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer);
+    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(MockWrapper::new());
+    let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer, wrapper);
 
     // Mock returns HTTP 500 for the mint request
     let mint_mock = server.mock(|when, then| {

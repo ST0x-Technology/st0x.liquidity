@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
+use approx::assert_relative_eq;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
@@ -31,6 +33,7 @@ use super::services::alpaca_broker::{
 use super::services::alpaca_tokenization::AlpacaTokenizationMock;
 use super::services::base_chain::{self, TakeDirection, TakeOrderResult};
 use super::services::ethereum_chain;
+use crate::assert_decimal_eq;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -129,7 +132,7 @@ pub fn build_ctx<P: Provider + Clone>(
         order_polling_interval: 1,
         order_polling_max_jitter: 0,
         position_check_interval: 2,
-        inventory_poll_interval: 15,
+        inventory_poll_interval: 2,
         broker: broker_ctx,
         telemetry: None,
         rebalancing: None,
@@ -155,7 +158,7 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
     broker: &AlpacaBrokerMock,
     db_path: &std::path::Path,
     deployment_block: u64,
-    equity_tokens: &[(&str, Address, Address)],
+    equity_tokens: &[(String, Address, Address)],
     usdc_rebalancing: UsdcRebalancing,
     redemption_wallet: Option<Address>,
 ) -> anyhow::Result<Ctx> {
@@ -172,7 +175,7 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
 
     let equities: HashMap<Symbol, EquityTokenAddresses> = equity_tokens
         .iter()
-        .map(|&(symbol, wrapped, unwrapped)| {
+        .map(|&(ref symbol, wrapped, unwrapped)| {
             Ok((
                 Symbol::new(symbol)?,
                 EquityTokenAddresses { wrapped, unwrapped },
@@ -182,8 +185,8 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
 
     let config = RebalancingConfig {
         equity: ImbalanceThreshold {
-            target: Decimal::new(5, 1),
-            deviation: Decimal::new(1, 1),
+            target: dec!(0.5),
+            deviation: dec!(0.1),
         },
         usdc: usdc_rebalancing,
         redemption_wallet: redemption_wallet.unwrap_or_else(Address::random),
@@ -216,7 +219,7 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
         order_polling_interval: 1,
         order_polling_max_jitter: 0,
         position_check_interval: 2,
-        inventory_poll_interval: 15,
+        inventory_poll_interval: 2,
         broker: broker_ctx,
         telemetry: None,
         rebalancing: Some(rebalancing_ctx),
@@ -326,8 +329,6 @@ pub async fn assert_full_hedging_flow<P: Provider>(
 
     Ok(())
 }
-
-// ── Broker assertions ────────────────────────────────────────────────
 
 /// Asserts broker orders and positions match expected state per symbol.
 ///
@@ -653,21 +654,24 @@ async fn assert_position_view(
     let expected_short = expected_position.expected_accumulated_short;
 
     assert_eq!(position.symbol, symbol);
-    assert_eq!(
-        position.net,
-        FractionalShares::new(expected_net),
+    assert_decimal_eq!(
+        position.net.inner(),
+        expected_net,
+        DEFAULT_EPSILON,
         "net position mismatch for {}",
         expected_position.symbol
     );
-    assert_eq!(
-        position.accumulated_long,
-        FractionalShares::new(expected_long),
+    assert_decimal_eq!(
+        position.accumulated_long.inner(),
+        expected_long,
+        DEFAULT_EPSILON,
         "accumulated_long mismatch for {}",
         expected_position.symbol
     );
-    assert_eq!(
-        position.accumulated_short,
-        FractionalShares::new(expected_short),
+    assert_decimal_eq!(
+        position.accumulated_short.inner(),
+        expected_short,
+        DEFAULT_EPSILON,
         "accumulated_short mismatch for {}",
         expected_position.symbol
     );
@@ -1042,3 +1046,28 @@ where
         execution_threshold,
     })
 }
+
+#[macro_export]
+macro_rules! assert_decimal_eq {
+    ($left:expr, $right:expr, $epsilon:expr $(,)?) => {
+        let (l, r, eps) = ($left, $right, $epsilon);
+        let diff = (l - r).abs();
+        if diff > eps {
+            panic!(
+                "assertion failed: `(left == right)` (within epsilon {})\n  left: `{:?}`\n right: `{:?}`\n delta: `{:?}`",
+                eps, l, r, diff
+            );
+        }
+    };
+    ($left:expr, $right:expr, $epsilon:expr, $($arg:tt)+) => {
+        let (l, r, eps) = ($left, $right, $epsilon);
+        let diff = (l - r).abs();
+        if diff > eps {
+            panic!(
+                "assertion failed: `(left == right)` (within epsilon {})\n  left: `{:?}`\n right: `{:?}`\n delta: `{:?}`\n{}",
+                eps, l, r, diff, format_args!($($arg)+)
+            );
+        }
+    };
+}
+const DEFAULT_EPSILON: Decimal = dec!(0.000000000000001);

@@ -34,6 +34,7 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal_macros::dec;
 
+use crate::services::alpaca_tokenization::REDEMPTION_WALLET;
 use common::{
     ExpectedPosition, MintAssertions, assert_broker_state, assert_cqrs_state,
     assert_event_subsequence, assert_full_hedging_flow, assert_rebalancing_state,
@@ -49,61 +50,6 @@ use services::ethereum_chain;
 use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV5;
 
-/// Processes several one-directional SellEquity trades to create an
-/// inventory imbalance (offchain accumulates hedged equity while onchain
-/// vault depletes). Verifies the inventory poller runs and emits
-/// `InventorySnapshot` events.
-#[test_log::test(tokio::test)]
-async fn inventory_snapshot_events_emitted() -> anyhow::Result<()> {
-    let onchain_price = dec!(150.00);
-    let broker_fill_price = dec!(150.00);
-    let amount_per_trade = dec!(7.5);
-
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
-
-    let current_block = infra.base_chain.provider.get_block_number().await?;
-    let equity_tokens: Vec<(&str, Address, Address)> = infra
-        .equity_addresses
-        .iter()
-        .map(|(symbol, vault, underlying)| (symbol.as_str(), *vault, *underlying))
-        .collect();
-
-    let ctx = build_rebalancing_ctx(
-        &infra.base_chain,
-        &infra.broker_service,
-        &infra.db_path,
-        current_block,
-        &equity_tokens,
-        UsdcRebalancing::Disabled,
-        None,
-    )?;
-    let bot = spawn_bot(ctx);
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Process several sells to create inventory pressure.
-    for _ in 0..3 {
-        infra
-            .base_chain
-            .take_order()
-            .symbol("AAPL")
-            .amount(amount_per_trade)
-            .price(onchain_price)
-            .direction(TakeDirection::SellEquity)
-            .call()
-            .await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-
-    // Wait for hedging + inventory poller cycles (poll interval is 15s)
-    wait_for_processing(&bot, 20).await;
-
-    assert_rebalancing_state(&infra.db_path, 3, None).await?;
-
-    bot.abort();
-    Ok(())
-}
-//
 /// Equity mint triggered by offchain-heavy imbalance.
 ///
 /// SellEquity trades cause the bot to sell equity onchain (vault depletes)
@@ -126,37 +72,16 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     let broker_fill_price = dec!(150.00);
     let amount_per_trade = dec!(7.5);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
-    let current_block = infra.base_chain.provider.get_block_number().await?;
-    let equity_tokens: Vec<(&str, Address, Address)> = infra
-        .equity_addresses
-        .iter()
-        .map(|(symbol, vault, underlying)| (symbol.as_str(), *vault, *underlying))
-        .collect();
-
-    let ctx = build_rebalancing_ctx(
-        &infra.base_chain,
-        &infra.broker_service,
-        &infra.db_path,
-        current_block,
-        &equity_tokens,
-        UsdcRebalancing::Disabled,
-        None,
-    )?;
-    let bot = spawn_bot(ctx);
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Process several SellEquity trades to create offchain-heavy imbalance.
-    // Each sell depletes the onchain vault and accumulates offchain equity.
-    // Inter-trade delays ensure hedging completes before the next trade.
-    let mut take_results = Vec::new();
+    // BEFORE bot starts: set up all orders from owner account.
+    // No concurrent bot transactions yet, so no nonce collisions.
+    let mut prepared_orders = Vec::new();
     for _ in 0..3 {
-        take_results.push(
+        prepared_orders.push(
             infra
                 .base_chain
-                .take_order()
+                .setup_order()
                 .symbol("AAPL")
                 .amount(amount_per_trade)
                 .price(onchain_price)
@@ -164,17 +89,40 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
                 .call()
                 .await?,
         );
+    }
+
+    // Capture block AFTER setup so the bot sees the orders
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+
+    let ctx = build_rebalancing_ctx(
+        &infra.base_chain,
+        &infra.broker_service,
+        &infra.db_path,
+        current_block,
+        &infra.equity_addresses,
+        UsdcRebalancing::Disabled,
+        None,
+    )?;
+    let bot = spawn_bot(ctx);
+
+    // Wait long enough for the bot's 5-second coordination phase
+    // (WebSocket first-event timeout + backfill + CQRS setup) to
+    // complete. With take_prepared_order, the take only has 2
+    // transactions (~2s), so it would arrive during coordination
+    // if we only waited 2s. Waiting 8s ensures the bot is fully
+    // set up and the live event processor is running.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // AFTER bot starts: take orders from taker account only.
+    // The taker has its own provider/nonces, no collision with bot.
+    let mut take_results = Vec::new();
+    for prepared in &prepared_orders {
+        take_results.push(infra.base_chain.take_prepared_order(prepared).await?);
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    // Wait for: hedging + inventory poller (15s interval) + trigger +
-    // tokenization request + polling (2 polls at 10s each) + wrapping +
-    // Raindex deposit (onchain txs need confirmations)
     wait_for_processing(&bot, 80).await;
 
-    // ── Layer 1: Hedging pipeline (broker + CQRS) ────────────────────
-    // Skip vault depletion assertions because the mint pipeline deposits
-    // wrapped tokens back into the output vault, making it non-zero.
     let expected_positions = [ExpectedPosition {
         symbol: "AAPL",
         amount: dec!(22.5),
@@ -190,7 +138,6 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     assert_broker_state(&expected_positions, &infra.broker_service);
     assert_cqrs_state(&expected_positions, take_results.len(), &database_url).await?;
 
-    // ── Layers 2+3: Inventory snapshots + mint pipeline ──────────────
     assert_rebalancing_state(
         &infra.db_path,
         3,
@@ -204,196 +151,194 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     bot.abort();
     Ok(())
 }
-//
-// /// Equity redemption triggered by onchain-heavy imbalance.
-// ///
-// /// BuyEquity trades cause the bot to receive equity onchain (vault fills)
-// /// and sell equity offchain (broker position shrinks). This creates a
-// /// TooMuchOnchain equity imbalance that should trigger a redemption
-// /// operation to unwrap and transfer tokens to the redemption wallet.
-// ///
-// /// Expected CQRS event flow:
-// /// - `EquityRedemption`: WithdrawnFromRaindex -> TokensUnwrapped
-// ///   -> TokensSent -> Detected -> Completed
-// ///
-// /// Requires: ERC-4626 vault wrapper on Anvil (for trigger ratio check),
-// /// Raindex vault with sufficient balance for withdrawal, and tokenization
-// /// API mock endpoints for redemption detection/completion polling.
-// #[tokio::test]
-// async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
-//     let mut chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
-//     let (vault_addr, underlying_addr) = chain.deploy_equity_vault("AAPL").await?;
-//
-//     let broker = AlpacaBrokerMock::start().call().await;
-//     broker.register_redemption_tokenization_endpoints();
-//
-//     // Create a known redemption wallet so the watcher can detect
-//     // ERC-20 transfers to it and auto-add redemption requests.
-//     let redemption_wallet = Address::random();
-//     let _watcher = broker.start_redemption_watcher(chain.provider.clone(), redemption_wallet);
-//
-//     let current_block = chain.provider.get_block_number().await?;
-//     let db_dir = tempfile::tempdir()?;
-//     let db_path = db_dir.path().join("e2e.sqlite");
-//     let database_url = db_path.display().to_string();
-//
-//     let ctx = build_rebalancing_ctx(
-//         &chain,
-//         &broker,
-//         &db_path,
-//         current_block,
-//         &[("AAPL", vault_addr, underlying_addr)],
-//         UsdcRebalancing::Disabled,
-//         Some(redemption_wallet),
-//     )?;
-//     let bot = spawn_bot(ctx);
-//
-//     tokio::time::sleep(Duration::from_secs(2)).await;
-//
-//     // BuyEquity trades: equity accumulates onchain while the bot sells
-//     // offchain to hedge. Each trade deposits equity into the order's
-//     // input vault, but the VaultRegistry only tracks the LAST vault per
-//     // token. With 3 trades of 7.5 shares each, only 7.5 is visible
-//     // onchain while offchain shows -22.5 (net = -15). To create a
-//     // genuine TooMuchOnchain imbalance, we pre-fund the last vault with
-//     // additional wrapped tokens after the trades.
-//     let mut take_results = Vec::new();
-//     for _ in 0..3 {
-//         take_results.push(
-//             chain
-//                 .take_order("AAPL", "7.5", TakeDirection::BuyEquity)
-//                 .await?,
-//         );
-//         tokio::time::sleep(Duration::from_secs(3)).await;
-//     }
-//
-//     // Deposit extra wrapped equity tokens into the last trade's input vault.
-//     // This is the vault the VaultRegistry tracks. After deposit:
-//     //   onchain = 7.5 + 100 = 107.5, offchain = -22.5
-//     //   total = 85, ratio = 107.5/85 ≈ 1.26 → TooMuchOnchain → Redemption
-//     let equity_vault_id = take_results.last().unwrap().input_vault_id;
-//     let extra_equity: U256 = parse_units("100", 18)?.into();
-//     chain
-//         .deposit_into_raindex_vault(vault_addr, equity_vault_id, extra_equity, 18)
-//         .await?;
-//
-//     // Wait for: hedging + inventory poller + trigger evaluation +
-//     // redemption pipeline (withdraw + unwrap + send + detection + completion)
-//     wait_for_processing(&bot, 40).await;
-//
-//     // ── Layer 1: Hedging pipeline (broker + CQRS) ────────────────────
-//     // Skip vault assertions because the redemption pipeline withdraws from
-//     // the vault that BuyEquity trades fill, altering its expected balance.
-//     let scenarios = [ExpectedPosition {
-//         symbol: "AAPL",
-//         amount: "22.5",
-//         direction: TakeDirection::BuyEquity,
-//         fill_price: "150.00",
-//         expected_accumulated_long: "22.5",
-//         expected_accumulated_short: "0",
-//         expected_net: "0",
-//     }];
-//
-//     assert_broker_state(&scenarios, &broker);
-//     assert_cqrs_state(&scenarios, take_results.len(), &database_url).await?;
-//
-//     // ── Layer 2: Inventory snapshots ─────────────────────────────────
-//     let pool = connect_db(&db_path).await?;
-//
-//     let inventory_events = count_events(&pool, "InventorySnapshot").await?;
-//     assert!(
-//         inventory_events >= 1,
-//         "Expected at least 1 InventorySnapshot event, got {inventory_events}"
-//     );
-//
-//     // ── Layer 3: Redemption pipeline (events) ────────────────────────
-//     let redemption_events = fetch_events_by_type(&pool, "EquityRedemption").await?;
-//     assert!(
-//         !redemption_events.is_empty(),
-//         "Expected at least 1 EquityRedemption event (redemption trigger fired), got 0"
-//     );
-//
-//     assert_event_subsequence(
-//         &redemption_events,
-//         &[
-//             "EquityRedemptionEvent::WithdrawnFromRaindex",
-//             "EquityRedemptionEvent::TokensUnwrapped",
-//             "EquityRedemptionEvent::TokensSent",
-//             "EquityRedemptionEvent::Detected",
-//             "EquityRedemptionEvent::Completed",
-//         ],
-//     );
-//
-//     assert_single_clean_aggregate(&redemption_events, &["Failed", "Rejected"]);
-//
-//     // Verify the first event's payload contains the correct symbol.
-//     let first_payload = &redemption_events[0].payload;
-//     assert_eq!(
-//         first_payload
-//             .get("WithdrawnFromRaindex")
-//             .and_then(|val| val.get("symbol"))
-//             .and_then(|val| val.as_str()),
-//         Some("AAPL"),
-//         "First redemption event should be for AAPL, got: {first_payload}"
-//     );
-//
-//     // ── Layer 3: Redemption pipeline (onchain) ───────────────────────
-//     // The redemption pipeline sends underlying tokens to the redemption
-//     // wallet. Verify the wallet received tokens.
-//     let underlying_balance = IERC20::new(underlying_addr, &chain.provider)
-//         .balanceOf(redemption_wallet)
-//         .call()
-//         .await?;
-//     assert!(
-//         underlying_balance > U256::ZERO,
-//         "Redemption wallet should hold underlying tokens after redemption"
-//     );
-//
-//     // ── Layer 3: Redemption pipeline (broker state) ──────────────────
-//     let redeem_requests: Vec<_> = broker
-//         .tokenization_requests()
-//         .into_iter()
-//         .filter(|req| req.request_type == "redeem")
-//         .collect();
-//     assert!(
-//         !redeem_requests.is_empty(),
-//         "Expected at least 1 redeem tokenization request on the broker"
-//     );
-//     assert!(
-//         redeem_requests.iter().any(|req| req.status == "completed"),
-//         "Expected at least one completed redeem request, got: {:?}",
-//         redeem_requests
-//             .iter()
-//             .map(|r| &r.status)
-//             .collect::<Vec<_>>(),
-//     );
-//
-//     // ── Layer 3: Redemption pipeline (CQRS projection) ──────────────
-//     // The equity_redemption_view projection stores the aggregate state.
-//     // By this point the pipeline should have reached Completed.
-//     let (payload_json,): (String,) =
-//         sqlx::query_as("SELECT payload FROM equity_redemption_view LIMIT 1")
-//             .fetch_one(&pool)
-//             .await?;
-//     let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
-//     // Projection stores Lifecycle<EquityRedemption>, serialized as
-//     // {"Live": {"Completed": {"symbol": "AAPL", ...}}}
-//     let live = payload
-//         .get("Live")
-//         .unwrap_or_else(|| panic!("equity_redemption_view payload should be Live, got: {payload}"));
-//     let completed = live.get("Completed").unwrap_or_else(|| {
-//         panic!("equity_redemption_view should be in Completed state, got: {live}")
-//     });
-//     assert_eq!(
-//         completed.get("symbol").and_then(|val| val.as_str()),
-//         Some("AAPL"),
-//         "Completed redemption should be for AAPL, got: {completed}"
-//     );
-//
-//     pool.close().await;
-//     bot.abort();
-//     Ok(())
-// }
+
+/// Equity redemption triggered by onchain-heavy imbalance.
+///
+/// BuyEquity trades cause the bot to receive equity onchain (vault fills)
+/// and sell equity offchain (broker position shrinks). This creates a
+/// TooMuchOnchain equity imbalance that should trigger a redemption
+/// operation to unwrap and transfer tokens to the redemption wallet.
+///
+/// Expected CQRS event flow:
+/// - `EquityRedemption`: WithdrawnFromRaindex -> TokensUnwrapped
+///   -> TokensSent -> Detected -> Completed
+///
+/// Requires: ERC-4626 vault wrapper on Anvil (for trigger ratio check),
+/// Raindex vault with sufficient balance for withdrawal, and tokenization
+/// API mock endpoints for redemption detection/completion polling.
+#[test_log::test(tokio::test)]
+async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
+    let onchain_price = dec!(125);
+    let broker_fill_price = dec!(125.55);
+    let trade_amount = dec!(10);
+
+    let infra =
+        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", dec!(20))]).await?;
+
+    // BEFORE bot starts: set up order and deposit extra equity from owner.
+    let prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::BuyEquity)
+        .call()
+        .await?;
+
+    // Deposit extra wrapped equity into the order's input vault.
+    // The VaultRegistry tracks this vault. After the take + deposit:
+    //   onchain = trade_amount + 100 = ~110, offchain = -trade_amount
+    //   ratio >> 0.6 threshold -> TooMuchOnchain -> Redemption
+    let vault_addr = infra.equity_addresses[0].1;
+    let underlying_addr = infra.equity_addresses[0].2;
+    let equity_vault_id = prepared.input_vault_id;
+    let extra_equity: U256 = parse_units("100", 18)?.into();
+    infra
+        .base_chain
+        .deposit_into_raindex_vault(vault_addr, equity_vault_id, extra_equity, 18)
+        .await?;
+
+    // Capture block AFTER all owner setup so the bot sees everything
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+
+    let ctx = build_rebalancing_ctx(
+        &infra.base_chain,
+        &infra.broker_service,
+        &infra.db_path,
+        current_block,
+        &infra.equity_addresses,
+        UsdcRebalancing::Disabled,
+        Some(REDEMPTION_WALLET),
+    )?;
+    let bot = spawn_bot(ctx);
+
+    // Wait long enough for the bot's 5-second coordination phase
+    // (WebSocket first-event timeout + backfill + CQRS setup) to
+    // complete before we submit the take.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // AFTER bot starts: take from taker account only
+    let _take_result = infra.base_chain.take_prepared_order(&prepared).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Wait for: hedging + inventory poller (15s) + trigger evaluation +
+    // redemption pipeline (withdraw + unwrap + send + detection + completion)
+    wait_for_processing(&bot, 80).await;
+
+    let expected_positions = [ExpectedPosition {
+        symbol: "AAPL",
+        amount: trade_amount,
+        direction: TakeDirection::BuyEquity,
+        onchain_price,
+        broker_fill_price,
+        expected_accumulated_long: dec!(10),
+        expected_accumulated_short: dec!(0),
+        expected_net: dec!(0),
+    }];
+
+    let database_url = infra.db_path.display().to_string();
+    assert_broker_state(&expected_positions, &infra.broker_service);
+    assert_cqrs_state(&expected_positions, 1, &database_url).await?;
+
+    // ── Layer 2: Inventory snapshots ─────────────────────────────────
+    let pool = connect_db(&infra.db_path).await?;
+
+    let inventory_events = count_events(&pool, "InventorySnapshot").await?;
+    assert!(
+        inventory_events >= 1,
+        "Expected at least 1 InventorySnapshot event, got {inventory_events}"
+    );
+
+    // ── Layer 3: Redemption pipeline (events) ────────────────────────
+    let redemption_events = fetch_events_by_type(&pool, "EquityRedemption").await?;
+    assert!(
+        !redemption_events.is_empty(),
+        "Expected at least 1 EquityRedemption event (redemption trigger fired), got 0"
+    );
+
+    assert_event_subsequence(
+        &redemption_events,
+        &[
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            "EquityRedemptionEvent::TokensUnwrapped",
+            "EquityRedemptionEvent::TokensSent",
+            "EquityRedemptionEvent::Detected",
+            "EquityRedemptionEvent::Completed",
+        ],
+    );
+
+    assert_single_clean_aggregate(&redemption_events, &["Failed", "Rejected"]);
+
+    // Verify the first event's payload contains the correct symbol.
+    let first_payload = &redemption_events[0].payload;
+    assert_eq!(
+        first_payload
+            .get("WithdrawnFromRaindex")
+            .and_then(|val| val.get("symbol"))
+            .and_then(|val| val.as_str()),
+        Some("AAPL"),
+        "First redemption event should be for AAPL, got: {first_payload}"
+    );
+
+    // ── Layer 3: Redemption pipeline (onchain) ───────────────────────
+    // The redemption pipeline sends underlying tokens to the redemption
+    // wallet. Verify the wallet received tokens.
+    let underlying_balance = IERC20::new(underlying_addr, &infra.base_chain.provider)
+        .balanceOf(REDEMPTION_WALLET)
+        .call()
+        .await?;
+    assert!(
+        underlying_balance > U256::ZERO,
+        "Redemption wallet should hold underlying tokens after redemption"
+    );
+
+    // ── Layer 3: Redemption pipeline (tokenization state) ────────────
+    let redeem_requests: Vec<_> = infra
+        .tokenization_service
+        .tokenization_requests()
+        .into_iter()
+        .filter(|req| req.request_type == "redeem")
+        .collect();
+    assert!(
+        !redeem_requests.is_empty(),
+        "Expected at least 1 redeem tokenization request"
+    );
+    assert!(
+        redeem_requests.iter().any(|req| req.status == "completed"),
+        "Expected at least one completed redeem request, got: {:?}",
+        redeem_requests
+            .iter()
+            .map(|req| &req.status)
+            .collect::<Vec<_>>(),
+    );
+
+    // ── Layer 3: Redemption pipeline (CQRS projection) ──────────────
+    // The equity_redemption_view projection stores the aggregate state.
+    // By this point the pipeline should have reached Completed.
+    let (payload_json,): (String,) =
+        sqlx::query_as("SELECT payload FROM equity_redemption_view LIMIT 1")
+            .fetch_one(&pool)
+            .await?;
+    let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+    // Projection stores Lifecycle<EquityRedemption>, serialized as
+    // {"Live": {"Completed": {"symbol": "AAPL", ...}}}
+    let live = payload
+        .get("Live")
+        .unwrap_or_else(|| panic!("equity_redemption_view payload should be Live, got: {payload}"));
+    let completed = live.get("Completed").unwrap_or_else(|| {
+        panic!("equity_redemption_view should be in Completed state, got: {live}")
+    });
+    assert_eq!(
+        completed.get("symbol").and_then(|val| val.as_str()),
+        Some("AAPL"),
+        "Completed redemption should be for AAPL, got: {completed}"
+    );
+
+    pool.close().await;
+    bot.abort();
+    Ok(())
+}
 //
 // /// USDC rebalancing from Alpaca (offchain) to Base (onchain).
 // ///

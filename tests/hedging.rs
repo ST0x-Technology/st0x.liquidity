@@ -35,7 +35,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     let broker_fill_price = dec!(150.25);
     let sell_amount = dec!(10.75);
 
-    let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)]).await?;
+    let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)], vec![]).await?;
 
     let expected_position = ExpectedPosition {
         symbol: equity_symbol,
@@ -97,11 +97,14 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     let msft_broker = dec!(410.75);
     let trade_amount = dec!(5.25);
 
-    let infra = TestInfra::start(vec![
-        ("AAPL", aapl_broker),
-        ("TSLA", tsla_broker),
-        ("MSFT", msft_broker),
-    ])
+    let infra = TestInfra::start(
+        vec![
+            ("AAPL", aapl_broker),
+            ("TSLA", tsla_broker),
+            ("MSFT", msft_broker),
+        ],
+        vec![],
+    )
     .await?;
 
     // Mix of directions: AAPL sell, TSLA buy, MSFT sell
@@ -191,7 +194,7 @@ async fn backfilling() -> anyhow::Result<()> {
     let sell_amount = dec!(4.5);
     let trade_count: i64 = 3;
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
     // Record the block BEFORE any take-orders (subtract 1 for safety margin)
     let pre_trade_block = infra
@@ -279,7 +282,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(8.3);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
@@ -405,10 +408,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // ── Reference run: uninterrupted ────────────────────────────────
 
-    let ref_infra = TestInfra::start(vec![
-        ("AAPL", broker_fill_price),
-        ("TSLA", broker_fill_price),
-    ])
+    let ref_infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price), ("TSLA", broker_fill_price)],
+        vec![],
+    )
     .await?;
 
     let ref_block = ref_infra.base_chain.provider.get_block_number().await?;
@@ -459,10 +462,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // ── Crash run: same trades, with interruption ───────────────────
 
-    let crash_infra = TestInfra::start(vec![
-        ("AAPL", broker_fill_price),
-        ("TSLA", broker_fill_price),
-    ])
+    let crash_infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price), ("TSLA", broker_fill_price)],
+        vec![],
+    )
     .await?;
 
     let crash_block = crash_infra.base_chain.provider.get_block_number().await?;
@@ -546,7 +549,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(12.5);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
     // Start with market CLOSED
     infra.broker_service.set_market_closed();
@@ -661,7 +664,7 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
     let broker_fill_price = dec!(195.00);
     let trade_amount = dec!(14.75);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
     let expected_position = ExpectedPosition {
         symbol: "AAPL",

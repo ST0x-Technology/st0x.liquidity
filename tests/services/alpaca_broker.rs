@@ -33,16 +33,16 @@ pub enum MockMode {
     PlacementFails,
 }
 
-struct MockPosition {
-    symbol: String,
-    qty: Decimal,
-    market_value: Decimal,
+pub struct MockPosition {
+    pub symbol: Symbol,
+    pub qty: Decimal,
+    pub market_value: Decimal,
 }
 
 struct MockAccount {
     cash: Decimal,
     buying_power: Decimal,
-    positions: HashMap<String, MockPosition>,
+    positions: HashMap<Symbol, MockPosition>,
 }
 
 struct MockOrder {
@@ -79,7 +79,7 @@ struct MockWalletTransfer {
 struct MockState {
     account: MockAccount,
     orders: HashMap<String, MockOrder>,
-    symbol_fill_prices: HashMap<String, String>,
+    symbol_fill_prices: HashMap<Symbol, Decimal>,
     mode: MockMode,
     /// Dynamic calendar entries. The endpoint reads from this on each request.
     calendar_entries: Vec<CalendarEntry>,
@@ -146,7 +146,10 @@ impl AlpacaBrokerMock {
     /// Starts the mock server with all core broker + tokenization endpoints
     /// registered. Optionally configure per-symbol fill prices.
     #[builder]
-    pub async fn start(#[builder(default)] symbol_fill_prices: Vec<(Symbol, Decimal)>) -> Self {
+    pub async fn start(
+        symbol_fill_prices: Vec<(Symbol, Decimal)>,
+        symbol_positions: Vec<MockPosition>,
+    ) -> Self {
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
         // Market open all day by default
@@ -156,17 +159,20 @@ impl AlpacaBrokerMock {
             close: "23:59".to_string(),
         }];
 
+        let symbol_fill_prices = symbol_fill_prices.into_iter().collect();
+        let positions = symbol_positions
+            .into_iter()
+            .map(|pos| (pos.symbol.clone(), pos))
+            .collect();
+
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
                 cash: Decimal::from(100_000),
                 buying_power: Decimal::from(100_000),
-                positions: HashMap::new(),
+                positions,
             },
             orders: HashMap::new(),
-            symbol_fill_prices: symbol_fill_prices
-                .into_iter()
-                .map(|(symbol, price)| (symbol.to_string(), price.to_string()))
-                .collect(),
+            symbol_fill_prices,
             mode: MockMode::HappyPath,
             calendar_entries,
             wallet_transfers: Vec::new(),
@@ -197,10 +203,8 @@ impl AlpacaBrokerMock {
     }
 
     /// Sets a fill price for a specific symbol.
-    pub fn set_symbol_fill_price(&self, symbol: &str, price: &str) {
-        lock(&self.state)
-            .symbol_fill_prices
-            .insert(symbol.to_string(), price.to_string());
+    pub fn set_symbol_fill_price(&self, symbol: Symbol, price: Decimal) {
+        lock(&self.state).symbol_fill_prices.insert(symbol, price);
     }
 
     /// Changes the mock mode for subsequent requests.
@@ -313,7 +317,7 @@ impl AlpacaBrokerMock {
             .positions
             .values()
             .map(|pos| MockPositionSnapshot {
-                symbol: pos.symbol.clone(),
+                symbol: pos.symbol.inner(),
                 qty: pos.qty.to_string(),
                 market_value: pos.market_value.to_string(),
             })
@@ -324,10 +328,9 @@ impl AlpacaBrokerMock {
 /// Locks the mutex, recovering from poisoning (a previous holder panicked).
 /// Safe for test mocks — we still want to inspect state after panics.
 fn lock(state: &Mutex<MockState>) -> MutexGuard<'_, MockState> {
-    match state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Registers all dynamic endpoints on the mock server.
@@ -550,13 +553,13 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
 
                 if matches!(mode, MockMode::HappyPath) {
                     let symbol = state.orders[&order_id].symbol.clone();
-                    let fill_price_str = state
+                    let fill_price = state
                         .symbol_fill_prices
-                        .get(&symbol)
-                        .cloned()
-                        .unwrap_or_else(|| "150.00".to_string());
+                        .get(&Symbol::force_new(symbol))
+                        .copied()
+                        .unwrap();
 
-                    apply_happy_path_fill(&mut state, &order_id, &fill_price_str);
+                    apply_happy_path_fill(&mut state, &order_id, fill_price);
                 }
 
                 if matches!(mode, MockMode::OrderRejected)
@@ -584,7 +587,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
 }
 
 /// Transitions a "new" order to "filled" and updates account balances.
-fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price_str: &str) {
+fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price: Decimal) {
     let should_fill = state
         .orders
         .get(order_id)
@@ -598,12 +601,12 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price_str: 
     let side = state.orders[order_id].side.clone();
 
     let qty = Decimal::from_str(&qty_str).unwrap_or(Decimal::ZERO);
-    let fill_price = Decimal::from_str(fill_price_str).unwrap_or(Decimal::ZERO);
+    let symbol_key = Symbol::force_new(symbol);
 
     // Update order status
     if let Some(order) = state.orders.get_mut(order_id) {
         order.status = "filled".to_string();
-        order.filled_price = Some(fill_price_str.to_string());
+        order.filled_price = Some(fill_price.to_string());
     }
 
     // Update account balances
@@ -612,9 +615,9 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price_str: 
         let position = state
             .account
             .positions
-            .entry(symbol.clone())
+            .entry(symbol_key.clone())
             .or_insert_with(|| MockPosition {
-                symbol,
+                symbol: symbol_key,
                 qty: Decimal::ZERO,
                 market_value: Decimal::ZERO,
             });
@@ -625,9 +628,9 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price_str: 
         let position = state
             .account
             .positions
-            .entry(symbol.clone())
+            .entry(symbol_key.clone())
             .or_insert_with(|| MockPosition {
-                symbol,
+                symbol: symbol_key,
                 qty: Decimal::ZERO,
                 market_value: Decimal::ZERO,
             });
