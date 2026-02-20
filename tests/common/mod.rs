@@ -28,6 +28,7 @@ use st0x_hedge::{
 use super::services::alpaca_broker::{
     self, AlpacaBrokerMock, MockOrderSnapshot, MockPositionSnapshot,
 };
+use super::services::alpaca_tokenization::AlpacaTokenizationMock;
 use super::services::base_chain::{self, TakeDirection, TakeOrderResult};
 use super::services::ethereum_chain;
 
@@ -306,7 +307,7 @@ pub async fn fetch_all_domain_events(pool: &SqlitePool) -> anyhow::Result<Vec<St
 ///
 /// This is the primary assertion entry point. Every e2e test should
 /// call this after the bot has finished processing.
-pub async fn assert_full_pipeline<P: Provider>(
+pub async fn assert_full_hedging_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],
     take_results: &[TakeOrderResult],
     provider: &P,
@@ -496,9 +497,16 @@ fn assert_onchain_trade_events(
 
             let recorded_price: Decimal = trade.payload["Filled"]["price_usdc"]
                 .as_str()
-                .expect("price_usdc should be present in OnChainTrade::Filled payload")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "price_usdc should be present in OnChainTrade::Filled payload: {:?}",
+                        trade.payload
+                    )
+                })
                 .parse()
-                .expect("price_usdc should be a valid Decimal");
+                .unwrap_or_else(|parse_error| {
+                    panic!("price_usdc should be a valid Decimal: {parse_error}")
+                });
             // Round to 2 dp (cents) because buy-side ioRatio (1/price)
             // introduces tiny precision artifacts in the onchain representation.
             assert_eq!(
@@ -864,6 +872,88 @@ pub fn assert_single_clean_aggregate(events: &[StoredEvent], error_substrings: &
             .map(|event| &event.event_type)
             .collect::<Vec<_>>(),
     );
+}
+
+// ── Rebalancing pipeline assertions ──────────────────────────────────
+
+/// Optional mint pipeline assertions passed to `assert_rebalancing_state`.
+pub struct MintAssertions<'a> {
+    pub symbol: &'a str,
+    pub tokenization: &'a AlpacaTokenizationMock,
+}
+
+/// Unified rebalancing assertions covering inventory snapshots and
+/// optionally the mint pipeline (events + broker tokenization state).
+///
+/// Every rebalancing e2e test should call this after the bot has
+/// finished processing. It complements `assert_broker_state` /
+/// `assert_cqrs_state` which cover the hedging layer.
+pub async fn assert_rebalancing_state(
+    db_path: &std::path::Path,
+    min_onchain_trades: i64,
+    mint: Option<MintAssertions<'_>>,
+) -> anyhow::Result<()> {
+    let pool = connect_db(db_path).await?;
+
+    let onchain_events = count_events(&pool, "OnChainTrade").await?;
+    assert!(
+        onchain_events >= min_onchain_trades,
+        "Expected at least {min_onchain_trades} OnChainTrade events, \
+         got {onchain_events}"
+    );
+
+    let inventory_events = count_events(&pool, "InventorySnapshot").await?;
+    assert!(
+        inventory_events >= 1,
+        "Expected at least 1 InventorySnapshot event from the inventory \
+         poller, got {inventory_events}"
+    );
+
+    if let Some(mint_assertions) = mint {
+        let mint_events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
+        assert!(
+            !mint_events.is_empty(),
+            "Expected at least 1 TokenizedEquityMint event \
+             (mint trigger fired), got 0"
+        );
+
+        assert_event_subsequence(
+            &mint_events,
+            &[
+                "TokenizedEquityMintEvent::MintRequested",
+                "TokenizedEquityMintEvent::MintAccepted",
+                "TokenizedEquityMintEvent::TokensReceived",
+                "TokenizedEquityMintEvent::TokensWrapped",
+                "TokenizedEquityMintEvent::DepositedIntoRaindex",
+            ],
+        );
+
+        assert_single_clean_aggregate(&mint_events, &["Failed", "Rejected"]);
+
+        let mint_requests: Vec<_> = mint_assertions
+            .tokenization
+            .tokenization_requests()
+            .into_iter()
+            .filter(|req| req.request_type == "mint" && req.symbol == mint_assertions.symbol)
+            .collect();
+        assert!(
+            !mint_requests.is_empty(),
+            "Expected at least 1 mint tokenization request for {} \
+             on the broker",
+            mint_assertions.symbol
+        );
+        assert!(
+            mint_requests.iter().any(|req| req.status == "completed"),
+            "Expected at least one completed mint request, got: {:?}",
+            mint_requests
+                .iter()
+                .map(|req| &req.status)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    pool.close().await;
+    Ok(())
 }
 
 /// Builds a `Ctx` with USDC rebalancing enabled and both chain endpoints.

@@ -32,13 +32,15 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
+use rust_decimal_macros::dec;
 
 use common::{
-    ExpectedPosition, assert_broker_state, assert_cqrs_state, assert_event_subsequence,
-    assert_full_pipeline, assert_single_clean_aggregate, build_rebalancing_ctx,
-    build_usdc_rebalancing_ctx, connect_db, count_events, fetch_events_by_type, spawn_bot,
-    wait_for_processing,
+    ExpectedPosition, MintAssertions, assert_broker_state, assert_cqrs_state,
+    assert_event_subsequence, assert_full_hedging_flow, assert_rebalancing_state,
+    assert_single_clean_aggregate, build_rebalancing_ctx, build_usdc_rebalancing_ctx, connect_db,
+    count_events, fetch_events_by_type, spawn_bot, wait_for_processing,
 };
+use services::TestInfra;
 use services::alpaca_broker::AlpacaBrokerMock;
 use services::base_chain::{self, IERC20, TakeDirection, USDC_BASE};
 use services::cctp_attestation::CctpAttestationMock;
@@ -47,201 +49,161 @@ use services::ethereum_chain;
 use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV5;
 
-const BASE_RPC_URL: &str =
-    "https://api.developer.coinbase.com/rpc/v1/base/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF";
-const ETHEREUM_RPC_URL: &str =
-    "https://api.developer.coinbase.com/rpc/v1/ethereum/DD1T1ZCY6bZ09lHv19TjBHi1saRZCHFF";
+/// Processes several one-directional SellEquity trades to create an
+/// inventory imbalance (offchain accumulates hedged equity while onchain
+/// vault depletes). Verifies the inventory poller runs and emits
+/// `InventorySnapshot` events.
+#[test_log::test(tokio::test)]
+async fn inventory_snapshot_events_emitted() -> anyhow::Result<()> {
+    let onchain_price = dec!(150.00);
+    let broker_fill_price = dec!(150.00);
+    let amount_per_trade = dec!(7.5);
 
-// /// Processes several one-directional SellEquity trades to create an
-// /// inventory imbalance (offchain accumulates hedged equity while onchain
-// /// vault depletes). Verifies the inventory poller runs and emits
-// /// `InventorySnapshot` events.
-// #[tokio::test]
-// async fn inventory_snapshot_events_emitted() -> anyhow::Result<()> {
-//     let mut chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
-//     let (vault_addr, underlying_addr) = chain.deploy_equity_vault("AAPL").await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let equity_tokens: Vec<(&str, Address, Address)> = infra
+        .equity_addresses
+        .iter()
+        .map(|(symbol, vault, underlying)| (symbol.as_str(), *vault, *underlying))
+        .collect();
+
+    let ctx = build_rebalancing_ctx(
+        &infra.base_chain,
+        &infra.broker_service,
+        &infra.db_path,
+        current_block,
+        &equity_tokens,
+        UsdcRebalancing::Disabled,
+        None,
+    )?;
+    let bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Process several sells to create inventory pressure.
+    for _ in 0..3 {
+        infra
+            .base_chain
+            .take_order()
+            .symbol("AAPL")
+            .amount(amount_per_trade)
+            .price(onchain_price)
+            .direction(TakeDirection::SellEquity)
+            .call()
+            .await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Wait for hedging + inventory poller cycles (poll interval is 15s)
+    wait_for_processing(&bot, 20).await;
+
+    assert_rebalancing_state(&infra.db_path, 3, None).await?;
+
+    bot.abort();
+    Ok(())
+}
 //
-//     let broker = AlpacaBrokerMock::start().build().await;
-//
-//     let current_block = chain.provider.get_block_number().await?;
-//     let db_dir = tempfile::tempdir()?;
-//     let db_path = db_dir.path().join("e2e.sqlite");
-//
-//     let ctx = build_rebalancing_ctx(
-//         &chain,
-//         &broker,
-//         &db_path,
-//         current_block,
-//         &[("AAPL", vault_addr, underlying_addr)],
-//         UsdcRebalancing::Disabled,
-//         None,
-//     )?;
-//     let bot = spawn_bot(ctx);
-//
-//     tokio::time::sleep(Duration::from_secs(2)).await;
-//
-//     // Process several sells to create inventory pressure.
-//     for _ in 0..3 {
-//         chain
-//             .take_order("AAPL", "7.5", TakeDirection::SellEquity)
-//             .await?;
-//         tokio::time::sleep(Duration::from_secs(3)).await;
-//     }
-//
-//     // Wait for hedging + inventory poller cycles (poll interval is 15s)
-//     wait_for_processing(&bot, 20).await;
-//
-//     // Verify inventory snapshot events were emitted by the poller
-//     let pool = connect_db(&db_path).await?;
-//
-//     let onchain_events = count_events(&pool, "OnChainTrade").await?;
-//     assert!(
-//         onchain_events >= 3,
-//         "Expected at least 3 OnChainTrade events, got {onchain_events}"
-//     );
-//
-//     let inventory_events = count_events(&pool, "InventorySnapshot").await?;
-//     assert!(
-//         inventory_events >= 1,
-//         "Expected at least 1 InventorySnapshot event from the inventory poller, \
-//          got {inventory_events}"
-//     );
-//
-//     pool.close().await;
-//     bot.abort();
-//     Ok(())
-// }
-//
-// /// Equity mint triggered by offchain-heavy imbalance.
-// ///
-// /// SellEquity trades cause the bot to sell equity onchain (vault depletes)
-// /// and buy equity offchain (broker position grows). This creates a
-// /// TooMuchOffchain equity imbalance that should trigger a mint operation
-// /// to tokenize offchain shares and deposit them into the Raindex vault.
-// ///
-// /// The test deploys an ERC-4626 vault wrapping a test ERC20 so the
-// /// trigger's `convertToAssets()` call succeeds. Tokenization API
-// /// endpoints are mocked on the broker server (the conductor resolves
-// /// all Alpaca services from the same base URL).
-// ///
-// /// We assert the full mint pipeline fires: MintRequested, MintAccepted,
-// /// TokensReceived, TokensWrapped, and DepositedIntoRaindex. This
-// /// verifies the complete flow from tokenization request through
-// /// ERC-4626 wrapping and Raindex vault deposit.
-// #[tokio::test]
-// async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
-//     let mut chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
-//
-//     // Deploy ERC-4626 vault for AAPL. The owner already has underlying
-//     // tokens + unlimited vault approval from deploy_equity_vault(), so
-//     // the wrapping step (ERC-4626 deposit) after Alpaca "mints" will
-//     // succeed using the owner key as the market maker.
-//     let (vault_addr, underlying_addr) = chain.deploy_equity_vault("AAPL").await?;
-//
-//     // Start broker mock with tokenization endpoints registered
-//     let broker = AlpacaBrokerMock::start().build().await;
-//     broker.register_tokenization_endpoints();
-//
-//     let current_block = chain.provider.get_block_number().await?;
-//     let db_dir = tempfile::tempdir()?;
-//     let db_path = db_dir.path().join("e2e.sqlite");
-//     let database_url = db_path.display().to_string();
-//
-//     let ctx = build_rebalancing_ctx(
-//         &chain,
-//         &broker,
-//         &db_path,
-//         current_block,
-//         &[("AAPL", vault_addr, underlying_addr)],
-//         UsdcRebalancing::Disabled,
-//         None,
-//     )?;
-//     let bot = spawn_bot(ctx);
-//
-//     tokio::time::sleep(Duration::from_secs(2)).await;
-//
-//     // Process several SellEquity trades to create offchain-heavy imbalance.
-//     // Each sell depletes the onchain vault and accumulates offchain equity.
-//     // Inter-trade delays ensure hedging completes before the next trade.
-//     let mut take_results = Vec::new();
-//     for _ in 0..3 {
-//         take_results.push(
-//             chain
-//                 .take_order("AAPL", "7.5", TakeDirection::SellEquity)
-//                 .await?,
-//         );
-//         tokio::time::sleep(Duration::from_secs(3)).await;
-//     }
-//
-//     // Wait for: hedging + inventory poller + trigger evaluation +
-//     // tokenization request + polling (2 polls at 10s each)
-//     wait_for_processing(&bot, 40).await;
-//
-//     // ── Layer 1: Hedging pipeline (broker + CQRS) ────────────────────
-//     // Skip vault depletion assertions because the mint pipeline deposits
-//     // wrapped tokens back into the output vault, making it non-zero.
-//     let scenarios = [ExpectedPosition {
-//         symbol: "AAPL",
-//         amount: "22.5",
-//         direction: TakeDirection::SellEquity,
-//         fill_price: "150.00",
-//         expected_accumulated_long: "0",
-//         expected_accumulated_short: "22.5",
-//         expected_net: "0",
-//     }];
-//
-//     assert_broker_state(&scenarios, &broker);
-//     assert_cqrs_state(&scenarios, take_results.len(), &database_url).await?;
-//
-//     // ── Layer 2: Inventory snapshots ─────────────────────────────────
-//     let pool = connect_db(&db_path).await?;
-//
-//     let inventory_events = count_events(&pool, "InventorySnapshot").await?;
-//     assert!(
-//         inventory_events >= 1,
-//         "Expected at least 1 InventorySnapshot event, got {inventory_events}"
-//     );
-//
-//     // ── Layer 3: Mint pipeline (events) ──────────────────────────────
-//     let mint_events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
-//     assert!(
-//         !mint_events.is_empty(),
-//         "Expected at least 1 TokenizedEquityMint event (mint trigger fired), got 0"
-//     );
-//
-//     assert_event_subsequence(
-//         &mint_events,
-//         &[
-//             "TokenizedEquityMintEvent::MintRequested",
-//             "TokenizedEquityMintEvent::MintAccepted",
-//             "TokenizedEquityMintEvent::TokensReceived",
-//             "TokenizedEquityMintEvent::TokensWrapped",
-//             "TokenizedEquityMintEvent::DepositedIntoRaindex",
-//         ],
-//     );
-//
-//     assert_single_clean_aggregate(&mint_events, &["Failed", "Rejected"]);
-//
-//     // ── Layer 3: Mint pipeline (broker state) ────────────────────────
-//     let mint_requests: Vec<_> = broker
-//         .tokenization_requests()
-//         .into_iter()
-//         .filter(|req| req.request_type == "mint" && req.symbol == "AAPL")
-//         .collect();
-//     assert!(
-//         !mint_requests.is_empty(),
-//         "Expected at least 1 mint tokenization request for AAPL on the broker"
-//     );
-//     assert!(
-//         mint_requests.iter().any(|req| req.status == "completed"),
-//         "Expected at least one completed mint request, got: {:?}",
-//         mint_requests.iter().map(|r| &r.status).collect::<Vec<_>>()
-//     );
-//
-//     pool.close().await;
-//     bot.abort();
-//     Ok(())
-// }
+/// Equity mint triggered by offchain-heavy imbalance.
+///
+/// SellEquity trades cause the bot to sell equity onchain (vault depletes)
+/// and buy equity offchain (broker position grows). This creates a
+/// TooMuchOffchain equity imbalance that should trigger a mint operation
+/// to tokenize offchain shares and deposit them into the Raindex vault.
+///
+/// The test deploys an ERC-4626 vault wrapping a test ERC20 so the
+/// trigger's `convertToAssets()` call succeeds. Tokenization API
+/// endpoints are mocked on the broker server (the conductor resolves
+/// all Alpaca services from the same base URL).
+///
+/// We assert the full mint pipeline fires: MintRequested, MintAccepted,
+/// TokensReceived, TokensWrapped, and DepositedIntoRaindex. This
+/// verifies the complete flow from tokenization request through
+/// ERC-4626 wrapping and Raindex vault deposit.
+#[test_log::test(tokio::test)]
+async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
+    let onchain_price = dec!(150.00);
+    let broker_fill_price = dec!(150.00);
+    let amount_per_trade = dec!(7.5);
+
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)]).await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let equity_tokens: Vec<(&str, Address, Address)> = infra
+        .equity_addresses
+        .iter()
+        .map(|(symbol, vault, underlying)| (symbol.as_str(), *vault, *underlying))
+        .collect();
+
+    let ctx = build_rebalancing_ctx(
+        &infra.base_chain,
+        &infra.broker_service,
+        &infra.db_path,
+        current_block,
+        &equity_tokens,
+        UsdcRebalancing::Disabled,
+        None,
+    )?;
+    let bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Process several SellEquity trades to create offchain-heavy imbalance.
+    // Each sell depletes the onchain vault and accumulates offchain equity.
+    // Inter-trade delays ensure hedging completes before the next trade.
+    let mut take_results = Vec::new();
+    for _ in 0..3 {
+        take_results.push(
+            infra
+                .base_chain
+                .take_order()
+                .symbol("AAPL")
+                .amount(amount_per_trade)
+                .price(onchain_price)
+                .direction(TakeDirection::SellEquity)
+                .call()
+                .await?,
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Wait for: hedging + inventory poller (15s interval) + trigger +
+    // tokenization request + polling (2 polls at 10s each) + wrapping +
+    // Raindex deposit (onchain txs need confirmations)
+    wait_for_processing(&bot, 80).await;
+
+    // ── Layer 1: Hedging pipeline (broker + CQRS) ────────────────────
+    // Skip vault depletion assertions because the mint pipeline deposits
+    // wrapped tokens back into the output vault, making it non-zero.
+    let expected_positions = [ExpectedPosition {
+        symbol: "AAPL",
+        amount: dec!(22.5),
+        direction: TakeDirection::SellEquity,
+        onchain_price,
+        broker_fill_price,
+        expected_accumulated_long: dec!(0),
+        expected_accumulated_short: dec!(22.5),
+        expected_net: dec!(0),
+    }];
+
+    let database_url = infra.db_path.display().to_string();
+    assert_broker_state(&expected_positions, &infra.broker_service);
+    assert_cqrs_state(&expected_positions, take_results.len(), &database_url).await?;
+
+    // ── Layers 2+3: Inventory snapshots + mint pipeline ──────────────
+    assert_rebalancing_state(
+        &infra.db_path,
+        3,
+        Some(MintAssertions {
+            symbol: "AAPL",
+            tokenization: &infra.tokenization_service,
+        }),
+    )
+    .await?;
+
+    bot.abort();
+    Ok(())
+}
 //
 // /// Equity redemption triggered by onchain-heavy imbalance.
 // ///
@@ -262,7 +224,7 @@ const ETHEREUM_RPC_URL: &str =
 //     let mut chain = base_chain::BaseChain::start(BASE_RPC_URL).await?;
 //     let (vault_addr, underlying_addr) = chain.deploy_equity_vault("AAPL").await?;
 //
-//     let broker = AlpacaBrokerMock::start().build().await;
+//     let broker = AlpacaBrokerMock::start().call().await;
 //     broker.register_redemption_tokenization_endpoints();
 //
 //     // Create a known redemption wallet so the watcher can detect
@@ -475,7 +437,7 @@ const ETHEREUM_RPC_URL: &str =
 //     );
 //
 //     // Start broker mock with wallet + tokenization endpoints
-//     let broker = AlpacaBrokerMock::start().build().await;
+//     let broker = AlpacaBrokerMock::start().call().await;
 //     broker.register_tokenization_endpoints();
 //     broker.register_wallet_endpoints(base_chain.owner);
 //
@@ -716,7 +678,7 @@ const ETHEREUM_RPC_URL: &str =
 //     );
 //
 //     // Start broker mock with wallet + tokenization endpoints
-//     let broker = AlpacaBrokerMock::start().build().await;
+//     let broker = AlpacaBrokerMock::start().call().await;
 //     broker.register_tokenization_endpoints();
 //     broker.register_wallet_endpoints(base_chain.owner);
 //

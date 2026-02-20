@@ -1,3 +1,4 @@
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use rust_decimal::Decimal;
 use st0x_execution::Symbol;
@@ -30,6 +31,8 @@ pub struct TestInfra<P1, P2> {
     pub broker_service: AlpacaBrokerMock,
     pub tokenization_service: AlpacaTokenizationMock,
     pub attestation_service: CctpAttestationMock,
+    /// `(symbol, vault_address, underlying_address)` per deployed equity vault.
+    pub equity_addresses: Vec<(String, Address, Address)>,
 }
 
 impl TestInfra<(), ()> {
@@ -40,8 +43,10 @@ impl TestInfra<(), ()> {
         let db_path = db_dir.path().join("e2e.sqlite");
 
         let mut base_chain = BaseChain::start(BASE_RPC_URL).await?;
+        let mut equity_addresses = Vec::new();
         for (symbol, _price) in &equities {
-            base_chain.deploy_equity_vault(symbol).await?;
+            let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
+            equity_addresses.push(((*symbol).to_owned(), vault_addr, underlying_addr));
         }
 
         let ethereum_chain = EthereumChain::start(ETHEREUM_RPC_URL).await?;
@@ -52,10 +57,10 @@ impl TestInfra<(), ()> {
             .collect::<anyhow::Result<_>>()?;
 
         let broker_service = AlpacaBrokerMock::start()
-            .with_symbol_price_map(symbol_prices)
-            .build()
+            .symbol_fill_prices(symbol_prices)
+            .call()
             .await;
-        let tokenization_service = AlpacaTokenizationMock::start().await;
+        let tokenization_service = AlpacaTokenizationMock::start(broker_service.server());
         let attestation_service = CctpAttestationMock::start().await;
 
         Ok(TestInfra {
@@ -66,6 +71,7 @@ impl TestInfra<(), ()> {
             broker_service,
             tokenization_service,
             attestation_service,
+            equity_addresses,
         })
     }
 }

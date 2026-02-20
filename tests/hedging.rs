@@ -21,7 +21,7 @@ use st0x_hedge::config::ExecutionThreshold;
 use st0x_hedge::{OffchainOrder, Position};
 
 use common::{
-    ExpectedPosition, assert_full_pipeline, build_ctx, connect_db, count_all_domain_events,
+    ExpectedPosition, assert_full_hedging_flow, build_ctx, connect_db, count_all_domain_events,
     count_events, count_processed_queue_events, count_queued_events, spawn_bot,
     wait_for_processing,
 };
@@ -72,7 +72,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
 
     wait_for_processing(&bot, 8).await;
 
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &[expected_position],
         &[take_result],
         &infra.base_chain.provider,
@@ -169,7 +169,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
 
     wait_for_processing(&bot, 12).await;
 
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &expected_positions,
         &take_results,
         &infra.base_chain.provider,
@@ -258,7 +258,7 @@ async fn backfilling() -> anyhow::Result<()> {
         expected_net: dec!(0),
     };
 
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &[expected_position],
         &take_results,
         &infra.base_chain.provider,
@@ -359,7 +359,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         expected_net: dec!(0),
     };
 
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &[expected_position],
         &[take1, take2],
         &infra.base_chain.provider,
@@ -440,7 +440,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     wait_for_processing(&ref_bot, 10).await;
 
     // Assert reference run passes full pipeline
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &expected_positions,
         &ref_take_results,
         &ref_infra.base_chain.provider,
@@ -512,7 +512,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     wait_for_processing(&bot2, 12).await;
 
     // Assert crash run also passes full pipeline (convergence)
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &expected_positions,
         &[crash_take1, crash_take2],
         &crash_infra.base_chain.provider,
@@ -622,7 +622,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         expected_net: dec!(0),
     };
 
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &[expected_position],
         &[take_result],
         &infra.base_chain.provider,
@@ -716,7 +716,7 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
 
     wait_for_processing(&bot, 8).await;
 
-    assert_full_pipeline(
+    assert_full_hedging_flow(
         &[expected_position],
         &[take_result_sell, take_result_buy],
         &infra.base_chain.provider,

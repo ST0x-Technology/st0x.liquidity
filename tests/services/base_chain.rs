@@ -81,7 +81,10 @@ impl BaseChain<()> {
     /// and deploys the Rain expression stack (Interpreter, Store, Parser,
     /// Deployer).
     pub async fn start(rpc_url: &str) -> anyhow::Result<BaseChain<impl Provider + Clone>> {
-        let anvil = Anvil::new().fork(rpc_url).spawn();
+        // Auto-mine a block every second so that onchain transactions
+        // requiring multiple confirmations (e.g., REQUIRED_CONFIRMATIONS=3
+        // in ShareWrapper) complete on Anvil instead of hanging forever.
+        let anvil = Anvil::new().fork(rpc_url).block_time(1).spawn();
 
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let signer = PrivateKeySigner::from_bytes(&key)?;
