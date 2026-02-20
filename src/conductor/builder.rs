@@ -205,6 +205,7 @@ where
             self.common.frameworks.position_projection.clone(),
             self.common.frameworks.offchain_order.clone(),
             self.common.execution_threshold,
+            self.common.ctx.operational_limits.clone(),
         );
         let trade_cqrs = super::TradeProcessingCqrs {
             onchain_trade: self.common.frameworks.onchain_trade,
@@ -212,6 +213,7 @@ where
             position_projection: self.common.frameworks.position_projection,
             offchain_order: self.common.frameworks.offchain_order,
             execution_threshold: self.common.execution_threshold,
+            operational_limits: self.common.ctx.operational_limits.clone(),
         };
         let queue_processor = spawn_queue_processor(
             self.common.executor,

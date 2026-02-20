@@ -25,6 +25,7 @@ use st0x_execution::{
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
+use crate::config::OperationalLimits;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
@@ -111,6 +112,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
+        limits: OperationalLimits::Disabled,
     }
 }
 
@@ -1094,6 +1096,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
             },
+            limits: OperationalLimits::Disabled,
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -1140,6 +1143,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
             },
+            limits: OperationalLimits::Disabled,
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());

@@ -10,6 +10,7 @@ use tracing::{trace, warn};
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{TokenAddressError, TriggeredOperation};
+use crate::config::OperationalLimits;
 use crate::inventory::{EquityImbalanceError, Imbalance, ImbalanceThreshold, InventoryView};
 use crate::wrapper::{UnderlyingPerWrapped, WrapperError};
 
@@ -100,6 +101,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     wrapped_token: Address,
     unwrapped_token: Address,
     vault_ratio: &UnderlyingPerWrapped,
+    limits: &OperationalLimits,
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
     let imbalance = {
         let inventory = inventory.read().await;
@@ -113,14 +115,14 @@ pub(super) async fn check_imbalance_and_build_operation(
 
     Ok(Some(match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let quantity = truncate_for_alpaca(symbol, excess);
+            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), limits);
             TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
             }
         }
         Imbalance::TooMuchOnchain { excess } => {
-            let quantity = truncate_for_alpaca(symbol, excess);
+            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), limits);
             TriggeredOperation::Redemption {
                 symbol: symbol.clone(),
                 quantity,
@@ -129,6 +131,29 @@ pub(super) async fn check_imbalance_and_build_operation(
             }
         }
     }))
+}
+
+fn cap_shares(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    limits: &OperationalLimits,
+) -> FractionalShares {
+    let OperationalLimits::Enabled { max_shares, .. } = limits else {
+        return quantity;
+    };
+
+    let cap = max_shares.inner();
+    if quantity > cap {
+        warn!(
+            %symbol,
+            computed = %quantity,
+            limit = %cap,
+            "Equity rebalancing shares capped by operational limit"
+        );
+        cap
+    } else {
+        quantity
+    }
 }
 
 /// Truncates to the Alpaca API decimal limit, logging a warning when
@@ -160,11 +185,13 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::str::FromStr;
 
-    use st0x_execution::FractionalShares;
+    use st0x_execution::{FractionalShares, Positive};
 
     use super::*;
+    use crate::config::OperationalLimits;
     use crate::inventory::view::Operator;
     use crate::inventory::{Inventory, TransferOp, Venue};
+    use crate::threshold::Usdc;
     use crate::wrapper::RATIO_ONE;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
@@ -258,6 +285,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
+            &OperationalLimits::Disabled,
         )
         .await;
 
@@ -281,6 +309,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
+            &OperationalLimits::Disabled,
         )
         .await;
 
@@ -306,6 +335,7 @@ mod tests {
             wrapped_addr,
             unwrapped_addr,
             &ratio,
+            &OperationalLimits::Disabled,
         )
         .await;
 
@@ -345,6 +375,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio_1_to_1,
+            &OperationalLimits::Disabled,
         )
         .await;
         assert_eq!(result_1_to_1.unwrap(), None);
@@ -359,6 +390,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio_1_5,
+            &OperationalLimits::Disabled,
         )
         .await;
         assert!(
@@ -429,6 +461,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &vault_ratio,
+            &OperationalLimits::Disabled,
         )
         .await
         .unwrap()
@@ -530,6 +563,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &vault_ratio,
+            &OperationalLimits::Disabled,
         )
         .await
         .unwrap()
@@ -595,6 +629,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &vault_ratio,
+            &OperationalLimits::Disabled,
         )
         .await;
 
@@ -632,5 +667,40 @@ mod tests {
         let result = truncate_for_alpaca(&symbol, original);
 
         assert_eq!(result, original);
+    }
+
+    #[tokio::test]
+    async fn operational_limits_cap_equity_shares() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = make_imbalanced_view(&symbol, 80, 20);
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+        let ratio = one_to_one_ratio();
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(10))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            &limits,
+        )
+        .await;
+
+        let Ok(Some(TriggeredOperation::Redemption { quantity, .. })) = result else {
+            panic!("Expected Redemption, got {result:?}");
+        };
+        assert_eq!(
+            quantity,
+            FractionalShares::new(dec!(10)),
+            "Operational limit should cap redemption to 10 shares, got {quantity}"
+        );
     }
 }

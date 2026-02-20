@@ -98,7 +98,7 @@ mod tests {
 
     use super::*;
     use crate::config::SchwabAuth;
-    use crate::config::{BrokerCtx, Ctx, TradingMode};
+    use crate::config::{BrokerCtx, Ctx, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -110,6 +110,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: crate::config::LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),

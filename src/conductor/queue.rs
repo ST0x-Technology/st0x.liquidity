@@ -237,6 +237,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
+    use crate::config::OperationalLimits;
     use crate::offchain_order::noop_order_placer;
     use crate::offchain_order::{OffchainOrder, OrderPlacer};
     use crate::onchain_trade::OnChainTrade;
@@ -313,6 +314,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
+            operational_limits: OperationalLimits::Disabled,
         }
     }
 

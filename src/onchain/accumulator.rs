@@ -3,6 +3,7 @@ use tracing::{debug, info};
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
 
+use crate::config::OperationalLimits;
 use crate::onchain::OnChainError;
 use crate::position::Position;
 
@@ -25,13 +26,14 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     position_projection: &Projection<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
+    limits: &OperationalLimits,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
     let Some(position) = position_projection.load(symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };
 
-    let Some((direction, shares)) = position.is_ready_for_execution(executor_type)? else {
+    let Some((direction, shares)) = position.is_ready_for_execution(executor_type, limits)? else {
         debug!(
             symbol = %symbol,
             net = %position.net,
@@ -85,13 +87,14 @@ pub(crate) async fn check_all_positions<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
     executor_type: SupportedExecutor,
+    limits: &OperationalLimits,
 ) -> Result<Vec<ExecutionCtx>, OnChainError> {
     let all_positions = position_projection.load_all().await?;
 
     let mut ready = Vec::new();
 
     for (symbol, position) in &all_positions {
-        if let Some((direction, shares)) = position.is_ready_for_execution(executor_type)? {
+        if let Some((direction, shares)) = position.is_ready_for_execution(executor_type, limits)? {
             if !check_market_open(executor, symbol).await? {
                 continue;
             }
@@ -137,6 +140,7 @@ mod tests {
     use st0x_execution::MockExecutor;
 
     use super::*;
+    use crate::config::OperationalLimits;
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -190,6 +194,7 @@ mod tests {
             &query,
             &Symbol::new("AAPL").unwrap(),
             SupportedExecutor::Schwab,
+            &OperationalLimits::Disabled,
         )
         .await
         .unwrap();
@@ -212,10 +217,15 @@ mod tests {
         )
         .await;
 
-        let result =
-            check_execution_readiness(&executor, &query, &symbol, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let result = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::Schwab,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_none());
     }
@@ -235,11 +245,16 @@ mod tests {
         )
         .await;
 
-        let params =
-            check_execution_readiness(&executor, &query, &symbol, SupportedExecutor::DryRun)
-                .await
-                .unwrap()
-                .expect("should be ready for execution");
+        let params = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap()
+        .expect("should be ready for execution");
 
         assert_eq!(params.symbol, symbol);
         assert_eq!(
@@ -281,9 +296,14 @@ mod tests {
         )
         .await;
 
-        let ready = check_all_positions(&executor, &query, SupportedExecutor::Schwab)
-            .await
-            .unwrap();
+        let ready = check_all_positions(
+            &executor,
+            &query,
+            SupportedExecutor::Schwab,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].symbol, msft);
@@ -315,10 +335,15 @@ mod tests {
 
         let executor = MockExecutor::new().with_market_open(false);
 
-        let result =
-            check_execution_readiness(&executor, &query, &symbol, SupportedExecutor::DryRun)
-                .await
-                .unwrap();
+        let result = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap();
 
         assert!(
             result.is_none(),
@@ -343,11 +368,16 @@ mod tests {
 
         let executor = MockExecutor::new().with_market_open(true);
 
-        let params =
-            check_execution_readiness(&executor, &query, &symbol, SupportedExecutor::DryRun)
-                .await
-                .unwrap()
-                .expect("should be ready when market is open");
+        let params = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap()
+        .expect("should be ready when market is open");
 
         assert_eq!(params.symbol, symbol);
         assert_eq!(
@@ -374,10 +404,15 @@ mod tests {
         )
         .await;
 
-        let result =
-            check_execution_readiness(&closed_executor, &query, &symbol, SupportedExecutor::DryRun)
-                .await
-                .unwrap();
+        let result = check_execution_readiness(
+            &closed_executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap();
         assert!(result.is_none(), "Should not execute while market closed");
 
         // Second trade while market closed - now above threshold
@@ -400,10 +435,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            check_execution_readiness(&closed_executor, &query, &symbol, SupportedExecutor::DryRun)
-                .await
-                .unwrap();
+        let result = check_execution_readiness(
+            &closed_executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap();
         assert!(
             result.is_none(),
             "Should still not execute while market closed"
@@ -412,11 +452,16 @@ mod tests {
         // Market opens - should now execute
         let open_executor = MockExecutor::new().with_market_open(true);
 
-        let params =
-            check_execution_readiness(&open_executor, &query, &symbol, SupportedExecutor::DryRun)
-                .await
-                .unwrap()
-                .expect("should execute when market opens with accumulated position");
+        let params = check_execution_readiness(
+            &open_executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+        )
+        .await
+        .unwrap()
+        .expect("should execute when market opens with accumulated position");
 
         assert_eq!(params.symbol, symbol);
         assert_eq!(

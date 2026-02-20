@@ -18,7 +18,7 @@ use st0x_execution::{
 };
 
 use super::auth::ensure_schwab_authentication;
-use crate::config::{BrokerCtx, Ctx};
+use crate::config::{BrokerCtx, Ctx, OperationalLimits};
 use crate::offchain_order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
 };
@@ -342,9 +342,14 @@ pub(super) async fn process_found_trade<W: Write>(
 
     // CLI test command uses MockExecutor (market always open)
     let executor = MockExecutor::new();
-    let Some(params) =
-        check_execution_readiness(&executor, &position_projection, base_symbol, executor_type)
-            .await?
+    let Some(params) = check_execution_readiness(
+        &executor,
+        &position_projection,
+        base_symbol,
+        executor_type,
+        &OperationalLimits::Disabled,
+    )
+    .await?
     else {
         writeln!(
             stdout,
@@ -516,6 +521,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),

@@ -305,6 +305,13 @@ async execution flows per event. Idempotency via `(tx_hash, log_index)` keys.
 Plaintext config (`--config`, see `example.config.toml`) and encrypted secrets
 (`--secrets`, see `example.secrets.toml`).
 
+**CRITICAL: No silent fallback defaults.** Unless explicitly told otherwise,
+every operational parameter must be explicitly configured. Never assume `Option`
+with a silent fallback default is acceptable — missing config fields must fail
+at startup, not silently assume values. Misconfigurations must surface
+immediately, not hide behind "reasonable defaults" that produce unexpected
+behavior.
+
 ### Naming Conventions
 
 Code names must be consistent with **[docs/domain.md](docs/domain.md)**, which

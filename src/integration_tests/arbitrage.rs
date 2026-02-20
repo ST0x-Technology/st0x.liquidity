@@ -39,6 +39,7 @@ use crate::conductor::{
     EventProcessingError, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
+use crate::config::OperationalLimits;
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
 use crate::onchain::OnchainTrade;
@@ -633,6 +634,7 @@ async fn create_test_cqrs(
         position_projection: position_projection.clone(),
         offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
+        operational_limits: OperationalLimits::Disabled,
     };
 
     (
@@ -882,6 +884,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
+        &OperationalLimits::Disabled,
     )
     .await?;
 
@@ -1405,6 +1408,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
+        &OperationalLimits::Disabled,
     )
     .await?;
 

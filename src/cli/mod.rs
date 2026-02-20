@@ -762,7 +762,7 @@ mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-    use crate::config::{BrokerCtx, LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{BrokerCtx, LogLevel, OperationalLimits, SchwabAuth, TradingMode};
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
@@ -1221,6 +1221,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: TEST_ORDERBOOK,
@@ -2268,6 +2269,8 @@ mod tests {
             &config_path,
             r#"
                 database_url = ":memory:"
+                [operational_limits]
+                mode = "disabled"
                 [evm]
                 orderbook = "0x1111111111111111111111111111111111111111"
                 deployment_block = 1

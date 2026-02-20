@@ -19,6 +19,7 @@ use st0x_execution::{
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
+use crate::config::OperationalLimits;
 use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
@@ -364,6 +365,7 @@ impl Position {
     pub(crate) fn is_ready_for_execution(
         &self,
         executor: SupportedExecutor,
+        limits: &OperationalLimits,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
         if self.pending_offchain_order_id.is_some() {
             return Ok(None);
@@ -375,11 +377,29 @@ impl Position {
             Some(TriggerReason::SharesThreshold { .. } | TriggerReason::DollarThreshold { .. }) => {
                 let raw_shares = self.net.abs();
 
-                let executable_shares = if executor.supports_fractional_shares() {
+                let floored_shares = if executor.supports_fractional_shares() {
                     raw_shares
                 } else {
                     FractionalShares::new(raw_shares.inner().trunc())
                 };
+
+                let executable_shares =
+                    if let OperationalLimits::Enabled { max_shares, .. } = limits {
+                        let cap = max_shares.inner();
+                        if floored_shares > cap {
+                            warn!(
+                                symbol = %self.symbol,
+                                computed = %floored_shares,
+                                limit = %cap,
+                                "Counter trade shares capped by operational limit"
+                            );
+                            cap
+                        } else {
+                            floored_shares
+                        }
+                    } else {
+                        floored_shares
+                    };
 
                 if executable_shares.is_zero() {
                     return Ok(None);
@@ -580,6 +600,7 @@ mod tests {
     use st0x_event_sorcery::{LifecycleError, Projection, StoreBuilder, TestHarness, replay};
 
     use super::*;
+    use crate::config::OperationalLimits;
     use crate::threshold::Usdc;
 
     fn one_share_threshold() -> ExecutionThreshold {
@@ -1183,7 +1204,7 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab)
+            .is_ready_for_execution(SupportedExecutor::Schwab, &OperationalLimits::Disabled)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1211,7 +1232,7 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab)
+            .is_ready_for_execution(SupportedExecutor::Schwab, &OperationalLimits::Disabled)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1239,7 +1260,10 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
+            .is_ready_for_execution(
+                SupportedExecutor::AlpacaTradingApi,
+                &OperationalLimits::Disabled,
+            )
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1267,7 +1291,10 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
+            .is_ready_for_execution(
+                SupportedExecutor::AlpacaTradingApi,
+                &OperationalLimits::Disabled,
+            )
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1277,6 +1304,72 @@ mod tests {
             dec!(2.567),
             "Alpaca executor should return full \
              fractional shares: expected 2.567, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn operational_limits_cap_shares() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(100)),
+            accumulated_long: FractionalShares::new(dec!(100)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_offchain_order_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+        };
+
+        let (direction, shares) = position
+            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .unwrap()
+            .expect("should be ready for execution");
+
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(
+            shares.inner(),
+            dec!(50),
+            "Shares should be capped by operational \
+             limit: expected 50, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn operational_limits_do_not_cap_below_limit() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(30)),
+            accumulated_long: FractionalShares::new(dec!(30)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_offchain_order_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+        };
+
+        let (direction, shares) = position
+            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .unwrap()
+            .expect("should be ready for execution");
+
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(
+            shares.inner(),
+            dec!(30),
+            "Shares should not be capped when below \
+             limit: expected 30, got {}",
             shares.inner()
         );
     }

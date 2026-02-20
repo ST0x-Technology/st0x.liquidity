@@ -471,7 +471,7 @@ mod tests {
 
     use super::*;
     use crate::cli::ConvertDirection;
-    use crate::config::{LogLevel, TradingMode};
+    use crate::config::{LogLevel, OperationalLimits, TradingMode};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
@@ -483,6 +483,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -518,6 +519,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),

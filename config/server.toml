@@ -2,6 +2,9 @@ database_url = "sqlite:///mnt/data/alpaca.db"
 log_level = "debug"
 server_port = 8001
 
+[operational_limits]
+mode = "disabled"
+
 [hyperdx]
 service_name = "st0x-hedge"
 
