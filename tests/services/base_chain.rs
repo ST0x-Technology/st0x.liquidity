@@ -14,6 +14,8 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use rain_math_float::Float;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use url::Url;
 
@@ -70,6 +72,7 @@ pub struct BaseChain<P> {
     deployer_addr: Address,
     interpreter_addr: Address,
     store_addr: Address,
+    // Map of equity symbol to vault address (used by `take_order()`)
     equity_tokens: HashMap<String, Address>,
 }
 
@@ -138,6 +141,7 @@ impl BaseChain<()> {
     }
 }
 
+#[bon::bon]
 impl<P: Provider + Clone> BaseChain<P> {
     /// Returns the WebSocket endpoint URL for the Anvil node.
     pub fn ws_endpoint(&self) -> anyhow::Result<Url> {
@@ -262,6 +266,43 @@ impl<P: Provider + Clone> BaseChain<P> {
         Ok(vault_id)
     }
 
+    /// Deposits tokens into an existing Raindex vault.
+    ///
+    /// `amount` is in raw units (e.g. 18-decimal for equity tokens).
+    /// Used by rebalancing tests to pre-fund vaults with additional tokens
+    /// beyond what trade orders deposit.
+    pub async fn deposit_into_raindex_vault(
+        &self,
+        token: Address,
+        vault_id: B256,
+        amount: U256,
+        decimals: u8,
+    ) -> anyhow::Result<()> {
+        let orderbook =
+            IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.provider);
+
+        // Over-approve for Rain float precision rounding
+        IERC20::new(token, &self.provider)
+            .approve(*orderbook.address(), amount * U256::from(2))
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        let deposit_float = Float::from_fixed_decimal_lossy(amount, decimals)
+            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+            .get_inner();
+
+        orderbook
+            .deposit3(token, vault_id, deposit_float, vec![])
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(())
+    }
+
     /// Funds the market maker wallet (derived from `[1u8; 32]`) with ETH
     /// for gas and returns its address.
     pub async fn fund_market_maker(&self) -> anyhow::Result<Address> {
@@ -328,13 +369,15 @@ impl<P: Provider + Clone> BaseChain<P> {
     /// The order is created with the owner account and immediately taken by
     /// the same account. This emits a `TakeOrderV3` event that the bot
     /// detects. Price is hardcoded to 100 (1 equity token = 100 USDC).
+    #[builder]
     pub async fn take_order(
         &self,
         symbol: &str,
-        amount: &str,
+        amount: Decimal,
+        price: Decimal,
         direction: TakeDirection,
     ) -> anyhow::Result<TakeOrderResult> {
-        let equity_addr = *self
+        let equity_vault_addr = *self
             .equity_tokens
             .get(symbol)
             .ok_or_else(|| anyhow::anyhow!("Equity token for {symbol} not deployed"))?;
@@ -344,19 +387,15 @@ impl<P: Provider + Clone> BaseChain<P> {
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
-        let price = 100u32;
-        let amount_f64: f64 = amount
-            .parse()
-            .map_err(|err| anyhow::anyhow!("Invalid amount: {err}"))?;
-        let usdc_total = amount_f64 * f64::from(price);
-        let amount_str = format!("{amount_f64:.6}");
+        let usdc_total = amount * price;
+        let amount_str = format!("{amount:.6}");
         let usdc_total_str = format!("{usdc_total:.6}");
 
         // Order: input = what order receives, output = what order gives
         let (input_token, output_token) = if is_sell {
-            (USDC_BASE, equity_addr)
+            (USDC_BASE, equity_vault_addr)
         } else {
-            (equity_addr, USDC_BASE)
+            (equity_vault_addr, USDC_BASE)
         };
 
         // Rain expression: maxAmount (output in base units) and ioRatio
@@ -369,7 +408,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             (base, price.to_string())
         } else {
             let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            let reciprocal = 1.0 / f64::from(price);
+            let reciprocal = dec!(1.0) / price;
             (base, format!("{reciprocal}"))
         };
         let expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");

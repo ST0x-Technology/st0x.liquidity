@@ -155,6 +155,7 @@ tempfile = "3.24.0"
 tracing-test = "0.2.5"
 bon = "3.9.0"
 st0x-hedge = { path = ".", features = ["test-support"] }
+test-log = { version = "0.2.19", features = ["trace"] }
 
 [lints]
 workspace = true

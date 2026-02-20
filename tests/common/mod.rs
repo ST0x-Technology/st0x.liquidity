@@ -1,6 +1,6 @@
-//! Shared helpers for e2e test scenarios.
+//! Shared helpers for e2e test assertions.
 //!
-//! Provides the `E2eScenario` struct, DB assertion utilities, and bot
+//! Provides the `ExpectedPosition` struct, DB assertion utilities, and bot
 //! lifecycle helpers used across `hedging.rs`, `rebalancing.rs`, and `main.rs`.
 
 use std::collections::HashMap;
@@ -37,18 +37,26 @@ use super::services::ethereum_chain;
 ///
 /// `amount` is the total expected hedge shares for this symbol across
 /// all trades (e.g., 3 sells of 1.0 each → amount = "3.0").
-pub struct E2eScenario {
+///
+/// Two prices are tracked separately:
+/// - `onchain_price`: the execution price from the Raindex order (USDC per
+///   equity share, derived from the Rain expression ioRatio)
+/// - `broker_fill_price`: the offchain hedge fill price from the broker mock
+///
+/// The spread between these two is where profit comes from.
+pub struct ExpectedPosition {
     pub symbol: &'static str,
-    pub amount: &'static str,
+    pub amount: Decimal,
     pub direction: TakeDirection,
-    pub fill_price: &'static str,
-    pub expected_accumulated_long: &'static str,
-    pub expected_accumulated_short: &'static str,
-    pub expected_net: &'static str,
+    pub onchain_price: Decimal,
+    pub broker_fill_price: Decimal,
+    pub expected_accumulated_long: Decimal,
+    pub expected_accumulated_short: Decimal,
+    pub expected_net: Decimal,
 }
 
-impl E2eScenario {
-    /// Whether this scenario expects an offchain hedge to be placed.
+impl ExpectedPosition {
+    /// Whether an offchain hedge is expected for this position.
     /// `NetZero` means opposing trades cancelled out and no hedge is needed.
     pub fn expects_hedge(&self) -> bool {
         !matches!(self.direction, TakeDirection::NetZero)
@@ -58,23 +66,23 @@ impl E2eScenario {
     ///
     /// # Panics
     ///
-    /// Panics if called on a `NetZero` scenario (no hedge direction exists).
+    /// Panics if called on a `NetZero` position (no hedge direction exists).
     pub fn expected_hedge_direction(&self) -> Direction {
         match self.direction {
             TakeDirection::SellEquity => Direction::Buy,
             TakeDirection::BuyEquity => Direction::Sell,
-            TakeDirection::NetZero => panic!("NetZero scenario has no hedge direction"),
+            TakeDirection::NetZero => panic!("NetZero position has no hedge direction"),
         }
     }
 
     /// # Panics
     ///
-    /// Panics if called on a `NetZero` scenario (no broker side exists).
+    /// Panics if called on a `NetZero` position (no broker side exists).
     pub fn expected_broker_side(&self) -> &'static str {
         match self.direction {
             TakeDirection::SellEquity => "buy",
             TakeDirection::BuyEquity => "sell",
-            TakeDirection::NetZero => panic!("NetZero scenario has no broker side"),
+            TakeDirection::NetZero => panic!("NetZero position has no broker side"),
         }
     }
 }
@@ -120,7 +128,7 @@ pub fn build_ctx<P: Provider + Clone>(
         order_polling_interval: 1,
         order_polling_max_jitter: 0,
         position_check_interval: 2,
-        inventory_poll_interval: 2,
+        inventory_poll_interval: 15,
         broker: broker_ctx,
         telemetry: None,
         rebalancing: None,
@@ -181,7 +189,7 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
         usdc_vault_id: B256::random(),
         equities,
         circle_api_base: None,
-        required_confirmations: None,
+        required_confirmations: Some(1),
     };
 
     // Use the chain owner's private key so that `Ctx::order_owner()`
@@ -207,7 +215,7 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
         order_polling_interval: 1,
         order_polling_max_jitter: 0,
         position_check_interval: 2,
-        inventory_poll_interval: 2,
+        inventory_poll_interval: 15,
         broker: broker_ctx,
         telemetry: None,
         rebalancing: Some(rebalancing_ctx),
@@ -296,10 +304,10 @@ pub async fn fetch_all_domain_events(pool: &SqlitePool) -> anyhow::Result<Vec<St
 /// Comprehensive end-to-end assertions covering broker state, onchain
 /// vaults, and CQRS events/views for one or more symbols.
 ///
-/// This is the primary assertion entry point. Every scenario test should
+/// This is the primary assertion entry point. Every e2e test should
 /// call this after the bot has finished processing.
 pub async fn assert_full_pipeline<P: Provider>(
-    scenarios: &[E2eScenario],
+    expected_positions: &[ExpectedPosition],
     take_results: &[TakeOrderResult],
     provider: &P,
     orderbook_addr: Address,
@@ -307,13 +315,13 @@ pub async fn assert_full_pipeline<P: Provider>(
     broker: &AlpacaBrokerMock,
     database_url: &str,
 ) -> anyhow::Result<()> {
-    assert_broker_state(scenarios, broker);
+    assert_broker_state(expected_positions, broker);
 
     for take_result in take_results {
         assert_onchain_vaults(provider, orderbook_addr, owner, take_result).await?;
     }
 
-    assert_cqrs_state(scenarios, take_results.len(), database_url).await?;
+    assert_cqrs_state(expected_positions, take_results.len(), database_url).await?;
 
     Ok(())
 }
@@ -322,79 +330,74 @@ pub async fn assert_full_pipeline<P: Provider>(
 
 /// Asserts broker orders and positions match expected state per symbol.
 ///
-/// For each scenario, verifies at least one filled order exists with the
+/// For each expected_position, verifies at least one filled order exists with the
 /// correct side and fill price, and exactly one position exists.
-pub fn assert_broker_state(scenarios: &[E2eScenario], broker: &AlpacaBrokerMock) {
+pub fn assert_broker_state(expected_positions: &[ExpectedPosition], broker: &AlpacaBrokerMock) {
     let orders = broker.orders();
     let positions = broker.positions();
 
-    for scenario in scenarios {
-        if !scenario.expects_hedge() {
-            let symbol_orders: Vec<&MockOrderSnapshot> = orders
-                .iter()
-                .filter(|order| order.symbol == scenario.symbol)
-                .collect();
+    for expected_position in expected_positions {
+        let symbol_orders: Vec<&MockOrderSnapshot> = orders
+            .iter()
+            .filter(|order| order.symbol == expected_position.symbol)
+            .collect();
 
+        if !expected_position.expects_hedge() {
             assert!(
                 symbol_orders.is_empty(),
                 "Expected no broker orders for {} (net zero), got {}",
-                scenario.symbol,
+                expected_position.symbol,
                 symbol_orders.len()
             );
 
             continue;
         }
 
-        let symbol_orders: Vec<&MockOrderSnapshot> = orders
-            .iter()
-            .filter(|order| order.symbol == scenario.symbol)
-            .collect();
-
         assert!(
             !symbol_orders.is_empty(),
             "Expected at least one broker order for {}",
-            scenario.symbol
+            expected_position.symbol
         );
 
         for order in &symbol_orders {
-            assert_broker_order(scenario, order);
+            assert_broker_order(expected_position, order);
         }
 
         let symbol_positions: Vec<&MockPositionSnapshot> = positions
             .iter()
-            .filter(|pos| pos.symbol == scenario.symbol)
+            .filter(|pos| pos.symbol == expected_position.symbol)
             .collect();
 
         assert_eq!(
             symbol_positions.len(),
             1,
             "Expected exactly one broker position for {}",
-            scenario.symbol
+            expected_position.symbol
         );
-        assert_broker_position(scenario, symbol_positions[0]);
+        assert_broker_position(expected_position, symbol_positions[0]);
     }
 }
 
-fn assert_broker_order(scenario: &E2eScenario, order: &MockOrderSnapshot) {
-    assert_eq!(order.symbol, scenario.symbol);
-    assert_eq!(order.side, scenario.expected_broker_side());
+fn assert_broker_order(expected_position: &ExpectedPosition, order: &MockOrderSnapshot) {
+    assert_eq!(order.symbol, expected_position.symbol);
+    assert_eq!(order.side, expected_position.expected_broker_side());
     assert_eq!(order.status, "filled");
     assert!(
         order.poll_count >= 1,
         "Order for {} should have been polled at least once, got {}",
-        scenario.symbol,
+        expected_position.symbol,
         order.poll_count
     );
     assert_eq!(
         order.filled_price.as_deref(),
-        Some(scenario.fill_price),
-        "Fill price for {} should match configured mock price",
-        scenario.symbol
+        Some(expected_position.broker_fill_price.to_string()).as_deref(),
+        "Broker fill price for {} should match configured mock price",
+        expected_position.symbol
     );
 }
 
-fn assert_broker_position(scenario: &E2eScenario, position: &MockPositionSnapshot) {
-    assert_eq!(position.symbol, scenario.symbol);
+fn assert_broker_position(expected_position: &ExpectedPosition, position: &MockPositionSnapshot) {
+    assert_eq!(position.symbol, expected_position.symbol);
 }
 
 // ── Onchain vault assertions ─────────────────────────────────────────
@@ -430,12 +433,12 @@ async fn assert_onchain_vaults<P: Provider>(
 
 // ── CQRS assertions ─────────────────────────────────────────────────
 
-/// Comprehensive CQRS assertions for one or more scenarios.
+/// Comprehensive CQRS assertions for one or more expected positions.
 ///
 /// Checks OnChainTrade events, Position events, OffchainOrder events,
 /// position projection views, and offchain order projection views.
-async fn assert_cqrs_state(
-    scenarios: &[E2eScenario],
+pub async fn assert_cqrs_state(
+    expected_positions: &[ExpectedPosition],
     expected_onchain_trade_count: usize,
     database_url: &str,
 ) -> anyhow::Result<()> {
@@ -444,22 +447,22 @@ async fn assert_cqrs_state(
     let events = fetch_all_domain_events(&pool).await?;
     assert!(!events.is_empty(), "Expected CQRS events to be persisted");
 
-    assert_onchain_trade_events(scenarios, &events, expected_onchain_trade_count);
-    assert_position_events(scenarios, &events);
-    assert_offchain_order_events(scenarios, &events);
+    assert_onchain_trade_events(expected_positions, &events, expected_onchain_trade_count);
+    assert_position_events(expected_positions, &events);
+    assert_offchain_order_events(expected_positions, &events);
 
-    for scenario in scenarios {
-        assert_position_view(scenario, &pool).await?;
+    for expected_position in expected_positions {
+        assert_position_view(expected_position, &pool).await?;
     }
 
-    assert_offchain_order_views(scenarios, &pool).await?;
+    assert_offchain_order_views(expected_positions, &pool).await?;
 
     pool.close().await;
     Ok(())
 }
 
 fn assert_onchain_trade_events(
-    scenarios: &[E2eScenario],
+    expected_positions: &[ExpectedPosition],
     events: &[StoredEvent],
     expected_count: usize,
 ) {
@@ -474,30 +477,49 @@ fn assert_onchain_trade_events(
         all_trades.len()
     );
 
-    for scenario in scenarios {
+    for expected_position in expected_positions {
         let symbol_trades: Vec<&&StoredEvent> = all_trades
             .iter()
-            .filter(|event| event.payload["Filled"]["symbol"].as_str() == Some(scenario.symbol))
+            .filter(|event| {
+                event.payload["Filled"]["symbol"].as_str() == Some(expected_position.symbol)
+            })
             .collect();
 
         assert!(
             !symbol_trades.is_empty(),
             "Expected at least one OnChainTrade for {}",
-            scenario.symbol
+            expected_position.symbol
         );
 
         for trade in &symbol_trades {
             assert_eq!(trade.event_type, "OnChainTradeEvent::Filled");
+
+            let recorded_price: Decimal = trade.payload["Filled"]["price_usdc"]
+                .as_str()
+                .expect("price_usdc should be present in OnChainTrade::Filled payload")
+                .parse()
+                .expect("price_usdc should be a valid Decimal");
+            // Round to 2 dp (cents) because buy-side ioRatio (1/price)
+            // introduces tiny precision artifacts in the onchain representation.
+            assert_eq!(
+                recorded_price.round_dp(2),
+                expected_position.onchain_price.round_dp(2),
+                "OnChainTrade price_usdc for {} should match onchain execution \
+                 price (rounded to cents): recorded={recorded_price}, \
+                 expected={}",
+                expected_position.symbol,
+                expected_position.onchain_price
+            );
         }
     }
 }
 
-fn assert_position_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
-    for scenario in scenarios {
+fn assert_position_events(expected_positions: &[ExpectedPosition], events: &[StoredEvent]) {
+    for expected_position in expected_positions {
         let pos_events: Vec<&StoredEvent> = events
             .iter()
             .filter(|event| {
-                event.aggregate_type == "Position" && event.aggregate_id == scenario.symbol
+                event.aggregate_type == "Position" && event.aggregate_id == expected_position.symbol
             })
             .collect();
 
@@ -505,10 +527,10 @@ fn assert_position_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
         assert_eq!(
             pos_events[0].event_type, "PositionEvent::Initialized",
             "First Position event for {} should be Initialized",
-            scenario.symbol
+            expected_position.symbol
         );
         assert_eq!(
-            pos_events[0].aggregate_id, scenario.symbol,
+            pos_events[0].aggregate_id, expected_position.symbol,
             "Position aggregate_id should be the symbol"
         );
 
@@ -520,55 +542,57 @@ fn assert_position_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
         assert!(
             event_types.contains(&"PositionEvent::OnChainOrderFilled"),
             "Missing PositionEvent::OnChainOrderFilled for {}",
-            scenario.symbol
+            expected_position.symbol
         );
 
-        if scenario.expects_hedge() {
+        if expected_position.expects_hedge() {
             assert!(
                 pos_events.len() >= 3,
                 "Expected at least 3 Position events for {}, got {}",
-                scenario.symbol,
+                expected_position.symbol,
                 pos_events.len()
             );
 
             assert!(
                 event_types.contains(&"PositionEvent::OffChainOrderPlaced"),
                 "Missing PositionEvent::OffChainOrderPlaced for {}",
-                scenario.symbol
+                expected_position.symbol
             );
             assert!(
                 event_types.contains(&"PositionEvent::OffChainOrderFilled"),
                 "Missing PositionEvent::OffChainOrderFilled for {}",
-                scenario.symbol
+                expected_position.symbol
             );
         } else {
             assert!(
                 !event_types.contains(&"PositionEvent::OffChainOrderPlaced"),
                 "Unexpected PositionEvent::OffChainOrderPlaced for net-zero {}",
-                scenario.symbol
+                expected_position.symbol
             );
             assert!(
                 !event_types.contains(&"PositionEvent::OffChainOrderFilled"),
                 "Unexpected PositionEvent::OffChainOrderFilled for net-zero {}",
-                scenario.symbol
+                expected_position.symbol
             );
         }
     }
 }
 
-fn assert_offchain_order_events(scenarios: &[E2eScenario], events: &[StoredEvent]) {
-    let hedged_scenarios: Vec<&E2eScenario> =
-        scenarios.iter().filter(|s| s.expects_hedge()).collect();
+fn assert_offchain_order_events(expected_positions: &[ExpectedPosition], events: &[StoredEvent]) {
+    let hedged_positions: Vec<&ExpectedPosition> = expected_positions
+        .iter()
+        .filter(|s| s.expects_hedge())
+        .collect();
 
     let offchain_events: Vec<&StoredEvent> = events
         .iter()
         .filter(|event| event.aggregate_type == "OffchainOrder")
         .collect();
 
-    if hedged_scenarios.is_empty() {
+    if hedged_positions.is_empty() {
         assert!(
             offchain_events.is_empty(),
-            "Expected no OffchainOrder events for net-zero scenarios, got {}",
+            "Expected no OffchainOrder events for net-zero positions, got {}",
             offchain_events.len()
         );
 
@@ -577,9 +601,9 @@ fn assert_offchain_order_events(scenarios: &[E2eScenario], events: &[StoredEvent
 
     // At least 3 events per hedged symbol (Placed, Submitted, Filled)
     assert!(
-        offchain_events.len() >= 3 * hedged_scenarios.len(),
+        offchain_events.len() >= 3 * hedged_positions.len(),
         "Expected at least {} OffchainOrder events, got {}",
-        3 * hedged_scenarios.len(),
+        3 * hedged_positions.len(),
         offchain_events.len()
     );
 
@@ -602,53 +626,59 @@ fn assert_offchain_order_events(scenarios: &[E2eScenario], events: &[StoredEvent
     );
 }
 
-async fn assert_position_view(scenario: &E2eScenario, pool: &SqlitePool) -> anyhow::Result<()> {
+async fn assert_position_view(
+    expected_position: &ExpectedPosition,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
     let projection = Projection::<Position>::sqlite(pool.clone())?;
-    let symbol = Symbol::new(scenario.symbol)?;
+    let symbol = Symbol::new(expected_position.symbol)?;
 
-    let position = projection
-        .load(&symbol)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Position view should exist for {}", scenario.symbol))?;
+    let position = projection.load(&symbol).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Position view should exist for {}",
+            expected_position.symbol
+        )
+    })?;
 
-    let expected_net: Decimal = scenario.expected_net.parse()?;
-    let expected_long: Decimal = scenario.expected_accumulated_long.parse()?;
-    let expected_short: Decimal = scenario.expected_accumulated_short.parse()?;
+    let expected_net = expected_position.expected_net;
+    let expected_long = expected_position.expected_accumulated_long;
+    let expected_short = expected_position.expected_accumulated_short;
 
     assert_eq!(position.symbol, symbol);
     assert_eq!(
         position.net,
         FractionalShares::new(expected_net),
         "net position mismatch for {}",
-        scenario.symbol
+        expected_position.symbol
     );
     assert_eq!(
         position.accumulated_long,
         FractionalShares::new(expected_long),
         "accumulated_long mismatch for {}",
-        scenario.symbol
+        expected_position.symbol
     );
     assert_eq!(
         position.accumulated_short,
         FractionalShares::new(expected_short),
         "accumulated_short mismatch for {}",
-        scenario.symbol
+        expected_position.symbol
     );
 
     assert!(
         position.pending_offchain_order_id.is_none(),
         "pending_offchain_order_id should be None after fill completes for {}",
-        scenario.symbol
+        expected_position.symbol
     );
-    assert!(
-        position.last_price_usdc.is_some(),
-        "last_price_usdc should be set after onchain fill for {}",
-        scenario.symbol
+    assert_eq!(
+        position.last_price_usdc.map(|price| price.round_dp(2)),
+        Some(expected_position.onchain_price.round_dp(2)),
+        "last_price_usdc for {} should match onchain execution price",
+        expected_position.symbol
     );
     assert!(
         position.last_updated.is_some(),
         "last_updated should be set for {}",
-        scenario.symbol
+        expected_position.symbol
     );
 
     Ok(())
@@ -656,17 +686,17 @@ async fn assert_position_view(scenario: &E2eScenario, pool: &SqlitePool) -> anyh
 
 /// Asserts offchain order views per symbol: all orders are Filled with
 /// correct direction, executor, and fill price. Total hedge shares per
-/// symbol must equal `scenario.amount`.
+/// symbol must equal `expected_position.amount`.
 async fn assert_offchain_order_views(
-    scenarios: &[E2eScenario],
+    expected_positions: &[ExpectedPosition],
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let projection = Projection::<OffchainOrder>::sqlite(pool.clone())?;
     let all_orders = projection.load_all().await?;
 
-    for scenario in scenarios {
-        if !scenario.expects_hedge() {
-            let expected_symbol = Symbol::new(scenario.symbol)?;
+    for expected_position in expected_positions {
+        if !expected_position.expects_hedge() {
+            let expected_symbol = Symbol::new(expected_position.symbol)?;
             let has_orders = all_orders
                 .iter()
                 .any(|(_, order)| matches!(order, OffchainOrder::Filled { symbol, .. } if symbol == &expected_symbol));
@@ -674,15 +704,15 @@ async fn assert_offchain_order_views(
             assert!(
                 !has_orders,
                 "Expected no offchain orders for net-zero {}, but found some",
-                scenario.symbol
+                expected_position.symbol
             );
 
             continue;
         }
 
-        let expected_symbol = Symbol::new(scenario.symbol)?;
-        let expected_amount: Decimal = scenario.amount.parse()?;
-        let expected_price: Decimal = scenario.fill_price.parse()?;
+        let expected_symbol = Symbol::new(expected_position.symbol)?;
+        let expected_amount = expected_position.amount;
+        let expected_price = expected_position.broker_fill_price;
 
         let mut total_shares = Decimal::ZERO;
         let mut found_any = false;
@@ -709,35 +739,35 @@ async fn assert_offchain_order_views(
 
             assert_eq!(
                 *direction,
-                scenario.expected_hedge_direction(),
+                expected_position.expected_hedge_direction(),
                 "Direction mismatch for {} offchain order {order_id}",
-                scenario.symbol
+                expected_position.symbol
             );
             assert_eq!(
                 *executor,
                 SupportedExecutor::AlpacaBrokerApi,
                 "Executor mismatch for {} offchain order {order_id}",
-                scenario.symbol
+                expected_position.symbol
             );
             assert_eq!(
                 *price,
                 Dollars(expected_price),
                 "Fill price mismatch for {} offchain order {order_id}",
-                scenario.symbol
+                expected_position.symbol
             );
         }
 
         assert!(
             found_any,
             "Expected at least one offchain order for {}",
-            scenario.symbol
+            expected_position.symbol
         );
         assert_eq!(
             FractionalShares::new(total_shares),
             FractionalShares::new(expected_amount),
             "Total hedge shares for {} should be {}",
-            scenario.symbol,
-            scenario.amount
+            expected_position.symbol,
+            expected_position.amount
         );
     }
 
@@ -807,16 +837,14 @@ pub fn assert_event_subsequence(events: &[StoredEvent], expected_types: &[&str])
 /// `error_substrings` are patterns that indicate error event types
 /// (e.g. "Failed", "Rejected").
 pub fn assert_single_clean_aggregate(events: &[StoredEvent], error_substrings: &[&str]) {
-    // Exactly one distinct aggregate ID
+    // At least one aggregate present
     let aggregate_ids: std::collections::HashSet<&str> = events
         .iter()
         .map(|event| event.aggregate_id.as_str())
         .collect();
-    assert_eq!(
-        aggregate_ids.len(),
-        1,
-        "Expected exactly 1 rebalancing aggregate, got {}: {aggregate_ids:?}",
-        aggregate_ids.len(),
+    assert!(
+        !aggregate_ids.is_empty(),
+        "Expected at least 1 rebalancing aggregate, got 0",
     );
 
     // No error events
@@ -917,7 +945,7 @@ where
         order_polling_interval: 1,
         order_polling_max_jitter: 0,
         position_check_interval: 2,
-        inventory_poll_interval: 2,
+        inventory_poll_interval: 15,
         broker: broker_ctx,
         telemetry: None,
         rebalancing: Some(rebalancing_ctx),

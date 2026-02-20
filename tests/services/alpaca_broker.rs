@@ -18,6 +18,7 @@ use chrono::Utc;
 use httpmock::prelude::*;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use st0x_execution::Symbol;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -105,8 +106,6 @@ struct MockTokenizationRequest {
 struct MockState {
     account: MockAccount,
     orders: HashMap<String, MockOrder>,
-    default_fill_price: String,
-    /// Per-symbol fill prices, checked before `default_fill_price`.
     symbol_fill_prices: HashMap<String, String>,
     mode: MockMode,
     /// Dynamic calendar entries. The endpoint reads from this on each request.
@@ -181,8 +180,7 @@ pub struct AlpacaBrokerMockBuilder {
     cash: Decimal,
     buying_power: Decimal,
     positions: HashMap<String, MockPosition>,
-    fill_price: String,
-    symbol_fill_prices: HashMap<String, String>,
+    symbol_fill_prices: HashMap<Symbol, Decimal>,
     mode: MockMode,
     market_closed: bool,
 }
@@ -207,15 +205,15 @@ impl AlpacaBrokerMockBuilder {
         self
     }
 
-    pub fn with_fill_price(mut self, price: &str) -> Self {
-        self.fill_price = price.to_string();
-        self
-    }
-
     /// Sets a fill price for a specific symbol, overriding the default.
-    pub fn with_symbol_fill_price(mut self, symbol: &str, price: &str) -> Self {
-        self.symbol_fill_prices
-            .insert(symbol.to_string(), price.to_string());
+    pub fn with_symbol_price_map(
+        mut self,
+        map: impl IntoIterator<Item = (Symbol, Decimal)>,
+    ) -> Self {
+        self.symbol_fill_prices = map
+            .into_iter()
+            .map(|(symbol, price)| (symbol, price))
+            .collect();
         self
     }
 
@@ -257,8 +255,11 @@ impl AlpacaBrokerMockBuilder {
                 positions: self.positions,
             },
             orders: HashMap::new(),
-            default_fill_price: self.fill_price,
-            symbol_fill_prices: self.symbol_fill_prices,
+            symbol_fill_prices: self
+                .symbol_fill_prices
+                .into_iter()
+                .map(|(symbol, price)| (symbol.to_string(), price.to_string()))
+                .collect(),
             mode: self.mode,
             calendar_entries,
             tokenization_requests: Vec::new(),
@@ -289,7 +290,6 @@ impl AlpacaBrokerMock {
             cash: Decimal::from(100_000),
             buying_power: Decimal::from(100_000),
             positions: HashMap::new(),
-            fill_price: "150.00".to_string(),
             symbol_fill_prices: HashMap::new(),
             mode: MockMode::HappyPath,
             market_closed: false,
@@ -312,12 +312,7 @@ impl AlpacaBrokerMock {
         &self.server
     }
 
-    /// Changes the default fill price for subsequent order fills.
-    pub fn set_fill_price(&self, price: &str) {
-        lock(&self.state).default_fill_price = price.to_string();
-    }
-
-    /// Sets a fill price for a specific symbol, overriding the default.
+    /// Sets a fill price for a specific symbol.
     pub fn set_symbol_fill_price(&self, symbol: &str, price: &str) {
         lock(&self.state)
             .symbol_fill_prices
@@ -336,6 +331,16 @@ impl AlpacaBrokerMock {
             date: today,
             open: "00:00".to_string(),
             close: "23:59".to_string(),
+        }];
+    }
+
+    /// Switches the calendar to market-closed for today.
+    pub fn set_market_closed(&self) {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        lock(&self.state).calendar_entries = vec![CalendarEntry {
+            date: today,
+            open: "04:00".to_string(),
+            close: "04:01".to_string(),
         }];
     }
 
@@ -812,7 +817,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                         .symbol_fill_prices
                         .get(&symbol)
                         .cloned()
-                        .unwrap_or_else(|| state.default_fill_price.clone());
+                        .unwrap_or_else(|| "150.00".to_string());
 
                     apply_happy_path_fill(&mut state, &order_id, &fill_price_str);
                 }
@@ -880,10 +885,17 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price_str: 
         position.market_value += qty * fill_price;
     } else {
         state.account.cash += qty * fill_price;
-        if let Some(position) = state.account.positions.get_mut(&symbol) {
-            position.qty -= qty;
-            position.market_value -= qty * fill_price;
-        }
+        let position = state
+            .account
+            .positions
+            .entry(symbol.clone())
+            .or_insert_with(|| MockPosition {
+                symbol,
+                qty: Decimal::ZERO,
+                market_value: Decimal::ZERO,
+            });
+        position.qty -= qty;
+        position.market_value -= qty * fill_price;
     }
 }
 
