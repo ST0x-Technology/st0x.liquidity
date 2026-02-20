@@ -21,8 +21,11 @@
 - [x] PR:
       [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
 
+- [ ] [#306 Configurable operational limits for safe deployment rollout](https://github.com/ST0x-Technology/st0x.liquidity/issues/306)
 - [ ] [#263 Check offchain inventory before placing counter trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/263)
-- [ ] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
+- [x] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
+  - PR:
+    [#278 check asset status before placing alpaca orders](https://github.com/ST0x-Technology/st0x.liquidity/pull/278)
 - [ ] [#105 Run the Alpaca instance without whole share accumulation](https://github.com/ST0x-Technology/st0x.liquidity/issues/105)
 - [ ] [#258 BUG: Alpaca Broker API should be expected with rebalancing enabled, not Alpaca Trading API](https://github.com/ST0x-Technology/st0x.liquidity/issues/258)
 - [ ] [#282 USDC inventory not updated from Position events (Buy/Sell trades)](https://github.com/ST0x-Technology/st0x.liquidity/issues/282)
