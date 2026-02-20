@@ -1,0 +1,397 @@
+//! EVM chain interaction abstraction.
+//!
+//! This crate provides two traits for interacting with EVM chains:
+//!
+//! - [`Evm`] -- read-only chain access with error-decoded view calls.
+//!   Provides the underlying provider and a `call` method that
+//!   automatically decodes Solidity revert data via the OpenChain
+//!   selector registry.
+//!
+//! - [`Wallet`] -- extends `Evm` with a signing identity and
+//!   transaction submission. Implementations handle key management
+//!   and signing (Fireblocks MPC in production,
+//!   `RawPrivateKeyWallet` in tests).
+//!
+//! Error decoding is built into both `Evm::call` (view calls) and
+//! `Wallet::submit` (write transactions), so consumers get
+//! human-readable revert reasons without manual wiring.
+
+use std::sync::Arc;
+
+use alloy::primitives::{Address, Bytes};
+use alloy::providers::Provider;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::sol_types::SolCall;
+use async_trait::async_trait;
+#[cfg(feature = "fireblocks")]
+use fireblocks_sdk::apis::transactions_api::CreateTransactionError;
+use rain_error_decoding::AbiDecodedErrorType;
+
+pub mod error_decoding;
+
+pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
+use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
+
+#[cfg(feature = "fireblocks")]
+pub mod fireblocks;
+
+#[cfg(feature = "local-signer")]
+pub mod local;
+
+/// Errors that can occur during EVM operations.
+#[derive(Debug, thiserror::Error)]
+pub enum EvmError {
+    #[error("transaction error: {0}")]
+    Transaction(#[from] alloy::providers::PendingTransactionError),
+    #[error("transport error: {0}")]
+    Transport(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
+    #[error("contract error: {0}")]
+    Contract(#[from] alloy::contract::Error),
+    #[error("ABI decode error: {0}")]
+    AbiDecode(#[from] alloy::sol_types::Error),
+    #[error("decoded contract error: {0}")]
+    DecodedRevert(#[from] AbiDecodedErrorType),
+    #[error("transaction reverted: {tx_hash}")]
+    Reverted { tx_hash: alloy::primitives::TxHash },
+    #[error("invalid private key: {0}")]
+    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+    #[cfg(feature = "fireblocks")]
+    #[error("Fireblocks error: {0}")]
+    Fireblocks(#[from] fireblocks::FireblocksError),
+}
+
+#[cfg(feature = "fireblocks")]
+impl From<fireblocks_sdk::FireblocksError> for EvmError {
+    fn from(error: fireblocks_sdk::FireblocksError) -> Self {
+        Self::Fireblocks(fireblocks::FireblocksError::from(error))
+    }
+}
+
+#[cfg(feature = "fireblocks")]
+impl From<fireblocks_sdk::apis::Error<CreateTransactionError>> for EvmError {
+    fn from(error: fireblocks_sdk::apis::Error<CreateTransactionError>) -> Self {
+        Self::Fireblocks(fireblocks::FireblocksError::from(error))
+    }
+}
+
+#[cfg(feature = "fireblocks")]
+impl From<alloy::hex::FromHexError> for EvmError {
+    fn from(error: alloy::hex::FromHexError) -> Self {
+        Self::Fireblocks(fireblocks::FireblocksError::from(error))
+    }
+}
+
+/// Read-only EVM chain access with error-decoded view calls.
+///
+/// Provides the underlying provider for direct chain queries (balance
+/// checks, block subscriptions, etc.) and a [`call`](Evm::call) method
+/// that executes `eth_call` with automatic Solidity revert decoding.
+///
+/// Implementations only need to supply the provider -- `call` has a
+/// default implementation that handles error decoding.
+#[async_trait]
+pub trait Evm: Send + Sync + 'static {
+    /// The provider type used for chain access.
+    type Provider: Provider + Clone + Send + Sync;
+
+    /// Returns the underlying provider for direct chain queries.
+    fn provider(&self) -> &Self::Provider;
+
+    /// Execute a typed view call with automatic revert decoding.
+    ///
+    /// Encodes the call via `SolCall::abi_encode()`, runs `eth_call`,
+    /// decodes the return value on success, and decodes the Solidity
+    /// error via the OpenChain selector registry on revert.
+    async fn call<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: Call,
+    ) -> Result<Call::Return, EvmError>
+    where
+        Self: Sized,
+    {
+        execute_call::<Registry, Call>(self.provider(), contract, call).await
+    }
+}
+
+/// Signing wallet on an EVM chain.
+///
+/// Extends [`Evm`] with a wallet identity (address) and transaction
+/// submission. Implementations provide [`send`](Wallet::send)
+/// (raw calldata submission), while [`submit`](Wallet::submit) wraps
+/// it with typed encoding and revert decoding.
+///
+/// Key management varies by implementation:
+/// [`FireblocksWallet`](fireblocks::FireblocksWallet) uses MPC-based
+/// signing via the Fireblocks API, while
+/// [`RawPrivateKeyWallet`](local::RawPrivateKeyWallet) signs locally
+/// (test-only).
+#[async_trait]
+pub trait Wallet: Evm {
+    /// Returns the address this wallet signs transactions from.
+    fn address(&self) -> Address;
+
+    /// Send raw calldata as a signed transaction.
+    ///
+    /// Implementations handle signing, submission, and waiting for the
+    /// receipt. They should NOT check `receipt.status()` -- the default
+    /// [`submit`](Wallet::submit) handles revert detection and decoding.
+    async fn send(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError>;
+
+    /// Submit a typed contract call with automatic revert decoding.
+    ///
+    /// Encodes the call via `SolCall::abi_encode()`, delegates to
+    /// [`send`](Wallet::send), then if the transaction reverted,
+    /// replays as `eth_call` at the reverted block to extract and
+    /// decode the revert reason.
+    async fn submit<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: Call,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError>
+    where
+        Self: Sized,
+    {
+        let calldata = Bytes::from(call.abi_encode());
+        let receipt = self.send(contract, calldata.clone(), note).await?;
+        decode_reverted_receipt::<Registry>(
+            self.provider(),
+            self.address(),
+            contract,
+            calldata,
+            receipt,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl<Inner: Evm + ?Sized> Evm for Arc<Inner> {
+    type Provider = Inner::Provider;
+
+    fn provider(&self) -> &Self::Provider {
+        (**self).provider()
+    }
+
+    async fn call<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: Call,
+    ) -> Result<Call::Return, EvmError>
+    where
+        Self: Sized,
+    {
+        execute_call::<Registry, Call>(self.provider(), contract, call).await
+    }
+}
+
+#[async_trait]
+impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
+    fn address(&self) -> Address {
+        (**self).address()
+    }
+
+    async fn send(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError> {
+        (**self).send(contract, calldata, note).await
+    }
+
+    async fn submit<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: Call,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError>
+    where
+        Self: Sized,
+    {
+        let calldata = Bytes::from(call.abi_encode());
+        let receipt = self.send(contract, calldata.clone(), note).await?;
+        decode_reverted_receipt::<Registry>(
+            self.provider(),
+            self.address(),
+            contract,
+            calldata,
+            receipt,
+        )
+        .await
+    }
+}
+
+/// Execute a typed view call with automatic revert decoding.
+///
+/// Shared logic for `Evm::call` -- encodes via `SolCall`, runs
+/// `eth_call`, decodes returns on success, decodes revert via the
+/// selector registry on failure.
+async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
+    provider: &impl Provider,
+    contract: Address,
+    call: Call,
+) -> Result<Call::Return, EvmError> {
+    let calldata = call.abi_encode();
+    let tx = TransactionRequest::default()
+        .to(contract)
+        .input(calldata.into());
+
+    match provider.call(tx).await {
+        Ok(result) => Ok(Call::abi_decode_returns(result.as_ref())?),
+        Err(rpc_err) => Err(decode_rpc_revert::<Registry>(rpc_err).await),
+    }
+}
+
+/// Read-only EVM access wrapping a bare [`Provider`].
+///
+/// Use this when you need an [`Evm`] implementation but don't have
+/// (or need) signing capabilities. Wraps any `Provider` into an `Evm`
+/// with the default error-decoded `call` implementation.
+pub struct ReadOnlyEvm<P> {
+    provider: P,
+}
+
+impl<P> ReadOnlyEvm<P> {
+    pub fn new(provider: P) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl<P> Evm for ReadOnlyEvm<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    type Provider = P;
+
+    fn provider(&self) -> &P {
+        &self.provider
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::network::EthereumWallet;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{Address, U256};
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol;
+    use std::sync::Arc;
+
+    use super::*;
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        TestERC20,
+        "../../lib/rain.orderbook/out/ArbTest.sol/Token.json"
+    );
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        IERC20,
+        "../../lib/forge-std/out/IERC20.sol/IERC20.json"
+    );
+
+    fn anvil_signer(anvil: &AnvilInstance) -> EthereumWallet {
+        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+        EthereumWallet::from(signer)
+    }
+
+    #[tokio::test]
+    async fn read_only_evm_call_returns_view_result() {
+        let anvil = Anvil::new().spawn();
+        let url = anvil.endpoint_url();
+        let deploy_provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(url.clone());
+
+        let token = TestERC20::deploy(&deploy_provider).await.unwrap();
+        let token_address = *token.address();
+
+        let read_only = ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(url),
+        );
+
+        let total_supply: U256 = read_only
+            .call::<NoOpErrorRegistry, _>(token_address, IERC20::totalSupplyCall {})
+            .await
+            .unwrap();
+
+        assert_eq!(total_supply, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn read_only_evm_call_decodes_revert_on_failure() {
+        let anvil = Anvil::new().spawn();
+        let read_only = ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(anvil.endpoint_url()),
+        );
+
+        let error = read_only
+            .call::<NoOpErrorRegistry, _>(
+                Address::random(),
+                IERC20::balanceOfCall {
+                    account: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, EvmError::AbiDecode(_)),
+            "expected AbiDecode error for call to non-contract address \
+             (empty return data), got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arc_evm_delegates_call() {
+        let anvil = Anvil::new().spawn();
+        let url = anvil.endpoint_url();
+        let deploy_provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(url.clone());
+
+        let token = TestERC20::deploy(&deploy_provider).await.unwrap();
+        let token_address = *token.address();
+
+        let read_only = Arc::new(ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(url),
+        ));
+
+        let total_supply: U256 = read_only
+            .call::<NoOpErrorRegistry, _>(token_address, IERC20::totalSupplyCall {})
+            .await
+            .unwrap();
+
+        assert_eq!(total_supply, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn arc_evm_exposes_provider() {
+        let anvil = Anvil::new().spawn();
+        let read_only = Arc::new(ReadOnlyEvm::new(
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(anvil.endpoint_url()),
+        ));
+
+        let block_number = read_only.provider().get_block_number().await.unwrap();
+
+        assert_eq!(block_number, 0);
+    }
+}

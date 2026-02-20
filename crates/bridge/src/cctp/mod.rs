@@ -32,11 +32,10 @@
 //!
 //! ```rust,ignore
 //! let bridge = CctpBridge::try_from_ctx(CctpCtx {
-//!     ethereum_provider,
-//!     base_provider,
-//!     owner,
 //!     usdc_ethereum,
 //!     usdc_base,
+//!     ethereum_wallet,
+//!     base_wallet,
 //! })?;
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
@@ -58,23 +57,22 @@
 
 mod evm;
 
-pub(crate) use evm::Evm;
-
 use std::mem::size_of;
 use std::time::Duration;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
-use alloy::providers::Provider;
 use alloy::sol;
 use async_trait::async_trait;
 use backon::Retryable;
-use rain_error_decoding::AbiDecodedErrorType;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+
 use crate::BridgeDirection;
+use evm::CctpEndpoint;
 
 // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
 sol!(
@@ -226,48 +224,37 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 ///
 /// Provides the minimal set of values needed to construct the bridge.
 /// CCTP contract addresses are hardcoded internally since they're the
-/// same on all supported chains.
-pub struct CctpCtx<EP, BP> {
-    /// Ethereum provider (must be wallet-enabled for signing transactions)
-    pub ethereum_provider: EP,
-    /// Base provider (must be wallet-enabled for signing transactions)
-    pub base_provider: BP,
-    /// Wallet address that owns tokens and signs transactions
-    pub owner: Address,
+/// same on all supported chains. Providers are obtained from the wallets
+/// via [`Wallet::provider()`].
+pub struct CctpCtx<EthWallet, BaseWallet> {
     /// USDC token address on Ethereum
     pub usdc_ethereum: Address,
     /// USDC token address on Base
     pub usdc_base: Address,
+    /// Wallet for submitting transactions on Ethereum
+    pub ethereum_wallet: EthWallet,
+    /// Wallet for submitting transactions on Base
+    pub base_wallet: BaseWallet,
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
-///
-/// # Type Parameters
-///
-/// * `EP` - Ethereum provider type implementing [`Provider`] + [`Clone`]
-/// * `BP` - Base provider type implementing [`Provider`] + [`Clone`]
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// let bridge = CctpBridge::try_from_ctx(CctpCtx {
-///     ethereum_provider: eth_provider,
-///     base_provider,
-///     owner,
 ///     usdc_ethereum: USDC_ETHEREUM,
 ///     usdc_base: USDC_BASE,
+///     ethereum_wallet,
+///     base_wallet,
 /// })?;
 ///
 /// let amount = U256::from(1_000_000); // 1 USDC
 /// let receipt = bridge.burn(BridgeDirection::EthereumToBase, amount, recipient).await?;
 /// ```
-pub struct CctpBridge<EP, BP>
-where
-    EP: Provider + Clone,
-    BP: Provider + Clone,
-{
-    ethereum: Evm<EP>,
-    base: Evm<BP>,
+pub struct CctpBridge<EthWallet: Wallet, BaseWallet: Wallet> {
+    ethereum: CctpEndpoint<EthWallet>,
+    base: CctpEndpoint<BaseWallet>,
     http_client: reqwest::Client,
     circle_api_base: String,
 }
@@ -275,12 +262,10 @@ where
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
-    #[error("Contract error: {0}")]
+    #[error("EVM error: {0}")]
+    Evm(#[from] EvmError),
+    #[error("Contract view error: {0}")]
     Contract(#[from] alloy::contract::Error),
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -341,33 +326,30 @@ struct FeeEntry {
     minimum_fee: Decimal,
 }
 
-impl<EP, BP> CctpBridge<EP, BP>
-where
-    EP: Provider + Clone,
-    BP: Provider + Clone,
-{
+impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Constructs a `CctpBridge` from a runtime context.
-    pub fn try_from_ctx(ctx: CctpCtx<EP, BP>) -> Result<Self, CctpError> {
-        let ethereum = Evm::new(
-            ctx.ethereum_provider,
-            ctx.owner,
+    pub fn try_from_ctx(ctx: CctpCtx<EthWallet, BaseWallet>) -> Result<Self, CctpError> {
+        let ethereum = CctpEndpoint::new(
             ctx.usdc_ethereum,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
+            ctx.ethereum_wallet,
         );
 
-        let base = Evm::new(
-            ctx.base_provider,
-            ctx.owner,
+        let base = CctpEndpoint::new(
             ctx.usdc_base,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
+            ctx.base_wallet,
         );
 
         Self::new(ethereum, base)
     }
 
-    fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Result<Self, CctpError> {
+    fn new(
+        ethereum: CctpEndpoint<EthWallet>,
+        base: CctpEndpoint<BaseWallet>,
+    ) -> Result<Self, CctpError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -530,7 +512,7 @@ where
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
-    async fn burn_internal(
+    async fn burn_internal<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         amount: U256,
@@ -540,15 +522,17 @@ where
 
         match direction {
             BridgeDirection::EthereumToBase => {
-                self.ethereum.ensure_usdc_approval(amount).await?;
                 self.ethereum
-                    .deposit_for_burn(amount, recipient, direction, max_fee)
+                    .ensure_usdc_approval::<Registry>(amount)
+                    .await?;
+                self.ethereum
+                    .deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
                     .await
             }
             BridgeDirection::BaseToEthereum => {
-                self.base.ensure_usdc_approval(amount).await?;
+                self.base.ensure_usdc_approval::<Registry>(amount).await?;
                 self.base
-                    .deposit_for_burn(amount, recipient, direction, max_fee)
+                    .deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
                     .await
             }
         }
@@ -558,15 +542,19 @@ where
     ///
     /// Returns the actual minted amount and fee collected from the `MintAndWithdraw` event.
     /// This is the source of truth for what the recipient actually received after fee deduction.
-    async fn mint_internal(
+    async fn mint_internal<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         message: Bytes,
         attestation: Bytes,
     ) -> Result<MintReceipt, CctpError> {
         match direction {
-            BridgeDirection::EthereumToBase => self.base.claim(message, attestation).await,
-            BridgeDirection::BaseToEthereum => self.ethereum.claim(message, attestation).await,
+            BridgeDirection::EthereumToBase => {
+                self.base.claim::<Registry>(message, attestation).await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.ethereum.claim::<Registry>(message, attestation).await
+            }
         }
     }
 
@@ -578,10 +566,10 @@ where
 }
 
 #[async_trait]
-impl<EP, BP> crate::Bridge for CctpBridge<EP, BP>
+impl<EthWallet, BaseWallet> crate::Bridge for CctpBridge<EthWallet, BaseWallet>
 where
-    EP: Provider + Clone + Send + Sync + 'static,
-    BP: Provider + Clone + Send + Sync + 'static,
+    EthWallet: Wallet,
+    BaseWallet: Wallet,
 {
     type Error = CctpError;
     type Attestation = AttestationResponse;
@@ -592,7 +580,8 @@ where
         amount: U256,
         recipient: Address,
     ) -> Result<crate::BurnReceipt, Self::Error> {
-        self.burn_internal(direction, amount, recipient).await
+        self.burn_internal::<OpenChainErrorRegistry>(direction, amount, recipient)
+            .await
     }
 
     async fn poll_attestation(
@@ -609,7 +598,7 @@ where
         attestation: &Self::Attestation,
     ) -> Result<crate::MintReceipt, Self::Error> {
         let internal = self
-            .mint_internal(
+            .mint_internal::<OpenChainErrorRegistry>(
                 direction,
                 attestation.message.clone(),
                 attestation.attestation.clone(),
@@ -628,17 +617,20 @@ where
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::address;
     use alloy::primitives::{B256, b256, keccak256};
-    use alloy::providers::ProviderBuilder;
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
     use httpmock::prelude::*;
+    use itertools::Itertools;
     use proptest::prelude::*;
     use rand::Rng;
     use rust_decimal_macros::dec;
 
-    use alloy::primitives::address;
+    use st0x_evm::NoOpErrorRegistry;
+    use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
 
@@ -657,39 +649,33 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, Box<dyn std::error::Error>>
-    {
-        let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let owner = signer.address();
-        let wallet = EthereumWallet::from(signer);
+    ) -> Result<
+        CctpBridge<
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+        >,
+        Box<dyn std::error::Error>,
+    > {
+        let ethereum_provider = ProviderBuilder::new().connect(ethereum_endpoint).await?;
 
-        let ethereum_provider = ProviderBuilder::new()
-            .wallet(wallet.clone())
-            .connect(ethereum_endpoint)
-            .await?;
+        let base_provider = ProviderBuilder::new().connect(base_endpoint).await?;
 
-        let base_provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(base_endpoint)
-            .await?;
+        let ethereum_wallet = RawPrivateKeyWallet::new(private_key, ethereum_provider, 1)?;
+        let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
-        let ethereum = Evm::new(
-            ethereum_provider,
-            owner,
+        let ethereum = CctpEndpoint::new(
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            ethereum_wallet,
+        );
 
-        let base = Evm::new(
-            base_provider,
-            owner,
+        let base = CctpEndpoint::new(
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            base_wallet,
+        );
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -805,8 +791,8 @@ mod tests {
             "Expected AttestationError::NotYetAvailable with status 404"
         );
         assert!(
-            mock.hits() >= 3,
-            "Expected at least 3 attempts with retries"
+            mock.hits() == 4,
+            "Expected exactly 4 attempts (1 initial + 3 retries)"
         );
     }
 
@@ -862,7 +848,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         let initial_allowance = bridge
             .ethereum
@@ -873,7 +859,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, U256::ZERO);
 
-        bridge.ethereum.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .ethereum
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .ethereum
@@ -906,7 +896,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         bridge
             .ethereum
@@ -928,7 +918,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, higher_amount);
 
-        bridge.ethereum.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .ethereum
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .ethereum
@@ -961,7 +955,7 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         bridge
             .ethereum
@@ -985,7 +979,7 @@ mod tests {
 
         bridge
             .ethereum
-            .ensure_usdc_approval(required_amount)
+            .ensure_usdc_approval::<NoOpErrorRegistry>(required_amount)
             .await
             .unwrap();
 
@@ -1004,39 +998,33 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         base_usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, Box<dyn std::error::Error>>
-    {
-        let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let owner = signer.address();
-        let wallet = EthereumWallet::from(signer);
+    ) -> Result<
+        CctpBridge<
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+            RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+        >,
+        Box<dyn std::error::Error>,
+    > {
+        let ethereum_provider = ProviderBuilder::new().connect(ethereum_endpoint).await?;
 
-        let ethereum_provider = ProviderBuilder::new()
-            .wallet(wallet.clone())
-            .connect(ethereum_endpoint)
-            .await?;
+        let base_provider = ProviderBuilder::new().connect(base_endpoint).await?;
 
-        let base_provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(base_endpoint)
-            .await?;
+        let ethereum_wallet = RawPrivateKeyWallet::new(private_key, ethereum_provider, 1)?;
+        let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
-        let ethereum = Evm::new(
-            ethereum_provider,
-            owner,
+        let ethereum = CctpEndpoint::new(
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            ethereum_wallet,
+        );
 
-        let base = Evm::new(
-            base_provider,
-            owner,
+        let base = CctpEndpoint::new(
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            base_wallet,
+        );
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -1059,7 +1047,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         let initial_allowance = bridge
             .base
@@ -1070,7 +1058,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, U256::ZERO);
 
-        bridge.base.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .base
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .base
@@ -1101,7 +1093,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         bridge
             .base
@@ -1123,7 +1115,11 @@ mod tests {
             .unwrap();
         assert_eq!(initial_allowance, higher_amount);
 
-        bridge.base.ensure_usdc_approval(amount).await.unwrap();
+        bridge
+            .base
+            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .base
@@ -1154,7 +1150,7 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         bridge
             .base
@@ -1178,7 +1174,7 @@ mod tests {
 
         bridge
             .base
-            .ensure_usdc_approval(required_amount)
+            .ensure_usdc_approval::<NoOpErrorRegistry>(required_amount)
             .await
             .unwrap();
 
@@ -1534,40 +1530,35 @@ mod tests {
         async fn create_bridge(
             &self,
         ) -> Result<
-            CctpBridge<impl Provider + Clone, impl Provider + Clone>,
+            CctpBridge<
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+            >,
             Box<dyn std::error::Error>,
         > {
-            let signer = PrivateKeySigner::from_bytes(&self.deployer_key)?;
-            let owner = signer.address();
-            let wallet = EthereumWallet::from(signer);
-
             let ethereum_provider = ProviderBuilder::new()
-                .wallet(wallet.clone())
                 .connect(&self.ethereum_endpoint)
                 .await?;
 
-            let base_provider = ProviderBuilder::new()
-                .wallet(wallet)
-                .connect(&self.base_endpoint)
-                .await?;
+            let base_provider = ProviderBuilder::new().connect(&self.base_endpoint).await?;
 
-            let ethereum = Evm::new(
-                ethereum_provider,
-                owner,
+            let ethereum_wallet =
+                RawPrivateKeyWallet::new(&self.deployer_key, ethereum_provider, 1)?;
+            let base_wallet = RawPrivateKeyWallet::new(&self.deployer_key, base_provider, 1)?;
+
+            let ethereum = CctpEndpoint::new(
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
-            )
-            .with_required_confirmations(1);
+                ethereum_wallet,
+            );
 
-            let base = Evm::new(
-                base_provider,
-                owner,
+            let base = CctpEndpoint::new(
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
-            )
-            .with_required_confirmations(1);
+                base_wallet,
+            );
 
             Ok(CctpBridge::new(ethereum, base)?
                 .with_circle_api_base(self.fee_mock_server.base_url()))
@@ -1655,7 +1646,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1678,7 +1669,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1701,7 +1692,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1713,7 +1704,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 message_with_nonce,
                 attestation,
@@ -1734,7 +1725,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1746,7 +1737,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 attestation,
@@ -1767,7 +1758,7 @@ mod tests {
         let amount = U256::from(2_500_000u64); // 2.5 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1781,7 +1772,7 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .base
-            .claim(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
             .await
             .unwrap();
 
@@ -1806,7 +1797,7 @@ mod tests {
         let amount = U256::from(7_500_000u64); // 7.5 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1820,7 +1811,7 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .ethereum
-            .claim(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
             .await
             .unwrap();
 
@@ -1845,7 +1836,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1859,7 +1850,7 @@ mod tests {
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 invalid_attestation,
@@ -1868,8 +1859,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_)),
-            "expected CctpError::Revert, got: {err:?}"
+            matches!(err, CctpError::Evm(_)),
+            "expected CctpError::Evm, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),
@@ -1886,7 +1877,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1898,7 +1889,7 @@ mod tests {
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 message,
                 invalid_attestation,
@@ -1907,8 +1898,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_)),
-            "expected CctpError::Revert, got: {err:?}"
+            matches!(err, CctpError::Evm(_)),
+            "expected CctpError::Evm, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),
@@ -1917,8 +1908,6 @@ mod tests {
     }
 
     fn build_nonce_message(header: &[u8], nonce: [u8; 32], trailer: &[u8]) -> Vec<u8> {
-        use itertools::Itertools;
-
         header
             .iter()
             .copied()
@@ -2039,7 +2028,7 @@ mod tests {
 
         let recipient = bridge.base.owner();
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         // Check initial allowance is 0
         let initial_allowance = bridge
@@ -2058,7 +2047,11 @@ mod tests {
         // First burn sets allowance to 1 USDC
         let small_amount = U256::from(1_000_000u64); // 1 USDC
         bridge
-            .burn_internal(BridgeDirection::EthereumToBase, small_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                small_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2079,7 +2072,11 @@ mod tests {
         // Second burn with larger amount should update allowance and succeed
         let large_amount = U256::from(100_000_000u64); // 100 USDC
         let receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, large_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                large_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2096,7 +2093,11 @@ mod tests {
         let burn_amount = U256::from(1_000_000u64); // 1 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::EthereumToBase, burn_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                burn_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2108,7 +2109,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 message_with_nonce,
                 attestation,
@@ -2144,7 +2145,11 @@ mod tests {
         let burn_amount = U256::from(5_000_000u64); // 5 USDC
 
         let burn_receipt = bridge
-            .burn_internal(BridgeDirection::BaseToEthereum, burn_amount, recipient)
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                burn_amount,
+                recipient,
+            )
             .await
             .unwrap();
 
@@ -2156,7 +2161,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint_internal(
+            .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 attestation,
@@ -2186,7 +2191,11 @@ mod tests {
 
         for i in 1..=5 {
             let receipt = bridge
-                .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                )
                 .await
                 .unwrap();
 

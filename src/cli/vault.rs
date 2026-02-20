@@ -1,9 +1,6 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
@@ -11,10 +8,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use st0x_event_sorcery::Projection;
+use st0x_evm::OpenChainErrorRegistry;
 
-use crate::bindings::IERC20;
 use crate::config::Ctx;
-use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistry;
@@ -27,7 +23,7 @@ pub(super) struct Deposit {
 }
 
 #[derive(Debug, Error)]
-pub enum VaultCliError {
+pub(crate) enum VaultCliError {
     #[error("negative amount: {0}")]
     NegativeAmount(Decimal),
 
@@ -51,15 +47,11 @@ fn decimal_to_u256(amount: Decimal, decimals: u8) -> Result<U256, VaultCliError>
     Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
 }
 
-pub(super) async fn vault_deposit_command<
-    W: Write,
-    BP: Provider + Clone + Send + Sync + 'static,
->(
-    stdout: &mut W,
+pub(super) async fn vault_deposit_command<Writer: Write>(
+    stdout: &mut Writer,
     deposit: Deposit,
     ctx: &Ctx,
     pool: &SqlitePool,
-    base_provider: BP,
 ) -> anyhow::Result<()> {
     let Deposit {
         amount,
@@ -72,61 +64,31 @@ pub(super) async fn vault_deposit_command<
     writeln!(stdout, "   Token: {token}")?;
     writeln!(stdout, "   Decimals: {decimals}")?;
 
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("vault-deposit requires rebalancing configuration"))?;
-
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let base_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(base_wallet)
-        .connect_provider(base_provider);
-
-    let token_contract = IERC20::IERC20Instance::new(token, &base_provider_with_wallet);
-
-    let balance = token_contract.balanceOf(sender_address).call().await?;
-    writeln!(stdout, "   Current token balance: {balance}")?;
-
     let amount_u256 = decimal_to_u256(amount, decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
-
-    if balance < amount_u256 {
-        anyhow::bail!("Insufficient token balance: have {balance}, need {amount_u256}");
-    }
-
-    writeln!(stdout, "   Approving orderbook to spend tokens...")?;
-    let approve_receipt = token_contract
-        .approve(ctx.evm.orderbook, amount_u256)
-        .send()
-        .await?
-        .with_required_confirmations(REQUIRED_CONFIRMATIONS)
-        .get_receipt()
-        .await?;
-    writeln!(
-        stdout,
-        "   Approval tx: {}",
-        approve_receipt.transaction_hash
-    )?;
 
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
-        base_provider_with_wallet,
+        rebalancing_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
     );
 
-    writeln!(stdout, "   Depositing to vault...")?;
+    writeln!(
+        stdout,
+        "   Depositing to vault (approve + deposit via Fireblocks)..."
+    )?;
     let deposit_tx = raindex_service
-        .deposit(token, RaindexVaultId(vault_id), amount_u256, decimals)
+        .deposit::<OpenChainErrorRegistry>(token, RaindexVaultId(vault_id), amount_u256, decimals)
         .await?;
     writeln!(stdout, "   Deposit tx: {deposit_tx}")?;
 
@@ -135,44 +97,31 @@ pub(super) async fn vault_deposit_command<
     Ok(())
 }
 
-pub(super) async fn vault_withdraw_command<
-    W: Write,
-    BP: Provider + Clone + Send + Sync + 'static,
->(
-    stdout: &mut W,
+pub(super) async fn vault_withdraw_command<Writer: Write>(
+    stdout: &mut Writer,
     amount: Usdc,
     ctx: &Ctx,
     pool: &SqlitePool,
-    base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("vault-withdraw requires rebalancing configuration"))?;
-
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let base_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
 
-    let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(base_wallet)
-        .connect_provider(base_provider);
-
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
     let raindex_service = RaindexService::new(
-        base_provider_with_wallet,
+        rebalancing_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
     );
+
     let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
@@ -189,14 +138,13 @@ pub(super) async fn vault_withdraw_command<
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
-    use alloy::providers::mock::Asserter;
+    use alloy::primitives::{Address, address, b256};
     use rust_decimal_macros::dec;
     use std::str::FromStr;
     use url::Url;
 
     use super::*;
-    use crate::config::{BrokerCtx, LogLevel};
+    use crate::config::{BrokerCtx, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -208,21 +156,17 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerCtx::DryRun,
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
-    }
-
-    fn create_mock_provider() -> impl Provider + Clone + 'static {
-        let asserter = Asserter::new();
-        ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
     const TEST_TOKEN: Address = address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913");
@@ -232,7 +176,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_deposit_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
         let amount = Decimal::from_str("100").unwrap();
 
         let mut stdout = Vec::new();
@@ -247,13 +190,12 @@ mod tests {
             deposit,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing configuration"),
+            err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"
         );
     }
@@ -261,7 +203,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
@@ -270,13 +211,12 @@ mod tests {
             amount,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing configuration"),
+            err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"
         );
     }
@@ -284,7 +224,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_deposit_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
 
         let mut stdout = Vec::new();
         let deposit = Deposit {
@@ -298,7 +237,6 @@ mod tests {
             deposit,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await
         .unwrap_err();
@@ -313,7 +251,6 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
@@ -322,7 +259,6 @@ mod tests {
             amount,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
-            provider,
         )
         .await
         .unwrap_err();

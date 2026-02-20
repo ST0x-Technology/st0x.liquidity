@@ -1,18 +1,68 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
-use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
-use alloy::rpc::types::Log;
+use alloy::primitives::{Address, B256, Bytes, LogData, address, bytes, fixed_bytes};
+use alloy::providers::RootProvider;
+use alloy::rpc::client::RpcClient;
+use alloy::rpc::types::{Log, TransactionReceipt};
+use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
+use std::sync::Arc;
 
+use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::{Direction, FractionalShares, SchwabTokens};
 
 use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
+
+/// Panicking wallet stub for tests that construct `RebalancingCtx`
+/// without needing real chain connectivity. Provider type matches
+/// production (`RootProvider`) so it fits `Arc<dyn Wallet<Provider =
+/// RootProvider>>`.
+pub(crate) struct StubWallet {
+    address: Address,
+    provider: RootProvider,
+}
+
+impl StubWallet {
+    pub(crate) fn stub(address: Address) -> Arc<dyn Wallet<Provider = RootProvider>> {
+        Arc::new(Self {
+            address,
+            provider: RootProvider::new(
+                RpcClient::builder().http("http://stub.invalid".parse().unwrap()),
+            ),
+        })
+    }
+}
+
+#[async_trait]
+impl Evm for StubWallet {
+    type Provider = RootProvider;
+
+    fn provider(&self) -> &RootProvider {
+        &self.provider
+    }
+}
+
+#[async_trait]
+impl Wallet for StubWallet {
+    fn address(&self) -> Address {
+        self.address
+    }
+
+    async fn send(
+        &self,
+        _contract: Address,
+        _calldata: Bytes,
+        _note: &str,
+    ) -> Result<TransactionReceipt, EvmError> {
+        panic!("StubWallet::send called - use a real wallet in tests that need transactions")
+    }
+}
 
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important -- only that the

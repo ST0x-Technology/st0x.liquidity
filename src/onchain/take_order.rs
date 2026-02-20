@@ -1,8 +1,9 @@
 //! Processes TakeOrderV3 events from the Raindex orderbook.
 
 use alloy::primitives::Address;
-use alloy::providers::Provider;
 use alloy::rpc::types::Log;
+
+use st0x_evm::Evm;
 
 use super::OnChainError;
 use crate::bindings::IOrderBookV5::{TakeOrderConfigV4, TakeOrderV3};
@@ -13,9 +14,9 @@ use crate::symbol::cache::SymbolCache;
 impl OnchainTrade {
     /// Creates OnchainTrade directly from TakeOrderV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
-    pub async fn try_from_take_order_if_target_owner<P: Provider>(
+    pub async fn try_from_take_order_if_target_owner<E: Evm>(
         cache: &SymbolCache,
-        provider: P,
+        evm: &E,
         event: TakeOrderV3,
         log: Log,
         target_order_owner: Address,
@@ -44,8 +45,7 @@ impl OnchainTrade {
             output_amount: event.input,
         };
 
-        Self::try_from_order_and_fill_details(cache, &provider, order, fill, log, feed_id_cache)
-            .await
+        Self::try_from_order_and_fill_details(cache, evm, order, fill, log, feed_id_cache).await
     }
 }
 
@@ -57,6 +57,7 @@ mod tests {
     use rain_math_float::Float;
     use rust_decimal_macros::dec;
 
+    use st0x_evm::ReadOnlyEvm;
     use st0x_execution::FractionalShares;
 
     use super::*;
@@ -138,12 +139,12 @@ mod tests {
             &"tAAPL".to_string(),
         ));
 
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
-            provider,
+            &evm,
             take_event,
             log,
             target_order_owner,
@@ -174,12 +175,12 @@ mod tests {
         let log = get_test_log();
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
-            &provider,
+            &evm,
             take_event,
             log,
             different_target_owner,
@@ -239,12 +240,12 @@ mod tests {
             &"USDC".to_string(),
         ));
 
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
-            provider,
+            &evm,
             take_event,
             log,
             target_order_owner,
@@ -305,12 +306,12 @@ mod tests {
             &"tAAPL".to_string(),
         ));
 
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
-            provider,
+            &evm,
             take_event,
             log,
             target_order_owner,
@@ -366,12 +367,12 @@ mod tests {
             &"tAAPL".to_string(),
         ));
 
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
-            provider,
+            &evm,
             take_event,
             log,
             target_order_owner,
@@ -415,12 +416,12 @@ mod tests {
         let log = get_test_log();
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
-            provider,
+            &evm,
             take_event,
             log,
             target_order_owner,

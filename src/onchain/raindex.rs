@@ -12,21 +12,17 @@
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
 use alloy::primitives::{Address, B256, TxHash, U256, address};
-use alloy::providers::Provider;
-use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
-use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use st0x_event_sorcery::ProjectionError;
+use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::bindings::{IERC20, IOrderBookV5};
-use crate::error_decoding::handle_contract_error;
-use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::threshold::Usdc;
 use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProjection};
 
@@ -39,12 +35,10 @@ pub(crate) struct RaindexVaultId(pub(crate) B256);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RaindexError {
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
+    #[error("EVM error: {0}")]
+    Evm(#[from] EvmError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
     #[error("Decimal parse error: {0}")]
@@ -59,65 +53,46 @@ pub(crate) enum RaindexError {
     VaultNotFound(Address),
     #[error("Token not found for symbol {0}")]
     TokenNotFound(Symbol),
-    #[error("Transaction reverted on-chain: {0}")]
-    TransactionReverted(TxHash),
 }
 
 /// Service for managing Rain OrderBook vault operations.
 ///
+/// Parameterized by [`Evm`] for read operations (balance queries, vault
+/// lookups) and additionally requires [`Wallet`] for write operations
+/// (deposits, withdrawals).
+///
 /// # Example
 ///
 /// ```ignore
-/// let service = RaindexService::new(provider, orderbook_address, vault_registry_projection, owner);
+/// let service = RaindexService::new(wallet, orderbook_address, projection, owner);
 ///
-/// // Lookup vault ID for a token
+/// // Lookup vault ID for a token (read-only, needs Evm)
 /// let vault_id = service.lookup_vault_id(token_address).await?;
 ///
-/// // Deposit USDC to vault
+/// // Deposit USDC to vault (needs Wallet)
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
 /// service.deposit_usdc(vault_id, amount).await?;
-///
-/// // Withdraw USDC from vault
-/// service.withdraw_usdc(vault_id, amount).await?;
 /// ```
-pub(crate) struct RaindexService<P>
-where
-    P: Provider + Clone,
-{
-    provider: P,
-    orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
+pub(crate) struct RaindexService<E: Evm> {
     orderbook_address: Address,
     vault_registry_projection: Arc<VaultRegistryProjection>,
+    evm: E,
     owner: Address,
-    required_confirmations: u64,
 }
 
-impl<P> RaindexService<P>
-where
-    P: Provider + Clone,
-{
+impl<E: Evm> RaindexService<E> {
     pub(crate) fn new(
-        provider: P,
+        evm: E,
         orderbook: Address,
         vault_registry_projection: Arc<VaultRegistryProjection>,
         owner: Address,
     ) -> Self {
         Self {
-            orderbook: IOrderBookV5::new(orderbook, provider.clone()),
-            provider,
             orderbook_address: orderbook,
             vault_registry_projection,
+            evm,
             owner,
-            required_confirmations: REQUIRED_CONFIRMATIONS,
         }
-    }
-
-    /// Sets the number of confirmations to wait after transactions.
-    /// Use 1 for tests running against anvil (single-node, no sync delays).
-    #[cfg(test)]
-    pub(crate) fn with_required_confirmations(mut self, confirmations: u64) -> Self {
-        self.required_confirmations = confirmations;
-        self
     }
 
     async fn load_registry(&self) -> Result<VaultRegistry, RaindexError> {
@@ -131,7 +106,10 @@ where
             .await?
             .ok_or(RaindexError::RegistryNotFound(aggregate_id))
     }
+}
 
+/// Write operations that require a [`Wallet`] for transaction signing.
+impl<W: Wallet> RaindexService<W> {
     /// Deposits tokens to a Rain OrderBook vault.
     ///
     /// # Parameters
@@ -145,8 +123,8 @@ where
     ///
     /// Returns `RaindexError::ZeroAmount` if amount is zero.
     /// Returns `RaindexError::Float` if amount cannot be converted to float format.
-    /// Returns `RaindexError::Transaction` or `RaindexError::Contract` for blockchain errors.
-    pub(crate) async fn deposit(
+    /// Returns `RaindexError::Evm` for transaction errors.
+    pub(crate) async fn deposit<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
@@ -157,40 +135,37 @@ where
             return Err(RaindexError::ZeroAmount);
         }
 
-        self.approve_for_orderbook(token, amount).await?;
+        self.approve_for_orderbook::<Registry>(token, amount)
+            .await?;
 
-        self.deposit3_to_vault(token, vault_id, amount, decimals)
+        self.deposit3_to_vault::<Registry>(token, vault_id, amount, decimals)
             .await
     }
 
-    async fn approve_for_orderbook(
+    async fn approve_for_orderbook<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         amount: U256,
     ) -> Result<(), RaindexError> {
         debug!(%token, %amount, spender = %self.orderbook_address, "Sending ERC20 approve");
 
-        let erc20 = IERC20::new(token, self.provider.clone());
-        let pending = log_and_decode_error(
-            erc20.approve(self.orderbook_address, amount).send().await,
-            "Approve",
-        )
-        .await?;
-
-        info!(tx_hash = %pending.tx_hash(), "Approve submitted");
-
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
+        let receipt = self
+            .evm
+            .submit::<Registry, _>(
+                token,
+                IERC20::approveCall {
+                    spender: self.orderbook_address,
+                    amount,
+                },
+                "ERC20 approve for orderbook",
+            )
             .await?;
-
-        ensure_receipt_success(&receipt)?;
 
         info!(tx_hash = %receipt.transaction_hash, "Approve confirmed");
         Ok(())
     }
 
-    async fn deposit3_to_vault(
+    async fn deposit3_to_vault<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
@@ -201,23 +176,17 @@ where
 
         debug!(%token, ?vault_id, %amount, "Sending deposit3");
 
-        let pending = log_and_decode_error(
-            self.orderbook
-                .deposit3(token, vault_id.0, amount_float.get_inner(), Vec::new())
-                .send()
-                .await,
-            "deposit3",
-        )
-        .await?;
+        let calldata = IOrderBookV5::deposit3Call {
+            token,
+            vaultId: vault_id.0,
+            depositAmount: amount_float.get_inner(),
+            tasks: Vec::new(),
+        };
 
-        info!(tx_hash = %pending.tx_hash(), "deposit3 submitted");
-
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
+        let receipt = self
+            .evm
+            .submit::<Registry, _>(self.orderbook_address, calldata, "deposit3 to vault")
             .await?;
-
-        ensure_receipt_success(&receipt)?;
 
         info!(tx_hash = %receipt.transaction_hash, "deposit3 confirmed");
         Ok(receipt.transaction_hash)
@@ -236,7 +205,7 @@ where
         vault_id: RaindexVaultId,
         amount: U256,
     ) -> Result<TxHash, RaindexError> {
-        self.deposit(USDC_BASE, vault_id, amount, USDC_DECIMALS)
+        self.deposit::<OpenChainErrorRegistry>(USDC_BASE, vault_id, amount, USDC_DECIMALS)
             .await
     }
 
@@ -256,38 +225,50 @@ where
         self.withdraw(USDC_BASE, vault_id, target_amount, USDC_DECIMALS)
             .await
     }
+}
 
-    /// Gets the current equity balance of a tokenized equity vault.
-    pub(crate) async fn get_equity_balance(
+/// Read operations that only need chain access (no signing).
+impl<E: Evm> RaindexService<E> {
+    pub(crate) async fn get_equity_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         token: Address,
         vault_id: RaindexVaultId,
     ) -> Result<FractionalShares, RaindexError> {
-        let decimal = self.get_vault_balance(owner, token, vault_id).await?;
+        let decimal = self
+            .get_vault_balance::<Registry>(owner, token, vault_id)
+            .await?;
         Ok(FractionalShares::new(decimal))
     }
 
     /// Gets the USDC balance of a vault on Base.
-    pub(crate) async fn get_usdc_balance(
+    pub(crate) async fn get_usdc_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         vault_id: RaindexVaultId,
     ) -> Result<Usdc, RaindexError> {
-        let decimal = self.get_vault_balance(owner, USDC_BASE, vault_id).await?;
+        let decimal = self
+            .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id)
+            .await?;
         Ok(Usdc(decimal))
     }
 
-    async fn get_vault_balance(
+    async fn get_vault_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         token: Address,
         vault_id: RaindexVaultId,
     ) -> Result<Decimal, RaindexError> {
         let balance_float = self
-            .orderbook
-            .vaultBalance2(owner, token, vault_id.0)
-            .call()
+            .evm
+            .call::<Registry, _>(
+                self.orderbook_address,
+                IOrderBookV5::vaultBalance2Call {
+                    owner,
+                    token,
+                    vaultId: vault_id.0,
+                },
+            )
             .await?;
 
         float_to_decimal(balance_float)
@@ -339,10 +320,7 @@ pub(crate) trait Raindex: Send + Sync {
 }
 
 #[async_trait]
-impl<P> Raindex for RaindexService<P>
-where
-    P: Provider + Clone + Send + Sync,
-{
+impl<W: Wallet> Raindex for RaindexService<W> {
     async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError> {
         let registry = self.load_registry().await?;
         registry
@@ -372,7 +350,7 @@ where
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        Self::deposit(self, token, vault_id, amount, decimals).await
+        Self::deposit::<OpenChainErrorRegistry>(self, token, vault_id, amount, decimals).await
     }
 
     async fn withdraw(
@@ -388,88 +366,61 @@ where
 
         let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
 
-        let tasks = Vec::new();
-
-        let pending = match self
-            .orderbook
-            .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(error) => return Err(handle_contract_error(error).await),
-        };
-
-        // Wait for confirmations to ensure state propagates across load-balanced
-        // RPC nodes before subsequent operations that depend on the withdrawal
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
+        let receipt = self
+            .evm
+            .submit::<OpenChainErrorRegistry, _>(
+                self.orderbook_address,
+                IOrderBookV5::withdraw3Call {
+                    token,
+                    vaultId: vault_id.0,
+                    targetAmount: amount_float.get_inner(),
+                    tasks: Vec::new(),
+                },
+                "withdraw3 from vault",
+            )
             .await?;
 
-        ensure_receipt_success(&receipt)?;
-
+        info!(tx_hash = %receipt.transaction_hash, "withdraw3 confirmed");
         Ok(receipt.transaction_hash)
-    }
-}
-
-fn ensure_receipt_success(receipt: &TransactionReceipt) -> Result<(), RaindexError> {
-    if receipt.status() {
-        Ok(())
-    } else {
-        warn!(tx_hash = %receipt.transaction_hash, "Transaction reverted on-chain");
-        Err(RaindexError::TransactionReverted(receipt.transaction_hash))
-    }
-}
-
-async fn log_and_decode_error<T>(
-    result: Result<T, alloy::contract::Error>,
-    name: &str,
-) -> Result<T, RaindexError> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            warn!(%error, "{name} failed");
-            Err(handle_contract_error(error).await)
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::network::{Ethereum, EthereumWallet};
+    use alloy::network::Ethereum;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{B256, b256};
+    use alloy::providers::Provider;
     use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
-    use alloy::signers::local::PrivateKeySigner;
     use alloy::transports::{RpcError, TransportErrorKind};
     use proptest::prelude::*;
     use tracing_test::traced_test;
+
+    use st0x_evm::NoOpErrorRegistry;
+    use st0x_evm::Wallet;
+    use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
 
-    type LocalEvmProvider = FillProvider<
+    type BaseProvider = FillProvider<
         JoinFill<
-            JoinFill<
-                Identity,
-                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-            >,
-            WalletFiller<EthereumWallet>,
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
         >,
         RootProvider<Ethereum>,
         Ethereum,
     >;
 
     struct LocalEvm {
-        _anvil: AnvilInstance,
-        provider: LocalEvmProvider,
-        signer: PrivateKeySigner,
+        anvil: AnvilInstance,
+        wallet: RawPrivateKeyWallet<BaseProvider>,
+        private_key: B256,
         orderbook_address: Address,
         token_address: Address,
     }
@@ -479,24 +430,21 @@ mod tests {
             let anvil = Anvil::new().spawn();
             let endpoint = anvil.endpoint();
 
-            let private_key_bytes = anvil.keys()[0].to_bytes();
-            let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes))?;
+            let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
 
-            let wallet = EthereumWallet::from(signer.clone());
-            let provider = ProviderBuilder::new()
-                .wallet(wallet)
-                .connect_http(endpoint.parse()?);
+            let base_provider = ProviderBuilder::new().connect_http(endpoint.parse()?);
+            let wallet = RawPrivateKeyWallet::new(&private_key, base_provider, 1)?;
 
-            Self::deploy_tofu_decimals(&provider).await?;
+            Self::deploy_tofu_decimals(wallet.provider()).await?;
 
-            let orderbook_address = Self::deploy_orderbook(&provider).await?;
+            let orderbook_address = Self::deploy_orderbook(wallet.provider()).await?;
 
-            let token_address = Self::deploy_token(&provider, signer.address()).await?;
+            let token_address = Self::deploy_token(wallet.provider(), wallet.address()).await?;
 
             Ok(Self {
-                _anvil: anvil,
-                provider,
-                signer,
+                anvil,
+                wallet,
+                private_key,
                 orderbook_address,
                 token_address,
             })
@@ -546,7 +494,7 @@ mod tests {
             spender: Address,
             amount: U256,
         ) -> Result<(), LocalEvmError> {
-            let token_contract = TestERC20::new(token, &self.provider);
+            let token_contract = TestERC20::new(token, self.wallet.provider());
 
             token_contract
                 .approve(spender, amount)
@@ -563,11 +511,16 @@ mod tests {
             token: Address,
             vault_id: B256,
         ) -> Result<B256, LocalEvmError> {
-            let orderbook = IOrderBookV5::new(self.orderbook_address, &self.provider);
-
-            let balance = orderbook
-                .vaultBalance2(self.signer.address(), token, vault_id)
-                .call()
+            let balance = self
+                .wallet
+                .call::<NoOpErrorRegistry, _>(
+                    self.orderbook_address,
+                    IOrderBookV5::vaultBalance2Call {
+                        owner: self.wallet.address(),
+                        token,
+                        vaultId: vault_id,
+                    },
+                )
                 .await?;
 
             Ok(balance)
@@ -576,8 +529,8 @@ mod tests {
 
     #[derive(Debug, thiserror::Error)]
     enum LocalEvmError {
-        #[error("Invalid private key")]
-        InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+        #[error("EVM error")]
+        Evm(#[from] EvmError),
         #[error("Contract error")]
         Contract(#[from] alloy::contract::Error),
         #[error("Provider error")]
@@ -594,36 +547,35 @@ mod tests {
     ));
 
     async fn create_test_raindex_service(
-        provider: LocalEvmProvider,
-        orderbook_address: Address,
-        owner: Address,
-    ) -> RaindexService<LocalEvmProvider> {
+        local_evm: &LocalEvm,
+    ) -> RaindexService<RawPrivateKeyWallet<BaseProvider>> {
         let pool = crate::test_utils::setup_test_db().await;
         let vault_registry_projection: Arc<VaultRegistryProjection> =
             Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
 
+        let base_provider =
+            ProviderBuilder::new().connect_http(local_evm.anvil.endpoint().parse().unwrap());
+
+        let wallet = RawPrivateKeyWallet::new(&local_evm.private_key, base_provider, 1).unwrap();
+
+        let owner = wallet.address();
+
         RaindexService::new(
-            provider,
-            orderbook_address,
+            wallet,
+            local_evm.orderbook_address,
             vault_registry_projection,
             owner,
         )
-        .with_required_confirmations(1)
     }
 
     #[tokio::test]
     async fn deposit_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await;
+        let service = create_test_raindex_service(&local_evm).await;
 
         let result = service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 U256::ZERO,
@@ -652,12 +604,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await;
+        let service = create_test_raindex_service(&local_evm).await;
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -667,7 +614,7 @@ mod tests {
         assert!(vault_balance_before.is_zero());
 
         let tx_hash = service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 vault_id,
                 deposit_amount,
@@ -689,10 +636,8 @@ mod tests {
         assert_eq!(vault_balance_after, expected_float);
 
         assert!(logs_contain("Sending ERC20 approve"));
-        assert!(logs_contain("Approve submitted"));
         assert!(logs_contain("Approve confirmed"));
         assert!(logs_contain("Sending deposit3"));
-        assert!(logs_contain("deposit3 submitted"));
         assert!(logs_contain("deposit3 confirmed"));
     }
 
@@ -713,12 +658,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await;
+        let service = create_test_raindex_service(&local_evm).await;
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -728,7 +668,7 @@ mod tests {
         assert!(vault_balance_before.is_zero());
 
         let tx_hash = service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 vault_id,
                 deposit_amount,
@@ -754,12 +694,7 @@ mod tests {
     async fn withdraw_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await;
+        let service = create_test_raindex_service(&local_evm).await;
 
         let result = service
             .withdraw(
@@ -790,16 +725,10 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await
-        .with_required_confirmations(1);
+        let service = create_test_raindex_service(&local_evm).await;
 
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 vault_id,
                 deposit_amount,
@@ -832,16 +761,11 @@ mod tests {
     #[tokio::test]
     async fn get_equity_balance_returns_zero_for_empty_vault() {
         let local_evm = LocalEvm::new().await.unwrap();
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await;
+        let service = create_test_raindex_service(&local_evm).await;
 
         let balance = service
-            .get_equity_balance(
-                local_evm.signer.address(),
+            .get_equity_balance::<NoOpErrorRegistry>(
+                local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
             )
@@ -866,15 +790,10 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await;
+        let service = create_test_raindex_service(&local_evm).await;
 
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 deposit_amount,
@@ -884,8 +803,8 @@ mod tests {
             .unwrap();
 
         let balance = service
-            .get_equity_balance(
-                local_evm.signer.address(),
+            .get_equity_balance::<NoOpErrorRegistry>(
+                local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
             )
@@ -915,16 +834,10 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await
-        .with_required_confirmations(1);
+        let service = create_test_raindex_service(&local_evm).await;
 
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 deposit_amount,
@@ -944,8 +857,8 @@ mod tests {
             .unwrap();
 
         let balance = service
-            .get_equity_balance(
-                local_evm.signer.address(),
+            .get_equity_balance::<NoOpErrorRegistry>(
+                local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
             )
@@ -1038,17 +951,11 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        )
-        .await
-        .with_required_confirmations(1);
+        let service = create_test_raindex_service(&local_evm).await;
 
         // This should succeed - the approve inside deposit() should cover the transferFrom amount
         service
-            .deposit(
+            .deposit::<NoOpErrorRegistry>(
                 local_evm.token_address,
                 TEST_VAULT_ID,
                 deposit_amount,

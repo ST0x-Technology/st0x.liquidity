@@ -23,50 +23,42 @@
 //! 2. Poll `list_requests` for Alpaca's detection
 //! 3. Poll until status is `Completed` or `Rejected`
 
-use std::time::Duration;
-
 use alloy::primitives::{Address, TxHash, U256};
-use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rain_error_decoding::AbiDecodedErrorType;
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, trace, warn};
 
+use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
+
 use super::{Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
-use crate::error_decoding::handle_contract_error;
 use crate::onchain::io::TokenizedEquitySymbol;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
 ///
 /// Wraps `AlpacaTokenizationClient` with default polling configuration.
-pub(crate) struct AlpacaTokenizationService<P>
-where
-    P: Provider + Clone,
-{
-    client: AlpacaTokenizationClient<P>,
+pub(crate) struct AlpacaTokenizationService<W: Wallet> {
+    client: AlpacaTokenizationClient<W>,
     polling_config: PollingConfig,
 }
 
-impl<P> AlpacaTokenizationService<P>
-where
-    P: Provider + Clone,
-{
+impl<W: Wallet> AlpacaTokenizationService<W> {
     /// Create a new tokenization service.
     pub(crate) fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
-        provider: P,
+        wallet: W,
         redemption_wallet: Address,
     ) -> Self {
         let client = AlpacaTokenizationClient::new(
@@ -74,7 +66,7 @@ where
             account_id,
             api_key,
             api_secret,
-            provider,
+            wallet,
             redemption_wallet,
         );
 
@@ -119,12 +111,14 @@ where
     }
 
     /// Send tokens to the redemption wallet to initiate a redemption.
-    pub(crate) async fn send_for_redemption(
+    pub(crate) async fn send_for_redemption<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
-        self.client.send_tokens_for_redemption(token, amount).await
+        self.client
+            .send_tokens_for_redemption::<Registry>(token, amount)
+            .await
     }
 
     /// Poll until Alpaca detects a redemption transfer.
@@ -157,7 +151,7 @@ where
     }
 
     #[cfg(test)]
-    fn new_with_client(client: AlpacaTokenizationClient<P>, polling_config: PollingConfig) -> Self {
+    fn new_with_client(client: AlpacaTokenizationClient<W>, polling_config: PollingConfig) -> Self {
         Self {
             client,
             polling_config,
@@ -340,18 +334,8 @@ pub(crate) enum AlpacaTokenizationError {
     #[error("Request not found: {id}")]
     RequestNotFound { id: TokenizationRequestId },
 
-    #[error("Redemption transfer failed: {0}")]
-    RedemptionTransferFailed(#[from] alloy::contract::Error),
-
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
-
-    #[error("Transaction error: {source}")]
-    Transaction {
-        tx_hash: TxHash,
-        #[source]
-        source: alloy::providers::PendingTransactionError,
-    },
+    #[error("EVM error: {0}")]
+    Evm(#[from] EvmError),
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
@@ -385,29 +369,23 @@ fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> Alpaca
 }
 
 /// Client for Alpaca's tokenization API and redemption transfers.
-struct AlpacaTokenizationClient<P>
-where
-    P: Provider + Clone,
-{
+struct AlpacaTokenizationClient<W: Wallet> {
     http_client: Client,
     base_url: String,
     account_id: AlpacaAccountId,
     api_key: String,
     api_secret: String,
-    provider: P,
+    wallet: W,
     redemption_wallet: Address,
 }
 
-impl<P> AlpacaTokenizationClient<P>
-where
-    P: Provider + Clone,
-{
+impl<W: Wallet> AlpacaTokenizationClient<W> {
     fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
-        provider: P,
+        wallet: W,
         redemption_wallet: Address,
     ) -> Self {
         Self {
@@ -416,27 +394,7 @@ where
             account_id,
             api_key,
             api_secret,
-            provider,
-            redemption_wallet,
-        }
-    }
-
-    #[cfg(test)]
-    fn new_with_base_url(
-        base_url: String,
-        account_id: AlpacaAccountId,
-        api_key: String,
-        api_secret: String,
-        provider: P,
-        redemption_wallet: Address,
-    ) -> Self {
-        Self {
-            http_client: Client::new(),
-            base_url,
-            account_id,
-            api_key,
-            api_secret,
-            provider,
+            wallet,
             redemption_wallet,
         }
     }
@@ -599,27 +557,25 @@ where
     ///
     /// # Errors
     ///
-    /// - `RedemptionTransferFailed` if the contract call fails
-    /// - `Revert` if the contract reverts with a decoded error
-    /// - `Transaction` if the transaction fails to confirm
-    async fn send_tokens_for_redemption(
+    /// - `Evm(EvmError)` if the ERC20 transfer transaction fails
+    async fn send_tokens_for_redemption<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
-        let erc20 = IERC20::new(token, self.provider.clone());
+        let receipt = self
+            .wallet
+            .submit::<Registry, _>(
+                token,
+                IERC20::transferCall {
+                    to: self.redemption_wallet,
+                    amount,
+                },
+                "ERC20 transfer for redemption",
+            )
+            .await?;
 
-        let pending = match erc20.transfer(self.redemption_wallet, amount).send().await {
-            Ok(pending) => pending,
-            Err(error) => return Err(handle_contract_error(error).await),
-        };
-
-        let tx_hash = *pending.tx_hash();
-        if let Err(source) = pending.get_receipt().await {
-            return Err(AlpacaTokenizationError::Transaction { tx_hash, source });
-        }
-
-        Ok(tx_hash)
+        Ok(receipt.transaction_hash)
     }
 
     /// Find a redemption request by its onchain transaction hash.
@@ -718,10 +674,7 @@ where
 }
 
 #[async_trait]
-impl<P> Tokenizer for AlpacaTokenizationService<P>
-where
-    P: Provider + Clone + Send + Sync,
-{
+impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
     async fn request_mint(
         &self,
         symbol: Symbol,
@@ -748,7 +701,7 @@ where
         token: Address,
         amount: U256,
     ) -> Result<TxHash, TokenizerError> {
-        Ok(Self::send_for_redemption(self, token, amount).await?)
+        Ok(Self::send_for_redemption::<OpenChainErrorRegistry>(self, token, amount).await?)
     }
 
     async fn poll_for_redemption(
@@ -768,24 +721,21 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use alloy::json_abi::Error as AlloyError;
-    use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{Address, B256, address, fixed_bytes};
-    use alloy::providers::{Provider, ProviderBuilder};
-    use alloy::signers::local::PrivateKeySigner;
-    use async_trait::async_trait;
+    use alloy::providers::ProviderBuilder;
     use httpmock::MockServer;
     use httpmock::prelude::*;
-    use rain_error_decoding::{AbiDecodeFailedErrors, ErrorRegistry};
     use rust_decimal_macros::dec;
     use serde_json::json;
     use std::time::Duration;
     use uuid::uuid;
 
+    use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{Evm, OpenChainErrorRegistry};
+
     use super::*;
     use crate::bindings::TestERC20;
-    use crate::error_decoding::handle_contract_error_with;
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
         address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
@@ -813,30 +763,27 @@ pub(crate) mod tests {
         anvil_endpoint: &str,
         private_key: &B256,
         redemption_wallet: Address,
-    ) -> AlpacaTokenizationClient<impl Provider + Clone + use<>> {
-        let signer = PrivateKeySigner::from_bytes(private_key).unwrap();
-        let wallet = EthereumWallet::from(signer);
-
+    ) -> AlpacaTokenizationClient<impl Wallet> {
         let provider = ProviderBuilder::new()
-            .wallet(wallet)
             .connect(anvil_endpoint)
             .await
             .unwrap();
 
-        AlpacaTokenizationClient::new_with_base_url(
+        let wallet = RawPrivateKeyWallet::new(private_key, provider, 1).unwrap();
+
+        AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
-            provider,
+            wallet,
             redemption_wallet,
         )
     }
 
-    fn create_test_service<P>(client: AlpacaTokenizationClient<P>) -> AlpacaTokenizationService<P>
-    where
-        P: Provider + Clone,
-    {
+    fn create_test_service(
+        client: AlpacaTokenizationClient<impl Wallet>,
+    ) -> AlpacaTokenizationService<impl Wallet> {
         let config = PollingConfig {
             interval: Duration::from_millis(10),
             timeout: Duration::from_secs(5),
@@ -852,7 +799,7 @@ pub(crate) mod tests {
         anvil_endpoint: &str,
         private_key: &B256,
         redemption_wallet: Address,
-    ) -> AlpacaTokenizationService<impl Provider + Clone + use<>> {
+    ) -> AlpacaTokenizationService<impl Wallet> {
         let client =
             create_test_client(server, anvil_endpoint, private_key, redemption_wallet).await;
         create_test_service(client)
@@ -1147,21 +1094,20 @@ pub(crate) mod tests {
     async fn test_send_tokens_for_redemption_success() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer.clone());
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
 
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&endpoint)
-            .await
-            .unwrap();
-
+        let provider = wallet.provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
         let mint_amount = U256::from(1_000_000_000u64);
         token
-            .mint(signer.address(), mint_amount)
+            .mint(wallet.address(), mint_amount)
             .send()
             .await
             .unwrap()
@@ -1169,19 +1115,19 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let client = AlpacaTokenizationClient::new_with_base_url(
+        let client = AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
-            provider.clone(),
+            wallet,
             TEST_REDEMPTION_WALLET,
         );
 
         let transfer_amount = U256::from(100_000u64);
 
         client
-            .send_tokens_for_redemption(token_address, transfer_amount)
+            .send_tokens_for_redemption::<OpenChainErrorRegistry>(token_address, transfer_amount)
             .await
             .unwrap();
 
@@ -1196,52 +1142,38 @@ pub(crate) mod tests {
         );
     }
 
-    struct MockErrorRegistry(Vec<AlloyError>);
-
-    #[async_trait]
-    impl ErrorRegistry for MockErrorRegistry {
-        async fn lookup(
-            &self,
-            _selector: [u8; 4],
-        ) -> Result<Vec<AlloyError>, AbiDecodeFailedErrors> {
-            Ok(self.0.clone())
-        }
-    }
-
     #[tokio::test]
     async fn test_send_tokens_for_redemption_insufficient_balance() {
         let (_anvil, endpoint, key) = setup_anvil();
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer);
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
 
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&endpoint)
-            .await
-            .unwrap();
-
+        let provider = wallet.provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
-        let erc20 = IERC20::new(*token.address(), provider);
+        let token_address = *token.address();
+
+        let client = AlpacaTokenizationClient::new(
+            "http://unused".to_string(),
+            TEST_ACCOUNT_ID,
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            wallet,
+            TEST_REDEMPTION_WALLET,
+        );
 
         let transfer_amount = U256::from(100_000u64);
-        let contract_err = erc20
-            .transfer(TEST_REDEMPTION_WALLET, transfer_amount)
-            .send()
+        let err = client
+            .send_tokens_for_redemption::<OpenChainErrorRegistry>(token_address, transfer_amount)
             .await
-            .expect_err("expected error for insufficient balance");
-
-        let registry = MockErrorRegistry(vec!["Error(string)".parse().unwrap()]);
-        let err: AlpacaTokenizationError =
-            handle_contract_error_with(contract_err, Some(&registry)).await;
+            .unwrap_err();
 
         assert!(
-            matches!(err, AlpacaTokenizationError::Revert(_)),
-            "expected Revert error variant, got: {err:?}"
-        );
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("transfer amount exceeds balance"),
-            "expected 'transfer amount exceeds balance' in error message, got: {err_msg}"
+            matches!(err, AlpacaTokenizationError::Evm(_)),
+            "expected Evm error variant, got: {err:?}"
         );
     }
 

@@ -23,7 +23,6 @@ mod conductor;
 pub mod config;
 pub(crate) mod dashboard;
 mod equity_redemption;
-mod error_decoding;
 mod inventory;
 mod offchain;
 mod offchain_order;
@@ -94,10 +93,7 @@ fn spawn_bot_task(
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let bot_span = info_span!("bot_task");
-        let _enter = bot_span.enter();
-
-        if let Err(error) = Box::pin(run(ctx, pool, event_sender)).await {
+        if let Err(error) = run(ctx, pool, event_sender).await {
             error!("Bot failed: {error}");
         }
     })
@@ -160,7 +156,7 @@ async fn run(
     const RERUN_DELAY_SECS: u64 = 10;
 
     loop {
-        let result = Box::pin(run_bot_session(&ctx, &pool, event_sender.clone())).await;
+        let result = run_bot_session(ctx.clone(), pool.clone(), event_sender.clone()).await;
 
         match result {
             Ok(()) => {
@@ -188,76 +184,41 @@ async fn run(
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 async fn run_bot_session(
-    ctx: &Ctx,
-    pool: &SqlitePool,
+    ctx: Ctx,
+    pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
-    match &ctx.broker {
+    match ctx.broker.clone() {
         BrokerCtx::DryRun => {
             info!("Initializing test executor for dry-run mode");
             let executor = MockExecutorCtx.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
         BrokerCtx::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let executor = schwab_ctx.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             info!("Initializing Alpaca Trading API executor");
-            let executor = alpaca_auth.clone().try_into_executor().await?;
+            let executor = alpaca_auth.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             info!("Initializing Alpaca Broker API executor");
-            let executor = alpaca_auth.clone().try_into_executor().await?;
+            let executor = alpaca_auth.try_into_executor().await?;
+            let maintenance = executor.run_executor_maintenance().await;
 
-            Box::pin(run_with_executor(
-                ctx.clone(),
-                pool.clone(),
-                executor,
-                event_sender,
-            ))
-            .await
+            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
         }
     }
-}
-
-async fn run_with_executor<E>(
-    ctx: Ctx,
-    pool: SqlitePool,
-    executor: E,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    conductor::EventProcessingError: From<E::Error>,
-{
-    let executor_maintenance = executor.run_executor_maintenance().await;
-
-    conductor::run_market_hours_loop(executor, ctx, pool, executor_maintenance, event_sender).await
 }
 
 #[cfg(test)]

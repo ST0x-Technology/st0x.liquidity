@@ -1,13 +1,11 @@
 //! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist,
 //! transfers, convert).
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
-use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 
+use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
 use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor, Positive};
 
 use super::ConvertDirection;
@@ -15,11 +13,11 @@ use crate::alpaca_wallet::{
     AlpacaWalletService, Network, TokenSymbol, TransferStatus, WhitelistStatus,
 };
 use crate::bindings::IERC20;
-use crate::config::Ctx;
+use crate::config::{BrokerCtx, Ctx};
 use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 use crate::threshold::Usdc;
 
-pub(super) async fn alpaca_deposit_command<W: Write>(
+pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
     amount: Usdc,
     ctx: &Ctx,
@@ -27,59 +25,66 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "Depositing USDC directly to Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("alpaca-deposit requires rebalancing configuration"))?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-deposit requires Alpaca Broker API configuration");
+    };
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let ethereum_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
 
-    let ethereum_provider = ProviderBuilder::new()
-        .wallet(ethereum_wallet)
-        .connect_http(rebalancing_ctx.ethereum_rpc_url.clone());
-
     let alpaca_wallet = AlpacaWalletService::new(
-        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
+        alpaca_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_broker_auth.account_id,
-        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
-    let usdc = TokenSymbol::new("USDC");
+    let usdc_symbol = TokenSymbol::new("USDC");
     let ethereum = Network::new("ethereum");
-    let deposit_address = alpaca_wallet.get_wallet_address(&usdc, &ethereum).await?;
+    let deposit_address = alpaca_wallet
+        .get_wallet_address(&usdc_symbol, &ethereum)
+        .await?;
     writeln!(stdout, "   Alpaca deposit address: {deposit_address}")?;
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
-    let (usdc_address, network) = if rebalancing_ctx.alpaca_broker_auth.is_sandbox() {
+    let (usdc_address, network) = if alpaca_auth.is_sandbox() {
         (USDC_ETHEREUM_SEPOLIA, "Ethereum Sepolia")
     } else {
         (USDC_ETHEREUM, "Ethereum Mainnet")
     };
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
-    let usdc = IERC20::IERC20Instance::new(usdc_address, &ethereum_provider);
-
-    let balance = usdc.balanceOf(sender_address).call().await?;
+    let balance = rebalancing_ctx
+        .ethereum_wallet()
+        .call::<Registry, _>(
+            usdc_address,
+            IERC20::balanceOfCall {
+                account: sender_address,
+            },
+        )
+        .await?;
     writeln!(stdout, "   Current USDC balance: {balance}")?;
 
     if balance < amount_u256 {
         anyhow::bail!("Insufficient USDC balance: have {balance}, need {amount_u256}");
     }
 
-    writeln!(stdout, "   Sending USDC transfer transaction...")?;
-    let tx_receipt = usdc
-        .transfer(deposit_address, amount_u256)
-        .send()
-        .await?
-        .get_receipt()
+    writeln!(stdout, "   Sending USDC transfer via Fireblocks...")?;
+    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+    let tx_receipt = ethereum_wallet
+        .submit::<Registry, _>(
+            usdc_address,
+            IERC20::transferCall {
+                to: deposit_address,
+                amount: amount_u256,
+            },
+            "USDC transfer to Alpaca",
+        )
         .await?;
 
     let tx_hash = tx_receipt.transaction_hash;
@@ -111,7 +116,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn alpaca_withdraw_command<W: Write>(
+pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
     amount: Usdc,
     to_address: Option<Address>,
@@ -120,39 +125,41 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     writeln!(stdout, "Withdrawing USDC from Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("alpaca-withdraw requires rebalancing configuration"))?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-withdraw requires Alpaca Broker API configuration");
+    };
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let ethereum_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let sender_address = rebalancing_ctx.base_wallet().address();
 
     let destination = to_address.unwrap_or(sender_address);
     writeln!(stdout, "   Destination address: {destination}")?;
 
-    let ethereum_provider = ProviderBuilder::new()
-        .wallet(ethereum_wallet)
-        .connect_http(rebalancing_ctx.ethereum_rpc_url.clone());
-
-    let (usdc_address, network) = if rebalancing_ctx.alpaca_broker_auth.is_sandbox() {
+    let (usdc_address, network) = if alpaca_auth.is_sandbox() {
         (USDC_ETHEREUM_SEPOLIA, "Ethereum Sepolia")
     } else {
         (USDC_ETHEREUM, "Ethereum Mainnet")
     };
+
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
-    let usdc = IERC20::IERC20Instance::new(usdc_address, &ethereum_provider);
 
-    let balance_before = usdc.balanceOf(destination).call().await?;
+    let balance_before = rebalancing_ctx
+        .ethereum_wallet()
+        .call::<Registry, _>(
+            usdc_address,
+            IERC20::balanceOfCall {
+                account: destination,
+            },
+        )
+        .await?;
+
     writeln!(stdout, "   Balance before: {balance_before}")?;
-
     let alpaca_wallet = AlpacaWalletService::new(
-        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
+        alpaca_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_broker_auth.account_id,
-        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     let usdc_asset = TokenSymbol::new("USDC");
@@ -181,9 +188,17 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
                 writeln!(stdout, "   Transaction hash: {tx_hash}")?;
             }
 
-            let balance_after = usdc.balanceOf(destination).call().await?;
-            writeln!(stdout, "   Balance after: {balance_after}")?;
+            let balance_after = rebalancing_ctx
+                .ethereum_wallet()
+                .call::<Registry, _>(
+                    usdc_address,
+                    IERC20::balanceOfCall {
+                        account: destination,
+                    },
+                )
+                .await?;
 
+            writeln!(stdout, "   Balance after: {balance_after}")?;
             let expected_increase = amount.to_u256_6_decimals()?;
             if balance_after >= balance_before + expected_increase {
                 writeln!(stdout, "   Balance increased as expected!")?;
@@ -216,14 +231,12 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     address: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("alpaca-whitelist requires rebalancing configuration"))?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-whitelist requires Alpaca Broker API configuration");
+    };
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let sender_address = signer.address();
-    let target_address = address.unwrap_or(sender_address);
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let target_address = address.unwrap_or_else(|| rebalancing_ctx.base_wallet().address());
 
     writeln!(stdout, "Whitelisting address for Alpaca withdrawals")?;
     writeln!(stdout, "   Address: {target_address}")?;
@@ -231,10 +244,10 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     writeln!(stdout, "   Network: Ethereum")?;
 
     let alpaca_wallet = AlpacaWalletService::new(
-        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
+        alpaca_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_broker_auth.account_id,
-        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
@@ -281,15 +294,15 @@ pub(super) async fn alpaca_whitelist_list_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("alpaca-whitelist-list requires rebalancing configuration")
-    })?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-whitelist-list requires Alpaca Broker API configuration");
+    };
 
     let alpaca_wallet = AlpacaWalletService::new(
-        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
-        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "Fetching whitelisted addresses...")?;
@@ -321,19 +334,18 @@ pub(super) async fn alpaca_unwhitelist_command<W: Write>(
     address: Address,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("alpaca-unwhitelist requires rebalancing configuration"))?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-unwhitelist requires Alpaca Broker API configuration");
+    };
 
     writeln!(stdout, "Removing address from Alpaca whitelist")?;
     writeln!(stdout, "   Address: {address}")?;
 
     let alpaca_wallet = AlpacaWalletService::new(
-        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
-        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     let removed = alpaca_wallet.remove_whitelist_entries(&address).await?;
@@ -353,24 +365,19 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("alpaca-transfers requires rebalancing configuration"))?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-transfers requires Alpaca Broker API configuration");
+    };
 
     let alpaca_wallet = AlpacaWalletService::new(
-        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
-        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
-    writeln!(
-        stdout,
-        "   Account: {}",
-        rebalancing_ctx.alpaca_broker_auth.account_id
-    )?;
+    writeln!(stdout, "   Account: {}", alpaca_auth.account_id)?;
 
     let transfers = alpaca_wallet.list_all_transfers().await?;
 
@@ -413,10 +420,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_ctx = ctx
-        .rebalancing
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("alpaca-convert requires rebalancing configuration"))?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
     let executor =
         AlpacaBrokerApi::try_from_ctx(rebalancing_ctx.alpaca_broker_auth.clone()).await?;
@@ -462,11 +466,12 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
+    use st0x_evm::NoOpErrorRegistry;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
     use super::*;
     use crate::cli::ConvertDirection;
-    use crate::config::{BrokerCtx, LogLevel};
+    use crate::config::{LogLevel, TradingMode};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
@@ -481,14 +486,15 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerCtx::DryRun,
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
@@ -515,7 +521,6 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -529,17 +534,15 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
-            rebalancing: Some(RebalancingCtx {
-                evm_private_key: B256::ZERO,
-                ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                usdc_vault_id: B256::ZERO,
-                redemption_wallet: Address::ZERO,
-                equity: ImbalanceThreshold {
+            trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
+                ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc: UsdcRebalancing::Disabled,
-                alpaca_broker_auth: AlpacaBrokerApiCtx {
+                UsdcRebalancing::Disabled,
+                Address::ZERO,
+                B256::ZERO,
+                AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
                     account_id: alpaca_account_id,
@@ -547,8 +550,8 @@ mod tests {
                     asset_cache_ttl: std::time::Duration::from_secs(3600),
                     time_in_force: TimeInForce::default(),
                 },
-                equities: HashMap::new(),
-            }),
+                HashMap::new(),
+            ))),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
@@ -559,12 +562,12 @@ mod tests {
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = alpaca_deposit_command(&mut stdout, amount, &ctx)
+        let err_msg = alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
             .await
             .unwrap_err()
             .to_string();
         assert!(
-            err_msg.contains("requires rebalancing configuration"),
+            err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"
         );
     }
@@ -575,7 +578,7 @@ mod tests {
         let amount = Usdc(dec!(500.50));
 
         let mut stdout = Vec::new();
-        alpaca_deposit_command(&mut stdout, amount, &ctx)
+        alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
             .await
             .unwrap_err();
 
@@ -592,12 +595,13 @@ mod tests {
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = alpaca_withdraw_command(&mut stdout, amount, None, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err_msg =
+            alpaca_withdraw_command::<NoOpErrorRegistry, _>(&mut stdout, amount, None, &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
         assert!(
-            err_msg.contains("requires rebalancing configuration"),
+            err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"
         );
     }
@@ -612,22 +616,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err_msg.contains("requires rebalancing configuration"),
-            "Expected rebalancing config error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_transfers_requires_rebalancing_ctx() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
-
-        let mut stdout = Vec::new();
-        let err_msg = alpaca_transfers_command(&mut stdout, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err_msg.contains("requires rebalancing configuration"),
+            err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"
         );
     }

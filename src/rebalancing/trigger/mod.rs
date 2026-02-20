@@ -4,19 +4,25 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
+use st0x_evm::Wallet;
+use st0x_evm::fireblocks::{
+    ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment, FireblocksError,
+    FireblocksVaultAccountId, FireblocksWallet,
+};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
@@ -24,6 +30,7 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
     ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, TransferOp, Venue,
 };
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{
@@ -56,10 +63,14 @@ pub(crate) enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
-    #[error("invalid EVM private key: {0}")]
-    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
-    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
-    WalletsMatch(Address),
+    #[error("failed to read Fireblocks secret file: {0}")]
+    FireblocksSecretRead(#[from] std::io::Error),
+    #[error(transparent)]
+    Fireblocks(#[from] FireblocksError),
+    #[error("RPC error during wallet setup: {0}")]
+    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
+    #[error("no Fireblocks asset ID configured for chain {chain_id}")]
+    MissingChainAssetId { chain_id: u64 },
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -73,8 +84,10 @@ pub(crate) enum UsdcRebalancing {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
+    pub(crate) base_rpc_url: Url,
     pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
+    pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
+    pub(crate) fireblocks_secret_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -85,57 +98,150 @@ pub(crate) struct RebalancingConfig {
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
     pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
+    pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
+    pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
+    pub(crate) fireblocks_environment: FireblocksEnvironment,
+    /// Override the Fireblocks API base URL. When absent, determined
+    /// by `fireblocks_environment`.
+    pub(crate) fireblocks_base_url: Option<Url>,
 }
 
 /// Runtime configuration for rebalancing operations.
-/// Constructed from `RebalancingConfig` + `RebalancingSecrets` + broker's `AlpacaBrokerApiCtx`.
+///
+/// Constructed asynchronously from `RebalancingConfig`, `RebalancingSecrets`,
+/// and broker auth. During construction, Fireblocks wallets are pre-built for
+/// both chains (each resolving the vault address from the Fireblocks API).
+/// After construction, all fields are immutable.
+///
+/// Read-only provider access for either chain is available via
+/// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Registry of wrapped token configurations for ERC-4626 vault operations.
     pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
+    /// Pre-built wallet for the base chain (e.g. Base mainnet).
+    base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    /// Pre-built wallet for Ethereum mainnet.
+    ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
 }
 
 impl RebalancingCtx {
-    /// Construct from config, secrets, and broker's Alpaca auth.
+    /// Construct from config, secrets, and broker auth.
     ///
-    /// This is the ONLY way to construct a `RebalancingCtx`, which enforces
-    /// the invariant that rebalancing always has valid `AlpacaBrokerApiCtx`.
-    pub(crate) fn new(
+    /// Reads the Fireblocks RSA secret, builds wallets for both chains
+    /// (resolving the vault address from the Fireblocks API), and
+    /// stores them immutably. Read-only provider access for either
+    /// chain is available via `base_wallet().provider()` and
+    /// `ethereum_wallet().provider()`.
+    pub(crate) async fn new(
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
-        let market_maker_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)?.address();
+        let fireblocks_secret = tokio::fs::read(&secrets.fireblocks_secret_path).await?;
 
-        if market_maker_wallet == config.redemption_wallet {
-            return Err(RebalancingCtxError::WalletsMatch(market_maker_wallet));
-        }
+        let (base_wallet, ethereum_wallet) = tokio::try_join!(
+            Self::build_wallet(
+                &config,
+                &fireblocks_secret,
+                &secrets.fireblocks_api_user_id,
+                secrets.base_rpc_url,
+            ),
+            Self::build_wallet(
+                &config,
+                &fireblocks_secret,
+                &secrets.fireblocks_api_user_id,
+                secrets.ethereum_rpc_url,
+            ),
+        )?;
+
+        info!(
+            wallet = %base_wallet.address(),
+            "Resolved market maker wallet from Fireblocks"
+        );
 
         Ok(Self {
             equity: config.equity,
             usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
-            ethereum_rpc_url: secrets.ethereum_rpc_url,
-            evm_private_key: secrets.evm_private_key,
             usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
             equities: config.equities,
+            base_wallet: Arc::new(base_wallet),
+            ethereum_wallet: Arc::new(ethereum_wallet),
         })
     }
 
-    /// Derives the market maker wallet address from the EVM private key.
-    pub(crate) fn market_maker_wallet(
-        &self,
-    ) -> Result<Address, alloy::signers::k256::ecdsa::Error> {
-        Ok(PrivateKeySigner::from_bytes(&self.evm_private_key)?.address())
+    async fn build_wallet(
+        config: &RebalancingConfig,
+        fireblocks_secret: &[u8],
+        api_user_id: &FireblocksApiUserId,
+        rpc_url: Url,
+    ) -> Result<FireblocksWallet<RootProvider>, RebalancingCtxError> {
+        let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
+        let chain_id = provider.get_chain_id().await?;
+
+        let asset_id = config
+            .fireblocks_chain_asset_ids
+            .get(chain_id)
+            .cloned()
+            .ok_or_else(|| {
+                warn!(chain_id, "No Fireblocks asset ID configured for chain");
+                RebalancingCtxError::MissingChainAssetId { chain_id }
+            })?;
+
+        Ok(FireblocksWallet::new(FireblocksCtx {
+            api_user_id: api_user_id.clone(),
+            secret: fireblocks_secret.to_vec(),
+            vault_account_id: config.fireblocks_vault_account_id.clone(),
+            environment: config.fireblocks_environment,
+            asset_id,
+            provider,
+            required_confirmations: REQUIRED_CONFIRMATIONS,
+            base_url: config.fireblocks_base_url.clone(),
+        })
+        .await?)
+    }
+
+    pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+        &self.base_wallet
+    }
+
+    pub(crate) fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+        &self.ethereum_wallet
+    }
+
+    /// Test constructor that creates a `RebalancingCtx` with stub wallets.
+    ///
+    /// The wallets panic on `send` -- use only in tests that don't submit
+    /// transactions through the rebalancing wallet.
+    #[cfg(test)]
+    pub(crate) fn stub(
+        equity: ImbalanceThreshold,
+        usdc: UsdcRebalancing,
+        redemption_wallet: Address,
+        usdc_vault_id: B256,
+        alpaca_broker_auth: AlpacaBrokerApiCtx,
+        equities: HashMap<Symbol, EquityTokenAddresses>,
+    ) -> Self {
+        let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
+
+        Self {
+            equity,
+            usdc,
+            redemption_wallet,
+            usdc_vault_id,
+            alpaca_broker_auth,
+            equities,
+            base_wallet: wallet.clone(),
+            ethereum_wallet: wallet,
+        }
     }
 }
 
@@ -145,13 +251,11 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("market_maker_wallet", &self.market_maker_wallet())
-            .field("ethereum_rpc_url", &"[REDACTED]")
-            .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("equities", &self.equities)
-            .finish()
+            .field("wallet", &self.base_wallet.address())
+            .finish_non_exhaustive()
     }
 }
 
@@ -289,7 +393,7 @@ impl RebalancingTrigger {
 
     /// Reprocess a snapshot event after the normal handler failed.
     ///
-    /// Resets the inventory, then force-applies the snapshot —
+    /// Resets the inventory, then force-applies the snapshot --
     /// bypassing inflight guards that may have caused the
     /// original failure.
     async fn on_snapshot_recovery(
@@ -816,9 +920,12 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
-    use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
+    use httpmock::MockServer;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
@@ -827,8 +934,8 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce,
     };
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, LazyLock};
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::{Uuid, uuid};
@@ -846,6 +953,15 @@ mod tests {
     use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
     use crate::vault_registry::VaultRegistryCommand;
     use crate::wrapper::mock::MockWrapper;
+
+    /// RSA private key generated at test time for Fireblocks JWT
+    /// signing. The mock server does not validate signatures.
+    static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        pem.as_bytes().to_vec()
+    });
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
@@ -2772,6 +2888,12 @@ mod tests {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equities]
 
@@ -2788,8 +2910,10 @@ mod tests {
 
     fn valid_rebalancing_secrets_toml() -> &'static str {
         r#"
+            base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            fireblocks_api_user_id = "test-api-user"
+            fireblocks_secret_path = "/tmp/test-fireblocks.key"
         "#
     }
 
@@ -2828,18 +2952,18 @@ mod tests {
             toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
     }
 
-    #[test]
-    fn new_constructs_ctx() {
+    #[tokio::test]
+    async fn new_fails_when_secret_file_missing() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
         let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
+        let error = RebalancingCtx::new(config, secrets, test_broker_auth())
+            .await
+            .unwrap_err();
 
-        assert_eq!(ctx.alpaca_broker_auth.api_key, "test_key");
-        assert_eq!(ctx.alpaca_broker_auth.api_secret, "test_secret");
-        assert_eq!(
-            ctx.alpaca_broker_auth.account_id,
-            AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"))
+        assert!(
+            matches!(error, RebalancingCtxError::FireblocksSecretRead(_)),
+            "Expected FireblocksSecretRead error, got {error:?}"
         );
     }
 
@@ -2849,6 +2973,12 @@ mod tests {
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equities]
 
@@ -2863,14 +2993,11 @@ mod tests {
         "#,
         )
         .unwrap();
-        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
+        assert_eq!(config.equity.target, dec!(0.6));
+        assert_eq!(config.equity.deviation, dec!(0.1));
 
-        assert_eq!(ctx.equity.target, dec!(0.6));
-        assert_eq!(ctx.equity.deviation, dec!(0.1));
-
-        let UsdcRebalancing::Enabled { target, deviation } = ctx.usdc else {
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
             panic!("expected enabled");
         };
         assert_eq!(target, dec!(0.4));
@@ -2881,6 +3008,12 @@ mod tests {
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equity]
             target = "0.5"
@@ -2898,15 +3031,16 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_evm_private_key_fails() {
+    fn deserialize_missing_fireblocks_fields_fails() {
         let toml_str = r#"
+            base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
         "#;
 
         let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
         assert!(
-            error.message().contains("evm_private_key"),
-            "Expected missing evm_private_key error, got: {error}"
+            error.message().contains("fireblocks_api_user_id"),
+            "Expected missing fireblocks_api_user_id error, got: {error}"
         );
     }
 
@@ -2915,6 +3049,12 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [usdc]
             mode = "disabled"
@@ -2932,6 +3072,12 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equities]
 
@@ -3746,49 +3892,96 @@ mod tests {
         );
     }
 
-    #[test]
-    fn new_derives_market_maker_wallet_from_private_key() {
-        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
-        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+    #[tokio::test]
+    async fn build_wallet_returns_missing_chain_asset_id_for_unknown_chain() {
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
 
-        let expected_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
-            .unwrap()
-            .address();
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            usdc_vault_id: fixed_bytes!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            equities: HashMap::new(),
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: None,
+        };
 
-        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
-
-        assert_eq!(ctx.market_maker_wallet().unwrap(), expected_wallet);
-    }
-
-    #[test]
-    fn new_rejects_identical_market_maker_and_redemption_wallets() {
-        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
-        let derived_wallet = PrivateKeySigner::from_bytes(&secrets.evm_private_key)
-            .unwrap()
-            .address();
-
-        let config_toml = format!(
-            r#"
-            redemption_wallet = "{derived_wallet}"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-
-            [equities]
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            mode = "disabled"
-        "#
-        );
-        let config: RebalancingConfig = toml::from_str(&config_toml).unwrap();
-
-        let error = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap_err();
+        let error = RebalancingCtx::build_wallet(
+            &config,
+            b"fake-rsa-key",
+            &FireblocksApiUserId::new("test-user"),
+            rpc_url,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
-            matches!(error, RebalancingCtxError::WalletsMatch(addr) if addr == derived_wallet),
-            "Expected WalletsMatch with {derived_wallet}, got: {error:?}"
+            matches!(
+                error,
+                RebalancingCtxError::MissingChainAssetId { chain_id: 31337 }
+            ),
+            "Expected MissingChainAssetId for Anvil's default chain 31337, got: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_wallet_resolves_address_from_fireblocks() {
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+        let server = MockServer::start();
+        let expected_address = address!("0x1111111111111111111111111111111111111111");
+
+        server.mock(|when, then| {
+            when.method("GET")
+                .path("/vault/accounts/0/ETH/addresses_paginated");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "addresses": [{
+                        "assetId": "ETH",
+                        "address": expected_address
+                    }]
+                }));
+        });
+
+        // Anvil's default chain ID is 31337
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            usdc_vault_id: fixed_bytes!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            equities: HashMap::new(),
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({
+                "31337": "ETH"
+            }))
+            .unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: Some(server.base_url().parse().unwrap()),
+        };
+
+        let wallet = RebalancingCtx::build_wallet(
+            &config,
+            &TEST_RSA_PEM,
+            &FireblocksApiUserId::new("test-api-key"),
+            rpc_url,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(wallet.address(), expected_address);
     }
 }

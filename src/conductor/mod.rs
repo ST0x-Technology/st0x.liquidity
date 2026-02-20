@@ -6,11 +6,9 @@
 mod builder;
 mod manifest;
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
@@ -26,6 +24,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
+use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
@@ -52,8 +51,8 @@ use crate::queue::{
 };
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
-    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
-    spawn_rebalancer,
+    RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
+    RebalancingTriggerConfig,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -101,8 +100,6 @@ pub(crate) enum EventProcessingError {
     EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
-    #[error("Ctx error: {0}")]
-    Ctx(#[from] CtxError),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("Execution error: {0}")]
@@ -125,7 +122,7 @@ where
     EventProcessingError: From<E::Error>,
 {
     let mut conductor =
-        Conductor::start(&ctx, &pool, executor, executor_maintenance, event_sender).await?;
+        Conductor::start(ctx, pool, executor, executor_maintenance, event_sender).await?;
 
     info!("Conductor running");
     let result = conductor.wait_for_completion().await;
@@ -141,117 +138,130 @@ pub(crate) struct VaultDiscoveryCtx<'a> {
 }
 
 impl Conductor {
-    pub(crate) async fn start<E>(
-        ctx: &Ctx,
-        pool: &SqlitePool,
+    pub(crate) fn start<E>(
+        ctx: Ctx,
+        pool: SqlitePool,
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
-    ) -> anyhow::Result<Self>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Self>> + Send>>
     where
         E: Executor + Clone + Send + 'static,
         EventProcessingError: From<E::Error>,
     {
-        let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
-        let cache = SymbolCache::default();
-        let orderbook = IOrderBookV5Instance::new(ctx.evm.orderbook, &provider);
+        Box::pin(async move {
+            let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
+            let provider = ProviderBuilder::new().connect_ws(ws).await?;
+            let cache = SymbolCache::default();
+            let orderbook = IOrderBookV5Instance::new(ctx.evm.orderbook, &provider);
 
-        let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-        let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
+            let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
+            let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
 
-        let cutoff_block =
-            get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, pool).await?;
+            let cutoff_block =
+                get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool).await?;
 
-        if let Some(end_block) = cutoff_block.checked_sub(1) {
-            backfill_events(pool, &provider, &ctx.evm, end_block).await?;
-        }
+            if let Some(end_block) = cutoff_block.checked_sub(1) {
+                backfill_events(&pool, &provider, &ctx.evm, end_block).await?;
+            }
 
-        let onchain_trade = Arc::new(
-            StoreBuilder::<OnChainTrade>::new(pool.clone())
-                .build(())
-                .await?,
-        );
+            let onchain_trade = Arc::new(
+                StoreBuilder::<OnChainTrade>::new(pool.clone())
+                    .build(())
+                    .await?,
+            );
 
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+            let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let vault_registry_projection =
-            Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+            let vault_registry_projection =
+                Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
-        let vault_registry = Arc::new(
-            StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .with(vault_registry_projection.clone())
-                .build(())
-                .await?,
-        );
+            let vault_registry = Arc::new(
+                StoreBuilder::<VaultRegistry>::new(pool.clone())
+                    .with(vault_registry_projection.clone())
+                    .build(())
+                    .await?,
+            );
 
-        let (position, position_projection, snapshot, rebalancer) =
-            if let Some(rebalancing_ctx) = ctx.rebalancing_ctx() {
-                let (position, position_projection, snapshot, rebalancer_handle) =
-                    spawn_rebalancing_infrastructure(
+            let rebalancing = match ctx.rebalancing_ctx() {
+                Ok(ctx) => Some(ctx.clone()),
+                Err(CtxError::NotRebalancing) => None,
+                Err(error) => return Err(error.into()),
+            };
+
+            let (position, position_projection, snapshot, rebalancer) =
+                if let Some(rebalancing_ctx) = rebalancing {
+                    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+                    let base_wallet = rebalancing_ctx.base_wallet().clone();
+                    let infra = spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
-                        pool,
-                        ctx,
-                        &inventory,
-                        event_sender,
-                        &provider,
-                        vault_registry.clone(),
+                        ethereum_wallet,
+                        base_wallet,
+                        RebalancingDeps {
+                            pool: pool.clone(),
+                            ctx: ctx.clone(),
+                            inventory: inventory.clone(),
+                            event_sender,
+                            vault_registry: vault_registry.clone(),
+                        },
                     )
                     .await?;
 
-                (
-                    position,
-                    position_projection,
-                    snapshot,
-                    Some(rebalancer_handle),
-                )
-            } else {
-                let (position, position_projection) = build_position_cqrs(pool).await?;
-                let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                    .build(())
-                    .await?;
-                (position, position_projection, snapshot, None)
+                    (
+                        infra.position,
+                        infra.position_projection,
+                        infra.snapshot,
+                        Some(infra.rebalancer),
+                    )
+                } else {
+                    let (position, position_projection) = build_position_cqrs(&pool).await?;
+                    let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                        .build(())
+                        .await?;
+                    (position, position_projection, snapshot, None)
+                };
+
+            let order_placer: Arc<dyn OrderPlacer> =
+                Arc::new(ExecutorOrderPlacer(executor.clone()));
+            let offchain_order_projection =
+                Arc::new(Projection::<OffchainOrder>::sqlite(pool.clone())?);
+
+            let offchain_order = Arc::new(
+                StoreBuilder::<OffchainOrder>::new(pool.clone())
+                    .with(offchain_order_projection.clone())
+                    .build(order_placer)
+                    .await?,
+            );
+
+            let frameworks = CqrsFrameworks {
+                onchain_trade,
+                position,
+                position_projection,
+                offchain_order,
+                offchain_order_projection,
+                vault_registry,
+                vault_registry_projection,
+                snapshot,
             };
 
-        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
-        let offchain_order_projection =
-            Arc::new(Projection::<OffchainOrder>::sqlite(pool.clone())?);
+            let mut builder = ConductorBuilder::new(
+                ctx.clone(),
+                pool.clone(),
+                cache,
+                provider,
+                executor,
+                ctx.execution_threshold,
+                frameworks,
+            )
+            .with_executor_maintenance(executor_maintenance)
+            .with_dex_event_streams(clear_stream, take_stream);
 
-        let offchain_order = Arc::new(
-            StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with(offchain_order_projection.clone())
-                .build(order_placer)
-                .await?,
-        );
+            if let Some(rebalancer_handle) = rebalancer {
+                builder = builder.with_rebalancer(rebalancer_handle);
+            }
 
-        let frameworks = CqrsFrameworks {
-            onchain_trade,
-            position,
-            position_projection,
-            offchain_order,
-            offchain_order_projection,
-            vault_registry,
-            vault_registry_projection,
-            snapshot,
-        };
-
-        let mut builder = ConductorBuilder::new(
-            ctx.clone(),
-            pool.clone(),
-            cache,
-            provider,
-            executor,
-            ctx.execution_threshold,
-            frameworks,
-        )
-        .with_executor_maintenance(executor_maintenance)
-        .with_dex_event_streams(clear_stream, take_stream);
-
-        if let Some(rebalancer_handle) = rebalancer {
-            builder = builder.with_rebalancer(rebalancer_handle);
-        }
-
-        Ok(builder.spawn())
+            Ok(builder.spawn())
+        })
     }
 }
 
@@ -303,108 +313,119 @@ impl Conductor {
     }
 }
 
-async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
-    rebalancing_ctx: &RebalancingCtx,
-    pool: &SqlitePool,
-    ctx: &Ctx,
-    inventory: &Arc<RwLock<InventoryView>>,
+struct RebalancingInfrastructure {
+    position: Arc<Store<Position>>,
+    position_projection: Arc<Projection<Position>>,
+    snapshot: Store<InventorySnapshot>,
+    rebalancer: JoinHandle<()>,
+}
+
+/// Shared infrastructure dependencies needed to spawn rebalancing.
+struct RebalancingDeps {
+    pool: SqlitePool,
+    ctx: Ctx,
+    inventory: Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
-    provider: &P,
     vault_registry: Arc<Store<VaultRegistry>>,
-) -> anyhow::Result<(
-    Arc<Store<Position>>,
-    Arc<Projection<Position>>,
-    Store<InventorySnapshot>,
-    JoinHandle<()>,
-)> {
-    info!("Initializing rebalancing infrastructure");
+}
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
-    let evm_wallet = EthereumWallet::from(signer);
-    let base_provider = ProviderBuilder::new()
-        .wallet(evm_wallet)
-        .connect_provider(provider.clone());
+fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
+    rebalancing_ctx: RebalancingCtx,
+    ethereum_wallet: Chain,
+    base_wallet: Chain,
+    deps: RebalancingDeps,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
+> {
+    Box::pin(async move {
+        info!("Initializing rebalancing infrastructure");
 
-    let market_maker_wallet = rebalancing_ctx.market_maker_wallet()?;
+        let market_maker_wallet = base_wallet.address();
 
-    const OPERATION_CHANNEL_CAPACITY: usize = 100;
-    let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
+        const OPERATION_CHANNEL_CAPACITY: usize = 100;
+        let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
-    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+        let vault_registry_projection =
+            Arc::new(Projection::<VaultRegistry>::sqlite(deps.pool.clone())?);
 
-    let raindex_service = Arc::new(RaindexService::new(
-        base_provider.clone(),
-        ctx.evm.orderbook,
-        vault_registry_projection,
-        market_maker_wallet,
-    ));
+        let raindex_service = Arc::new(RaindexService::new(
+            base_wallet.clone(),
+            deps.ctx.evm.orderbook,
+            vault_registry_projection,
+            market_maker_wallet,
+        ));
 
-    let tokenization = Arc::new(AlpacaTokenizationService::new(
-        rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
-        rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-        rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
-        base_provider.clone(),
-        rebalancing_ctx.redemption_wallet,
-    ));
+        let tokenization = Arc::new(AlpacaTokenizationService::new(
+            rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
+            rebalancing_ctx.alpaca_broker_auth.account_id,
+            rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
+            rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+            base_wallet.clone(),
+            rebalancing_ctx.redemption_wallet,
+        ));
 
-    let tokenizer: Arc<dyn Tokenizer> = tokenization;
+        let tokenizer: Arc<dyn Tokenizer> = tokenization;
 
-    let wrapper = Arc::new(WrapperService::new(
-        base_provider.clone(),
-        market_maker_wallet,
-        rebalancing_ctx.equities.clone(),
-    ));
+        let wrapper = Arc::new(WrapperService::new(
+            base_wallet.clone(),
+            rebalancing_ctx.equities.clone(),
+        ));
 
-    let equity_transfer_services = EquityTransferServices {
-        raindex: raindex_service.clone(),
-        tokenizer: tokenizer.clone(),
-        wrapper: wrapper.clone(),
-    };
+        let equity_transfer_services = EquityTransferServices {
+            raindex: raindex_service.clone(),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+        };
 
-    let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
-        RebalancingTriggerConfig {
-            equity: rebalancing_ctx.equity,
-            usdc: rebalancing_ctx.usdc.clone(),
-        },
-        vault_registry,
-        ctx.evm.orderbook,
-        market_maker_wallet,
-        inventory.clone(),
-        operation_sender,
-        wrapper,
-    ));
+        let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity: rebalancing_ctx.equity,
+                usdc: rebalancing_ctx.usdc.clone(),
+            },
+            deps.vault_registry,
+            deps.ctx.evm.orderbook,
+            market_maker_wallet,
+            deps.inventory.clone(),
+            operation_sender,
+            wrapper,
+        ));
 
-    let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender));
-    let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
+        let event_broadcaster = Arc::new(EventBroadcaster::new(deps.event_sender));
+        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
-    let (built, wired) = manifest
-        .build(pool.clone(), equity_transfer_services)
+        let (built, wired) = manifest
+            .build(deps.pool.clone(), equity_transfer_services)
+            .await?;
+
+        let frameworks = RebalancingCqrsFrameworks {
+            mint: Arc::new(built.mint),
+            redemption: Arc::new(built.redemption),
+            usdc: Arc::new(built.usdc),
+        };
+
+        let services = RebalancerServices::new(
+            rebalancing_ctx.clone(),
+            ethereum_wallet,
+            base_wallet,
+            raindex_service,
+            tokenizer,
+        )
         .await?;
 
-    let frameworks = RebalancingCqrsFrameworks {
-        mint: Arc::new(built.mint),
-        redemption: Arc::new(built.redemption),
-        usdc: Arc::new(built.usdc),
-    };
+        let handle = services.spawn(
+            &rebalancing_ctx,
+            market_maker_wallet,
+            operation_receiver,
+            frameworks,
+        );
 
-    let handle = spawn_rebalancer(
-        rebalancing_ctx,
-        base_provider,
-        market_maker_wallet,
-        operation_receiver,
-        frameworks,
-        raindex_service.clone(),
-        tokenizer,
-    )
-    .await?;
-
-    Ok((
-        Arc::new(built.position),
-        Arc::new(wired.position_view),
-        built.snapshot,
-        handle,
-    ))
+        Ok(RebalancingInfrastructure {
+            position: Arc::new(built.position),
+            position_projection: Arc::new(wired.position_view),
+            snapshot: built.snapshot,
+            rebalancer: handle,
+        })
+    })
 }
 
 async fn wait_for_infrastructure(
@@ -560,6 +581,7 @@ where
     let ctx_clone = ctx.clone();
     let pool_clone = pool.clone();
     let cache_clone = cache.clone();
+    let evm = ReadOnlyEvm::new(provider);
 
     tokio::spawn(async move {
         run_queue_processor(
@@ -567,7 +589,7 @@ where
             &ctx_clone,
             &pool_clone,
             &cache_clone,
-            provider,
+            &evm,
             &cqrs,
             &vault_registry,
         )
@@ -612,17 +634,17 @@ where
     })
 }
 
-fn spawn_inventory_poller<P, E>(
-    raindex_service: Arc<RaindexService<P>>,
-    executor: E,
+fn spawn_inventory_poller<Chain, Exe>(
+    raindex_service: Arc<RaindexService<Chain>>,
+    executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
     snapshot: Store<InventorySnapshot>,
 ) -> JoinHandle<()>
 where
-    P: Provider + Clone + Send + 'static,
-    E: Executor + Clone + Send + 'static,
+    Chain: st0x_evm::Evm,
+    Exe: Executor + Clone + Send + 'static,
 {
     info!("Starting inventory poller");
 
@@ -771,16 +793,15 @@ async fn process_live_event(
     Ok(())
 }
 
-async fn run_queue_processor<P, E>(
+async fn run_queue_processor<E>(
     executor: &E,
     ctx: &Ctx,
     pool: &SqlitePool,
     cache: &SymbolCache,
-    provider: P,
+    evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     vault_registry: &Store<VaultRegistry>,
 ) where
-    P: Provider + Clone,
     E: Executor + Clone,
     EventProcessingError: From<E::Error>,
 {
@@ -795,10 +816,11 @@ async fn run_queue_processor<P, E>(
         feed_id_cache: &feed_id_cache,
         vault_registry,
         executor,
+        order_owner: ctx.order_owner(),
     };
 
     loop {
-        let delay = process_queue_step(ctx, pool, &provider, cqrs, &queue_context).await;
+        let delay = process_queue_step(ctx, pool, evm, cqrs, &queue_context).await;
         sleep(delay).await;
     }
 }
@@ -813,14 +835,14 @@ async fn log_unprocessed_count(pool: &SqlitePool) {
     }
 }
 
-async fn process_queue_step<P: Provider + Clone, E: Executor>(
+async fn process_queue_step<E: Executor>(
     ctx: &Ctx,
     pool: &SqlitePool,
-    provider: &P,
+    evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingCtx<'_, E>,
 ) -> Duration {
-    match process_next_queued_event(ctx, pool, provider, cqrs, queue_context).await {
+    match process_next_queued_event(ctx, pool, evm, cqrs, queue_context).await {
         Ok(Some(offchain_order_id)) => {
             info!(%offchain_order_id, "Offchain order placed successfully");
             std::time::Duration::ZERO
@@ -839,13 +861,14 @@ struct QueueProcessingCtx<'a, E> {
     feed_id_cache: &'a FeedIdCache,
     vault_registry: &'a Store<VaultRegistry>,
     executor: &'a E,
+    order_owner: Address,
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
+async fn process_next_queued_event<E: Executor>(
     ctx: &Ctx,
     pool: &SqlitePool,
-    provider: &P,
+    evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingCtx<'_, E>,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
@@ -861,9 +884,10 @@ async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
     let onchain_trade = convert_event_to_trade(
         ctx,
         queue_context.cache,
-        provider,
+        evm,
         &queued_event,
         queue_context.feed_id_cache,
+        queue_context.order_owner,
     )
     .await?;
 
@@ -884,7 +908,7 @@ async fn process_next_queued_event<P: Provider + Clone, E: Executor>(
     let vault_discovery_ctx = VaultDiscoveryCtx {
         vault_registry: queue_context.vault_registry,
         orderbook: ctx.evm.orderbook,
-        order_owner: ctx.order_owner()?,
+        order_owner: queue_context.order_owner,
     };
 
     process_valid_trade(
@@ -971,22 +995,22 @@ pub(crate) async fn discover_vaults_for_trade(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn convert_event_to_trade<P: Provider + Clone>(
+async fn convert_event_to_trade(
     ctx: &Ctx,
     cache: &SymbolCache,
-    provider: &P,
+    evm: &impl Evm,
     queued_event: &QueuedEvent,
     feed_id_cache: &FeedIdCache,
+    order_owner: Address,
 ) -> Result<Option<OnchainTrade>, EventProcessingError> {
     let reconstructed_log = reconstruct_log_from_queued_event(&ctx.evm, queued_event);
-    let order_owner = ctx.order_owner()?;
 
     let onchain_trade = match &queued_event.event {
         TradeEvent::ClearV3(clear_event) => {
             OnchainTrade::try_from_clear_v3(
                 &ctx.evm,
                 cache,
-                provider,
+                evm,
                 *clear_event.clone(),
                 reconstructed_log,
                 feed_id_cache,
@@ -997,7 +1021,7 @@ async fn convert_event_to_trade<P: Provider + Clone>(
         TradeEvent::TakeOrderV3(take_event) => {
             OnchainTrade::try_from_take_order_if_target_owner(
                 cache,
-                provider,
+                evm,
                 *take_event.clone(),
                 reconstructed_log,
                 order_owner,
@@ -1473,7 +1497,9 @@ async fn buffer_live_events<S1, S2>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, IntoLogData, TxHash, U256, address, bytes, fixed_bytes};
+    use alloy::primitives::{
+        Address, B256, IntoLogData, TxHash, U256, address, bytes, fixed_bytes,
+    };
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
@@ -1584,11 +1610,19 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
+            order_owner: ctx.order_owner(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        let result = process_next_queued_event(&ctx, &pool, &provider, &cqrs, &queue_context).await;
+        let result = process_next_queued_event(
+            &ctx,
+            &pool,
+            &ReadOnlyEvm::new(provider),
+            &cqrs,
+            &queue_context,
+        )
+        .await;
 
         assert_eq!(result.unwrap(), None);
 
@@ -1635,13 +1669,20 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
+            order_owner: ctx.order_owner(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        process_next_queued_event(&ctx, &pool, &provider, &cqrs, &queue_context)
-            .await
-            .unwrap();
+        process_next_queued_event(
+            &ctx,
+            &pool,
+            &ReadOnlyEvm::new(provider),
+            &cqrs,
+            &queue_context,
+        )
+        .await
+        .unwrap();
 
         assert!(logs_contain("Event filtered out"));
     }
@@ -1685,13 +1726,20 @@ mod tests {
             feed_id_cache: &feed_id_cache,
             vault_registry: &frameworks.vault_registry,
             executor: &executor,
+            order_owner: ctx.order_owner(),
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
 
-        process_next_queued_event(&ctx, &pool, &provider, &cqrs, &queue_context)
-            .await
-            .unwrap();
+        process_next_queued_event(
+            &ctx,
+            &pool,
+            &ReadOnlyEvm::new(provider),
+            &cqrs,
+            &queue_context,
+        )
+        .await
+        .unwrap();
 
         assert!(logs_contain("ClearV3"));
     }

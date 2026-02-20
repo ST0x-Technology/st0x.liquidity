@@ -292,15 +292,7 @@ abstractions.
 - Supported implementations: SchwabExecutor, AlpacaTradingApi, AlpacaBrokerApi,
   MockExecutor
 
-**Benefits**:
-
-- Zero changes to core bot logic when adding new implementations
-- Type safety via compile-time verification
-- Independent testing per implementation
-- Zero-cost abstractions via generics (no dynamic dispatch)
-
-For detailed implementation requirements and module organization, see
-@crates/execution/AGENTS.md
+For detailed implementation requirements, see @crates/execution/AGENTS.md
 
 ### Core Flow
 
@@ -392,26 +384,17 @@ is the source of truth for terminology and naming conventions.
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
   `OffchainOrder`/`OrderPlacer`
 - **Type Modeling**: Make invalid states unrepresentable through the type
-  system. Use algebraic data types (ADTs) and enums to encode business rules and
-  state transitions directly in types rather than relying on runtime validation.
-  Examples:
-  - Use enum variants to represent mutually exclusive states instead of multiple
-    boolean flags
-  - Encode state-specific data within enum variants rather than using nullable
-    fields
-  - Use newtypes for domain concepts to prevent mixing incompatible values
-  - Leverage the type system to enforce invariants at compile time
+  system. Use ADTs and enums to encode business rules and state transitions
+  directly in types rather than runtime validation. See "Type modeling" in Code
+  Style for details
 - **Schema Design**: Avoid database columns that can contradict each other. Use
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where
   possible
-- **No Denormalized Columns**: Never store values that can be computed from
-  other columns. Denormalized data inevitably becomes stale when the source
-  columns are updated but the derived column is forgotten. Always compute
-  derived values on-demand in queries (e.g., use
-  `ABS(accumulated_long - accumulated_short) >= 1.0` instead of storing a
-  separate `net_position` column). If performance requires caching, use database
-  views or generated columns that auto-update, never manually-maintained columns
+- **No Denormalized Columns**: Never store values computable from other columns
+  -- they inevitably become stale. Compute derived values on-demand in queries.
+  If performance requires caching, use database views or generated columns,
+  never manually-maintained columns
 - **Functional Programming Patterns**: Favor FP and ADT patterns over OOP
   patterns. Avoid unnecessary encapsulation, inheritance hierarchies, or
   getter/setter patterns that don't make sense with Rust's algebraic data types.
@@ -718,6 +701,13 @@ conventional iterator variables in very short closures where the type makes the
 meaning unambiguous (e.g., `|event| event.payload`), but even then prefer a
 descriptive name.
 
+**Generic type parameters**: Single-letter type variables (`T`, `P`, `R`, `C`,
+etc.) are forbidden whenever there is more than one type variable in a given
+context (function, impl block, trait definition). Use descriptive names that
+convey the role: `Call`, `Registry`, `Wallet` instead of `C`, `R`, `W`. A lone
+type variable on a simple generic (e.g., `ReadOnlyEvm<P>`) is acceptable only
+when the meaning is unambiguous from context.
+
 #### Module Organization
 
 Organize code within modules by importance to the reader, not by when it was
@@ -770,6 +760,20 @@ assert!(matches!(error, SomeError::SpecificVariant { .. }));
 `assert!(result.is_ok())` is equally bad - just call `.unwrap()`.
 
 **FORBIDDEN**: `assert!(x.is_err())`, `assert!(x.is_ok())`
+
+#### Prefer exhaustive `match` over `matches!` in production code
+
+Outside of test assertions, always use a proper exhaustive `match` instead of
+the `matches!` macro. Exhaustive matches force you to handle new variants when
+enums change, preventing silent bugs. `matches!` hides unhandled variants behind
+a catch-all `_ => false`.
+
+**Test code**: `matches!` is fine for concise assertions (e.g.,
+`assert!(matches!(error, MyError::Specific { .. }))`).
+
+**Production code**: Use exhaustive `match` with explicit arms for every
+variant. When adding a new variant to an enum, the compiler will flag every
+match site that needs updating.
 
 #### Assertions must be specific
 

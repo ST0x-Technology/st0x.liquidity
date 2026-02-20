@@ -10,12 +10,12 @@ use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
 
+use st0x_event_sorcery::{Projection, Store, StoreBuilder};
+use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
     MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
-
-use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
@@ -181,7 +181,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     Ok(())
 }
 
-pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
+pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'static>(
     tx_hash: TxHash,
     ctx: &Ctx,
     pool: &SqlitePool,
@@ -190,12 +190,20 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     cache: &SymbolCache,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let evm = &ctx.evm;
+    let evm_ctx = &ctx.evm;
     let feed_id_cache = FeedIdCache::new();
-    let order_owner = ctx.order_owner()?;
+    let order_owner = ctx.order_owner();
+    let read_evm = ReadOnlyEvm::new(provider.clone());
 
-    match OnchainTrade::try_from_tx_hash(tx_hash, provider, cache, evm, &feed_id_cache, order_owner)
-        .await
+    match OnchainTrade::try_from_tx_hash(
+        tx_hash,
+        &read_evm,
+        cache,
+        evm_ctx,
+        &feed_id_cache,
+        order_owner,
+    )
+    .await
     {
         Ok(Some(onchain_trade)) => {
             process_found_trade(onchain_trade, ctx, pool, stdout, order_placer).await?;
@@ -496,7 +504,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{LogLevel, SchwabAuth};
+    use crate::config::{LogLevel, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
@@ -511,7 +519,6 @@ mod tests {
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -525,7 +532,9 @@ mod tests {
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             telemetry: None,
-            rebalancing: None,
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

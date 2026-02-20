@@ -1,16 +1,18 @@
 //! Single-chain CCTP operations.
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use tracing::{info, trace};
+
+#[cfg(test)]
+use st0x_evm::Evm;
+use st0x_evm::{IntoErrorRegistry, Wallet};
 
 use super::{
     CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
 };
 use crate::BridgeDirection;
-use crate::error_decoding::handle_contract_error;
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -18,86 +20,74 @@ sol!(
     IERC20, "../../lib/forge-std/out/IERC20.sol/IERC20.json"
 );
 
-/// Default number of confirmations to wait for approval transactions.
-/// Higher values help with load-balanced RPC providers like dRPC.
-const REQUIRED_CONFIRMATIONS: u64 = 3;
-
-/// EVM chain connection with contract instances for CCTP operations.
-pub(crate) struct Evm<P>
-where
-    P: Provider + Clone,
-{
-    /// Address of the account that owns tokens and signs transactions
-    owner: Address,
-    /// USDC token contract instance
-    usdc: IERC20::IERC20Instance<P>,
-    /// TokenMessengerV2 contract instance for CCTP burns
-    token_messenger: TokenMessengerV2::TokenMessengerV2Instance<P>,
-    /// MessageTransmitterV2 contract instance for CCTP mints
-    message_transmitter: MessageTransmitterV2::MessageTransmitterV2Instance<P>,
-    /// Number of confirmations to wait for approval transactions.
-    /// Higher values help with load-balanced RPC providers like dRPC.
-    required_confirmations: u64,
+/// Single-chain CCTP endpoint with contract instances for cross-chain operations.
+///
+/// The wallet's provider is used for read-only view calls (e.g. allowance
+/// checks). All write operations are submitted through the [`Wallet`] trait.
+pub(crate) struct CctpEndpoint<W: Wallet> {
+    /// USDC token address
+    usdc_address: Address,
+    /// TokenMessengerV2 contract address
+    token_messenger_address: Address,
+    /// MessageTransmitterV2 contract address
+    message_transmitter_address: Address,
+    /// Wallet for submitting write transactions
+    wallet: W,
 }
 
-impl<P> Evm<P>
-where
-    P: Provider + Clone,
-{
-    /// Creates a new EVM chain connection with the given provider and contract addresses.
+impl<W: Wallet> CctpEndpoint<W> {
+    /// Creates a new CCTP endpoint from a wallet and contract addresses.
     ///
-    /// The `owner` address should be the account that will sign transactions
-    /// (typically obtained from a signer via `.address()`).
-    ///
-    /// Uses 3 confirmations by default for approval transactions to handle
-    /// load-balanced RPC providers. Use `with_required_confirmations` to override.
+    /// The wallet's provider is used for read-only view calls.
+    /// The wallet itself handles signing and submission of write transactions.
     pub(crate) fn new(
-        provider: P,
-        owner: Address,
         usdc: Address,
         token_messenger: Address,
         message_transmitter: Address,
+        wallet: W,
     ) -> Self {
         Self {
-            owner,
-            usdc: IERC20::new(usdc, provider.clone()),
-            token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
-            message_transmitter: MessageTransmitterV2::new(message_transmitter, provider),
-            required_confirmations: REQUIRED_CONFIRMATIONS,
+            usdc_address: usdc,
+            token_messenger_address: token_messenger,
+            message_transmitter_address: message_transmitter,
+            wallet,
         }
     }
 
-    /// Sets the number of confirmations to wait for approval transactions.
-    #[cfg(test)]
-    pub(crate) fn with_required_confirmations(mut self, confirmations: u64) -> Self {
-        self.required_confirmations = confirmations;
-        self
-    }
+    pub(super) async fn ensure_usdc_approval<Registry: IntoErrorRegistry>(
+        &self,
+        amount: U256,
+    ) -> Result<(), CctpError> {
+        let allowance = self
+            .wallet
+            .call::<Registry, _>(
+                self.usdc_address,
+                IERC20::allowanceCall {
+                    owner: self.wallet.address(),
+                    spender: self.token_messenger_address,
+                },
+            )
+            .await?;
 
-    pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
-        let spender = *self.token_messenger.address();
-        let allowance = self.usdc.allowance(self.owner, spender).call().await?;
-
-        trace!(%allowance, %amount, "Checking USDC allowance");
+        trace!(?allowance, %amount, "Checking USDC allowance");
 
         if allowance < amount {
-            let pending = match self.usdc.approve(spender, amount).send().await {
-                Ok(pending) => pending,
-                Err(error) => return Err(handle_contract_error(error).await),
-            };
-
-            // Wait for multiple confirmations to ensure state propagates across
-            // load-balanced RPC nodes before the subsequent burn transaction
-            pending
-                .with_required_confirmations(self.required_confirmations)
-                .get_receipt()
+            self.wallet
+                .submit::<Registry, _>(
+                    self.usdc_address,
+                    IERC20::approveCall {
+                        spender: self.token_messenger_address,
+                        amount,
+                    },
+                    "USDC approve for CCTP",
+                )
                 .await?;
         }
 
         Ok(())
     }
 
-    pub(super) async fn deposit_for_burn(
+    pub(super) async fn deposit_for_burn<Registry: IntoErrorRegistry>(
         &self,
         amount: U256,
         recipient: Address,
@@ -112,27 +102,21 @@ where
         // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
         let destination_caller = FixedBytes::<32>::ZERO;
 
-        let pending = match self
-            .token_messenger
-            .depositForBurn(
-                amount,
-                direction.dest_domain(),
-                recipient_bytes32,
-                *self.usdc.address(),
-                destination_caller,
-                max_fee,
-                FAST_TRANSFER_THRESHOLD,
+        let receipt = self
+            .wallet
+            .submit::<Registry, _>(
+                self.token_messenger_address,
+                TokenMessengerV2::depositForBurnCall {
+                    amount,
+                    destinationDomain: direction.dest_domain(),
+                    mintRecipient: recipient_bytes32,
+                    burnToken: self.usdc_address,
+                    destinationCaller: destination_caller,
+                    maxFee: max_fee,
+                    minFinalityThreshold: FAST_TRANSFER_THRESHOLD,
+                },
+                "depositForBurn",
             )
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(error) => return Err(handle_contract_error(error).await),
-        };
-
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
             .await?;
 
         if !receipt
@@ -155,24 +139,21 @@ where
     /// Parses the `MintAndWithdraw` event from the transaction receipt to extract
     /// the actual minted amount and fee collected. This is the source of truth
     /// for what the recipient actually received.
-    pub(super) async fn claim(
+    pub(super) async fn claim<Registry: IntoErrorRegistry>(
         &self,
         message: Bytes,
         attestation: Bytes,
     ) -> Result<MintReceipt, CctpError> {
-        let pending = match self
-            .message_transmitter
-            .receiveMessage(message, attestation)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(error) => return Err(handle_contract_error(error).await),
-        };
-
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
+        let receipt = self
+            .wallet
+            .submit::<Registry, _>(
+                self.message_transmitter_address,
+                MessageTransmitterV2::receiveMessageCall {
+                    message: message.clone(),
+                    attestation,
+                },
+                "receiveMessage",
+            )
             .await?;
 
         let mint_event = receipt
@@ -196,17 +177,17 @@ where
     }
 
     #[cfg(test)]
+    pub(super) fn usdc(&self) -> IERC20::IERC20Instance<&<W as Evm>::Provider> {
+        IERC20::new(self.usdc_address, self.wallet.provider())
+    }
+
+    #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
-        self.owner
+        self.wallet.address()
     }
 
     #[cfg(test)]
-    pub(super) fn usdc(&self) -> &IERC20::IERC20Instance<P> {
-        &self.usdc
-    }
-
-    #[cfg(test)]
-    pub(super) fn token_messenger(&self) -> &TokenMessengerV2::TokenMessengerV2Instance<P> {
-        &self.token_messenger
+    pub(super) fn token_messenger_address(&self) -> Address {
+        self.token_messenger_address
     }
 }

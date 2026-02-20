@@ -2,6 +2,12 @@
 
 ## Current Development Focus
 
+### Fireblocks Contract Calls
+
+- [ ] [#297 Harden wallet management with Fireblocks contract calls](https://github.com/ST0x-Technology/st0x.liquidity/issues/297)
+  - PR:
+    [#300 add fireblocks integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/300)
+
 ### Live testing of auto-rebalancing on the Alpaca instance
 
 **Wrapped Token Handling:**
@@ -109,6 +115,15 @@ Phase 3)
 Extract hedging logic and create application binary:
 
 - [ ] [#272 Convert st0x-hedge to library crate and create st0x-server binary](https://github.com/ST0x-Technology/st0x.liquidity/issues/272)
+
+---
+
+## Backlog: Quant Research Data
+
+Ensure the event store captures all data needed for quantitative research —
+execution timing, market conditions, and operational metrics.
+
+- [ ] [#303 Audit external integrations: record start/end timestamps for all calls in event store](https://github.com/ST0x-Technology/st0x.liquidity/issues/303)
 
 ---
 

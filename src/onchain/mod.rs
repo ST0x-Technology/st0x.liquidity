@@ -55,7 +55,6 @@ pub(crate) struct EvmSecrets {
 pub(crate) struct EvmCtx {
     pub(crate) ws_rpc_url: Url,
     pub(crate) orderbook: Address,
-    pub(crate) order_owner: Option<Address>,
     pub(crate) deployment_block: u64,
 }
 
@@ -64,7 +63,6 @@ impl std::fmt::Debug for EvmCtx {
         f.debug_struct("EvmCtx")
             .field("ws_rpc_url", &"[REDACTED]")
             .field("orderbook", &self.orderbook)
-            .field("order_owner", &self.order_owner)
             .field("deployment_block", &self.deployment_block)
             .finish()
     }
@@ -75,7 +73,6 @@ impl EvmCtx {
         Self {
             ws_rpc_url: secrets.ws_rpc_url,
             orderbook: config.orderbook,
-            order_owner: config.order_owner,
             deployment_block: config.deployment_block,
         }
     }
@@ -91,8 +88,8 @@ pub(crate) enum OnChainError {
     Persistence(#[from] PersistenceError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Contract call error: {0}")]
-    ContractCall(#[from] alloy::contract::Error),
+    #[error("EVM error: {0}")]
+    Evm(#[from] st0x_evm::EvmError),
     #[error("Sol type error: {0}")]
     SolType(#[from] alloy::sol_types::Error),
     #[error("RPC transport error: {0}")]

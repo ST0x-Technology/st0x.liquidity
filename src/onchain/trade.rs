@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
+use st0x_evm::Evm;
 use st0x_execution::{Direction, FractionalShares};
 
 use super::pyth::PythPricing;
@@ -155,9 +156,9 @@ pub struct OnchainTrade {
 
 impl OnchainTrade {
     /// Core parsing logic for converting blockchain events to trades
-    pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
+    pub(crate) async fn try_from_order_and_fill_details<EvmImpl: Evm>(
         cache: &SymbolCache,
-        provider: P,
+        evm: &EvmImpl,
         order: OrderV4,
         fill: OrderFill,
         log: Log,
@@ -167,7 +168,7 @@ impl OnchainTrade {
         let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
 
         // Fetch transaction receipt to get gas information
-        let receipt = provider.get_transaction_receipt(tx_hash).await?;
+        let receipt = evm.provider().get_transaction_receipt(tx_hash).await?;
         let (gas_used, effective_gas_price) = match receipt {
             Some(receipt) => (Some(receipt.gas_used), Some(receipt.effective_gas_price)),
             None => (None, None),
@@ -184,10 +185,10 @@ impl OnchainTrade {
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
         let onchain_input_amount = float_to_decimal(fill.input_amount)?;
-        let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
+        let onchain_input_symbol = cache.get_io_symbol(evm, input).await?;
 
         let onchain_output_amount = float_to_decimal(fill.output_amount)?;
-        let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
+        let onchain_output_symbol = cache.get_io_symbol(evm, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
         let trade_details = TradeDetails::try_from_io(
@@ -219,7 +220,7 @@ impl OnchainTrade {
 
         let pyth_pricing = match PythPricing::try_from_tx_hash(
             tx_hash,
-            &provider,
+            evm.provider(),
             &tokenized_symbol.base().to_string(),
             feed_id_cache,
         )
@@ -261,15 +262,16 @@ impl OnchainTrade {
 
     /// Attempts to create an OnchainTrade from a transaction hash by looking up
     /// the transaction receipt and parsing relevant orderbook events.
-    pub async fn try_from_tx_hash<P: Provider>(
+    pub async fn try_from_tx_hash<EvmImpl: Evm>(
         tx_hash: TxHash,
-        provider: P,
+        evm: &EvmImpl,
         cache: &SymbolCache,
         ctx: &EvmCtx,
         feed_id_cache: &FeedIdCache,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
-        let receipt = provider
+        let receipt = evm
+            .provider()
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| {
@@ -295,15 +297,9 @@ impl OnchainTrade {
         }
 
         for log in trades {
-            if let Some(trade) = try_convert_log_to_onchain_trade(
-                log,
-                &provider,
-                cache,
-                ctx,
-                feed_id_cache,
-                order_owner,
-            )
-            .await?
+            if let Some(trade) =
+                try_convert_log_to_onchain_trade(log, evm, cache, ctx, feed_id_cache, order_owner)
+                    .await?
             {
                 return Ok(Some(trade));
             }
@@ -321,9 +317,9 @@ pub(crate) struct OrderFill {
     pub output_amount: B256,
 }
 
-async fn try_convert_log_to_onchain_trade<P: Provider>(
+async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     log: &Log,
-    provider: P,
+    evm: &EvmImpl,
     cache: &SymbolCache,
     ctx: &EvmCtx,
     feed_id_cache: &FeedIdCache,
@@ -344,7 +340,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
         return OnchainTrade::try_from_clear_v3(
             ctx,
             cache,
-            &provider,
+            evm,
             clear_event.data().clone(),
             log_with_metadata,
             feed_id_cache,
@@ -356,7 +352,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     if let Ok(take_order_event) = log.log_decode::<TakeOrderV3>() {
         return OnchainTrade::try_from_take_order_if_target_owner(
             cache,
-            &provider,
+            evm,
             take_order_event.data().clone(),
             log_with_metadata,
             order_owner,
@@ -437,6 +433,8 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
     use rust_decimal_macros::dec;
+
+    use st0x_evm::ReadOnlyEvm;
 
     use super::*;
     use crate::bindings::IOrderBookV5;
@@ -599,7 +597,6 @@ mod tests {
         let ctx = EvmCtx {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
-            order_owner: Some(Address::ZERO),
             deployment_block: 0,
         };
 
@@ -609,7 +606,7 @@ mod tests {
         // Mock returns empty response by default, simulating transaction not found
         let result = OnchainTrade::try_from_tx_hash(
             tx_hash,
-            provider,
+            &ReadOnlyEvm::new(provider),
             &cache,
             &ctx,
             &feed_id_cache,

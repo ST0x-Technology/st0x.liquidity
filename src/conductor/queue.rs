@@ -163,7 +163,7 @@ where
     let vault_discovery_context = VaultDiscoveryCtx {
         vault_registry: queue_context.vault_registry,
         orderbook: ctx.evm.orderbook,
-        order_owner: ctx.order_owner()?,
+        order_owner: ctx.order_owner(),
     };
     discover_vaults_for_trade(&queued_event, &trade, &vault_discovery_context).await?;
 
