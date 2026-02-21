@@ -92,7 +92,10 @@ impl QueryManifest {
             .build(services.clone())
             .await?;
 
+        let redemption_projection = Projection::<EquityRedemption>::sqlite(pool.clone())?;
+
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(Arc::new(redemption_projection))
             .with(rebalancing_trigger.clone())
             .with(event_broadcaster.clone())
             .build(services)
