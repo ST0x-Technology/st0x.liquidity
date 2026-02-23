@@ -6,12 +6,13 @@
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, TxHash, U256, address, keccak256};
-use alloy::providers::ProviderBuilder;
 use alloy::providers::ext::AnvilApi as _;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
 use httpmock::Mock;
 use httpmock::prelude::*;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -30,7 +31,8 @@ use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::onchain::mock::MockRaindex;
-use crate::position::{Position, PositionCommand};
+use crate::onchain::raindex::Raindex;
+use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::trigger::UsdcRebalancing;
@@ -79,7 +81,7 @@ async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address)
 /// be produced by an ERC20 transfer. Anvil is deterministic: same sender +
 /// nonce + calldata = same tx_hash.
 async fn discover_deterministic_tx_hash(
-    provider: &impl alloy::providers::Provider,
+    provider: &impl Provider,
     token: Address,
     recipient: Address,
     amount: U256,
@@ -263,8 +265,8 @@ enum Imbalance<'a> {
     Equity {
         position_cqrs: &'a Store<Position>,
         symbol: &'a Symbol,
-        onchain: rust_decimal::Decimal,
-        offchain: rust_decimal::Decimal,
+        onchain: Decimal,
+        offchain: Decimal,
     },
     Usdc {
         inventory: &'a Arc<RwLock<InventoryView>>,
@@ -287,7 +289,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                     PositionCommand::AcknowledgeOnChainFill {
                         symbol: symbol.clone(),
                         threshold: ExecutionThreshold::whole_share(),
-                        trade_id: crate::position::TradeId {
+                        trade_id: TradeId {
                             tx_hash: TxHash::random(),
                             log_index: 0,
                         },
@@ -346,7 +348,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
 
 fn build_equity_transfer(
     pool: &SqlitePool,
-    raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    raindex: Arc<dyn Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
 ) -> Arc<CrossVenueEquityTransfer> {
     let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(MockWrapper::new());
@@ -410,7 +412,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
-    let raindex: Arc<dyn crate::onchain::raindex::Raindex> = Arc::new(MockRaindex::new());
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
     let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer);
 
     // json_body_partial acts as an implicit assertion: the mock only matches if
@@ -451,7 +453,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             PositionCommand::AcknowledgeOnChainFill {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
-                trade_id: crate::position::TradeId {
+                trade_id: TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -619,8 +621,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
-    let raindex: Arc<dyn crate::onchain::raindex::Raindex> =
-        Arc::new(MockRaindex::new().with_token(token_address));
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new().with_token(token_address));
     let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer);
 
     build_imbalanced_inventory(Imbalance::Equity {
@@ -648,7 +649,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             PositionCommand::AcknowledgeOnChainFill {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
-                trade_id: crate::position::TradeId {
+                trade_id: TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -964,7 +965,7 @@ async fn mint_api_failure_produces_rejected_event() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
-    let raindex: Arc<dyn crate::onchain::raindex::Raindex> = Arc::new(MockRaindex::new());
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
     let equity_transfer = build_equity_transfer(&pool, raindex, tokenizer);
 
     // Mock returns HTTP 500 for the mint request
@@ -991,7 +992,7 @@ async fn mint_api_failure_produces_rejected_event() {
             PositionCommand::AcknowledgeOnChainFill {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
-                trade_id: crate::position::TradeId {
+                trade_id: TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -1072,16 +1073,17 @@ async fn mint_api_failure_produces_rejected_event() {
 async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let pool = setup_test_db().await;
 
-    // 100 onchain, 900 offchain = 10% ratio -> TooMuchOffchain
-    // Excess to reach 50% target = 500 - 100 = 400 USDC
+    // 50 onchain, 950 offchain = 5% ratio -> TooMuchOffchain
+    // Excess to reach 50% target = 500 - 50 = 450 USDC
     let inventory = Arc::new(RwLock::new(
-        InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(900))),
+        InventoryView::default().with_usdc(Usdc(dec!(50)), Usdc(dec!(950))),
     ));
 
     let limits = OperationalLimits::Enabled {
         max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
         max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
     };
+
     let config = RebalancingTriggerConfig {
         equity: ImbalanceThreshold {
             target: dec!(0.5),
@@ -1108,7 +1110,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         wrapper,
     );
 
-    // Cycle 1: excess = 400, capped to 100
+    // Cycle 1: excess = 450, capped to 100
     trigger.check_and_trigger_usdc().await;
     let op1 = receiver.try_recv().expect("First trigger should fire");
     match op1 {
@@ -1119,15 +1121,15 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     }
     trigger.clear_usdc_in_progress();
 
-    // Simulate first transfer: 200 onchain, 800 offchain = 20% ratio
-    // Still below 30% lower bound, excess = 500 - 200 = 300
+    // Simulate first transfer: 150 onchain, 850 offchain = 15% ratio
+    // Still below 30% lower bound, excess = 500 - 150 = 350
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc(dec!(200)), Usdc(dec!(800)));
+        *guard = taken.with_usdc(Usdc(dec!(150)), Usdc(dec!(850)));
     }
 
-    // Cycle 2: excess = 300, capped to 100
+    // Cycle 2: excess = 350, capped to 100
     trigger.check_and_trigger_usdc().await;
     let op2 = receiver.try_recv().expect("Second trigger should fire");
     match op2 {
@@ -1138,27 +1140,33 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     }
     trigger.clear_usdc_in_progress();
 
-    // Simulate second transfer: 300 onchain, 700 offchain = 30% ratio
-    // Still at the boundary, excess = 500 - 300 = 200
+    // Simulate second transfer: 250 onchain, 750 offchain = 25% ratio
+    // Still below 30% lower bound, excess = 500 - 250 = 250
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc(dec!(300)), Usdc(dec!(700)));
+        *guard = taken.with_usdc(Usdc(dec!(250)), Usdc(dec!(750)));
     }
 
-    // Cycle 3: ratio is exactly at lower bound (30%), imbalance check may or may not trigger
-    // depending on strict comparison. If it triggers, excess = 200, capped to 100.
+    // Cycle 3: excess = 250, capped to 100
     trigger.check_and_trigger_usdc().await;
-
-    // Simulate convergence: 500 onchain, 500 offchain = balanced
+    let op3 = receiver.try_recv().expect("Third trigger should fire");
+    match op3 {
+        TriggeredOperation::UsdcAlpacaToBase { amount } => {
+            assert_eq!(amount, Usdc(dec!(100)), "Third transfer capped to $100");
+        }
+        _ => panic!("Expected UsdcAlpacaToBase, got {op3:?}"),
+    }
     trigger.clear_usdc_in_progress();
+
+    // Simulate third transfer: 350 onchain, 650 offchain = 35% ratio
+    // Now within [30%, 70%] band -> balanced, no more trigger
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc(dec!(500)), Usdc(dec!(500)));
+        *guard = taken.with_usdc(Usdc(dec!(350)), Usdc(dec!(650)));
     }
 
-    // Final: balanced -> no trigger
     trigger.check_and_trigger_usdc().await;
     assert!(
         matches!(
@@ -1212,12 +1220,17 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         wrapper,
     );
 
-    // First trigger fires
+    // First trigger fires: excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
-    assert!(
-        receiver.try_recv().is_ok(),
-        "First trigger should produce an operation"
-    );
+    let op1 = receiver
+        .try_recv()
+        .expect("First trigger should produce an operation");
+    match op1 {
+        TriggeredOperation::UsdcAlpacaToBase { amount } => {
+            assert_eq!(amount, Usdc(dec!(100)), "First transfer capped to $100");
+        }
+        _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
+    }
 
     // Without clearing in_progress, second trigger is blocked
     trigger.check_and_trigger_usdc().await;
@@ -1232,12 +1245,21 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     // Clear in-progress (simulates operation completion/failure)
     trigger.clear_usdc_in_progress();
 
-    // Now trigger fires again
+    // Trigger fires again: same inventory, same excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
-    assert!(
-        receiver.try_recv().is_ok(),
-        "After clearing in_progress, trigger should fire again"
-    );
+    let op2 = receiver
+        .try_recv()
+        .expect("After clearing in_progress, trigger should fire again");
+    match op2 {
+        TriggeredOperation::UsdcAlpacaToBase { amount } => {
+            assert_eq!(
+                amount,
+                Usdc(dec!(100)),
+                "Retry transfer also capped to $100"
+            );
+        }
+        _ => panic!("Expected UsdcAlpacaToBase, got {op2:?}"),
+    }
 }
 
 /// Tests that threshold configuration controls trigger sensitivity: the same
