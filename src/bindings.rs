@@ -28,14 +28,14 @@ sol!(
     TestERC20, "lib/rain.orderbook/out/ArbTest.sol/Token.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
     OrderBook, "lib/rain.orderbook/out/OrderBook.sol/OrderBook.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -44,32 +44,54 @@ sol!(
 
 // ERC20 with configurable name, symbol, and decimals via constructor args.
 // Distinct from `TestERC20` (ArbTest Token) which has a no-arg constructor.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
     DeployableERC20, "lib/rain.orderbook/lib/rain.interpreter/out/TestERC20.sol/TestERC20.json"
 );
 
-#[cfg(test)]
+// ERC20 with configurable metadata and CCTP-compatible mint/burn.
+// Combines DeployableERC20 (name, symbol, decimals) with the IMintBurnToken
+// interface that CCTP's TokenMinterV2 expects. Used in e2e rebalancing tests
+// so the orderbook can read decimals() while CCTP can mint/burn.
+#[cfg(any(test, feature = "test-support"))]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    TestMintBurnToken, "out/TestMintBurnToken.sol/TestMintBurnToken.json"
+);
+
+// ERC-4626 vault with configurable name/symbol and 1:1 asset ratio.
+// Constructor takes `(name, symbol, underlying_address)`. Used in e2e
+// tests so the vault reports a "t"-prefixed symbol that the bot's
+// trade validation accepts, while providing a real `convertToAssets()`.
+#[cfg(any(test, feature = "test-support"))]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    TestVault, "out/TestVault.sol/TestVault.json"
+);
+
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Interpreter, "lib/rain.orderbook/out/Rainterpreter.sol/Rainterpreter.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Store, "lib/rain.orderbook/out/RainterpreterStore.sol/RainterpreterStore.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Parser, "lib/rain.orderbook/out/RainterpreterParser.sol/RainterpreterParser.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Deployer, "lib/rain.orderbook/out/RainterpreterExpressionDeployer.sol/RainterpreterExpressionDeployer.json"

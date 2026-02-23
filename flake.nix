@@ -88,7 +88,7 @@
             body = ''
               set -euxo pipefail
               cargo check --workspace
-              cargo test --workspace -q
+              cargo nextest run --workspace
               cargo clippy --workspace --all-targets --all-features
               cargo fmt
             '';
@@ -104,6 +104,7 @@
               (cd lib/rain.orderbook/lib/rain.interpreter/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
+              forge build
             '';
           };
 
@@ -207,6 +208,7 @@
               sqlx-cli
               cargo-expand
               cargo-chef
+              cargo-nextest
               terraform
               ragenix.packages.${system}.default
               packages.ci

@@ -1,0 +1,35 @@
+[package]
+name = "e2e-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+alloy.workspace = true
+anyhow = "1.0.98"
+async-trait.workspace = true
+bon = "3.9.0"
+chrono.workspace = true
+httpmock.workspace = true
+rain-math-float.workspace = true
+rand.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+rust_decimal_macros = "1.38.0"
+serde_json.workspace = true
+sqlx.workspace = true
+tempfile = "3.24.0"
+test-log = { version = "0.2.19", features = ["trace"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+url.workspace = true
+uuid.workspace = true
+
+st0x-event-sorcery = { path = "../event-sorcery", features = ["test-support"] }
+st0x-evm = { workspace = true, features = ["local-signer"] }
+st0x-execution = { path = "../execution", features = ["mock", "test-support"] }
+st0x-hedge = { path = "../..", features = ["test-support"] }
+
+[lints]
+workspace = true
