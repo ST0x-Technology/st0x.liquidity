@@ -5,6 +5,7 @@ members = [
   "crates/event-sorcery",
   "crates/execution",
   "crates/bridge",
+  "crates/evm"
 ]
 resolver = "2"
 

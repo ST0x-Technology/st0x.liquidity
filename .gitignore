@@ -11,3 +11,4 @@ tarpaulin-report.html
 .claude/
 .sqlx/
 .idea/
+out/

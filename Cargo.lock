@@ -6641,7 +6641,6 @@ dependencies = [
  "st0x-event-sorcery",
  "st0x-evm",
  "st0x-execution",
- "st0x-hedge",
  "temp-env",
  "tempfile",
  "test-log",
