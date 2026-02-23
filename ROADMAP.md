@@ -22,6 +22,8 @@
       [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
 
 - [ ] [#306 Configurable operational limits for safe deployment rollout](https://github.com/ST0x-Technology/st0x.liquidity/issues/306)
+  - PR:
+    [#307 feat: configurable operational limits](https://github.com/ST0x-Technology/st0x.liquidity/pull/307)
 - [ ] [#263 Check offchain inventory before placing counter trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/263)
 - [x] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
   - PR:
@@ -35,6 +37,7 @@
   - PR:
     [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
 - [ ] [#277 No automatic retry after offchain order failure](https://github.com/ST0x-Technology/st0x.liquidity/issues/277)
+- [ ] [#310 StoreBuilder allows omitting projections that entities declare as required](https://github.com/ST0x-Technology/st0x.liquidity/issues/310)
 
 **CQRS/ES Phase 3 - Complete Migration:**
 
@@ -174,7 +177,6 @@ execution timing, market conditions, and operational metrics.
 
 **Code Quality:**
 
-- [ ] [#287 Replace all floating point calculations with fixed point calculations](https://github.com/ST0x-Technology/st0x.liquidity/issues/287)
 - [ ] [#54 Create BrokerAuthProvider trait to abstract authentication across codebase](https://github.com/ST0x-Technology/st0x.liquidity/issues/54) -
       Authentication abstraction
 - [x] [#247 Financial calculations use f64 instead of fixed-precision types](https://github.com/ST0x-Technology/st0x.liquidity/issues/247)
