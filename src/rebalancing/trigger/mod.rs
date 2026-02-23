@@ -3,6 +3,8 @@
 mod equity;
 mod usdc;
 
+pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
+
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;

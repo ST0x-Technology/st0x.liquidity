@@ -216,6 +216,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
         &cqrs.position_projection,
         base_symbol,
         executor_type,
+        &cqrs.operational_limits,
     )
     .await?
     else {

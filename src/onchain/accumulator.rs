@@ -470,4 +470,43 @@ mod tests {
             "Should execute full accumulated amount"
         );
     }
+
+    #[tokio::test]
+    async fn operational_limits_cap_accumulated_position() {
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new();
+
+        initialize_position_with_fill(
+            &store,
+            &symbol,
+            FractionalShares::new(dec!(10.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
+            max_amount: Positive::new(crate::threshold::Usdc(dec!(1000))).unwrap(),
+        };
+
+        let params = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &limits,
+        )
+        .await
+        .unwrap()
+        .expect("should be ready with capped shares");
+
+        assert_eq!(params.symbol, symbol);
+        assert_eq!(
+            params.shares,
+            Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
+            "Shares should be capped by operational limit"
+        );
+    }
 }

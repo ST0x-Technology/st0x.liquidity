@@ -18,7 +18,7 @@ use st0x_execution::{
 };
 
 use super::auth::ensure_schwab_authentication;
-use crate::config::{BrokerCtx, Ctx, OperationalLimits};
+use crate::config::{BrokerCtx, Ctx};
 use crate::offchain_order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
 };
@@ -347,7 +347,7 @@ pub(super) async fn process_found_trade<W: Write>(
         &position_projection,
         base_symbol,
         executor_type,
-        &OperationalLimits::Disabled,
+        &ctx.operational_limits,
     )
     .await?
     else {
@@ -509,7 +509,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{LogLevel, OperationalLimits, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;

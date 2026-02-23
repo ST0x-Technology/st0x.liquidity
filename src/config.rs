@@ -39,7 +39,7 @@ pub struct Env {
 
 /// Configurable caps on operation sizes for safe deployment.
 ///
-/// Required in config — operators must explicitly choose
+/// Required in config -- operators must explicitly choose
 /// between conservative limits or uncapped mode.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "lowercase")]
@@ -366,6 +366,16 @@ impl Ctx {
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
+        if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits {
+            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+            if max_amount.inner() < minimum {
+                return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
+                    configured: max_amount.inner(),
+                    minimum,
+                });
+            }
+        }
+
         Ok(Self {
             database_url: config.database_url,
             log_level,
@@ -437,6 +447,11 @@ pub enum CtxError {
          rebalancing is enabled (address is derived from vault)"
     )]
     OrderOwnerConflictsWithFireblocks { configured: Address },
+    #[error(
+        "operational_limits max_amount {configured} is below Alpaca's \
+         minimum withdrawal of {minimum}"
+    )]
+    OperationalLimitBelowMinimumWithdrawal { configured: Usdc, minimum: Usdc },
 }
 
 #[cfg(test)]
@@ -454,6 +469,9 @@ impl CtxError {
             Self::RebalancingConfigMissing => "rebalancing config missing",
             Self::OrderOwnerConflictsWithFireblocks { .. } => {
                 "order_owner conflicts with fireblocks"
+            }
+            Self::OperationalLimitBelowMinimumWithdrawal { .. } => {
+                "operational limit below minimum withdrawal"
             }
         }
     }
@@ -482,6 +500,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
+    use rust_decimal_macros::dec;
 
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
@@ -664,10 +683,15 @@ pub(crate) mod tests {
         let ctx = Ctx::from_toml(config, dry_run_secrets_toml())
             .await
             .unwrap();
-        assert!(matches!(
-            ctx.operational_limits,
-            OperationalLimits::Enabled { .. }
-        ));
+        let OperationalLimits::Enabled {
+            max_amount,
+            max_shares,
+        } = ctx.operational_limits
+        else {
+            panic!("Expected Enabled, got {:?}", ctx.operational_limits);
+        };
+        assert_eq!(max_amount.inner(), Usdc(dec!(100)));
+        assert_eq!(max_shares.inner(), FractionalShares::new(dec!(2)));
     }
 
     #[tokio::test]
@@ -686,6 +710,55 @@ pub(crate) mod tests {
             matches!(error, CtxError::Toml(_)),
             "Missing operational_limits should be a TOML parse error, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn operational_limits_max_amount_below_minimum_withdrawal_fails() {
+        let config = r#"
+            database_url = ":memory:"
+            [operational_limits]
+            mode = "enabled"
+            max_amount = "50"
+            max_shares = "2"
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#;
+
+        let error = Ctx::from_toml(config, dry_run_secrets_toml())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CtxError::OperationalLimitBelowMinimumWithdrawal { .. }
+            ),
+            "max_amount of $50 should fail validation (minimum is $51), got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_limits_max_amount_at_minimum_withdrawal_succeeds() {
+        let config = r#"
+            database_url = ":memory:"
+            [operational_limits]
+            mode = "enabled"
+            max_amount = "51"
+            max_shares = "2"
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#;
+
+        let ctx = Ctx::from_toml(config, dry_run_secrets_toml())
+            .await
+            .unwrap();
+        let OperationalLimits::Enabled { max_amount, .. } = ctx.operational_limits else {
+            panic!("Expected Enabled");
+        };
+        assert_eq!(max_amount.inner(), Usdc(dec!(51)));
     }
 
     #[tokio::test]

@@ -604,6 +604,19 @@ async fn create_test_cqrs(
     Arc<Store<crate::offchain_order::OffchainOrder>>,
     Arc<Projection<OffchainOrder>>,
 ) {
+    create_test_cqrs_with_limits(pool, OperationalLimits::Disabled).await
+}
+
+async fn create_test_cqrs_with_limits(
+    pool: &SqlitePool,
+    limits: OperationalLimits,
+) -> (
+    TradeProcessingCqrs,
+    Arc<Store<Position>>,
+    Arc<Projection<Position>>,
+    Arc<Store<crate::offchain_order::OffchainOrder>>,
+    Arc<Projection<OffchainOrder>>,
+) {
     let onchain_trade = Arc::new(test_store(pool.clone(), ()));
 
     let position_projection = Arc::new(Projection::<Position>::sqlite(pool.clone()).unwrap());
@@ -634,7 +647,7 @@ async fn create_test_cqrs(
         position_projection: position_projection.clone(),
         offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
-        operational_limits: OperationalLimits::Disabled,
+        operational_limits: limits,
     };
 
     (
@@ -2056,6 +2069,321 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
         ],
     )
     .await;
+
+    Ok(())
+}
+
+/// Tests that operational limits cap counter trade sizes, requiring multiple
+/// position checker cycles to fully hedge a large fill. A 5-share onchain sell
+/// with a 2-share limit produces: 2-share hedge -> fill -> position checker
+/// finds 3 remaining -> 2-share hedge -> fill -> position checker finds 1
+/// remaining -> 1-share hedge -> fill -> fully hedged.
+#[tokio::test]
+async fn operational_limits_cap_counter_trades_across_cycles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut orderbook = setup_anvil_orderbook().await;
+    let pool = setup_test_db().await;
+
+    let limits = OperationalLimits::Enabled {
+        max_shares: st0x_execution::Positive::new(FractionalShares::new(dec!(2))).unwrap(),
+        max_amount: st0x_execution::Positive::new(crate::threshold::Usdc(dec!(100))).unwrap(),
+    };
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs_with_limits(&pool, limits.clone()).await;
+    let symbol = Symbol::new(TEST_AAPL).unwrap();
+
+    // Large fill: 5 shares sell -> net = -5, crosses threshold
+    let trade1 = orderbook
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(dec!(5))
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
+        .await;
+    let order1 = trade1
+        .seed_and_submit(&pool, &cqrs)
+        .await?
+        .expect("5 shares crosses threshold");
+
+    // Capped to 2 shares
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(dec!(-5)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(5)))
+        .pending(Some(order1))
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
+
+    let events = fetch_events(&pool).await;
+    let placed1 = events
+        .iter()
+        .find(|event| event.event_type == "OffchainOrderEvent::Placed")
+        .unwrap();
+    assert_eq!(
+        placed1.payload["Placed"]["shares"].as_str().unwrap(),
+        "2",
+        "First hedge should be capped to 2 shares"
+    );
+
+    // Fill the first capped order -> net becomes -3
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(dec!(-3)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(5)))
+        .pending(None)
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
+
+    // Position checker cycle 2: finds -3 net, caps to 2
+    check_and_execute_accumulated_positions(
+        &MockExecutor::new(),
+        &position,
+        &position_query,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &limits,
+    )
+    .await?;
+
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(dec!(-3)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(5)))
+        .pending(Some(
+            position_query
+                .load(&symbol)
+                .await?
+                .unwrap()
+                .pending_offchain_order_id
+                .expect("Should have pending order"),
+        ))
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
+
+    let events = fetch_events(&pool).await;
+    let placed_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "OffchainOrderEvent::Placed")
+        .collect();
+    assert_eq!(
+        placed_events.len(),
+        2,
+        "Should have two Placed events so far"
+    );
+    assert_eq!(
+        placed_events[1].payload["Placed"]["shares"]
+            .as_str()
+            .unwrap(),
+        "2",
+        "Second hedge should also be capped to 2 shares"
+    );
+
+    // Fill second order -> net becomes -1
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(dec!(-1)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(5)))
+        .pending(None)
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
+
+    // Position checker cycle 3: finds -1 net, below cap so executes 1
+    check_and_execute_accumulated_positions(
+        &MockExecutor::new(),
+        &position,
+        &position_query,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &limits,
+    )
+    .await?;
+
+    let events = fetch_events(&pool).await;
+    let placed_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "OffchainOrderEvent::Placed")
+        .collect();
+    assert_eq!(placed_events.len(), 3, "Should have three Placed events");
+    assert_eq!(
+        placed_events[2].payload["Placed"]["shares"]
+            .as_str()
+            .unwrap(),
+        "1",
+        "Third hedge should be the remaining 1 share (below cap)"
+    );
+
+    // Fill third order -> net becomes 0
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::ZERO)
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(5)))
+        .pending(None)
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
+
+    // Position checker should be a no-op now
+    let events_before = fetch_events(&pool).await;
+    check_and_execute_accumulated_positions(
+        &MockExecutor::new(),
+        &position,
+        &position_query,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &limits,
+    )
+    .await?;
+    let events_after = fetch_events(&pool).await;
+    assert_eq!(
+        events_before.len(),
+        events_after.len(),
+        "No new events after fully hedged"
+    );
+
+    Ok(())
+}
+
+/// Tests that a failed capped counter trade blocks subsequent position checker
+/// cycles until the failure is resolved, preventing cascading retries on a
+/// broken broker connection.
+#[tokio::test]
+async fn failed_capped_counter_trade_blocks_next_cycle() -> Result<(), Box<dyn std::error::Error>> {
+    let mut orderbook = setup_anvil_orderbook().await;
+    let pool = setup_test_db().await;
+
+    let limits = OperationalLimits::Enabled {
+        max_shares: st0x_execution::Positive::new(FractionalShares::new(dec!(2))).unwrap(),
+        max_amount: st0x_execution::Positive::new(crate::threshold::Usdc(dec!(100))).unwrap(),
+    };
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs_with_limits(&pool, limits.clone()).await;
+    let symbol = Symbol::new(TEST_AAPL).unwrap();
+
+    // 5 shares sell -> capped to 2 -> order placed
+    let trade1 = orderbook
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(dec!(5))
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
+        .await;
+    let order1 = trade1
+        .seed_and_submit(&pool, &cqrs)
+        .await?
+        .expect("5 shares crosses threshold");
+
+    // Broker FAILS the order
+    let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
+        failed_at: Utc::now(),
+        error_reason: Some("Broker rejected".to_string()),
+    });
+    OrderStatusPoller::new(
+        OrderPollerCtx::default(),
+        failed_executor,
+        offchain_order_projection.as_ref().clone(),
+        offchain_order.clone(),
+        position.clone(),
+    )
+    .poll_pending_orders()
+    .await?;
+
+    // Pending cleared after failure, position still has -5 net
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(dec!(-5)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(5)))
+        .pending(None)
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
+
+    // Position checker retries: places a new capped order for 2 shares
+    check_and_execute_accumulated_positions(
+        &MockExecutor::new(),
+        &position,
+        &position_query,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &limits,
+    )
+    .await?;
+
+    let pos = position_query.load(&symbol).await?.unwrap();
+    let order2 = pos
+        .pending_offchain_order_id
+        .expect("Should have a new pending order after retry");
+    assert_ne!(order1, order2, "Retry creates a new offchain order");
+
+    // Verify the retry order is also capped to 2 shares
+    let events = fetch_events(&pool).await;
+    let placed_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "OffchainOrderEvent::Placed")
+        .collect();
+    assert_eq!(placed_events.len(), 2, "Original + retry = 2 placed events");
+    assert_eq!(
+        placed_events[1].payload["Placed"]["shares"]
+            .as_str()
+            .unwrap(),
+        "2",
+        "Retry should also be capped to 2 shares"
+    );
+
+    // While pending, position checker should NOT place another order
+    let events_before = fetch_events(&pool).await;
+    check_and_execute_accumulated_positions(
+        &MockExecutor::new(),
+        &position,
+        &position_query,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &limits,
+    )
+    .await?;
+    let events_after = fetch_events(&pool).await;
+    assert_eq!(
+        events_before.len(),
+        events_after.len(),
+        "Pending order blocks new execution"
+    );
+
+    // Fill the retry -> net becomes -3, continue hedging
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(dec!(-3)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(dec!(5)))
+        .pending(None)
+        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .call()
+        .await;
 
     Ok(())
 }

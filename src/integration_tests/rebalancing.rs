@@ -1063,6 +1063,183 @@ async fn mint_api_failure_produces_rejected_event() {
     );
 }
 
+/// Tests that operational limits cap USDC rebalancing amounts, requiring
+/// multiple trigger cycles to resolve a large imbalance. With a $100 cap and
+/// $400 excess, the first trigger produces a $100 transfer. After updating
+/// inventory to reflect the transfer, the second trigger fires again with the
+/// remaining imbalance, and so on until the inventory is balanced.
+#[tokio::test]
+async fn usdc_operational_limits_cap_across_trigger_cycles() {
+    let pool = setup_test_db().await;
+
+    // 100 onchain, 900 offchain = 10% ratio -> TooMuchOffchain
+    // Excess to reach 50% target = 500 - 100 = 400 USDC
+    let inventory = Arc::new(RwLock::new(
+        InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(900))),
+    ));
+
+    let limits = OperationalLimits::Enabled {
+        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+    };
+    let config = RebalancingTriggerConfig {
+        equity: ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        },
+        usdc: UsdcRebalancing::Enabled {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        },
+        limits,
+    };
+
+    let (sender, mut receiver) = mpsc::channel(10);
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
+
+    let trigger = RebalancingTrigger::new(
+        config,
+        vault_registry,
+        TEST_ORDERBOOK,
+        TEST_ORDER_OWNER,
+        Arc::clone(&inventory),
+        sender,
+        wrapper,
+    );
+
+    // Cycle 1: excess = 400, capped to 100
+    trigger.check_and_trigger_usdc().await;
+    let op1 = receiver.try_recv().expect("First trigger should fire");
+    match op1 {
+        TriggeredOperation::UsdcAlpacaToBase { amount } => {
+            assert_eq!(amount, Usdc(dec!(100)), "First transfer capped to $100");
+        }
+        _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
+    }
+    trigger.clear_usdc_in_progress();
+
+    // Simulate first transfer: 200 onchain, 800 offchain = 20% ratio
+    // Still below 30% lower bound, excess = 500 - 200 = 300
+    {
+        let mut guard = inventory.write().await;
+        let taken = std::mem::take(&mut *guard);
+        *guard = taken.with_usdc(Usdc(dec!(200)), Usdc(dec!(800)));
+    }
+
+    // Cycle 2: excess = 300, capped to 100
+    trigger.check_and_trigger_usdc().await;
+    let op2 = receiver.try_recv().expect("Second trigger should fire");
+    match op2 {
+        TriggeredOperation::UsdcAlpacaToBase { amount } => {
+            assert_eq!(amount, Usdc(dec!(100)), "Second transfer capped to $100");
+        }
+        _ => panic!("Expected UsdcAlpacaToBase, got {op2:?}"),
+    }
+    trigger.clear_usdc_in_progress();
+
+    // Simulate second transfer: 300 onchain, 700 offchain = 30% ratio
+    // Still at the boundary, excess = 500 - 300 = 200
+    {
+        let mut guard = inventory.write().await;
+        let taken = std::mem::take(&mut *guard);
+        *guard = taken.with_usdc(Usdc(dec!(300)), Usdc(dec!(700)));
+    }
+
+    // Cycle 3: ratio is exactly at lower bound (30%), imbalance check may or may not trigger
+    // depending on strict comparison. If it triggers, excess = 200, capped to 100.
+    trigger.check_and_trigger_usdc().await;
+
+    // Simulate convergence: 500 onchain, 500 offchain = balanced
+    trigger.clear_usdc_in_progress();
+    {
+        let mut guard = inventory.write().await;
+        let taken = std::mem::take(&mut *guard);
+        *guard = taken.with_usdc(Usdc(dec!(500)), Usdc(dec!(500)));
+    }
+
+    // Final: balanced -> no trigger
+    trigger.check_and_trigger_usdc().await;
+    assert!(
+        matches!(
+            receiver.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Empty
+        ),
+        "Balanced inventory should not trigger"
+    );
+}
+
+/// Tests that the USDC in-progress guard blocks concurrent triggers. When a
+/// USDC operation is in progress, subsequent trigger attempts are silently
+/// skipped. After the guard is released (operation completes or fails), the
+/// trigger fires again.
+#[tokio::test]
+async fn usdc_in_progress_blocks_concurrent_triggers() {
+    let pool = setup_test_db().await;
+
+    // Large imbalance: 100 onchain, 900 offchain
+    let inventory = Arc::new(RwLock::new(
+        InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(900))),
+    ));
+
+    let limits = OperationalLimits::Enabled {
+        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+    };
+    let config = RebalancingTriggerConfig {
+        equity: ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        },
+        usdc: UsdcRebalancing::Enabled {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        },
+        limits,
+    };
+
+    let (sender, mut receiver) = mpsc::channel(10);
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
+
+    let trigger = RebalancingTrigger::new(
+        config,
+        vault_registry,
+        TEST_ORDERBOOK,
+        TEST_ORDER_OWNER,
+        Arc::clone(&inventory),
+        sender,
+        wrapper,
+    );
+
+    // First trigger fires
+    trigger.check_and_trigger_usdc().await;
+    assert!(
+        receiver.try_recv().is_ok(),
+        "First trigger should produce an operation"
+    );
+
+    // Without clearing in_progress, second trigger is blocked
+    trigger.check_and_trigger_usdc().await;
+    assert!(
+        matches!(
+            receiver.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Empty
+        ),
+        "In-progress guard should block second trigger"
+    );
+
+    // Clear in-progress (simulates operation completion/failure)
+    trigger.clear_usdc_in_progress();
+
+    // Now trigger fires again
+    trigger.check_and_trigger_usdc().await;
+    assert!(
+        receiver.try_recv().is_ok(),
+        "After clearing in_progress, trigger should fire again"
+    );
+}
+
 /// Tests that threshold configuration controls trigger sensitivity: the same
 /// USDC inventory (35% onchain) is within bounds for a wide threshold but
 /// outside bounds for a tight threshold, causing only the tight config to

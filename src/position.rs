@@ -377,29 +377,28 @@ impl Position {
             Some(TriggerReason::SharesThreshold { .. } | TriggerReason::DollarThreshold { .. }) => {
                 let raw_shares = self.net.abs();
 
-                let floored_shares = if executor.supports_fractional_shares() {
-                    raw_shares
+                let capped_shares = if let OperationalLimits::Enabled { max_shares, .. } = limits {
+                    let cap = max_shares.inner();
+                    if raw_shares > cap {
+                        warn!(
+                            symbol = %self.symbol,
+                            computed = %raw_shares,
+                            limit = %cap,
+                            "Counter trade shares capped by operational limit"
+                        );
+                        cap
+                    } else {
+                        raw_shares
+                    }
                 } else {
-                    FractionalShares::new(raw_shares.inner().trunc())
+                    raw_shares
                 };
 
-                let executable_shares =
-                    if let OperationalLimits::Enabled { max_shares, .. } = limits {
-                        let cap = max_shares.inner();
-                        if floored_shares > cap {
-                            warn!(
-                                symbol = %self.symbol,
-                                computed = %floored_shares,
-                                limit = %cap,
-                                "Counter trade shares capped by operational limit"
-                            );
-                            cap
-                        } else {
-                            floored_shares
-                        }
-                    } else {
-                        floored_shares
-                    };
+                let executable_shares = if executor.supports_fractional_shares() {
+                    capped_shares
+                } else {
+                    FractionalShares::new(capped_shares.inner().trunc())
+                };
 
                 if executable_shares.is_zero() {
                     return Ok(None);
@@ -1370,6 +1369,38 @@ mod tests {
             dec!(30),
             "Shares should not be capped when below \
              limit: expected 30, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn operational_limits_cap_floors_for_non_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(100)),
+            accumulated_long: FractionalShares::new(dec!(100)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_offchain_order_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50.7))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+        };
+
+        let (_, shares) = position
+            .is_ready_for_execution(SupportedExecutor::Schwab, &limits)
+            .unwrap()
+            .expect("should be ready for execution");
+
+        assert_eq!(
+            shares.inner(),
+            dec!(50),
+            "Non-fractional executor should floor capped shares: \
+             cap is 50.7, floored to 50, got {}",
             shares.inner()
         );
     }
