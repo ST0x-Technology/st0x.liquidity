@@ -367,22 +367,24 @@ impl Ctx {
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
-        let usdc_rebalancing_enabled = match &trading_mode {
-            TradingMode::Rebalancing(ctx) => {
-                matches!(ctx.usdc, UsdcRebalancing::Enabled { .. })
-            }
-            TradingMode::Standalone { .. } => false,
+        let usdc = match &trading_mode {
+            TradingMode::Rebalancing(ctx) => Some(&ctx.usdc),
+            TradingMode::Standalone { .. } => None,
+        };
+        let usdc_rebalancing_enabled = match usdc {
+            Some(UsdcRebalancing::Enabled { .. }) => true,
+            Some(UsdcRebalancing::Disabled) | None => false,
         };
 
-        if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits {
-            if usdc_rebalancing_enabled {
-                let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
-                if max_amount.inner() < minimum {
-                    return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
-                        configured: max_amount.inner(),
-                        minimum,
-                    });
-                }
+        if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits
+            && usdc_rebalancing_enabled
+        {
+            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+            if max_amount.inner() < minimum {
+                return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
+                    configured: max_amount.inner(),
+                    minimum,
+                });
             }
         }
 

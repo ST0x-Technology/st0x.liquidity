@@ -393,10 +393,8 @@ impl Position {
                         }
                     });
 
-                    let cap = match dollar_cap_in_shares {
-                        Some(dollar_cap) => shares_cap.min(dollar_cap),
-                        None => shares_cap,
-                    };
+                    let cap = dollar_cap_in_shares
+                        .map_or(shares_cap, |dollar_cap| shares_cap.min(dollar_cap));
 
                     if raw_shares > cap {
                         warn!(
