@@ -1478,7 +1478,7 @@ mod tests {
         let after_second = Position {
             net: FractionalShares::new(dec!(20)),
             accumulated_long: FractionalShares::new(dec!(20)),
-            ..position.clone()
+            ..position
         };
 
         let (_, third_shares) = after_second
