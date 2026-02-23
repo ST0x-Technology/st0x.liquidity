@@ -703,4 +703,86 @@ mod tests {
             "Operational limit should cap redemption to 10 shares, got {quantity}"
         );
     }
+
+    #[tokio::test]
+    async fn capped_equity_rebalancing_leaves_remaining_imbalance_triggerable() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+        let ratio = one_to_one_ratio();
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(10))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+        };
+
+        // 80 onchain / 20 offchain -> 80% onchain, above 70% -> excess ~30
+        let inventory = make_imbalanced_view(&symbol, 80, 20);
+
+        let first = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            &limits,
+        )
+        .await;
+
+        let Ok(Some(TriggeredOperation::Redemption {
+            quantity: first_qty,
+            ..
+        })) = first
+        else {
+            panic!("Expected first Redemption, got {first:?}");
+        };
+        assert_eq!(first_qty, FractionalShares::new(dec!(10)));
+
+        // After redeeming 10: 70 onchain / 30 offchain -> 70% onchain, still at boundary
+        let inventory_after = make_imbalanced_view(&symbol, 70, 30);
+
+        let second = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory_after,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            &limits,
+        )
+        .await;
+
+        // 70% is right at the boundary (target 50% + deviation 20% = 70%)
+        // so no further trigger expected
+        assert_eq!(second.unwrap(), None, "At boundary, no further trigger");
+
+        // But if we only redeemed 5 (69 onchain / 31 offchain), still above
+        let still_imbalanced = make_imbalanced_view(&symbol, 75, 25);
+
+        let third = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &still_imbalanced,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            &limits,
+        )
+        .await;
+
+        let Ok(Some(TriggeredOperation::Redemption {
+            quantity: third_qty,
+            ..
+        })) = third
+        else {
+            panic!("Expected third Redemption, got {third:?}");
+        };
+        assert_eq!(
+            third_qty,
+            FractionalShares::new(dec!(10)),
+            "Remaining imbalance triggers another capped operation"
+        );
+    }
 }

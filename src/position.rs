@@ -1428,4 +1428,67 @@ mod tests {
         assert_eq!(position.symbol, symbol);
         assert_eq!(position.net.inner(), dec!(1));
     }
+
+    #[test]
+    fn capped_execution_leaves_remaining_exposure_triggerable() {
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+        };
+
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(120)),
+            accumulated_long: FractionalShares::new(dec!(120)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_offchain_order_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let (_, first_shares) = position
+            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .unwrap()
+            .expect("first check should trigger");
+        assert_eq!(
+            first_shares.inner(),
+            dec!(50),
+            "First execution capped to 50"
+        );
+
+        // Simulate executing 50 shares: net goes from 120 to 70
+        let after_first = Position {
+            net: FractionalShares::new(dec!(70)),
+            accumulated_long: FractionalShares::new(dec!(70)),
+            ..position.clone()
+        };
+
+        let (_, second_shares) = after_first
+            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .unwrap()
+            .expect("remaining 70 shares still exceeds threshold");
+        assert_eq!(
+            second_shares.inner(),
+            dec!(50),
+            "Second execution capped to 50"
+        );
+
+        // Simulate executing another 50: net goes from 70 to 20
+        let after_second = Position {
+            net: FractionalShares::new(dec!(20)),
+            accumulated_long: FractionalShares::new(dec!(20)),
+            ..position.clone()
+        };
+
+        let (_, third_shares) = after_second
+            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .unwrap()
+            .expect("remaining 20 shares still exceeds threshold");
+        assert_eq!(
+            third_shares.inner(),
+            dec!(20),
+            "Third execution returns remaining 20 (below cap)"
+        );
+    }
 }

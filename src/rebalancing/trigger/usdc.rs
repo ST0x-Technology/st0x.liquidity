@@ -318,4 +318,53 @@ mod tests {
             "Operational limit should cap USDC transfer to 100, got {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn capped_usdc_rebalancing_leaves_remaining_imbalance_triggerable() {
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+        };
+
+        // 100 onchain / 500 offchain -> 83% offchain, excess = 200
+        let inventory = Arc::new(RwLock::new(
+            InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(500))),
+        ));
+
+        let first = check_imbalance_and_build_operation(&threshold, &inventory, &limits).await;
+        assert!(
+            matches!(first, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc(dec!(100))),
+            "First transfer capped to 100, got {first:?}"
+        );
+
+        // After transferring 100: 200 onchain / 400 offchain -> 67% offchain
+        // Still above 70% threshold? No — 400/600 = 66.7%, within 30%-70%. No trigger.
+        let after_first = Arc::new(RwLock::new(
+            InventoryView::default().with_usdc(Usdc(dec!(200)), Usdc(dec!(400))),
+        ));
+
+        let second = check_imbalance_and_build_operation(&threshold, &after_first, &limits).await;
+        assert_eq!(
+            second,
+            Err(UsdcTriggerSkip::NoImbalance),
+            "After 100 USDC transfer, 66.7% offchain is within bounds"
+        );
+
+        // But if only 50 was transferred: 150 onchain / 450 offchain -> 75% offchain
+        // Still above 70%, so triggers again
+        let partially_resolved = Arc::new(RwLock::new(
+            InventoryView::default().with_usdc(Usdc(dec!(150)), Usdc(dec!(450))),
+        ));
+
+        let third =
+            check_imbalance_and_build_operation(&threshold, &partially_resolved, &limits).await;
+        assert!(
+            matches!(third, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc(dec!(100))),
+            "Remaining imbalance triggers another capped transfer, got {third:?}"
+        );
+    }
 }
