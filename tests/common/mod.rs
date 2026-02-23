@@ -4,10 +4,14 @@
 //! lifecycle helpers used across `hedging.rs`, `rebalancing.rs`, and `main.rs`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
-use alloy::providers::Provider;
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::signers::local::PrivateKeySigner;
 use approx::assert_relative_eq;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -15,16 +19,18 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 
+use async_trait::async_trait;
 use st0x_event_sorcery::Projection;
+use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Direction, FractionalShares,
     SupportedExecutor, Symbol, TimeInForce,
 };
 use st0x_hedge::bindings::IOrderBookV5;
-use st0x_hedge::config::{BrokerCtx, Ctx, EvmCtx, LogLevel};
+use st0x_hedge::config::{BrokerCtx, Ctx, LogLevel};
 use st0x_hedge::{
-    Dollars, EquityTokenAddresses, ImbalanceThreshold, OffchainOrder, Position, RebalancingConfig,
-    RebalancingSecrets, UsdcRebalancing, launch,
+    Dollars, EquityTokenAddresses, EvmCtx, ExecutionThreshold, ImbalanceThreshold, OffchainOrder,
+    Position, TradingMode, UsdcRebalancing, launch,
 };
 
 use super::services::alpaca_broker::{
@@ -34,6 +40,99 @@ use super::services::alpaca_tokenization::AlpacaTokenizationMock;
 use super::services::base_chain::{self, TakeDirection, TakeOrderResult};
 use super::services::ethereum_chain;
 use crate::assert_decimal_eq;
+
+// ── Test wallet ──────────────────────────────────────────────────────
+
+/// Local signing wallet for e2e tests that exposes `Provider = RootProvider`.
+///
+/// Matches the `FireblocksWallet` pattern: keeps a bare `RootProvider`
+/// for the `Evm::provider()` trait method (used by view calls and event
+/// queries) and a filler-equipped signing provider internally for
+/// `send()`.
+struct TestWallet {
+    address: Address,
+    read_provider: RootProvider,
+    signing_provider: alloy::providers::fillers::FillProvider<
+        alloy::providers::fillers::JoinFill<
+            alloy::providers::fillers::JoinFill<
+                alloy::providers::Identity,
+                alloy::providers::fillers::JoinFill<
+                    alloy::providers::fillers::GasFiller,
+                    alloy::providers::fillers::JoinFill<
+                        alloy::providers::fillers::BlobGasFiller,
+                        alloy::providers::fillers::JoinFill<
+                            alloy::providers::fillers::NonceFiller,
+                            alloy::providers::fillers::ChainIdFiller,
+                        >,
+                    >,
+                >,
+            >,
+            alloy::providers::fillers::WalletFiller<EthereumWallet>,
+        >,
+        RootProvider,
+        alloy::network::Ethereum,
+    >,
+    required_confirmations: u64,
+}
+
+impl TestWallet {
+    fn new(private_key: &B256, rpc_url: url::Url, required_confirmations: u64) -> Self {
+        use alloy::rpc::client::RpcClient;
+
+        let signer = PrivateKeySigner::from_bytes(private_key).unwrap();
+        let address = signer.address();
+        let eth_wallet = EthereumWallet::from(signer);
+
+        let read_provider = RootProvider::new(RpcClient::builder().http(rpc_url.clone()));
+        let signing_provider = ProviderBuilder::new()
+            .wallet(eth_wallet)
+            .connect_http(rpc_url);
+
+        Self {
+            address,
+            read_provider,
+            signing_provider,
+            required_confirmations,
+        }
+    }
+}
+
+#[async_trait]
+impl Evm for TestWallet {
+    type Provider = RootProvider;
+
+    fn provider(&self) -> &RootProvider {
+        &self.read_provider
+    }
+}
+
+#[async_trait]
+impl Wallet for TestWallet {
+    fn address(&self) -> Address {
+        self.address
+    }
+
+    async fn send(
+        &self,
+        contract: Address,
+        calldata: alloy::primitives::Bytes,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError> {
+        tracing::info!(%contract, note, "Submitting local test wallet call");
+
+        let tx = TransactionRequest::default()
+            .to(contract)
+            .input(calldata.into());
+
+        let pending = self.signing_provider.send_transaction(tx).await?;
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
+
+        Ok(receipt)
+    }
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -126,7 +225,6 @@ pub fn build_ctx<P: Provider + Clone>(
         evm: EvmCtx {
             ws_rpc_url: chain.ws_endpoint()?,
             orderbook: chain.orderbook_addr,
-            order_owner: Some(chain.owner),
             deployment_block,
         },
         order_polling_interval: 1,
@@ -135,7 +233,9 @@ pub fn build_ctx<P: Provider + Clone>(
         inventory_poll_interval: 2,
         broker: broker_ctx,
         telemetry: None,
-        rebalancing: None,
+        trading_mode: TradingMode::Standalone {
+            order_owner: chain.owner,
+        },
         execution_threshold,
     })
 }
@@ -183,28 +283,25 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let config = RebalancingConfig {
-        equity: ImbalanceThreshold {
+    let wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+        &chain.owner_key,
+        chain.endpoint().parse()?,
+        1,
+    ));
+
+    let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets(
+        ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.1),
         },
-        usdc: usdc_rebalancing,
-        redemption_wallet: redemption_wallet.unwrap_or_else(Address::random),
-        usdc_vault_id: B256::random(),
+        usdc_rebalancing,
+        redemption_wallet.unwrap_or_else(Address::random),
+        B256::random(),
+        alpaca_auth,
         equities,
-        circle_api_base: None,
-        required_confirmations: Some(1),
-    };
-
-    // Use the chain owner's private key so that `Ctx::order_owner()`
-    // (which derives the address from this key when rebalancing is
-    // enabled) matches the account that places orders in tests.
-    let secrets = RebalancingSecrets {
-        ethereum_rpc_url: chain.ws_endpoint()?,
-        evm_private_key: chain.owner_key,
-    };
-
-    let rebalancing_ctx = st0x_hedge::RebalancingCtx::new(config, secrets, alpaca_auth)?;
+        wallet.clone(),
+        wallet,
+    );
 
     Ok(Ctx {
         database_url: db_path.display().to_string(),
@@ -213,7 +310,6 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
         evm: EvmCtx {
             ws_rpc_url: chain.ws_endpoint()?,
             orderbook: chain.orderbook_addr,
-            order_owner: Some(chain.owner),
             deployment_block,
         },
         order_polling_interval: 1,
@@ -222,7 +318,7 @@ pub fn build_rebalancing_ctx<P: Provider + Clone>(
         inventory_poll_interval: 2,
         broker: broker_ctx,
         telemetry: None,
-        rebalancing: Some(rebalancing_ctx),
+        trading_mode: TradingMode::Rebalancing(Box::new(rebalancing_ctx)),
         execution_threshold,
     })
 }
@@ -234,13 +330,19 @@ pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
 
 /// Sleeps for `seconds`, then panics if the bot task has already finished
 /// (indicating it crashed during processing).
-pub async fn wait_for_processing(bot: &JoinHandle<anyhow::Result<()>>, seconds: u64) {
-    tokio::time::sleep(Duration::from_secs(seconds)).await;
-
-    assert!(
-        !bot.is_finished(),
-        "Bot task finished unexpectedly during wait_for_processing"
-    );
+pub async fn wait_for_processing(bot: &mut JoinHandle<anyhow::Result<()>>, seconds: u64) {
+    tokio::select! {
+        result = &mut *bot => {
+            match result {
+                Ok(Ok(())) => panic!("Bot exited cleanly before processing completed ({seconds}s)"),
+                Ok(Err(error)) => panic!("Bot crashed during wait_for_processing: {error:#}"),
+                Err(join_error) => panic!("Bot task panicked: {join_error}"),
+            }
+        }
+        () = tokio::time::sleep(Duration::from_secs(seconds)) => {
+            // Bot is still running — expected
+        }
+    }
 }
 
 // ── Database helpers ─────────────────────────────────────────────────
@@ -1003,28 +1105,36 @@ where
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let config = RebalancingConfig {
-        equity: ImbalanceThreshold {
+    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
+        Arc::new(TestWallet::new(
+            &base_chain.owner_key,
+            base_chain.endpoint().parse()?,
+            1,
+        ));
+
+    let ethereum_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
+        Arc::new(TestWallet::new(
+            &base_chain.owner_key,
+            ethereum_chain.endpoint().parse()?,
+            1,
+        ));
+
+    let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets(
+        ImbalanceThreshold {
             target: Decimal::new(5, 1),
             deviation: Decimal::new(1, 1),
         },
-        usdc: UsdcRebalancing::Enabled {
+        UsdcRebalancing::Enabled {
             target: Decimal::new(5, 1),
             deviation: Decimal::new(1, 1),
         },
-        redemption_wallet: Address::random(),
+        Address::random(),
         usdc_vault_id,
+        alpaca_auth,
         equities,
-        circle_api_base: Some(attestation_base_url.to_string()),
-        required_confirmations: Some(1),
-    };
-
-    let secrets = RebalancingSecrets {
-        ethereum_rpc_url: ethereum_chain.ws_endpoint()?,
-        evm_private_key: base_chain.owner_key,
-    };
-
-    let rebalancing_ctx = st0x_hedge::RebalancingCtx::new(config, secrets, alpaca_auth)?;
+        base_wallet,
+        ethereum_wallet,
+    );
 
     Ok(Ctx {
         database_url: db_path.display().to_string(),
@@ -1033,7 +1143,6 @@ where
         evm: EvmCtx {
             ws_rpc_url: base_chain.ws_endpoint()?,
             orderbook: base_chain.orderbook_addr,
-            order_owner: Some(base_chain.owner),
             deployment_block,
         },
         order_polling_interval: 1,
@@ -1042,7 +1151,7 @@ where
         inventory_poll_interval: 15,
         broker: broker_ctx,
         telemetry: None,
-        rebalancing: Some(rebalancing_ctx),
+        trading_mode: TradingMode::Rebalancing(Box::new(rebalancing_ctx)),
         execution_threshold,
     })
 }

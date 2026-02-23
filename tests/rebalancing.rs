@@ -103,7 +103,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         UsdcRebalancing::Disabled,
         None,
     )?;
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
 
     // Wait long enough for the bot's 5-second coordination phase
     // (WebSocket first-event timeout + backfill + CQRS setup) to
@@ -121,7 +121,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    wait_for_processing(&bot, 80).await;
+    wait_for_processing(&mut bot, 80).await;
 
     let expected_positions = [ExpectedPosition {
         symbol: "AAPL",
@@ -211,7 +211,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         UsdcRebalancing::Disabled,
         Some(REDEMPTION_WALLET),
     )?;
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
 
     // Wait long enough for the bot's 5-second coordination phase
     // (WebSocket first-event timeout + backfill + CQRS setup) to
@@ -224,7 +224,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 
     // Wait for: hedging + inventory poller (15s) + trigger evaluation +
     // redemption pipeline (withdraw + unwrap + send + detection + completion)
-    wait_for_processing(&bot, 80).await;
+    wait_for_processing(&mut bot, 80).await;
 
     let expected_positions = [ExpectedPosition {
         symbol: "AAPL",
@@ -405,7 +405,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 //         &[("AAPL", vault_addr, underlying_addr)],
 //         usdc_vault_id,
 //     )?;
-//     let bot = spawn_bot(ctx);
+//     let mut bot = spawn_bot(ctx);
 //
 //     tokio::time::sleep(Duration::from_secs(2)).await;
 //
@@ -425,7 +425,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 //
 //     // Wait for: hedging + inventory poller + trigger + full USDC pipeline
 //     // (conversion + withdrawal + bridge + deposit)
-//     wait_for_processing(&bot, 60).await;
+//     wait_for_processing(&mut bot, 60).await;
 //
 //     // ── Layer 1: Full hedging pipeline (broker + vaults + CQRS) ──────
 //     let scenario = ExpectedPosition {
@@ -648,7 +648,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 //         &[("AAPL", vault_addr, underlying_addr)],
 //         usdc_vault_id,
 //     )?;
-//     let bot = spawn_bot(ctx);
+//     let mut bot = spawn_bot(ctx);
 //
 //     tokio::time::sleep(Duration::from_secs(2)).await;
 //
@@ -668,7 +668,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 //
 //     // Wait for: hedging + inventory poller + trigger + full USDC pipeline
 //     // (withdraw from Raindex + bridge + deposit to Alpaca + conversion)
-//     wait_for_processing(&bot, 60).await;
+//     wait_for_processing(&mut bot, 60).await;
 //
 //     // ── Layer 1: Full hedging pipeline (broker + vaults + CQRS) ──────
 //     let scenario = ExpectedPosition {

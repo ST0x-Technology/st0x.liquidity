@@ -47,7 +47,10 @@ pub use position::Position;
 pub use rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, UsdcRebalancing,
 };
+pub use config::TradingMode;
+pub use onchain::EvmCtx;
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
+pub use threshold::ExecutionThreshold;
 pub use wrapper::EquityTokenAddresses;
 
 #[cfg(any(test, feature = "test-support"))]

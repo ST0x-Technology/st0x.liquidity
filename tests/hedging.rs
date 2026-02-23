@@ -17,7 +17,7 @@ use alloy::providers::Provider;
 use rust_decimal_macros::dec;
 use st0x_event_sorcery::Projection;
 use st0x_execution::{FractionalShares, Positive, Symbol};
-use st0x_hedge::config::ExecutionThreshold;
+use st0x_hedge::ExecutionThreshold;
 use st0x_hedge::{OffchainOrder, Position};
 
 use common::{
@@ -56,7 +56,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         &infra.db_path,
         current_block,
     )?;
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -70,7 +70,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    wait_for_processing(&bot, 8).await;
+    wait_for_processing(&mut bot, 8).await;
 
     assert_full_hedging_flow(
         &[expected_position],
@@ -148,7 +148,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
         &infra.db_path,
         current_block,
     )?;
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -170,7 +170,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    wait_for_processing(&bot, 12).await;
+    wait_for_processing(&mut bot, 12).await;
 
     assert_full_hedging_flow(
         &expected_positions,
@@ -230,13 +230,13 @@ async fn backfilling() -> anyhow::Result<()> {
         &infra.db_path,
         pre_trade_block,
     )?;
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
 
     // Wait for backfill + processing. With 3 rapid backfilled trades, only
     // 1 offchain order is placed initially (the bot won't place a second
     // while the first is pending). After the first fill, the remaining net
     // needs the position checker's cycle (2s in tests) to detect and hedge.
-    wait_for_processing(&bot, 12).await;
+    wait_for_processing(&mut bot, 12).await;
 
     // Verify all historical events were picked up via backfill
     let pool = connect_db(&infra.db_path).await?;
@@ -293,7 +293,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         &infra.db_path,
         current_block,
     )?;
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let take1 = infra
@@ -306,7 +306,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    wait_for_processing(&bot, 10).await;
+    wait_for_processing(&mut bot, 10).await;
 
     // Snapshot DB state before shutdown
     let pool = connect_db(&infra.db_path).await?;
@@ -335,10 +335,10 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         &infra.db_path,
         current_block,
     )?;
-    let bot2 = spawn_bot(ctx2);
+    let mut bot2 = spawn_bot(ctx2);
 
     // Wait for backfill to pick up missed events + processing
-    wait_for_processing(&bot2, 12).await;
+    wait_for_processing(&mut bot2, 12).await;
 
     // Verify no duplicate CQRS events
     let pool = connect_db(&infra.db_path).await?;
@@ -421,7 +421,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         &ref_infra.db_path,
         ref_block,
     )?;
-    let ref_bot = spawn_bot(ref_ctx);
+    let mut ref_bot = spawn_bot(ref_ctx);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut ref_take_results = Vec::new();
@@ -440,7 +440,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    wait_for_processing(&ref_bot, 10).await;
+    wait_for_processing(&mut ref_bot, 10).await;
 
     // Assert reference run passes full pipeline
     assert_full_hedging_flow(
@@ -477,7 +477,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         &crash_infra.db_path,
         crash_block,
     )?;
-    let bot1 = spawn_bot(ctx1);
+    let mut bot1 = spawn_bot(ctx1);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let crash_take1 = crash_infra
@@ -489,7 +489,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         .direction(expected_positions[0].direction)
         .call()
         .await?;
-    wait_for_processing(&bot1, 10).await;
+    wait_for_processing(&mut bot1, 10).await;
     bot1.abort();
     let _ = bot1.await;
 
@@ -510,9 +510,9 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         &crash_infra.db_path,
         crash_block,
     )?;
-    let bot2 = spawn_bot(ctx2);
+    let mut bot2 = spawn_bot(ctx2);
 
-    wait_for_processing(&bot2, 12).await;
+    wait_for_processing(&mut bot2, 12).await;
 
     // Assert crash run also passes full pipeline (convergence)
     assert_full_hedging_flow(
@@ -561,7 +561,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         &infra.db_path,
         current_block,
     )?;
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -577,7 +577,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         .await?;
 
     // Wait for event processing but not order placement (market closed)
-    wait_for_processing(&bot, 8).await;
+    wait_for_processing(&mut bot, 8).await;
 
     // Assert: position accumulated but NO offchain orders placed
     let pool = connect_db(&infra.db_path).await?;
@@ -611,7 +611,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
 
     // Wait for the position checker's periodic cycle (2s in tests) plus processing.
     // The checker detects the pending position and places orders.
-    wait_for_processing(&bot, 8).await;
+    wait_for_processing(&mut bot, 8).await;
 
     // Full pipeline assertions after market opens
     let expected_position = ExpectedPosition {
@@ -690,7 +690,7 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
     let high_threshold = Positive::<FractionalShares>::new(FractionalShares::new(dec!(200)))?;
     ctx.execution_threshold = ExecutionThreshold::Shares(high_threshold);
 
-    let bot = spawn_bot(ctx);
+    let mut bot = spawn_bot(ctx);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // SellEquity 14.75 shares -- below 200-share threshold
@@ -717,7 +717,7 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    wait_for_processing(&bot, 8).await;
+    wait_for_processing(&mut bot, 8).await;
 
     assert_full_hedging_flow(
         &[expected_position],

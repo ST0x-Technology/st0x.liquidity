@@ -243,6 +243,31 @@ impl RebalancingCtx {
             ethereum_wallet: wallet,
         }
     }
+
+    /// Test constructor that accepts pre-built wallets for e2e tests
+    /// that need real onchain interaction (e.g. with Anvil forks).
+    #[cfg(feature = "test-support")]
+    pub fn with_wallets(
+        equity: ImbalanceThreshold,
+        usdc: UsdcRebalancing,
+        redemption_wallet: Address,
+        usdc_vault_id: B256,
+        alpaca_broker_auth: AlpacaBrokerApiCtx,
+        equities: HashMap<Symbol, EquityTokenAddresses>,
+        base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        Self {
+            equity,
+            usdc,
+            redemption_wallet,
+            usdc_vault_id,
+            alpaca_broker_auth,
+            equities,
+            base_wallet,
+            ethereum_wallet,
+        }
+    }
 }
 
 impl std::fmt::Debug for RebalancingCtx {

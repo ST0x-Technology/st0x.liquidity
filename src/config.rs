@@ -98,7 +98,7 @@ enum BrokerSecrets {
 /// `Standalone`: order_owner comes from config, no rebalancing.
 /// `Rebalancing`: order_owner resolved from Fireblocks at runtime.
 #[derive(Clone, Debug)]
-pub(crate) enum TradingMode {
+pub enum TradingMode {
     Standalone { order_owner: Address },
     Rebalancing(Box<RebalancingCtx>),
 }
@@ -107,18 +107,18 @@ pub(crate) enum TradingMode {
 /// encrypted secrets, and derived runtime state.
 #[derive(Clone)]
 pub struct Ctx {
-    pub(crate) database_url: String,
+    pub database_url: String,
     pub log_level: LogLevel,
-    pub(crate) server_port: u16,
-    pub(crate) evm: EvmCtx,
-    pub(crate) order_polling_interval: u64,
-    pub(crate) order_polling_max_jitter: u64,
-    pub(crate) position_check_interval: u64,
-    pub(crate) inventory_poll_interval: u64,
-    pub(crate) broker: BrokerCtx,
+    pub server_port: u16,
+    pub evm: EvmCtx,
+    pub order_polling_interval: u64,
+    pub order_polling_max_jitter: u64,
+    pub position_check_interval: u64,
+    pub inventory_poll_interval: u64,
+    pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    pub(crate) trading_mode: TradingMode,
-    pub(crate) execution_threshold: ExecutionThreshold,
+    pub trading_mode: TradingMode,
+    pub execution_threshold: ExecutionThreshold,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -140,7 +140,7 @@ impl BrokerCtx {
         }
     }
 
-    fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
+    pub fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
             Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(
                 Positive::<FractionalShares>::ONE,
@@ -463,6 +463,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
     // (single INSERT per trade) to avoid blocking the main bot.
     let options: SqliteConnectOptions = database_url
         .parse::<SqliteConnectOptions>()?
+        .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_secs(10));
 
