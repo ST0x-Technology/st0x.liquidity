@@ -632,8 +632,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new().with_token(token_address));
     let wrapper = MockWrapper::new().with_unwrapped_token(token_address);
-    let equity_transfer =
-        build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper);
+    let equity_transfer = build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper);
 
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
