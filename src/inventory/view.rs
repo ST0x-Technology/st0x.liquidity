@@ -44,13 +44,66 @@ pub(crate) enum Imbalance<T> {
 }
 
 /// Threshold configuration for imbalance detection.
+///
+/// Invariants enforced by [`ImbalanceThreshold::new`]:
+/// - `target` must be in `[0.0, 1.0]`
+/// - `deviation` must be `>= 0`
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawImbalanceThreshold", deny_unknown_fields)]
 pub struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
-    pub target: Decimal,
+    pub(crate) target: Decimal,
     /// Deviation from target that triggers rebalancing.
-    pub deviation: Decimal,
+    pub(crate) deviation: Decimal,
+}
+
+/// Error returned when [`ImbalanceThreshold`] is constructed with
+/// out-of-range values.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum InvalidImbalanceThreshold {
+    #[error(
+        "target must be between 0.0 and 1.0 inclusive, \
+         got {target}"
+    )]
+    TargetOutOfRange { target: Decimal },
+    #[error("deviation must be >= 0, got {deviation}")]
+    NegativeDeviation { deviation: Decimal },
+}
+
+impl ImbalanceThreshold {
+    /// Creates a new threshold with validated parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidImbalanceThreshold`] if `target` is not in
+    /// `[0.0, 1.0]` or `deviation` is negative.
+    pub fn new(target: Decimal, deviation: Decimal) -> Result<Self, InvalidImbalanceThreshold> {
+        if target < Decimal::ZERO || target > Decimal::ONE {
+            return Err(InvalidImbalanceThreshold::TargetOutOfRange { target });
+        }
+
+        if deviation < Decimal::ZERO {
+            return Err(InvalidImbalanceThreshold::NegativeDeviation { deviation });
+        }
+
+        Ok(Self { target, deviation })
+    }
+}
+
+/// Private helper for serde deserialization with validation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawImbalanceThreshold {
+    target: Decimal,
+    deviation: Decimal,
+}
+
+impl TryFrom<RawImbalanceThreshold> for ImbalanceThreshold {
+    type Error = InvalidImbalanceThreshold;
+
+    fn try_from(raw: RawImbalanceThreshold) -> Result<Self, Self::Error> {
+        Self::new(raw.target, raw.deviation)
+    }
 }
 
 /// Discriminant for the two venues tracked by an [`Inventory`].
@@ -582,6 +635,7 @@ mod tests {
     use alloy::primitives::U256;
     use chrono::Utc;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
     use super::*;
@@ -629,7 +683,7 @@ mod tests {
     #[test]
     fn ratio_returns_half_for_equal_split() {
         let inventory = make_inventory(50, 0, 50, 0);
-        assert_eq!(inventory.ratio().unwrap(), Decimal::new(5, 1));
+        assert_eq!(inventory.ratio().unwrap(), dec!(0.5));
     }
 
     #[test]
@@ -647,7 +701,7 @@ mod tests {
     #[test]
     fn ratio_includes_inflight_in_total() {
         let inventory = make_inventory(25, 25, 25, 25);
-        assert_eq!(inventory.ratio().unwrap(), Decimal::new(5, 1));
+        assert_eq!(inventory.ratio().unwrap(), dec!(0.5));
     }
 
     #[test]

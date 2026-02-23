@@ -151,7 +151,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     /// Uses `Entity::PROJECTION` directly to determine the view
     /// table name. Only callable on entities with a materialized
     /// view.
-    pub(crate) fn sqlite(pool: SqlitePool) -> Self {
+    pub fn sqlite(pool: SqlitePool) -> Self {
         let Table(table) = Entity::PROJECTION;
         let repo = Arc::new(SqliteProjectionRepo {
             inner: SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(

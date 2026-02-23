@@ -311,6 +311,24 @@ impl<Entity: EventSourced> Store<Entity> {
 
         Ok(context.aggregate.into_result()?)
     }
+
+    /// Reconstruct an entity's state from events without needing
+    /// a full `Store` (no services or CQRS framework required).
+    ///
+    /// Useful in test/CLI contexts where you only need to read
+    /// aggregate state and never send commands.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn load_from_pool(
+        pool: SqlitePool,
+        id: &Entity::Id,
+    ) -> Result<Option<Entity>, SendError<Entity>> {
+        let repo = SqliteEventRepository::new(pool);
+        let event_store =
+            PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_event_store(repo);
+        let context = event_store.load_aggregate(&id.to_string()).await?;
+
+        Ok(context.aggregate.into_result()?)
+    }
 }
 
 /// Error returned by [`Store::send`] and [`Store::load`].
