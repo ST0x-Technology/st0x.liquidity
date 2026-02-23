@@ -5,7 +5,7 @@ members = [
   "crates/event-sorcery",
   "crates/execution",
   "crates/bridge",
-  "crates/evm"
+  "crates/evm",
 ]
 resolver = "2"
 
@@ -71,6 +71,7 @@ tracing = "0.1.41"
 url = { version = "2.5.4", features = ["serde"] }
 urlencoding = "2.1"
 rand = "0.8"
+rsa = { version = "0.9.10", features = ["pem"] }
 uuid = { version = "1.11", features = ["serde", "v4"] }
 chrono-tz = "0.10.4"
 num-traits = "0.2"
@@ -81,6 +82,7 @@ tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
 rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
 rust_decimal = { version = "1.38.0", features = ["serde"] }
+st0x-evm = { path = "crates/evm" }
 num-decimal = { version = "0.2.5", default-features = false, features = [
   "num-v04",
 ] }
@@ -141,16 +143,18 @@ ts-rs = { version = "11.1.0", features = [
 rocket_ws = "0.1.1"
 toml = "0.9.11"
 rust_decimal_macros = "1.38.0"
+st0x-evm = { workspace = true, features = ["fireblocks"] }
 
 [dev-dependencies]
 httpmock.workspace = true
-proptest.workspace = true
 serial_test.workspace = true
+proptest.workspace = true
 temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"
 st0x-event-sorcery = { path = "crates/event-sorcery", features = [
   "test-support",
 ] }
+st0x-evm = { workspace = true, features = ["local-signer"] }
 st0x-execution = { path = "crates/execution", features = ["mock"] }
 tempfile = "3.24.0"
 tracing-test = "0.2.5"
@@ -158,6 +162,7 @@ bon = "3.9.0"
 st0x-hedge = { path = ".", features = ["test-support"] }
 test-log = { version = "0.2.19", features = ["trace"] }
 approx = "0.5.1"
+rsa.workspace = true
 
 [lints]
 workspace = true

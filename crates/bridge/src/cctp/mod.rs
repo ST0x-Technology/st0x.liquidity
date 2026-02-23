@@ -1321,7 +1321,7 @@ mod tests {
             let fee_mock_server = MockServer::start();
             // Mock fee endpoint for any domain pair - returns fast (1000) and standard (2000) fees
             fee_mock_server.mock(|when, then| {
-                when.method(GET).path_contains("/v2/burn/USDC/fees/");
+                when.method(GET).path_includes("/v2/burn/USDC/fees/");
                 then.status(200).json_body(serde_json::json!([
                     {"finalityThreshold": 1000, "minimumFee": 1},
                     {"finalityThreshold": 2000, "minimumFee": 0}

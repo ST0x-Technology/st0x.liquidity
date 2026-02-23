@@ -182,6 +182,7 @@ where
             self.common.ctx.evm.orderbook,
             order_owner,
             self.common.frameworks.snapshot,
+            std::time::Duration::from_secs(self.common.ctx.inventory_poll_interval),
         ));
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 
@@ -205,6 +206,7 @@ where
             self.common.frameworks.position_projection.clone(),
             self.common.frameworks.offchain_order.clone(),
             self.common.execution_threshold,
+            std::time::Duration::from_secs(self.common.ctx.position_check_interval),
         );
         let trade_cqrs = super::TradeProcessingCqrs {
             onchain_trade: self.common.frameworks.onchain_trade,
