@@ -21,6 +21,7 @@ use st0x_execution::{
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
+use crate::rebalancing::trigger::UsdcRebalancing;
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
 };
@@ -366,13 +367,22 @@ impl Ctx {
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
+        let usdc_rebalancing_enabled = match &trading_mode {
+            TradingMode::Rebalancing(ctx) => {
+                matches!(ctx.usdc, UsdcRebalancing::Enabled { .. })
+            }
+            TradingMode::Standalone { .. } => false,
+        };
+
         if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits {
-            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
-            if max_amount.inner() < minimum {
-                return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
-                    configured: max_amount.inner(),
-                    minimum,
-                });
+            if usdc_rebalancing_enabled {
+                let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+                if max_amount.inner() < minimum {
+                    return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
+                        configured: max_amount.inner(),
+                        minimum,
+                    });
+                }
             }
         }
 
@@ -713,38 +723,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn operational_limits_max_amount_below_minimum_withdrawal_fails() {
+    async fn standalone_mode_skips_usdc_withdrawal_minimum_check() {
+        // max_amount below ALPACA_MINIMUM_WITHDRAWAL is fine in standalone
+        // mode because USDC rebalancing transfers don't apply.
         let config = r#"
             database_url = ":memory:"
             [operational_limits]
             mode = "enabled"
             max_amount = "50"
-            max_shares = "2"
-            [evm]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#;
-
-        let error = Ctx::from_toml(config, dry_run_secrets_toml())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::OperationalLimitBelowMinimumWithdrawal { .. }
-            ),
-            "max_amount of $50 should fail validation (minimum is $51), got {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn operational_limits_max_amount_at_minimum_withdrawal_succeeds() {
-        let config = r#"
-            database_url = ":memory:"
-            [operational_limits]
-            mode = "enabled"
-            max_amount = "51"
             max_shares = "2"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -758,7 +744,7 @@ pub(crate) mod tests {
         let OperationalLimits::Enabled { max_amount, .. } = ctx.operational_limits else {
             panic!("Expected Enabled");
         };
-        assert_eq!(max_amount.inner(), Usdc(dec!(51)));
+        assert_eq!(max_amount.inner(), Usdc(dec!(50)));
     }
 
     #[tokio::test]
