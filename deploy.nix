@@ -87,7 +87,8 @@ in {
         text = ''
           ${deployPreamble}
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity.system \
-            -- --impure --accept-flake-config "$@"
+            -- --impure --accept-flake-config \
+            --extra-experimental-features 'nix-command flakes' "$@"
         '';
       };
 
@@ -99,7 +100,8 @@ in {
           profile="''${1:?usage: deploy-service <profile>}"
           shift
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ".#st0x-liquidity.$profile" \
-            -- --impure --accept-flake-config "$@"
+            -- --impure --accept-flake-config \
+            --extra-experimental-features 'nix-command flakes' "$@"
         '';
       };
 
@@ -109,7 +111,8 @@ in {
         text = ''
           ${deployPreamble}
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity \
-            -- --impure --accept-flake-config "$@"
+            -- --impure --accept-flake-config \
+            --extra-experimental-features 'nix-command flakes' "$@"
         '';
       };
     };

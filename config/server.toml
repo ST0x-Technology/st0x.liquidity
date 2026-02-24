@@ -17,8 +17,17 @@ deployment_block = 40850446
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
 usdc_vault_id = "0x03c31202da3b08a9957433f65fd4c1e9152fcca78910f58fe2df7a2b7b529f9f"
-fireblocks_vault_account_id = "0"
 fireblocks_environment = "production"
+fireblocks_vault_account_id = "0"
+
+[rebalancing.equity]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc]
+mode = "enabled"
+target = "0.5"
+deviation = "0.3"
 
 [rebalancing.fireblocks_chain_asset_ids]
 1 = "ETH"
@@ -75,12 +84,3 @@ wrapped = "0x02512ec661f0ba89c275ea105e31bad6fcfcf319"
 [rebalancing.equities.tRKLB]
 unwrapped = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
 wrapped = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-
-[rebalancing.equity]
-target = "0.5"
-deviation = "0.2"
-
-[rebalancing.usdc]
-mode = "enabled"
-target = "0.5"
-deviation = "0.3"
