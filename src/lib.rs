@@ -17,7 +17,10 @@ use crate::config::{BrokerCtx, Ctx};
 
 mod alpaca_wallet;
 pub mod api;
-mod bindings;
+#[cfg(any(test, feature = "test-support"))]
+pub mod bindings;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) mod bindings;
 pub mod cli;
 mod conductor;
 pub mod config;
@@ -42,6 +45,30 @@ mod vault_registry;
 mod wrapper;
 
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use config::TradingMode;
+#[cfg(any(test, feature = "test-support"))]
+pub use inventory::ImbalanceThreshold;
+#[cfg(any(test, feature = "test-support"))]
+pub use offchain_order::{Dollars, OffchainOrder, OffchainOrderId};
+#[cfg(any(test, feature = "test-support"))]
+pub use onchain::EvmCtx;
+#[cfg(any(test, feature = "test-support"))]
+pub use position::Position;
+#[cfg(any(test, feature = "test-support"))]
+pub use rebalancing::{
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, UsdcRebalancing,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use threshold::ExecutionThreshold;
+#[cfg(any(test, feature = "test-support"))]
+pub use wrapper::EquityTokenAddresses;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use equity_redemption::{EquityRedemption, RedemptionAggregateId};
+#[cfg(any(test, feature = "test-support"))]
+pub use onchain::USDC_BASE;
 
 #[cfg(test)]
 mod integration_tests;
