@@ -66,7 +66,7 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use uuid::Uuid;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 
 use crate::alpaca_wallet::AlpacaTransferId;
 use crate::threshold::Usdc;
@@ -487,7 +487,8 @@ impl EventSourced for UsdcRebalance {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
-    const PROJECTION: Option<Table> = None;
+    type Materialized = Nil;
+    const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

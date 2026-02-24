@@ -44,7 +44,8 @@ impl EventSourced for Position {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "Position";
-    const PROJECTION: Option<Table> = Some(Table("position_view"));
+    type Materialized = Table;
+    const PROJECTION: Table = Table("position_view");
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

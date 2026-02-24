@@ -40,16 +40,16 @@ pub(super) struct QueryManifest {
 
 /// All query processors after wiring is complete.
 pub(super) struct WiredQueries {
-    pub(super) position_view: Projection<Position>,
+    pub(super) position_view: Arc<Projection<Position>>,
 }
 
 /// Built CQRS frameworks from the wiring process.
 pub(super) struct BuiltFrameworks {
-    pub(super) position: Store<Position>,
-    pub(super) mint: Store<TokenizedEquityMint>,
-    pub(super) redemption: Store<EquityRedemption>,
-    pub(super) usdc: Store<UsdcRebalance>,
-    pub(super) snapshot: Store<InventorySnapshot>,
+    pub(super) position: Arc<Store<Position>>,
+    pub(super) mint: Arc<Store<TokenizedEquityMint>>,
+    pub(super) redemption: Arc<Store<EquityRedemption>>,
+    pub(super) usdc: Arc<Store<UsdcRebalance>>,
+    pub(super) snapshot: Arc<Store<InventorySnapshot>>,
 }
 
 impl QueryManifest {
@@ -78,10 +78,7 @@ impl QueryManifest {
             event_broadcaster,
         } = self;
 
-        let position_projection = Projection::<Position>::sqlite(pool.clone())?;
-
-        let position = StoreBuilder::<Position>::new(pool.clone())
-            .with(Arc::new(position_projection.clone()))
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(rebalancing_trigger.clone())
             .build(())
             .await?;

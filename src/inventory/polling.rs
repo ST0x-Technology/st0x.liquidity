@@ -50,7 +50,7 @@ where
     vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
-    snapshot: Store<InventorySnapshot>,
+    snapshot: Arc<Store<InventorySnapshot>>,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -64,7 +64,7 @@ where
         vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         order_owner: Address,
-        snapshot: Store<InventorySnapshot>,
+        snapshot: Arc<Store<InventorySnapshot>>,
     ) -> Self {
         Self {
             raindex_service,

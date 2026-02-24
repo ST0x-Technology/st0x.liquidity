@@ -74,7 +74,8 @@ impl EventSourced for VaultRegistry {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "VaultRegistry";
-    const PROJECTION: Option<Table> = Some(Table("vault_registry_view"));
+    type Materialized = Table;
+    const PROJECTION: Table = Table("vault_registry_view");
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

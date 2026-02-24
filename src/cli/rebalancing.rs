@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_event_sorcery::{Projection, StoreBuilder};
+use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{Evm, OpenChainErrorRegistry, ReadOnlyEvm};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
@@ -18,6 +18,7 @@ use super::TransferDirection;
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
+use crate::equity_redemption::EquityRedemption;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
@@ -27,7 +28,8 @@ use crate::threshold::Usdc;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
-use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
+use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 
@@ -65,46 +67,49 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         rebalancing_ctx.redemption_wallet,
     ));
 
+    let (_vault_store, vault_registry_projection) =
+        StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await?;
+
+    let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
+        base_caller.clone(),
+        rebalancing_ctx.equities.clone(),
+    ));
+
+    let raindex = Arc::new(RaindexService::new(
+        base_caller.clone(),
+        ctx.evm.orderbook,
+        vault_registry_projection,
+        wallet,
+    ));
+
+    let services = EquityTransferServices {
+        raindex: raindex.clone(),
+        tokenizer: tokenization_service.clone(),
+        wrapper: wrapper.clone(),
+    };
+
+    let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        .build(services.clone())
+        .await?;
+
+    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        .build(services)
+        .await?;
+
+    let equity_transfer = CrossVenueEquityTransfer::new(
+        raindex,
+        tokenization_service,
+        wrapper,
+        wallet,
+        mint_store,
+        redemption_store,
+    );
+
     match direction {
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
-
-            let vault_registry_projection =
-                Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
-            let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-                base_caller.clone(),
-                rebalancing_ctx.equities.clone(),
-            ));
-
-            let raindex = Arc::new(RaindexService::new(
-                base_caller.clone(),
-                ctx.evm.orderbook,
-                vault_registry_projection.clone(),
-                wallet,
-            ));
-
-            let services = EquityTransferServices {
-                raindex: raindex.clone(),
-                tokenizer: tokenization_service.clone(),
-                wrapper: wrapper.clone(),
-            };
-
-            let mint_store = Arc::new(
-                StoreBuilder::new(pool.clone())
-                    .build(services.clone())
-                    .await?,
-            );
-            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
-
-            let equity_transfer = CrossVenueEquityTransfer::new(
-                raindex,
-                tokenization_service,
-                wrapper,
-                wallet,
-                mint_store,
-                redemption_store,
-            );
-
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
 
             CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
@@ -121,42 +126,6 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
         TransferDirection::ToAlpaca => {
             writeln!(stdout, "   Sending tokens for redemption...")?;
-
-            let vault_registry_projection =
-                Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
-            let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-                base_caller.clone(),
-                rebalancing_ctx.equities.clone(),
-            ));
-
-            let raindex = Arc::new(RaindexService::new(
-                base_caller.clone(),
-                ctx.evm.orderbook,
-                vault_registry_projection,
-                wallet,
-            ));
-
-            let services = EquityTransferServices {
-                raindex: raindex.clone(),
-                tokenizer: tokenization_service.clone(),
-                wrapper: wrapper.clone(),
-            };
-
-            let mint_store = Arc::new(
-                StoreBuilder::new(pool.clone())
-                    .build(services.clone())
-                    .await?,
-            );
-            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(services).await?);
-
-            let equity_transfer = CrossVenueEquityTransfer::new(
-                raindex,
-                tokenization_service,
-                wrapper,
-                wallet,
-                mint_store,
-                redemption_store,
-            );
 
             CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
                 &equity_transfer,
@@ -227,14 +196,21 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         base_wallet: rebalancing_ctx.base_wallet().clone(),
     })?);
 
-    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+    let (_vault_store, vault_registry_projection) =
+        StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await?;
+
     let vault_service = Arc::new(RaindexService::new(
         rebalancing_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         owner,
     ));
-    let usdc_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
+
+    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        .build(())
+        .await?;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,

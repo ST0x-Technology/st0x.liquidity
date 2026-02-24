@@ -93,7 +93,7 @@ impl<Entity: EventSourced> StoreBuilder<Entity> {
 }
 
 /// Projected entities: auto-creates and wires a [`Projection`],
-/// returning `(Store, Projection)`.
+/// returning `(Arc<Store>, Arc<Projection>)`.
 impl<Entity: EventSourced<Materialized = Table> + 'static> StoreBuilder<Entity, Table>
 where
     Entity::Id: Clone,

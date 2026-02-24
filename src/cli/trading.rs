@@ -10,7 +10,7 @@ use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use st0x_event_sorcery::{Projection, Store, StoreBuilder};
+use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
@@ -326,13 +326,9 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let position_projection = Projection::<Position>::sqlite(pool.clone())?;
-    let position_store: Arc<Store<Position>> = Arc::new(
-        StoreBuilder::new(pool.clone())
-            .with(Arc::new(position_projection.clone()))
-            .build(())
-            .await?,
-    );
+    let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        .build(())
+        .await?;
     let (offchain_order_store, _) = build_offchain_order_cqrs(pool, order_placer).await?;
 
     update_position_aggregate(&position_store, &onchain_trade, ctx.execution_threshold).await;
@@ -344,7 +340,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let executor = MockExecutor::new();
     let Some(params) = check_execution_readiness(
         &executor,
-        &position_projection,
+        &*position_projection,
         base_symbol,
         executor_type,
         &ctx.operational_limits,
