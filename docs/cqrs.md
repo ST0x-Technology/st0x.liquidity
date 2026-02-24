@@ -189,7 +189,7 @@ let store = StoreBuilder::<OnChainTrade>::new(pool)
     .await?;
 ```
 
-Projections are created and wired automatically — no manual
+Projections are created and wired automatically - no manual
 `Projection::sqlite()` or `.with(projection)` calls needed. This eliminates a
 class of bugs where forgetting to wire a projection causes silent data
 staleness.

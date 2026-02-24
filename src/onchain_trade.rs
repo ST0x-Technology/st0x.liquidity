@@ -15,9 +15,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use st0x_execution::{Direction, Symbol};
-
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_execution::{Direction, Symbol};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OnChainTradeId {

@@ -883,9 +883,8 @@ mod tests {
         TimeInForce,
     };
 
-    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
-
     use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
 
