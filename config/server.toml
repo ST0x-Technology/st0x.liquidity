@@ -3,7 +3,9 @@ log_level = "debug"
 server_port = 8001
 
 [operational_limits]
-mode = "disabled"
+mode = "enabled"
+max_amount = "100"
+max_shares = "2"
 
 [hyperdx]
 service_name = "st0x-hedge"
