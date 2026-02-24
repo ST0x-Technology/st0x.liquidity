@@ -238,7 +238,9 @@ impl<E: Evm> RaindexService<E> {
         let decimal = self
             .get_vault_balance::<Registry>(owner, token, vault_id)
             .await?;
-        Ok(FractionalShares::new(decimal))
+        // Equity tokens have 18 onchain decimals. Rain Float -> Decimal
+        // conversion can introduce spurious digits beyond dp 18.
+        Ok(FractionalShares::new(decimal.round_dp(18)))
     }
 
     /// Gets the USDC balance of a vault on Base.
@@ -250,7 +252,8 @@ impl<E: Evm> RaindexService<E> {
         let decimal = self
             .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id)
             .await?;
-        Ok(Usdc(decimal))
+        // USDC has 6 onchain decimals. Normalize for same reason as above.
+        Ok(Usdc(decimal.round_dp(USDC_DECIMALS.into())))
     }
 
     async fn get_vault_balance<Registry: IntoErrorRegistry>(

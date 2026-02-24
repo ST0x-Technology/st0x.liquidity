@@ -99,6 +99,13 @@ impl Symbol {
         }
         Ok(Self(symbol))
     }
+    pub fn inner(&self) -> String {
+        self.0.clone()
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_new(symbol: String) -> Self {
+        Self(symbol)
+    }
 }
 
 impl<'de> Deserialize<'de> for Symbol {
@@ -338,7 +345,11 @@ impl FractionalShares {
 
         raw_decimal
             .checked_div(TOKENIZED_EQUITY_SCALE)
-            .map(Self)
+            // U256 values are integer multiples of 10^-18, so the result
+            // has at most 18 decimal places. Decimal's 96-bit mantissa can
+            // produce spurious digits beyond dp 18 after division; truncate
+            // them to avoid precision artifacts propagating downstream.
+            .map(|decimal| Self(decimal.round_dp(18)))
             .ok_or(SharesConversionError::Overflow)
     }
 }

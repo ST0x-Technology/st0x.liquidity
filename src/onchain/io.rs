@@ -155,8 +155,13 @@ impl TradeDetails {
         if equity_amount_raw < Decimal::ZERO {
             return Err(TradeValidationError::NegativeShares(equity_amount_raw).into());
         }
-        let equity_amount = FractionalShares::new(equity_amount_raw);
-        let usdc_amount = Usdc::new(usdc_amount_raw)?;
+        // Tokenized equities have 18 onchain decimals. Rain Float -> Decimal
+        // conversion can introduce spurious digits beyond dp 18 due to
+        // Decimal's 96-bit mantissa. Normalize to avoid precision artifacts
+        // propagating into position tracking and inventory checks.
+        let equity_amount = FractionalShares::new(equity_amount_raw.round_dp(18));
+        // USDC has 6 onchain decimals — same normalization as equity above.
+        let usdc_amount = Usdc::new(usdc_amount_raw.round_dp(6))?;
 
         Ok(Self {
             ticker,
