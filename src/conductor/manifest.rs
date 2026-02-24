@@ -8,11 +8,10 @@
 //! # Adding a new query processor
 //!
 //! 1. Add field to [`QueryManifest`]
-//! 2. Add corresponding field to [`WiredQueries`] if needed
-//! 3. Create it in [`QueryManifest::new()`]
-//! 4. Wire it in [`QueryManifest::build_frameworks()`] -
+//! 2. Create it in [`QueryManifest::new()`]
+//! 3. Wire it in [`QueryManifest::build()`] -
 //!    destructuring forces you to handle it
-//! 5. Extract and return it in [`WiredQueries`]
+//! 4. Add output to [`BuiltFrameworks`] if needed
 
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -38,14 +37,10 @@ pub(super) struct QueryManifest {
     event_broadcaster: Arc<EventBroadcaster>,
 }
 
-/// All query processors after wiring is complete.
-pub(super) struct WiredQueries {
-    pub(super) position_view: Arc<Projection<Position>>,
-}
-
 /// Built CQRS frameworks from the wiring process.
 pub(super) struct BuiltFrameworks {
     pub(super) position: Arc<Store<Position>>,
+    pub(super) position_projection: Arc<Projection<Position>>,
     pub(super) mint: Arc<Store<TokenizedEquityMint>>,
     pub(super) redemption: Arc<Store<EquityRedemption>>,
     pub(super) usdc: Arc<Store<UsdcRebalance>>,
@@ -72,7 +67,7 @@ impl QueryManifest {
         self,
         pool: SqlitePool,
         services: EquityTransferServices,
-    ) -> anyhow::Result<(BuiltFrameworks, WiredQueries)> {
+    ) -> anyhow::Result<BuiltFrameworks> {
         let Self {
             rebalancing_trigger,
             event_broadcaster,
@@ -106,18 +101,14 @@ impl QueryManifest {
             .build(())
             .await?;
 
-        Ok((
-            BuiltFrameworks {
-                position,
-                mint,
-                redemption,
-                usdc,
-                snapshot,
-            },
-            WiredQueries {
-                position_view: position_projection,
-            },
-        ))
+        Ok(BuiltFrameworks {
+            position,
+            position_projection,
+            mint,
+            redemption,
+            usdc,
+            snapshot,
+        })
     }
 }
 
@@ -131,6 +122,8 @@ mod tests {
     use super::*;
     use crate::config::OperationalLimits;
     use crate::inventory::{ImbalanceThreshold, InventoryView};
+    use st0x_execution::Symbol;
+
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::trigger::UsdcRebalancing;
@@ -179,13 +172,13 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
         };
 
-        let (_frameworks, queries) = manifest.build(pool, services).await.unwrap();
+        let frameworks = manifest.build(pool, services).await.unwrap();
 
         // Verify stores are usable by checking that loading a
         // nonexistent position returns None
-        let result = queries
-            .position_view
-            .load(&st0x_execution::Symbol::new("AAPL").unwrap())
+        let result = frameworks
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
             .await
             .unwrap();
         assert!(result.is_none());

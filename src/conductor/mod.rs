@@ -383,7 +383,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let event_broadcaster = Arc::new(EventBroadcaster::new(deps.event_sender));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
-        let (built, wired) = manifest
+        let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)
             .await?;
 
@@ -411,7 +411,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         Ok(RebalancingInfrastructure {
             position: built.position,
-            position_projection: wired.position_view,
+            position_projection: built.position_projection,
             snapshot: built.snapshot,
             rebalancer: handle,
         })
