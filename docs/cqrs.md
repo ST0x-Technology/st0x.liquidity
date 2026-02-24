@@ -76,9 +76,10 @@ impl EventSourced for MyEntity {
     type Command = MyEntityCommand;
     type Error = Never;         // or a thiserror type
     type Services = ();         // or Arc<dyn SomeService>
+    type Materialized = Table;  // Table for projected, Nil for non-projected
 
     const AGGREGATE_TYPE: &'static str = "MyEntity";
-    const PROJECTION: Option<Table> = Some(Table("my_entity_view"));
+    const PROJECTION: Table = Table("my_entity_view");
     const SCHEMA_VERSION: u64 = 1;
 
     // Event-side: reconstruct state from events
@@ -117,6 +118,7 @@ impl EventSourced for MyEntity {
 | `Never`                | Error type for infallible entities           |
 | `DomainEvent`          | Trait for event serialization (from cqrs-es) |
 | `Table`                | Newtype for projection table name            |
+| `Nil`                  | Marker for entities without projections      |
 
 ## Sending Commands
 
@@ -139,15 +141,18 @@ Production code reads entity state through `Projection`, never by loading
 aggregates directly:
 
 ```rust
-let projection: Projection<Position> = Projection::sqlite(pool.clone())?;
+// Projection is returned by StoreBuilder::build() for Table entities
+let (store, projection) = StoreBuilder::<Position>::new(pool)
+    .build(())
+    .await?;
 
 // Load by typed ID
 let position: Option<Position> = projection.load(&symbol).await?;
 ```
 
 Projections are materialized views stored in SQLite tables (named by
-`PROJECTION` constant). They're automatically updated when events are persisted
-through a `Store` that has the projection wired.
+`PROJECTION` constant). `StoreBuilder::build()` automatically creates and wires
+projections for entities with `type Materialized = Table`.
 
 ### Filtered Queries with Columns
 
@@ -161,19 +166,33 @@ let pending_orders: Vec<OffchainOrder> = projection
 
 ## Wiring: StoreBuilder
 
-`StoreBuilder` wires projections and reactors to a `Store` at startup. It uses
-type-level linked lists (`Cons`/`Nil`) to ensure all required processors are
-wired at compile time.
+`StoreBuilder` wires reactors to a `Store` at startup and auto-wires projections
+based on the entity's `Materialized` type. It uses type-level linked lists
+(`Cons`/`Nil`) to ensure all required processors are wired at compile time.
+
+For **projected entities** (`type Materialized = Table`), `build()` returns
+`(Arc<Store>, Arc<Projection>)`:
 
 ```rust
-let projection = Projection::<Position>::sqlite(pool.clone())?;
-
-let (store, (trigger, ())) = StoreBuilder::<Position>::new(pool)
-    .with(projection.clone())  // wire the projection
-    .wire(trigger)             // wire a reactor (via Unwired)
-    .build(services)
+let (store, projection) = StoreBuilder::<Position>::new(pool)
+    .with(rebalancing_trigger)  // wire a reactor
+    .build(())
     .await?;
 ```
+
+For **non-projected entities** (`type Materialized = Nil`), `build()` returns
+`Arc<Store>`:
+
+```rust
+let store = StoreBuilder::<OnChainTrade>::new(pool)
+    .build(())
+    .await?;
+```
+
+Projections are created and wired automatically — no manual
+`Projection::sqlite()` or `.with(projection)` calls needed. This eliminates a
+class of bugs where forgetting to wire a projection causes silent data
+staleness.
 
 The `QueryManifest` pattern in `conductor/manifest.rs` ensures exhaustive wiring
 by destructuring all processors.
@@ -535,7 +554,7 @@ use crate::event_sourced::SqliteQuery;
 // SqliteQuery<Position> wraps
 // GenericQuery<SqliteViewRepository<Lifecycle<Position>,
 //     Lifecycle<Position>>>
-let query: Arc<SqliteQuery<Position>> = /* built by CqrsBuilder */;
+let query: Arc<SqliteQuery<Position>> = /* built by StoreBuilder */;
 
 // Load view by aggregate ID
 let view: Option<Lifecycle<Position>> =
@@ -612,7 +631,7 @@ Pass services when building the `Store`:
 
 ```rust
 let services: Arc<dyn MyService> = Arc::new(MyServiceImpl::new());
-let store: Store<MyEntity> = CqrsBuilder::<MyEntity>::new(pool)
+let store = StoreBuilder::<MyEntity>::new(pool)
     .build(services)
     .await?;
 ```
@@ -649,8 +668,8 @@ For entities that don't need services, use `type Services = ()`.
 ## Single Framework Instance Per Aggregate
 
 **CRITICAL**: Each entity type must have exactly ONE `Store<Entity>` instance,
-constructed once in `Conductor::start` via `CqrsBuilder`, then shared. The
-`CqrsBuilder` enforces compile-time query wiring via type-level linked lists
+constructed once in `Conductor::start` via `StoreBuilder`, then shared. The
+`StoreBuilder` enforces compile-time query wiring via type-level linked lists
 (`Cons`/`Nil`), making it impossible to silently forget wiring a query
 processor.
 
@@ -664,17 +683,17 @@ while the application continues operating as if everything worked.
 ### Rules
 
 - **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` directly in
-  the server binary -- use `CqrsBuilder` instead
+  the server binary -- use `StoreBuilder` instead
 - **FORBIDDEN**: Creating multiple `Store<Entity>` instances for the same entity
   type in the bot flow
-- **REQUIRED**: Wire all query processors via `CqrsBuilder::wire()` before
+- **REQUIRED**: Wire all query processors via `StoreBuilder::wire()` before
   calling `build()`
 - **ALLOWED**: Direct construction in test code (via `wire::test_cqrs()`), CLI
   code, and migration code (different execution contexts)
 
 ### Adding a New Query Processor
 
-1. Wire it via `CqrsBuilder::wire()` in `Conductor::start`
+1. Wire it via `StoreBuilder::wire()` in `Conductor::start`
 2. Never create a new framework instance just to add a processor
 3. The builder tracks wired queries at the type level -- if a query is required
    by the manifest but not wired, it's a compile-time error
