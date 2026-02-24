@@ -452,9 +452,9 @@ mod tests {
         type Command = CounterCommand;
         type Error = CounterError;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
-        type Materialized = Nil;
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 

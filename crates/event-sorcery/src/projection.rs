@@ -450,9 +450,9 @@ mod tests {
         type Command = ();
         type Error = Never;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "TestEntity";
-        type Materialized = Nil;
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 

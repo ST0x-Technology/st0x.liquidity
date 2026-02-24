@@ -340,7 +340,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let executor = MockExecutor::new();
     let Some(params) = check_execution_readiness(
         &executor,
-        &*position_projection,
+        &position_projection,
         base_symbol,
         executor_type,
         &ctx.operational_limits,

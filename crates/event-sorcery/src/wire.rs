@@ -185,9 +185,9 @@ mod tests {
         type Command = ();
         type Error = Never;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateA";
-        type Materialized = Nil;
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
@@ -215,9 +215,9 @@ mod tests {
         type Command = ();
         type Error = Never;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateB";
-        type Materialized = Nil;
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 

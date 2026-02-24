@@ -88,10 +88,9 @@ impl EventSourced for OffchainOrder {
     type Command = OffchainOrderCommand;
     type Error = OffchainOrderError;
     type Services = Arc<dyn OrderPlacer>;
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
-
-    type Materialized = Table;
     const PROJECTION: Table = Table("offchain_order_view");
     const SCHEMA_VERSION: u64 = 1;
 

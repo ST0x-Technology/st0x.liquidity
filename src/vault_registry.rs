@@ -72,9 +72,9 @@ impl EventSourced for VaultRegistry {
     type Command = VaultRegistryCommand;
     type Error = Never;
     type Services = ();
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "VaultRegistry";
-    type Materialized = Table;
     const PROJECTION: Table = Table("vault_registry_view");
     const SCHEMA_VERSION: u64 = 1;
 

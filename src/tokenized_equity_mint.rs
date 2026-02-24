@@ -388,10 +388,9 @@ impl EventSourced for TokenizedEquityMint {
     type Command = TokenizedEquityMintCommand;
     type Error = TokenizedEquityMintError;
     type Services = EquityTransferServices;
+    type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
-
-    type Materialized = Nil;
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 

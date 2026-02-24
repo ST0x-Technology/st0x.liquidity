@@ -42,10 +42,9 @@ impl EventSourced for Position {
     type Command = PositionCommand;
     type Error = PositionError;
     type Services = ();
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "Position";
-
-    type Materialized = Table;
     const PROJECTION: Table = Table("position_view");
     const SCHEMA_VERSION: u64 = 1;
 

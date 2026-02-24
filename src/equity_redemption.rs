@@ -355,9 +355,9 @@ impl EventSourced for EquityRedemption {
     type Command = EquityRedemptionCommand;
     type Error = EquityRedemptionError;
     type Services = EquityTransferServices;
+    type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "EquityRedemption";
-    type Materialized = Nil;
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 

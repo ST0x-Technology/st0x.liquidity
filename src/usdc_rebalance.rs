@@ -485,10 +485,9 @@ impl EventSourced for UsdcRebalance {
     type Command = UsdcRebalanceCommand;
     type Error = UsdcRebalanceError;
     type Services = ();
+    type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
-
-    type Materialized = Nil;
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 

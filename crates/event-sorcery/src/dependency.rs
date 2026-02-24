@@ -418,9 +418,9 @@ mod tests {
         type Command = ();
         type Error = AlphaError;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Alpha";
-        type Materialized = Nil;
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
@@ -475,9 +475,9 @@ mod tests {
         type Command = ();
         type Error = BetaError;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Beta";
-        type Materialized = Nil;
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
