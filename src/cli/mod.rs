@@ -187,7 +187,11 @@ pub enum Commands {
     ///
     /// Shows all deposits and withdrawals for the Alpaca account.
     /// Useful for debugging transfer status and verifying deposits.
-    AlpacaTransfers,
+    AlpacaTransfers {
+        /// Only show pending transfers
+        #[arg(long)]
+        pending: bool,
+    },
 
     /// Deposit tokens into a Raindex vault
     ///
@@ -415,7 +419,9 @@ enum SimpleCommand {
     AlpacaUnwhitelist {
         address: Address,
     },
-    AlpacaTransfers,
+    AlpacaTransfers {
+        pending: bool,
+    },
     AlpacaConvert {
         direction: ConvertDirection,
         amount: Usdc,
@@ -524,7 +530,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
         Commands::AlpacaWhitelistList => Ok(SimpleCommand::AlpacaWhitelistList),
         Commands::AlpacaUnwhitelist { address } => Ok(SimpleCommand::AlpacaUnwhitelist { address }),
-        Commands::AlpacaTransfers => Ok(SimpleCommand::AlpacaTransfers),
+        Commands::AlpacaTransfers { pending } => Ok(SimpleCommand::AlpacaTransfers { pending }),
         Commands::AlpacaConvert { direction, amount } => {
             Ok(SimpleCommand::AlpacaConvert { direction, amount })
         }
@@ -647,8 +653,8 @@ async fn run_simple_command<W: Write>(
             )
             .await
         }
-        SimpleCommand::AlpacaTransfers => {
-            alpaca_wallet::alpaca_transfers_command(stdout, ctx).await
+        SimpleCommand::AlpacaTransfers { pending } => {
+            alpaca_wallet::alpaca_transfers_command(stdout, pending, ctx).await
         }
         SimpleCommand::AlpacaConvert { direction, amount } => {
             alpaca_wallet::alpaca_convert_command(stdout, direction, amount, ctx).await
