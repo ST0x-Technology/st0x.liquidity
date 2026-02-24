@@ -554,7 +554,7 @@ mod tests {
 
         // Account endpoint is hit twice: once during try_from_ctx (verify_account)
         // and once during get_inventory (get_account_details for cash balance)
-        account_mock.assert_hits(2);
+        account_mock.assert_calls(2);
         positions_mock.assert();
         assert!(matches!(result, crate::InventoryResult::Fetched(_)));
     }
@@ -739,9 +739,9 @@ mod tests {
         executor.place_market_order(order2).await.unwrap();
 
         // Asset endpoint should only be called once
-        asset_mock.assert_hits(1);
+        asset_mock.assert_calls(1);
         // Order endpoint should be called twice
-        order_mock.assert_hits(2);
+        order_mock.assert_calls(2);
     }
 
     #[tokio::test]
@@ -811,7 +811,7 @@ mod tests {
         executor.place_market_order(order2).await.unwrap();
 
         // Asset endpoint should be called twice due to cache expiration
-        asset_mock.assert_hits(2);
-        order_mock.assert_hits(2);
+        asset_mock.assert_calls(2);
+        order_mock.assert_calls(2);
     }
 }
