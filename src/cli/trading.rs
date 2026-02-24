@@ -342,9 +342,14 @@ pub(super) async fn process_found_trade<W: Write>(
 
     // CLI test command uses MockExecutor (market always open)
     let executor = MockExecutor::new();
-    let Some(params) =
-        check_execution_readiness(&executor, &position_projection, base_symbol, executor_type)
-            .await?
+    let Some(params) = check_execution_readiness(
+        &executor,
+        &position_projection,
+        base_symbol,
+        executor_type,
+        &ctx.operational_limits,
+    )
+    .await?
     else {
         writeln!(
             stdout,
@@ -504,7 +509,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{LogLevel, OperationalLimits, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
@@ -516,6 +521,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),

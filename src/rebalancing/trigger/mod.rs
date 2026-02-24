@@ -3,6 +3,8 @@
 mod equity;
 mod usdc;
 
+pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
+
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
@@ -25,6 +27,7 @@ use st0x_evm::fireblocks::{
 };
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
+use crate::config::OperationalLimits;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
@@ -264,6 +267,7 @@ impl std::fmt::Debug for RebalancingCtx {
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
+    pub(crate) limits: OperationalLimits,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -624,6 +628,7 @@ impl RebalancingTrigger {
             wrapped_token,
             unwrapped_token,
             &vault_ratio,
+            &self.config.limits,
         )
         .await?
         else {
@@ -671,8 +676,12 @@ impl RebalancingTrigger {
         };
 
         let threshold = ImbalanceThreshold { target, deviation };
-        let Ok(operation) =
-            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory).await
+        let Ok(operation) = usdc::check_imbalance_and_build_operation(
+            &threshold,
+            &self.inventory,
+            &self.config.limits,
+        )
+        .await
         else {
             return;
         };
@@ -973,6 +982,7 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
+            limits: OperationalLimits::Disabled,
         }
     }
 
@@ -1043,6 +1053,7 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: test_config().equity,
                 usdc: UsdcRebalancing::Disabled,
+                limits: OperationalLimits::Disabled,
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,

@@ -144,7 +144,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{BrokerCtx, LogLevel, TradingMode};
+    use crate::config::{BrokerCtx, LogLevel, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -153,6 +153,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),

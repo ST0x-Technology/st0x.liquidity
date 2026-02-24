@@ -167,6 +167,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
+    use crate::config::OperationalLimits;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -233,6 +234,7 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
+            limits: OperationalLimits::Disabled,
         };
 
         assert_eq!(trigger_config.equity.target, dec!(0.5));
@@ -246,6 +248,7 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
+            limits: OperationalLimits::Disabled,
         };
 
         let UsdcRebalancing::Enabled { target, deviation } = trigger_config.usdc else {

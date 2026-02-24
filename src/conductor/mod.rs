@@ -30,7 +30,7 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
-use crate::config::{Ctx, CtxError};
+use crate::config::{Ctx, CtxError, OperationalLimits};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
@@ -72,6 +72,7 @@ pub(crate) struct TradeProcessingCqrs {
     pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) execution_threshold: ExecutionThreshold,
+    pub(crate) operational_limits: OperationalLimits,
 }
 
 pub(crate) struct Conductor {
@@ -381,6 +382,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             RebalancingTriggerConfig {
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc.clone(),
+                limits: deps.ctx.operational_limits.clone(),
             },
             deps.vault_registry,
             deps.ctx.evm.orderbook,
@@ -603,6 +605,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     position_projection: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
+    operational_limits: OperationalLimits,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -625,6 +628,7 @@ where
                 &position_projection,
                 &offchain_order,
                 &execution_threshold,
+                &operational_limits,
             )
             .await
             {
@@ -1189,6 +1193,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
         &cqrs.position_projection,
         base_symbol,
         executor_type,
+        &cqrs.operational_limits,
     )
     .await?
     else {
@@ -1336,13 +1341,15 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     position_projection: &Projection<Position>,
     offchain_order: &Arc<Store<OffchainOrder>>,
     threshold: &ExecutionThreshold,
+    limits: &OperationalLimits,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let ready_positions = check_all_positions(executor, position_projection, executor_type).await?;
+    let ready_positions =
+        check_all_positions(executor, position_projection, executor_type, limits).await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1542,6 +1549,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
+            operational_limits: OperationalLimits::Disabled,
         }
     }
 
@@ -2816,6 +2824,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
+            operational_limits: OperationalLimits::Disabled,
         }
     }
 
@@ -3151,6 +3160,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
+            &cqrs.operational_limits,
         )
         .await
         .unwrap();
@@ -3345,6 +3355,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
+                limits: OperationalLimits::Disabled,
             },
             vault_registry,
             orderbook,
@@ -3430,6 +3441,7 @@ mod tests {
                     target: threshold.target,
                     deviation: threshold.deviation,
                 },
+                limits: OperationalLimits::Disabled,
             },
             vault_registry,
             orderbook,
@@ -3528,6 +3540,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
+                limits: OperationalLimits::Disabled,
             },
             vault_registry,
             orderbook,
@@ -3649,6 +3662,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
+                limits: OperationalLimits::Disabled,
             },
             vault_registry,
             orderbook,
@@ -3923,6 +3937,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
+            &cqrs.operational_limits,
         )
         .await
         .unwrap();
@@ -4005,6 +4020,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
+            &cqrs.operational_limits,
         )
         .await
         .unwrap();

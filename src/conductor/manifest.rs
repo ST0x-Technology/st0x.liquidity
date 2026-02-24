@@ -132,6 +132,7 @@ mod tests {
     use tokio::sync::{RwLock, broadcast, mpsc};
 
     use super::*;
+    use crate::config::OperationalLimits;
     use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -150,6 +151,7 @@ mod tests {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
+            limits: OperationalLimits::Disabled,
         }
     }
 

@@ -310,6 +310,10 @@ async execution flows per event. Idempotency via `(tx_hash, log_index)` keys.
 Plaintext config (`--config`, see `example.config.toml`) and encrypted secrets
 (`--secrets`, see `example.secrets.toml`).
 
+**CRITICAL: No silent fallback defaults.** Unless explicitly told otherwise,
+every operational parameter must be explicitly configured -- missing config
+fields must fail in tests and at startup, not silently assume values.
+
 ### Naming Conventions
 
 Code names must be consistent with **[docs/domain.md](docs/domain.md)**, which
@@ -463,19 +467,9 @@ is the source of truth for terminology and naming conventions.
     `#[source]`
   - **REQUIRED**: Discover error variants as needed during implementation, not
     preemptively
-  - **Principle**: Error types must enable debugging and preserve all context -
-    opaque strings make debugging impossible
-  - When adding new error variants:
-    1. Only add variants when you encounter actual errors during implementation
-    2. Use `#[from]` for error types from external crates
-    3. Use `#[source]` for wrapped errors in struct variants
-    4. Never use `.to_string()`, `.map_err(|e| Foo(e.to_string()))`, or similar
-       patterns
-    5. If an error needs context, use a struct variant with fields + `#[source]`
-  - **FORBIDDEN: `.map_err` for error conversion**: Always use `#[from]` on
-    error variants and `?` for conversion. `.map_err` is verbose boilerplate
-    that `#[from]` eliminates. If you need to log the error before converting,
-    use `.inspect_err(|error| error!(?error, "context"))` chained before `?`
+  - **FORBIDDEN: `.map_err` for error conversion**: Use `#[from]` + `?` instead.
+    To log before converting, chain
+    `.inspect_err(|error| error!(?error, "context"))` before `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
@@ -499,30 +493,13 @@ is the source of truth for terminology and naming conventions.
 
 ### CRITICAL: Financial Data Integrity
 
-**This is a mission-critical financial application. The following patterns are
-STRICTLY FORBIDDEN and can result in catastrophic financial losses:**
+**NEVER** silently mask failures on financial values: no defensive capping,
+fallback defaults, precision truncation, `unwrap_or()`, `unwrap_or_default()`.
+ALL financial operations must use explicit error handling.
 
-**NEVER** silently mask failures: no defensive capping, fallback defaults,
-precision truncation, `unwrap_or()`, `unwrap_or_default()`, or graceful
-degradation on financial values. ALL financial operations must use explicit
-error handling with proper error propagation.
-
-#### Error Categories That Must Fail Fast
-
-1. **Numeric Conversions**: Any conversion between numeric types must use
-   `try_into()` or equivalent
-2. **Precision Loss**: Operations that could lose precision must be explicit
-   about it
-3. **Range Violations**: Values outside expected ranges must error, not clamp
-4. **Parse Failures**: String-to-number parsing must propagate parse errors
-5. **Arithmetic Operations**: Use checked arithmetic for all financial
-   calculations
-6. **Database Constraints**: Let database constraints fail rather than masking
-   violations
-
-**Remember: In financial applications, ALWAYS fail fast with clear errors rather
-than continue with potentially corrupted data. Silent data corruption leads to
-massive losses and regulatory violations.**
+**Must fail fast**: numeric conversions (`try_into()`), precision loss, range
+violations (error, not clamp), parse failures, arithmetic (checked), database
+constraints. Silent data corruption leads to massive losses.
 
 ### CRITICAL: Security and Secrets Management
 

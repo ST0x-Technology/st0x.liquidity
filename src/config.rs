@@ -21,6 +21,7 @@ use st0x_execution::{
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
+use crate::rebalancing::trigger::UsdcRebalancing;
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
 };
@@ -37,6 +38,20 @@ pub struct Env {
     pub secrets: PathBuf,
 }
 
+/// Configurable caps on operation sizes for safe deployment.
+///
+/// Required in config -- operators must explicitly choose
+/// between conservative limits or uncapped mode.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum OperationalLimits {
+    Enabled {
+        max_amount: Positive<Usdc>,
+        max_shares: Positive<FractionalShares>,
+    },
+    Disabled,
+}
+
 /// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +60,7 @@ struct Config {
     log_level: Option<LogLevel>,
     server_port: Option<u16>,
     evm: EvmConfig,
+    operational_limits: OperationalLimits,
     order_polling_interval: Option<u64>,
     order_polling_max_jitter: Option<u64>,
     #[serde(rename = "hyperdx")]
@@ -108,6 +124,7 @@ pub struct Ctx {
     pub(crate) database_url: String,
     pub log_level: LogLevel,
     pub(crate) server_port: u16,
+    pub(crate) operational_limits: OperationalLimits,
     pub(crate) evm: EvmCtx,
     pub(crate) order_polling_interval: u64,
     pub(crate) order_polling_max_jitter: u64,
@@ -252,6 +269,7 @@ impl std::fmt::Debug for Ctx {
             .field("database_url", &self.database_url)
             .field("log_level", &self.log_level)
             .field("server_port", &self.server_port)
+            .field("operational_limits", &self.operational_limits)
             .field("evm", &self.evm)
             .field("order_polling_interval", &self.order_polling_interval)
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
@@ -349,10 +367,32 @@ impl Ctx {
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
+        let usdc = match &trading_mode {
+            TradingMode::Rebalancing(ctx) => Some(&ctx.usdc),
+            TradingMode::Standalone { .. } => None,
+        };
+        let usdc_rebalancing_enabled = match usdc {
+            Some(UsdcRebalancing::Enabled { .. }) => true,
+            Some(UsdcRebalancing::Disabled) | None => false,
+        };
+
+        if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits
+            && usdc_rebalancing_enabled
+        {
+            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+            if max_amount.inner() < minimum {
+                return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
+                    configured: max_amount.inner(),
+                    minimum,
+                });
+            }
+        }
+
         Ok(Self {
             database_url: config.database_url,
             log_level,
             server_port: config.server_port.unwrap_or(8080),
+            operational_limits: config.operational_limits,
             evm,
             order_polling_interval: config.order_polling_interval.unwrap_or(15),
             order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
@@ -419,6 +459,11 @@ pub enum CtxError {
          rebalancing is enabled (address is derived from vault)"
     )]
     OrderOwnerConflictsWithFireblocks { configured: Address },
+    #[error(
+        "operational_limits max_amount {configured} is below Alpaca's \
+         minimum withdrawal of {minimum}"
+    )]
+    OperationalLimitBelowMinimumWithdrawal { configured: Usdc, minimum: Usdc },
 }
 
 #[cfg(test)]
@@ -436,6 +481,9 @@ impl CtxError {
             Self::RebalancingConfigMissing => "rebalancing config missing",
             Self::OrderOwnerConflictsWithFireblocks { .. } => {
                 "order_owner conflicts with fireblocks"
+            }
+            Self::OperationalLimitBelowMinimumWithdrawal { .. } => {
+                "operational limit below minimum withdrawal"
             }
         }
     }
@@ -464,6 +512,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
+    use rust_decimal_macros::dec;
 
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
@@ -478,6 +527,7 @@ pub(crate) mod tests {
             database_url: ":memory:".to_owned(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -502,6 +552,8 @@ pub(crate) mod tests {
     fn minimal_config_toml() -> &'static str {
         r#"
             database_url = ":memory:"
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -533,6 +585,8 @@ pub(crate) mod tests {
     fn minimal_config_toml_without_order_owner() -> &'static str {
         r#"
             database_url = ":memory:"
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
@@ -625,6 +679,77 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn operational_limits_enabled_parses_correctly() {
+        let config = r#"
+            database_url = ":memory:"
+            [operational_limits]
+            mode = "enabled"
+            max_amount = "100"
+            max_shares = "2"
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#;
+
+        let ctx = Ctx::from_toml(config, dry_run_secrets_toml())
+            .await
+            .unwrap();
+        let OperationalLimits::Enabled {
+            max_amount,
+            max_shares,
+        } = ctx.operational_limits
+        else {
+            panic!("Expected Enabled, got {:?}", ctx.operational_limits);
+        };
+        assert_eq!(max_amount.inner(), Usdc(dec!(100)));
+        assert_eq!(max_shares.inner(), FractionalShares::new(dec!(2)));
+    }
+
+    #[tokio::test]
+    async fn operational_limits_missing_fails() {
+        let config = r#"
+            database_url = ":memory:"
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#;
+
+        let result = Ctx::from_toml(config, dry_run_secrets_toml()).await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, CtxError::Toml(_)),
+            "Missing operational_limits should be a TOML parse error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_mode_skips_usdc_withdrawal_minimum_check() {
+        // max_amount below ALPACA_MINIMUM_WITHDRAWAL is fine in standalone
+        // mode because USDC rebalancing transfers don't apply.
+        let config = r#"
+            database_url = ":memory:"
+            [operational_limits]
+            mode = "enabled"
+            max_amount = "50"
+            max_shares = "2"
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#;
+
+        let ctx = Ctx::from_toml(config, dry_run_secrets_toml())
+            .await
+            .unwrap();
+        let OperationalLimits::Enabled { max_amount, .. } = ctx.operational_limits else {
+            panic!("Expected Enabled");
+        };
+        assert_eq!(max_amount.inner(), Usdc(dec!(50)));
+    }
+
+    #[tokio::test]
     async fn optional_fields_override_defaults() {
         let config = r#"
             database_url = ":memory:"
@@ -632,6 +757,8 @@ pub(crate) mod tests {
             server_port = 9090
             order_polling_interval = 30
             order_polling_max_jitter = 10
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -667,6 +794,8 @@ pub(crate) mod tests {
 
         let config = r#"
             database_url = ":memory:"
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
@@ -758,6 +887,8 @@ pub(crate) mod tests {
     async fn telemetry_ctx_assembled_from_config_and_secrets() {
         let config = r#"
             database_url = ":memory:"
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -785,7 +916,8 @@ pub(crate) mod tests {
     async fn telemetry_config_without_secrets_fails() {
         let config = r#"
             database_url = ":memory:"
-
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -833,6 +965,8 @@ pub(crate) mod tests {
     async fn rebalancing_ctx_without_secrets_fails() {
         let config = r#"
             database_url = ":memory:"
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
@@ -963,6 +1097,8 @@ pub(crate) mod tests {
 
         let config = r#"
             database_url = ":memory:"
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1008,6 +1144,8 @@ pub(crate) mod tests {
         let config = r#"
             database_url = ":memory:"
             bogus_field = "should fail"
+            [operational_limits]
+            mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
