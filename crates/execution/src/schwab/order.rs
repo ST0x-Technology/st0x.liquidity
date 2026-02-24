@@ -674,7 +674,7 @@ mod tests {
 
         // At least one attempt should have been made
         assert!(
-            order_mock.hits() >= 1,
+            order_mock.calls() >= 1,
             "Expected at least one API call attempt"
         );
     }
@@ -1169,7 +1169,7 @@ mod tests {
         account_mock.assert();
 
         // Should have made at least one request (retry logic is handled by backon)
-        assert!(order_status_mock.hits() >= 1);
+        assert!(order_status_mock.calls() >= 1);
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }

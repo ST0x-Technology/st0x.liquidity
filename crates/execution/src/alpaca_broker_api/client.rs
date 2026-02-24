@@ -394,7 +394,7 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
-            when.method(POST).path("/v1/journals").json_body_partial(
+            when.method(POST).path("/v1/journals").json_body_includes(
                 r#"{
                         "from_account":"904837e3-3b76-47ec-b432-046db621571b",
                         "to_account":"11111111-2222-3333-4444-555555555555",
