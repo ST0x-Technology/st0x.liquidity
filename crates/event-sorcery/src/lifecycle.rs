@@ -303,7 +303,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::{EventSourced, Table};
+    use crate::{EventSourced, Nil};
 
     /// Test entity: a simple counter with controllable error behavior.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,7 +351,8 @@ mod tests {
         type Services = ();
 
         const AGGREGATE_TYPE: &'static str = "Counter";
-        const PROJECTION: Option<Table> = None;
+        type Materialized = Nil;
+        const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(event: &CounterEvent) -> Option<Self> {

@@ -97,7 +97,8 @@ use std::fmt::{Debug, Display};
 use std::str::FromStr;
 
 #[doc(hidden)]
-pub use dependency::{Cons, Nil};
+pub use dependency::Cons;
+pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
@@ -180,12 +181,17 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
 
     const AGGREGATE_TYPE: &'static str;
 
-    /// The materialized view table for this entity, if any.
+    /// Whether this entity has a materialized view.
     ///
-    /// Set to `Some(Table("..."))` to enable [`Projection::sqlite`]
-    /// for this entity type. Set to `None` for entities without
-    /// materialized views.
-    const PROJECTION: Option<Table>;
+    /// Set to `Table` with `PROJECTION = Table("view_name")` for
+    /// entities with materialized views. Set to `Nil` with
+    /// `PROJECTION = Nil` for entities without views.
+    ///
+    /// [`StoreBuilder::build()`] uses this to auto-wire projections:
+    /// `Table` entities return `(Store, Projection)`, `Nil` entities
+    /// return just `Store`.
+    type Materialized;
+    const PROJECTION: Self::Materialized;
 
     const SCHEMA_VERSION: u64;
 

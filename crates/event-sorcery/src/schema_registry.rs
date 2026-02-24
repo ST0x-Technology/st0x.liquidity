@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use tracing::info;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::{DomainEvent, EventSourced, Table};
+use crate::{DomainEvent, EventSourced, Nil};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
@@ -68,7 +68,8 @@ impl EventSourced for SchemaRegistry {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
-    const PROJECTION: Option<Table> = None;
+    type Materialized = Nil;
+    const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
