@@ -608,7 +608,7 @@ mod tests {
         };
 
         // Phase 1: emit an event with NO reactors
-        let bare_store = StoreBuilder::<VaultRegistry>::new(pool.clone())
+        let (bare_store, _projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -629,7 +629,7 @@ mod tests {
         // Phase 2: create a NEW framework with a counting reactor
         let counter = Arc::new(AtomicUsize::new(0));
         let reactor = EventCounter(counter.clone());
-        let observed_store = StoreBuilder::<VaultRegistry>::new(pool.clone())
+        let (observed_store, _projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
             .with(Arc::new(reactor))
             .build(())
             .await

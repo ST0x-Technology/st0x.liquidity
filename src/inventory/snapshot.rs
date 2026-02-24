@@ -87,6 +87,7 @@ impl EventSourced for InventorySnapshot {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
+
     type Materialized = Nil;
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;

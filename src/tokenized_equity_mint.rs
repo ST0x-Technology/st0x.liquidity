@@ -390,6 +390,7 @@ impl EventSourced for TokenizedEquityMint {
     type Services = EquityTransferServices;
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
+
     type Materialized = Nil;
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;

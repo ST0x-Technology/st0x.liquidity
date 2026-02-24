@@ -487,6 +487,7 @@ impl EventSourced for UsdcRebalance {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
+
     type Materialized = Nil;
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;

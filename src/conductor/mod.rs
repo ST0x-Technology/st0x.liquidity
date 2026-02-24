@@ -1498,7 +1498,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{
         Direction, ExecutorOrderId, MarketOrder, MockExecutor, MockExecutorCtx, Positive, Symbol,
         TryIntoExecutor,
@@ -2755,38 +2755,38 @@ mod tests {
         pool: &SqlitePool,
         order_placer: Arc<dyn OrderPlacer>,
     ) -> (CqrsFrameworks, Arc<Projection<OffchainOrder>>) {
-        let onchain_trade = Arc::new(test_store(pool.clone(), ()));
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
 
-        let position_projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-        let position = Arc::new(
-            StoreBuilder::<Position>::new(pool.clone())
-                .with(Arc::new(position_projection.clone()))
-                .build(())
-                .await
-                .unwrap(),
-        );
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
 
-        let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
-        let offchain_order = Arc::new(
+        let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .with(Arc::new(offchain_order_projection.clone()))
                 .build(order_placer)
                 .await
-                .unwrap(),
-        );
+                .unwrap();
 
-        let vault_registry_projection =
-            Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone()).unwrap());
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
-        let snapshot = test_store(pool.clone(), ());
+        let (vault_registry, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
 
-        let offchain_order_projection = Arc::new(offchain_order_projection);
+        let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
 
         (
             CqrsFrameworks {
                 onchain_trade,
                 position,
-                position_projection: Arc::new(position_projection),
+                position_projection: position_projection.clone(),
                 offchain_order,
                 offchain_order_projection: offchain_order_projection.clone(),
                 vault_registry,
@@ -3348,15 +3348,11 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-        let position_store = Arc::new(
-            StoreBuilder::<Position>::new(pool.clone())
-                .with(Arc::new(projection.clone()))
-                .with(Arc::clone(&trigger))
-                .build(())
-                .await
-                .unwrap(),
-        );
+        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .with(Arc::clone(&trigger))
+            .build(())
+            .await
+            .unwrap();
 
         // Acknowledge a fill -> fires position events -> trigger should react.
         position_store
@@ -3434,15 +3430,11 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-        let position_store = Arc::new(
-            StoreBuilder::<Position>::new(pool.clone())
-                .with(Arc::new(projection.clone()))
-                .with(Arc::clone(&trigger))
-                .build(())
-                .await
-                .unwrap(),
-        );
+        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .with(Arc::clone(&trigger))
+            .build(())
+            .await
+            .unwrap();
 
         // Add 50 onchain shares via CQRS -> trigger applies to inventory.
         position_store
@@ -3533,15 +3525,11 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-        let position_store = Arc::new(
-            StoreBuilder::<Position>::new(pool.clone())
-                .with(Arc::new(projection.clone()))
-                .with(trigger.clone())
-                .build(())
-                .await
-                .unwrap(),
-        );
+        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .with(trigger.clone())
+            .build(())
+            .await
+            .unwrap();
 
         // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
         position_store
@@ -3655,15 +3643,11 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-        let position_store = Arc::new(
-            StoreBuilder::<Position>::new(pool.clone())
-                .with(Arc::new(projection.clone()))
-                .with(trigger)
-                .build(())
-                .await
-                .unwrap(),
-        );
+        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .with(trigger)
+            .build(())
+            .await
+            .unwrap();
 
         (position_store, receiver, symbol)
     }

@@ -147,14 +147,11 @@ mod tests {
 
     async fn create_test_position_infra(
         pool: &SqlitePool,
-    ) -> (Store<Position>, Projection<Position>) {
-        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-        let position_store = StoreBuilder::new(pool.clone())
-            .with(Arc::new(projection.clone()))
+    ) -> (Arc<Store<Position>>, Arc<Projection<Position>>) {
+        StoreBuilder::<Position>::new(pool.clone())
             .build(())
             .await
-            .unwrap();
-        (position_store, projection)
+            .unwrap()
     }
 
     async fn initialize_position_with_fill(

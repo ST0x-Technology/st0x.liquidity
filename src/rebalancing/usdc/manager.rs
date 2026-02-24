@@ -883,7 +883,7 @@ mod tests {
         TimeInForce,
     };
 
-    use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
 
     use st0x_bridge::cctp::{CctpBridge, CctpCtx};
     use st0x_evm::Wallet;
@@ -894,7 +894,7 @@ mod tests {
     use crate::onchain::raindex::RaindexService;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
-    use crate::vault_registry::VaultRegistryProjection;
+    use crate::vault_registry::VaultRegistry;
 
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
@@ -1049,8 +1049,11 @@ mod tests {
 
         let pool = crate::test_utils::setup_test_db().await;
 
-        let vault_registry_projection: Arc<VaultRegistryProjection> =
-            Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
+        let (_vault_registry_store, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool)
+                .build(())
+                .await
+                .unwrap();
 
         let owner = wallet.address();
 

@@ -80,6 +80,7 @@ impl EventSourced for OnChainTrade {
     type Services = ();
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
+
     type Materialized = Nil;
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;

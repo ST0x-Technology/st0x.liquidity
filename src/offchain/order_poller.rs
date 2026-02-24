@@ -341,26 +341,28 @@ mod tests {
 
     use sqlx::SqlitePool;
 
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{StoreBuilder, test_store};
 
     use super::*;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
-    fn create_test_frameworks(
+    async fn create_test_frameworks(
         pool: &SqlitePool,
     ) -> (
         Projection<OffchainOrder>,
         Arc<Store<OffchainOrder>>,
         Arc<Store<Position>>,
     ) {
+        let (offchain_order_store, offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(crate::offchain_order::noop_order_placer())
+                .await
+                .unwrap();
         (
-            Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap(),
-            Arc::new(test_store(
-                pool.clone(),
-                crate::offchain_order::noop_order_placer(),
-            )),
+            Arc::unwrap_or_clone(offchain_order_projection),
+            offchain_order_store,
             Arc::new(test_store(pool.clone(), ())),
         )
     }
@@ -448,7 +450,7 @@ mod tests {
     async fn test_handle_filled_order_executes_cqrs_commands() {
         let pool = setup_test_db().await;
         let (offchain_order_projection, offchain_order_store, position_store) =
-            create_test_frameworks(&pool);
+            create_test_frameworks(&pool).await;
         let broker = MockExecutor::default();
         let ctx = OrderPollerCtx::default();
 
@@ -534,7 +536,7 @@ mod tests {
     async fn test_handle_failed_order_executes_cqrs_commands() {
         let pool = setup_test_db().await;
         let (offchain_order_projection, offchain_order_store, position_store) =
-            create_test_frameworks(&pool);
+            create_test_frameworks(&pool).await;
         let broker = MockExecutor::default();
         let ctx = OrderPollerCtx::default();
 
