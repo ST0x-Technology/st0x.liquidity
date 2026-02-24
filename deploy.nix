@@ -58,11 +58,15 @@ in {
   wrappers = { pkgs, infraPkgs, localSystem }:
     let
       deployInputs = infraPkgs.buildInputs
-        ++ [ deploy-rs.packages.${localSystem}.deploy-rs ];
+        ++ [ deploy-rs.packages.${localSystem}.deploy-rs pkgs.openssh ];
 
       deployPreamble = ''
         ${infraPkgs.resolveIp}
         export DEPLOY_HOST="$host_ip"
+
+        # Auto-update known_hosts so deploys survive host key changes
+        ssh-keygen -R "$host_ip" 2>/dev/null || true
+        ssh-keyscan -t ed25519 "$host_ip" >> "$HOME/.ssh/known_hosts" 2>/dev/null
 
         ssh_flag=""
         if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
@@ -83,7 +87,7 @@ in {
         text = ''
           ${deployPreamble}
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity.system \
-            -- --impure "$@"
+            -- --impure --accept-flake-config "$@"
         '';
       };
 
@@ -95,7 +99,7 @@ in {
           profile="''${1:?usage: deploy-service <profile>}"
           shift
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ".#st0x-liquidity.$profile" \
-            -- --impure "$@"
+            -- --impure --accept-flake-config "$@"
         '';
       };
 
@@ -105,7 +109,7 @@ in {
         text = ''
           ${deployPreamble}
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity \
-            -- --impure "$@"
+            -- --impure --accept-flake-config "$@"
         '';
       };
     };
