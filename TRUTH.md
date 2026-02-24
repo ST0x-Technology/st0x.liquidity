@@ -82,15 +82,13 @@ sequenceDiagram
 
 ### Price Formation & Feed
 
+**A: Current - Pyth Hermes**
+
 ```mermaid
 graph LR
-    subgraph "A: Current - Pyth Hermes"
-        PP[Pyth Publishers] -->|publisher latency| PA[Pyth Aggregation]
-        PA -->|aggregation latency| H[Hermes API]
-        H -->|dissemination + RTT| OE["Order Expressions<br/>(read Pyth on-chain)"]
-        OE -->|"~0-300s staleness<br/>(5 min write cadence)"| OE
-
-    end
+    PP[Pyth Publishers] -->|publisher latency| PA[Pyth Aggregation]
+    PA -->|aggregation latency| H[Hermes API]
+    H -->|dissemination + RTT| OE["Order Expressions (read Pyth on-chain)<br/>~0-300s staleness from 5 min write cadence"]
 
     style PP fill:#4a4a6a
     style PA fill:#4a4a6a
@@ -98,13 +96,13 @@ graph LR
     style OE fill:#5a3a3a
 ```
 
+**B: Future - Solver Signed Context**
+
 ```mermaid
 graph LR
-    subgraph "B: Future - Solver Signed Context"
-        DV[Deep Venue] -->|price discovery| HV[Hedge Venue API]
-        HV -->|"quote update + RTT"| SLV[Solver]
-        SLV -->|"signed context<br/>in solve tx"| OE2["Order Expressions<br/>(verify signature,<br/>use price)"]
-    end
+    DV[Deep Venue] -->|price discovery| HV[Hedge Venue API]
+    HV -->|quote update + RTT| SLV[Solver]
+    SLV -->|signed context in solve tx| OE2["Order Expressions (verify + use price)"]
 
     style DV fill:#4a4a6a
     style HV fill:#4a4a6a
@@ -164,11 +162,11 @@ doc is as complete as possible.
 ### Intent & Solver (Strictly dependent on solver competition)
 
 ```mermaid
-graph TD
-    TI[Taker Intent] -->|propagation latency| ID["Solver detects intent"]
-    ID -->|"detection latency<br/>(relevant if solver competition)"| SD["Solver evaluates<br/>price + inventory + risk"]
-    SD -->|"computation latency<br/>(relevant if > block time)"| TC["Tx construction<br/>+ signed context"]
-    TC -->|RPC submission latency| SUB["Submitted to<br/>OrderBook"]
+graph LR
+    TI[Taker Intent] -->|propagation| ID[Solver detects]
+    ID -->|"detection (if competition)"| SD[Evaluate price/inventory/risk]
+    SD -->|"computation (if > block time)"| TC[Construct tx + signed context]
+    TC -->|RPC submission| SUB[Submitted to OrderBook]
 
     style TI fill:#4a4a6a
     style ID fill:#4a4a6a
@@ -191,74 +189,6 @@ graph TD
 ---
 
 ## Costs with Immediate Economic Impact
-
-```mermaid
-graph TD
-    subgraph "Revenue"
-        SS[Quoted Half-Spread]
-        SC[Intent Surplus Capture]
-    end
-
-    subgraph "DEX Costs"
-        TF[DEX Trading Fee]
-        SF[Solver Network Fee]
-        GS[Gas / Solve Tx]
-        GR[Gas / Price Write]
-    end
-
-    subgraph "Hedge Costs"
-        HC[Commission]
-        HR[Regulatory Fees]
-        HS[Half-Spread Crossing]
-        HRS[Routing Slippage]
-    end
-
-    subgraph "Financing Costs"
-        MI[Margin Interest]
-        BC[Borrow Cost]
-        FL[Forced Liquidation]
-    end
-
-    subgraph "Conversion Costs"
-        MG[Mint Gas]
-        BG[Burn Gas]
-        IF[Issuance Fee]
-        IS[Issuance Spread]
-    end
-
-    subgraph "Risk Loss Channels"
-        RL1[Feed Staleness Loss]
-        RL2[Hedge Latency Markout]
-        RL3[Spread Widening Loss]
-        RL4[Volatility Mispricing]
-        RL5[Adverse Selection]
-        RL6[Conversion Timing]
-    end
-
-    style SS fill:#2a5a2a
-    style SC fill:#2a5a2a
-    style TF fill:#5a3a3a
-    style SF fill:#5a3a3a
-    style GS fill:#5a3a3a
-    style GR fill:#5a3a3a
-    style HC fill:#5a3a3a
-    style HR fill:#5a3a3a
-    style HS fill:#5a3a3a
-    style HRS fill:#5a3a3a
-    style MI fill:#5a4a2a
-    style BC fill:#5a4a2a
-    style FL fill:#5a4a2a
-    style MG fill:#5a4a2a
-    style BG fill:#5a4a2a
-    style IF fill:#5a4a2a
-    style IS fill:#5a4a2a
-    style RL1 fill:#6a2a2a
-    style RL2 fill:#6a2a2a
-    style RL3 fill:#6a2a2a
-    style RL4 fill:#6a2a2a
-    style RL5 fill:#6a2a2a
-    style RL6 fill:#6a2a2a
-```
 
 ### Spread & Surplus
 
@@ -358,113 +288,74 @@ flowchart TD
 
 ## Price Feed Comparison: Pyth vs Solver Signed Context
 
-```mermaid
-graph TD
-    subgraph "Path A: Pyth Hermes - Current"
-        A1[Market Move] --> A2[Pyth Publishers]
-        A2 --> A3[Pyth Aggregation]
-        A3 --> A4[Hermes API]
-        A4 --> A5["Order expressions<br/>read Pyth on-chain"]
-        A5 --> A6["~5 min write cadence<br/>= staleness window"]
-    end
+**Path A** has more hops and a staleness window but uses existing Pyth
+infrastructure. **Path B** has fewer hops with per-tx fresh prices but requires
+solver complexity and write cost.
 
-    subgraph "Path B: Solver Signed Context - Future"
-        B1[Market Move] --> B2["Hedge Venue<br/>quote update"]
-        B2 --> B3["Solver fetches<br/>price from source"]
-        B3 --> B4["Signed context<br/>included in solve tx"]
-        B4 --> B5["Order expressions<br/>verify signature,<br/>use price"]
-    end
-
-    subgraph "Trade-offs"
-        T1["A: More hops, staleness window,<br/>but existing Pyth infrastructure"]
-        T2["B: Fewer hops, per-tx fresh prices,<br/>but write cost + solver complexity"]
-    end
-
-    style A1 fill:#4a4a6a
-    style A6 fill:#5a3a3a
-    style B1 fill:#4a4a6a
-    style B5 fill:#3a5a3a
-    style T1 fill:#3a3a3a
-    style T2 fill:#3a3a3a
-```
+Both paths are shown in the Price Formation diagrams above.
 
 ---
 
 ## System Architecture
 
+Two diagrams: the hedge pipeline (core trade flow) and the rebalancing pipeline.
+
+**Hedge Pipeline** (event -> position -> broker order -> fill)
+
 ```mermaid
-graph TB
-    subgraph "External Infrastructure"
-        UV[Upstream Venues]
-        HV["Hedge Venue<br/>(Alpaca / Schwab)"]
-        Pyth[Pyth Network]
-        CCTP[Circle CCTP Bridge]
-    end
-
-    subgraph "On-Chain (Base L2)"
-        OB["Raindex OrderBook<br/>(order expressions + vaults)"]
-        Tokens["Tokenized Equities<br/>(tAAPL, tTSLA, ...)"]
-        USDC_C[USDC on Base]
-    end
-
-    subgraph "Solver (currently separate, planned integration)"
-        SLV["Solver<br/>(intent detection,<br/>signed context,<br/>solve tx construction)"]
-    end
-
-    subgraph "st0x.liquidity (Conductor)"
-        EVT["Event Monitor<br/>(WS: ClearV3 / TakeOrderV3)"]
-        EQ["Event Queue<br/>(dedup by tx_hash + log_index)"]
-        POS["Position Aggregate<br/>(per-symbol net exposure)"]
-        ACC["Accumulator<br/>(execution threshold check)"]
-        OOP["OffchainOrder<br/>(Executor trait)"]
-        OSP["OrderStatusPoller<br/>(broker fill tracking)"]
-        INV["InventoryView<br/>(cross-venue balances)"]
-        REB["RebalancingTrigger<br/>(equity + USDC)"]
-        TOK["Tokenizer<br/>(mint / redeem)"]
-        RDX["RaindexService<br/>(vault deposit / withdraw)"]
-    end
-
-    UV --> Pyth
-    UV --> HV
-    Pyth --> OB
-    HV --> SLV
-    SLV --> OB
-
-    OB --> EVT
-    EVT --> EQ
-    EQ --> POS
-    POS --> ACC
-    ACC --> OOP
-    OOP --> HV
-    HV --> OSP
+graph LR
+    OB["Raindex OrderBook"] -->|ClearV3 / TakeOrderV3| EVT[Event Monitor]
+    EVT --> EQ[Event Queue]
+    EQ --> POS[Position Aggregate]
+    POS -->|threshold reached| OOP["OffchainOrder (Executor)"]
+    OOP --> HV["Hedge Venue (Alpaca / Schwab)"]
+    HV -->|fill status| OSP[OrderStatusPoller]
     OSP --> POS
 
-    INV --> REB
-    HV --> INV
-    OB --> INV
-    REB --> TOK
-    TOK --> HV
-    TOK --> Tokens
-    REB --> RDX
-    RDX --> OB
-    REB -->|USDC bridging| CCTP
-
-    style UV fill:#4a4a6a
-    style HV fill:#4a4a6a
-    style Pyth fill:#4a4a6a
-    style CCTP fill:#4a4a6a
     style OB fill:#5a4a2a
-    style Tokens fill:#5a4a2a
-    style USDC_C fill:#5a4a2a
-    style SLV fill:#4a4a6a
     style EVT fill:#3a5a3a
     style EQ fill:#3a5a3a
     style POS fill:#3a5a3a
-    style ACC fill:#3a5a3a
     style OOP fill:#3a5a3a
+    style HV fill:#4a4a6a
     style OSP fill:#3a5a3a
+```
+
+**Rebalancing Pipeline** (inventory monitoring -> mint/redeem/bridge)
+
+```mermaid
+graph LR
+    HV["Hedge Venue"] --> INV[InventoryView]
+    OB["Raindex OrderBook"] --> INV
+    INV --> REB[RebalancingTrigger]
+    REB -->|equity| TOK["Tokenizer (mint/redeem)"]
+    REB -->|vaults| RDX["RaindexService (deposit/withdraw)"]
+    REB -->|USDC| CCTP[Circle CCTP Bridge]
+    TOK --> HV
+    RDX --> OB
+
+    style HV fill:#4a4a6a
+    style OB fill:#5a4a2a
     style INV fill:#3a5a3a
     style REB fill:#3a5a3a
     style TOK fill:#3a5a3a
     style RDX fill:#3a5a3a
+    style CCTP fill:#4a4a6a
+```
+
+**Price Formation** (upstream -> solver -> on-chain order expressions)
+
+```mermaid
+graph LR
+    UV[Upstream Venues] --> HV["Hedge Venue"]
+    UV --> Pyth[Pyth Network]
+    HV --> SLV["Solver (currently separate)"]
+    SLV -->|signed context| OB["Raindex OrderBook"]
+    Pyth -->|oracle feed| OB
+
+    style UV fill:#4a4a6a
+    style HV fill:#4a4a6a
+    style Pyth fill:#4a4a6a
+    style SLV fill:#4a4a6a
+    style OB fill:#5a4a2a
 ```
