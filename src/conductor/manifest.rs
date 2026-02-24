@@ -116,14 +116,14 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use rust_decimal_macros::dec;
-    use st0x_event_sorcery::test_store;
     use tokio::sync::{RwLock, broadcast, mpsc};
+
+    use st0x_event_sorcery::test_store;
+    use st0x_execution::Symbol;
 
     use super::*;
     use crate::config::OperationalLimits;
     use crate::inventory::{ImbalanceThreshold, InventoryView};
-    use st0x_execution::Symbol;
-
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::trigger::UsdcRebalancing;
