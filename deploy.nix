@@ -9,6 +9,7 @@ let
 
   rage = "/run/current-system/sw/bin/rage";
   hostKey = "/etc/ssh/ssh_host_ed25519_key";
+  expectedHostPubKey = (import ./keys.nix).keys.host;
 
   services = import ./services.nix;
   enabledServices = builtins.attrNames (builtins.removeAttrs services
@@ -64,9 +65,21 @@ in {
         ${infraPkgs.resolveIp}
         export DEPLOY_HOST="$host_ip"
 
-        # Auto-update known_hosts so deploys survive host key changes
+        # Verify host key against keys.nix trust anchor
+        scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null)
+        if [ -z "$scanned" ]; then
+          echo "ERROR: ssh-keyscan returned no key for $host_ip" >&2
+          exit 1
+        fi
+        if ! echo "$scanned" | grep -qF "${expectedHostPubKey}"; then
+          echo "ERROR: host key mismatch for $host_ip" >&2
+          echo "  expected: ${expectedHostPubKey}" >&2
+          echo "  got:      $scanned" >&2
+          echo "If the host was re-bootstrapped, update keys.nix and rekey secrets." >&2
+          exit 1
+        fi
         ssh-keygen -R "$host_ip" 2>/dev/null || true
-        ssh-keyscan -t ed25519 "$host_ip" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+        echo "$scanned" >> "$HOME/.ssh/known_hosts"
 
         ssh_flag=""
         if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
