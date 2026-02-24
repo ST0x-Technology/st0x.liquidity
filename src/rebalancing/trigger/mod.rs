@@ -79,34 +79,34 @@ pub enum RebalancingCtxError {
 /// USDC rebalancing configuration with explicit enable/disable.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
-pub(crate) enum UsdcRebalancing {
+pub enum UsdcRebalancing {
     Enabled { target: Decimal, deviation: Decimal },
     Disabled,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RebalancingSecrets {
-    pub(crate) base_rpc_url: Url,
-    pub(crate) ethereum_rpc_url: Url,
-    pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
-    pub(crate) fireblocks_secret_path: PathBuf,
+pub struct RebalancingSecrets {
+    pub base_rpc_url: Url,
+    pub ethereum_rpc_url: Url,
+    pub fireblocks_api_user_id: FireblocksApiUserId,
+    pub fireblocks_secret_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RebalancingConfig {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancing,
-    pub(crate) redemption_wallet: Address,
-    pub(crate) usdc_vault_id: B256,
-    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
-    pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
-    pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
-    pub(crate) fireblocks_environment: FireblocksEnvironment,
+pub struct RebalancingConfig {
+    pub equity: ImbalanceThreshold,
+    pub usdc: UsdcRebalancing,
+    pub redemption_wallet: Address,
+    pub usdc_vault_id: B256,
+    pub equities: HashMap<Symbol, EquityTokenAddresses>,
+    pub fireblocks_vault_account_id: FireblocksVaultAccountId,
+    pub fireblocks_chain_asset_ids: ChainAssetIds,
+    pub fireblocks_environment: FireblocksEnvironment,
     /// Override the Fireblocks API base URL. When absent, determined
     /// by `fireblocks_environment`.
-    pub(crate) fireblocks_base_url: Option<Url>,
+    pub fireblocks_base_url: Option<Url>,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -119,7 +119,7 @@ pub(crate) struct RebalancingConfig {
 /// Read-only provider access for either chain is available via
 /// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
-pub(crate) struct RebalancingCtx {
+pub struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
@@ -132,6 +132,13 @@ pub(crate) struct RebalancingCtx {
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     /// Pre-built wallet for Ethereum mainnet.
     ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    /// Override the Circle attestation/fee API base URL (for e2e tests
+    /// with locally deployed CCTP contracts).
+    pub(crate) circle_api_base: Option<String>,
+    /// Override the `TokenMessengerV2` contract address.
+    pub(crate) token_messenger: Option<Address>,
+    /// Override the `MessageTransmitterV2` contract address.
+    pub(crate) message_transmitter: Option<Address>,
 }
 
 impl RebalancingCtx {
@@ -178,6 +185,9 @@ impl RebalancingCtx {
             equities: config.equities,
             base_wallet: Arc::new(base_wallet),
             ethereum_wallet: Arc::new(ethereum_wallet),
+            circle_api_base: None,
+            token_messenger: None,
+            message_transmitter: None,
         })
     }
 
@@ -244,7 +254,61 @@ impl RebalancingCtx {
             equities,
             base_wallet: wallet.clone(),
             ethereum_wallet: wallet,
+            circle_api_base: None,
+            token_messenger: None,
+            message_transmitter: None,
         }
+    }
+
+    /// Test constructor that accepts pre-built wallets for e2e tests
+    /// that need real onchain interaction (e.g. with Anvil forks).
+    #[cfg(feature = "test-support")]
+    pub fn with_wallets(
+        equity: ImbalanceThreshold,
+        usdc: UsdcRebalancing,
+        redemption_wallet: Address,
+        usdc_vault_id: B256,
+        alpaca_broker_auth: AlpacaBrokerApiCtx,
+        equities: HashMap<Symbol, EquityTokenAddresses>,
+        base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        Self {
+            equity,
+            usdc,
+            redemption_wallet,
+            usdc_vault_id,
+            alpaca_broker_auth,
+            equities,
+            base_wallet,
+            ethereum_wallet,
+            circle_api_base: None,
+            token_messenger: None,
+            message_transmitter: None,
+        }
+    }
+
+    /// Sets the Circle API base URL override (for e2e tests with local
+    /// CCTP contracts and a mock attestation server).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_circle_api_base(mut self, base_url: String) -> Self {
+        self.circle_api_base = Some(base_url);
+        self
+    }
+
+    /// Sets the CCTP contract address overrides (for e2e tests with
+    /// locally deployed CCTP contracts).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_cctp_addresses(
+        mut self,
+        token_messenger: Address,
+        message_transmitter: Address,
+    ) -> Self {
+        self.token_messenger = Some(token_messenger);
+        self.message_transmitter = Some(message_transmitter);
+        self
     }
 }
 

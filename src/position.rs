@@ -24,15 +24,15 @@ use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct Position {
-    pub(crate) symbol: Symbol,
-    pub(crate) net: FractionalShares,
-    pub(crate) accumulated_long: FractionalShares,
-    pub(crate) accumulated_short: FractionalShares,
-    pub(crate) pending_offchain_order_id: Option<OffchainOrderId>,
-    pub(crate) threshold: ExecutionThreshold,
-    pub(crate) last_price_usdc: Option<Decimal>,
-    pub(crate) last_updated: Option<DateTime<Utc>>,
+pub struct Position {
+    pub symbol: Symbol,
+    pub net: FractionalShares,
+    pub accumulated_long: FractionalShares,
+    pub accumulated_short: FractionalShares,
+    pub pending_offchain_order_id: Option<OffchainOrderId>,
+    pub threshold: ExecutionThreshold,
+    pub last_price_usdc: Option<Decimal>,
+    pub last_updated: Option<DateTime<Utc>>,
 }
 
 #[async_trait]
@@ -435,7 +435,7 @@ impl Position {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum PositionError {
+pub enum PositionError {
     #[error("Position has not been initialized")]
     Uninitialized,
     #[error(
@@ -469,7 +469,7 @@ pub(crate) enum PositionError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum PositionCommand {
+pub enum PositionCommand {
     AcknowledgeOnChainFill {
         symbol: Symbol,
         threshold: ExecutionThreshold,
@@ -504,7 +504,7 @@ pub(crate) enum PositionCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum PositionEvent {
+pub enum PositionEvent {
     Initialized {
         symbol: Symbol,
         threshold: ExecutionThreshold,
@@ -581,9 +581,9 @@ impl DomainEvent for PositionEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct TradeId {
-    pub(crate) tx_hash: TxHash,
-    pub(crate) log_index: u64,
+pub struct TradeId {
+    pub tx_hash: TxHash,
+    pub log_index: u64,
 }
 
 impl std::fmt::Display for TradeId {
@@ -593,7 +593,7 @@ impl std::fmt::Display for TradeId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum TriggerReason {
+pub enum TriggerReason {
     SharesThreshold {
         net_position_shares: Decimal,
         threshold_shares: Decimal,
