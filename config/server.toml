@@ -16,7 +16,7 @@ deployment_block = 40850446
 
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
-usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000ffaabb"
+usdc_vault_id = "0x03c31202da3b08a9957433f65fd4c1e9152fcca78910f58fe2df7a2b7b529f9f"
 fireblocks_vault_account_id = "0"
 fireblocks_environment = "production"
 
