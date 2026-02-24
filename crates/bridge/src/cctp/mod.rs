@@ -36,6 +36,9 @@
 //!     usdc_base,
 //!     ethereum_wallet,
 //!     base_wallet,
+//!     circle_api_base: None,
+//!     token_messenger: None,
+//!     message_transmitter: None,
 //! })?;
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
@@ -223,9 +226,9 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 /// Runtime context for constructing a [`CctpBridge`].
 ///
 /// Provides the minimal set of values needed to construct the bridge.
-/// CCTP contract addresses are hardcoded internally since they're the
-/// same on all supported chains. Providers are obtained from the wallets
-/// via [`Wallet::provider()`].
+/// CCTP contract addresses default to production addresses but can be
+/// overridden for testing with locally deployed contracts.
+/// Providers are obtained from the wallets via [`Wallet::provider()`].
 pub struct CctpCtx<EthWallet, BaseWallet> {
     /// USDC token address on Ethereum
     pub usdc_ethereum: Address,
@@ -235,6 +238,15 @@ pub struct CctpCtx<EthWallet, BaseWallet> {
     pub ethereum_wallet: EthWallet,
     /// Wallet for submitting transactions on Base
     pub base_wallet: BaseWallet,
+    /// Override the Circle attestation/fee API base URL.
+    /// Defaults to `https://iris-api.circle.com` when `None`.
+    pub circle_api_base: Option<String>,
+    /// Override the `TokenMessengerV2` contract address.
+    /// Defaults to the production address when `None`.
+    pub token_messenger: Option<Address>,
+    /// Override the `MessageTransmitterV2` contract address.
+    /// Defaults to the production address when `None`.
+    pub message_transmitter: Option<Address>,
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
@@ -247,6 +259,9 @@ pub struct CctpCtx<EthWallet, BaseWallet> {
 ///     usdc_base: USDC_BASE,
 ///     ethereum_wallet,
 ///     base_wallet,
+///     circle_api_base: None,
+///     token_messenger: None,
+///     message_transmitter: None,
 /// })?;
 ///
 /// let amount = U256::from(1_000_000); // 1 USDC
@@ -329,21 +344,30 @@ struct FeeEntry {
 impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Constructs a `CctpBridge` from a runtime context.
     pub fn try_from_ctx(ctx: CctpCtx<EthWallet, BaseWallet>) -> Result<Self, CctpError> {
+        let token_messenger = ctx.token_messenger.unwrap_or(TOKEN_MESSENGER_V2);
+        let message_transmitter = ctx.message_transmitter.unwrap_or(MESSAGE_TRANSMITTER_V2);
+
         let ethereum = CctpEndpoint::new(
             ctx.usdc_ethereum,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
+            token_messenger,
+            message_transmitter,
             ctx.ethereum_wallet,
         );
 
         let base = CctpEndpoint::new(
             ctx.usdc_base,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
+            token_messenger,
+            message_transmitter,
             ctx.base_wallet,
         );
 
-        Self::new(ethereum, base)
+        let mut bridge = Self::new(ethereum, base)?;
+
+        if let Some(base_url) = ctx.circle_api_base {
+            bridge.circle_api_base = base_url;
+        }
+
+        Ok(bridge)
     }
 
     fn new(
@@ -731,7 +755,7 @@ mod tests {
         };
 
         fetch_attestation.retry(backoff).await.unwrap();
-        assert_eq!(mock.hits(), 1, "Expected exactly 1 API call");
+        assert_eq!(mock.calls(), 1, "Expected exactly 1 API call");
     }
 
     #[tokio::test]
@@ -791,7 +815,7 @@ mod tests {
             "Expected AttestationError::NotYetAvailable with status 404"
         );
         assert!(
-            mock.hits() == 4,
+            mock.calls() == 4,
             "Expected exactly 4 attempts (1 initial + 3 retries)"
         );
     }
@@ -1321,7 +1345,7 @@ mod tests {
             let fee_mock_server = MockServer::start();
             // Mock fee endpoint for any domain pair - returns fast (1000) and standard (2000) fees
             fee_mock_server.mock(|when, then| {
-                when.method(GET).path_contains("/v2/burn/USDC/fees/");
+                when.method(GET).path_includes("/v2/burn/USDC/fees/");
                 then.status(200).json_body(serde_json::json!([
                     {"finalityThreshold": 1000, "minimumFee": 1},
                     {"finalityThreshold": 2000, "minimumFee": 0}

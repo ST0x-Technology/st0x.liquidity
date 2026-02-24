@@ -63,6 +63,8 @@ struct Config {
     operational_limits: OperationalLimits,
     order_polling_interval: Option<u64>,
     order_polling_max_jitter: Option<u64>,
+    position_check_interval: Option<u64>,
+    inventory_poll_interval: Option<u64>,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
@@ -273,6 +275,8 @@ impl std::fmt::Debug for Ctx {
             .field("evm", &self.evm)
             .field("order_polling_interval", &self.order_polling_interval)
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
+            .field("position_check_interval", &self.position_check_interval)
+            .field("inventory_poll_interval", &self.inventory_poll_interval)
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("trading_mode", &self.trading_mode)
@@ -396,6 +400,8 @@ impl Ctx {
             evm,
             order_polling_interval: config.order_polling_interval.unwrap_or(15),
             order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
+            position_check_interval: config.position_check_interval.unwrap_or(60),
+            inventory_poll_interval: config.inventory_poll_interval.unwrap_or(60),
             broker,
             telemetry,
             trading_mode,
@@ -503,6 +509,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
     // (single INSERT per trade) to avoid blocking the main bot.
     let options: SqliteConnectOptions = database_url
         .parse::<SqliteConnectOptions>()?
+        .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_secs(10));
 
@@ -535,6 +542,8 @@ pub(crate) mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::Schwab(SchwabAuth {
                 app_key: "test_key".to_owned(),
                 app_secret: "test_secret".to_owned(),
@@ -676,6 +685,8 @@ pub(crate) mod tests {
         assert_eq!(ctx.server_port, 8080);
         assert_eq!(ctx.order_polling_interval, 15);
         assert_eq!(ctx.order_polling_max_jitter, 5);
+        assert_eq!(ctx.position_check_interval, 60);
+        assert_eq!(ctx.inventory_poll_interval, 60);
     }
 
     #[tokio::test]
@@ -757,6 +768,8 @@ pub(crate) mod tests {
             server_port = 9090
             order_polling_interval = 30
             order_polling_max_jitter = 10
+            position_check_interval = 120
+            inventory_poll_interval = 90
             [operational_limits]
             mode = "disabled"
             [evm]
@@ -772,6 +785,8 @@ pub(crate) mod tests {
         assert_eq!(ctx.server_port, 9090);
         assert_eq!(ctx.order_polling_interval, 30);
         assert_eq!(ctx.order_polling_max_jitter, 10);
+        assert_eq!(ctx.position_check_interval, 120);
+        assert_eq!(ctx.inventory_poll_interval, 90);
     }
 
     #[tokio::test]

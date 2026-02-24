@@ -225,6 +225,9 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         usdc_base: USDC_BASE,
         ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
         base_wallet: rebalancing_ctx.base_wallet().clone(),
+        circle_api_base: None,
+        token_messenger: None,
+        message_transmitter: None,
     })?);
 
     let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
@@ -579,6 +582,8 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone {

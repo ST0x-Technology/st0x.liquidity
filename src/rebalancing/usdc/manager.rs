@@ -1044,6 +1044,9 @@ mod tests {
             usdc_base: USDC_ADDRESS,
             ethereum_wallet: wallet.clone(),
             base_wallet: wallet.clone(),
+            circle_api_base: None,
+            token_messenger: None,
+            message_transmitter: None,
         })
         .unwrap();
 

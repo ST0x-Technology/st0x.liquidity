@@ -118,6 +118,8 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
