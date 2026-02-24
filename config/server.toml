@@ -11,7 +11,7 @@ max_shares = "2"
 service_name = "st0x-hedge"
 
 [evm]
-orderbook = "0x52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775"
+orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 deployment_block = 40850446
 
 [rebalancing]
