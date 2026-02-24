@@ -85,6 +85,8 @@ usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000
 fireblocks_environment = "production"
 fireblocks_vault_account_id = "1"
 
+[rebalancing.equities]
+
 [rebalancing.equity]
 target = "0.5"
 deviation = "0.2"

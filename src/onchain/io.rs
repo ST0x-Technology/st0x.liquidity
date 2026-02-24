@@ -577,6 +577,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known precision dust bug — not yet patched"]
+    fn test_trade_details_normalizes_spurious_precision_beyond_onchain_scales() {
+        let usdc_with_dust = Decimal::from_str("64.169234000001").unwrap();
+        let shares_with_dust = Decimal::from_str("0.374000000000000000001").unwrap();
+
+        let details =
+            TradeDetails::try_from_io("USDC", usdc_with_dust, "tNVDA", shares_with_dust).unwrap();
+
+        assert_eq!(details.usdc_amount().value(), dec!(64.169234));
+        assert_eq!(details.equity_amount().inner(), dec!(0.374));
+    }
+
+    #[test]
+    #[ignore = "known precision dust bug — not yet patched"]
+    fn test_trade_details_regression_precision_dust_breaks_exact_equality_without_normalization() {
+        let shares_with_dust = Decimal::from_str("0.200000000000000000001").unwrap();
+        let pre_fix_shares = FractionalShares::new(shares_with_dust);
+
+        assert_ne!(
+            pre_fix_shares,
+            FractionalShares::new(dec!(0.2)),
+            "Pre-fix behavior preserved dust and broke exact equality checks",
+        );
+
+        let details = TradeDetails::try_from_io(
+            "USDC",
+            Decimal::from_str("34.645024000001").unwrap(),
+            "tNVDA",
+            shares_with_dust,
+        )
+        .unwrap();
+
+        assert_eq!(details.equity_amount().inner(), dec!(0.2));
+        assert_eq!(details.usdc_amount().value(), dec!(34.645024));
+    }
+
+    #[test]
     fn test_edge_case_validation_very_small_amounts() {
         let details =
             TradeDetails::try_from_io("USDC", dec!(0.01), "wtAAPL", dec!(0.0001)).unwrap();

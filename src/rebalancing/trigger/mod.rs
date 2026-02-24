@@ -42,7 +42,7 @@ use crate::tokenized_equity_mint::{
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use crate::wrapper::Wrapper;
+use crate::wrapper::{EquityTokenAddresses, Wrapper};
 
 /// Why the rebalancing trigger reactor failed.
 #[derive(Debug, thiserror::Error)]
@@ -3125,6 +3125,8 @@ mod tests {
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
+            [equities]
+
             [fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
@@ -3208,6 +3210,8 @@ mod tests {
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
+            [equities]
+
             [fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
@@ -3240,6 +3244,8 @@ mod tests {
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
+
+            [equities]
 
             [fireblocks_chain_asset_ids]
             1 = "ETH"
@@ -3282,6 +3288,8 @@ mod tests {
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
+            [equities]
+
             [fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
@@ -3304,6 +3312,8 @@ mod tests {
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
+
+            [equities]
 
             [fireblocks_chain_asset_ids]
             1 = "ETH"
@@ -4138,7 +4148,7 @@ mod tests {
             usdc_vault_id: fixed_bytes!(
                 "0x0000000000000000000000000000000000000000000000000000000000000001"
             ),
-
+            equities: HashMap::new(),
             fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
             fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
             fireblocks_environment: FireblocksEnvironment::Sandbox,
@@ -4194,7 +4204,7 @@ mod tests {
             usdc_vault_id: fixed_bytes!(
                 "0x0000000000000000000000000000000000000000000000000000000000000001"
             ),
-
+            equities: HashMap::new(),
             fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
             fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({
                 "31337": "ETH"

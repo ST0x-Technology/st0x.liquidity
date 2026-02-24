@@ -10,8 +10,8 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use tracing::Level;
 use url::Url;
 
@@ -140,7 +140,7 @@ pub struct Ctx {
     pub telemetry: Option<TelemetryCtx>,
     pub(crate) trading_mode: TradingMode,
     pub(crate) execution_threshold: ExecutionThreshold,
-    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
+    pub equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -950,6 +950,8 @@ pub(crate) mod tests {
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
+            [rebalancing.equities]
+
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
@@ -1038,6 +1040,8 @@ pub(crate) mod tests {
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
+
+            [rebalancing.equities]
 
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"
@@ -1184,6 +1188,8 @@ pub(crate) mod tests {
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
+
+            [rebalancing.equities]
 
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"
@@ -1340,6 +1346,8 @@ pub(crate) mod tests {
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
+
+            [rebalancing.equities]
 
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"

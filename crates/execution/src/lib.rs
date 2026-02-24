@@ -99,6 +99,13 @@ impl Symbol {
         }
         Ok(Self(symbol))
     }
+    pub fn inner(&self) -> String {
+        self.0.clone()
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_new(symbol: String) -> Self {
+        Self(symbol)
+    }
 }
 
 impl<'de> Deserialize<'de> for Symbol {
@@ -745,7 +752,7 @@ mod tests {
     #[test]
     fn mul_decimal_succeeds() {
         let shares = FractionalShares::new(Decimal::from(100));
-        let ratio = Decimal::new(5, 1); // 0.5
+        let ratio = dec!(0.5);
         let result = (shares * ratio).unwrap();
         assert_eq!(result.inner(), Decimal::from(50));
     }
