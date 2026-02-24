@@ -132,6 +132,13 @@ pub(crate) struct RebalancingCtx {
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     /// Pre-built wallet for Ethereum mainnet.
     ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    /// Override the Circle attestation/fee API base URL (for e2e tests
+    /// with locally deployed CCTP contracts).
+    pub(crate) circle_api_base: Option<String>,
+    /// Override the `TokenMessengerV2` contract address.
+    pub(crate) token_messenger: Option<Address>,
+    /// Override the `MessageTransmitterV2` contract address.
+    pub(crate) message_transmitter: Option<Address>,
 }
 
 impl RebalancingCtx {
@@ -177,6 +184,9 @@ impl RebalancingCtx {
             alpaca_broker_auth: broker_auth,
             base_wallet: Arc::new(base_wallet),
             ethereum_wallet: Arc::new(ethereum_wallet),
+            circle_api_base: None,
+            token_messenger: None,
+            message_transmitter: None,
         })
     }
 
@@ -241,6 +251,9 @@ impl RebalancingCtx {
             alpaca_broker_auth,
             base_wallet: wallet.clone(),
             ethereum_wallet: wallet,
+            circle_api_base: None,
+            token_messenger: None,
+            message_transmitter: None,
         }
     }
 }
