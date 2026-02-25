@@ -10,6 +10,7 @@ use alloy::providers::{PendingTransactionBuilder, Provider};
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
+use backon::Retryable;
 use fireblocks_sdk::apis::transactions_api::{CreateTransactionError, CreateTransactionParams};
 use fireblocks_sdk::apis::vaults_api::{
     GetVaultAccountAssetAddressesPaginatedError, GetVaultAccountAssetAddressesPaginatedParams,
@@ -26,7 +27,7 @@ use url::Url;
 use crate::{Evm, EvmError, Wallet};
 
 /// Polling timeout for Fireblocks transaction completion.
-const POLL_TIMEOUT: Duration = Duration::from_secs(600);
+const POLL_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Polling interval between status checks.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -183,6 +184,14 @@ pub enum FireblocksError {
          status: {status:?}"
     )]
     TransactionFailed {
+        tx_id: String,
+        status: TransactionStatus,
+    },
+    #[error(
+        "Fireblocks transaction {tx_id} polling timed out \
+         while still pending with status: {status:?}"
+    )]
+    PollTimeout {
         tx_id: String,
         status: TransactionStatus,
     },
@@ -370,29 +379,7 @@ where
             "Fireblocks transaction created, polling for completion"
         );
 
-        let result =
-            Client::poll_transaction(&self.client, &tx_id, POLL_TIMEOUT, POLL_INTERVAL, |tx| {
-                debug!(
-                    fireblocks_tx_id = %tx_id,
-                    status = ?tx.status,
-                    "Polling Fireblocks transaction"
-                );
-            })
-            .await?;
-
-        if result.status != TransactionStatus::Completed {
-            if is_still_pending(result.status) {
-                warn!(
-                    fireblocks_tx_id = %tx_id,
-                    status = ?result.status,
-                    "Polling timed out but transaction may still confirm on-chain"
-                );
-            }
-            return Err(EvmError::Fireblocks(FireblocksError::TransactionFailed {
-                tx_id,
-                status: result.status,
-            }));
-        }
+        let result = poll_until_terminal(&self.client, &tx_id, POLL_TIMEOUT, POLL_INTERVAL).await?;
 
         let tx_hash_str = result.tx_hash.ok_or_else(|| {
             EvmError::Fireblocks(FireblocksError::MissingTxHash {
@@ -506,25 +493,79 @@ fn generate_external_tx_id(note: &str) -> String {
     format!("{timestamp}-{truncated_note}-{uuid}")
 }
 
-/// Returns `true` if the transaction is still in a non-terminal state
-/// and may eventually confirm on-chain.
-fn is_still_pending(status: TransactionStatus) -> bool {
-    use TransactionStatus::*;
+/// Polls a Fireblocks transaction until it reaches `Completed`,
+/// a terminal failure, or the timeout expires.
+///
+/// Unlike the SDK's `poll_transaction`, this continues polling
+/// through `Confirming` and other pending statuses that the SDK
+/// treats as terminal.
+async fn poll_until_terminal(
+    client: &Client,
+    tx_id: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<models::TransactionResponse, FireblocksError> {
+    let max_times = (timeout.as_millis() / interval.as_millis()) as usize;
 
-    match status {
-        Submitted
-        | PendingAmlScreening
-        | PendingEnrichment
-        | PendingAuthorization
-        | Queued
-        | PendingSignature
-        | Pending3RdPartyManualApproval
-        | Pending3RdParty
-        | Broadcasting
-        | Confirming => true,
+    let backoff = backon::ConstantBuilder::default()
+        .with_delay(interval)
+        .with_max_times(max_times);
 
-        Completed | Cancelling | Cancelled | Blocked | Rejected | Failed => false,
-    }
+    (|| async {
+        let response = client.get_transaction(tx_id).await?;
+
+        debug!(
+            fireblocks_tx_id = %tx_id,
+            status = ?response.status,
+            "Polling Fireblocks transaction"
+        );
+
+        use TransactionStatus::*;
+        match response.status {
+            Completed => Ok(response),
+
+            Failed | Cancelled | Cancelling | Blocked | Rejected => {
+                Err(FireblocksError::TransactionFailed {
+                    tx_id: tx_id.to_string(),
+                    status: response.status,
+                })
+            }
+
+            Submitted
+            | PendingAmlScreening
+            | PendingEnrichment
+            | PendingAuthorization
+            | Queued
+            | PendingSignature
+            | Pending3RdPartyManualApproval
+            | Pending3RdParty
+            | Broadcasting
+            | Confirming => Err(FireblocksError::PollTimeout {
+                tx_id: tx_id.to_string(),
+                status: response.status,
+            }),
+        }
+    })
+    .retry(backoff)
+    .when(|error| {
+        use FireblocksError::*;
+        match error {
+            PollTimeout { .. } => true,
+
+            Sdk(_)
+            | CreateTransaction(_)
+            | VaultAddresses(_)
+            | Rpc(_)
+            | Hex(_)
+            | MissingTransactionId
+            | TransactionFailed { .. }
+            | MissingTxHash { .. }
+            | NoDepositAddress { .. }
+            | GetContracts(_)
+            | ContractNotWhitelisted { .. } => false,
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1100,35 +1141,109 @@ mod tests {
         );
     }
 
-    #[test]
-    fn is_still_pending_matches_expected_statuses() {
-        use TransactionStatus::*;
+    #[tokio::test]
+    async fn poll_until_terminal_returns_ok_on_completed() {
+        let server = MockServer::start();
 
-        let pending = [
-            Submitted,
-            PendingAmlScreening,
-            PendingEnrichment,
-            PendingAuthorization,
-            Queued,
-            PendingSignature,
-            Pending3RdPartyManualApproval,
-            Pending3RdParty,
-            Broadcasting,
-            Confirming,
-        ];
+        let poll_mock = server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-ok-1");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-ok-1",
+                    "status": "COMPLETED",
+                    "txHash": "0xabc123",
+                    "assetId": "ETH"
+                }));
+        });
 
-        let terminal = [Completed, Cancelling, Cancelled, Blocked, Rejected, Failed];
+        let client = mock_client(&server);
+        let timeout = Duration::from_secs(5);
+        let interval = Duration::from_millis(50);
 
-        for status in pending {
-            assert!(is_still_pending(status), "{status:?} should be pending");
-        }
+        let response = poll_until_terminal(&client, "tx-ok-1", timeout, interval)
+            .await
+            .unwrap();
 
-        for status in terminal {
-            assert!(
-                !is_still_pending(status),
-                "{status:?} should not be pending"
-            );
-        }
+        poll_mock.assert();
+        assert_eq!(response.status, TransactionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn poll_until_terminal_returns_immediately_on_failed() {
+        let server = MockServer::start();
+
+        let poll_mock = server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-fail-1");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-fail-1",
+                    "status": "FAILED",
+                    "assetId": "ETH"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let timeout = Duration::from_secs(5);
+        let interval = Duration::from_millis(50);
+
+        let error = poll_until_terminal(&client, "tx-fail-1", timeout, interval)
+            .await
+            .unwrap_err();
+
+        poll_mock.assert();
+        assert!(
+            matches!(
+                error,
+                FireblocksError::TransactionFailed {
+                    ref tx_id,
+                    status: TransactionStatus::Failed,
+                } if tx_id == "tx-fail-1"
+            ),
+            "expected TransactionFailed with Failed status, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_until_terminal_times_out_with_pending_status() {
+        let server = MockServer::start();
+
+        let poll_mock = server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-timeout-1");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-timeout-1",
+                    "status": "CONFIRMING",
+                    "assetId": "ETH"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let timeout = Duration::from_millis(200);
+        let interval = Duration::from_millis(50);
+
+        let error = poll_until_terminal(&client, "tx-timeout-1", timeout, interval)
+            .await
+            .unwrap_err();
+
+        assert!(
+            poll_mock.hits() >= 2,
+            "should have polled multiple times before timing out, \
+             but only polled {} time(s)",
+            poll_mock.hits()
+        );
+        assert!(
+            matches!(
+                error,
+                FireblocksError::PollTimeout {
+                    ref tx_id,
+                    status: TransactionStatus::Confirming,
+                } if tx_id == "tx-timeout-1"
+            ),
+            "expected PollTimeout with Confirming status, got: {error:?}"
+        );
     }
 
     #[test]

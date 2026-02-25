@@ -8,6 +8,7 @@ default = []
 local-signer = []
 fireblocks = [
   "dep:fireblocks-sdk",
+  "dep:backon",
   "dep:chrono",
   "dep:uuid",
   "dep:serde",
@@ -17,6 +18,7 @@ fireblocks = [
 [dependencies]
 alloy.workspace = true
 async-trait.workspace = true
+backon = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 fireblocks-sdk = { version = "2025.10.17", optional = true }
 rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }

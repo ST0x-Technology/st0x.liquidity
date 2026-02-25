@@ -6854,6 +6854,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "async-trait",
+ "backon",
  "chrono",
  "fireblocks-sdk",
  "httpmock",
