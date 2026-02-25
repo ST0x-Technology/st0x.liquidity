@@ -9,7 +9,7 @@ let
   hedgeCfg = services.st0x-hedge;
 
   cli = pkgs.writeShellApplication {
-    name = "st0x";
+    name = "stox";
     runtimeInputs = [ st0x-liquidity ];
     text = ''
       exec cli --config ${./config/st0x-hedge.toml} \

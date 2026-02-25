@@ -317,8 +317,18 @@ impl From<&LogLevel> for Level {
 
 impl Ctx {
     pub async fn load_files(config_path: &Path, secrets_path: &Path) -> Result<Self, CtxError> {
-        let config_str = tokio::fs::read_to_string(config_path).await?;
-        let secrets_str = tokio::fs::read_to_string(secrets_path).await?;
+        let config_str = tokio::fs::read_to_string(config_path)
+            .await
+            .map_err(|source| CtxError::ConfigIo {
+                path: config_path.to_path_buf(),
+                source,
+            })?;
+        let secrets_str = tokio::fs::read_to_string(secrets_path)
+            .await
+            .map_err(|source| CtxError::SecretsIo {
+                path: secrets_path.to_path_buf(),
+                source,
+            })?;
 
         let config: Config =
             toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
@@ -445,8 +455,16 @@ pub enum CtxError {
     Rebalancing(#[from] RebalancingCtxError),
     #[error("ORDER_OWNER required when rebalancing is disabled")]
     MissingOrderOwner,
-    #[error("failed to read config file")]
-    Io(#[from] std::io::Error),
+    #[error("failed to read config file {path}")]
+    ConfigIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to read secrets file {path}")]
+    SecretsIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse config {path}")]
     ConfigToml {
         path: PathBuf,
@@ -486,7 +504,8 @@ impl CtxError {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::NotRebalancing => "operation requires rebalancing mode",
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
-            Self::Io(_) => "failed to read config file",
+            Self::ConfigIo { .. } => "failed to read config file",
+            Self::SecretsIo { .. } => "failed to read secrets file",
             Self::ConfigToml { .. } => "failed to parse config",
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
