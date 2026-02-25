@@ -38,6 +38,7 @@
     [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
 - [ ] [#277 No automatic retry after offchain order failure](https://github.com/ST0x-Technology/st0x.liquidity/issues/277)
 - [ ] [#310 StoreBuilder allows omitting projections that entities declare as required](https://github.com/ST0x-Technology/st0x.liquidity/issues/310)
+- [ ] [#322 CLI should not depend on database](https://github.com/ST0x-Technology/st0x.liquidity/issues/322)
 
 **CQRS/ES Phase 3 - Complete Migration:**
 
