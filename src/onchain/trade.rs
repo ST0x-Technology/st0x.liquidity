@@ -18,7 +18,7 @@ use st0x_evm::Evm;
 use st0x_execution::{Direction, FractionalShares};
 
 use super::pyth::PythPricing;
-use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
+use crate::bindings::IOrderBookV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::EvmCtx;
 use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
@@ -437,7 +437,7 @@ mod tests {
     use st0x_evm::ReadOnlyEvm;
 
     use super::*;
-    use crate::bindings::IOrderBookV5;
+    use crate::bindings::IOrderBookV6;
     use crate::onchain::EvmCtx;
     use crate::symbol::cache::SymbolCache;
 
@@ -546,6 +546,7 @@ mod tests {
         let large_coeff = 1_000_000_000_000_000_i128;
         let float_large = Float::from_fixed_decimal_lossy(U256::from(large_coeff), 0)
             .unwrap()
+            .0
             .get_inner();
         let result = float_to_decimal(float_large).unwrap();
         assert!((result - dec!(1_000_000_000_000_000.0)).abs() < dec!(1.0));
@@ -554,6 +555,7 @@ mod tests {
         // 1e-50 exceeds Decimal's 28-digit precision, so it truncates to zero
         let float_small = Float::from_fixed_decimal_lossy(uint!(1_U256), 50)
             .unwrap()
+            .0
             .get_inner();
         let result = float_to_decimal(float_small).unwrap();
         assert_eq!(result, dec!(0.0));
@@ -620,8 +622,8 @@ mod tests {
         ));
     }
 
-    fn make_io(token: Address, vault_id: B256) -> IOrderBookV5::IOV2 {
-        IOrderBookV5::IOV2 {
+    fn make_io(token: Address, vault_id: B256) -> IOrderBookV6::IOV2 {
+        IOrderBookV6::IOV2 {
             token,
             vaultId: vault_id,
         }
@@ -629,12 +631,12 @@ mod tests {
 
     fn make_order(
         owner: Address,
-        inputs: Vec<IOrderBookV5::IOV2>,
-        outputs: Vec<IOrderBookV5::IOV2>,
-    ) -> IOrderBookV5::OrderV4 {
-        IOrderBookV5::OrderV4 {
+        inputs: Vec<IOrderBookV6::IOV2>,
+        outputs: Vec<IOrderBookV6::IOV2>,
+    ) -> IOrderBookV6::OrderV4 {
+        IOrderBookV6::OrderV4 {
             owner,
-            evaluable: IOrderBookV5::EvaluableV4::default(),
+            evaluable: IOrderBookV6::EvaluableV4::default(),
             validInputs: inputs,
             validOutputs: outputs,
             nonce: B256::ZERO,
@@ -727,11 +729,11 @@ mod tests {
             )],
         );
 
-        let event = IOrderBookV5::ClearV3 {
+        let event = IOrderBookV6::ClearV3 {
             sender: address!("0x0000000000000000000000000000000000000000"),
             alice,
             bob,
-            clearConfig: IOrderBookV5::ClearConfigV2 {
+            clearConfig: IOrderBookV6::ClearConfigV2 {
                 aliceInputIOIndex: uint!(0_U256),
                 aliceOutputIOIndex: uint!(0_U256),
                 bobInputIOIndex: uint!(0_U256),

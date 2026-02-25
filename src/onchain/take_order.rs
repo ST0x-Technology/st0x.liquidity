@@ -6,7 +6,7 @@ use alloy::rpc::types::Log;
 use st0x_evm::Evm;
 
 use super::OnChainError;
-use crate::bindings::IOrderBookV5::{TakeOrderConfigV4, TakeOrderV3};
+use crate::bindings::IOrderBookV6::{TakeOrderConfigV4, TakeOrderV3};
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
@@ -33,7 +33,7 @@ impl OnchainTrade {
             signedContext: _,
         } = event.config;
 
-        // Per IOrderBookV5.sol lines 385-386, TakeOrderV3's `input`/`output` are
+        // Per IOrderBookV6.sol lines 385-386, TakeOrderV3's `input`/`output` are
         // "from the perspective of sender" (the taker), NOT the order:
         // - event.input = what taker received = what order GAVE (order's output)
         // - event.output = what taker gave = what order RECEIVED (order's input)
@@ -62,16 +62,16 @@ mod tests {
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV5::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
+    use crate::bindings::IOrderBookV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
 
     fn create_take_order_event_with_order(
-        order: crate::bindings::IOrderBookV5::OrderV4,
+        order: crate::bindings::IOrderBookV6::OrderV4,
     ) -> TakeOrderV3 {
-        // Per IOrderBookV5.sol lines 385-386, input/output are from taker's perspective.
+        // Per IOrderBookV6.sol lines 385-386, input/output are from taker's perspective.
         // For a trade where order receives 100 USDC and gives 9 shares:
         // - input = 9 (taker received 9 shares = order gave 9 shares)
         // - output = 100 (taker gave 100 USDC = order received 100 USDC)
@@ -89,9 +89,11 @@ mod tests {
             },
             input: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
                 .unwrap()
+                .0
                 .get_inner(),
             output: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
                 .unwrap()
+                .0
                 .get_inner(),
         }
     }
@@ -216,9 +218,11 @@ mod tests {
             },
             input: Float::from_fixed_decimal_lossy(uint!(50_U256), 0)
                 .unwrap()
+                .0
                 .get_inner(),
             output: Float::from_fixed_decimal_lossy(uint!(5_U256), 0)
                 .unwrap()
+                .0
                 .get_inner(),
         };
 
@@ -282,9 +286,11 @@ mod tests {
             },
             input: Float::from_fixed_decimal_lossy(uint!(15_U256), 0)
                 .unwrap()
+                .0
                 .get_inner(),
             output: Float::from_fixed_decimal_lossy(uint!(200_U256), 0)
                 .unwrap()
+                .0
                 .get_inner(),
         };
 
@@ -393,7 +399,8 @@ mod tests {
         // Helper to create Float for testing using from_fixed_decimal_lossy
         fn create_float(value: u64, decimals: u8) -> B256 {
             let u256_value = U256::from(value);
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            let (float, _lossy) =
+                Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
         }
 

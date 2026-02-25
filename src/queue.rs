@@ -8,7 +8,7 @@ use std::num::TryFromIntError;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
-use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
+use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::onchain::trade::TradeEvent;
 
 /// Trait for events that can be enqueued
@@ -271,7 +271,7 @@ mod tests {
     use alloy::primitives::{B256, LogData, address, b256};
 
     use super::*;
-    use crate::bindings::IOrderBookV5::{
+    use crate::bindings::IOrderBookV6::{
         ClearConfigV2, ClearV3, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::test_utils::setup_test_db;

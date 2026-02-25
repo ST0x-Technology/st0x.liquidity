@@ -29,7 +29,7 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares};
 
-use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
+use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError, OperationalLimits};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
@@ -154,7 +154,7 @@ impl Conductor {
             let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
             let provider = ProviderBuilder::new().connect_ws(ws).await?;
             let cache = SymbolCache::default();
-            let orderbook = IOrderBookV5Instance::new(ctx.evm.orderbook, &provider);
+            let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
             let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
             let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
@@ -1505,7 +1505,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::bindings::IOrderBookV5::{
+    use crate::bindings::IOrderBookV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4,
     };
     use crate::conductor::builder::CqrsFrameworks;

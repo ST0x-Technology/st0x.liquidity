@@ -237,7 +237,7 @@ mod tests {
     use st0x_execution::{ExecutorOrderId, MarketOrder, MockExecutor, Symbol};
 
     use super::*;
-    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
+    use crate::bindings::IOrderBookV6::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::config::OperationalLimits;
     use crate::offchain_order::noop_order_placer;
     use crate::offchain_order::{OffchainOrder, OrderPlacer};

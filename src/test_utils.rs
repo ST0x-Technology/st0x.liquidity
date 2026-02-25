@@ -14,7 +14,7 @@ use std::sync::Arc;
 use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::{Direction, FractionalShares, SchwabTokens};
 
-use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
+use crate::bindings::IOrderBookV6::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};

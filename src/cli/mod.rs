@@ -761,7 +761,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
+    use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{BrokerCtx, LogLevel, OperationalLimits, SchwabAuth, TradingMode};
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
@@ -1300,7 +1300,8 @@ mod tests {
         });
 
         fn create_float_from_u256(value: U256, decimals: u8) -> B256 {
-            let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
+            let (float, _lossy) =
+                Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
             float.get_inner()
         }
 

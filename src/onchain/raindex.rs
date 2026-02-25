@@ -1,14 +1,14 @@
-//! Rain OrderBook V5 (Raindex) vault operations on Base.
+//! Rain OrderBook V6 (Raindex) vault operations on Base.
 //!
 //! This module provides a service layer for depositing and withdrawing tokens to/from
-//! Raindex vaults using the `deposit3` and `withdraw3` contract functions.
+//! Raindex vaults using the `deposit4` and `withdraw4` contract functions.
 //!
 //! The primary use case is USDC vault management for inventory rebalancing in the
 //! market making system.
 //!
-//! ## V5 Float Format
+//! ## V6 Float Format
 //!
-//! OrderBook V5 uses a custom float format (B256) for amounts. All conversions between
+//! OrderBook V6 uses a custom float format (B256) for amounts. All conversions between
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
 use alloy::primitives::{Address, B256, TxHash, U256, address};
@@ -22,7 +22,7 @@ use st0x_event_sorcery::ProjectionError;
 use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::bindings::{IERC20, IOrderBookV5};
+use crate::bindings::{IERC20, IOrderBookV6};
 use crate::threshold::Usdc;
 use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProjection};
 
@@ -138,7 +138,7 @@ impl<W: Wallet> RaindexService<W> {
         self.approve_for_orderbook::<Registry>(token, amount)
             .await?;
 
-        self.deposit3_to_vault::<Registry>(token, vault_id, amount, decimals)
+        self.deposit4_to_vault::<Registry>(token, vault_id, amount, decimals)
             .await
     }
 
@@ -181,7 +181,7 @@ impl<W: Wallet> RaindexService<W> {
         Ok(())
     }
 
-    async fn deposit3_to_vault<Registry: IntoErrorRegistry>(
+    async fn deposit4_to_vault<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
@@ -190,9 +190,9 @@ impl<W: Wallet> RaindexService<W> {
     ) -> Result<TxHash, RaindexError> {
         let amount_float = Float::from_fixed_decimal(amount, decimals)?;
 
-        debug!(%token, ?vault_id, %amount, "Sending deposit3");
+        debug!(%token, ?vault_id, %amount, "Sending deposit4");
 
-        let calldata = IOrderBookV5::deposit3Call {
+        let calldata = IOrderBookV6::deposit4Call {
             token,
             vaultId: vault_id.0,
             depositAmount: amount_float.get_inner(),
@@ -201,10 +201,10 @@ impl<W: Wallet> RaindexService<W> {
 
         let receipt = self
             .evm
-            .submit::<Registry, _>(self.orderbook_address, calldata, "deposit3 to vault")
+            .submit::<Registry, _>(self.orderbook_address, calldata, "deposit4 to vault")
             .await?;
 
-        info!(tx_hash = %receipt.transaction_hash, "deposit3 confirmed");
+        info!(tx_hash = %receipt.transaction_hash, "deposit4 confirmed");
         Ok(receipt.transaction_hash)
     }
 
@@ -279,7 +279,7 @@ impl<E: Evm> RaindexService<E> {
             .evm
             .call::<Registry, _>(
                 self.orderbook_address,
-                IOrderBookV5::vaultBalance2Call {
+                IOrderBookV6::vaultBalance2Call {
                     owner,
                     token,
                     vaultId: vault_id.0,
@@ -386,17 +386,17 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .evm
             .submit::<OpenChainErrorRegistry, _>(
                 self.orderbook_address,
-                IOrderBookV5::withdraw3Call {
+                IOrderBookV6::withdraw4Call {
                     token,
                     vaultId: vault_id.0,
                     targetAmount: amount_float.get_inner(),
                     tasks: Vec::new(),
                 },
-                "withdraw3 from vault",
+                "withdraw4 from vault",
             )
             .await?;
 
-        info!(tx_hash = %receipt.transaction_hash, "withdraw3 confirmed");
+        info!(tx_hash = %receipt.transaction_hash, "withdraw4 confirmed");
         Ok(receipt.transaction_hash)
     }
 }
@@ -422,9 +422,9 @@ mod tests {
     use st0x_event_sorcery::StoreBuilder;
 
     use super::*;
-    use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::bindings::{IOrderBookV6, OrderBook, TOFUTokenDecimals, TestERC20};
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
-    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
+    const TOFU_DECIMALS_ADDRESS: Address = address!("0xF66761F6b5F58202998D6Cd944C81b22Dc6d4f1E");
 
     type BaseProvider = FillProvider<
         JoinFill<
@@ -533,7 +533,7 @@ mod tests {
                 .wallet
                 .call::<NoOpErrorRegistry, _>(
                     self.orderbook_address,
-                    IOrderBookV5::vaultBalance2Call {
+                    IOrderBookV6::vaultBalance2Call {
                         owner: self.wallet.address(),
                         token,
                         vaultId: vault_id,
@@ -657,8 +657,8 @@ mod tests {
 
         assert!(logs_contain("Sending ERC20 approve"));
         assert!(logs_contain("Approve confirmed"));
-        assert!(logs_contain("Sending deposit3"));
-        assert!(logs_contain("deposit3 confirmed"));
+        assert!(logs_contain("Sending deposit4"));
+        assert!(logs_contain("deposit4 confirmed"));
     }
 
     #[tokio::test]

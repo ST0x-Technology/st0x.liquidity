@@ -30,7 +30,7 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Positive, Symbol};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
-use crate::bindings::IOrderBookV5::{self, TakeOrderV3};
+use crate::bindings::IOrderBookV6::{self, TakeOrderV3};
 use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, OrderBook, Parser, Store as RainStore,
     TOFUTokenDecimals,
@@ -257,7 +257,7 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
 
     provider
         .anvil_set_code(
-            address!("4f1C29FAAB7EDdF8D7794695d8259996734Cc665"),
+            address!("0xF66761F6b5F58202998D6Cd944C81b22Dc6d4f1E"),
             TOFUTokenDecimals::DEPLOYED_BYTECODE.clone(),
         )
         .await
@@ -406,7 +406,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let equity_addr = self.ensure_equity_token(symbol).await;
 
         let orderbook =
-            IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.provider);
+            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook_addr, &self.provider);
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
 
         let is_sell = direction == Direction::Sell;
@@ -451,17 +451,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let input_vault_id = B256::random();
         let output_vault_id = B256::random();
 
-        let order_config = IOrderBookV5::OrderConfigV4 {
-            evaluable: IOrderBookV5::EvaluableV4 {
+        let order_config = IOrderBookV6::OrderConfigV4 {
+            evaluable: IOrderBookV6::EvaluableV4 {
                 interpreter: self.interpreter_addr,
                 store: self.store_addr,
                 bytecode: Bytes::from(parsed_bytecode),
             },
-            validInputs: vec![IOrderBookV5::IOV2 {
+            validInputs: vec![IOrderBookV6::IOV2 {
                 token: input_token,
                 vaultId: input_vault_id,
             }],
-            validOutputs: vec![IOrderBookV5::IOV2 {
+            validOutputs: vec![IOrderBookV6::IOV2 {
                 token: output_token,
                 vaultId: output_vault_id,
             }],
@@ -471,7 +471,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         };
 
         let add_order_receipt = orderbook
-            .addOrder3(order_config, vec![])
+            .addOrder4(order_config, vec![])
             .send()
             .await
             .unwrap()
@@ -483,7 +483,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             .inner
             .logs()
             .iter()
-            .find_map(|log| log.log_decode::<IOrderBookV5::AddOrderV3>().ok())
+            .find_map(|log| log.log_decode::<IOrderBookV6::AddOrderV3>().ok())
             .expect("AddOrderV3 event not found");
         let order = add_order_event.data().order.clone();
 
@@ -496,6 +496,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let deposit_micro: U256 = parse_units(deposit_amount_str, 6).unwrap().into();
         let deposit_float = Float::from_fixed_decimal_lossy(deposit_micro, 6)
             .unwrap()
+            .0
             .get_inner();
 
         let deposit_approve: U256 = if is_sell {
@@ -514,7 +515,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             .unwrap();
 
         orderbook
-            .deposit3(output_token, output_vault_id, deposit_float, vec![])
+            .deposit4(output_token, output_vault_id, deposit_float, vec![])
             .send()
             .await
             .unwrap()
@@ -538,16 +539,19 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             .await
             .unwrap();
 
-        // Take the order with permissive bounds (large maximumInput/maximumIORatio)
-        let take_config = IOrderBookV5::TakeOrdersConfigV4 {
-            minimumInput: B256::ZERO,
-            maximumInput: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
+        // Take the order with permissive bounds (large maximumIO/maximumIORatio)
+        let take_config = IOrderBookV6::TakeOrdersConfigV5 {
+            minimumIO: B256::ZERO,
+            maximumIO: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
                 .unwrap()
+                .0
                 .get_inner(),
             maximumIORatio: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
                 .unwrap()
+                .0
                 .get_inner(),
-            orders: vec![IOrderBookV5::TakeOrderConfigV4 {
+            IOIsInput: true,
+            orders: vec![IOrderBookV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(0),
@@ -557,7 +561,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         };
 
         let take_receipt = orderbook
-            .takeOrders3(take_config)
+            .takeOrders4(take_config)
             .send()
             .await
             .unwrap()
@@ -567,7 +571,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
 
         assert!(
             take_receipt.status(),
-            "takeOrders3 reverted. Logs: {:?}",
+            "takeOrders4 reverted. Logs: {:?}",
             take_receipt.inner.logs()
         );
 

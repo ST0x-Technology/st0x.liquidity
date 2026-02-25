@@ -6,7 +6,7 @@ use alloy::sol;
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IOrderBookV5, "lib/rain.orderbook/out/IOrderBookV5.sol/IOrderBookV5.json"
+    IOrderBookV6, "lib/rain.orderbook/out/IOrderBookV6.sol/IOrderBookV6.json"
 );
 
 sol!(
@@ -32,7 +32,7 @@ sol!(
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    OrderBook, "lib/rain.orderbook/out/OrderBook.sol/OrderBook.json"
+    OrderBook, "lib/rain.orderbook/out/OrderBookV6.sol/OrderBookV6.json"
 );
 
 #[cfg(test)]
