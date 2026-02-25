@@ -1237,7 +1237,6 @@ pub(crate) mod tests {
             mode = "disabled"
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1258,9 +1257,17 @@ pub(crate) mod tests {
         "#,
         );
 
-        Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker)
+            ),
+            "expected NotAlpacaBroker, got: {error:?}"
+        );
     }
 
     #[tokio::test]

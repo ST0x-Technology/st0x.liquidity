@@ -65,7 +65,7 @@ in {
         export DEPLOY_HOST="$host_ip"
 
         # Verify host key against keys.nix trust anchor
-        scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null)
+        scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null | grep -v '^#')
         expected="$host_ip ${expectedHostPubKey}"
 
         if [ -z "$scanned" ]; then
@@ -86,7 +86,7 @@ in {
           exit 1
         fi
 
-        ssh-keygen -R "$host_ip" 2>/dev/null || true
+        ssh-keygen -R "$host_ip" >/dev/null 2>&1 || true
         echo "$expected" >> "$HOME/.ssh/known_hosts"
 
         ssh_flag=""
