@@ -8,6 +8,7 @@ use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
+use tracing::debug;
 use uuid::Uuid;
 
 use st0x_execution::Positive;
@@ -176,6 +177,11 @@ pub(super) async fn initiate_withdrawal(
         asset,
         address,
     };
+
+    debug!(
+        "Withdrawal request body: {}",
+        serde_json::to_string_pretty(&request).unwrap_or_default()
+    );
 
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
 

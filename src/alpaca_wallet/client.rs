@@ -180,7 +180,11 @@ impl AlpacaWalletClient {
         let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
 
         let response = self.get(&path).await?;
-        let entries: Vec<WhitelistEntry> = response.json().await?;
+        let text = response.text().await?;
+
+        debug!("Raw whitelist response: {text}");
+
+        let entries: Vec<WhitelistEntry> = serde_json::from_str(&text)?;
 
         Ok(entries)
     }
