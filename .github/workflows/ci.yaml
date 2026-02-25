@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  pre-commit:
+  hooks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +28,7 @@ jobs:
       - name: pre-commit hooks
         run: nix develop -c pre-commit run --all-files
 
-  build-backend:
+  backend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,7 +75,7 @@ jobs:
       - name: Clippy
         run: nix build --impure .#st0x-clippy
 
-  build-dashboard:
+  dashboard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -108,7 +108,7 @@ jobs:
           path: result/
 
   e2e:
-    needs: [build-backend, build-dashboard]
+    needs: [backend, dashboard]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
