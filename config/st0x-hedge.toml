@@ -1,4 +1,4 @@
-database_url = "sqlite:///mnt/data/alpaca.db"
+database_url = "sqlite:///mnt/data/st0x-hedge.db"
 log_level = "debug"
 server_port = 8001
 
