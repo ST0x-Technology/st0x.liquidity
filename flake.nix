@@ -118,6 +118,14 @@
             '';
           };
 
+          genE2eBunNix = rainix.mkTask.${system} {
+            name = "gen-e2e-bun-nix";
+            additionalBuildInputs = [ bun2nix.packages.${system}.default ];
+            body = ''
+              exec bun2nix -o e2e/bun.nix --lock-file e2e/bun.lock
+            '';
+          };
+
           bootstrap = rainix.mkTask.${system} {
             name = "bootstrap-nixos";
             additionalBuildInputs = infraPkgs.buildInputs
@@ -219,6 +227,12 @@
               packages.deployService
               packages.deployAll
             ] ++ rainix.devShells.${system}.default.buildInputs;
+        };
+
+        devShells.e2e = pkgs.mkShell {
+          buildInputs = [ pkgs.bun ];
+          PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
         };
       });
 
