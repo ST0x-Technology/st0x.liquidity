@@ -1,4 +1,4 @@
-{ pkgs, lib, modulesPath, dashboard, ... }:
+{ pkgs, lib, modulesPath, dashboard, st0x-liquidity, ... }:
 
 let
   inherit (import ./keys.nix) roles;
@@ -185,15 +185,9 @@ in {
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
-  environment.systemPackages = with pkgs; [
-    bat
-    curl
-    htop
-    magic-wormhole
-    sqlite
-    rage
-    zellij
-  ];
+  environment.systemPackages =
+    (with pkgs; [ bat curl htop magic-wormhole sqlite rage zellij ])
+    ++ [ st0x-liquidity ]; # TODO: pull out CLI into a separate derivation
 
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";

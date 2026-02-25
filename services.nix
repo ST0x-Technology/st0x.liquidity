@@ -1,6 +1,6 @@
 {
   server.enabled = true;
-  server.bin = "server";
+  server.bin = "st0x-hedge";
 
   reporter.enabled = false;
   reporter.bin = "reporter";

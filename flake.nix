@@ -27,7 +27,10 @@
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
-          specialArgs.dashboard = self.packages.x86_64-linux.st0x-dashboard;
+          specialArgs = {
+            dashboard = self.packages.x86_64-linux.st0x-dashboard;
+            inherit (self.packages.x86_64-linux) st0x-liquidity;
+          };
 
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
