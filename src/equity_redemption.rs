@@ -131,6 +131,17 @@ pub(crate) enum EquityRedemptionError {
         wrapped_amount: U256,
         error_message: String,
     },
+    /// Underlying token address lookup failed after unwrapping.
+    /// WrapperError can't be wrapped with #[from] for the same reason
+    /// as UnwrapFailed above.
+    #[error(
+        "Underlying token lookup failed for {symbol}: \
+         {error_message}"
+    )]
+    UnderlyingLookupFailed {
+        symbol: Symbol,
+        error_message: String,
+    },
     /// Transaction failed with a known tx hash
     #[error("Transaction failed: {tx_hash}")]
     TransactionFailed { tx_hash: TxHash },
@@ -212,6 +223,7 @@ pub(crate) enum EquityRedemptionEvent {
     },
     /// ERC-4626 wrapped tokens have been unwrapped.
     TokensUnwrapped {
+        underlying_token: Address,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
         unwrapped_at: DateTime<Utc>,
@@ -294,6 +306,7 @@ pub(crate) enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
+        underlying_token: Address,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -414,6 +427,7 @@ impl EventSourced for EquityRedemption {
             },
 
             TokensUnwrapped {
+                underlying_token,
                 unwrap_tx_hash,
                 unwrapped_amount,
                 unwrapped_at,
@@ -434,6 +448,7 @@ impl EventSourced for EquityRedemption {
                     symbol: symbol.clone(),
                     quantity: *quantity,
                     token: *token,
+                    underlying_token: *underlying_token,
                     raindex_withdraw_tx: *raindex_withdraw_tx,
                     unwrap_tx_hash: *unwrap_tx_hash,
                     unwrapped_amount: *unwrapped_amount,
@@ -466,14 +481,14 @@ impl EventSourced for EquityRedemption {
                 Self::TokensUnwrapped {
                     symbol,
                     quantity,
-                    token,
+                    underlying_token,
                     raindex_withdraw_tx,
                     unwrap_tx_hash,
                     ..
                 } => Some(Self::TokensSent {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    token: *token,
+                    token: *underlying_token,
                     raindex_withdraw_tx: *raindex_withdraw_tx,
                     unwrap_tx_hash: Some(*unwrap_tx_hash),
                     redemption_wallet: *redemption_wallet,
@@ -651,10 +666,22 @@ impl EventSourced for EquityRedemption {
 
             UnwrapTokens => match self {
                 Self::WithdrawnFromRaindex {
+                    symbol,
                     token,
                     wrapped_amount,
                     ..
                 } => {
+                    let underlying_token = services
+                        .wrapper
+                        .lookup_unwrapped(symbol)
+                        .inspect_err(|error| {
+                            warn!(%error, %symbol, "Underlying token lookup failed");
+                        })
+                        .map_err(|error| EquityRedemptionError::UnderlyingLookupFailed {
+                            symbol: symbol.clone(),
+                            error_message: error.to_string(),
+                        })?;
+
                     let owner = services.wrapper.owner();
                     let (unwrap_tx_hash, unwrapped_amount) = services
                         .wrapper
@@ -668,7 +695,9 @@ impl EventSourced for EquityRedemption {
                             wrapped_amount: *wrapped_amount,
                             error_message: error.to_string(),
                         })?;
+
                     Ok(vec![TokensUnwrapped {
+                        underlying_token,
                         unwrap_tx_hash,
                         unwrapped_amount,
                         unwrapped_at: Utc::now(),
@@ -681,11 +710,11 @@ impl EventSourced for EquityRedemption {
 
             SendTokens => match self {
                 Self::TokensUnwrapped {
-                    token,
+                    underlying_token,
                     unwrapped_amount,
                     ..
                 } => {
-                    let token = *token;
+                    let token = *underlying_token;
                     let amount = *unwrapped_amount;
 
                     info!(%token, %amount, "Sending unwrapped tokens for redemption");
@@ -912,6 +941,54 @@ mod tests {
 
         let entity = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(entity, EquityRedemption::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn send_tokens_uses_underlying_token_not_wrapped_token() {
+        let wrapped_token = Address::random();
+        let underlying_token = Address::random();
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new().with_unwrapped_token(underlying_token)),
+        };
+
+        let store = TestStore::<EquityRedemption>::new(services);
+        let id = RedemptionAggregateId::new("underlying-token-fix");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: dec!(10),
+                    token: wrapped_token,
+                    amount: U256::from(10_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let EquityRedemption::TokensSent { token, .. } = entity else {
+            panic!("Expected TokensSent state, got: {entity:?}");
+        };
+
+        assert_eq!(
+            token, underlying_token,
+            "SendTokens should use the underlying token, not the wrapped token"
+        );
     }
 
     #[tokio::test]
@@ -1261,6 +1338,29 @@ mod tests {
                 LifecycleError::Apply(EquityRedemptionError::UnwrapFailed { .. })
             ),
             "Expected UnwrapFailed error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn underlying_lookup_failure_returns_underlying_lookup_failed_error() {
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::failing_lookup()),
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![withdrawn_from_raindex_event()])
+            .when(EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::UnderlyingLookupFailed { .. })
+            ),
+            "Expected UnderlyingLookupFailed error, got: {error:?}"
         );
     }
 
