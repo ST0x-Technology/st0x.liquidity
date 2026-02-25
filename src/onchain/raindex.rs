@@ -669,7 +669,7 @@ mod tests {
         let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
         let vault_id = TEST_VAULT_ID;
 
-        // Pre-approve with sufficient allowance — deposit should skip the approve tx
+        // Pre-approve with sufficient allowance -- deposit should skip the approve tx
         local_evm
             .approve_tokens(
                 local_evm.token_address,
