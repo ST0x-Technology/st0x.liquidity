@@ -195,8 +195,17 @@ in {
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
-  environment.systemPackages =
-    (with pkgs; [ bat curl htop magic-wormhole sqlite rage zellij ]) ++ [ cli ];
+  environment.systemPackages = with pkgs; [
+    bat
+    curl
+    htop
+    magic-wormhole
+    sqlite
+    rage
+    vim
+    zellij
+    cli
+  ];
 
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";
