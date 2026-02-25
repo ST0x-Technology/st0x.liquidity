@@ -1,0 +1,86 @@
+database_url = "sqlite:///mnt/data/alpaca.db"
+log_level = "debug"
+server_port = 8001
+
+[operational_limits]
+mode = "enabled"
+max_amount = "100"
+max_shares = "2"
+
+[hyperdx]
+service_name = "st0x-hedge"
+
+[evm]
+orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
+deployment_block = 40850446
+
+[rebalancing]
+redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+usdc_vault_id = "0x03c31202da3b08a9957433f65fd4c1e9152fcca78910f58fe2df7a2b7b529f9f"
+fireblocks_environment = "production"
+fireblocks_vault_account_id = "0"
+
+[rebalancing.equity]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc]
+mode = "enabled"
+target = "0.5"
+deviation = "0.3"
+
+[rebalancing.fireblocks_chain_asset_ids]
+1 = "ETH"
+8453 = "BASECHAIN_ETH"
+
+[rebalancing.equities.tSPYM]
+unwrapped = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
+wrapped = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+
+[rebalancing.equities.tTSLA]
+unwrapped = "0x4e169cd2ab4f82640a8c65c68fed55863866fdb0"
+wrapped = "0x219a8d384a10bf19b9f24cb5cc53f79dd0e5a03d"
+
+[rebalancing.equities.tAMZN]
+unwrapped = "0x466cb2e46fa1afc0ab5e22274b34d0391db18efd"
+wrapped = "0x997bae3ec193a249596d3708c3fab7c501bb8a53"
+
+[rebalancing.equities.tNVDA]
+unwrapped = "0x7271a3c91bb6070ed09333b84a815949d4f16d14"
+wrapped = "0xfb5b41acdba20a3230f84be995173cfb98b8d6e7"
+
+[rebalancing.equities.tMSTR]
+unwrapped = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe"
+wrapped = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2"
+
+[rebalancing.equities.tQSEP]
+unwrapped = "0x4a9a9fc94a507559481270d0bff3315ab92fcefa"
+wrapped = "0x849e389982209f901b7b9ffca57ae4c9eeb11c0d"
+
+[rebalancing.equities.tIAU]
+unwrapped = "0x9a507314ea2a6c5686c0d07bfecb764dcf324dff"
+wrapped = "0x1e46d7efef64a833afb1cd49299a7ad5b439f4d8"
+
+[rebalancing.equities.tCOIN]
+unwrapped = "0x626757e6f50675d17fcad312e82f989ae7a23d38"
+wrapped = "0x5cda0e1ca4ce2af96315f7f8963c85399c172204"
+
+[rebalancing.equities.tSIVR]
+unwrapped = "0x58ce5024b89b4f73c27814c0f0abbea331c99be8"
+wrapped = "0xeb7f3e4093c9d68253b6104fbbff561f3ec0442f"
+
+[rebalancing.equities.tCRCL]
+unwrapped = "0x38eb797892ed71da69bdc27a456a7c83ff813b52"
+wrapped = "0x8afba81dec38de0a18e2df5e1967a7493651eebf"
+
+[rebalancing.equities.tPPLT]
+unwrapped = "0x1f17523b147ccc2a2328c0f014f6d49c479ea063"
+wrapped = "0x82f5baee1076334357a34a19e04f7c282d51ce47"
+
+[rebalancing.equities.tBMNR]
+unwrapped = "0xfbde45df60249203b12148452fc77c3b5f811eb2"
+wrapped = "0x02512ec661f0ba89c275ea105e31bad6fcfcf319"
+
+[rebalancing.equities.tRKLB]
+unwrapped = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+wrapped = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"

@@ -6,6 +6,17 @@ let
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
 
+  hedgeCfg = services.st0x-hedge;
+
+  cli = pkgs.writeShellApplication {
+    name = "st0x";
+    runtimeInputs = [ st0x-liquidity ];
+    text = ''
+      exec cli --config ${./config/st0x-hedge.toml} \
+        --secrets ${hedgeCfg.decryptedSecretPath} "$@"
+    '';
+  };
+
   mkService = name: cfg:
     let
       path = "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
@@ -25,7 +36,7 @@ let
 
         # Marker file created ONLY by service profile activation.
         # Guarantees service is SKIPPED (not failed) during system activation.
-        ConditionPathExists = "/run/st0x/${name}.ready";
+        ConditionPathExists = cfg.markerFile;
       };
 
       serviceConfig = {
@@ -36,19 +47,13 @@ let
           "--config"
           "${configFile}"
           "--secrets"
-          "/run/agenix/${name}.toml"
+          cfg.decryptedSecretPath
         ];
         Restart = "always";
         RestartSec = 5;
         ReadWritePaths = [ "/mnt/data" ];
       };
     };
-
-  mkSecret = name: _: {
-    file = ./secret/${name}.toml.age;
-    group = "st0x";
-    mode = "0640";
-  };
 
 in {
   imports = [
@@ -181,13 +186,17 @@ in {
   users.groups.st0x = { };
   programs.bash.interactiveShellInit = "set -o vi";
 
-  age.secrets = lib.mapAttrs mkSecret enabledServices;
+  age.secrets = lib.mapAttrs' (_: cfg:
+    lib.nameValuePair cfg.decryptedSecret {
+      file = ./secret/${cfg.encryptedSecret};
+      group = "st0x";
+      mode = "0640";
+    }) enabledServices;
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
   environment.systemPackages =
-    (with pkgs; [ bat curl htop magic-wormhole sqlite rage zellij ])
-    ++ [ st0x-liquidity ]; # TODO: pull out CLI into a separate derivation
+    (with pkgs; [ bat curl htop magic-wormhole sqlite rage zellij ]) ++ [ cli ];
 
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";

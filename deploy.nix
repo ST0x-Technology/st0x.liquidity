@@ -19,17 +19,16 @@ let
   # Decrypts secrets and restarts service atomically
   mkServiceProfile = name:
     let
-      markerFile = "/run/st0x/${name}.ready";
-      secretsFile = ./secret/${name}.toml.age;
-      decryptedSecrets = "/run/agenix/${name}.toml";
+      cfg = services.${name};
+      secretsFile = ./secret/${cfg.encryptedSecret};
     in activate.custom st0xPackage (builtins.concatStringsSep " && " [
       "systemctl stop ${name} || true"
-      "rm -f ${markerFile}"
-      "mkdir -p /run/agenix /run/st0x"
-      "${rage} -d -i ${hostKey} ${secretsFile} > ${decryptedSecrets}"
-      "chown root:st0x ${decryptedSecrets}"
-      "chmod 0640 ${decryptedSecrets}"
-      "touch ${markerFile}"
+      "rm -f ${cfg.markerFile}"
+      "mkdir -p /run/st0x"
+      "${rage} -d -i ${hostKey} ${secretsFile} > ${cfg.decryptedSecretPath}"
+      "chown root:st0x ${cfg.decryptedSecretPath}"
+      "chmod 0640 ${cfg.decryptedSecretPath}"
+      "touch ${cfg.markerFile}"
       "systemctl restart ${name}"
     ]);
 
