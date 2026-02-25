@@ -1257,7 +1257,7 @@ pub(crate) mod tests {
 
     #[test]
     fn server_config_toml_is_valid() {
-        let config_str = include_str!("../config/server.toml");
+        let config_str = include_str!("../config/st0x-hedge.toml");
         toml::from_str::<Config>(config_str).unwrap();
     }
 
