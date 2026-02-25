@@ -66,19 +66,28 @@ in {
 
         # Verify host key against keys.nix trust anchor
         scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null)
+        expected="$host_ip ${expectedHostPubKey}"
+
         if [ -z "$scanned" ]; then
           echo "ERROR: ssh-keyscan returned no key for $host_ip" >&2
           exit 1
         fi
-        if ! echo "$scanned" | grep -qF "${expectedHostPubKey}"; then
-          echo "ERROR: host key mismatch for $host_ip" >&2
-          echo "  expected: ${expectedHostPubKey}" >&2
-          echo "  got:      $scanned" >&2
-          echo "If the host was re-bootstrapped, update keys.nix and rekey secrets." >&2
+
+        if [ "$(echo "$scanned" | wc -l)" -ne 1 ]; then
+          echo "ERROR: expected 1 key from $host_ip, got multiple:" >&2
+          echo "$scanned" >&2
           exit 1
         fi
+
+        if [ "$scanned" != "$expected" ]; then
+          echo "ERROR: host key mismatch for $host_ip" >&2
+          echo "  expected: $expected" >&2
+          echo "  got:      $scanned" >&2
+          exit 1
+        fi
+
         ssh-keygen -R "$host_ip" 2>/dev/null || true
-        echo "$scanned" >> "$HOME/.ssh/known_hosts"
+        echo "$expected" >> "$HOME/.ssh/known_hosts"
 
         ssh_flag=""
         if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
