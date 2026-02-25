@@ -12,8 +12,10 @@ let
     name = "stox";
     runtimeInputs = [ st0x-liquidity ];
     text = ''
-      exec cli --config ${./config/st0x-hedge.toml} \
-        --secrets ${hedgeCfg.decryptedSecretPath} "$@"
+      exec cli \
+        --config "''${STOX_CONFIG:-${./config/st0x-hedge.toml}}" \
+        --secrets "''${STOX_SECRETS:-${hedgeCfg.decryptedSecretPath}}" \
+        "$@"
     '';
   };
 
@@ -191,7 +193,7 @@ in {
       file = ./secret/${cfg.encryptedSecret};
       group = "st0x";
       mode = "0640";
-    }) enabledServices;
+    }) services;
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
