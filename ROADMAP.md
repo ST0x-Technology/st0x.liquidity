@@ -11,6 +11,9 @@
 
 ### Live testing of auto-rebalancing on the Alpaca instance
 
+- PR:
+  [#315 go live prod configuration](https://github.com/ST0x-Technology/st0x.liquidity/pull/315)
+
 **Wrapped Token Handling:**
 
 - [x] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
