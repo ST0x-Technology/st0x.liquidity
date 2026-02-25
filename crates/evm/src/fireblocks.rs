@@ -162,6 +162,33 @@ impl<P> FireblocksCtx<P> {
     }
 }
 
+/// Errors from polling a single Fireblocks transaction to completion.
+#[derive(Debug, thiserror::Error)]
+pub enum PollError {
+    #[error("Fireblocks SDK error: {0}")]
+    Sdk(#[from] fireblocks_sdk::FireblocksError),
+    #[error(
+        "Fireblocks transaction {tx_id} reached terminal \
+         status: {status:?}"
+    )]
+    TransactionFailed {
+        tx_id: String,
+        status: TransactionStatus,
+    },
+    #[error(
+        "Fireblocks transaction {tx_id} polling timed out \
+         while still pending with status: {status:?}"
+    )]
+    StillPending {
+        tx_id: String,
+        status: TransactionStatus,
+    },
+    #[error("poll interval must be non-zero")]
+    ZeroInterval,
+    #[error("poll count overflow: {0}")]
+    CountOverflow(#[from] std::num::TryFromIntError),
+}
+
 /// Errors specific to the Fireblocks signing backend.
 #[derive(Debug, thiserror::Error)]
 pub enum FireblocksError {
@@ -179,22 +206,8 @@ pub enum FireblocksError {
     Hex(#[from] alloy::hex::FromHexError),
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
-    #[error(
-        "Fireblocks transaction {tx_id} reached terminal \
-         status: {status:?}"
-    )]
-    TransactionFailed {
-        tx_id: String,
-        status: TransactionStatus,
-    },
-    #[error(
-        "Fireblocks transaction {tx_id} polling timed out \
-         while still pending with status: {status:?}"
-    )]
-    PollTimeout {
-        tx_id: String,
-        status: TransactionStatus,
-    },
+    #[error(transparent)]
+    Poll(#[from] PollError),
     #[error("Fireblocks transaction {tx_id} did not include a transaction hash")]
     MissingTxHash { tx_id: String },
     #[error("no deposit address found for vault {vault_account_id} asset {asset_id}")]
@@ -288,7 +301,8 @@ where
     /// whitelisted contract wallet matching the given on-chain address.
     /// Returns the Fireblocks wallet ID.
     async fn resolve_contract_wallet(&self, contract: Address) -> Result<String, FireblocksError> {
-        let needle = contract.to_string().to_lowercase();
+        let contract_address = contract.to_string().to_lowercase();
+        let expected_asset_id = self.asset_id.as_str();
 
         self.client
             .wallet_contract_api()
@@ -300,10 +314,11 @@ where
                     .assets
                     .iter()
                     .any(|asset| {
-                        asset
-                            .address
-                            .as_ref()
-                            .is_some_and(|addr| addr.to_lowercase() == needle)
+                        asset.id.as_ref().is_some_and(|id| id == expected_asset_id)
+                            && asset
+                                .address
+                                .as_ref()
+                                .is_some_and(|address| address.to_lowercase() == contract_address)
                     })
                     .then_some(wallet.id)
             })
@@ -379,7 +394,9 @@ where
             "Fireblocks transaction created, polling for completion"
         );
 
-        let result = poll_until_terminal(&self.client, &tx_id, POLL_TIMEOUT, POLL_INTERVAL).await?;
+        let result = poll_until_terminal(&self.client, &tx_id, POLL_TIMEOUT, POLL_INTERVAL)
+            .await
+            .map_err(FireblocksError::from)?;
 
         let tx_hash_str = result.tx_hash.ok_or_else(|| {
             EvmError::Fireblocks(FireblocksError::MissingTxHash {
@@ -504,8 +521,12 @@ async fn poll_until_terminal(
     tx_id: &str,
     timeout: Duration,
     interval: Duration,
-) -> Result<models::TransactionResponse, FireblocksError> {
-    let max_times = (timeout.as_millis() / interval.as_millis()) as usize;
+) -> Result<models::TransactionResponse, PollError> {
+    let max_times: usize = timeout
+        .as_millis()
+        .checked_div(interval.as_millis())
+        .ok_or(PollError::ZeroInterval)?
+        .try_into()?;
 
     let backoff = backon::ConstantBuilder::default()
         .with_delay(interval)
@@ -525,7 +546,7 @@ async fn poll_until_terminal(
             Completed => Ok(response),
 
             Failed | Cancelled | Cancelling | Blocked | Rejected => {
-                Err(FireblocksError::TransactionFailed {
+                Err(PollError::TransactionFailed {
                     tx_id: tx_id.to_string(),
                     status: response.status,
                 })
@@ -540,7 +561,7 @@ async fn poll_until_terminal(
             | Pending3RdPartyManualApproval
             | Pending3RdParty
             | Broadcasting
-            | Confirming => Err(FireblocksError::PollTimeout {
+            | Confirming => Err(PollError::StillPending {
                 tx_id: tx_id.to_string(),
                 status: response.status,
             }),
@@ -548,21 +569,10 @@ async fn poll_until_terminal(
     })
     .retry(backoff)
     .when(|error| {
-        use FireblocksError::*;
+        use PollError::*;
         match error {
-            PollTimeout { .. } => true,
-
-            Sdk(_)
-            | CreateTransaction(_)
-            | VaultAddresses(_)
-            | Rpc(_)
-            | Hex(_)
-            | MissingTransactionId
-            | TransactionFailed { .. }
-            | MissingTxHash { .. }
-            | NoDepositAddress { .. }
-            | GetContracts(_)
-            | ContractNotWhitelisted { .. } => false,
+            StillPending { .. } => true,
+            Sdk(_) | TransactionFailed { .. } | ZeroInterval | CountOverflow(_) => false,
         }
     })
     .await
@@ -799,10 +809,10 @@ mod tests {
         assert!(
             matches!(
                 error,
-                EvmError::Fireblocks(FireblocksError::TransactionFailed {
+                EvmError::Fireblocks(FireblocksError::Poll(PollError::TransactionFailed {
                     ref tx_id,
                     status: TransactionStatus::Failed,
-                }) if tx_id == "tx-123"
+                })) if tx_id == "tx-123"
             ),
             "expected TransactionFailed with Failed status, got: {error:?}"
         );
@@ -1142,6 +1152,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_contract_wallet_rejects_wrong_asset_id() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let contract = Address::random();
+
+        let contracts_mock = server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!([{
+                    "id": "some-wallet-id",
+                    "name": "Test Contract",
+                    "assets": [{
+                        "id": "BASECHAIN_ETH",
+                        "address": contract.to_string()
+                    }]
+                }]));
+        });
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let error = wallet.resolve_contract_wallet(contract).await.unwrap_err();
+
+        contracts_mock.assert();
+        assert!(
+            matches!(
+                error,
+                FireblocksError::ContractNotWhitelisted { contract: addr } if addr == contract
+            ),
+            "expected ContractNotWhitelisted for wrong asset ID, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn poll_until_terminal_returns_ok_on_completed() {
         let server = MockServer::start();
 
@@ -1196,12 +1245,27 @@ mod tests {
         assert!(
             matches!(
                 error,
-                FireblocksError::TransactionFailed {
+                PollError::TransactionFailed {
                     ref tx_id,
                     status: TransactionStatus::Failed,
                 } if tx_id == "tx-fail-1"
             ),
             "expected TransactionFailed with Failed status, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_until_terminal_fails_on_zero_interval() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+
+        let error = poll_until_terminal(&client, "tx-zero", Duration::from_secs(5), Duration::ZERO)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, PollError::ZeroInterval),
+            "expected ZeroInterval, got: {error:?}"
         );
     }
 
@@ -1237,12 +1301,12 @@ mod tests {
         assert!(
             matches!(
                 error,
-                FireblocksError::PollTimeout {
+                PollError::StillPending {
                     ref tx_id,
                     status: TransactionStatus::Confirming,
                 } if tx_id == "tx-timeout-1"
             ),
-            "expected PollTimeout with Confirming status, got: {error:?}"
+            "expected StillPending with Confirming status, got: {error:?}"
         );
     }
 
