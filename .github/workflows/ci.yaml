@@ -10,7 +10,25 @@ permissions:
   contents: read
 
 jobs:
-  rust:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: pre-commit hooks
+        run: nix develop -c pre-commit run --all-files
+
+  build-backend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,12 +47,35 @@ jobs:
         run: nix run .#prepSolArtifacts
 
       - name: Build and test
-        run: nix build --impure .#st0x-liquidity
+        run: nix build --impure .#st0x-liquidity -o result
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: st0x-liquidity
+          path: result/
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
 
       - name: Clippy
         run: nix build --impure .#st0x-clippy
 
-  dashboard:
+  build-dashboard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,10 +99,16 @@ jobs:
           nix fmt -- dashboard/bun.nix
           git diff --exit-code dashboard/bun.nix
 
-      - name: Dashboard
-        run: nix build --impure .#st0x-dashboard
+      - name: Build dashboard
+        run: nix build --impure .#st0x-dashboard -o result
 
-  pre-commit:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: st0x-dashboard
+          path: result/
+
+  e2e:
+    needs: [build-backend, build-dashboard]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,5 +123,33 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: pre-commit hooks
-        run: nix develop -c pre-commit run --all-files
+      - uses: actions/download-artifact@v4
+        with:
+          name: st0x-liquidity
+          path: ./artifacts/backend
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: st0x-dashboard
+          path: ./artifacts/dashboard
+
+      - name: Prepare artifacts
+        run: |
+          chmod +x artifacts/backend/bin/server
+          cp -r artifacts/dashboard dashboard/build
+
+      - name: Check e2e bun.nix is up to date
+        run: |
+          nix run .#genE2eBunNix
+          nix fmt -- e2e/bun.nix
+          git diff --exit-code e2e/bun.nix
+
+      - name: Run E2E tests
+        run: |
+          nix develop .#e2e -c bash -c '
+            cd e2e
+            bun install
+            BACKEND_BIN=../artifacts/backend/bin/server \
+            DASHBOARD_DIR=../dashboard \
+            bunx playwright test
+          '
