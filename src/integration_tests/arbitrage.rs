@@ -619,27 +619,19 @@ async fn create_test_cqrs_with_limits(
 ) {
     let onchain_trade = Arc::new(test_store(pool.clone(), ()));
 
-    let position_projection = Arc::new(Projection::<Position>::sqlite(pool.clone()).unwrap());
-    let position = Arc::new(
-        StoreBuilder::<Position>::new(pool.clone())
-            .with(position_projection.clone())
-            .build(())
-            .await
-            .unwrap(),
-    );
+    let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        .build(())
+        .await
+        .unwrap();
 
     let order_placer: Arc<dyn crate::offchain_order::OrderPlacer> =
         Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
 
-    let offchain_order_projection =
-        Arc::new(Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap());
-    let offchain_order = Arc::new(
+    let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .with(offchain_order_projection.clone())
             .build(order_placer)
             .await
-            .unwrap(),
-    );
+            .unwrap();
 
     let cqrs = TradeProcessingCqrs {
         onchain_trade,

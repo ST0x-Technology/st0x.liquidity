@@ -8,11 +8,10 @@
 //! # Adding a new query processor
 //!
 //! 1. Add field to [`QueryManifest`]
-//! 2. Add corresponding field to [`WiredQueries`] if needed
-//! 3. Create it in [`QueryManifest::new()`]
-//! 4. Wire it in [`QueryManifest::build_frameworks()`] -
+//! 2. Create it in [`QueryManifest::new()`]
+//! 3. Wire it in [`QueryManifest::build()`] -
 //!    destructuring forces you to handle it
-//! 5. Extract and return it in [`WiredQueries`]
+//! 4. Add output to [`BuiltFrameworks`] if needed
 
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -38,18 +37,14 @@ pub(super) struct QueryManifest {
     event_broadcaster: Arc<EventBroadcaster>,
 }
 
-/// All query processors after wiring is complete.
-pub(super) struct WiredQueries {
-    pub(super) position_view: Projection<Position>,
-}
-
 /// Built CQRS frameworks from the wiring process.
 pub(super) struct BuiltFrameworks {
-    pub(super) position: Store<Position>,
-    pub(super) mint: Store<TokenizedEquityMint>,
-    pub(super) redemption: Store<EquityRedemption>,
-    pub(super) usdc: Store<UsdcRebalance>,
-    pub(super) snapshot: Store<InventorySnapshot>,
+    pub(super) position: Arc<Store<Position>>,
+    pub(super) position_projection: Arc<Projection<Position>>,
+    pub(super) mint: Arc<Store<TokenizedEquityMint>>,
+    pub(super) redemption: Arc<Store<EquityRedemption>>,
+    pub(super) usdc: Arc<Store<UsdcRebalance>>,
+    pub(super) snapshot: Arc<Store<InventorySnapshot>>,
 }
 
 impl QueryManifest {
@@ -72,16 +67,13 @@ impl QueryManifest {
         self,
         pool: SqlitePool,
         services: EquityTransferServices,
-    ) -> anyhow::Result<(BuiltFrameworks, WiredQueries)> {
+    ) -> anyhow::Result<BuiltFrameworks> {
         let Self {
             rebalancing_trigger,
             event_broadcaster,
         } = self;
 
-        let position_projection = Projection::<Position>::sqlite(pool.clone())?;
-
-        let position = StoreBuilder::<Position>::new(pool.clone())
-            .with(Arc::new(position_projection.clone()))
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(rebalancing_trigger.clone())
             .build(())
             .await?;
@@ -109,18 +101,14 @@ impl QueryManifest {
             .build(())
             .await?;
 
-        Ok((
-            BuiltFrameworks {
-                position,
-                mint,
-                redemption,
-                usdc,
-                snapshot,
-            },
-            WiredQueries {
-                position_view: position_projection,
-            },
-        ))
+        Ok(BuiltFrameworks {
+            position,
+            position_projection,
+            mint,
+            redemption,
+            usdc,
+            snapshot,
+        })
     }
 }
 
@@ -128,8 +116,10 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use rust_decimal_macros::dec;
-    use st0x_event_sorcery::test_store;
     use tokio::sync::{RwLock, broadcast, mpsc};
+
+    use st0x_event_sorcery::test_store;
+    use st0x_execution::Symbol;
 
     use super::*;
     use crate::config::OperationalLimits;
@@ -182,13 +172,13 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
         };
 
-        let (_frameworks, queries) = manifest.build(pool, services).await.unwrap();
+        let frameworks = manifest.build(pool, services).await.unwrap();
 
         // Verify stores are usable by checking that loading a
         // nonexistent position returns None
-        let result = queries
-            .position_view
-            .load(&st0x_execution::Symbol::new("AAPL").unwrap())
+        let result = frameworks
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
             .await
             .unwrap();
         assert!(result.is_none());

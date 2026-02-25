@@ -50,7 +50,7 @@ where
     vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
-    snapshot: Store<InventorySnapshot>,
+    snapshot: Arc<Store<InventorySnapshot>>,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -64,7 +64,7 @@ where
         vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         order_owner: Address,
-        snapshot: Store<InventorySnapshot>,
+        snapshot: Arc<Store<InventorySnapshot>>,
     ) -> Self {
         Self {
             raindex_service,
@@ -250,14 +250,14 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::{Row, SqlitePool};
 
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryProjection};
+    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     /// A Float (bytes32) representing zero balance, used as mock vaultBalance2 response.
     const ZERO_FLOAT_HEX: &str =
@@ -284,12 +284,15 @@ mod tests {
         FractionalShares::new(Decimal::from(n))
     }
 
-    fn create_test_raindex_service(
+    async fn create_test_raindex_service(
         pool: &SqlitePool,
         provider: impl Provider + Clone + 'static,
     ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + 'static>>> {
-        let vault_registry_projection: Arc<VaultRegistryProjection> =
-            Arc::new(VaultRegistryProjection::sqlite(pool.clone()).unwrap());
+        let (_vault_store, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
 
         Arc::new(RaindexService::new(
             ReadOnlyEvm::new(provider),
@@ -303,7 +306,7 @@ mod tests {
     async fn poll_and_record_emits_offchain_equity_command_with_executor_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -329,7 +332,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -361,7 +364,7 @@ mod tests {
     async fn poll_and_record_emits_offchain_cash_command_with_executor_cash_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -376,7 +379,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -404,7 +407,7 @@ mod tests {
     async fn poll_and_record_emits_empty_positions_when_executor_has_no_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -419,7 +422,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -441,7 +444,7 @@ mod tests {
     async fn poll_and_record_skips_offchain_commands_when_executor_returns_unimplemented() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -452,7 +455,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         // Should succeed without error
@@ -487,7 +490,7 @@ mod tests {
     async fn poll_and_record_handles_negative_cash_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
         // Margin account with negative cash (borrowed funds)
@@ -507,7 +510,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -534,7 +537,7 @@ mod tests {
     async fn poll_and_record_handles_fractional_share_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
         let fractional_qty = FractionalShares::new(Decimal::new(12345, 3)); // 12.345 shares
@@ -554,7 +557,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -579,7 +582,7 @@ mod tests {
     async fn poll_and_record_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let orderbook = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let order_owner = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
 
@@ -595,7 +598,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -677,7 +680,7 @@ mod tests {
     async fn poll_and_record_skips_onchain_when_vault_registry_not_initialized() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone());
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -688,7 +691,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -727,7 +730,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider);
+        let raindex_service = create_test_raindex_service(&pool, provider).await;
 
         let executor = MockExecutor::new();
 
@@ -737,7 +740,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -777,7 +780,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider);
+        let raindex_service = create_test_raindex_service(&pool, provider).await;
 
         let executor = MockExecutor::new();
 
@@ -787,7 +790,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -825,7 +828,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider);
+        let raindex_service = create_test_raindex_service(&pool, provider).await;
 
         let executor = MockExecutor::new();
 
@@ -835,7 +838,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -856,7 +859,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider);
+        let raindex_service = create_test_raindex_service(&pool, provider).await;
 
         let executor = MockExecutor::new();
 
@@ -866,7 +869,7 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             orderbook,
             order_owner,
-            test_store(pool.clone(), ()),
+            Arc::new(test_store(pool.clone(), ())),
         );
 
         let error = service.poll_and_record().await.unwrap_err();

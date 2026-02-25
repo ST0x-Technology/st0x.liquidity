@@ -162,7 +162,7 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{Projection, test_store};
+    use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
@@ -335,9 +335,11 @@ mod tests {
             rebalancing_ctx.equities.clone(),
         ));
 
-        let vault_registry_projection = Arc::new(
-            Projection::<VaultRegistry>::sqlite(crate::test_utils::setup_test_db().await).unwrap(),
-        );
+        let (_vault_registry_store, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(crate::test_utils::setup_test_db().await)
+                .build(())
+                .await
+                .unwrap();
         let owner = base_wallet.address();
         let raindex = Arc::new(RaindexService::new(
             base_wallet,

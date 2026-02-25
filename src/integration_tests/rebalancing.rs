@@ -19,7 +19,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
-use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
+use st0x_event_sorcery::{Store, StoreBuilder, test_store};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
@@ -125,16 +125,13 @@ async fn build_position_cqrs_with_trigger(
     pool: &SqlitePool,
     trigger: &Arc<RebalancingTrigger>,
 ) -> Arc<Store<Position>> {
-    let projection = Arc::new(Projection::<Position>::sqlite(pool.clone()).unwrap());
+    let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
+        .with(Arc::clone(trigger))
+        .build(())
+        .await
+        .unwrap();
 
-    Arc::new(
-        StoreBuilder::<Position>::new(pool.clone())
-            .with(projection)
-            .with(Arc::clone(trigger))
-            .build(())
-            .await
-            .unwrap(),
-    )
+    store
 }
 
 /// Shared state for equity rebalancing tests (mint and redemption) that

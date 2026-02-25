@@ -11,22 +11,20 @@
 //! Use [`.with()`](StoreBuilder::with) to register a reactor
 //! with a builder. For single-entity reactors, wrap in
 //! `Arc::new()`. For multi-entity reactors, clone the same
-//! `Arc` into each builder:
+//! `Arc` into each builder.
 //!
-//! ```ignore
-//! let trigger = Arc::new(RebalancingTrigger::new(...));
+//! # Auto-wired projections
 //!
-//! let position = StoreBuilder::<Position>::new(pool.clone())
-//!     .with(Arc::new(position_view))
-//!     .with(trigger.clone())
-//!     .build(())
-//!     .await?;
+//! `build()` dispatches on `Entity::Materialized` via a type
+//! parameter that defaults to `Entity::Materialized`:
 //!
-//! let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-//!     .with(trigger.clone())
-//!     .build(services)
-//!     .await?;
-//! ```
+//! - `Table` entities: auto-creates and wires a [`Projection`],
+//!   returning `(Arc<Store>, Arc<Projection>)`.
+//! - `Nil` entities: returns `Arc<Store>`.
+//!
+//! This eliminates the footgun of forgetting to wire a
+//! projection -- if the entity declares a table, the projection
+//! is always present.
 //!
 //! Exhaustive entity handling is enforced by the reactor's
 //! [`.on()`](crate::OneOf::on) /
@@ -40,24 +38,29 @@ use std::sync::Arc;
 use cqrs_es::Query;
 use sqlx::SqlitePool;
 
+use crate::Nil;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
+use crate::projection::{Projection, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler};
 use crate::{EventSourced, Store};
 
 /// Builder for a single CQRS framework.
 ///
-/// Parameterized on an [`EventSourced`] entity type. Internally
-/// constructs `SqliteCqrs<Lifecycle<Entity>>` but returns
-/// [`Store<Entity>`], keeping Lifecycle as an implementation
-/// detail.
+/// Parameterized on an [`EventSourced`] entity type. The
+/// `Materialized` type parameter defaults to
+/// `Entity::Materialized` and determines the `build()` return
+/// type: `Table` returns `(Arc<Store>, Arc<Projection>)`, `Nil`
+/// returns `Arc<Store>`.
 ///
 /// Register reactors via [`.with()`](Self::with), then call
 /// [`.build()`](Self::build) to construct the framework.
-pub struct StoreBuilder<Entity: EventSourced> {
+pub struct StoreBuilder<Entity: EventSourced, Materialized = <Entity as EventSourced>::Materialized>
+{
     pool: SqlitePool,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
+    _materialized: std::marker::PhantomData<Materialized>,
 }
 
 impl<Entity: EventSourced> StoreBuilder<Entity> {
@@ -66,6 +69,7 @@ impl<Entity: EventSourced> StoreBuilder<Entity> {
         Self {
             pool,
             queries: vec![],
+            _materialized: std::marker::PhantomData,
         }
     }
 
@@ -74,27 +78,6 @@ impl<Entity: EventSourced> StoreBuilder<Entity> {
     /// The reactor must declare `Entity` in its dependency list
     /// (via [`deps!`](crate::deps)). For multi-entity reactors,
     /// clone the same `Arc` into each relevant builder.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Single-entity reactor
-    /// StoreBuilder::<Position>::new(pool.clone())
-    ///     .with(Arc::new(position_view))
-    ///     .build(())
-    ///     .await?;
-    ///
-    /// // Multi-entity reactor (shared across builders)
-    /// let trigger = Arc::new(RebalancingTrigger::new(...));
-    /// StoreBuilder::<Position>::new(pool.clone())
-    ///     .with(trigger.clone())
-    ///     .build(())
-    ///     .await?;
-    /// StoreBuilder::<Mint>::new(pool.clone())
-    ///     .with(trigger.clone())
-    ///     .build(services)
-    ///     .await?;
-    /// ```
     #[must_use]
     pub fn with<R>(mut self, reactor: Arc<R>) -> Self
     where
@@ -107,22 +90,48 @@ impl<Entity: EventSourced> StoreBuilder<Entity> {
         self.queries.push(Box::new(ReactorBridge { reactor }));
         self
     }
+}
 
-    /// Builds the CQRS framework.
-    ///
-    /// Reconciles the entity's schema version before constructing
-    /// the framework, clearing stale snapshots if the version
-    /// changed.
-    ///
-    /// Returns a [`Store`] for type-safe command dispatch.
-    pub async fn build(self, services: Entity::Services) -> Result<Store<Entity>, ReconcileError> {
+/// Projected entities: auto-creates and wires a [`Projection`],
+/// returning `(Arc<Store>, Arc<Projection>)`.
+impl<Entity: EventSourced<Materialized = Table> + 'static> StoreBuilder<Entity, Table>
+where
+    Entity::Id: Clone,
+    Entity::Event: Clone,
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    pub async fn build(
+        mut self,
+        services: Entity::Services,
+    ) -> Result<(Arc<Store<Entity>>, Arc<Projection<Entity>>), ReconcileError> {
+        Reconciler::new(self.pool.clone())
+            .reconcile::<Entity>()
+            .await?;
+
+        let projection = Arc::new(Projection::sqlite(self.pool.clone()));
+        self.queries.push(Box::new(ReactorBridge {
+            reactor: projection.clone(),
+        }));
+
+        #[allow(clippy::disallowed_methods)]
+        let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
+        Ok((Arc::new(Store::new(cqrs, self.pool)), projection))
+    }
+}
+
+/// Non-projected entities: returns just `Store`.
+impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, Nil> {
+    pub async fn build(
+        self,
+        services: Entity::Services,
+    ) -> Result<Arc<Store<Entity>>, ReconcileError> {
         Reconciler::new(self.pool.clone())
             .reconcile::<Entity>()
             .await?;
 
         #[allow(clippy::disallowed_methods)]
         let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
-        Ok(Store::new(cqrs, self.pool))
+        Ok(Arc::new(Store::new(cqrs, self.pool)))
     }
 }
 
@@ -133,7 +142,6 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Table;
     use crate::dependency::EntityList;
     use crate::deps;
     use crate::lifecycle::Never;
@@ -177,9 +185,10 @@ mod tests {
         type Command = ();
         type Error = Never;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateA";
-        const PROJECTION: Option<Table> = None;
+        const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &EventA) -> Option<Self> {
@@ -206,9 +215,10 @@ mod tests {
         type Command = ();
         type Error = Never;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateB";
-        const PROJECTION: Option<Table> = None;
+        const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &EventB) -> Option<Self> {

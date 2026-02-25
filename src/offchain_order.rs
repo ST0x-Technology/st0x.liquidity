@@ -21,15 +21,12 @@ use st0x_execution::{
 pub(crate) async fn build_offchain_order_cqrs(
     pool: &SqlitePool,
     order_placer: Arc<dyn OrderPlacer>,
-) -> anyhow::Result<(Arc<Store<OffchainOrder>>, Projection<OffchainOrder>)> {
-    let projection = Projection::<OffchainOrder>::sqlite(pool.clone())?;
-
-    let store = StoreBuilder::new(pool.clone())
-        .with(Arc::new(projection.clone()))
+) -> anyhow::Result<(Arc<Store<OffchainOrder>>, Arc<Projection<OffchainOrder>>)> {
+    let (store, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
         .build(order_placer)
         .await?;
 
-    Ok((Arc::new(store), projection))
+    Ok((store, projection))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -91,9 +88,10 @@ impl EventSourced for OffchainOrder {
     type Command = OffchainOrderCommand;
     type Error = OffchainOrderError;
     type Services = Arc<dyn OrderPlacer>;
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
-    const PROJECTION: Option<Table> = Some(Table("offchain_order_view"));
+    const PROJECTION: Table = Table("offchain_order_view");
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

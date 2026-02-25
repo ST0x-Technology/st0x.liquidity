@@ -754,7 +754,7 @@ mod tests {
     use std::str::FromStr;
     use url::Url;
 
-    use st0x_event_sorcery::{Column, Projection};
+    use st0x_event_sorcery::{Column, StoreBuilder};
     use st0x_execution::{
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
@@ -1934,8 +1934,12 @@ mod tests {
             result.as_ref().err()
         );
 
-        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
-            .unwrap()
+        let (_offchain_store, offchain_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(trading::create_order_placer(&ctx, &pool))
+                .await
+                .unwrap();
+        let executions = offchain_projection
             .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();
@@ -2031,8 +2035,12 @@ mod tests {
             result1.as_ref().err()
         );
 
-        let executions = Projection::<OffchainOrder>::sqlite(pool.clone())
-            .unwrap()
+        let (_offchain_store, offchain_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer.clone())
+                .await
+                .unwrap();
+        let executions = offchain_projection
             .filter(STATUS, &OrderStatus::Submitted)
             .await
             .unwrap();

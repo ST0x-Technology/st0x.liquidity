@@ -97,7 +97,8 @@ use std::fmt::{Debug, Display};
 use std::str::FromStr;
 
 #[doc(hidden)]
-pub use dependency::{Cons, Nil};
+pub use dependency::Cons;
+pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
@@ -172,21 +173,36 @@ pub use wire::StoreBuilder;
 ///   the handler only deals with live state.
 #[async_trait]
 pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned {
+    /// Aggregate identity type, used as the key in the event store.
     type Id: Display + FromStr + Send + Sync;
+    /// Domain event type emitted by commands and applied during replay.
     type Event: DomainEvent + Eq;
+    /// Command type that drives state transitions.
     type Command: Send + Sync;
+    /// Domain error type returned by command handlers and event
+    /// application.
     type Error: DomainError;
+    /// External dependencies injected into command handlers (e.g.
+    /// API clients, order placers).
     type Services: Send + Sync;
-
-    const AGGREGATE_TYPE: &'static str;
-
-    /// The materialized view table for this entity, if any.
+    /// Whether this entity has a materialized view.
     ///
-    /// Set to `Some(Table("..."))` to enable [`Projection::sqlite`]
-    /// for this entity type. Set to `None` for entities without
-    /// materialized views.
-    const PROJECTION: Option<Table>;
+    /// Set to `Table` with `PROJECTION = Table("view_name")` for
+    /// entities with materialized views. Set to `Nil` with
+    /// `PROJECTION = Nil` for entities without views.
+    ///
+    /// [`StoreBuilder::build()`] uses this to auto-wire projections:
+    /// `Table` entities return `(Store, Projection)`, `Nil` entities
+    /// return just `Store`.
+    type Materialized;
 
+    /// Unique string identifying this aggregate type in the event
+    /// store. Must be stable across deployments.
+    const AGGREGATE_TYPE: &'static str;
+    /// Projection table name (for `Table` entities) or `Nil`.
+    const PROJECTION: Self::Materialized;
+    /// Schema version for migration reconciliation. Bump when the
+    /// event schema changes.
     const SCHEMA_VERSION: u64;
 
     /// Create initial state from a genesis event.

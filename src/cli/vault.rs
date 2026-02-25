@@ -4,10 +4,9 @@ use alloy::primitives::{Address, B256, U256};
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
-use std::sync::Arc;
 use thiserror::Error;
 
-use st0x_event_sorcery::Projection;
+use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::OpenChainErrorRegistry;
 
 use crate::config::Ctx;
@@ -74,7 +73,10 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     let amount_u256 = decimal_to_u256(amount, decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
-    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+    let (_vault_store, vault_registry_projection) =
+        StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await?;
 
     let raindex_service = RaindexService::new(
         rebalancing_ctx.base_wallet().clone(),
@@ -113,7 +115,10 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
 
-    let vault_registry_projection = Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+    let (_vault_store, vault_registry_projection) =
+        StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await?;
 
     let raindex_service = RaindexService::new(
         rebalancing_ctx.base_wallet().clone(),

@@ -403,6 +403,8 @@ mod tests {
     use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
 
+    use st0x_event_sorcery::StoreBuilder;
+
     use super::*;
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
@@ -550,8 +552,10 @@ mod tests {
         local_evm: &LocalEvm,
     ) -> RaindexService<RawPrivateKeyWallet<BaseProvider>> {
         let pool = crate::test_utils::setup_test_db().await;
-        let vault_registry_projection: Arc<VaultRegistryProjection> =
-            Arc::new(VaultRegistryProjection::sqlite(pool).unwrap());
+        let (_store, vault_registry_projection) = StoreBuilder::<VaultRegistry>::new(pool)
+            .build(())
+            .await
+            .unwrap();
 
         let base_provider =
             ProviderBuilder::new().connect_http(local_evm.anvil.endpoint().parse().unwrap());

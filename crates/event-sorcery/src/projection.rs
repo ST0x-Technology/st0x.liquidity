@@ -54,8 +54,6 @@ impl std::fmt::Display for Column {
 /// Errors from [`Projection`] query operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionError<Entity: EventSourced> {
-    #[error("entity has no materialized view (PROJECTION = None)")]
-    NoTable,
     #[error(
         "operation requires a SQLite-backed projection \
          created via Projection::sqlite()"
@@ -146,11 +144,15 @@ pub struct Projection<Entity: EventSourced, Repo = SqliteProjectionRepo<Entity>>
     _entity: PhantomData<Entity>,
 }
 
-impl<Entity: EventSourced> Projection<Entity> {
-    /// Returns `Err(ProjectionError::NoTable)` if the entity has
-    /// no materialized view configured (`PROJECTION = None`).
-    pub fn sqlite(pool: SqlitePool) -> Result<Self, ProjectionError<Entity>> {
-        let Table(table) = Entity::PROJECTION.ok_or(ProjectionError::NoTable)?;
+impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
+    /// Creates a SQLite-backed projection for an entity that
+    /// declares `type Materialized = Table`.
+    ///
+    /// Uses `Entity::PROJECTION` directly to determine the view
+    /// table name. Only callable on entities with a materialized
+    /// view.
+    pub(crate) fn sqlite(pool: SqlitePool) -> Self {
+        let Table(table) = Entity::PROJECTION;
         let repo = Arc::new(SqliteProjectionRepo {
             inner: SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
                 pool.clone(),
@@ -158,12 +160,12 @@ impl<Entity: EventSourced> Projection<Entity> {
             ),
         });
 
-        Ok(Self {
+        Self {
             repo,
             pool: Some(pool),
             table_name: Some(table.to_string()),
             _entity: PhantomData,
-        })
+        }
     }
 
     /// Load all live entities from the view table.
@@ -421,6 +423,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
+    use crate::Nil;
     use crate::lifecycle::Never;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,9 +450,10 @@ mod tests {
         type Command = ();
         type Error = Never;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "TestEntity";
-        const PROJECTION: Option<Table> = None;
+        const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(_event: &TestEvent) -> Option<Self> {

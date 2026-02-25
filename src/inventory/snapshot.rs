@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use thiserror::Error;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::threshold::Usdc;
@@ -85,9 +85,10 @@ impl EventSourced for InventorySnapshot {
     type Command = InventorySnapshotCommand;
     type Error = Never;
     type Services = ();
+    type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
-    const PROJECTION: Option<Table> = None;
+    const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

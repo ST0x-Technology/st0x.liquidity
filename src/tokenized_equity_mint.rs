@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::warn;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::rebalancing::equity::EquityTransferServices;
@@ -388,9 +388,10 @@ impl EventSourced for TokenizedEquityMint {
     type Command = TokenizedEquityMintCommand;
     type Error = TokenizedEquityMintError;
     type Services = EquityTransferServices;
+    type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
-    const PROJECTION: Option<Table> = None;
+    const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {

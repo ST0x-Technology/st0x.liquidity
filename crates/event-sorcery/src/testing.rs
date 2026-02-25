@@ -399,7 +399,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Table;
+    use crate::Nil;
 
     // Required for ReactorHarness::receive to resolve HasEntity<Counter>.
     crate::register_entities!(Counter);
@@ -452,9 +452,10 @@ mod tests {
         type Command = CounterCommand;
         type Error = CounterError;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
-        const PROJECTION: Option<Table> = None;
+        const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(event: &CounterEvent) -> Option<Self> {

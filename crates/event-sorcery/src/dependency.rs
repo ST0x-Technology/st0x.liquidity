@@ -387,7 +387,6 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Table;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -419,9 +418,10 @@ mod tests {
         type Command = ();
         type Error = AlphaError;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Alpha";
-        const PROJECTION: Option<Table> = None;
+        const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(event: &AlphaEvent) -> Option<Self> {
@@ -475,9 +475,10 @@ mod tests {
         type Command = ();
         type Error = BetaError;
         type Services = ();
+        type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Beta";
-        const PROJECTION: Option<Table> = None;
+        const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
         fn originate(event: &BetaEvent) -> Option<Self> {

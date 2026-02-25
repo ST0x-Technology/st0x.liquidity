@@ -42,9 +42,10 @@ impl EventSourced for Position {
     type Command = PositionCommand;
     type Error = PositionError;
     type Services = ();
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "Position";
-    const PROJECTION: Option<Table> = Some(Table("position_view"));
+    const PROJECTION: Table = Table("position_view");
     const SCHEMA_VERSION: u64 = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -609,11 +610,10 @@ pub(crate) enum TriggerReason {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
-    use std::sync::Arc;
 
     use st0x_execution::Positive;
 
-    use st0x_event_sorcery::{LifecycleError, Projection, StoreBuilder, TestHarness, replay};
+    use st0x_event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
 
     use super::*;
     use crate::config::OperationalLimits;
@@ -1532,7 +1532,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_none_when_no_aggregate_exists() {
         let pool = crate::test_utils::setup_test_db().await;
-        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
+        let (_store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
 
         let result = projection
             .load(&Symbol::new("AAPL").unwrap())
@@ -1548,13 +1548,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_position_for_live_lifecycle() {
         let pool = crate::test_utils::setup_test_db().await;
-        let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
-
-        let store = StoreBuilder::<Position>::new(pool.clone())
-            .with(Arc::new(projection.clone()))
-            .build(())
-            .await
-            .unwrap();
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
 
         let symbol = Symbol::new("AAPL").unwrap();
 
