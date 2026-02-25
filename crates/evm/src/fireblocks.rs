@@ -14,6 +14,7 @@ use fireblocks_sdk::apis::transactions_api::{CreateTransactionError, CreateTrans
 use fireblocks_sdk::apis::vaults_api::{
     GetVaultAccountAssetAddressesPaginatedError, GetVaultAccountAssetAddressesPaginatedParams,
 };
+use fireblocks_sdk::apis::whitelisted_contracts_api::GetContractsError;
 use fireblocks_sdk::models::{self, TransactionOperation, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use serde::Deserialize;
@@ -192,6 +193,13 @@ pub enum FireblocksError {
         vault_account_id: FireblocksVaultAccountId,
         asset_id: AssetId,
     },
+    #[error("Fireblocks get contracts API error: {0:?}")]
+    GetContracts(#[from] fireblocks_sdk::apis::Error<GetContractsError>),
+    #[error(
+        "contract {contract} is not whitelisted in Fireblocks \
+         contract wallets"
+    )]
+    ContractNotWhitelisted { contract: Address },
 }
 
 /// Wallet that submits transactions via Fireblocks MPC.
@@ -263,6 +271,37 @@ impl<P> FireblocksWallet<P> {
     }
 }
 
+impl<P> FireblocksWallet<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    /// Queries the Fireblocks `GET /contracts` API to find the
+    /// whitelisted contract wallet matching the given on-chain address.
+    /// Returns the Fireblocks wallet ID.
+    async fn resolve_contract_wallet(&self, contract: Address) -> Result<String, FireblocksError> {
+        let needle = contract.to_string().to_lowercase();
+
+        self.client
+            .wallet_contract_api()
+            .get_contracts()
+            .await?
+            .into_iter()
+            .find_map(|wallet| {
+                wallet
+                    .assets
+                    .iter()
+                    .any(|asset| {
+                        asset
+                            .address
+                            .as_ref()
+                            .is_some_and(|addr| addr.to_lowercase() == needle)
+                    })
+                    .then_some(wallet.id)
+            })
+            .ok_or(FireblocksError::ContractNotWhitelisted { contract })
+    }
+}
+
 #[async_trait]
 impl<P> Evm for FireblocksWallet<P>
 where
@@ -290,12 +329,14 @@ where
         calldata: Bytes,
         note: &str,
     ) -> Result<TransactionReceipt, EvmError> {
+        let wallet_id = self.resolve_contract_wallet(contract).await?;
+
         let external_tx_id = generate_external_tx_id(note);
 
         let tx_request = build_contract_call_request(
             self.asset_id.as_str(),
             self.vault_account_id.as_str(),
-            contract,
+            &wallet_id,
             &calldata,
             note,
             &external_tx_id,
@@ -387,7 +428,7 @@ where
 fn build_contract_call_request(
     asset_id: &str,
     vault_account_id: &str,
-    contract_address: Address,
+    wallet_id: &str,
     calldata: &Bytes,
     note: &str,
     external_tx_id: &str,
@@ -412,10 +453,10 @@ fn build_contract_call_request(
             is_collateral: None,
         }),
         destination: Some(models::DestinationTransferPeerPath {
-            r#type: models::TransferPeerPathType::OneTimeAddress,
-            one_time_address: Some(models::OneTimeAddress::new(contract_address.to_string())),
+            r#type: models::TransferPeerPathType::ExternalWallet,
+            id: Some(wallet_id.to_string()),
+            one_time_address: None,
             sub_type: None,
-            id: None,
             name: None,
             wallet_id: None,
             is_collateral: None,
@@ -523,6 +564,24 @@ mod tests {
             .unwrap()
     }
 
+    const TEST_CONTRACT_WALLET_ID: &str = "test-contract-wallet-id";
+
+    fn mock_whitelisted_contracts(server: &MockServer, contract: Address) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!([{
+                    "id": TEST_CONTRACT_WALLET_ID,
+                    "name": "Test Contract",
+                    "assets": [{
+                        "id": "ETH",
+                        "address": contract.to_string()
+                    }]
+                }]));
+        })
+    }
+
     fn test_ctx<P>(server: &MockServer, provider: P) -> FireblocksCtx<P> {
         FireblocksCtx {
             api_user_id: FireblocksApiUserId::new("test-api-key"),
@@ -623,7 +682,9 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -638,6 +699,8 @@ mod tests {
             .await
             .unwrap_err();
 
+        contracts_mock.assert();
+        create_mock.assert();
         assert!(
             matches!(
                 error,
@@ -655,7 +718,9 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -665,7 +730,7 @@ mod tests {
                 }));
         });
 
-        server.mock(|when, then| {
+        let poll_mock = server.mock(|when, then| {
             when.method("GET").path("/transactions/tx-123");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -684,6 +749,12 @@ mod tests {
             .await
             .unwrap_err();
 
+        contracts_mock.assert();
+        create_mock.assert();
+        assert!(
+            poll_mock.hits() >= 1,
+            "poll endpoint should be hit at least once"
+        );
         assert!(
             matches!(
                 error,
@@ -704,7 +775,9 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -714,7 +787,7 @@ mod tests {
                 }));
         });
 
-        server.mock(|when, then| {
+        let poll_mock = server.mock(|when, then| {
             when.method("GET").path("/transactions/tx-456");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -733,6 +806,12 @@ mod tests {
             .await
             .unwrap_err();
 
+        contracts_mock.assert();
+        create_mock.assert();
+        assert!(
+            poll_mock.hits() >= 1,
+            "poll endpoint should be hit at least once"
+        );
         assert!(
             matches!(
                 error,
@@ -755,7 +834,6 @@ mod tests {
             .wallet(signer)
             .connect_http(url.clone());
 
-        // Create a real transaction on anvil to get a valid tx hash.
         let tx = TransactionRequest::default()
             .to(signer_address)
             .value(alloy::primitives::U256::ZERO);
@@ -764,7 +842,9 @@ mod tests {
         let receipt = pending.get_receipt().await.unwrap();
         let tx_hash = receipt.transaction_hash;
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -774,7 +854,7 @@ mod tests {
                 }));
         });
 
-        server.mock(|when, then| {
+        let poll_mock = server.mock(|when, then| {
             when.method("GET").path("/transactions/tx-789");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -798,6 +878,12 @@ mod tests {
             .await
             .unwrap();
 
+        contracts_mock.assert();
+        create_mock.assert();
+        assert!(
+            poll_mock.hits() >= 1,
+            "poll endpoint should be hit at least once"
+        );
         assert_eq!(result.transaction_hash, tx_hash);
     }
 
@@ -861,7 +947,7 @@ mod tests {
         let request = build_contract_call_request(
             "ETH",
             "0",
-            Address::ZERO,
+            TEST_CONTRACT_WALLET_ID,
             &Bytes::from(vec![0x12, 0x34]),
             "test",
             "ext-123",
@@ -871,10 +957,39 @@ mod tests {
     }
 
     #[test]
+    fn build_contract_call_request_uses_whitelisted_wallet() {
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            TEST_CONTRACT_WALLET_ID,
+            &Bytes::new(),
+            "test",
+            "ext-123",
+        );
+
+        let destination = request.destination.unwrap();
+        assert_eq!(
+            destination.r#type,
+            models::TransferPeerPathType::ExternalWallet
+        );
+        assert_eq!(destination.id.as_deref(), Some(TEST_CONTRACT_WALLET_ID));
+        assert!(
+            destination.one_time_address.is_none(),
+            "whitelisted contract should not use one_time_address"
+        );
+    }
+
+    #[test]
     fn build_contract_call_request_sets_calldata_without_0x() {
         let calldata = Bytes::from(vec![0xab, 0xcd, 0xef]);
-        let request =
-            build_contract_call_request("ETH", "0", Address::ZERO, &calldata, "test", "ext-123");
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            TEST_CONTRACT_WALLET_ID,
+            &calldata,
+            "test",
+            "ext-123",
+        );
 
         let contract_call_data = request
             .extra_parameters
@@ -894,7 +1009,7 @@ mod tests {
         let request = build_contract_call_request(
             "ETH",
             "0",
-            Address::ZERO,
+            TEST_CONTRACT_WALLET_ID,
             &Bytes::new(),
             "test",
             "ext-123",
@@ -904,6 +1019,85 @@ mod tests {
             request.amount,
             Some(models::TransactionRequestAmount::String(ref amount)) if amount == "0"
         ));
+    }
+
+    #[tokio::test]
+    async fn send_rejects_non_whitelisted_contract() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let contracts_mock = server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!([]));
+        });
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let non_whitelisted = Address::random();
+        let error = wallet
+            .send(non_whitelisted, Bytes::new(), "test")
+            .await
+            .unwrap_err();
+
+        contracts_mock.assert();
+        assert!(
+            matches!(
+                error,
+                EvmError::Fireblocks(FireblocksError::ContractNotWhitelisted {
+                    contract,
+                }) if contract == non_whitelisted
+            ),
+            "expected ContractNotWhitelisted, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_finds_whitelisted_contract() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let contract = Address::random();
+        let contracts_mock = mock_whitelisted_contracts(&server, contract);
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, contract, provider);
+
+        let resolved = wallet.resolve_contract_wallet(contract).await.unwrap();
+
+        contracts_mock.assert();
+        assert_eq!(resolved, TEST_CONTRACT_WALLET_ID);
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_returns_not_whitelisted_for_unknown() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let unknown = Address::random();
+        let error = wallet.resolve_contract_wallet(unknown).await.unwrap_err();
+
+        contracts_mock.assert();
+        assert!(
+            matches!(error, FireblocksError::ContractNotWhitelisted { contract } if contract == unknown),
+            "expected ContractNotWhitelisted, got: {error:?}"
+        );
     }
 
     #[test]
