@@ -156,7 +156,17 @@ struct WithdrawalRequest<'a> {
     #[serde(serialize_with = "serialize_decimal_as_string")]
     amount: Decimal,
     asset: &'a TokenSymbol,
+    #[serde(serialize_with = "serialize_address_checksummed")]
     address: &'a Address,
+}
+
+fn serialize_address_checksummed<S>(address: &&Address, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // None = standard EIP-55 checksum (no chain-specific EIP-1191 encoding).
+    // Fine for now since this system only handles Ethereum mainnet.
+    serializer.serialize_str(&address.to_checksum(None))
 }
 
 fn serialize_decimal_as_string<S>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
@@ -257,6 +267,26 @@ mod tests {
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
+    #[test]
+    fn withdrawal_request_serializes_address_as_checksummed() {
+        let address = address!("0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6");
+        let asset = TokenSymbol::new("USDC");
+
+        let request = WithdrawalRequest {
+            amount: dec!(100),
+            asset: &asset,
+            address: &address,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            json["address"].as_str().unwrap(),
+            "0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6",
+            "Alpaca requires EIP-55 checksummed addresses for whitelist matching"
+        );
+    }
+
     #[tokio::test]
     async fn test_initiate_withdrawal_successful() {
         let server = MockServer::start();
@@ -269,7 +299,7 @@ mod tests {
                 .json_body(json!({
                     "amount": "100.5",
                     "asset": "USDC",
-                    "address": to_address
+                    "address": to_address.to_checksum(None)
                 }));
             then.status(200)
                 .header("content-type", "application/json")
