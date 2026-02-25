@@ -106,17 +106,31 @@ async fn await_shutdown(
     let server_abort = server_task.abort_handle();
     let bot_abort = bot_task.abort_handle();
 
+    tokio::pin!(server_task);
+    tokio::pin!(bot_task);
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             handle_ctrl_c(&server_abort, &bot_abort);
+            return;
+        }
+        result = &mut server_task => {
+            log_server_result(result);
+            abort_task("bot", &bot_abort);
+            return;
+        }
+        result = &mut bot_task => {
+            log_bot_result(result);
+            warn!("Bot stopped but server remains available for dashboard access");
+        }
+    }
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            abort_task("server", &server_abort);
         }
         result = server_task => {
             log_server_result(result);
-            abort_task("bot", &bot_abort);
-        }
-        result = bot_task => {
-            log_bot_result(result);
-            abort_task("server", &server_abort);
         }
     }
 }
@@ -223,6 +237,9 @@ async fn run_bot_session(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use alloy::primitives::{Address, address};
 
     use super::*;
@@ -274,5 +291,47 @@ mod tests {
         Box::pin(run(ctx, pool, create_test_event_sender()))
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn server_survives_bot_failure() {
+        let server_still_running = Arc::new(AtomicBool::new(true));
+        let running = server_still_running.clone();
+
+        let server_task: JoinHandle<Result<Rocket<Ignite>, rocket::Error>> =
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            });
+
+        let bot_task: JoinHandle<()> = tokio::spawn(async {});
+
+        let server_abort = server_task.abort_handle();
+
+        let running_check = running.clone();
+        let monitor = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            running_check.store(!server_abort.is_finished(), Ordering::Relaxed);
+        });
+
+        let shutdown = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            await_shutdown(server_task, bot_task),
+        )
+        .await;
+
+        monitor.abort();
+
+        assert!(
+            shutdown.is_err(),
+            "await_shutdown should not return after bot completes — \
+             it should keep waiting for server or ctrl+c"
+        );
+
+        assert!(
+            server_still_running.load(Ordering::Relaxed),
+            "server task must not be aborted when bot fails"
+        );
     }
 }
