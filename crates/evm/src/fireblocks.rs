@@ -10,10 +10,12 @@ use alloy::providers::{PendingTransactionBuilder, Provider};
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
+use backon::Retryable;
 use fireblocks_sdk::apis::transactions_api::{CreateTransactionError, CreateTransactionParams};
 use fireblocks_sdk::apis::vaults_api::{
     GetVaultAccountAssetAddressesPaginatedError, GetVaultAccountAssetAddressesPaginatedParams,
 };
+use fireblocks_sdk::apis::whitelisted_contracts_api::GetContractsError;
 use fireblocks_sdk::models::{self, TransactionOperation, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use serde::Deserialize;
@@ -25,7 +27,7 @@ use url::Url;
 use crate::{Evm, EvmError, Wallet};
 
 /// Polling timeout for Fireblocks transaction completion.
-const POLL_TIMEOUT: Duration = Duration::from_secs(600);
+const POLL_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Polling interval between status checks.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -160,6 +162,33 @@ impl<P> FireblocksCtx<P> {
     }
 }
 
+/// Errors from polling a single Fireblocks transaction to completion.
+#[derive(Debug, thiserror::Error)]
+pub enum PollError {
+    #[error("Fireblocks SDK error: {0}")]
+    Sdk(#[from] fireblocks_sdk::FireblocksError),
+    #[error(
+        "Fireblocks transaction {tx_id} reached terminal \
+         status: {status:?}"
+    )]
+    TransactionFailed {
+        tx_id: String,
+        status: TransactionStatus,
+    },
+    #[error(
+        "Fireblocks transaction {tx_id} polling timed out \
+         while still pending with status: {status:?}"
+    )]
+    StillPending {
+        tx_id: String,
+        status: TransactionStatus,
+    },
+    #[error("poll interval must be non-zero")]
+    ZeroInterval,
+    #[error("poll count overflow: {0}")]
+    CountOverflow(#[from] std::num::TryFromIntError),
+}
+
 /// Errors specific to the Fireblocks signing backend.
 #[derive(Debug, thiserror::Error)]
 pub enum FireblocksError {
@@ -177,14 +206,8 @@ pub enum FireblocksError {
     Hex(#[from] alloy::hex::FromHexError),
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
-    #[error(
-        "Fireblocks transaction {tx_id} reached terminal \
-         status: {status:?}"
-    )]
-    TransactionFailed {
-        tx_id: String,
-        status: TransactionStatus,
-    },
+    #[error(transparent)]
+    Poll(#[from] PollError),
     #[error("Fireblocks transaction {tx_id} did not include a transaction hash")]
     MissingTxHash { tx_id: String },
     #[error("no deposit address found for vault {vault_account_id} asset {asset_id}")]
@@ -192,6 +215,13 @@ pub enum FireblocksError {
         vault_account_id: FireblocksVaultAccountId,
         asset_id: AssetId,
     },
+    #[error("Fireblocks get contracts API error: {0:?}")]
+    GetContracts(#[from] fireblocks_sdk::apis::Error<GetContractsError>),
+    #[error(
+        "contract {contract} is not whitelisted in Fireblocks \
+         contract wallets"
+    )]
+    ContractNotWhitelisted { contract: Address },
 }
 
 /// Wallet that submits transactions via Fireblocks MPC.
@@ -263,6 +293,39 @@ impl<P> FireblocksWallet<P> {
     }
 }
 
+impl<P> FireblocksWallet<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    /// Queries the Fireblocks `GET /contracts` API to find the
+    /// whitelisted contract wallet matching the given on-chain address.
+    /// Returns the Fireblocks wallet ID.
+    async fn resolve_contract_wallet(&self, contract: Address) -> Result<String, FireblocksError> {
+        let contract_address = contract.to_string().to_lowercase();
+        let expected_asset_id = self.asset_id.as_str();
+
+        self.client
+            .wallet_contract_api()
+            .get_contracts()
+            .await?
+            .into_iter()
+            .find_map(|wallet| {
+                wallet
+                    .assets
+                    .iter()
+                    .any(|asset| {
+                        asset.id.as_ref().is_some_and(|id| id == expected_asset_id)
+                            && asset
+                                .address
+                                .as_ref()
+                                .is_some_and(|address| address.to_lowercase() == contract_address)
+                    })
+                    .then_some(wallet.id)
+            })
+            .ok_or(FireblocksError::ContractNotWhitelisted { contract })
+    }
+}
+
 #[async_trait]
 impl<P> Evm for FireblocksWallet<P>
 where
@@ -290,12 +353,14 @@ where
         calldata: Bytes,
         note: &str,
     ) -> Result<TransactionReceipt, EvmError> {
+        let wallet_id = self.resolve_contract_wallet(contract).await?;
+
         let external_tx_id = generate_external_tx_id(note);
 
         let tx_request = build_contract_call_request(
             self.asset_id.as_str(),
             self.vault_account_id.as_str(),
-            contract,
+            &wallet_id,
             &calldata,
             note,
             &external_tx_id,
@@ -329,29 +394,9 @@ where
             "Fireblocks transaction created, polling for completion"
         );
 
-        let result =
-            Client::poll_transaction(&self.client, &tx_id, POLL_TIMEOUT, POLL_INTERVAL, |tx| {
-                debug!(
-                    fireblocks_tx_id = %tx_id,
-                    status = ?tx.status,
-                    "Polling Fireblocks transaction"
-                );
-            })
-            .await?;
-
-        if result.status != TransactionStatus::Completed {
-            if is_still_pending(result.status) {
-                warn!(
-                    fireblocks_tx_id = %tx_id,
-                    status = ?result.status,
-                    "Polling timed out but transaction may still confirm on-chain"
-                );
-            }
-            return Err(EvmError::Fireblocks(FireblocksError::TransactionFailed {
-                tx_id,
-                status: result.status,
-            }));
-        }
+        let result = poll_until_terminal(&self.client, &tx_id, POLL_TIMEOUT, POLL_INTERVAL)
+            .await
+            .map_err(FireblocksError::from)?;
 
         let tx_hash_str = result.tx_hash.ok_or_else(|| {
             EvmError::Fireblocks(FireblocksError::MissingTxHash {
@@ -387,7 +432,7 @@ where
 fn build_contract_call_request(
     asset_id: &str,
     vault_account_id: &str,
-    contract_address: Address,
+    wallet_id: &str,
     calldata: &Bytes,
     note: &str,
     external_tx_id: &str,
@@ -412,10 +457,10 @@ fn build_contract_call_request(
             is_collateral: None,
         }),
         destination: Some(models::DestinationTransferPeerPath {
-            r#type: models::TransferPeerPathType::OneTimeAddress,
-            one_time_address: Some(models::OneTimeAddress::new(contract_address.to_string())),
+            r#type: models::TransferPeerPathType::ExternalWallet,
+            id: Some(wallet_id.to_string()),
+            one_time_address: None,
             sub_type: None,
-            id: None,
             name: None,
             wallet_id: None,
             is_collateral: None,
@@ -465,25 +510,72 @@ fn generate_external_tx_id(note: &str) -> String {
     format!("{timestamp}-{truncated_note}-{uuid}")
 }
 
-/// Returns `true` if the transaction is still in a non-terminal state
-/// and may eventually confirm on-chain.
-fn is_still_pending(status: TransactionStatus) -> bool {
-    use TransactionStatus::*;
+/// Polls a Fireblocks transaction until it reaches `Completed`,
+/// a terminal failure, or the timeout expires.
+///
+/// Unlike the SDK's `poll_transaction`, this continues polling
+/// through `Confirming` and other pending statuses that the SDK
+/// treats as terminal.
+async fn poll_until_terminal(
+    client: &Client,
+    tx_id: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<models::TransactionResponse, PollError> {
+    let max_times: usize = timeout
+        .as_millis()
+        .checked_div(interval.as_millis())
+        .ok_or(PollError::ZeroInterval)?
+        .try_into()?;
 
-    match status {
-        Submitted
-        | PendingAmlScreening
-        | PendingEnrichment
-        | PendingAuthorization
-        | Queued
-        | PendingSignature
-        | Pending3RdPartyManualApproval
-        | Pending3RdParty
-        | Broadcasting
-        | Confirming => true,
+    let backoff = backon::ConstantBuilder::default()
+        .with_delay(interval)
+        .with_max_times(max_times);
 
-        Completed | Cancelling | Cancelled | Blocked | Rejected | Failed => false,
-    }
+    (|| async {
+        let response = client.get_transaction(tx_id).await?;
+
+        debug!(
+            fireblocks_tx_id = %tx_id,
+            status = ?response.status,
+            "Polling Fireblocks transaction"
+        );
+
+        use TransactionStatus::*;
+        match response.status {
+            Completed => Ok(response),
+
+            Failed | Cancelled | Cancelling | Blocked | Rejected => {
+                Err(PollError::TransactionFailed {
+                    tx_id: tx_id.to_string(),
+                    status: response.status,
+                })
+            }
+
+            Submitted
+            | PendingAmlScreening
+            | PendingEnrichment
+            | PendingAuthorization
+            | Queued
+            | PendingSignature
+            | Pending3RdPartyManualApproval
+            | Pending3RdParty
+            | Broadcasting
+            | Confirming => Err(PollError::StillPending {
+                tx_id: tx_id.to_string(),
+                status: response.status,
+            }),
+        }
+    })
+    .retry(backoff)
+    .when(|error| {
+        use PollError::*;
+        match error {
+            StillPending { .. } => true,
+            Sdk(_) | TransactionFailed { .. } | ZeroInterval | CountOverflow(_) => false,
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -521,6 +613,24 @@ mod tests {
             .with_url(&server.base_url())
             .build()
             .unwrap()
+    }
+
+    const TEST_CONTRACT_WALLET_ID: &str = "test-contract-wallet-id";
+
+    fn mock_whitelisted_contracts(server: &MockServer, contract: Address) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!([{
+                    "id": TEST_CONTRACT_WALLET_ID,
+                    "name": "Test Contract",
+                    "assets": [{
+                        "id": "ETH",
+                        "address": contract.to_string()
+                    }]
+                }]));
+        })
     }
 
     fn test_ctx<P>(server: &MockServer, provider: P) -> FireblocksCtx<P> {
@@ -623,7 +733,9 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -638,6 +750,8 @@ mod tests {
             .await
             .unwrap_err();
 
+        contracts_mock.assert();
+        create_mock.assert();
         assert!(
             matches!(
                 error,
@@ -655,7 +769,9 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -665,7 +781,7 @@ mod tests {
                 }));
         });
 
-        server.mock(|when, then| {
+        let poll_mock = server.mock(|when, then| {
             when.method("GET").path("/transactions/tx-123");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -684,13 +800,19 @@ mod tests {
             .await
             .unwrap_err();
 
+        contracts_mock.assert();
+        create_mock.assert();
+        assert!(
+            poll_mock.hits() >= 1,
+            "poll endpoint should be hit at least once"
+        );
         assert!(
             matches!(
                 error,
-                EvmError::Fireblocks(FireblocksError::TransactionFailed {
+                EvmError::Fireblocks(FireblocksError::Poll(PollError::TransactionFailed {
                     ref tx_id,
                     status: TransactionStatus::Failed,
-                }) if tx_id == "tx-123"
+                })) if tx_id == "tx-123"
             ),
             "expected TransactionFailed with Failed status, got: {error:?}"
         );
@@ -704,7 +826,9 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -714,7 +838,7 @@ mod tests {
                 }));
         });
 
-        server.mock(|when, then| {
+        let poll_mock = server.mock(|when, then| {
             when.method("GET").path("/transactions/tx-456");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -733,6 +857,12 @@ mod tests {
             .await
             .unwrap_err();
 
+        contracts_mock.assert();
+        create_mock.assert();
+        assert!(
+            poll_mock.hits() >= 1,
+            "poll endpoint should be hit at least once"
+        );
         assert!(
             matches!(
                 error,
@@ -755,7 +885,6 @@ mod tests {
             .wallet(signer)
             .connect_http(url.clone());
 
-        // Create a real transaction on anvil to get a valid tx hash.
         let tx = TransactionRequest::default()
             .to(signer_address)
             .value(alloy::primitives::U256::ZERO);
@@ -764,7 +893,9 @@ mod tests {
         let receipt = pending.get_receipt().await.unwrap();
         let tx_hash = receipt.transaction_hash;
 
-        server.mock(|when, then| {
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let create_mock = server.mock(|when, then| {
             when.method("POST").path("/transactions");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -774,7 +905,7 @@ mod tests {
                 }));
         });
 
-        server.mock(|when, then| {
+        let poll_mock = server.mock(|when, then| {
             when.method("GET").path("/transactions/tx-789");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -798,6 +929,12 @@ mod tests {
             .await
             .unwrap();
 
+        contracts_mock.assert();
+        create_mock.assert();
+        assert!(
+            poll_mock.hits() >= 1,
+            "poll endpoint should be hit at least once"
+        );
         assert_eq!(result.transaction_hash, tx_hash);
     }
 
@@ -861,7 +998,7 @@ mod tests {
         let request = build_contract_call_request(
             "ETH",
             "0",
-            Address::ZERO,
+            TEST_CONTRACT_WALLET_ID,
             &Bytes::from(vec![0x12, 0x34]),
             "test",
             "ext-123",
@@ -871,10 +1008,39 @@ mod tests {
     }
 
     #[test]
+    fn build_contract_call_request_uses_whitelisted_wallet() {
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            TEST_CONTRACT_WALLET_ID,
+            &Bytes::new(),
+            "test",
+            "ext-123",
+        );
+
+        let destination = request.destination.unwrap();
+        assert_eq!(
+            destination.r#type,
+            models::TransferPeerPathType::ExternalWallet
+        );
+        assert_eq!(destination.id.as_deref(), Some(TEST_CONTRACT_WALLET_ID));
+        assert!(
+            destination.one_time_address.is_none(),
+            "whitelisted contract should not use one_time_address"
+        );
+    }
+
+    #[test]
     fn build_contract_call_request_sets_calldata_without_0x() {
         let calldata = Bytes::from(vec![0xab, 0xcd, 0xef]);
-        let request =
-            build_contract_call_request("ETH", "0", Address::ZERO, &calldata, "test", "ext-123");
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            TEST_CONTRACT_WALLET_ID,
+            &calldata,
+            "test",
+            "ext-123",
+        );
 
         let contract_call_data = request
             .extra_parameters
@@ -894,7 +1060,7 @@ mod tests {
         let request = build_contract_call_request(
             "ETH",
             "0",
-            Address::ZERO,
+            TEST_CONTRACT_WALLET_ID,
             &Bytes::new(),
             "test",
             "ext-123",
@@ -906,35 +1072,242 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn is_still_pending_matches_expected_statuses() {
-        use TransactionStatus::*;
+    #[tokio::test]
+    async fn send_rejects_non_whitelisted_contract() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
 
-        let pending = [
-            Submitted,
-            PendingAmlScreening,
-            PendingEnrichment,
-            PendingAuthorization,
-            Queued,
-            PendingSignature,
-            Pending3RdPartyManualApproval,
-            Pending3RdParty,
-            Broadcasting,
-            Confirming,
-        ];
+        let contracts_mock = server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!([]));
+        });
 
-        let terminal = [Completed, Cancelling, Cancelled, Blocked, Rejected, Failed];
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
 
-        for status in pending {
-            assert!(is_still_pending(status), "{status:?} should be pending");
-        }
+        let non_whitelisted = Address::random();
+        let error = wallet
+            .send(non_whitelisted, Bytes::new(), "test")
+            .await
+            .unwrap_err();
 
-        for status in terminal {
-            assert!(
-                !is_still_pending(status),
-                "{status:?} should not be pending"
-            );
-        }
+        contracts_mock.assert();
+        assert!(
+            matches!(
+                error,
+                EvmError::Fireblocks(FireblocksError::ContractNotWhitelisted {
+                    contract,
+                }) if contract == non_whitelisted
+            ),
+            "expected ContractNotWhitelisted, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_finds_whitelisted_contract() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let contract = Address::random();
+        let contracts_mock = mock_whitelisted_contracts(&server, contract);
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, contract, provider);
+
+        let resolved = wallet.resolve_contract_wallet(contract).await.unwrap();
+
+        contracts_mock.assert();
+        assert_eq!(resolved, TEST_CONTRACT_WALLET_ID);
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_returns_not_whitelisted_for_unknown() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let contracts_mock = mock_whitelisted_contracts(&server, Address::ZERO);
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let unknown = Address::random();
+        let error = wallet.resolve_contract_wallet(unknown).await.unwrap_err();
+
+        contracts_mock.assert();
+        assert!(
+            matches!(error, FireblocksError::ContractNotWhitelisted { contract } if contract == unknown),
+            "expected ContractNotWhitelisted, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_rejects_wrong_asset_id() {
+        let server = MockServer::start();
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let contract = Address::random();
+
+        let contracts_mock = server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!([{
+                    "id": "some-wallet-id",
+                    "name": "Test Contract",
+                    "assets": [{
+                        "id": "BASECHAIN_ETH",
+                        "address": contract.to_string()
+                    }]
+                }]));
+        });
+
+        let client = mock_client(&server);
+        let wallet = build_wallet(client, Address::ZERO, provider);
+
+        let error = wallet.resolve_contract_wallet(contract).await.unwrap_err();
+
+        contracts_mock.assert();
+        assert!(
+            matches!(
+                error,
+                FireblocksError::ContractNotWhitelisted { contract: addr } if addr == contract
+            ),
+            "expected ContractNotWhitelisted for wrong asset ID, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_until_terminal_returns_ok_on_completed() {
+        let server = MockServer::start();
+
+        let poll_mock = server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-ok-1");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-ok-1",
+                    "status": "COMPLETED",
+                    "txHash": "0xabc123",
+                    "assetId": "ETH"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let timeout = Duration::from_secs(5);
+        let interval = Duration::from_millis(50);
+
+        let response = poll_until_terminal(&client, "tx-ok-1", timeout, interval)
+            .await
+            .unwrap();
+
+        poll_mock.assert();
+        assert_eq!(response.status, TransactionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn poll_until_terminal_returns_immediately_on_failed() {
+        let server = MockServer::start();
+
+        let poll_mock = server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-fail-1");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-fail-1",
+                    "status": "FAILED",
+                    "assetId": "ETH"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let timeout = Duration::from_secs(5);
+        let interval = Duration::from_millis(50);
+
+        let error = poll_until_terminal(&client, "tx-fail-1", timeout, interval)
+            .await
+            .unwrap_err();
+
+        poll_mock.assert();
+        assert!(
+            matches!(
+                error,
+                PollError::TransactionFailed {
+                    ref tx_id,
+                    status: TransactionStatus::Failed,
+                } if tx_id == "tx-fail-1"
+            ),
+            "expected TransactionFailed with Failed status, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_until_terminal_fails_on_zero_interval() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+
+        let error = poll_until_terminal(&client, "tx-zero", Duration::from_secs(5), Duration::ZERO)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, PollError::ZeroInterval),
+            "expected ZeroInterval, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_until_terminal_times_out_with_pending_status() {
+        let server = MockServer::start();
+
+        let poll_mock = server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-timeout-1");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "tx-timeout-1",
+                    "status": "CONFIRMING",
+                    "assetId": "ETH"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let timeout = Duration::from_millis(200);
+        let interval = Duration::from_millis(50);
+
+        let error = poll_until_terminal(&client, "tx-timeout-1", timeout, interval)
+            .await
+            .unwrap_err();
+
+        assert!(
+            poll_mock.hits() >= 2,
+            "should have polled multiple times before timing out, \
+             but only polled {} time(s)",
+            poll_mock.hits()
+        );
+        assert!(
+            matches!(
+                error,
+                PollError::StillPending {
+                    ref tx_id,
+                    status: TransactionStatus::Confirming,
+                } if tx_id == "tx-timeout-1"
+            ),
+            "expected StillPending with Confirming status, got: {error:?}"
+        );
     }
 
     #[test]

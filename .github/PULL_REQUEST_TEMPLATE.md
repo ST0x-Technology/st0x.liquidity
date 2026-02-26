@@ -1,10 +1,5 @@
 <!-- Thanks for your Pull Request, please read the contributing guidelines before submitting. -->
 
-<!-- Use the snippet below for chained PRs
-> [!CAUTION]
-> Chained to #PR
--->
-
 ## Motivation
 
 <!--

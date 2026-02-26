@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+reviews:
+  auto_review:
+    base_branches:
+      - ".*"
+
+    # Controls the "Reviews paused — this branch is under active development"
+    # message that CodeRabbit posts on PRs. After this many reviewed commits,
+    # it stops reviewing new ones. Default is 5; raised to 10. Set to 0 to
+    # disable entirely.
+    auto_pause_after_reviewed_commits: 10
+
+  profile: assertive
+  request_changes_workflow: true
+  review_details: true
+  collapse_walkthrough: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  auto_apply_labels: true
+  auto_assign_reviewers: false
+  poem: false
+  path_instructions:
+    - path: "*"
+      instructions: >-
+        Focus on providing constructive criticism. Whenever you see a suboptimal approach, suggest
+        more idiomatic or robust alternative(s). Flag potential footguns. Suggest FP alternatives to
+        mutable/imperative code. Point out architectural flaws like leaky abstractions, tight
+        coupling, wrong level of abstraction, poor type modeling, over-abstraction, unclear domain
+        boundaries. Code should generally be organized based on business concerns rather than
+        technical aspects - suggest improvements if you find violations. Point out gaps in test
+        coverage but suggest tests that are not too coupled to the implementation and actually test
+        domain invariants and business logic
+    - path: "**/*.md"
+      instructions: >-
+        Focus on the contents of the docs and not on cosmetic things like markdown formatting. We
+        use markdown files for various docs including but not limited to the north star system
+        specification, SPEC.md, the plan for how to get there, ROADMAP.md, guidelines for AI
+        contributors, AGENTS.md, project overview and instructions for human contributors,
+        README.md. Think about the target audience of a document when deciding what comment to
+        leave. For specifications and designs, suggest potential product, architectural, and UI/UX
+        improvements. For plans, suggest changes that would make things more parallelizable and
+        deliverable-focused. For instructions, suggest better rules and guidelines and point out
+        missing instructions. In all cases, flag needless bloat, prefer clear concise writing, and
+        consider the structure of the document and order of the sections

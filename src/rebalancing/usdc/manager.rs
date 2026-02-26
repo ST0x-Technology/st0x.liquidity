@@ -387,7 +387,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                         },
                     )
                     .await?;
-                return Err(UsdcTransferError::Cctp(error));
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 
@@ -426,7 +426,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                         },
                     )
                     .await?;
-                return Err(UsdcTransferError::Cctp(error));
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 
@@ -466,7 +466,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                         },
                     )
                     .await?;
-                return Err(UsdcTransferError::Cctp(error));
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 
@@ -646,7 +646,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                         },
                     )
                     .await?;
-                return Err(UsdcTransferError::Cctp(error));
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 
@@ -685,7 +685,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                         },
                     )
                     .await?;
-                return Err(UsdcTransferError::Cctp(error));
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 
@@ -725,7 +725,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                         },
                     )
                     .await?;
-                return Err(UsdcTransferError::Cctp(error));
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 

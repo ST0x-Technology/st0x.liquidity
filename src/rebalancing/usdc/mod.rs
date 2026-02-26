@@ -28,7 +28,7 @@ pub(crate) enum UsdcTransferError {
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
-    Cctp(#[from] CctpError),
+    Cctp(#[from] Box<CctpError>),
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
     #[error("Aggregate error: {0}")]
