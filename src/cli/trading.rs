@@ -481,7 +481,7 @@ fn display_trade_details<W: Write>(
     onchain_trade: &OnchainTrade,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let ticker = onchain_trade.symbol.extract_base();
+    let ticker = onchain_trade.symbol.base().to_string();
 
     writeln!(stdout, "✅ Found opposite-side trade opportunity:")?;
     writeln!(stdout, "   Transaction: {}", onchain_trade.tx_hash)?;

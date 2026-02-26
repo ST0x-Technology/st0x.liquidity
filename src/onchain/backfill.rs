@@ -1069,14 +1069,14 @@ mod tests {
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         asserter.push_success(&serde_json::json!([after_clear_log]));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
