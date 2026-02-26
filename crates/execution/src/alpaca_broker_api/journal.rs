@@ -1,6 +1,7 @@
 //! Alpaca Broker API journal types for transferring securities
 //! between accounts under the same firm.
 
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,8 +24,20 @@ pub(super) struct JournalRequest {
     pub(super) to_account: AlpacaAccountId,
     pub(super) entry_type: JournalEntryType,
     pub(super) symbol: Symbol,
-    #[serde(rename = "qty")]
-    pub(super) quantity: String,
+    #[serde(rename = "qty", serialize_with = "serialize_positive_shares")]
+    pub(super) quantity: Positive<FractionalShares>,
+}
+
+// serde's serialize_with requires the field to be passed by reference
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_positive_shares<S>(
+    shares: &Positive<FractionalShares>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&shares.inner().inner().to_string())
 }
 
 impl JournalRequest {
@@ -39,7 +52,7 @@ impl JournalRequest {
             to_account,
             entry_type: JournalEntryType::Jnls,
             symbol,
-            quantity: quantity.to_string(),
+            quantity,
         }
     }
 }
@@ -59,8 +72,8 @@ pub struct JournalResponse {
     pub price: Option<Decimal>,
     pub from_account: AlpacaAccountId,
     pub to_account: AlpacaAccountId,
-    pub settle_date: Option<String>,
-    pub system_date: Option<String>,
+    pub settle_date: Option<NaiveDate>,
+    pub system_date: Option<NaiveDate>,
     pub description: Option<String>,
 }
 
@@ -121,6 +134,9 @@ impl std::fmt::Display for JournalStatus {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
+    use uuid::uuid;
+
     use super::*;
 
     #[test]
@@ -176,7 +192,39 @@ mod tests {
         let response: JournalResponse = serde_json::from_value(json).unwrap();
         assert_eq!(
             response.quantity,
-            Positive::new(FractionalShares::new(rust_decimal_macros::dec!(10.5))).unwrap()
+            Positive::new(FractionalShares::new(dec!(10.5))).unwrap()
         );
+    }
+
+    #[test]
+    fn journal_request_serializes_quantity_as_string() {
+        let from = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        let to = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = Positive::new(FractionalShares::new(dec!(10.5))).unwrap();
+
+        let request = JournalRequest::security(from, to, symbol, quantity);
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["qty"], "10.5");
+    }
+
+    #[test]
+    fn deserialize_dates_as_naive_date() {
+        let json = serde_json::json!({
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "status": "executed",
+            "symbol": "AAPL",
+            "qty": "10",
+            "from_account": "904837e3-3b76-47ec-b432-046db621571b",
+            "to_account": "11111111-2222-3333-4444-555555555555",
+            "settle_date": "2026-02-28",
+            "system_date": "2026-02-26"
+        });
+
+        let response: JournalResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(response.settle_date, NaiveDate::from_ymd_opt(2026, 2, 28));
+        assert_eq!(response.system_date, NaiveDate::from_ymd_opt(2026, 2, 26));
     }
 }
