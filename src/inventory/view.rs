@@ -495,10 +495,25 @@ impl Default for InventoryView {
 }
 
 impl InventoryView {
-    /// Registers a symbol with zeroed inventory.
+    /// Registers a symbol with specified available balances (zero inflight).
     #[cfg(test)]
-    pub(crate) fn with_equity(mut self, symbol: Symbol) -> Self {
-        self.equities.insert(symbol, Inventory::default());
+    pub(crate) fn with_equity(
+        mut self,
+        symbol: Symbol,
+        onchain_available: FractionalShares,
+        offchain_available: FractionalShares,
+    ) -> Self {
+        self.equities.insert(
+            symbol,
+            Inventory {
+                onchain: Some(VenueBalance::new(onchain_available, FractionalShares::ZERO)),
+                offchain: Some(VenueBalance::new(
+                    offchain_available,
+                    FractionalShares::ZERO,
+                )),
+                last_rebalancing: None,
+            },
+        );
         self
     }
 

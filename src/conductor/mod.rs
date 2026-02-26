@@ -3271,7 +3271,11 @@ mod tests {
     /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
             .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 symbol,
@@ -3395,9 +3399,14 @@ mod tests {
             deviation: dec!(0.2),
         };
 
-        // Seed inventory with 50 offchain shares. CQRS will add 50 onchain.
+        // Seed inventory with 50 offchain shares and USDC. CQRS will add 50 onchain.
         let initial_inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3479,7 +3488,11 @@ mod tests {
 
         // Start balanced: 50 onchain, 50 offchain.
         let initial_inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3597,7 +3610,11 @@ mod tests {
 
         // 65 onchain, 35 offchain = 65% < 70% upper bound -> within bounds.
         let initial_inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
             .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,

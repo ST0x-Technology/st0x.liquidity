@@ -152,7 +152,11 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
 
     let inventory = Arc::new(RwLock::new(
         InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
             .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000))),
     ));
     let (sender, receiver) = mpsc::channel(10);
