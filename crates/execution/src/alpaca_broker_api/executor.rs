@@ -14,8 +14,8 @@ use super::journal::JournalResponse;
 use super::order::{ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor, Symbol,
-    TryIntoExecutor,
+    Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive,
+    SupportedExecutor, Symbol, TryIntoExecutor,
 };
 
 /// Response from the asset endpoint
@@ -225,7 +225,7 @@ impl AlpacaBrokerApi {
         &self,
         destination: AlpacaAccountId,
         symbol: &Symbol,
-        quantity: &str,
+        quantity: Positive<FractionalShares>,
     ) -> Result<JournalResponse, AlpacaBrokerApiError> {
         self.client
             .create_journal(destination, symbol, quantity)

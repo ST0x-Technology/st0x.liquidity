@@ -18,7 +18,7 @@ use thiserror::Error;
 use tracing::info;
 
 use st0x_evm::OpenChainErrorRegistry;
-use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Symbol, TimeInForce};
+use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 
 use crate::config::{Ctx, Env};
 use crate::offchain_order::OrderPlacer;
@@ -56,6 +56,11 @@ pub enum CctpChain {
 pub enum CliError {
     #[error("Invalid quantity: {value}. Quantity must be greater than zero")]
     InvalidQuantity { value: u64 },
+}
+
+fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
+    let shares: FractionalShares = input.parse().map_err(|err| format!("{err}"))?;
+    Positive::new(shares).map_err(|err| format!("{err}"))
 }
 
 #[derive(Debug, Parser)]
@@ -325,9 +330,9 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to transfer (supports fractional shares)
-        #[arg(short = 'q', long = "quantity")]
-        quantity: FractionalShares,
+        /// Number of shares to transfer (must be positive, supports fractional)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
     },
 
     /// List all Alpaca tokenization requests
@@ -446,7 +451,7 @@ enum SimpleCommand {
     AlpacaJournal {
         destination: AlpacaAccountId,
         symbol: Symbol,
-        quantity: FractionalShares,
+        quantity: Positive<FractionalShares>,
     },
     OrderStatus {
         order_id: String,

@@ -12,7 +12,7 @@ use super::auth::{AccountResponse, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBr
 use super::executor::AssetResponse;
 use super::journal::{JournalRequest, JournalResponse};
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
-use crate::Symbol;
+use crate::{FractionalShares, Positive, Symbol};
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
@@ -156,17 +156,12 @@ impl AlpacaBrokerApiClient {
         &self,
         to_account: AlpacaAccountId,
         symbol: &Symbol,
-        qty: &str,
+        quantity: Positive<FractionalShares>,
     ) -> Result<JournalResponse, AlpacaBrokerApiError> {
         let url = format!("{}/v1/journals", self.base_url);
 
-        let request = JournalRequest {
-            from_account: self.account_id,
-            to_account,
-            entry_type: "JNLS",
-            symbol: symbol.clone(),
-            qty: qty.to_string(),
-        };
+        let request =
+            JournalRequest::security(self.account_id, to_account, symbol.clone(), quantity);
 
         debug!("Creating security journal at {url}: {request:?}");
 
@@ -216,11 +211,13 @@ impl AlpacaBrokerApiClient {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use rust_decimal_macros::dec;
     use uuid::uuid;
 
     use super::*;
     use crate::alpaca_broker_api::auth::AlpacaAccountId;
     use crate::alpaca_broker_api::{AssetStatus, TimeInForce};
+    use crate::{FractionalShares, Positive};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -424,8 +421,9 @@ mod tests {
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = Positive::new(FractionalShares::new(dec!(10.5))).unwrap();
         let response = client
-            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, "10.5")
+            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, quantity)
             .await
             .unwrap();
 
@@ -439,9 +437,9 @@ mod tests {
             response.status,
             crate::alpaca_broker_api::JournalStatus::Pending
         );
-        assert_eq!(response.symbol, "AAPL");
-        assert_eq!(response.qty, "10.5");
-        assert_eq!(response.price.as_deref(), Some("150.25"));
+        assert_eq!(response.symbol, Symbol::new("AAPL").unwrap());
+        assert_eq!(response.quantity, FractionalShares::new(dec!(10.5)));
+        assert_eq!(response.price, Some(dec!(150.25)));
     }
 
     #[tokio::test]
@@ -461,8 +459,9 @@ mod tests {
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = Positive::new(FractionalShares::new(dec!(999999))).unwrap();
         let err = client
-            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, "999999")
+            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, quantity)
             .await
             .unwrap_err();
 
@@ -489,8 +488,9 @@ mod tests {
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = Positive::new(FractionalShares::new(dec!(10))).unwrap();
         let err = client
-            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, "10")
+            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, quantity)
             .await
             .unwrap_err();
 
