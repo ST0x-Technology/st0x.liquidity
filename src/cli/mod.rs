@@ -1912,7 +1912,7 @@ mod tests {
 
         let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
 
-        let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "tAAPL");
+        let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "wtAAPL");
         let cache = SymbolCache::default();
         let order_placer = trading::create_order_placer(&ctx, &pool);
 
@@ -2011,7 +2011,7 @@ mod tests {
         ));
         asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tTSLA".to_string(),
+            &"wtTSLA".to_string(),
         ));
 
         let provider1 = ProviderBuilder::new().connect_mocked_client(asserter1);
@@ -2065,7 +2065,7 @@ mod tests {
         ));
         asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tTSLA".to_string(),
+            &"wtTSLA".to_string(),
         ));
 
         let provider2 = ProviderBuilder::new().connect_mocked_client(asserter2);

@@ -313,7 +313,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             let equity = DeployableERC20::deploy(
                 &self.provider,
                 format!("{symbol} Tokenized"),
-                format!("t{symbol}"),
+                format!("wt{symbol}"),
                 18,
                 self.owner,
                 parse_units("1000000", 18).unwrap().into(),

@@ -475,7 +475,7 @@ mod tests {
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tMSFT".to_string(),
+            &"wtMSFT".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -690,13 +690,13 @@ mod tests {
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tMSFT".to_string(),
+            &"wtMSFT".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tMSFT".to_string(),
+            &"wtMSFT".to_string(),
         ));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);

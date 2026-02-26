@@ -457,7 +457,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
 
-        setup_position_with_onchain_fill(&position_store, &symbol, "tAAPL", dec!(10)).await;
+        setup_position_with_onchain_fill(&position_store, &symbol, "wtAAPL", dec!(10)).await;
 
         let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(
@@ -543,7 +543,7 @@ mod tests {
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
 
-        setup_position_with_onchain_fill(&position_store, &symbol, "tTSLA", dec!(5)).await;
+        setup_position_with_onchain_fill(&position_store, &symbol, "wtTSLA", dec!(5)).await;
 
         let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(

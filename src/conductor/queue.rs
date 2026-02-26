@@ -321,7 +321,7 @@ mod tests {
 
     fn test_trade(amount: Decimal, log_index: u64) -> OnchainTrade {
         OnchainTradeBuilder::default()
-            .with_symbol("tAAPL")
+            .with_symbol("wtAAPL")
             .with_amount(amount)
             .with_price(dec!(150.0))
             .with_log_index(log_index)
