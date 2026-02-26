@@ -21,7 +21,9 @@
 
 #### Wrapped Token Handling
 
-- [ ] [#329 Trade validation rejects wrapped tokenized equity symbols (wt prefix)](https://github.com/ST0x-Technology/st0x.liquidity/issues/329)
+- [x] [#329 Trade validation rejects wrapped tokenized equity symbols (wt prefix)](https://github.com/ST0x-Technology/st0x.liquidity/issues/329)
+  - PR:
+    [#330 fix trade validation for wrapped tokenized equity symbols](https://github.com/ST0x-Technology/st0x.liquidity/pull/330)
 - [x] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
   - PR:
     [#241 Wrapped Token Handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/241)
