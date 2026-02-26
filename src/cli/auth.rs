@@ -102,6 +102,7 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
+    use std::collections::HashMap;
     use url::Url;
 
     use st0x_execution::SchwabTokens;
@@ -142,6 +143,7 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         };
 
         (ctx, schwab_auth)

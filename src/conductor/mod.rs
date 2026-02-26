@@ -357,7 +357,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let wrapper = Arc::new(WrapperService::new(
             base_wallet.clone(),
-            rebalancing_ctx.equities.clone(),
+            deps.ctx.equities.clone(),
         ));
 
         let equity_transfer_services = EquityTransferServices {
@@ -366,7 +366,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper: wrapper.clone(),
         };
 
-        let disabled_assets = rebalancing_ctx
+        let disabled_assets = deps
+            .ctx
             .equities
             .iter()
             .filter(|(_, config)| !config.enabled)
@@ -403,6 +404,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let services = RebalancerServices::new(
             rebalancing_ctx.clone(),
+            deps.ctx.equities.clone(),
             ethereum_wallet,
             base_wallet,
             raindex_service,

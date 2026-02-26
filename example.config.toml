@@ -7,6 +7,11 @@ mode = "enabled"
 max_amount = "100"
 max_shares = "2"
 
+[equities.tEXAMPLE]
+enabled = true
+unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 [evm]
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
@@ -23,11 +28,6 @@ fireblocks_environment = "sandbox"
 [rebalancing.fireblocks_chain_asset_ids]
 1 = "ETH"
 8453 = "BASECHAIN_ETH"
-
-[rebalancing.equities.tEXAMPLE]
-unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-enabled = true
 
 [rebalancing.equity]
 target = "0.5"

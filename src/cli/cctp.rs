@@ -230,6 +230,7 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
 mod tests {
     use alloy::primitives::{Address, address};
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
@@ -259,6 +260,7 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 

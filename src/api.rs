@@ -94,6 +94,7 @@ mod tests {
     use rocket::http::{ContentType, Status};
     use rocket::local::asynchronous::Client;
     use serde_json::json;
+    use std::collections::HashMap;
     use url::Url;
 
     use super::*;
@@ -131,6 +132,7 @@ mod tests {
                 order_owner: address!("0x2222222222222222222222222222222222222222"),
             },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 

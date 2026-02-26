@@ -41,7 +41,7 @@ use crate::tokenized_equity_mint::{
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use crate::wrapper::{EquityTokenAddresses, Wrapper};
+use crate::wrapper::Wrapper;
 
 /// Why the rebalancing trigger reactor failed.
 #[derive(Debug, thiserror::Error)]
@@ -100,7 +100,6 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
-    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
     pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
     pub(crate) fireblocks_environment: FireblocksEnvironment,
@@ -126,8 +125,6 @@ pub(crate) struct RebalancingCtx {
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
-    /// Registry of wrapped token configurations for ERC-4626 vault operations.
-    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
     /// Pre-built wallet for the base chain (e.g. Base mainnet).
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     /// Pre-built wallet for Ethereum mainnet.
@@ -175,7 +172,6 @@ impl RebalancingCtx {
             redemption_wallet: config.redemption_wallet,
             usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
-            equities: config.equities,
             base_wallet: Arc::new(base_wallet),
             ethereum_wallet: Arc::new(ethereum_wallet),
         })
@@ -212,16 +208,6 @@ impl RebalancingCtx {
         .await?)
     }
 
-    /// Returns whether the given asset is enabled for trading and rebalancing.
-    ///
-    /// Assets not present in the equity config are treated as enabled
-    /// by default for rebalancing.
-    pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
-        self.equities
-            .get(symbol)
-            .is_none_or(|equity| equity.enabled)
-    }
-
     pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.base_wallet
     }
@@ -241,7 +227,6 @@ impl RebalancingCtx {
         redemption_wallet: Address,
         usdc_vault_id: B256,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
-        equities: HashMap<Symbol, EquityTokenAddresses>,
     ) -> Self {
         let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
 
@@ -251,7 +236,6 @@ impl RebalancingCtx {
             redemption_wallet,
             usdc_vault_id,
             alpaca_broker_auth,
-            equities,
             base_wallet: wallet.clone(),
             ethereum_wallet: wallet,
         }
@@ -266,7 +250,6 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("redemption_wallet", &self.redemption_wallet)
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
-            .field("equities", &self.equities)
             .field("wallet", &self.base_wallet.address())
             .finish_non_exhaustive()
     }
@@ -2957,8 +2940,6 @@ mod tests {
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
 
-            [equities]
-
             [equity]
             target = "0.5"
             deviation = "0.2"
@@ -3041,8 +3022,6 @@ mod tests {
             [fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
-
-            [equities]
 
             [equity]
             target = "0.6"
@@ -3140,8 +3119,6 @@ mod tests {
             [fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
-
-            [equities]
 
             [equity]
             target = "0.5"
@@ -3972,7 +3949,7 @@ mod tests {
             usdc_vault_id: fixed_bytes!(
                 "0x0000000000000000000000000000000000000000000000000000000000000001"
             ),
-            equities: HashMap::new(),
+
             fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
             fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
             fireblocks_environment: FireblocksEnvironment::Sandbox,
@@ -4028,7 +4005,7 @@ mod tests {
             usdc_vault_id: fixed_bytes!(
                 "0x0000000000000000000000000000000000000000000000000000000000000001"
             ),
-            equities: HashMap::new(),
+
             fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
             fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({
                 "31337": "ETH"

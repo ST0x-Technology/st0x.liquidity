@@ -1,6 +1,7 @@
 //! Spawns the rebalancing infrastructure.
 
 use alloy::primitives::Address;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -9,7 +10,7 @@ use tracing::info;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
-use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Executor};
+use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol};
 
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
@@ -21,7 +22,7 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::wrapper::WrapperService;
+use crate::wrapper::{EquityTokenAddresses, WrapperService};
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +64,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// must happen before this constructor is called.
     pub(crate) async fn new(
         ctx: RebalancingCtx,
+        equities: HashMap<Symbol, EquityTokenAddresses>,
         ethereum_wallet: Chain,
         base_wallet: Chain,
         raindex: Arc<RaindexService<Chain>>,
@@ -84,7 +86,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             base_wallet: base_wallet.clone(),
         })?);
 
-        let wrapper = Arc::new(WrapperService::new(base_wallet, ctx.equities.clone()));
+        let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
 
         Ok(Self {
             broker,
@@ -209,7 +211,6 @@ mod tests {
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
             },
-            HashMap::new(),
         )
     }
 
@@ -332,10 +333,7 @@ mod tests {
             .unwrap(),
         );
 
-        let wrapper = Arc::new(WrapperService::new(
-            base_wallet.clone(),
-            rebalancing_ctx.equities.clone(),
-        ));
+        let wrapper = Arc::new(WrapperService::new(base_wallet.clone(), HashMap::new()));
 
         let (_vault_registry_store, vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(crate::test_utils::setup_test_db().await)

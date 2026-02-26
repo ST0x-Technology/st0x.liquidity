@@ -74,7 +74,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
         base_caller.clone(),
-        rebalancing_ctx.equities.clone(),
+        ctx.equities.clone(),
     ));
 
     let raindex = Arc::new(RaindexService::new(
@@ -530,6 +530,7 @@ fn format_tokenization_request<Writer: Write>(
 mod tests {
     use alloy::primitives::{Address, address};
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
@@ -561,6 +562,7 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 

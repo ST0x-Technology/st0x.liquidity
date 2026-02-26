@@ -145,6 +145,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 mod tests {
     use alloy::primitives::{Address, address, b256};
     use rust_decimal_macros::dec;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
@@ -172,6 +173,7 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 
