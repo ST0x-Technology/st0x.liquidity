@@ -16,7 +16,8 @@ use url::Url;
 
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
-    AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
+    AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
+    TimeInForce,
 };
 
 use crate::offchain::order_poller::OrderPollerCtx;
@@ -445,6 +446,17 @@ impl Ctx {
         match &self.trading_mode {
             TradingMode::Standalone { order_owner } => *order_owner,
             TradingMode::Rebalancing(ctx) => ctx.base_wallet().address(),
+        }
+    }
+
+    /// Returns whether the given asset is enabled for trading and rebalancing.
+    ///
+    /// In `Standalone` mode, all assets are enabled (no equity config).
+    /// In `Rebalancing` mode, delegates to `RebalancingCtx::is_asset_enabled`.
+    pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
+        match &self.trading_mode {
+            TradingMode::Standalone { .. } => true,
+            TradingMode::Rebalancing(ctx) => ctx.is_asset_enabled(symbol),
         }
     }
 }

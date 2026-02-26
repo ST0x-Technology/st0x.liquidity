@@ -212,6 +212,16 @@ impl RebalancingCtx {
         .await?)
     }
 
+    /// Returns whether the given asset is enabled for trading and rebalancing.
+    ///
+    /// Assets not present in the equity config are considered enabled
+    /// (conservative default for standalone mode).
+    pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
+        self.equities
+            .get(symbol)
+            .is_none_or(|equity| equity.enabled)
+    }
+
     pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.base_wallet
     }
@@ -268,6 +278,7 @@ pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) limits: OperationalLimits,
+    pub(crate) disabled_assets: HashSet<Symbol>,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -605,6 +616,10 @@ impl RebalancingTrigger {
         &self,
         symbol: &Symbol,
     ) -> Result<(), equity::EquityTriggerError> {
+        if self.config.disabled_assets.contains(symbol) {
+            return Ok(());
+        }
+
         let Some(guard) = equity::InProgressGuard::try_claim(
             symbol.clone(),
             Arc::clone(&self.equity_in_progress),
@@ -942,7 +957,7 @@ mod tests {
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, LazyLock};
     use tokio::sync::mpsc;
@@ -983,6 +998,7 @@ mod tests {
                 deviation: dec!(0.2),
             },
             limits: OperationalLimits::Disabled,
+            disabled_assets: HashSet::new(),
         }
     }
 
@@ -1054,6 +1070,7 @@ mod tests {
                 equity: test_config().equity,
                 usdc: UsdcRebalancing::Disabled,
                 limits: OperationalLimits::Disabled,
+                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
@@ -1071,6 +1088,40 @@ mod tests {
                 mpsc::error::TryRecvError::Empty
             ),
             "Expected channel to be empty when USDC rebalancing is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_asset_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (sender, mut receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let pool = crate::test_utils::setup_test_db().await;
+        let wrapper = Arc::new(MockWrapper::new());
+
+        let trigger = RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity: test_config().equity,
+                usdc: UsdcRebalancing::Disabled,
+                limits: OperationalLimits::Disabled,
+                disabled_assets: HashSet::from([symbol.clone()]),
+            },
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            sender,
+            wrapper,
+        );
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Disabled asset should not trigger equity rebalancing"
         );
     }
 

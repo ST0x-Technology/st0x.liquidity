@@ -159,7 +159,7 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
         TimeInForce,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
@@ -235,6 +235,7 @@ mod tests {
             equity: ctx.equity,
             usdc: ctx.usdc,
             limits: OperationalLimits::Disabled,
+            disabled_assets: HashSet::new(),
         };
 
         assert_eq!(trigger_config.equity.target, dec!(0.5));
@@ -249,6 +250,7 @@ mod tests {
             equity: ctx.equity,
             usdc: ctx.usdc,
             limits: OperationalLimits::Disabled,
+            disabled_assets: HashSet::new(),
         };
 
         let UsdcRebalancing::Enabled { target, deviation } = trigger_config.usdc else {

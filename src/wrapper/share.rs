@@ -21,6 +21,12 @@ const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0,
 pub struct EquityTokenAddresses {
     pub wrapped: Address,
     pub unwrapped: Address,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 /// Service for managing ERC-4626 token wrapping/unwrapping operations.
@@ -220,6 +226,7 @@ mod tests {
         EquityTokenAddresses {
             wrapped: Address::random(),
             unwrapped: Address::random(),
+            enabled: true,
         }
     }
 

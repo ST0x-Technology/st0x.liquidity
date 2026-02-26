@@ -116,6 +116,7 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use rust_decimal_macros::dec;
+    use std::collections::HashSet;
     use tokio::sync::{RwLock, broadcast, mpsc};
 
     use st0x_event_sorcery::test_store;
@@ -142,6 +143,7 @@ mod tests {
                 deviation: dec!(0.15),
             },
             limits: OperationalLimits::Disabled,
+            disabled_assets: HashSet::new(),
         }
     }
 

@@ -170,7 +170,18 @@ where
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
 
-    process_queued_trade(executor, pool, &queued_event, event_id, trade, cqrs).await
+    let asset_enabled = ctx.is_asset_enabled(trade.symbol.base());
+
+    process_queued_trade(
+        executor,
+        pool,
+        &queued_event,
+        event_id,
+        trade,
+        cqrs,
+        asset_enabled,
+    )
+    .await
 }
 
 fn event_type_name(event: &TradeEvent) -> &'static str {
@@ -195,6 +206,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
     event_id: i64,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
+    asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
@@ -217,6 +229,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
         base_symbol,
         executor_type,
         &cqrs.operational_limits,
+        asset_enabled,
     )
     .await?
     else {
@@ -402,6 +415,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await;
 
@@ -450,6 +464,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await;
 
@@ -501,6 +516,7 @@ mod tests {
             event_id_1,
             trade_1,
             &cqrs,
+            true,
         )
         .await;
 
@@ -520,6 +536,7 @@ mod tests {
             event_id_2,
             trade_2,
             &cqrs,
+            true,
         )
         .await;
 
@@ -561,6 +578,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await
         .unwrap();

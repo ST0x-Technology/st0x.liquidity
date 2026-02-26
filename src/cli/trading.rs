@@ -344,6 +344,7 @@ pub(super) async fn process_found_trade<W: Write>(
         base_symbol,
         executor_type,
         &ctx.operational_limits,
+        true,
     )
     .await?
     else {

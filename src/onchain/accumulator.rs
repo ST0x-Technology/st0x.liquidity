@@ -18,16 +18,22 @@ pub(crate) struct ExecutionCtx {
 /// Checks whether a position is ready for offchain execution.
 ///
 /// Loads the position from the CQRS view and checks if the net exposure
-/// exceeds the configured threshold. Also verifies the market is open.
-/// The Position aggregate already tracks pending executions --
-/// `is_ready_for_execution` returns `None` if one is already in flight.
+/// exceeds the configured threshold. Also verifies the market is open
+/// and the asset is enabled. The Position aggregate already tracks pending
+/// executions -- `is_ready_for_execution` returns `None` if one is already
+/// in flight.
 pub(crate) async fn check_execution_readiness<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
     limits: &OperationalLimits,
+    asset_enabled: bool,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
+    if !asset_enabled {
+        return Ok(None);
+    }
+
     let Some(position) = position_projection.load(symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
@@ -76,10 +82,10 @@ async fn check_market_open<E: Executor>(
 /// Checks all positions for execution readiness.
 ///
 /// Loads all active positions from the view, then checks each
-/// against its configured threshold. Returns execution parameters for
-/// positions that are ready.
+/// against its configured threshold. Skips disabled assets.
+/// Returns execution parameters for positions that are ready.
 #[tracing::instrument(
-    skip(executor, position_projection),
+    skip(executor, position_projection, is_asset_enabled),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
@@ -88,12 +94,18 @@ pub(crate) async fn check_all_positions<E: Executor>(
     position_projection: &Projection<Position>,
     executor_type: SupportedExecutor,
     limits: &OperationalLimits,
+    is_asset_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<ExecutionCtx>, OnChainError> {
     let all_positions = position_projection.load_all().await?;
 
     let mut ready = Vec::new();
 
     for (symbol, position) in &all_positions {
+        if !is_asset_enabled(symbol) {
+            debug!(symbol = %symbol, "Asset disabled, skipping periodic check");
+            continue;
+        }
+
         if let Some((direction, shares)) = position.is_ready_for_execution(executor_type, limits)? {
             if !check_market_open(executor, symbol).await? {
                 continue;
@@ -192,6 +204,7 @@ mod tests {
             &Symbol::new("AAPL").unwrap(),
             SupportedExecutor::Schwab,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap();
@@ -220,6 +233,7 @@ mod tests {
             &symbol,
             SupportedExecutor::Schwab,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap();
@@ -248,6 +262,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap()
@@ -298,6 +313,7 @@ mod tests {
             &query,
             SupportedExecutor::Schwab,
             &OperationalLimits::Disabled,
+            |_| true,
         )
         .await
         .unwrap();
@@ -338,6 +354,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap();
@@ -371,6 +388,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap()
@@ -407,6 +425,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap();
@@ -438,6 +457,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap();
@@ -455,6 +475,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &OperationalLimits::Disabled,
+            true,
         )
         .await
         .unwrap()
@@ -494,6 +515,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &limits,
+            true,
         )
         .await
         .unwrap()
@@ -505,5 +527,77 @@ mod tests {
             Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
             "Shares should be capped by operational limit"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_asset_skips_execution() {
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new();
+
+        initialize_position_with_fill(
+            &store,
+            &symbol,
+            FractionalShares::new(dec!(5.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let result = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "Disabled asset should not trigger execution even with large position"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_all_positions_skips_disabled_assets() {
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let executor = MockExecutor::new();
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+
+        // Both above threshold
+        initialize_position_with_fill(
+            &store,
+            &aapl,
+            FractionalShares::new(dec!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        initialize_position_with_fill(
+            &store,
+            &msft,
+            FractionalShares::new(dec!(3.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let ready = check_all_positions(
+            &executor,
+            &query,
+            SupportedExecutor::DryRun,
+            &OperationalLimits::Disabled,
+            |symbol| symbol != &aapl,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ready.len(), 1, "Only MSFT should be ready (AAPL disabled)");
+        assert_eq!(ready[0].symbol, msft);
     }
 }

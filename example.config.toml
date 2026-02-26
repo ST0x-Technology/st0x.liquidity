@@ -27,6 +27,7 @@ fireblocks_environment = "sandbox"
 [rebalancing.equities.tEXAMPLE]
 unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+enabled = true
 
 [rebalancing.equity]
 target = "0.5"

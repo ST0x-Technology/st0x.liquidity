@@ -27,7 +27,7 @@ use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
 use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
-use st0x_execution::{ExecutionError, Executor, FractionalShares};
+use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError, OperationalLimits};
@@ -366,11 +366,19 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper: wrapper.clone(),
         };
 
+        let disabled_assets = rebalancing_ctx
+            .equities
+            .iter()
+            .filter(|(_, config)| !config.enabled)
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc.clone(),
                 limits: deps.ctx.operational_limits.clone(),
+                disabled_assets,
             },
             deps.vault_registry,
             deps.ctx.evm.orderbook,
@@ -589,6 +597,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
     operational_limits: OperationalLimits,
+    ctx: Ctx,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -612,6 +621,7 @@ where
                 &offchain_order,
                 &execution_threshold,
                 &operational_limits,
+                |symbol| ctx.is_asset_enabled(symbol),
             )
             .await
             {
@@ -898,14 +908,34 @@ async fn process_next_queued_event<E: Executor>(
         order_owner: queue_context.order_owner,
     };
 
-    process_valid_trade(
+    info!(
+        "Event successfully converted to trade: event_type={:?}, \
+         tx_hash={:?}, log_index={}, symbol={}, amount={}",
+        match &queued_event.event {
+            TradeEvent::ClearV3(_) => "ClearV3",
+            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
+        },
+        trade.tx_hash,
+        trade.log_index,
+        trade.symbol,
+        trade.amount
+    );
+
+    discover_vaults_for_trade(&queued_event, &trade, &vault_discovery_ctx).await?;
+
+    let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
+    let _guard = symbol_lock.lock().await;
+
+    let asset_enabled = ctx.is_asset_enabled(trade.symbol.base());
+
+    process_queued_trade(
         queue_context.executor,
         pool,
         &queued_event,
         event_id,
         trade,
         cqrs,
-        &vault_discovery_ctx,
+        asset_enabled,
     )
     .await
 }
@@ -1021,47 +1051,6 @@ async fn convert_event_to_trade(
     Ok(onchain_trade)
 }
 
-#[tracing::instrument(
-    skip(executor, pool, queued_event, trade, cqrs, vault_discovery_ctx),
-    fields(event_id, symbol = %trade.symbol),
-    level = tracing::Level::INFO
-)]
-async fn process_valid_trade<E: Executor>(
-    executor: &E,
-    pool: &SqlitePool,
-    queued_event: &QueuedEvent,
-    event_id: i64,
-    trade: OnchainTrade,
-    cqrs: &TradeProcessingCqrs,
-    vault_discovery_ctx: &VaultDiscoveryCtx<'_>,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    info!(
-        "Event successfully converted to trade: event_type={:?}, \
-         tx_hash={:?}, log_index={}, symbol={}, amount={}",
-        match &queued_event.event {
-            TradeEvent::ClearV3(_) => "ClearV3",
-            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-        },
-        trade.tx_hash,
-        trade.log_index,
-        trade.symbol,
-        trade.amount
-    );
-
-    discover_vaults_for_trade(queued_event, &trade, vault_discovery_ctx).await?;
-
-    let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
-    let _guard = symbol_lock.lock().await;
-
-    info!(
-        "Processing queued trade: symbol={}, amount={}, \
-         direction={:?}, tx_hash={:?}, log_index={}",
-        trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
-    );
-
-    process_queued_trade(executor, pool, queued_event, event_id, trade, cqrs).await
-}
-
 async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
@@ -1154,6 +1143,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     event_id: i64,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
+    asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
@@ -1177,6 +1167,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
         base_symbol,
         executor_type,
         &cqrs.operational_limits,
+        asset_enabled,
     )
     .await?
     else {
@@ -1325,14 +1316,21 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     offchain_order: &Arc<Store<OffchainOrder>>,
     threshold: &ExecutionThreshold,
     limits: &OperationalLimits,
+    is_asset_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let ready_positions =
-        check_all_positions(executor, position_projection, executor_type, limits).await?;
+    let ready_positions = check_all_positions(
+        executor,
+        position_projection,
+        executor_type,
+        limits,
+        is_asset_enabled,
+    )
+    .await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1496,6 +1494,7 @@ mod tests {
     use futures_util::stream;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
@@ -2863,6 +2862,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await;
 
@@ -2914,6 +2914,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await;
 
@@ -2965,6 +2966,7 @@ mod tests {
             event_id_1,
             trade_1,
             &cqrs,
+            true,
         )
         .await;
 
@@ -2984,6 +2986,7 @@ mod tests {
             event_id_2,
             trade_2,
             &cqrs,
+            true,
         )
         .await;
 
@@ -3021,6 +3024,7 @@ mod tests {
             event_id_1,
             trade_1,
             &cqrs,
+            true,
         )
         .await
         .unwrap()
@@ -3036,6 +3040,7 @@ mod tests {
             event_id_2,
             trade_2,
             &cqrs,
+            true,
         )
         .await;
 
@@ -3083,6 +3088,7 @@ mod tests {
             event_id_1,
             trade_1,
             &cqrs,
+            true,
         )
         .await
         .unwrap()
@@ -3099,6 +3105,7 @@ mod tests {
             event_id_2,
             trade_2,
             &cqrs,
+            true,
         )
         .await
         .unwrap();
@@ -3144,6 +3151,7 @@ mod tests {
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
             &cqrs.operational_limits,
+            |_| true,
         )
         .await
         .unwrap();
@@ -3186,6 +3194,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await;
 
@@ -3339,6 +3348,7 @@ mod tests {
                     deviation: dec!(0.2),
                 },
                 limits: OperationalLimits::Disabled,
+                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,
@@ -3421,6 +3431,7 @@ mod tests {
                     deviation: threshold.deviation,
                 },
                 limits: OperationalLimits::Disabled,
+                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,
@@ -3516,6 +3527,7 @@ mod tests {
                     deviation: dec!(0.2),
                 },
                 limits: OperationalLimits::Disabled,
+                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,
@@ -3634,6 +3646,7 @@ mod tests {
                     deviation: dec!(0.2),
                 },
                 limits: OperationalLimits::Disabled,
+                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,
@@ -3867,6 +3880,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await
         .unwrap();
@@ -3905,6 +3919,7 @@ mod tests {
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
             &cqrs.operational_limits,
+            |_| true,
         )
         .await
         .unwrap();
@@ -3988,6 +4003,7 @@ mod tests {
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
             &cqrs.operational_limits,
+            |_| true,
         )
         .await
         .unwrap();
