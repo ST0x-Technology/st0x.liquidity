@@ -19,7 +19,7 @@ use super::{
     spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
     spawn_queue_processor,
 };
-use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
+use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
 use crate::inventory::InventorySnapshot;
 use crate::offchain_order::OffchainOrder;

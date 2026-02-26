@@ -10,7 +10,7 @@ use tracing::{debug, info};
 use st0x_evm::Evm;
 
 use super::OnChainError;
-use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
+use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
 use crate::onchain::trade::TradeValidationError;
 use crate::onchain::{
     EvmCtx,
@@ -238,8 +238,8 @@ mod tests {
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV5;
-    use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
+    use crate::bindings::IOrderBookV6;
+    use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
@@ -254,8 +254,8 @@ mod tests {
     }
 
     fn create_clear_event(
-        alice_order: IOrderBookV5::OrderV4,
-        bob_order: IOrderBookV5::OrderV4,
+        alice_order: IOrderBookV6::OrderV4,
+        bob_order: IOrderBookV6::OrderV4,
     ) -> ClearV3 {
         ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),

@@ -3709,8 +3709,9 @@ mod tests {
     }
 
     /// Complementary test: verify that trigger DOES fire once both venues have data.
-    #[sqlx::test]
-    async fn trigger_fires_when_both_venues_have_data(pool: SqlitePool) {
+    #[tokio::test]
+    async fn trigger_fires_when_both_venues_have_data() {
+        let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (sender, mut receiver) = mpsc::channel(10);
@@ -3785,8 +3786,9 @@ mod tests {
 
     /// Verifies logging shows when imbalance check skips due to partial data.
     #[tracing_test::traced_test]
-    #[sqlx::test]
-    async fn logs_show_partial_data_skips_imbalance_check(pool: SqlitePool) {
+    #[tokio::test]
+    async fn logs_show_partial_data_skips_imbalance_check() {
+        let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (sender, _receiver) = mpsc::channel(10);
@@ -3842,8 +3844,9 @@ mod tests {
 
     /// Verifies logging shows trigger fires when both venues have data.
     #[tracing_test::traced_test]
-    #[sqlx::test]
-    async fn logs_show_trigger_fires_with_complete_data(pool: SqlitePool) {
+    #[tokio::test]
+    async fn logs_show_trigger_fires_with_complete_data() {
+        let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (sender, _receiver) = mpsc::channel(10);

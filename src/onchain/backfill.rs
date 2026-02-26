@@ -15,7 +15,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::EvmCtx;
 use super::OnChainError;
-use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
+use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::queue::enqueue;
 
 fn get_backfill_retry_strat() -> ExponentialBuilder {
@@ -264,7 +264,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV5;
+    use crate::bindings::IOrderBookV6;
     use crate::onchain::EvmCtx;
     use crate::onchain::trade::TradeEvent;
     use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
@@ -372,7 +372,7 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
-        let clear_config = IOrderBookV5::ClearConfigV2 {
+        let clear_config = IOrderBookV6::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
@@ -381,7 +381,7 @@ mod tests {
             bobBountyVaultId: B256::ZERO,
         };
 
-        let clear_event = IOrderBookV5::ClearV3 {
+        let clear_event = IOrderBookV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
@@ -433,9 +433,9 @@ mod tests {
             deployment_block: 1,
         };
 
-        let take_event = IOrderBookV5::TakeOrderV3 {
+        let take_event = IOrderBookV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV5::TakeOrderConfigV4 {
+            config: IOrderBookV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -443,9 +443,11 @@ mod tests {
             },
             input: Float::from_fixed_decimal_lossy(uint!(100_000_000_U256), 0)
                 .unwrap()
+                .0
                 .get_inner(),
             output: Float::from_fixed_decimal_lossy(uint!(9_000_000_000_000_000_000_U256), 18)
                 .unwrap()
+                .0
                 .get_inner(),
         };
 
@@ -503,11 +505,11 @@ mod tests {
         };
 
         let different_order = get_test_order();
-        let clear_event = IOrderBookV5::ClearV3 {
+        let clear_event = IOrderBookV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: different_order.clone(),
             bob: different_order.clone(),
-            clearConfig: IOrderBookV5::ClearConfigV2 {
+            clearConfig: IOrderBookV6::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
@@ -603,13 +605,13 @@ mod tests {
     }
 
     fn create_test_take_event(
-        order: &IOrderBookV5::OrderV4,
+        order: &IOrderBookV6::OrderV4,
         input: U256,
         output: U256,
-    ) -> IOrderBookV5::TakeOrderV3 {
-        IOrderBookV5::TakeOrderV3 {
+    ) -> IOrderBookV6::TakeOrderV3 {
+        IOrderBookV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV5::TakeOrderConfigV4 {
+            config: IOrderBookV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -618,17 +620,19 @@ mod tests {
 
             input: Float::from_fixed_decimal_lossy(input, 0)
                 .unwrap()
+                .0
                 .get_inner(),
 
             output: Float::from_fixed_decimal_lossy(output, 18)
                 .unwrap()
+                .0
                 .get_inner(),
         }
     }
 
     fn create_test_log(
         orderbook: Address,
-        event: &IOrderBookV5::TakeOrderV3,
+        event: &IOrderBookV6::TakeOrderV3,
         block_number: u64,
         tx_hash: FixedBytes<32>,
     ) -> Log {
@@ -954,8 +958,8 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    fn create_clear_log(orderbook: Address, order: &IOrderBookV5::OrderV4, tx_hash: TxHash) -> Log {
-        let clear_config = IOrderBookV5::ClearConfigV2 {
+    fn create_clear_log(orderbook: Address, order: &IOrderBookV6::OrderV4, tx_hash: TxHash) -> Log {
+        let clear_config = IOrderBookV6::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
@@ -964,7 +968,7 @@ mod tests {
             bobBountyVaultId: B256::ZERO,
         };
 
-        let clear_event = IOrderBookV5::ClearV3 {
+        let clear_event = IOrderBookV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
@@ -987,22 +991,25 @@ mod tests {
     }
 
     fn create_after_clear_log(orderbook: Address, tx_hash: TxHash) -> Log {
-        let after_clear_event = IOrderBookV5::AfterClearV2 {
+        let after_clear_event = IOrderBookV6::AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: IOrderBookV5::ClearStateChangeV2 {
+            clearStateChange: IOrderBookV6::ClearStateChangeV2 {
                 aliceOutput: Float::from_fixed_decimal_lossy(
                     uint!(5_000_000_000_000_000_000_U256),
                     18,
                 )
                 .unwrap()
+                .0
                 .get_inner(),
 
                 bobOutput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
                     .unwrap()
+                    .0
                     .get_inner(),
 
                 aliceInput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
                     .unwrap()
+                    .0
                     .get_inner(),
 
                 bobInput: Float::from_fixed_decimal_lossy(
@@ -1010,6 +1017,7 @@ mod tests {
                     18,
                 )
                 .unwrap()
+                .0
                 .get_inner(),
             },
         };
@@ -1475,11 +1483,11 @@ mod tests {
         let order = get_test_order();
 
         // Create a ClearV3 event
-        let clear_event = IOrderBookV5::ClearV3 {
+        let clear_event = IOrderBookV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
-            clearConfig: IOrderBookV5::ClearConfigV2 {
+            clearConfig: IOrderBookV6::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),

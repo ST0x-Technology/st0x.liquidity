@@ -12,7 +12,7 @@ use std::{
 
 use st0x_evm::{Evm, OpenChainErrorRegistry};
 
-use crate::bindings::{IERC20, IOrderBookV5::IOV2};
+use crate::bindings::{IERC20, IOrderBookV6::IOV2};
 use crate::onchain::OnChainError;
 
 #[derive(Debug, Default, Clone)]

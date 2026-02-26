@@ -4,12 +4,15 @@
 
 ### Fireblocks Contract Calls
 
-- [ ] [#297 Harden wallet management with Fireblocks contract calls](https://github.com/ST0x-Technology/st0x.liquidity/issues/297)
+- [x] [#325 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/issues/325)
   - PR:
-    [#300 add fireblocks integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/300)
+    [#326 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/pull/326)
 - [x] [#323 Fireblocks integration uses OneTimeAddress instead of whitelisted contract wallets](https://github.com/ST0x-Technology/st0x.liquidity/issues/323)
   - PR:
     [#324 resolve fireblocks contract wallet via API per call](https://github.com/ST0x-Technology/st0x.liquidity/pull/324)
+- [x] [#297 Harden wallet management with Fireblocks contract calls](https://github.com/ST0x-Technology/st0x.liquidity/issues/297)
+  - PR:
+    [#300 add fireblocks integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/300)
 
 ### Live testing of auto-rebalancing on the Alpaca instance
 
