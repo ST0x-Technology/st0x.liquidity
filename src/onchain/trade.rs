@@ -210,18 +210,17 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        // Parse the tokenized equity symbol to ensure it's valid
-        let (tokenized_symbol_str, equity_token) = if onchain_input_symbol == "USDC" {
+        let (equity_symbol_str, equity_token) = if onchain_input_symbol == "USDC" {
             (onchain_output_symbol, output.token)
         } else {
             (onchain_input_symbol, input.token)
         };
-        let tokenized_symbol = TokenizedEquitySymbol::parse(&tokenized_symbol_str)?;
+        let equity_symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse(&equity_symbol_str)?;
 
         let pyth_pricing = match PythPricing::try_from_tx_hash(
             tx_hash,
             evm.provider(),
-            &tokenized_symbol.base().to_string(),
+            &equity_symbol.base().to_string(),
             feed_id_cache,
         )
         .await

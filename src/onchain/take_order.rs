@@ -306,10 +306,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
 
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
@@ -327,7 +327,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(15)));
         // Price should be 200 USDC / 15 shares = 13.333... USDC per share
         assert_eq!(trade.price.value(), dec!(200) / dec!(15));
