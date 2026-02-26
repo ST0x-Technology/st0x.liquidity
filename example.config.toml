@@ -2,15 +2,15 @@ database_url = ":memory:"
 log_level = "debug"
 server_port = 8080
 
-[operational_limits]
-mode = "enabled"
-max_amount = "100"
-max_shares = "2"
-
 [equities.tEXAMPLE]
 enabled = true
 unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[operational_limits]
+mode = "enabled"
+max_amount = "100"
+max_shares = "2"
 
 [evm]
 orderbook = "0x1111111111111111111111111111111111111111"

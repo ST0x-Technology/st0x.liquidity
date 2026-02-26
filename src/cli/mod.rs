@@ -2330,6 +2330,8 @@ mod tests {
             r#"
                 database_url = ":memory:"
 
+                [equities]
+
                 [operational_limits]
                 mode = "disabled"
 
@@ -2337,8 +2339,6 @@ mod tests {
                 orderbook = "0x1111111111111111111111111111111111111111"
                 deployment_block = 1
                 order_owner = "0x2222222222222222222222222222222222222222"
-
-                [equities]
             "#,
         )
         .await
@@ -2349,6 +2349,7 @@ mod tests {
             r#"
                 [evm]
                 ws_rpc_url = "ws://localhost:8545"
+
                 [broker]
                 type = "dry-run"
             "#,
