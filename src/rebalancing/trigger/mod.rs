@@ -536,7 +536,7 @@ impl Reactor for RebalancingTrigger {
                 use PositionEvent::*;
 
                 let timestamp = event.timestamp();
-                let (equity_update, usdc_venue, usdc_op, usdc_amount) = match &event {
+                let (equity_update, usdc_update) = match &event {
                     OnChainOrderFilled {
                         amount,
                         direction,
@@ -554,9 +554,11 @@ impl Reactor for RebalancingTrigger {
 
                         (
                             Inventory::available(Venue::MarketMaking, equity_op, *amount),
-                            Venue::MarketMaking,
-                            equity_op.inverse(),
-                            Usdc(usdc_value),
+                            Inventory::available(
+                                Venue::MarketMaking,
+                                equity_op.inverse(),
+                                Usdc(usdc_value),
+                            ),
                         )
                     }
 
@@ -577,9 +579,11 @@ impl Reactor for RebalancingTrigger {
 
                         (
                             Inventory::available(Venue::Hedging, equity_op, shares_filled.inner()),
-                            Venue::Hedging,
-                            equity_op.inverse(),
-                            Usdc(usdc_value),
+                            Inventory::available(
+                                Venue::Hedging,
+                                equity_op.inverse(),
+                                Usdc(usdc_value),
+                            ),
                         )
                     }
 
@@ -588,8 +592,6 @@ impl Reactor for RebalancingTrigger {
                     | OffChainOrderFailed { .. }
                     | ThresholdUpdated { .. } => return Ok(()),
                 };
-
-                let usdc_update = Inventory::available(usdc_venue, usdc_op, usdc_amount);
 
                 let mut inventory = self.inventory.write().await;
                 *inventory = inventory
