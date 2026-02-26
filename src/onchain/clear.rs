@@ -240,6 +240,7 @@ mod tests {
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV6;
     use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
+    use crate::onchain::io::WrappedTokenizedShares;
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
@@ -365,10 +366,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
@@ -386,7 +387,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -441,10 +445,10 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (tAAPL)
+        // Mock decimals() then symbol() calls for input token (wtAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
@@ -467,7 +471,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -796,10 +803,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
@@ -818,7 +825,10 @@ mod tests {
 
         // Should process Alice first (alice_hash_matches is checked first)
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -948,10 +958,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
@@ -969,7 +979,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 
@@ -1093,10 +1106,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // tAAPL decimals
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtAAPL decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
@@ -1114,7 +1127,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 
@@ -1162,10 +1178,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
@@ -1183,7 +1199,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
@@ -1237,10 +1256,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
@@ -1258,7 +1277,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 
@@ -1521,10 +1543,10 @@ mod tests {
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
-        // Mock decimals() then symbol() calls for output token (tAAPL)
+        // Mock decimals() then symbol() calls for output token (wtAAPL)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"tAAPL".to_string(),
+            &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let feed_id_cache = FeedIdCache::default();
@@ -1542,7 +1564,10 @@ mod tests {
         .unwrap();
 
         let trade = result.unwrap();
-        assert_eq!(trade.symbol, tokenized_symbol!("tAAPL"));
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
         assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
     }
 }

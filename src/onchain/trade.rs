@@ -21,7 +21,7 @@ use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::EvmCtx;
 use crate::onchain::OnChainError;
-use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
+use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
 
@@ -139,7 +139,7 @@ pub struct OnchainTrade {
     pub(crate) id: Option<i64>,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
-    pub(crate) symbol: TokenizedEquitySymbol,
+    pub(crate) symbol: TokenizedSymbol<WrappedTokenizedShares>,
     pub(crate) equity_token: Address,
     pub(crate) amount: FractionalShares,
     pub(crate) direction: Direction,
@@ -210,18 +210,17 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        // Parse the tokenized equity symbol to ensure it's valid
-        let (tokenized_symbol_str, equity_token) = if onchain_input_symbol == "USDC" {
+        let (equity_symbol_str, equity_token) = if onchain_input_symbol == "USDC" {
             (onchain_output_symbol, output.token)
         } else {
             (onchain_input_symbol, input.token)
         };
-        let tokenized_symbol = TokenizedEquitySymbol::parse(&tokenized_symbol_str)?;
+        let equity_symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse(&equity_symbol_str)?;
 
         let pyth_pricing = match PythPricing::try_from_tx_hash(
             tx_hash,
             evm.provider(),
-            &tokenized_symbol.base().to_string(),
+            &equity_symbol.base().to_string(),
             feed_id_cache,
         )
         .await
@@ -239,7 +238,7 @@ impl OnchainTrade {
             id: None,
             tx_hash,
             log_index,
-            symbol: tokenized_symbol,
+            symbol: equity_symbol,
             equity_token,
             amount: trade_details.equity_amount(),
             direction: trade_details.direction(),
@@ -392,8 +391,8 @@ pub(crate) enum TradeValidationError {
     #[error("No output found at index: {0}")]
     NoOutputAtIndex(usize),
     #[error(
-        "Expected IO to contain USDC and one tokenized \
-         equity (t prefix) but got {0} and {1}"
+        "Expected IO to contain USDC and one wrapped \
+         tokenized equity (wt prefix) but got {0} and {1}"
     )]
     InvalidSymbolConfiguration(String, String),
     #[error("Transaction not found: {0}")]
@@ -422,7 +421,7 @@ pub(crate) enum TradeValidationError {
     NegativeUsdc(Decimal),
     #[error(
         "symbol '{symbol_provided}' is not a tokenized equity \
-         (must have 't' prefix, e.g. tAAPL, tSPYM)"
+         (must have 't' or 'wt' prefix, e.g. tAAPL, wtCOIN)"
     )]
     NotTokenizedEquity { symbol_provided: String },
 }
@@ -504,7 +503,7 @@ mod tests {
         // After swapping (as done in take_order.rs):
         // - input_amount (order's input token = USDC) = event.output = 160.15
         // - output_amount (order's output token = tSPLG) = event.input = 2.0
-        // Then TradeDetails::try_from_io("USDC", 160.15, "tSPLG", 2.0) correctly extracts:
+        // Then TradeDetails::try_from_io("USDC", 160.15, "wtSPLG", 2.0) correctly extracts:
         // - equity_amount = 2.0 (from output since output is tokenized equity)
         // - usdc_amount = 160.15 (from input since input is USDC)
     }

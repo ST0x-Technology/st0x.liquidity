@@ -17,7 +17,7 @@ use st0x_execution::{Direction, FractionalShares, SchwabTokens};
 use crate::bindings::IOrderBookV6::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
 use crate::onchain::OnchainTrade;
-use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
+use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
 
 /// Panicking wallet stub for tests that construct `RebalancingCtx`
 /// without needing real chain connectivity. Provider type matches
@@ -168,7 +168,9 @@ impl OnchainTradeBuilder {
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
                 log_index: 1,
-                symbol: "tAAPL".parse::<TokenizedEquitySymbol>().unwrap(),
+                symbol: "wtAAPL"
+                    .parse::<TokenizedSymbol<WrappedTokenizedShares>>()
+                    .unwrap(),
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 amount: FractionalShares::new(Decimal::ONE),
                 direction: Direction::Buy,
@@ -187,7 +189,9 @@ impl OnchainTradeBuilder {
 
     #[must_use]
     pub(crate) fn with_symbol(mut self, symbol: &str) -> Self {
-        self.trade.symbol = symbol.parse::<TokenizedEquitySymbol>().unwrap();
+        self.trade.symbol = symbol
+            .parse::<TokenizedSymbol<WrappedTokenizedShares>>()
+            .unwrap();
         self
     }
 

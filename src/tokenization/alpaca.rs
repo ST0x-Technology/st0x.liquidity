@@ -40,7 +40,7 @@ use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
 use super::{Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
-use crate::onchain::io::TokenizedEquitySymbol;
+use crate::onchain::io::{OneToOneTokenizedShares, TokenizedSymbol};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
@@ -205,7 +205,7 @@ pub(crate) struct TokenizationRequest {
     pub(crate) status: TokenizationRequestStatus,
     pub(crate) underlying_symbol: Symbol,
     #[serde(deserialize_with = "deserialize_tokenized_symbol")]
-    pub(crate) token_symbol: Option<TokenizedEquitySymbol>,
+    pub(crate) token_symbol: Option<TokenizedSymbol<OneToOneTokenizedShares>>,
     #[serde(rename = "qty")]
     pub(crate) quantity: FractionalShares,
     issuer: Issuer,
@@ -265,7 +265,7 @@ impl TokenizationRequest {
 
 fn deserialize_tokenized_symbol<'de, D>(
     deserializer: D,
-) -> Result<Option<TokenizedEquitySymbol>, D::Error>
+) -> Result<Option<TokenizedSymbol<OneToOneTokenizedShares>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

@@ -2537,7 +2537,7 @@ mod tests {
     }
 
     fn create_test_trade(symbol: &str) -> OnchainTrade {
-        let tokenized_symbol = format!("t{symbol}");
+        let tokenized_symbol = format!("wt{symbol}");
         OnchainTradeBuilder::default()
             .with_symbol(&tokenized_symbol)
             .with_equity_token(TEST_EQUITY_TOKEN)
@@ -2546,7 +2546,7 @@ mod tests {
 
     fn test_trade_with_amount(amount: Decimal, log_index: u64) -> OnchainTrade {
         OnchainTradeBuilder::default()
-            .with_symbol("tAAPL")
+            .with_symbol("wtAAPL")
             .with_equity_token(TEST_EQUITY_TOKEN)
             .with_amount(amount)
             .with_log_index(log_index)

@@ -63,11 +63,18 @@ rebalancing), and respects market hours by pausing trading outside open hours.
 ### Symbol
 
 A type-safe stock ticker represented as a newtype (`Symbol(String)`). Tokenized
-equities use a "t" prefix to distinguish them from base assets:
+equities appear onchain in two forms, modeled by `TokenizedSymbol<Form>`:
 
-- `tAAPL` - tokenized Apple stock (onchain)
-- `AAPL` - Apple stock (offchain, at the brokerage)
+- `tAAPL` - 1:1 minted tokenized shares (`OneToOneTokenizedShares`)
+- `wtCOIN` - ERC-4626 vault shares wrapping tokenized equity
+  (`WrappedTokenizedShares`)
+- `AAPL` - base equity stock (offchain, at the brokerage)
 - `USDC` - stablecoin used as the quote currency onchain
+
+Both forms resolve to the same base `Symbol` for offchain hedging (e.g. `tAAPL`
+and `wtAAPL` both resolve to `AAPL`). Each context uses the specific form it
+knows: Raindex events use `TokenizedSymbol<WrappedTokenizedShares>`, Alpaca
+tokenization uses `TokenizedSymbol<OneToOneTokenizedShares>`.
 
 ### Hedge
 
