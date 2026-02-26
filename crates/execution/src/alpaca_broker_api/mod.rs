@@ -25,6 +25,7 @@ pub enum TimeInForce {
 mod auth;
 mod client;
 mod executor;
+mod journal;
 mod market_hours;
 mod order;
 mod positions;
@@ -39,6 +40,7 @@ pub enum AssetStatus {
 
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
+pub use journal::{JournalResponse, JournalStatus};
 pub use order::{ConversionDirection, CryptoOrderResponse};
 
 impl fmt::Display for TimeInForce {

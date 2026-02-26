@@ -1,12 +1,15 @@
-//! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist,
-//! transfers, convert).
+//! Alpaca CLI commands (deposit, withdraw, whitelist, transfers,
+//! convert, journal).
 
 use alloy::primitives::Address;
 use rust_decimal::Decimal;
 use std::io::Write;
 
 use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
-use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor, Positive};
+use st0x_execution::{
+    AlpacaAccountId, AlpacaBrokerApi, ConversionDirection, Executor, FractionalShares, Positive,
+    Symbol,
+};
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
@@ -472,6 +475,45 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     Ok(())
 }
 
+pub(super) async fn alpaca_journal_command<W: Write>(
+    stdout: &mut W,
+    destination: AlpacaAccountId,
+    symbol: Symbol,
+    quantity: FractionalShares,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-journal requires Alpaca Broker API configuration");
+    };
+
+    writeln!(stdout, "Journaling equities between Alpaca accounts")?;
+    writeln!(stdout, "   Symbol: {symbol}")?;
+    writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Destination: {destination}")?;
+
+    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
+
+    let response = executor
+        .create_journal(destination, &symbol, &quantity.to_string())
+        .await?;
+
+    writeln!(stdout, "Journal created successfully!")?;
+    writeln!(stdout, "   ID: {}", response.id)?;
+    writeln!(stdout, "   Status: {}", response.status)?;
+    writeln!(stdout, "   Symbol: {}", response.symbol)?;
+    writeln!(stdout, "   Quantity: {}", response.qty)?;
+
+    if let Some(price) = &response.price {
+        writeln!(stdout, "   Price: ${price}")?;
+    }
+
+    if let Some(settle_date) = &response.settle_date {
+        writeln!(stdout, "   Settle date: {settle_date}")?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, address};
@@ -672,6 +714,48 @@ mod tests {
         assert!(
             output.contains("USD → USDC"),
             "Expected USD to USDC in output, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_journal_requires_alpaca_config() {
+        let ctx = create_ctx_without_alpaca();
+        let destination = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(dec!(10));
+
+        let mut stdout = Vec::new();
+        let err_msg = alpaca_journal_command(&mut stdout, destination, symbol, quantity, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err_msg.contains("alpaca-journal requires Alpaca Broker API"),
+            "Expected Alpaca config error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_journal_writes_details_to_stdout() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        let destination = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
+        let symbol = Symbol::new("TSLA").unwrap();
+        let quantity = FractionalShares::new(dec!(5.5));
+
+        let mut stdout = Vec::new();
+        alpaca_journal_command(&mut stdout, destination, symbol, quantity, &ctx)
+            .await
+            .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("TSLA"),
+            "Expected symbol in output, got: {output}"
+        );
+        assert!(
+            output.contains("5.5"),
+            "Expected quantity in output, got: {output}"
         );
     }
 }

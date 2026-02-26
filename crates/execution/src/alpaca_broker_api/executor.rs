@@ -8,8 +8,9 @@ use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
-use super::auth::{AccountStatus, AlpacaBrokerApiCtx};
+use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
+use super::journal::JournalResponse;
 use super::order::{ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
@@ -216,6 +217,19 @@ impl AlpacaBrokerApi {
         );
 
         super::order::poll_crypto_order_until_filled(&self.client, order.id).await
+    }
+
+    /// Journal (transfer) equities from the configured account to a
+    /// destination account under the same Alpaca broker firm.
+    pub async fn create_journal(
+        &self,
+        destination: AlpacaAccountId,
+        symbol: &Symbol,
+        quantity: &str,
+    ) -> Result<JournalResponse, AlpacaBrokerApiError> {
+        self.client
+            .create_journal(destination, symbol, quantity)
+            .await
     }
 
     async fn get_asset_cached(&self, symbol: &Symbol) -> Result<CachedAsset, AlpacaBrokerApiError> {

@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::AlpacaBrokerApiError;
 use super::auth::{AccountResponse, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use super::executor::AssetResponse;
+use super::journal::{JournalRequest, JournalResponse};
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
 use crate::Symbol;
 
@@ -148,6 +149,28 @@ impl AlpacaBrokerApiClient {
         debug!("Fetching crypto order {} from {}", order_id, url);
 
         self.get(&url).await
+    }
+
+    /// Create a security journal (JNLS) to transfer equities between accounts.
+    pub(crate) async fn create_journal(
+        &self,
+        to_account: AlpacaAccountId,
+        symbol: &Symbol,
+        qty: &str,
+    ) -> Result<JournalResponse, AlpacaBrokerApiError> {
+        let url = format!("{}/v1/journals", self.base_url);
+
+        let request = JournalRequest {
+            from_account: self.account_id,
+            to_account,
+            entry_type: "JNLS",
+            symbol: symbol.clone(),
+            qty: qty.to_string(),
+        };
+
+        debug!("Creating security journal at {url}: {request:?}");
+
+        self.post(&url, &request).await
     }
 
     /// Perform a GET request
@@ -360,6 +383,118 @@ mod tests {
 
         mock.assert();
         let err = result.unwrap_err();
+        assert!(
+            matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 404)
+        );
+    }
+
+    const DESTINATION_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
+
+    #[tokio::test]
+    async fn test_create_journal_success() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/journals").json_body_partial(
+                r#"{
+                        "from_account":"904837e3-3b76-47ec-b432-046db621571b",
+                        "to_account":"11111111-2222-3333-4444-555555555555",
+                        "entry_type":"JNLS",
+                        "symbol":"AAPL",
+                        "qty":"10.5"
+                    }"#,
+            );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "status": "pending",
+                    "symbol": "AAPL",
+                    "qty": "10.5",
+                    "price": "150.25",
+                    "from_account": "904837e3-3b76-47ec-b432-046db621571b",
+                    "to_account": "11111111-2222-3333-4444-555555555555",
+                    "settle_date": "2026-02-28",
+                    "system_date": "2026-02-26",
+                    "description": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let response = client
+            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, "10.5")
+            .await
+            .unwrap();
+
+        mock.assert();
+
+        assert_eq!(
+            response.id.to_string(),
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        );
+        assert_eq!(
+            response.status,
+            crate::alpaca_broker_api::JournalStatus::Pending
+        );
+        assert_eq!(response.symbol, "AAPL");
+        assert_eq!(response.qty, "10.5");
+        assert_eq!(response.price.as_deref(), Some("150.25"));
+    }
+
+    #[tokio::test]
+    async fn test_create_journal_insufficient_assets() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/journals");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "code": 40_310_000_u64,
+                    "message": "insufficient assets"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let err = client
+            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, "999999")
+            .await
+            .unwrap_err();
+
+        mock.assert();
+        assert!(
+            matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 403)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_journal_account_not_found() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/journals");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "code": 40_410_000_u64,
+                    "message": "account not found"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let err = client
+            .create_journal(DESTINATION_ACCOUNT_ID, &symbol, "10")
+            .await
+            .unwrap_err();
+
+        mock.assert();
         assert!(
             matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 404)
         );
