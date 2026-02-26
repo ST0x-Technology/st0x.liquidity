@@ -363,6 +363,7 @@ pub(super) async fn alpaca_unwhitelist_command<W: Write>(
 
 pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
+    pending_only: bool,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
@@ -379,10 +380,23 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
     writeln!(stdout, "   Account: {}", alpaca_auth.account_id)?;
 
-    let transfers = alpaca_wallet.list_all_transfers().await?;
+    let all_transfers = alpaca_wallet.list_all_transfers().await?;
+
+    let transfers: Vec<_> = if pending_only {
+        all_transfers
+            .into_iter()
+            .filter(|transfer| transfer.status.is_pending())
+            .collect()
+    } else {
+        all_transfers
+    };
 
     if transfers.is_empty() {
-        writeln!(stdout, "\nNo transfers found.")?;
+        if pending_only {
+            writeln!(stdout, "\nNo pending transfers found.")?;
+        } else {
+            writeln!(stdout, "\nNo transfers found.")?;
+        }
         return Ok(());
     }
 

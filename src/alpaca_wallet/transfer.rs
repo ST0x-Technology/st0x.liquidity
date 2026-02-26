@@ -80,6 +80,18 @@ pub(crate) enum TransferStatus {
     Failed,
 }
 
+impl TransferStatus {
+    /// Whether the transfer is still in flight (not yet complete or failed).
+    pub(crate) fn is_pending(self) -> bool {
+        use TransferStatus::*;
+
+        match self {
+            Pending | Processing => true,
+            Complete | Failed => false,
+        }
+    }
+}
+
 /// Transfer response from Alpaca Crypto Wallets API.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct Transfer {
@@ -1035,5 +1047,17 @@ mod tests {
         ));
 
         transfers_mock.assert();
+    }
+
+    #[test]
+    fn pending_and_processing_are_pending_statuses() {
+        assert!(TransferStatus::Pending.is_pending());
+        assert!(TransferStatus::Processing.is_pending());
+    }
+
+    #[test]
+    fn complete_and_failed_are_not_pending() {
+        assert!(!TransferStatus::Complete.is_pending());
+        assert!(!TransferStatus::Failed.is_pending());
     }
 }
