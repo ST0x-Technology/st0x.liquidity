@@ -236,9 +236,11 @@ defined in `migrations/20250703115746_trades.sql`.
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 - Per-asset market enable/disable: individual equity markets can be disabled via
-  `enabled = false` in the config. Disabled assets accumulate position changes
-  but do not trigger counter-trades or rebalancing operations. When re-enabled,
-  accumulated positions execute normally (same as market close/open behavior)
+  the `enabled` flag in the equity config. Disabled assets accumulate position
+  changes but do not trigger counter-trades or rebalancing operations. When
+  re-enabled (`enabled = true`), the system resumes both executing accumulated
+  counter-trade positions and evaluating rebalancing triggers for any resulting
+  inventory imbalances (same semantics as market close/open behavior)
 
 ### Infrastructure and Deployment
 

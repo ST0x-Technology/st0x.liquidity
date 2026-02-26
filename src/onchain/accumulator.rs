@@ -1,4 +1,4 @@
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
@@ -30,21 +30,17 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     limits: &OperationalLimits,
     asset_enabled: bool,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
-    if !asset_enabled {
+    if !check_asset_enabled(asset_enabled, symbol) {
         return Ok(None);
     }
 
     let Some(position) = position_projection.load(symbol).await? else {
-        debug!(symbol = %symbol, "Position aggregate not found, skipping");
+        debug!(%symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };
 
     let Some((direction, shares)) = position.is_ready_for_execution(executor_type, limits)? else {
-        debug!(
-            symbol = %symbol,
-            net = %position.net,
-            "Position not ready for execution"
-        );
+        debug!(%symbol, net = %position.net, "Position not ready for execution");
         return Ok(None);
     };
 
@@ -53,7 +49,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     }
 
     let shares = Positive::new(shares)?;
-    info!(symbol = %symbol, shares = %shares, direction = ?direction, "Position ready for execution");
+    info!(%symbol, %shares, ?direction, "Position ready for execution");
 
     Ok(Some(ExecutionCtx {
         symbol: symbol.clone(),
@@ -61,6 +57,14 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
         shares,
         executor: executor_type,
     }))
+}
+
+fn check_asset_enabled(asset_enabled: bool, symbol: &Symbol) -> bool {
+    if !asset_enabled {
+        warn!(%symbol, "asset disabled, skipping execution readiness check");
+    }
+
+    asset_enabled
 }
 
 async fn check_market_open<E: Executor>(

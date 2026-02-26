@@ -328,4 +328,11 @@ mod tests {
             "expected SymbolNotConfigured for tXYZ, got: {error:?}"
         );
     }
+
+    #[test]
+    fn enabled_defaults_to_true_when_omitted() {
+        let json = r#"{"wrapped": "0x1111111111111111111111111111111111111111", "unwrapped": "0x2222222222222222222222222222222222222222"}"#;
+        let addresses: EquityTokenAddresses = serde_json::from_str(json).unwrap();
+        assert!(addresses.enabled);
+    }
 }

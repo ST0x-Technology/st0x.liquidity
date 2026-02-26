@@ -589,4 +589,53 @@ mod tests {
             "Event should be marked processed regardless of threshold"
         );
     }
+
+    #[tokio::test]
+    async fn disabled_asset_accumulates_position_without_placing_order() {
+        let pool = setup_test_db().await;
+        let frameworks = create_test_cqrs_frameworks(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_test_event(&pool, 50).await;
+        let trade = test_trade(5.0, 50);
+
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.unwrap().is_none(),
+            "Disabled asset should not trigger execution even above threshold"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(
+            position.net.inner(),
+            dec!(5.0),
+            "Position should still accumulate despite asset being disabled"
+        );
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "No offchain order should be pending for disabled asset"
+        );
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "Event should be marked processed even for disabled asset"
+        );
+    }
 }

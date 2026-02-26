@@ -214,8 +214,8 @@ impl RebalancingCtx {
 
     /// Returns whether the given asset is enabled for trading and rebalancing.
     ///
-    /// Assets not present in the equity config are considered enabled
-    /// (conservative default for standalone mode).
+    /// Assets not present in the equity config are treated as enabled
+    /// by default for rebalancing.
     pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
         self.equities
             .get(symbol)
