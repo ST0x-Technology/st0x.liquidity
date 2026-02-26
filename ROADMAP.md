@@ -7,8 +7,12 @@
 - [ ] [#297 Harden wallet management with Fireblocks contract calls](https://github.com/ST0x-Technology/st0x.liquidity/issues/297)
   - PR:
     [#300 add fireblocks integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/300)
+- [ ] [#323 Fireblocks integration uses OneTimeAddress instead of whitelisted contract wallets](https://github.com/ST0x-Technology/st0x.liquidity/issues/323)
 
 ### Live testing of auto-rebalancing on the Alpaca instance
+
+- PR:
+  [#315 go live prod configuration](https://github.com/ST0x-Technology/st0x.liquidity/pull/315)
 
 **Wrapped Token Handling:**
 
@@ -38,6 +42,7 @@
     [#279 fixes from live testing](https://github.com/ST0x-Technology/st0x.liquidity/pull/279)
 - [ ] [#277 No automatic retry after offchain order failure](https://github.com/ST0x-Technology/st0x.liquidity/issues/277)
 - [ ] [#310 StoreBuilder allows omitting projections that entities declare as required](https://github.com/ST0x-Technology/st0x.liquidity/issues/310)
+- [ ] [#322 CLI should not depend on database](https://github.com/ST0x-Technology/st0x.liquidity/issues/322)
 
 **CQRS/ES Phase 3 - Complete Migration:**
 

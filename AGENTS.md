@@ -268,7 +268,10 @@ above older completed sections.
 
 **When creating new issues:**
 
-1. Add the issue to the appropriate roadmap section
+1. Add the issue to the appropriate **existing** roadmap section. Do not create
+   a new section for a single issue — only create subsections when grouping
+   multiple related items. If no existing section fits, add to the closest
+   match.
 2. Use this format:
    ```markdown
    - [ ] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)

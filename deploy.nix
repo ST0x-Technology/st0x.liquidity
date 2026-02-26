@@ -9,6 +9,7 @@ let
 
   rage = "/run/current-system/sw/bin/rage";
   hostKey = "/etc/ssh/ssh_host_ed25519_key";
+  expectedHostPubKey = (import ./keys.nix).keys.host;
 
   services = import ./services.nix;
   enabledServices = builtins.attrNames (builtins.removeAttrs services
@@ -18,17 +19,16 @@ let
   # Decrypts secrets and restarts service atomically
   mkServiceProfile = name:
     let
-      markerFile = "/run/st0x/${name}.ready";
-      secretsFile = ./secret/${name}.toml.age;
-      decryptedSecrets = "/run/agenix/${name}.toml";
+      cfg = services.${name};
+      secretsFile = ./secret/${cfg.encryptedSecret};
     in activate.custom st0xPackage (builtins.concatStringsSep " && " [
       "systemctl stop ${name} || true"
-      "rm -f ${markerFile}"
-      "mkdir -p /run/agenix /run/st0x"
-      "${rage} -d -i ${hostKey} ${secretsFile} > ${decryptedSecrets}"
-      "chown root:st0x ${decryptedSecrets}"
-      "chmod 0640 ${decryptedSecrets}"
-      "touch ${markerFile}"
+      "rm -f ${cfg.markerFile}"
+      "mkdir -p /run/st0x"
+      "${rage} -d -i ${hostKey} ${secretsFile} > ${cfg.decryptedSecretPath}"
+      "chown root:st0x ${cfg.decryptedSecretPath}"
+      "chmod 0640 ${cfg.decryptedSecretPath}"
+      "touch ${cfg.markerFile}"
       "systemctl restart ${name}"
     ]);
 
@@ -58,11 +58,36 @@ in {
   wrappers = { pkgs, infraPkgs, localSystem }:
     let
       deployInputs = infraPkgs.buildInputs
-        ++ [ deploy-rs.packages.${localSystem}.deploy-rs ];
+        ++ [ deploy-rs.packages.${localSystem}.deploy-rs pkgs.openssh ];
 
       deployPreamble = ''
         ${infraPkgs.resolveIp}
         export DEPLOY_HOST="$host_ip"
+
+        # Verify host key against keys.nix trust anchor
+        scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null | grep -v '^#')
+        expected="$host_ip ${expectedHostPubKey}"
+
+        if [ -z "$scanned" ]; then
+          echo "ERROR: ssh-keyscan returned no key for $host_ip" >&2
+          exit 1
+        fi
+
+        if [ "$(echo "$scanned" | wc -l)" -ne 1 ]; then
+          echo "ERROR: expected 1 key from $host_ip, got multiple:" >&2
+          echo "$scanned" >&2
+          exit 1
+        fi
+
+        if [ "$scanned" != "$expected" ]; then
+          echo "ERROR: host key mismatch for $host_ip" >&2
+          echo "  expected: $expected" >&2
+          echo "  got:      $scanned" >&2
+          exit 1
+        fi
+
+        ssh-keygen -R "$host_ip" >/dev/null 2>&1 || true
+        echo "$expected" >> "$HOME/.ssh/known_hosts"
 
         ssh_flag=""
         if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
@@ -83,7 +108,8 @@ in {
         text = ''
           ${deployPreamble}
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity.system \
-            -- --impure "$@"
+            -- --impure --accept-flake-config \
+            --extra-experimental-features 'nix-command flakes' "$@"
         '';
       };
 
@@ -95,7 +121,8 @@ in {
           profile="''${1:?usage: deploy-service <profile>}"
           shift
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ".#st0x-liquidity.$profile" \
-            -- --impure "$@"
+            -- --impure --accept-flake-config \
+            --extra-experimental-features 'nix-command flakes' "$@"
         '';
       };
 
@@ -105,7 +132,8 @@ in {
         text = ''
           ${deployPreamble}
           deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity \
-            -- --impure "$@"
+            -- --impure --accept-flake-config \
+            --extra-experimental-features 'nix-command flakes' "$@"
         '';
       };
     };

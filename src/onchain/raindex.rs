@@ -147,7 +147,23 @@ impl<W: Wallet> RaindexService<W> {
         token: Address,
         amount: U256,
     ) -> Result<(), RaindexError> {
-        debug!(%token, %amount, spender = %self.orderbook_address, "Sending ERC20 approve");
+        let current_allowance: U256 = self
+            .evm
+            .call::<Registry, _>(
+                token,
+                IERC20::allowanceCall {
+                    owner: self.owner,
+                    spender: self.orderbook_address,
+                },
+            )
+            .await?;
+
+        if current_allowance >= amount {
+            debug!(%token, %amount, %current_allowance, "Sufficient allowance, skipping approve");
+            return Ok(());
+        }
+
+        debug!(%token, %amount, %current_allowance, spender = %self.orderbook_address, "Sending ERC20 approve");
 
         let receipt = self
             .evm
@@ -646,13 +662,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deposit_succeeds_with_prior_allowance() {
+    #[traced_test]
+    async fn deposit_skips_approve_when_allowance_is_sufficient() {
         let local_evm = LocalEvm::new().await.unwrap();
 
         let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
         let vault_id = TEST_VAULT_ID;
 
-        // Pre-approve to verify deposit still works when allowance already exists
+        // Pre-approve with sufficient allowance -- deposit should skip the approve tx
         local_evm
             .approve_tokens(
                 local_evm.token_address,
@@ -692,6 +709,10 @@ mod tests {
             .unwrap()
             .get_inner();
         assert_eq!(vault_balance_after, expected_float);
+
+        // Approve should NOT have been sent since allowance was already sufficient
+        assert!(!logs_contain("Sending ERC20 approve"));
+        assert!(logs_contain("Sufficient allowance"));
     }
 
     #[tokio::test]

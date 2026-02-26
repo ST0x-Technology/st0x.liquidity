@@ -1,22 +1,33 @@
-database_url = "sqlite:///mnt/data/alpaca.db"
+database_url = "sqlite:///mnt/data/st0x-hedge.db"
 log_level = "debug"
 server_port = 8001
 
 [operational_limits]
-mode = "disabled"
+mode = "enabled"
+max_amount = "100"
+max_shares = "2"
 
 [hyperdx]
 service_name = "st0x-hedge"
 
 [evm]
-orderbook = "0x52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775"
+orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 deployment_block = 40850446
 
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
-usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000ffaabb"
-fireblocks_vault_account_id = "0"
+usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
 fireblocks_environment = "production"
+fireblocks_vault_account_id = "1"
+
+[rebalancing.equity]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc]
+mode = "enabled"
+target = "0.5"
+deviation = "0.3"
 
 [rebalancing.fireblocks_chain_asset_ids]
 1 = "ETH"
@@ -73,12 +84,3 @@ wrapped = "0x02512ec661f0ba89c275ea105e31bad6fcfcf319"
 [rebalancing.equities.tRKLB]
 unwrapped = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
 wrapped = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-
-[rebalancing.equity]
-target = "0.5"
-deviation = "0.2"
-
-[rebalancing.usdc]
-mode = "enabled"
-target = "0.5"
-deviation = "0.3"

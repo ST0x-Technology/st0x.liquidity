@@ -1,10 +1,23 @@
-{ pkgs, lib, modulesPath, dashboard, ... }:
+{ pkgs, lib, modulesPath, dashboard, st0x-liquidity, ... }:
 
 let
   inherit (import ./keys.nix) roles;
 
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
+
+  hedgeCfg = services.st0x-hedge;
+
+  cli = pkgs.writeShellApplication {
+    name = "stox";
+    runtimeInputs = [ st0x-liquidity ];
+    text = ''
+      exec cli \
+        --config "''${STOX_CONFIG:-${./config/st0x-hedge.toml}}" \
+        --secrets "''${STOX_SECRETS:-${hedgeCfg.decryptedSecretPath}}" \
+        "$@"
+    '';
+  };
 
   mkService = name: cfg:
     let
@@ -25,7 +38,7 @@ let
 
         # Marker file created ONLY by service profile activation.
         # Guarantees service is SKIPPED (not failed) during system activation.
-        ConditionPathExists = "/run/st0x/${name}.ready";
+        ConditionPathExists = cfg.markerFile;
       };
 
       serviceConfig = {
@@ -36,19 +49,13 @@ let
           "--config"
           "${configFile}"
           "--secrets"
-          "/run/agenix/${name}.toml"
+          cfg.decryptedSecretPath
         ];
         Restart = "always";
         RestartSec = 5;
         ReadWritePaths = [ "/mnt/data" ];
       };
     };
-
-  mkSecret = name: _: {
-    file = ./secret/${name}.toml.age;
-    group = "st0x";
-    mode = "0640";
-  };
 
 in {
   imports = [
@@ -181,7 +188,12 @@ in {
   users.groups.st0x = { };
   programs.bash.interactiveShellInit = "set -o vi";
 
-  age.secrets = lib.mapAttrs mkSecret enabledServices;
+  age.secrets = lib.mapAttrs' (_: cfg:
+    lib.nameValuePair cfg.decryptedSecret {
+      file = ./secret/${cfg.encryptedSecret};
+      group = "st0x";
+      mode = "0640";
+    }) services;
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
@@ -192,7 +204,9 @@ in {
     magic-wormhole
     sqlite
     rage
+    vim
     zellij
+    cli
   ];
 
   system.activationScripts.per-service-profiles.text =
