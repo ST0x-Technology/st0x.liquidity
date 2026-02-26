@@ -385,7 +385,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     let transfers: Vec<_> = if pending_only {
         all_transfers
             .into_iter()
-            .filter(|transfer| transfer.status == TransferStatus::Pending)
+            .filter(|transfer| transfer.status.is_pending())
             .collect()
     } else {
         all_transfers
