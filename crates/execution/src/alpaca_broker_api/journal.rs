@@ -8,15 +8,23 @@ use uuid::Uuid;
 use super::auth::AlpacaAccountId;
 use crate::{FractionalShares, Positive, Symbol};
 
+/// Type of journal entry in the Alpaca Broker API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum JournalEntryType {
+    /// Journal of securities (stock positions).
+    Jnls,
+}
+
 /// Request body for creating a security journal (JNLS) between accounts.
 #[derive(Debug, Serialize)]
 pub(super) struct JournalRequest {
-    pub from_account: AlpacaAccountId,
-    pub to_account: AlpacaAccountId,
-    pub entry_type: &'static str,
-    pub symbol: Symbol,
+    pub(super) from_account: AlpacaAccountId,
+    pub(super) to_account: AlpacaAccountId,
+    pub(super) entry_type: JournalEntryType,
+    pub(super) symbol: Symbol,
     #[serde(rename = "qty")]
-    pub quantity: String,
+    pub(super) quantity: String,
 }
 
 impl JournalRequest {
@@ -29,7 +37,7 @@ impl JournalRequest {
         Self {
             from_account,
             to_account,
-            entry_type: "JNLS",
+            entry_type: JournalEntryType::Jnls,
             symbol,
             quantity: quantity.to_string(),
         }
