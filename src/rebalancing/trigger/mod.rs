@@ -2283,22 +2283,15 @@ mod tests {
             .await
             .unwrap();
 
-        let usdc_imbalance =
-            trigger
-                .inventory
-                .read()
-                .await
-                .check_usdc_imbalance(&ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.5),
-                });
+        // 10000 - 1500 = 8500 onchain USDC
+        let onchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::MarketMaking)
+            .unwrap();
 
-        // 10000 - 1500 = 8500 onchain, 10000 offchain
-        // ratio = 8500/18500 ~= 0.459 -> within threshold
-        assert!(
-            usdc_imbalance.is_none(),
-            "USDC should be roughly balanced after onchain buy, got {usdc_imbalance:?}"
-        );
+        assert_eq!(onchain_usdc, Usdc(dec!(8500)));
     }
 
     #[tokio::test]
@@ -2325,22 +2318,15 @@ mod tests {
             .await
             .unwrap();
 
-        let usdc_imbalance =
-            trigger
-                .inventory
-                .read()
-                .await
-                .check_usdc_imbalance(&ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.5),
-                });
+        // 10000 + 1500 = 11500 onchain USDC
+        let onchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::MarketMaking)
+            .unwrap();
 
-        // 10000 + 1500 = 11500 onchain, 10000 offchain
-        // ratio = 11500/21500 ~= 0.535 -> within threshold
-        assert!(
-            usdc_imbalance.is_none(),
-            "USDC should be roughly balanced after onchain sell, got {usdc_imbalance:?}"
-        );
+        assert_eq!(onchain_usdc, Usdc(dec!(11500)));
     }
 
     #[tokio::test]
@@ -2361,22 +2347,15 @@ mod tests {
             .await
             .unwrap();
 
-        let usdc_imbalance =
-            trigger
-                .inventory
-                .read()
-                .await
-                .check_usdc_imbalance(&ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.5),
-                });
+        // 10000 - 1500 = 8500 offchain USDC
+        let offchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::Hedging)
+            .unwrap();
 
-        // 10000 onchain, 10000 - 1500 = 8500 offchain
-        // ratio = 10000/18500 ~= 0.541 -> within threshold
-        assert!(
-            usdc_imbalance.is_none(),
-            "USDC should be roughly balanced after offchain buy, got {usdc_imbalance:?}"
-        );
+        assert_eq!(offchain_usdc, Usdc(dec!(8500)));
     }
 
     #[tokio::test]
@@ -2403,22 +2382,15 @@ mod tests {
             .await
             .unwrap();
 
-        let usdc_imbalance =
-            trigger
-                .inventory
-                .read()
-                .await
-                .check_usdc_imbalance(&ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.5),
-                });
+        // 10000 + 1500 = 11500 offchain USDC
+        let offchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::Hedging)
+            .unwrap();
 
-        // 10000 onchain, 10000 + 1500 = 11500 offchain
-        // ratio = 10000/21500 ~= 0.465 -> within threshold
-        assert!(
-            usdc_imbalance.is_none(),
-            "USDC should be roughly balanced after offchain sell, got {usdc_imbalance:?}"
-        );
+        assert_eq!(offchain_usdc, Usdc(dec!(11500)));
     }
 
     #[tokio::test]

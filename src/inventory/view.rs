@@ -502,6 +502,15 @@ impl InventoryView {
         self
     }
 
+    /// Returns the USDC available balance at the given venue.
+    #[cfg(test)]
+    pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
+        match venue {
+            Venue::MarketMaking => self.usdc.onchain.map(|vb| vb.available()),
+            Venue::Hedging => self.usdc.offchain.map(|vb| vb.available()),
+        }
+    }
+
     /// Sets USDC inventory with specified available balances (zero inflight).
     #[cfg(test)]
     pub(crate) fn with_usdc(self, onchain_available: Usdc, offchain_available: Usdc) -> Self {
