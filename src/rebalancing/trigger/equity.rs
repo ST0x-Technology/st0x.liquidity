@@ -208,7 +208,7 @@ mod tests {
         offchain: i64,
     ) -> Arc<RwLock<InventoryView>> {
         let view = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(onchain)),
@@ -270,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn test_balanced_inventory_returns_no_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let view = InventoryView::default().with_equity(symbol.clone());
+        let view = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
         let inventory = Arc::new(RwLock::new(view));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
@@ -409,7 +409,7 @@ mod tests {
         offchain: &str,
     ) -> Arc<RwLock<InventoryView>> {
         let view = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, precise_shares(onchain)),

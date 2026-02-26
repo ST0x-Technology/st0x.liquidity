@@ -521,8 +521,8 @@ impl InventoryView {
     #[cfg(test)]
     pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
         match venue {
-            Venue::MarketMaking => self.usdc.onchain.map(|vb| vb.available()),
-            Venue::Hedging => self.usdc.offchain.map(|vb| vb.available()),
+            Venue::MarketMaking => self.usdc.onchain.map(VenueBalance::available),
+            Venue::Hedging => self.usdc.offchain.map(VenueBalance::available),
         }
     }
 

@@ -1146,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn test_balanced_inventory_does_not_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
@@ -1291,7 +1291,7 @@ mod tests {
     #[tokio::test]
     async fn load_token_address_returns_address_for_known_symbol() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -1304,7 +1304,7 @@ mod tests {
     async fn load_token_address_returns_none_for_unknown_symbol() {
         let known = Symbol::new("AAPL").unwrap();
         let unknown = Symbol::new("MSFT").unwrap();
-        let inventory = InventoryView::default().with_equity(known.clone());
+        let inventory = InventoryView::default().with_equity(known.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &known).await;
@@ -1388,7 +1388,7 @@ mod tests {
     async fn position_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)));
 
         let (trigger, mut receiver) =
@@ -1427,7 +1427,7 @@ mod tests {
     async fn position_event_maintaining_balance_triggers_nothing() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
@@ -1468,7 +1468,7 @@ mod tests {
     async fn position_event_causing_imbalance_triggers_mint() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
@@ -1506,7 +1506,7 @@ mod tests {
     async fn high_vault_ratio_triggers_redemption_that_would_be_balanced_at_one_to_one() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(65)),
@@ -1607,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn mint_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         // Start with 20 onchain and 80 offchain - imbalanced (20% onchain).
         // Threshold: target 50%, deviation 20%, so lower bound is 30%.
@@ -1668,7 +1668,7 @@ mod tests {
     #[tokio::test]
     async fn mint_completion_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
@@ -1692,7 +1692,7 @@ mod tests {
     #[tokio::test]
     async fn mint_rejection_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
@@ -1752,7 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn mint_rejection_via_reactor_clears_in_progress() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
         {
@@ -1783,7 +1783,7 @@ mod tests {
     async fn redemption_completion_via_reactor_clears_in_progress() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -1821,7 +1821,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain triggers Mint
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -1872,7 +1872,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -1922,7 +1922,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -1970,7 +1970,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced (triggers Mint)
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2027,7 +2027,7 @@ mod tests {
     async fn mint_wrapping_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2072,7 +2072,7 @@ mod tests {
     async fn mint_raindex_deposit_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2117,7 +2117,7 @@ mod tests {
     async fn redemption_transfer_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -2156,7 +2156,7 @@ mod tests {
     async fn redemption_detection_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -2195,7 +2195,7 @@ mod tests {
     async fn redemption_rejected_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -2233,7 +2233,7 @@ mod tests {
     #[tokio::test]
     async fn position_noop_events_via_reactor_do_not_error() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
@@ -2269,7 +2269,7 @@ mod tests {
     async fn onchain_buy_updates_usdc_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
 
         let (trigger, _receiver) =
@@ -2298,7 +2298,7 @@ mod tests {
     async fn onchain_sell_updates_usdc_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
             .update_equity(
                 &symbol,
@@ -2333,7 +2333,7 @@ mod tests {
     async fn offchain_buy_updates_usdc_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
 
         let (trigger, _receiver) =
@@ -2362,7 +2362,7 @@ mod tests {
     async fn offchain_sell_updates_usdc_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
             .update_equity(
                 &symbol,
@@ -2398,7 +2398,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // Start with 80 onchain, 20 offchain = 80% -> TooMuchOnchain
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
@@ -2450,7 +2450,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // Start with 20 onchain, 80 offchain = 20% -> TooMuchOffchain triggers Mint
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2508,7 +2508,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 80 onchain, 20 offchain = 80% ratio -> TooMuchOnchain triggers Redemption
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
@@ -2557,7 +2557,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 80 onchain, 20 offchain = imbalanced
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
@@ -2797,7 +2797,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         // Start with 80 onchain and 20 offchain - imbalanced (80% onchain).
         // Threshold: target 50%, deviation 20%, so upper bound is 70%.
@@ -2838,7 +2838,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_completion_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
