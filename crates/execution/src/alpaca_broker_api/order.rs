@@ -187,12 +187,10 @@ fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decima
 where
     D: serde::Deserializer<'de>,
 {
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    opt.map_or(Ok(None), |s| {
-        s.parse::<Decimal>()
-            .map(Some)
-            .map_err(serde::de::Error::custom)
-    })
+    let maybe_string: Option<String> = Option::deserialize(deserializer)?;
+    maybe_string
+        .map(|string| string.parse().map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 pub(super) async fn place_market_order(

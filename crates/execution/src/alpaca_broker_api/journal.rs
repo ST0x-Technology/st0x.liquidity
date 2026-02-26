@@ -97,16 +97,45 @@ pub enum JournalStatus {
 
 impl std::fmt::Display for JournalStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use JournalStatus::*;
+
         match self {
-            Self::Queued => write!(f, "queued"),
-            Self::SentToClearing => write!(f, "sent_to_clearing"),
-            Self::Pending => write!(f, "pending"),
-            Self::Executed => write!(f, "executed"),
-            Self::Rejected => write!(f, "rejected"),
-            Self::Canceled => write!(f, "canceled"),
-            Self::Refused => write!(f, "refused"),
-            Self::Deleted => write!(f, "deleted"),
-            Self::Correct => write!(f, "correct"),
+            Queued => write!(f, "queued"),
+            SentToClearing => write!(f, "sent_to_clearing"),
+            Pending => write!(f, "pending"),
+            Executed => write!(f, "executed"),
+            Rejected => write!(f, "rejected"),
+            Canceled => write!(f, "canceled"),
+            Refused => write!(f, "refused"),
+            Deleted => write!(f, "deleted"),
+            Correct => write!(f, "correct"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_status_display_matches_serde_names() {
+        assert_eq!(JournalStatus::Queued.to_string(), "queued");
+        assert_eq!(
+            JournalStatus::SentToClearing.to_string(),
+            "sent_to_clearing"
+        );
+        assert_eq!(JournalStatus::Pending.to_string(), "pending");
+        assert_eq!(JournalStatus::Executed.to_string(), "executed");
+        assert_eq!(JournalStatus::Rejected.to_string(), "rejected");
+        assert_eq!(JournalStatus::Canceled.to_string(), "canceled");
+        assert_eq!(JournalStatus::Refused.to_string(), "refused");
+        assert_eq!(JournalStatus::Deleted.to_string(), "deleted");
+        assert_eq!(JournalStatus::Correct.to_string(), "correct");
+    }
+
+    #[test]
+    fn journal_entry_type_serializes_as_screaming_snake_case() {
+        let json = serde_json::to_string(&JournalEntryType::Jnls).unwrap();
+        assert_eq!(json, "\"JNLS\"");
     }
 }
