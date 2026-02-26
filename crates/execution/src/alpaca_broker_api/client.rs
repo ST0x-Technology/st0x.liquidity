@@ -438,7 +438,10 @@ mod tests {
             crate::alpaca_broker_api::JournalStatus::Pending
         );
         assert_eq!(response.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(response.quantity, FractionalShares::new(dec!(10.5)));
+        assert_eq!(
+            response.quantity,
+            Positive::new(FractionalShares::new(dec!(10.5))).unwrap()
+        );
         assert_eq!(response.price, Some(dec!(150.25)));
     }
 
