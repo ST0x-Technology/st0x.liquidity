@@ -31,7 +31,7 @@ use crate::config::OperationalLimits;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
-    ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, TransferOp, Venue,
+    ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, Operator, TransferOp, Venue,
 };
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::position::{Position, PositionEvent};
@@ -50,6 +50,8 @@ pub(crate) enum RebalancingTriggerError {
     Inventory(#[from] InventoryViewError),
     #[error(transparent)]
     EquityTrigger(#[from] equity::EquityTriggerError),
+    #[error("USDC amount overflow computing price {price} * quantity {quantity}")]
+    UsdcAmountOverflow { price: Decimal, quantity: Decimal },
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -407,7 +409,8 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         let inventory_error = match error {
             RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
-            other @ RebalancingTriggerError::EquityTrigger(_) => return Err(other),
+            other @ (RebalancingTriggerError::EquityTrigger(_)
+            | RebalancingTriggerError::UsdcAmountOverflow { .. }) => return Err(other),
         };
 
         warn!(
@@ -533,20 +536,52 @@ impl Reactor for RebalancingTrigger {
                 use PositionEvent::*;
 
                 let timestamp = event.timestamp();
-                let update = match &event {
+                let (equity_update, usdc_venue, usdc_op, usdc_amount) = match &event {
                     OnChainOrderFilled {
-                        amount, direction, ..
-                    } => Inventory::available(Venue::MarketMaking, (*direction).into(), *amount),
+                        amount,
+                        direction,
+                        price_usdc,
+                        ..
+                    } => {
+                        let equity_op: Operator = (*direction).into();
+                        let quantity = Decimal::from(*amount);
+                        let usdc_value = price_usdc.checked_mul(quantity).ok_or(
+                            RebalancingTriggerError::UsdcAmountOverflow {
+                                price: *price_usdc,
+                                quantity,
+                            },
+                        )?;
+
+                        (
+                            Inventory::available(Venue::MarketMaking, equity_op, *amount),
+                            Venue::MarketMaking,
+                            equity_op.inverse(),
+                            Usdc(usdc_value),
+                        )
+                    }
 
                     OffChainOrderFilled {
                         shares_filled,
                         direction,
+                        price,
                         ..
-                    } => Inventory::available(
-                        Venue::Hedging,
-                        (*direction).into(),
-                        shares_filled.inner(),
-                    ),
+                    } => {
+                        let equity_op: Operator = (*direction).into();
+                        let quantity = Decimal::from(shares_filled.inner());
+                        let usdc_value = price.0.checked_mul(quantity).ok_or(
+                            RebalancingTriggerError::UsdcAmountOverflow {
+                                price: price.0,
+                                quantity,
+                            },
+                        )?;
+
+                        (
+                            Inventory::available(Venue::Hedging, equity_op, shares_filled.inner()),
+                            Venue::Hedging,
+                            equity_op.inverse(),
+                            Usdc(usdc_value),
+                        )
+                    }
 
                     Initialized { .. }
                     | OffChainOrderPlaced { .. }
@@ -554,10 +589,13 @@ impl Reactor for RebalancingTrigger {
                     | ThresholdUpdated { .. } => return Ok(()),
                 };
 
+                let usdc_update = Inventory::available(usdc_venue, usdc_op, usdc_amount);
+
                 let mut inventory = self.inventory.write().await;
                 *inventory = inventory
                     .clone()
-                    .update_equity(&symbol, update, timestamp)?;
+                    .update_equity(&symbol, equity_update, timestamp)?
+                    .update_usdc(usdc_update, timestamp)?;
                 drop(inventory);
 
                 self.check_and_trigger_equity(&symbol).await?;
@@ -1287,7 +1325,9 @@ mod tests {
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let inventory = Arc::new(RwLock::new(
+            InventoryView::default().with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000))),
+        ));
         let pool = crate::test_utils::setup_test_db().await;
 
         seed_vault_registry(&pool, &symbol).await;
@@ -1345,7 +1385,9 @@ mod tests {
     #[tokio::test]
     async fn position_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)));
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -1384,6 +1426,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(50)),
@@ -1424,6 +1467,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2217,6 +2261,162 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn onchain_buy_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Onchain buy of 10 shares at $150 -> adds 10 equity onchain, removes $1500 USDC onchain
+        let event = make_onchain_fill(shares(10), Direction::Buy);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let usdc_imbalance =
+            trigger
+                .inventory
+                .read()
+                .await
+                .check_usdc_imbalance(&ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.5),
+                });
+
+        // 10000 - 1500 = 8500 onchain, 10000 offchain
+        // ratio = 8500/18500 ~= 0.459 -> within threshold
+        assert!(
+            usdc_imbalance.is_none(),
+            "USDC should be roughly balanced after onchain buy, got {usdc_imbalance:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn onchain_sell_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Onchain sell of 10 shares at $150 -> removes 10 equity onchain, adds $1500 USDC onchain
+        let event = make_onchain_fill(shares(10), Direction::Sell);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let usdc_imbalance =
+            trigger
+                .inventory
+                .read()
+                .await
+                .check_usdc_imbalance(&ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.5),
+                });
+
+        // 10000 + 1500 = 11500 onchain, 10000 offchain
+        // ratio = 11500/21500 ~= 0.535 -> within threshold
+        assert!(
+            usdc_imbalance.is_none(),
+            "USDC should be roughly balanced after onchain sell, got {usdc_imbalance:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_buy_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Offchain buy of 10 shares at $150 -> adds 10 equity offchain, removes $1500 USDC offchain
+        let event = make_offchain_fill(shares(10), Direction::Buy);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let usdc_imbalance =
+            trigger
+                .inventory
+                .read()
+                .await
+                .check_usdc_imbalance(&ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.5),
+                });
+
+        // 10000 onchain, 10000 - 1500 = 8500 offchain
+        // ratio = 10000/18500 ~= 0.541 -> within threshold
+        assert!(
+            usdc_imbalance.is_none(),
+            "USDC should be roughly balanced after offchain buy, got {usdc_imbalance:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_sell_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Offchain sell of 10 shares at $150 -> removes 10 equity offchain, adds $1500 USDC offchain
+        let event = make_offchain_fill(shares(10), Direction::Sell);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let usdc_imbalance =
+            trigger
+                .inventory
+                .read()
+                .await
+                .check_usdc_imbalance(&ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.5),
+                });
+
+        // 10000 onchain, 10000 + 1500 = 11500 offchain
+        // ratio = 10000/21500 ~= 0.465 -> within threshold
+        assert!(
+            usdc_imbalance.is_none(),
+            "USDC should be roughly balanced after offchain sell, got {usdc_imbalance:?}"
+        );
     }
 
     #[tokio::test]

@@ -1517,7 +1517,7 @@ mod tests {
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use crate::threshold::{ExecutionThreshold, Usdc};
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
@@ -3272,6 +3272,7 @@ mod tests {
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
             .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 symbol,
                 Inventory::available(
@@ -3597,6 +3598,7 @@ mod tests {
         // 65 onchain, 35 offchain = 65% < 70% upper bound -> within bounds.
         let initial_inventory = InventoryView::default()
             .with_equity(symbol.clone())
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(

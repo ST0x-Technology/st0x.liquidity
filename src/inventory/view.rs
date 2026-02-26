@@ -78,6 +78,19 @@ pub(crate) enum Operator {
     Remove,
 }
 
+impl Operator {
+    /// Returns the opposite operator: Add becomes Remove, Remove becomes Add.
+    ///
+    /// Used when a fill event affects two asset types in opposite directions
+    /// (e.g., buying equity removes USDC, selling equity adds USDC).
+    pub(crate) fn inverse(self) -> Self {
+        match self {
+            Self::Add => Self::Remove,
+            Self::Remove => Self::Add,
+        }
+    }
+}
+
 impl From<Direction> for Operator {
     fn from(direction: Direction) -> Self {
         match direction {
