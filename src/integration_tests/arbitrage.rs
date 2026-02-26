@@ -57,6 +57,7 @@ use crate::vault_registry::VaultRegistryId;
 const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";
 const AAPL_PRICE: u32 = 100;
+const TOFU_TOKEN_DECIMALS: Address = address!("0xF66761F6b5F58202998D6Cd944C81b22Dc6d4f1E");
 const MSFT_PRICE: u32 = 200;
 
 /// Loads a position and asserts it matches the expected field values.
@@ -257,7 +258,7 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
 
     provider
         .anvil_set_code(
-            address!("0xF66761F6b5F58202998D6Cd944C81b22Dc6d4f1E"),
+            TOFU_TOKEN_DECIMALS,
             TOFUTokenDecimals::DEPLOYED_BYTECODE.clone(),
         )
         .await
