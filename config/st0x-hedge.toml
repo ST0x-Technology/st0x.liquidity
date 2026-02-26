@@ -25,9 +25,9 @@ target = "0.5"
 deviation = "0.2"
 
 [rebalancing.usdc]
-mode = "enabled"
-target = "0.5"
-deviation = "0.3"
+mode = "disabled"
+# target = "0.5"
+# deviation = "0.3"
 
 [rebalancing.fireblocks_chain_asset_ids]
 1 = "ETH"
