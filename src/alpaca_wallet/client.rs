@@ -222,7 +222,9 @@ impl AlpacaWalletClient {
         let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
 
         let request = Request {
-            address: address.to_string(),
+            // None = standard EIP-55 checksum (no chain-specific EIP-1191 encoding).
+            // Fine for now since this system only handles Ethereum mainnet.
+            address: address.to_checksum(None),
             asset: asset.as_ref(),
         };
 
