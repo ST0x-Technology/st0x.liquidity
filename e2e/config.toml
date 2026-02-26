@@ -2,6 +2,11 @@ database_url = ":memory:"
 log_level = "info"
 server_port = 8001
 
+[equities.tEXAMPLE]
+enabled = true
+unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 [operational_limits]
 mode = "enabled"
 max_amount = "100"
@@ -23,10 +28,6 @@ fireblocks_environment = "sandbox"
 [rebalancing.fireblocks_chain_asset_ids]
 1 = "ETH"
 8453 = "BASECHAIN_ETH"
-
-[rebalancing.equities.tEXAMPLE]
-unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 [rebalancing.equity]
 target = "0.5"
