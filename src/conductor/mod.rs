@@ -1518,7 +1518,7 @@ mod tests {
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use crate::threshold::{ExecutionThreshold, Usdc};
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
@@ -3282,7 +3282,12 @@ mod tests {
     /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 symbol,
                 Inventory::available(
@@ -3406,9 +3411,14 @@ mod tests {
             deviation: dec!(0.2),
         };
 
-        // Seed inventory with 50 offchain shares. CQRS will add 50 onchain.
+        // Seed inventory with 50 offchain shares and USDC. CQRS will add 50 onchain.
         let initial_inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3491,7 +3501,12 @@ mod tests {
 
         // Start balanced: 50 onchain, 50 offchain.
         let initial_inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
+            .with_usdc(Usdc(Decimal::ZERO), Usdc(Decimal::ZERO))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3509,6 +3524,16 @@ mod tests {
                     Operator::Add,
                     FractionalShares::new(dec!(50)),
                 ),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .update_usdc(
+                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc(dec!(50))),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .update_usdc(
+                Inventory::available(Venue::Hedging, Operator::Add, Usdc(dec!(50))),
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -3610,7 +3635,12 @@ mod tests {
 
         // 65 onchain, 35 offchain = 65% < 70% upper bound -> within bounds.
         let initial_inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(

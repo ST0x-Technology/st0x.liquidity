@@ -31,8 +31,9 @@ use crate::config::OperationalLimits;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
-    ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, TransferOp, Venue,
+    ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, Operator, TransferOp, Venue,
 };
+use crate::offchain_order::Dollars;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
@@ -50,6 +51,8 @@ pub(crate) enum RebalancingTriggerError {
     Inventory(#[from] InventoryViewError),
     #[error(transparent)]
     EquityTrigger(#[from] equity::EquityTriggerError),
+    #[error("USDC amount overflow computing price {price} * quantity {quantity}")]
+    UsdcAmountOverflow { price: Decimal, quantity: Decimal },
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -401,7 +404,8 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         let inventory_error = match error {
             RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
-            other @ RebalancingTriggerError::EquityTrigger(_) => return Err(other),
+            other @ (RebalancingTriggerError::EquityTrigger(_)
+            | RebalancingTriggerError::UsdcAmountOverflow { .. }) => return Err(other),
         };
 
         warn!(
@@ -527,20 +531,57 @@ impl Reactor for RebalancingTrigger {
                 use PositionEvent::*;
 
                 let timestamp = event.timestamp();
-                let update = match &event {
+                let (equity_update, usdc_update) = match &event {
                     OnChainOrderFilled {
-                        amount, direction, ..
-                    } => Inventory::available(Venue::MarketMaking, (*direction).into(), *amount),
+                        amount,
+                        direction,
+                        price_usdc,
+                        ..
+                    } => {
+                        let equity_op: Operator = (*direction).into();
+                        let quantity = Decimal::from(*amount);
+                        let usdc_value = price_usdc.checked_mul(quantity).ok_or(
+                            RebalancingTriggerError::UsdcAmountOverflow {
+                                price: *price_usdc,
+                                quantity,
+                            },
+                        )?;
+
+                        (
+                            Inventory::available(Venue::MarketMaking, equity_op, *amount),
+                            Inventory::available(
+                                Venue::MarketMaking,
+                                equity_op.inverse(),
+                                Usdc(usdc_value),
+                            ),
+                        )
+                    }
 
                     OffChainOrderFilled {
                         shares_filled,
                         direction,
+                        price,
                         ..
-                    } => Inventory::available(
-                        Venue::Hedging,
-                        (*direction).into(),
-                        shares_filled.inner(),
-                    ),
+                    } => {
+                        let equity_op: Operator = (*direction).into();
+                        let quantity = Decimal::from(shares_filled.inner());
+                        let Dollars(price_value) = price;
+                        let usdc_value = price_value.checked_mul(quantity).ok_or(
+                            RebalancingTriggerError::UsdcAmountOverflow {
+                                price: *price_value,
+                                quantity,
+                            },
+                        )?;
+
+                        (
+                            Inventory::available(Venue::Hedging, equity_op, shares_filled.inner()),
+                            Inventory::available(
+                                Venue::Hedging,
+                                equity_op.inverse(),
+                                Usdc(usdc_value),
+                            ),
+                        )
+                    }
 
                     Initialized { .. }
                     | OffChainOrderPlaced { .. }
@@ -551,7 +592,8 @@ impl Reactor for RebalancingTrigger {
                 let mut inventory = self.inventory.write().await;
                 *inventory = inventory
                     .clone()
-                    .update_equity(&symbol, update, timestamp)?;
+                    .update_equity(&symbol, equity_update, timestamp)?
+                    .update_usdc(usdc_update, timestamp)?;
                 drop(inventory);
 
                 self.check_and_trigger_equity(&symbol).await?;
@@ -1140,7 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn test_balanced_inventory_does_not_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
@@ -1285,7 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn load_token_address_returns_address_for_known_symbol() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -1298,7 +1340,7 @@ mod tests {
     async fn load_token_address_returns_none_for_unknown_symbol() {
         let known = Symbol::new("AAPL").unwrap();
         let unknown = Symbol::new("MSFT").unwrap();
-        let inventory = InventoryView::default().with_equity(known.clone());
+        let inventory = InventoryView::default().with_equity(known.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &known).await;
@@ -1321,7 +1363,9 @@ mod tests {
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let inventory = Arc::new(RwLock::new(
+            InventoryView::default().with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000))),
+        ));
         let pool = crate::test_utils::setup_test_db().await;
 
         seed_vault_registry(&pool, &symbol).await;
@@ -1379,7 +1423,9 @@ mod tests {
     #[tokio::test]
     async fn position_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)));
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -1417,7 +1463,8 @@ mod tests {
     async fn position_event_maintaining_balance_triggers_nothing() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(50)),
@@ -1457,7 +1504,8 @@ mod tests {
     async fn position_event_causing_imbalance_triggers_mint() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -1494,7 +1542,7 @@ mod tests {
     async fn high_vault_ratio_triggers_redemption_that_would_be_balanced_at_one_to_one() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(65)),
@@ -1595,7 +1643,7 @@ mod tests {
     #[tokio::test]
     async fn mint_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         // Start with 20 onchain and 80 offchain - imbalanced (20% onchain).
         // Threshold: target 50%, deviation 20%, so lower bound is 30%.
@@ -1656,7 +1704,7 @@ mod tests {
     #[tokio::test]
     async fn mint_completion_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
@@ -1680,7 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn mint_rejection_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
@@ -1740,7 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn mint_rejection_via_reactor_clears_in_progress() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
         {
@@ -1771,7 +1819,7 @@ mod tests {
     async fn redemption_completion_via_reactor_clears_in_progress() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -1809,7 +1857,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain triggers Mint
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -1860,7 +1908,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -1910,7 +1958,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -1958,7 +2006,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced (triggers Mint)
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2015,7 +2063,7 @@ mod tests {
     async fn mint_wrapping_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2060,7 +2108,7 @@ mod tests {
     async fn mint_raindex_deposit_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2105,7 +2153,7 @@ mod tests {
     async fn redemption_transfer_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -2144,7 +2192,7 @@ mod tests {
     async fn redemption_detection_failed_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -2183,7 +2231,7 @@ mod tests {
     async fn redemption_rejected_via_reactor_is_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -2221,7 +2269,7 @@ mod tests {
     #[tokio::test]
     async fn position_noop_events_via_reactor_do_not_error() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
@@ -2254,11 +2302,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn onchain_buy_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Onchain buy of 10 shares at $150 -> adds 10 equity onchain, removes $1500 USDC onchain
+        let event = make_onchain_fill(shares(10), Direction::Buy);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        // 10000 - 1500 = 8500 onchain USDC
+        let onchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::MarketMaking)
+            .unwrap();
+
+        assert_eq!(onchain_usdc, Usdc(dec!(8500)));
+    }
+
+    #[tokio::test]
+    async fn onchain_sell_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Onchain sell of 10 shares at $150 -> removes 10 equity onchain, adds $1500 USDC onchain
+        let event = make_onchain_fill(shares(10), Direction::Sell);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        // 10000 + 1500 = 11500 onchain USDC
+        let onchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::MarketMaking)
+            .unwrap();
+
+        assert_eq!(onchain_usdc, Usdc(dec!(11500)));
+    }
+
+    #[tokio::test]
+    async fn offchain_buy_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Offchain buy of 10 shares at $150 -> adds 10 equity offchain, removes $1500 USDC offchain
+        let event = make_offchain_fill(shares(10), Direction::Buy);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        // 10000 - 1500 = 8500 offchain USDC
+        let offchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::Hedging)
+            .unwrap();
+
+        assert_eq!(offchain_usdc, Usdc(dec!(8500)));
+    }
+
+    #[tokio::test]
+    async fn offchain_sell_updates_usdc_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+
+        // Offchain sell of 10 shares at $150 -> removes 10 equity offchain, adds $1500 USDC offchain
+        let event = make_offchain_fill(shares(10), Direction::Sell);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        // 10000 + 1500 = 11500 offchain USDC
+        let offchain_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::Hedging)
+            .unwrap();
+
+        assert_eq!(offchain_usdc, Usdc(dec!(11500)));
+    }
+
+    #[tokio::test]
     async fn snapshot_onchain_equity_via_reactor_triggers_check() {
         let symbol = Symbol::new("AAPL").unwrap();
         // Start with 80 onchain, 20 offchain = 80% -> TooMuchOnchain
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
@@ -2310,7 +2486,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // Start with 20 onchain, 80 offchain = 20% -> TooMuchOffchain triggers Mint
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2368,7 +2544,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 80 onchain, 20 offchain = 80% ratio -> TooMuchOnchain triggers Redemption
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
@@ -2417,7 +2593,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 80 onchain, 20 offchain = imbalanced
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone())
+            .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
@@ -2657,7 +2833,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         // Start with 80 onchain and 20 offchain - imbalanced (80% onchain).
         // Threshold: target 50%, deviation 20%, so upper bound is 70%.
@@ -2698,7 +2874,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_completion_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone());
+        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 

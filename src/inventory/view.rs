@@ -78,6 +78,19 @@ pub(crate) enum Operator {
     Remove,
 }
 
+impl Operator {
+    /// Returns the opposite operator: Add becomes Remove, Remove becomes Add.
+    ///
+    /// Used when a fill event affects two asset types in opposite directions
+    /// (e.g., buying equity removes USDC, selling equity adds USDC).
+    pub(crate) fn inverse(self) -> Self {
+        match self {
+            Self::Add => Self::Remove,
+            Self::Remove => Self::Add,
+        }
+    }
+}
+
 impl From<Direction> for Operator {
     fn from(direction: Direction) -> Self {
         match direction {
@@ -482,11 +495,35 @@ impl Default for InventoryView {
 }
 
 impl InventoryView {
-    /// Registers a symbol with zeroed inventory.
+    /// Registers a symbol with specified available balances (zero inflight).
     #[cfg(test)]
-    pub(crate) fn with_equity(mut self, symbol: Symbol) -> Self {
-        self.equities.insert(symbol, Inventory::default());
+    pub(crate) fn with_equity(
+        mut self,
+        symbol: Symbol,
+        onchain_available: FractionalShares,
+        offchain_available: FractionalShares,
+    ) -> Self {
+        self.equities.insert(
+            symbol,
+            Inventory {
+                onchain: Some(VenueBalance::new(onchain_available, FractionalShares::ZERO)),
+                offchain: Some(VenueBalance::new(
+                    offchain_available,
+                    FractionalShares::ZERO,
+                )),
+                last_rebalancing: None,
+            },
+        );
         self
+    }
+
+    /// Returns the USDC available balance at the given venue.
+    #[cfg(test)]
+    pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
+        match venue {
+            Venue::MarketMaking => self.usdc.onchain.map(VenueBalance::available),
+            Venue::Hedging => self.usdc.offchain.map(VenueBalance::available),
+        }
     }
 
     /// Sets USDC inventory with specified available balances (zero inflight).

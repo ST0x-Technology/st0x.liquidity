@@ -9,5 +9,5 @@ pub(crate) use polling::InventoryPollingService;
 pub(crate) use snapshot::InventorySnapshot;
 pub(crate) use view::{
     EquityImbalanceError, Imbalance, ImbalanceThreshold, Inventory, InventoryView,
-    InventoryViewError, TransferOp, Venue,
+    InventoryViewError, Operator, TransferOp, Venue,
 };
