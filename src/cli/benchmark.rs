@@ -274,6 +274,7 @@ async fn measure_redeem(
         status: completed.status,
     })
 }
+
 /// Place a market order and poll until filled.
 async fn place_and_fill<W: Write>(
     executor: &AlpacaBrokerApi,
