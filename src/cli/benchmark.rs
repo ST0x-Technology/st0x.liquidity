@@ -26,14 +26,14 @@ use crate::threshold::Usd;
 use crate::tokenization::{AlpacaTokenizationService, TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::IssuerRequestId;
 
-/// Direction of a single benchmark measurement.
+/// Phase of a tokenization round trip being measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BenchmarkDirection {
+pub(crate) enum RoundTripPhase {
     Mint,
     Redeem,
 }
 
-impl Display for BenchmarkDirection {
+impl Display for RoundTripPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Mint => write!(f, "mint"),
@@ -46,7 +46,7 @@ impl Display for BenchmarkDirection {
 #[derive(Debug, Clone)]
 pub(crate) struct BenchmarkRow {
     pub(crate) trip: usize,
-    pub(crate) direction: BenchmarkDirection,
+    pub(crate) phase: RoundTripPhase,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) completed_at: DateTime<Utc>,
     pub(crate) duration: Duration,
@@ -65,7 +65,7 @@ pub(crate) struct BenchmarkSummary {
 #[derive(Serialize)]
 struct TsvRecord {
     trip: usize,
-    direction: String,
+    phase: String,
     started_at: String,
     completed_at: String,
     duration_secs: String,
@@ -77,7 +77,7 @@ impl From<&BenchmarkRow> for TsvRecord {
     fn from(row: &BenchmarkRow) -> Self {
         Self {
             trip: row.trip,
-            direction: row.direction.to_string(),
+            phase: row.phase.to_string(),
             started_at: row.started_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             completed_at: row.completed_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             duration_secs: format!("{:.1}", row.duration.as_secs_f64()),
@@ -159,34 +159,35 @@ impl BenchmarkSummary {
         let mut mint_durations: Vec<Duration> = self
             .rows
             .iter()
-            .filter(|row| row.direction == BenchmarkDirection::Mint)
+            .filter(|row| row.phase == RoundTripPhase::Mint)
             .map(|row| row.duration)
             .collect();
 
         let mut redeem_durations: Vec<Duration> = self
             .rows
             .iter()
-            .filter(|row| row.direction == BenchmarkDirection::Redeem)
+            .filter(|row| row.phase == RoundTripPhase::Redeem)
             .map(|row| row.duration)
             .collect();
 
-        let mut full_trip_durations: Vec<Duration> =
-            (1..=self.round_trips)
-                .filter_map(|trip| {
-                    let mint = self.rows.iter().find(|row| {
-                        row.trip == trip && row.direction == BenchmarkDirection::Mint
-                    })?;
-                    let redeem = self.rows.iter().find(|row| {
-                        row.trip == trip && row.direction == BenchmarkDirection::Redeem
-                    })?;
-                    Some(mint.duration + redeem.duration)
-                })
-                .collect();
+        let mut full_trip_durations: Vec<Duration> = (1..=self.round_trips)
+            .filter_map(|trip| {
+                let mint = self
+                    .rows
+                    .iter()
+                    .find(|row| row.trip == trip && row.phase == RoundTripPhase::Mint)?;
+                let redeem = self
+                    .rows
+                    .iter()
+                    .find(|row| row.trip == trip && row.phase == RoundTripPhase::Redeem)?;
+                Some(mint.duration + redeem.duration)
+            })
+            .collect();
 
         writeln!(
             writer,
             "{:<11}| {:<8}| {:<8}| {:<8}| Median",
-            "Direction", "Min", "Max", "Avg",
+            "Phase", "Min", "Max", "Avg",
         )?;
         writeln!(writer, "-----------+---------+---------+---------+--------",)?;
 
@@ -282,7 +283,7 @@ async fn measure_mint(
 
     Ok(BenchmarkRow {
         trip,
-        direction: BenchmarkDirection::Mint,
+        phase: RoundTripPhase::Mint,
         started_at,
         completed_at: Utc::now(),
         duration,
@@ -316,7 +317,7 @@ async fn measure_redeem(
 
     Ok(BenchmarkRow {
         trip,
-        direction: BenchmarkDirection::Redeem,
+        phase: RoundTripPhase::Redeem,
         started_at,
         completed_at: Utc::now(),
         duration,
@@ -483,7 +484,7 @@ mod tests {
 
     fn make_row(
         trip: usize,
-        direction: BenchmarkDirection,
+        phase: RoundTripPhase,
         duration_secs: f64,
         fees: Option<Usd>,
     ) -> BenchmarkRow {
@@ -493,7 +494,7 @@ mod tests {
 
         BenchmarkRow {
             trip,
-            direction,
+            phase,
             started_at,
             completed_at,
             duration,
@@ -504,7 +505,7 @@ mod tests {
 
     #[test]
     fn tsv_record_with_fees() {
-        let row = make_row(1, BenchmarkDirection::Mint, 75.2, Some(Usd(dec!(1.50))));
+        let row = make_row(1, RoundTripPhase::Mint, 75.2, Some(Usd(dec!(1.50))));
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
         writer.serialize(TsvRecord::from(&row)).unwrap();
@@ -516,7 +517,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "header + 1 data row");
         assert_eq!(
             lines[0],
-            "trip\tdirection\tstarted_at\tcompleted_at\tduration_secs\tfees\tstatus",
+            "trip\tphase\tstarted_at\tcompleted_at\tduration_secs\tfees\tstatus",
         );
         assert_eq!(
             lines[1],
@@ -526,7 +527,7 @@ mod tests {
 
     #[test]
     fn tsv_record_without_fees() {
-        let row = make_row(1, BenchmarkDirection::Redeem, 89.1, None);
+        let row = make_row(1, RoundTripPhase::Redeem, 89.1, None);
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
         writer.serialize(TsvRecord::from(&row)).unwrap();
@@ -544,10 +545,10 @@ mod tests {
     #[test]
     fn tsv_full_report_includes_header_and_rows() {
         let rows = vec![
-            make_row(1, BenchmarkDirection::Mint, 75.2, None),
-            make_row(1, BenchmarkDirection::Redeem, 89.1, None),
-            make_row(2, BenchmarkDirection::Mint, 80.0, None),
-            make_row(2, BenchmarkDirection::Redeem, 91.0, None),
+            make_row(1, RoundTripPhase::Mint, 75.2, None),
+            make_row(1, RoundTripPhase::Redeem, 89.1, None),
+            make_row(2, RoundTripPhase::Mint, 80.0, None),
+            make_row(2, RoundTripPhase::Redeem, 91.0, None),
         ];
 
         let summary = BenchmarkSummary {
@@ -564,7 +565,7 @@ mod tests {
         assert_eq!(lines.len(), 5, "header + 4 data rows");
         assert_eq!(
             lines[0],
-            "trip\tdirection\tstarted_at\tcompleted_at\tduration_secs\tfees\tstatus",
+            "trip\tphase\tstarted_at\tcompleted_at\tduration_secs\tfees\tstatus",
         );
 
         assert!(lines[1].starts_with("1\tmint\t"));
@@ -576,12 +577,12 @@ mod tests {
     #[test]
     fn summary_stats_correct_for_known_values() {
         let rows = vec![
-            make_row(1, BenchmarkDirection::Mint, 72.1, None),
-            make_row(1, BenchmarkDirection::Redeem, 88.0, None),
-            make_row(2, BenchmarkDirection::Mint, 85.3, None),
-            make_row(2, BenchmarkDirection::Redeem, 95.2, None),
-            make_row(3, BenchmarkDirection::Mint, 77.1, None),
-            make_row(3, BenchmarkDirection::Redeem, 91.1, None),
+            make_row(1, RoundTripPhase::Mint, 72.1, None),
+            make_row(1, RoundTripPhase::Redeem, 88.0, None),
+            make_row(2, RoundTripPhase::Mint, 85.3, None),
+            make_row(2, RoundTripPhase::Redeem, 95.2, None),
+            make_row(3, RoundTripPhase::Mint, 77.1, None),
+            make_row(3, RoundTripPhase::Redeem, 91.1, None),
         ];
 
         let summary = BenchmarkSummary {
@@ -700,9 +701,9 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_direction_display() {
-        assert_eq!(BenchmarkDirection::Mint.to_string(), "mint");
-        assert_eq!(BenchmarkDirection::Redeem.to_string(), "redeem");
+    fn round_trip_phase_display() {
+        assert_eq!(RoundTripPhase::Mint.to_string(), "mint");
+        assert_eq!(RoundTripPhase::Redeem.to_string(), "redeem");
     }
 
     #[test]
@@ -710,7 +711,7 @@ mod tests {
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
 
-        let row = make_row(1, BenchmarkDirection::Mint, 75.0, None);
+        let row = make_row(1, RoundTripPhase::Mint, 75.0, None);
         writer.serialize(TsvRecord::from(&row)).unwrap();
         writer.flush().unwrap();
         drop(writer);
