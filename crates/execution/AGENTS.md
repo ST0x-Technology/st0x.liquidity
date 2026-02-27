@@ -55,11 +55,10 @@ remain hidden.
 
 ### Module Organization Pattern
 
-Look at `src/schwab/mod.rs` and `src/alpaca_trading_api/mod.rs` as reference
-examples:
+Look at `src/schwab.rs` and `src/alpaca_trading_api.rs` as reference examples:
 
 ```rust
-// src/schwab/mod.rs - GOOD EXAMPLE
+// src/schwab.rs - GOOD EXAMPLE
 
 // Private implementation modules
 mod auth;
@@ -128,7 +127,8 @@ Ameritrade):
 
 1. **Create module** in `src/your_executor/` with private submodules
 2. **Implement `Executor` trait** with all required methods
-3. **Define minimal public API** in `mod.rs`:
+3. **Define minimal public API** in the parent module file (e.g.,
+   `src/your_executor.rs`):
    - Implementation type (`YourExecutor`)
    - Config/auth types needed for construction
    - Error type
@@ -141,7 +141,7 @@ Ameritrade):
 ### Example New Module Structure
 
 ```rust
-// src/fidelity/mod.rs
+// src/fidelity.rs
 
 mod auth;              // Private - OAuth/token logic
 mod executor;          // Private - Executor trait implementation
