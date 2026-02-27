@@ -343,6 +343,11 @@ is the source of truth for terminology and naming conventions.
   - **Flat by default**: Start with a single file per feature (e.g.,
     `position.rs`). Only split into a directory with submodules when natural
     business logic boundaries emerge and the split provides clear value
+  - **FORBIDDEN: `mod.rs`**: Use Rust 2018+ module style (`foo.rs` +
+    `foo/bar.rs`) instead of `foo/mod.rs`. The `mod.rs` convention obscures
+    module identity in editor tabs and search results — every `mod.rs` looks
+    identical. With the 2018+ layout, the parent file (`foo.rs`) carries the
+    module name, making navigation and diffs clearer
 - **Event-Driven Architecture**: Each trade spawns independent async task for
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and
