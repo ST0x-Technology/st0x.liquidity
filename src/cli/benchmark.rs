@@ -49,8 +49,11 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let token_addresses = ctx.equities.get(&symbol).ok_or_else(|| {
-        anyhow::anyhow!("No token addresses configured for {symbol} in equities config")
+    let tokenized_key = Symbol::new(format!("t{symbol}"))?;
+    let token_addresses = ctx.equities.get(&tokenized_key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No equity configured for {symbol} (looked up {tokenized_key} in equities config)"
+        )
     })?;
 
     let token = token_addresses.unwrapped;
