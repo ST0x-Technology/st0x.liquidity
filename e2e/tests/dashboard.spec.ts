@@ -19,6 +19,8 @@ test.describe('dashboard', () => {
     await expect(page.getByText('Trade Log')).toBeVisible()
     await expect(page.getByText('Inventory')).toBeVisible()
     await expect(page.getByText('Rebalancing')).toBeVisible()
+
+    await expect(page).toHaveScreenshot('dashboard-full.png', { fullPage: true })
   })
 
   test('KPI strip shows placeholder values', async ({ page }) => {
