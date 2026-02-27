@@ -42,9 +42,9 @@ impl Display for RoundTripPhase {
     }
 }
 
-/// A single row in the benchmark TSV report.
+/// Timed observation of one phase (mint or redeem) of a round trip.
 #[derive(Debug, Clone)]
-pub(crate) struct BenchmarkRow {
+pub(crate) struct Measurement {
     pub(crate) trip: usize,
     pub(crate) phase: RoundTripPhase,
     pub(crate) started_at: DateTime<Utc>,
@@ -54,11 +54,11 @@ pub(crate) struct BenchmarkRow {
     pub(crate) status: TokenizationRequestStatus,
 }
 
-/// Benchmark results for a series of round trips.
+/// Collected measurements from a series of round trips.
 pub(crate) struct BenchmarkSummary {
     pub(crate) symbol: Symbol,
     pub(crate) round_trips: usize,
-    pub(crate) rows: Vec<BenchmarkRow>,
+    pub(crate) measurements: Vec<Measurement>,
 }
 
 /// Flat record for csv crate serialization.
@@ -73,19 +73,25 @@ struct TsvRecord {
     status: String,
 }
 
-impl From<&BenchmarkRow> for TsvRecord {
-    fn from(row: &BenchmarkRow) -> Self {
+impl From<&Measurement> for TsvRecord {
+    fn from(measurement: &Measurement) -> Self {
         Self {
-            trip: row.trip,
-            phase: row.phase.to_string(),
-            started_at: row.started_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            completed_at: row.completed_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            duration_secs: format!("{:.1}", row.duration.as_secs_f64()),
-            fees: row
+            trip: measurement.trip,
+            phase: measurement.phase.to_string(),
+            started_at: measurement
+                .started_at
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+            completed_at: measurement
+                .completed_at
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+            duration_secs: format!("{:.1}", measurement.duration.as_secs_f64()),
+            fees: measurement
                 .fees
                 .as_ref()
                 .map_or_else(String::new, ToString::to_string),
-            status: row.status.to_string(),
+            status: measurement.status.to_string(),
         }
     }
 }
@@ -134,13 +140,13 @@ impl DurationStats {
 }
 
 impl BenchmarkSummary {
-    /// Write the full TSV report (header + all rows).
+    /// Write the full TSV report (header + all measurements).
     #[cfg(test)]
     fn write_tsv<W: Write>(&self, writer: W) -> csv::Result<()> {
         let mut tsv = tsv_writer(writer);
 
-        for row in &self.rows {
-            tsv.serialize(TsvRecord::from(row))?;
+        for measurement in &self.measurements {
+            tsv.serialize(TsvRecord::from(measurement))?;
         }
 
         tsv.flush()?;
@@ -157,14 +163,14 @@ impl BenchmarkSummary {
         writeln!(writer)?;
 
         let mut mint_durations: Vec<Duration> = self
-            .rows
+            .measurements
             .iter()
             .filter(|row| row.phase == RoundTripPhase::Mint)
             .map(|row| row.duration)
             .collect();
 
         let mut redeem_durations: Vec<Duration> = self
-            .rows
+            .measurements
             .iter()
             .filter(|row| row.phase == RoundTripPhase::Redeem)
             .map(|row| row.duration)
@@ -173,11 +179,11 @@ impl BenchmarkSummary {
         let mut full_trip_durations: Vec<Duration> = (1..=self.round_trips)
             .filter_map(|trip| {
                 let mint = self
-                    .rows
+                    .measurements
                     .iter()
                     .find(|row| row.trip == trip && row.phase == RoundTripPhase::Mint)?;
                 let redeem = self
-                    .rows
+                    .measurements
                     .iter()
                     .find(|row| row.trip == trip && row.phase == RoundTripPhase::Redeem)?;
                 Some(mint.duration + redeem.duration)
@@ -258,14 +264,14 @@ async fn poll_order_until_filled(
     anyhow::bail!("Order polling timed out after {ORDER_POLL_MAX_ATTEMPTS} attempts")
 }
 
-/// Measure a single mint operation and return the benchmark row.
+/// Measure a single mint operation.
 async fn measure_mint(
     tokenization_service: &AlpacaTokenizationService<impl Wallet>,
     symbol: &Symbol,
     quantity: FractionalShares,
     wallet: Address,
     trip: usize,
-) -> anyhow::Result<BenchmarkRow> {
+) -> anyhow::Result<Measurement> {
     let started_at = Utc::now();
     let start_instant = tokio::time::Instant::now();
 
@@ -281,7 +287,7 @@ async fn measure_mint(
 
     let duration = start_instant.elapsed();
 
-    Ok(BenchmarkRow {
+    Ok(Measurement {
         trip,
         phase: RoundTripPhase::Mint,
         started_at,
@@ -292,13 +298,13 @@ async fn measure_mint(
     })
 }
 
-/// Measure a single redemption operation and return the benchmark row.
+/// Measure a single redemption operation.
 async fn measure_redeem(
     tokenization_service: &AlpacaTokenizationService<impl Wallet>,
     token: Address,
     quantity: FractionalShares,
     trip: usize,
-) -> anyhow::Result<BenchmarkRow> {
+) -> anyhow::Result<Measurement> {
     let started_at = Utc::now();
     let start_instant = tokio::time::Instant::now();
 
@@ -315,7 +321,7 @@ async fn measure_redeem(
 
     let duration = start_instant.elapsed();
 
-    Ok(BenchmarkRow {
+    Ok(Measurement {
         trip,
         phase: RoundTripPhase::Redeem,
         started_at,
@@ -389,7 +395,7 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
     let report_file = File::create(&report_path)?;
     let mut tsv = tsv_writer(report_file);
 
-    let mut rows = Vec::new();
+    let mut measurements = Vec::new();
 
     for trip in 1..=round_trips {
         writeln!(stdout, "--- Round trip {trip}/{round_trips} ---")?;
@@ -409,7 +415,7 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
 
         // Step 2: Mint (timed)
         writeln!(stdout, "   Minting...")?;
-        let mint_row = measure_mint(
+        let mint = measure_mint(
             &tokenization_service,
             &symbol,
             quantity.inner(),
@@ -421,29 +427,28 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
         writeln!(
             stdout,
             "   Mint {}: {:.1}s",
-            mint_row.status,
-            mint_row.duration.as_secs_f64(),
+            mint.status,
+            mint.duration.as_secs_f64(),
         )?;
 
-        tsv.serialize(TsvRecord::from(&mint_row))?;
+        tsv.serialize(TsvRecord::from(&mint))?;
         tsv.flush()?;
-        rows.push(mint_row);
+        measurements.push(mint);
 
         // Step 3: Redeem (timed)
         writeln!(stdout, "   Redeeming...")?;
-        let redeem_row =
-            measure_redeem(&tokenization_service, token, quantity.inner(), trip).await?;
+        let redeem = measure_redeem(&tokenization_service, token, quantity.inner(), trip).await?;
 
         writeln!(
             stdout,
             "   Redeem {}: {:.1}s",
-            redeem_row.status,
-            redeem_row.duration.as_secs_f64(),
+            redeem.status,
+            redeem.duration.as_secs_f64(),
         )?;
 
-        tsv.serialize(TsvRecord::from(&redeem_row))?;
+        tsv.serialize(TsvRecord::from(&redeem))?;
         tsv.flush()?;
-        rows.push(redeem_row);
+        measurements.push(redeem);
 
         // Step 4: Sell equity
         writeln!(stdout, "   Selling {quantity} {symbol}...")?;
@@ -464,7 +469,7 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
     let summary = BenchmarkSummary {
         symbol: symbol.clone(),
         round_trips,
-        rows,
+        measurements,
     };
 
     writeln!(stdout)?;
@@ -482,17 +487,17 @@ mod tests {
 
     use super::*;
 
-    fn make_row(
+    fn make_measurement(
         trip: usize,
         phase: RoundTripPhase,
         duration_secs: f64,
         fees: Option<Usd>,
-    ) -> BenchmarkRow {
+    ) -> Measurement {
         let started_at = Utc.with_ymd_and_hms(2026, 2, 27, 18, 30, 0).unwrap();
         let duration = Duration::from_secs_f64(duration_secs);
         let completed_at = started_at + chrono::Duration::from_std(duration).unwrap();
 
-        BenchmarkRow {
+        Measurement {
             trip,
             phase,
             started_at,
@@ -505,10 +510,10 @@ mod tests {
 
     #[test]
     fn tsv_record_with_fees() {
-        let row = make_row(1, RoundTripPhase::Mint, 75.2, Some(Usd(dec!(1.50))));
+        let measurement = make_measurement(1, RoundTripPhase::Mint, 75.2, Some(Usd(dec!(1.50))));
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
-        writer.serialize(TsvRecord::from(&row)).unwrap();
+        writer.serialize(TsvRecord::from(&measurement)).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -527,10 +532,10 @@ mod tests {
 
     #[test]
     fn tsv_record_without_fees() {
-        let row = make_row(1, RoundTripPhase::Redeem, 89.1, None);
+        let measurement = make_measurement(1, RoundTripPhase::Redeem, 89.1, None);
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
-        writer.serialize(TsvRecord::from(&row)).unwrap();
+        writer.serialize(TsvRecord::from(&measurement)).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -543,18 +548,18 @@ mod tests {
     }
 
     #[test]
-    fn tsv_full_report_includes_header_and_rows() {
-        let rows = vec![
-            make_row(1, RoundTripPhase::Mint, 75.2, None),
-            make_row(1, RoundTripPhase::Redeem, 89.1, None),
-            make_row(2, RoundTripPhase::Mint, 80.0, None),
-            make_row(2, RoundTripPhase::Redeem, 91.0, None),
+    fn tsv_full_report_includes_header_and_measurements() {
+        let measurements = vec![
+            make_measurement(1, RoundTripPhase::Mint, 75.2, None),
+            make_measurement(1, RoundTripPhase::Redeem, 89.1, None),
+            make_measurement(2, RoundTripPhase::Mint, 80.0, None),
+            make_measurement(2, RoundTripPhase::Redeem, 91.0, None),
         ];
 
         let summary = BenchmarkSummary {
             symbol: Symbol::new("AAPL").unwrap(),
             round_trips: 2,
-            rows,
+            measurements,
         };
 
         let mut output = Vec::new();
@@ -576,19 +581,19 @@ mod tests {
 
     #[test]
     fn summary_stats_correct_for_known_values() {
-        let rows = vec![
-            make_row(1, RoundTripPhase::Mint, 72.1, None),
-            make_row(1, RoundTripPhase::Redeem, 88.0, None),
-            make_row(2, RoundTripPhase::Mint, 85.3, None),
-            make_row(2, RoundTripPhase::Redeem, 95.2, None),
-            make_row(3, RoundTripPhase::Mint, 77.1, None),
-            make_row(3, RoundTripPhase::Redeem, 91.1, None),
+        let measurements = vec![
+            make_measurement(1, RoundTripPhase::Mint, 72.1, None),
+            make_measurement(1, RoundTripPhase::Redeem, 88.0, None),
+            make_measurement(2, RoundTripPhase::Mint, 85.3, None),
+            make_measurement(2, RoundTripPhase::Redeem, 95.2, None),
+            make_measurement(3, RoundTripPhase::Mint, 77.1, None),
+            make_measurement(3, RoundTripPhase::Redeem, 91.1, None),
         ];
 
         let summary = BenchmarkSummary {
             symbol: Symbol::new("AAPL").unwrap(),
             round_trips: 3,
-            rows,
+            measurements,
         };
 
         let mut output = Vec::new();
@@ -711,8 +716,8 @@ mod tests {
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
 
-        let row = make_row(1, RoundTripPhase::Mint, 75.0, None);
-        writer.serialize(TsvRecord::from(&row)).unwrap();
+        let measurement = make_measurement(1, RoundTripPhase::Mint, 75.0, None);
+        writer.serialize(TsvRecord::from(&measurement)).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
