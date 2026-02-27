@@ -1596,4 +1596,57 @@ pub(crate) mod tests {
             "Empty token_symbol string should deserialize as None"
         );
     }
+
+    #[test]
+    fn fees_absent_deserializes_as_none() {
+        let json = json!({
+            "tokenization_request_id": "req_no_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "5",
+            "issuer": "alpaca",
+            "network": "base",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.fees, None);
+    }
+
+    #[test]
+    fn fees_null_deserializes_as_none() {
+        let json = json!({
+            "tokenization_request_id": "req_null_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "5",
+            "issuer": "alpaca",
+            "network": "base",
+            "fees": null,
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.fees, None);
+    }
+
+    #[test]
+    fn fees_with_value_deserializes_as_some() {
+        let json = json!({
+            "tokenization_request_id": "req_with_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "5",
+            "issuer": "alpaca",
+            "network": "base",
+            "fees": "1.50",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.fees, Some(Usd(dec!(1.50))));
+    }
 }

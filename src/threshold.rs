@@ -215,6 +215,29 @@ mod tests {
     }
 
     #[test]
+    fn usd_parse_and_display_roundtrip() {
+        let cases = ["1", "1.00", "0.1234", "99999.99"];
+
+        for input in cases {
+            let parsed: Usd = input.parse().unwrap();
+            let displayed = parsed.to_string();
+            let reparsed: Usd = displayed.parse().unwrap();
+            assert_eq!(parsed, reparsed, "roundtrip failed for {input}");
+        }
+    }
+
+    #[test]
+    fn usd_parse_invalid_returns_err() {
+        assert!("not_a_number".parse::<Usd>().is_err());
+    }
+
+    #[test]
+    fn usd_display_preserves_scale() {
+        let usd: Usd = "1.50".parse().unwrap();
+        assert_eq!(usd.to_string(), "1.50");
+    }
+
+    #[test]
     fn whole_share_matches_smart_constructor() {
         let from_whole_share = ExecutionThreshold::whole_share();
         let from_constructor = ExecutionThreshold::Shares(Positive::<FractionalShares>::ONE);

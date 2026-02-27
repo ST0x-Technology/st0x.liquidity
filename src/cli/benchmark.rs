@@ -43,6 +43,10 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
     output_path: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    if round_trips == 0 {
+        anyhow::bail!("round_trips must be > 0");
+    }
+
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-benchmark requires Alpaca Broker API configuration");
     };
@@ -105,42 +109,61 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
     for trip in 1..=round_trips {
         writeln!(stdout, "--- Round trip {trip}/{round_trips} ---")?;
 
-        place_and_fill(&executor, &symbol, quantity, Direction::Buy, stdout).await?;
+        let result: anyhow::Result<()> = async {
+            place_and_fill(&executor, &symbol, quantity, Direction::Buy, stdout).await?;
 
-        writeln!(stdout, "   Minting...")?;
-        let mint = measure_mint(
-            &tokenization_service,
-            &symbol,
-            quantity.inner(),
-            wallet,
-            trip,
-        )
-        .await?;
+            writeln!(stdout, "   Minting...")?;
+            let mint = measure_mint(
+                &tokenization_service,
+                &symbol,
+                quantity.inner(),
+                wallet,
+                trip,
+            )
+            .await?;
 
-        writeln!(
-            stdout,
-            "   Mint {}: {:.1}s",
-            mint.status,
-            mint.duration.as_secs_f64(),
-        )?;
-        tsv.serialize(&mint)?;
-        tsv.flush()?;
-        measurements.push(mint);
+            writeln!(
+                stdout,
+                "   Mint {}: {:.1}s",
+                mint.status,
+                mint.duration.as_secs_f64(),
+            )?;
+            tsv.serialize(&mint)?;
+            tsv.flush()?;
+            measurements.push(mint);
 
-        writeln!(stdout, "   Redeeming...")?;
-        let redeem = measure_redeem(&tokenization_service, token, quantity.inner(), trip).await?;
+            writeln!(stdout, "   Redeeming...")?;
+            let redeem =
+                measure_redeem(&tokenization_service, token, quantity.inner(), trip).await?;
 
-        writeln!(
-            stdout,
-            "   Redeem {}: {:.1}s",
-            redeem.status,
-            redeem.duration.as_secs_f64(),
-        )?;
-        tsv.serialize(&redeem)?;
-        tsv.flush()?;
-        measurements.push(redeem);
+            writeln!(
+                stdout,
+                "   Redeem {}: {:.1}s",
+                redeem.status,
+                redeem.duration.as_secs_f64(),
+            )?;
+            tsv.serialize(&redeem)?;
+            tsv.flush()?;
+            measurements.push(redeem);
 
-        place_and_fill(&executor, &symbol, quantity, Direction::Sell, stdout).await?;
+            place_and_fill(&executor, &symbol, quantity, Direction::Sell, stdout).await?;
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(?error, trip, "trip failed, attempting cleanup");
+            writeln!(stdout, "   ERROR: {error:#}")?;
+            writeln!(stdout, "   Attempting cleanup sell...")?;
+
+            if let Err(cleanup_error) =
+                place_and_fill(&executor, &symbol, quantity, Direction::Sell, stdout).await
+            {
+                tracing::error!(?cleanup_error, trip, "cleanup sell also failed");
+                writeln!(stdout, "   Cleanup sell failed: {cleanup_error:#}")?;
+            }
+        }
 
         writeln!(stdout)?;
     }
@@ -251,7 +274,6 @@ async fn measure_redeem(
         status: completed.status,
     })
 }
-
 /// Place a market order and poll until filled.
 async fn place_and_fill<W: Write>(
     executor: &AlpacaBrokerApi,
