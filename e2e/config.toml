@@ -14,26 +14,8 @@ max_shares = "2"
 
 [evm]
 orderbook = "0x1111111111111111111111111111111111111111"
+order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
 deployment_block = 1
 
 [hyperdx]
 service_name = "st0x-hedge-e2e"
-
-[rebalancing]
-redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-fireblocks_vault_account_id = "0"
-fireblocks_environment = "sandbox"
-
-[rebalancing.fireblocks_chain_asset_ids]
-1 = "ETH"
-8453 = "BASECHAIN_ETH"
-
-[rebalancing.equity]
-target = "0.5"
-deviation = "0.2"
-
-[rebalancing.usdc]
-mode = "enabled"
-target = "0.5"
-deviation = "0.3"
