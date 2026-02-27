@@ -39,7 +39,9 @@
   - PR:
     [#307 feat: configurable operational limits](https://github.com/ST0x-Technology/st0x.liquidity/pull/307)
 - [ ] [#333 Alpaca transfer shows Processing then disappears from pending list](https://github.com/ST0x-Technology/st0x.liquidity/issues/333)
-- [ ] [#331 Add CLI command to journal equities between Alpaca accounts](https://github.com/ST0x-Technology/st0x.liquidity/issues/331)
+- [x] [#331 Add CLI command to journal equities between Alpaca accounts](https://github.com/ST0x-Technology/st0x.liquidity/issues/331)
+  - PR:
+    [#334 add CLI command to journal equities between Alpaca accounts](https://github.com/ST0x-Technology/st0x.liquidity/pull/334)
 - [ ] [#263 Check offchain inventory before placing counter trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/263)
 - [x] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
   - PR:

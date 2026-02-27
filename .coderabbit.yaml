@@ -11,7 +11,7 @@ reviews:
     auto_pause_after_reviewed_commits: 10
 
   profile: assertive
-  request_changes_workflow: true
+  request_changes_workflow: false
   review_details: true
   collapse_walkthrough: false
   sequence_diagrams: false

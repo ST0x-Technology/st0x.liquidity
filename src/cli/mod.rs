@@ -18,7 +18,7 @@ use thiserror::Error;
 use tracing::info;
 
 use st0x_evm::OpenChainErrorRegistry;
-use st0x_execution::{Direction, FractionalShares, Symbol, TimeInForce};
+use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 
 use crate::config::{Ctx, Env};
 use crate::offchain_order::OrderPlacer;
@@ -56,6 +56,11 @@ pub enum CctpChain {
 pub enum CliError {
     #[error("Invalid quantity: {value}. Quantity must be greater than zero")]
     InvalidQuantity { value: u64 },
+}
+
+fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
+    let shares: FractionalShares = input.parse().map_err(|err| format!("{err}"))?;
+    Positive::new(shares).map_err(|err| format!("{err}"))
 }
 
 #[derive(Debug, Parser)]
@@ -313,6 +318,23 @@ pub enum Commands {
         amount: Usdc,
     },
 
+    /// Journal (transfer) equities between Alpaca accounts
+    ///
+    /// Creates a security journal (JNLS) to move shares from the configured
+    /// account to a destination account. Both accounts must be under the
+    /// same Alpaca broker firm.
+    AlpacaJournal {
+        /// Destination account ID (UUID)
+        #[arg(long = "to")]
+        destination: AlpacaAccountId,
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of shares to transfer (must be positive, supports fractional)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
+    },
+
     /// List all Alpaca tokenization requests
     ///
     /// Shows mint and redemption requests for the Alpaca account.
@@ -426,6 +448,11 @@ enum SimpleCommand {
         direction: ConvertDirection,
         amount: Usdc,
     },
+    AlpacaJournal {
+        destination: AlpacaAccountId,
+        symbol: Symbol,
+        quantity: Positive<FractionalShares>,
+    },
     OrderStatus {
         order_id: String,
     },
@@ -534,6 +561,15 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::AlpacaConvert { direction, amount } => {
             Ok(SimpleCommand::AlpacaConvert { direction, amount })
         }
+        Commands::AlpacaJournal {
+            destination,
+            symbol,
+            quantity,
+        } => Ok(SimpleCommand::AlpacaJournal {
+            destination,
+            symbol,
+            quantity,
+        }),
         Commands::AlpacaTokenizationRequests => Err(ProviderCommand::AlpacaTokenizationRequests),
         Commands::ProcessTx { tx_hash } => Err(ProviderCommand::ProcessTx { tx_hash }),
         Commands::TransferUsdc { direction, amount } => {
@@ -658,6 +694,13 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::AlpacaConvert { direction, amount } => {
             alpaca_wallet::alpaca_convert_command(stdout, direction, amount, ctx).await
+        }
+        SimpleCommand::AlpacaJournal {
+            destination,
+            symbol,
+            quantity,
+        } => {
+            alpaca_wallet::alpaca_journal_command(stdout, destination, symbol, quantity, ctx).await
         }
         SimpleCommand::OrderStatus { order_id } => {
             trading::order_status_command(stdout, &order_id, ctx, pool).await

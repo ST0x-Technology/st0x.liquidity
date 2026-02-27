@@ -1,12 +1,15 @@
-//! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist,
-//! transfers, convert).
+//! Alpaca CLI commands (deposit, withdraw, whitelist, transfers,
+//! convert, journal).
 
 use alloy::primitives::Address;
 use rust_decimal::Decimal;
 use std::io::Write;
 
 use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
-use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor, Positive};
+use st0x_execution::{
+    AlpacaAccountId, AlpacaBrokerApi, ConversionDirection, Executor, FractionalShares, Positive,
+    Symbol,
+};
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
@@ -472,10 +475,51 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     Ok(())
 }
 
+pub(super) async fn alpaca_journal_command<W: Write>(
+    stdout: &mut W,
+    destination: AlpacaAccountId,
+    symbol: Symbol,
+    quantity: Positive<FractionalShares>,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-journal requires Alpaca Broker API configuration");
+    };
+
+    writeln!(stdout, "Journaling equities between Alpaca accounts")?;
+    writeln!(stdout, "   Symbol: {symbol}")?;
+    writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Destination: {destination}")?;
+
+    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
+
+    let response = executor
+        .create_journal(destination, &symbol, quantity)
+        .await?;
+
+    writeln!(stdout, "Journal created successfully!")?;
+    writeln!(stdout, "   ID: {}", response.id)?;
+    writeln!(stdout, "   Status: {}", response.status)?;
+    writeln!(stdout, "   Symbol: {}", response.symbol)?;
+    writeln!(stdout, "   Quantity: {}", response.quantity)?;
+
+    if let Some(price) = response.price {
+        writeln!(stdout, "   Price: ${price}")?;
+    }
+
+    if let Some(settle_date) = &response.settle_date {
+        writeln!(stdout, "   Settle date: {settle_date}")?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, address};
+    use httpmock::prelude::*;
     use rust_decimal_macros::dec;
+    use serde_json::json;
     use std::collections::HashMap;
     use url::Url;
     use uuid::uuid;
@@ -514,6 +558,8 @@ mod tests {
         }
     }
 
+    const TEST_ACCOUNT_ID: &str = "904837e3-3b76-47ec-b432-046db621571b";
+
     fn create_alpaca_ctx_without_rebalancing() -> Ctx {
         let mut ctx = create_ctx_without_alpaca();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
@@ -521,6 +567,19 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+        });
+        ctx
+    }
+
+    fn create_mock_alpaca_ctx(base_url: String) -> Ctx {
+        let mut ctx = create_ctx_without_alpaca();
+        ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            mode: Some(AlpacaBrokerApiMode::Mock(base_url)),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
         });
@@ -672,6 +731,90 @@ mod tests {
         assert!(
             output.contains("USD → USDC"),
             "Expected USD to USDC in output, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_journal_requires_alpaca_config() {
+        let ctx = create_ctx_without_alpaca();
+        let destination = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = Positive::new(FractionalShares::new(dec!(10))).unwrap();
+
+        let mut stdout = Vec::new();
+        let err_msg = alpaca_journal_command(&mut stdout, destination, symbol, quantity, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err_msg.contains("alpaca-journal requires Alpaca Broker API"),
+            "Expected Alpaca config error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_journal_success() {
+        let server = MockServer::start();
+        let ctx = create_mock_alpaca_ctx(server.base_url());
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/account"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": TEST_ACCOUNT_ID,
+                    "status": "ACTIVE"
+                }));
+        });
+
+        let journal_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/journals");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "status": "pending",
+                    "symbol": "TSLA",
+                    "qty": "5.5",
+                    "price": "250.00",
+                    "from_account": TEST_ACCOUNT_ID,
+                    "to_account": "11111111-2222-3333-4444-555555555555",
+                    "settle_date": "2026-02-28",
+                    "system_date": "2026-02-26",
+                    "description": null
+                }));
+        });
+
+        let destination = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
+        let symbol = Symbol::new("TSLA").unwrap();
+        let quantity = Positive::new(FractionalShares::new(dec!(5.5))).unwrap();
+
+        let mut stdout = Vec::new();
+        alpaca_journal_command(&mut stdout, destination, symbol, quantity, &ctx)
+            .await
+            .unwrap();
+
+        account_mock.assert();
+        journal_mock.assert();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("TSLA"),
+            "Expected symbol in output, got: {output}"
+        );
+        assert!(
+            output.contains("5.5"),
+            "Expected quantity in output, got: {output}"
+        );
+        assert!(
+            output.contains("Journal created successfully!"),
+            "Expected success message, got: {output}"
+        );
+        assert!(
+            output.contains("$250"),
+            "Expected price in output, got: {output}"
         );
     }
 }

@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,6 +18,14 @@ impl AlpacaAccountId {
 impl std::fmt::Display for AlpacaAccountId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for AlpacaAccountId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::from_str(value).map(Self)
     }
 }
 
@@ -171,6 +181,19 @@ mod tests {
             production_ctx.base_url(),
             "https://broker-api.alpaca.markets"
         );
+    }
+
+    #[test]
+    fn test_alpaca_account_id_from_str() {
+        let account_id: AlpacaAccountId = "904837e3-3b76-47ec-b432-046db621571b".parse().unwrap();
+
+        assert_eq!(account_id, TEST_ACCOUNT_ID);
+    }
+
+    #[test]
+    fn test_alpaca_account_id_from_str_invalid() {
+        let result = "not-a-uuid".parse::<AlpacaAccountId>();
+        assert!(result.is_err());
     }
 
     #[test]
