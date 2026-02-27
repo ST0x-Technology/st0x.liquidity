@@ -33,6 +33,7 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
     ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, Operator, TransferOp, Venue,
 };
+use crate::offchain_order::Dollars;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
@@ -570,9 +571,10 @@ impl Reactor for RebalancingTrigger {
                     } => {
                         let equity_op: Operator = (*direction).into();
                         let quantity = Decimal::from(shares_filled.inner());
-                        let usdc_value = price.0.checked_mul(quantity).ok_or(
+                        let Dollars(price_value) = price;
+                        let usdc_value = price_value.checked_mul(quantity).ok_or(
                             RebalancingTriggerError::UsdcAmountOverflow {
-                                price: price.0,
+                                price: *price_value,
                                 quantity,
                             },
                         )?;

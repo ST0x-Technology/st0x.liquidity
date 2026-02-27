@@ -3493,6 +3493,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
+            .with_usdc(Usdc(Decimal::ZERO), Usdc(Decimal::ZERO))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3510,6 +3511,16 @@ mod tests {
                     Operator::Add,
                     FractionalShares::new(dec!(50)),
                 ),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .update_usdc(
+                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc(dec!(50))),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .update_usdc(
+                Inventory::available(Venue::Hedging, Operator::Add, Usdc(dec!(50))),
                 chrono::Utc::now(),
             )
             .unwrap();
