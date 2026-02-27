@@ -12,3 +12,5 @@ tarpaulin-report.html
 !.claude/skills
 .sqlx/
 .idea/
+e2e/test-results/
+e2e/playwright-report/

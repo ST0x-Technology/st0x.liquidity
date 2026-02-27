@@ -9,9 +9,11 @@ export default defineConfig({
   testDir: './tests',
   timeout: 30_000,
   retries: 0,
+  snapshotPathTemplate: '{testDir}/snapshots/{arg}{ext}',
   use: {
     baseURL: `http://localhost:${String(FRONTEND_PORT)}`,
-    headless: true
+    headless: true,
+    viewport: { width: 1440, height: 900 }
   },
   webServer: [
     {
