@@ -43,15 +43,52 @@ impl Display for RoundTripPhase {
 }
 
 /// Timed observation of one phase (mint or redeem) of a round trip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct Measurement {
     pub(crate) trip: usize,
+    #[serde(serialize_with = "serialize_display")]
     pub(crate) phase: RoundTripPhase,
+    #[serde(serialize_with = "serialize_utc")]
     pub(crate) started_at: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_utc")]
     pub(crate) completed_at: DateTime<Utc>,
+    #[serde(rename = "duration_secs", serialize_with = "serialize_duration")]
     pub(crate) duration: Duration,
+    #[serde(serialize_with = "serialize_optional_display")]
     pub(crate) fees: Option<Usd>,
+    #[serde(serialize_with = "serialize_display")]
     pub(crate) status: TokenizationRequestStatus,
+}
+
+fn serialize_display<T: Display, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&value.to_string())
+}
+
+fn serialize_utc<S: serde::Serializer>(
+    dt: &DateTime<Utc>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+fn serialize_duration<S: serde::Serializer>(
+    duration: &Duration,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format!("{:.1}", duration.as_secs_f64()))
+}
+
+fn serialize_optional_display<T: Display, S: serde::Serializer>(
+    value: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(inner) => serializer.serialize_str(&inner.to_string()),
+        None => serializer.serialize_str(""),
+    }
 }
 
 /// Collected measurements from a series of round trips.
@@ -59,41 +96,6 @@ pub(crate) struct BenchmarkSummary {
     pub(crate) symbol: Symbol,
     pub(crate) round_trips: usize,
     pub(crate) measurements: Vec<Measurement>,
-}
-
-/// Flat record for csv crate serialization.
-#[derive(Serialize)]
-struct TsvRecord {
-    trip: usize,
-    phase: String,
-    started_at: String,
-    completed_at: String,
-    duration_secs: String,
-    fees: String,
-    status: String,
-}
-
-impl From<&Measurement> for TsvRecord {
-    fn from(measurement: &Measurement) -> Self {
-        Self {
-            trip: measurement.trip,
-            phase: measurement.phase.to_string(),
-            started_at: measurement
-                .started_at
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string(),
-            completed_at: measurement
-                .completed_at
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string(),
-            duration_secs: format!("{:.1}", measurement.duration.as_secs_f64()),
-            fees: measurement
-                .fees
-                .as_ref()
-                .map_or_else(String::new, ToString::to_string),
-            status: measurement.status.to_string(),
-        }
-    }
 }
 
 fn tsv_writer<W: Write>(writer: W) -> csv::Writer<W> {
@@ -109,15 +111,15 @@ struct DurationStats {
 }
 
 impl DurationStats {
-    fn compute(durations: &mut [Duration]) -> Option<Self> {
+    fn compute(durations: &mut Vec<Duration>) -> Option<Self> {
         if durations.is_empty() {
             return None;
         }
 
         durations.sort();
 
-        let min = durations[0];
-        let max = durations[durations.len() - 1];
+        let min = *durations.first()?;
+        let max = *durations.last()?;
 
         let total: Duration = durations.iter().sum();
         let count = u32::try_from(durations.len()).unwrap_or(u32::MAX);
@@ -146,11 +148,43 @@ impl BenchmarkSummary {
         let mut tsv = tsv_writer(writer);
 
         for measurement in &self.measurements {
-            tsv.serialize(TsvRecord::from(measurement))?;
+            tsv.serialize(measurement)?;
         }
 
         tsv.flush()?;
         Ok(())
+    }
+
+    fn durations_for_phase(&self, phase: RoundTripPhase) -> Vec<Duration> {
+        self.measurements
+            .iter()
+            .filter(|measurement| measurement.phase == phase)
+            .map(|measurement| measurement.duration)
+            .collect()
+    }
+
+    fn full_trip_durations(&self) -> Vec<Duration> {
+        (1..=self.round_trips)
+            .filter_map(|trip| {
+                let mint = self
+                    .measurements
+                    .iter()
+                    .find(|measurement| {
+                        measurement.trip == trip && measurement.phase == RoundTripPhase::Mint
+                    })?
+                    .duration;
+
+                let redeem = self
+                    .measurements
+                    .iter()
+                    .find(|measurement| {
+                        measurement.trip == trip && measurement.phase == RoundTripPhase::Redeem
+                    })?
+                    .duration;
+
+                Some(mint + redeem)
+            })
+            .collect()
     }
 
     /// Write the CLI summary table to the given writer.
@@ -162,34 +196,6 @@ impl BenchmarkSummary {
         )?;
         writeln!(writer)?;
 
-        let mut mint_durations: Vec<Duration> = self
-            .measurements
-            .iter()
-            .filter(|row| row.phase == RoundTripPhase::Mint)
-            .map(|row| row.duration)
-            .collect();
-
-        let mut redeem_durations: Vec<Duration> = self
-            .measurements
-            .iter()
-            .filter(|row| row.phase == RoundTripPhase::Redeem)
-            .map(|row| row.duration)
-            .collect();
-
-        let mut full_trip_durations: Vec<Duration> = (1..=self.round_trips)
-            .filter_map(|trip| {
-                let mint = self
-                    .measurements
-                    .iter()
-                    .find(|row| row.trip == trip && row.phase == RoundTripPhase::Mint)?;
-                let redeem = self
-                    .measurements
-                    .iter()
-                    .find(|row| row.trip == trip && row.phase == RoundTripPhase::Redeem)?;
-                Some(mint.duration + redeem.duration)
-            })
-            .collect();
-
         writeln!(
             writer,
             "{:<11}| {:<8}| {:<8}| {:<8}| Median",
@@ -197,16 +203,16 @@ impl BenchmarkSummary {
         )?;
         writeln!(writer, "-----------+---------+---------+---------+--------",)?;
 
-        if let Some(stats) = DurationStats::compute(&mut mint_durations) {
-            write_stats_row(writer, "Mint", &stats)?;
-        }
+        let stat_rows = [
+            ("Mint", self.durations_for_phase(RoundTripPhase::Mint)),
+            ("Redeem", self.durations_for_phase(RoundTripPhase::Redeem)),
+            ("Full trip", self.full_trip_durations()),
+        ];
 
-        if let Some(stats) = DurationStats::compute(&mut redeem_durations) {
-            write_stats_row(writer, "Redeem", &stats)?;
-        }
-
-        if let Some(stats) = DurationStats::compute(&mut full_trip_durations) {
-            write_stats_row(writer, "Full trip", &stats)?;
+        for (label, mut durations) in stat_rows {
+            if let Some(stats) = DurationStats::compute(&mut durations) {
+                write_stats_row(writer, label, &stats)?;
+            }
         }
 
         Ok(())
@@ -431,7 +437,7 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
             mint.duration.as_secs_f64(),
         )?;
 
-        tsv.serialize(TsvRecord::from(&mint))?;
+        tsv.serialize(&mint)?;
         tsv.flush()?;
         measurements.push(mint);
 
@@ -446,7 +452,7 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
             redeem.duration.as_secs_f64(),
         )?;
 
-        tsv.serialize(TsvRecord::from(&redeem))?;
+        tsv.serialize(&redeem)?;
         tsv.flush()?;
         measurements.push(redeem);
 
@@ -513,7 +519,7 @@ mod tests {
         let measurement = make_measurement(1, RoundTripPhase::Mint, 75.2, Some(Usd(dec!(1.50))));
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
-        writer.serialize(TsvRecord::from(&measurement)).unwrap();
+        writer.serialize(&measurement).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -535,7 +541,7 @@ mod tests {
         let measurement = make_measurement(1, RoundTripPhase::Redeem, 89.1, None);
         let mut output = Vec::new();
         let mut writer = tsv_writer(&mut output);
-        writer.serialize(TsvRecord::from(&measurement)).unwrap();
+        writer.serialize(&measurement).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -679,7 +685,7 @@ mod tests {
 
     #[test]
     fn duration_stats_empty_returns_none() {
-        assert!(DurationStats::compute(&mut []).is_none());
+        assert!(DurationStats::compute(&mut vec![]).is_none());
     }
 
     #[test]
@@ -717,7 +723,7 @@ mod tests {
         let mut writer = tsv_writer(&mut output);
 
         let measurement = make_measurement(1, RoundTripPhase::Mint, 75.0, None);
-        writer.serialize(TsvRecord::from(&measurement)).unwrap();
+        writer.serialize(&measurement).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
