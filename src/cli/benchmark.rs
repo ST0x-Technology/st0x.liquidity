@@ -54,7 +54,6 @@ pub(crate) struct Measurement {
     pub(crate) completed_at: DateTime<Utc>,
     #[serde(rename = "duration_secs", serialize_with = "serialize_duration")]
     pub(crate) duration: Duration,
-    #[serde(serialize_with = "serialize_optional_display")]
     pub(crate) fees: Option<Usd>,
     #[serde(serialize_with = "serialize_display")]
     pub(crate) status: TokenizationRequestStatus,
@@ -81,16 +80,6 @@ fn serialize_duration<S: serde::Serializer>(
     serializer.serialize_str(&format!("{:.1}", duration.as_secs_f64()))
 }
 
-fn serialize_optional_display<T: Display, S: serde::Serializer>(
-    value: &Option<T>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match value {
-        Some(inner) => serializer.serialize_str(&inner.to_string()),
-        None => serializer.serialize_str(""),
-    }
-}
-
 /// Collected measurements from a series of round trips.
 pub(crate) struct BenchmarkSummary {
     pub(crate) symbol: Symbol,
@@ -111,7 +100,7 @@ struct DurationStats {
 }
 
 impl DurationStats {
-    fn compute(durations: &mut Vec<Duration>) -> Option<Self> {
+    fn compute(durations: &mut [Duration]) -> Option<Self> {
         if durations.is_empty() {
             return None;
         }
@@ -147,12 +136,11 @@ impl BenchmarkSummary {
     fn write_tsv<W: Write>(&self, writer: W) -> csv::Result<()> {
         let mut tsv = tsv_writer(writer);
 
-        for measurement in &self.measurements {
-            tsv.serialize(measurement)?;
-        }
+        self.measurements
+            .iter()
+            .try_for_each(|measurement| tsv.serialize(measurement))?;
 
-        tsv.flush()?;
-        Ok(())
+        Ok(tsv.flush()?)
     }
 
     fn durations_for_phase(&self, phase: RoundTripPhase) -> Vec<Duration> {
@@ -203,19 +191,16 @@ impl BenchmarkSummary {
         )?;
         writeln!(writer, "-----------+---------+---------+---------+--------",)?;
 
-        let stat_rows = [
+        [
             ("Mint", self.durations_for_phase(RoundTripPhase::Mint)),
             ("Redeem", self.durations_for_phase(RoundTripPhase::Redeem)),
             ("Full trip", self.full_trip_durations()),
-        ];
-
-        for (label, mut durations) in stat_rows {
-            if let Some(stats) = DurationStats::compute(&mut durations) {
-                write_stats_row(writer, label, &stats)?;
-            }
-        }
-
-        Ok(())
+        ]
+        .into_iter()
+        .filter_map(|(label, mut durations)| {
+            DurationStats::compute(&mut durations).map(|stats| (label, stats))
+        })
+        .try_for_each(|(label, stats)| write_stats_row(writer, label, &stats))
     }
 }
 
@@ -338,6 +323,42 @@ async fn measure_redeem(
     })
 }
 
+/// Place a market order and poll until filled.
+async fn place_and_fill<W: Write>(
+    executor: &AlpacaBrokerApi,
+    symbol: &Symbol,
+    quantity: Positive<FractionalShares>,
+    direction: Direction,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    use Direction::{Buy, Sell};
+
+    let verb = match direction {
+        Buy => "Buying",
+        Sell => "Selling",
+    };
+
+    writeln!(stdout, "   {verb} {quantity} {symbol}...")?;
+
+    let order = MarketOrder {
+        symbol: symbol.clone(),
+        shares: quantity,
+        direction,
+    };
+
+    let placement = executor.place_market_order(order).await?;
+    info!(order_id = %placement.order_id, %direction, "order placed");
+    poll_order_until_filled(executor, &placement.order_id).await?;
+
+    let past = match direction {
+        Buy => "Buy",
+        Sell => "Sell",
+    };
+
+    writeln!(stdout, "   {past} filled")?;
+    Ok(())
+}
+
 /// Run the Alpaca tokenization benchmark.
 pub(super) async fn alpaca_benchmark_command<W: Write>(
     stdout: &mut W,
@@ -406,20 +427,8 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
     for trip in 1..=round_trips {
         writeln!(stdout, "--- Round trip {trip}/{round_trips} ---")?;
 
-        // Step 1: Buy equity
-        writeln!(stdout, "   Buying {quantity} {symbol}...")?;
-        let buy_order = MarketOrder {
-            symbol: symbol.clone(),
-            shares: quantity,
-            direction: Direction::Buy,
-        };
+        place_and_fill(&executor, &symbol, quantity, Direction::Buy, stdout).await?;
 
-        let buy_placement = executor.place_market_order(buy_order).await?;
-        info!(order_id = %buy_placement.order_id, "Buy order placed");
-        poll_order_until_filled(&executor, &buy_placement.order_id).await?;
-        writeln!(stdout, "   Buy filled")?;
-
-        // Step 2: Mint (timed)
         writeln!(stdout, "   Minting...")?;
         let mint = measure_mint(
             &tokenization_service,
@@ -436,12 +445,10 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
             mint.status,
             mint.duration.as_secs_f64(),
         )?;
-
         tsv.serialize(&mint)?;
         tsv.flush()?;
         measurements.push(mint);
 
-        // Step 3: Redeem (timed)
         writeln!(stdout, "   Redeeming...")?;
         let redeem = measure_redeem(&tokenization_service, token, quantity.inner(), trip).await?;
 
@@ -451,23 +458,11 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
             redeem.status,
             redeem.duration.as_secs_f64(),
         )?;
-
         tsv.serialize(&redeem)?;
         tsv.flush()?;
         measurements.push(redeem);
 
-        // Step 4: Sell equity
-        writeln!(stdout, "   Selling {quantity} {symbol}...")?;
-        let sell_order = MarketOrder {
-            symbol: symbol.clone(),
-            shares: quantity,
-            direction: Direction::Sell,
-        };
-
-        let sell_placement = executor.place_market_order(sell_order).await?;
-        info!(order_id = %sell_placement.order_id, "Sell order placed");
-        poll_order_until_filled(&executor, &sell_placement.order_id).await?;
-        writeln!(stdout, "   Sell filled")?;
+        place_and_fill(&executor, &symbol, quantity, Direction::Sell, stdout).await?;
 
         writeln!(stdout)?;
     }
@@ -685,7 +680,7 @@ mod tests {
 
     #[test]
     fn duration_stats_empty_returns_none() {
-        assert!(DurationStats::compute(&mut vec![]).is_none());
+        assert!(DurationStats::compute(&mut []).is_none());
     }
 
     #[test]
