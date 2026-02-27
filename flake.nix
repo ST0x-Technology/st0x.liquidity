@@ -204,6 +204,18 @@
             '';
           };
 
+          runE2e = pkgs.writeShellApplication {
+            name = "run-e2e";
+            runtimeInputs = [ pkgs.bun pkgs.git ];
+            text = ''
+              export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
+              export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+              cd "$(git rev-parse --show-toplevel)/e2e"
+              bun install
+              exec bunx playwright test "$@"
+            '';
+          };
+
         };
 
         formatter = pkgs.nixfmt-classic;
@@ -223,16 +235,11 @@
               packages.ci
               packages.prepSolArtifacts
               packages.remote
+              packages.runE2e
               packages.deployNixos
               packages.deployService
               packages.deployAll
             ] ++ rainix.devShells.${system}.default.buildInputs;
-        };
-
-        devShells.e2e = pkgs.mkShell {
-          buildInputs = [ pkgs.bun ];
-          PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
         };
       });
 

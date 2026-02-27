@@ -145,11 +145,7 @@ jobs:
           git diff --exit-code e2e/bun.nix
 
       - name: Run E2E tests
-        run: |
-          nix develop .#e2e -c bash -c '
-            cd e2e
-            bun install
-            BACKEND_BIN=../artifacts/backend/bin/server \
-            DASHBOARD_DIR=../dashboard \
-            bunx playwright test
-          '
+        env:
+          BACKEND_BIN: ../artifacts/backend/bin/server
+          DASHBOARD_DIR: ../dashboard
+        run: nix run .#runE2e
