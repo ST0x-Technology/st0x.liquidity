@@ -14,6 +14,24 @@ use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Positive};
 use std::ops::{Add, Mul, Sub};
 use std::str::FromStr;
 
+/// A USD dollar amount (e.g., fees from Alpaca tokenization).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Usd(pub(crate) Decimal);
+
+impl Display for Usd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for Usd {
+    type Err = rust_decimal::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Decimal::from_str(s).map(Self)
+    }
+}
+
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Usdc(pub(crate) Decimal);
@@ -194,6 +212,29 @@ mod tests {
 
             prop_assert_eq!(usdc.is_negative(), decimal.is_sign_negative());
         }
+    }
+
+    #[test]
+    fn usd_parse_and_display_roundtrip() {
+        let cases = ["1", "1.00", "0.1234", "99999.99"];
+
+        for input in cases {
+            let parsed: Usd = input.parse().unwrap();
+            let displayed = parsed.to_string();
+            let reparsed: Usd = displayed.parse().unwrap();
+            assert_eq!(parsed, reparsed, "roundtrip failed for {input}");
+        }
+    }
+
+    #[test]
+    fn usd_parse_invalid_returns_err() {
+        assert!("not_a_number".parse::<Usd>().is_err());
+    }
+
+    #[test]
+    fn usd_display_preserves_scale() {
+        let usd: Usd = "1.50".parse().unwrap();
+        assert_eq!(usd.to_string(), "1.50");
     }
 
     #[test]
