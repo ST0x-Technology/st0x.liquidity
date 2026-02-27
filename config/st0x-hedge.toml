@@ -38,7 +38,7 @@ unwrapped = "0x9a507314ea2a6c5686c0d07bfecb764dcf324dff"
 wrapped = "0x1e46d7efef64a833afb1cd49299a7ad5b439f4d8"
 
 [equities.tCOIN]
-enabled = true
+enabled = false
 unwrapped = "0x626757e6f50675d17fcad312e82f989ae7a23d38"
 wrapped = "0x5cda0e1ca4ce2af96315f7f8963c85399c172204"
 
