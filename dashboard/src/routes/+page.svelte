@@ -39,6 +39,13 @@
     </div>
   {/if}
 
+  <!-- TODO: visual polish before review
+    - fix inconsistent spacing/padding between panels
+    - center empty state text ("No spread data available", etc.)
+    - fix inventory table spacing
+    - match SPEC.md layout proportions more closely
+    - add mobile viewport baseline screenshots for visual regression
+  -->
   <main class="flex-1 overflow-auto p-2 md:overflow-hidden md:p-4">
     <div class="flex h-full flex-col gap-2 md:gap-4">
       <KpiStrip />
