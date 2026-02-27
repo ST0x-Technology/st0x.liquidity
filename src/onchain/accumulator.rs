@@ -145,10 +145,14 @@ pub(crate) async fn check_all_positions<E: Executor>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::TxHash;
-    use rust_decimal_macros::dec;
     use std::sync::Arc;
 
+    use st0x_exact_decimal::ExactDecimal;
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     use sqlx::SqlitePool;
 
@@ -188,7 +192,7 @@ mod tests {
                     },
                     amount,
                     direction,
-                    price_usdc: dec!(150.0),
+                    price_usdc: ed("150.0"),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -226,7 +230,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(0.5)),
+            FractionalShares::new(ed("0.5")),
             Direction::Buy,
         )
         .await;
@@ -255,7 +259,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(1.5)),
+            FractionalShares::new(ed("1.5")),
             Direction::Buy,
         )
         .await;
@@ -275,7 +279,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+            Positive::new(FractionalShares::new(ed("1.5"))).unwrap(),
             "DryRun supports fractional shares"
         );
         assert_eq!(
@@ -298,7 +302,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &aapl,
-            FractionalShares::new(dec!(0.3)),
+            FractionalShares::new(ed("0.3")),
             Direction::Buy,
         )
         .await;
@@ -307,7 +311,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &msft,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(ed("2.0")),
             Direction::Sell,
         )
         .await;
@@ -326,7 +330,7 @@ mod tests {
         assert_eq!(ready[0].symbol, msft);
         assert_eq!(
             ready[0].shares,
-            Positive::new(FractionalShares::new(dec!(2))).unwrap()
+            Positive::new(FractionalShares::new(ed("2"))).unwrap()
         );
         assert_eq!(
             ready[0].direction,
@@ -345,7 +349,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(ed("2.0")),
             Direction::Buy,
         )
         .await;
@@ -379,7 +383,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(ed("2.0")),
             Direction::Buy,
         )
         .await;
@@ -401,7 +405,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(2))).unwrap()
+            Positive::new(FractionalShares::new(ed("2"))).unwrap()
         );
     }
 
@@ -418,7 +422,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(0.5)),
+            FractionalShares::new(ed("0.5")),
             Direction::Buy,
         )
         .await;
@@ -446,9 +450,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },
-                    amount: FractionalShares::new(dec!(1.0)),
+                    amount: FractionalShares::new(ed("1.0")),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: ed("150.0"),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -488,7 +492,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+            Positive::new(FractionalShares::new(ed("1.5"))).unwrap(),
             "Should execute full accumulated amount"
         );
     }
@@ -503,14 +507,14 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(10.0)),
+            FractionalShares::new(ed("10.0")),
             Direction::Buy,
         )
         .await;
 
         let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
-            max_amount: Positive::new(crate::threshold::Usdc(dec!(1000))).unwrap(),
+            max_shares: Positive::new(FractionalShares::new(ed("3.0"))).unwrap(),
+            max_amount: Positive::new(crate::threshold::Usdc(ed("1000"))).unwrap(),
         };
 
         let params = check_execution_readiness(
@@ -528,7 +532,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
+            Positive::new(FractionalShares::new(ed("3.0"))).unwrap(),
             "Shares should be capped by operational limit"
         );
     }
@@ -543,7 +547,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(5.0)),
+            FractionalShares::new(ed("5.0")),
             Direction::Buy,
         )
         .await;
@@ -578,7 +582,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &aapl,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(ed("2.0")),
             Direction::Buy,
         )
         .await;
@@ -586,7 +590,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &msft,
-            FractionalShares::new(dec!(3.0)),
+            FractionalShares::new(ed("3.0")),
             Direction::Buy,
         )
         .await;

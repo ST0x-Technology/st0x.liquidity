@@ -14,12 +14,18 @@ use e2e_tests::services::alpaca_broker;
 use e2e_tests::services::alpaca_broker::AlpacaBrokerMock;
 use e2e_tests::services::base_chain::{self, TakeOrderResult};
 
-pub(crate) use std::str::FromStr;
 pub(crate) use std::time::Duration;
 
 pub(crate) use alloy::providers::Provider;
-pub(crate) use rust_decimal::Decimal;
-pub(crate) use rust_decimal_macros::dec;
+pub(crate) use st0x_exact_decimal::ExactDecimal;
+
+pub(crate) fn ed(value: &str) -> ExactDecimal {
+    match ExactDecimal::parse(value) {
+        Ok(val) => val,
+        Err(error) => panic!("ed({value:?}) failed: {error}"),
+    }
+}
+
 pub(crate) use st0x_event_sorcery::Projection;
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;

@@ -433,14 +433,19 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
-    use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
+    use st0x_exact_decimal::ExactDecimal;
     use std::sync::Arc;
 
     use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
 
     use super::*;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
+
     use crate::onchain::mock::MockRaindex;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use crate::wrapper::mock::MockWrapper;
@@ -488,7 +493,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(ed("100.0")),
             },
         )
         .await
@@ -513,7 +518,7 @@ mod tests {
                 &transfer,
                 Equity {
                     symbol: Symbol::new("TEST").unwrap(),
-                    quantity: FractionalShares::new(dec!(50)),
+                    quantity: FractionalShares::new(ed("50")),
                 },
             ),
         )
@@ -535,7 +540,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(ed("50")),
             },
         )
         .await
@@ -560,7 +565,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(ed("50")),
             },
         )
         .await
@@ -588,7 +593,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(ed("50")),
             },
         )
         .await
@@ -616,7 +621,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(ed("50")),
             },
         )
         .await
@@ -641,7 +646,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(ed("100.0")),
             },
         )
         .await
@@ -666,7 +671,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(ed("100.0")),
             },
         )
         .await

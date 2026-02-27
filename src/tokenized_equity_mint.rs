@@ -41,12 +41,13 @@
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::warn;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::rebalancing::equity::EquityTransferServices;
@@ -130,27 +131,24 @@ pub(crate) enum TokenizedEquityMintError {
     /// Completed mint response missing tx_hash
     #[error("Missing tx_hash in completed mint response")]
     MissingTxHash,
-    /// Decimal overflow when scaling quantity to 18 decimals
-    #[error("Decimal overflow when scaling {value} to 18 decimals")]
-    DecimalScalingOverflow { value: Decimal },
-    /// U256 conversion failed for a scaled decimal value
-    #[error("Failed to convert scaled decimal {scaled_value} to U256")]
-    U256ConversionFailed { scaled_value: String },
     /// Negative quantity is invalid for minting
     #[error("Negative quantity: {value}")]
-    NegativeQuantity { value: Decimal },
-    /// Input has more than 18 decimal places, conversion would lose precision
-    #[error(
-        "Precision loss: {value} has more than 18 decimal places \
-         (scaled value {scaled} has fractional part)"
-    )]
-    PrecisionLoss { value: Decimal, scaled: Decimal },
+    NegativeQuantity { value: ExactDecimal },
+    /// Float arithmetic or conversion error
+    #[error("Float error: {0}")]
+    Float(String),
     /// Vault lookup failed for the given symbol
     #[error("Vault lookup failed for {0}")]
     VaultLookupFailed(Symbol),
     /// Vault deposit transaction failed
     #[error("Vault deposit failed")]
     VaultDepositFailed,
+}
+
+impl From<FloatError> for TokenizedEquityMintError {
+    fn from(error: FloatError) -> Self {
+        Self::Float(error.to_string())
+    }
 }
 
 /// Commands for the TokenizedEquityMint aggregate.
@@ -168,7 +166,7 @@ pub(crate) enum TokenizedEquityMintCommand {
     RequestMint {
         issuer_request_id: IssuerRequestId,
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         wallet: Address,
     },
     /// Calls `poll_mint_until_complete()` on the tokenizer service.
@@ -189,7 +187,7 @@ pub(crate) enum TokenizedEquityMintCommand {
 pub(crate) enum TokenizedEquityMintEvent {
     MintRequested {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         wallet: Address,
         requested_at: DateTime<Utc>,
     },
@@ -228,7 +226,7 @@ pub(crate) enum TokenizedEquityMintEvent {
     /// Wrapping failed after tokens were received.
     WrappingFailed {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         failed_at: DateTime<Utc>,
     },
 
@@ -281,7 +279,7 @@ pub(crate) enum TokenizedEquityMint {
     /// Mint request initiated with symbol, quantity, and destination wallet
     MintRequested {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         wallet: Address,
         requested_at: DateTime<Utc>,
     },
@@ -289,7 +287,7 @@ pub(crate) enum TokenizedEquityMint {
     /// Alpaca API accepted the mint request and returned tracking identifiers
     MintAccepted {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         wallet: Address,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -300,7 +298,7 @@ pub(crate) enum TokenizedEquityMint {
     /// Onchain token transfer detected with transaction details
     TokensReceived {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         wallet: Address,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -315,7 +313,7 @@ pub(crate) enum TokenizedEquityMint {
     /// Tokens have been wrapped into ERC-4626 vault shares
     TokensWrapped {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         wallet: Address,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -333,7 +331,7 @@ pub(crate) enum TokenizedEquityMint {
     /// Wrapped tokens deposited to Raindex vault
     DepositedIntoRaindex {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         /// Alpaca cross-system identifiers for auditing
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -349,7 +347,7 @@ pub(crate) enum TokenizedEquityMint {
     /// Mint operation failed (terminal state)
     Failed {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: ExactDecimal,
         reason: String,
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -359,26 +357,12 @@ pub(crate) enum TokenizedEquityMint {
 /// Our tokenized equity tokens use 18 decimals.
 pub(crate) const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
-fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, TokenizedEquityMintError> {
-    if value.is_sign_negative() {
+fn quantity_to_u256_18_decimals(value: ExactDecimal) -> Result<U256, TokenizedEquityMintError> {
+    if value.is_negative()? {
         return Err(TokenizedEquityMintError::NegativeQuantity { value });
     }
 
-    let scale_factor = Decimal::from(10u64.pow(18));
-    let scaled = value
-        .checked_mul(scale_factor)
-        .ok_or(TokenizedEquityMintError::DecimalScalingOverflow { value })?;
-
-    if scaled.fract() != Decimal::ZERO {
-        return Err(TokenizedEquityMintError::PrecisionLoss { value, scaled });
-    }
-
-    let repr = scaled.trunc().to_string();
-    let Ok(amount) = U256::from_str_radix(&repr, 10) else {
-        return Err(TokenizedEquityMintError::U256ConversionFailed { scaled_value: repr });
-    };
-
-    Ok(amount)
+    Ok(value.to_fixed_decimal_lossy(TOKENIZED_EQUITY_DECIMALS)?.0)
 }
 
 #[async_trait]
@@ -646,7 +630,7 @@ impl EventSourced for TokenizedEquityMint {
             return Err(TokenizedEquityMintError::NotInitialized);
         };
 
-        if quantity.is_sign_negative() {
+        if quantity.is_negative()? {
             return Err(TokenizedEquityMintError::NegativeQuantity { value: quantity });
         }
 
@@ -733,7 +717,7 @@ impl EventSourced for TokenizedEquityMint {
                             let tx_hash = completed
                                 .tx_hash
                                 .ok_or(TokenizedEquityMintError::MissingTxHash)?;
-                            let shares_minted = decimal_to_u256_18_decimals(*quantity)?;
+                            let shares_minted = quantity_to_u256_18_decimals(*quantity)?;
 
                             Ok(vec![TokensReceived {
                                 tx_hash,
@@ -800,7 +784,6 @@ impl EventSourced for TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
@@ -810,6 +793,10 @@ mod tests {
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
     use crate::wrapper::mock::MockWrapper;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     fn mint_services(tokenizer: MockTokenizer) -> EquityTransferServices {
         EquityTransferServices {
@@ -823,7 +810,7 @@ mod tests {
         TokenizedEquityMintCommand::RequestMint {
             issuer_request_id: IssuerRequestId::new("ISS001"),
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: ed("10"),
             wallet: Address::ZERO,
         }
     }
@@ -831,7 +818,7 @@ mod tests {
     fn mint_requested_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         }
@@ -935,7 +922,7 @@ mod tests {
     fn test_evolve_accepted_rejects_wrong_state() {
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             token_tx_hash: TxHash::random(),
@@ -958,7 +945,7 @@ mod tests {
     fn test_evolve_tokens_received_rejects_wrong_state() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -978,7 +965,7 @@ mod tests {
     fn test_evolve_rejected_rejects_non_requested_states() {
         let accepted = TokenizedEquityMint::MintAccepted {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
@@ -999,7 +986,7 @@ mod tests {
     fn test_evolve_acceptance_failed_rejects_non_accepted_states() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -1017,14 +1004,14 @@ mod tests {
     fn test_evolve_rejects_mint_requested_on_existing_state() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
 
         let event = TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new("GOOG").unwrap(),
-            quantity: dec!(50.0),
+            quantity: ed("50"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -1037,7 +1024,7 @@ mod tests {
     fn test_evolve_vault_deposited_rejects_wrong_state() {
         let accepted = TokenizedEquityMint::MintAccepted {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
@@ -1055,8 +1042,8 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_rejects_negative() {
-        let error = decimal_to_u256_18_decimals(dec!(-5)).unwrap_err();
+    fn quantity_to_u256_18_decimals_rejects_negative() {
+        let error = quantity_to_u256_18_decimals(ed("-5")).unwrap_err();
         assert!(
             matches!(error, TokenizedEquityMintError::NegativeQuantity { .. }),
             "Expected NegativeQuantity, got: {error:?}"
@@ -1064,31 +1051,21 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_converts_correctly() {
-        let result = decimal_to_u256_18_decimals(dec!(3)).unwrap();
+    fn quantity_to_u256_18_decimals_converts_correctly() {
+        let result = quantity_to_u256_18_decimals(ed("3")).unwrap();
         assert_eq!(result, U256::from(3_000_000_000_000_000_000_u128));
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_zero_returns_zero() {
-        let result = decimal_to_u256_18_decimals(dec!(0)).unwrap();
+    fn quantity_to_u256_18_decimals_zero_returns_zero() {
+        let result = quantity_to_u256_18_decimals(ed("0")).unwrap();
         assert_eq!(result, U256::ZERO);
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_rejects_19_decimal_places() {
-        let value = Decimal::from_str("1.1234567890123456789").unwrap();
-        let error = decimal_to_u256_18_decimals(value).unwrap_err();
-        assert!(
-            matches!(error, TokenizedEquityMintError::PrecisionLoss { .. }),
-            "Expected PrecisionLoss, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn decimal_to_u256_18_decimals_accepts_exactly_18_decimal_places() {
-        let value = Decimal::from_str("1.123456789012345678").unwrap();
-        let result = decimal_to_u256_18_decimals(value).unwrap();
+    fn quantity_to_u256_18_decimals_accepts_exactly_18_decimal_places() {
+        let value = ExactDecimal::parse("1.123456789012345678").unwrap();
+        let result = quantity_to_u256_18_decimals(value).unwrap();
         assert_eq!(result, U256::from(1_123_456_789_012_345_678_u128));
     }
 
@@ -1096,7 +1073,7 @@ mod tests {
     fn test_evolve_tokens_wrapped_rejects_wrong_state() {
         let accepted = TokenizedEquityMint::MintAccepted {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: ed("100.5"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
@@ -1207,7 +1184,7 @@ mod tests {
     fn reject_mint_evolves_from_requested_to_failed() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: ed("10"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -1230,7 +1207,7 @@ mod tests {
     fn wrapping_failed_evolves_from_tokens_received_to_failed() {
         let tokens_received = TokenizedEquityMint::TokensReceived {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: ed("10"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("REQ001".to_string()),
@@ -1244,7 +1221,7 @@ mod tests {
 
         let event = TokenizedEquityMintEvent::WrappingFailed {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: ed("10"),
             failed_at: Utc::now(),
         };
 

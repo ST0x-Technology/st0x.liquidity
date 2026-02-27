@@ -4,6 +4,7 @@
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use st0x_exact_decimal::ExactDecimal;
 use uuid::Uuid;
 
 use super::auth::AlpacaAccountId;
@@ -68,8 +69,8 @@ pub struct JournalResponse {
         deserialize_with = "deserialize_positive_fractional_shares"
     )]
     pub quantity: Positive<FractionalShares>,
-    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
-    pub price: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_optional_exact_decimal")]
+    pub price: Option<ExactDecimal>,
     pub from_account: AlpacaAccountId,
     pub to_account: AlpacaAccountId,
     pub settle_date: Option<NaiveDate>,
@@ -85,17 +86,19 @@ where
 {
     let string = String::deserialize(deserializer)?;
     let decimal: Decimal = string.parse().map_err(serde::de::Error::custom)?;
-    let shares = FractionalShares::new(decimal);
+    let shares = FractionalShares::from_decimal(decimal).map_err(serde::de::Error::custom)?;
     Positive::new(shares).map_err(serde::de::Error::custom)
 }
 
-fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+fn deserialize_optional_exact_decimal<'de, D>(
+    deserializer: D,
+) -> Result<Option<ExactDecimal>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let maybe_string: Option<String> = Option::deserialize(deserializer)?;
     maybe_string
-        .map(|string| string.parse().map_err(serde::de::Error::custom))
+        .map(|string| ExactDecimal::parse(&string).map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -134,7 +137,6 @@ impl std::fmt::Display for JournalStatus {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use uuid::uuid;
 
     use super::*;
@@ -192,7 +194,7 @@ mod tests {
         let response: JournalResponse = serde_json::from_value(json).unwrap();
         assert_eq!(
             response.quantity,
-            Positive::new(FractionalShares::new(dec!(10.5))).unwrap()
+            Positive::new(FractionalShares::new(ExactDecimal::parse("10.5").unwrap())).unwrap()
         );
     }
 
@@ -201,7 +203,8 @@ mod tests {
         let from = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
         let to = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = Positive::new(FractionalShares::new(dec!(10.5))).unwrap();
+        let quantity =
+            Positive::new(FractionalShares::new(ExactDecimal::parse("10.5").unwrap())).unwrap();
 
         let request = JournalRequest::security(from, to, symbol, quantity);
         let json = serde_json::to_value(&request).unwrap();

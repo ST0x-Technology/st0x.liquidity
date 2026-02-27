@@ -250,7 +250,7 @@ impl DomainEvent for InventorySnapshotEvent {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
+    use st0x_exact_decimal::ExactDecimal;
     use std::str::FromStr;
 
     use super::*;
@@ -301,7 +301,7 @@ mod tests {
     }
 
     fn test_shares(n: i64) -> FractionalShares {
-        FractionalShares::new(Decimal::from(n))
+        FractionalShares::new(ExactDecimal::parse(&n.to_string()).unwrap())
     }
 
     #[tokio::test]

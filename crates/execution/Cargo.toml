@@ -37,6 +37,8 @@ sqlite-es.workspace = true
 rust_decimal = { workspace = true, features = ["serde-with-float"] }
 num-decimal.workspace = true
 rust_decimal_macros = "1.40.0"
+st0x-exact-decimal = { version = "0.1.0", path = "../exact-decimal" }
+rain-math-float = { version = "0.1.0", path = "../../lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
 
 [dev-dependencies]
 httpmock.workspace = true

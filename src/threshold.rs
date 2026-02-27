@@ -5,24 +5,25 @@
 //! broker order.
 
 use alloy::primitives::U256;
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
-
-use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Positive};
 use std::ops::{Add, Mul, Sub};
 use std::str::FromStr;
 
+use st0x_exact_decimal::ExactDecimal;
+use st0x_execution::{FractionalShares, HasZero, Positive};
+
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Usdc(pub(crate) Decimal);
+#[serde(transparent)]
+pub struct Usdc(pub(crate) ExactDecimal);
 
 impl FromStr for Usdc {
-    type Err = rust_decimal::Error;
+    type Err = FloatError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Decimal::from_str(s).map(Self)
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        ExactDecimal::parse(value).map(Self)
     }
 }
 
@@ -33,101 +34,68 @@ impl Display for Usdc {
 }
 
 impl HasZero for Usdc {
-    const ZERO: Self = Self(Decimal::ZERO);
+    const ZERO: Self = Self(ExactDecimal::zero());
 }
-
-/// 10^6 scale factor for USDC (6 decimals).
-const USDC_DECIMAL_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
 
 impl Usdc {
     /// Creates a Usdc amount from cents (e.g., 12345 cents = $123.45).
     pub(crate) fn from_cents(cents: i64) -> Option<Self> {
-        Decimal::from(cents).checked_div(dec!(100)).map(Self)
-    }
+        let cents_ed = ExactDecimal::parse(&cents.to_string()).ok()?;
+        let hundred = ExactDecimal::parse("100").ok()?;
 
-    pub(crate) fn is_zero(self) -> bool {
-        self.0.is_zero()
-    }
-
-    pub(crate) fn is_negative(self) -> bool {
-        self.0.is_sign_negative()
+        (cents_ed / hundred).ok().map(Self)
     }
 
     /// Converts to U256 with 6 decimal places (USDC standard).
     ///
     /// Returns an error for negative values or overflow during scaling.
     pub fn to_u256_6_decimals(self) -> Result<U256, UsdcConversionError> {
-        if self.0.is_sign_negative() {
+        if self.0.is_negative().map_err(UsdcConversionError::Float)? {
             return Err(UsdcConversionError::NegativeValue(self.0));
         }
 
-        let scaled = self
-            .0
-            .checked_mul(USDC_DECIMAL_SCALE)
-            .ok_or(UsdcConversionError::Overflow)?;
-
-        Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
+        self.0
+            .to_fixed_decimal_lossy(6)
+            .map(|(fixed, _lossless)| fixed)
+            .map_err(UsdcConversionError::Float)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum UsdcConversionError {
     #[error("USDC amount cannot be negative: {0}")]
-    NegativeValue(Decimal),
-    #[error("overflow when scaling USDC to 6 decimals")]
-    Overflow,
-    #[error("failed to parse U256: {0}")]
-    ParseError(#[from] alloy::primitives::ruint::ParseError),
+    NegativeValue(ExactDecimal),
+    #[error("Float operation failed: {0}")]
+    Float(FloatError),
 }
 
-impl From<Usdc> for Decimal {
+impl From<Usdc> for ExactDecimal {
     fn from(value: Usdc) -> Self {
         value.0
     }
 }
 
-impl Mul<Decimal> for Usdc {
-    type Output = Result<Self, ArithmeticError<Self>>;
+impl Mul<ExactDecimal> for Usdc {
+    type Output = Result<Self, FloatError>;
 
-    fn mul(self, rhs: Decimal) -> Self::Output {
-        self.0
-            .checked_mul(rhs)
-            .map(Self)
-            .ok_or_else(|| ArithmeticError {
-                operation: "*".to_string(),
-                lhs: self,
-                rhs: Self(rhs),
-            })
+    fn mul(self, rhs: ExactDecimal) -> Self::Output {
+        (self.0 * rhs).map(Self)
     }
 }
 
 impl Add for Usdc {
-    type Output = Result<Self, ArithmeticError<Self>>;
+    type Output = Result<Self, FloatError>;
 
     fn add(self, rhs: Self) -> Self::Output {
-        self.0
-            .checked_add(rhs.0)
-            .map(Self)
-            .ok_or_else(|| ArithmeticError {
-                operation: "+".to_string(),
-                lhs: self,
-                rhs,
-            })
+        (self.0 + rhs.0).map(Self)
     }
 }
 
 impl Sub for Usdc {
-    type Output = Result<Self, ArithmeticError<Self>>;
+    type Output = Result<Self, FloatError>;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        self.0
-            .checked_sub(rhs.0)
-            .map(Self)
-            .ok_or_else(|| ArithmeticError {
-                operation: "-".to_string(),
-                lhs: self,
-                rhs,
-            })
+        (self.0 - rhs.0).map(Self)
     }
 }
 
@@ -157,7 +125,9 @@ impl ExecutionThreshold {
 
     #[cfg(test)]
     pub(crate) fn whole_share() -> Self {
-        Self::Shares(Positive::new(FractionalShares::new(Decimal::ONE)).unwrap())
+        Self::Shares(
+            Positive::new(FractionalShares::new(ExactDecimal::parse("1").unwrap())).unwrap(),
+        )
     }
 }
 
@@ -172,52 +142,76 @@ pub enum InvalidThresholdError {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use rust_decimal::Decimal;
 
     use super::*;
 
-    fn arb_decimal() -> impl Strategy<Value = Decimal> {
-        (any::<i64>(), 0u32..=10).prop_map(|(mantissa, scale)| Decimal::new(mantissa, scale))
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
+
+    fn arb_exact_decimal() -> impl Strategy<Value = ExactDecimal> {
+        (any::<i64>(), 0u32..=10).prop_filter_map(
+            "ExactDecimal::parse must succeed",
+            |(mantissa, scale)| {
+                let divisor = 10i64.checked_pow(scale).unwrap_or(1);
+                let integer_part = mantissa / divisor;
+                let frac_part = (mantissa % divisor).unsigned_abs();
+
+                let value_str = format!(
+                    "{integer_part}.{frac_part:0>width$}",
+                    width = scale as usize
+                );
+                ExactDecimal::parse(&value_str).ok()
+            },
+        )
     }
 
     proptest! {
         #[test]
-        fn usdc_is_zero_matches_decimal_is_zero(decimal in arb_decimal()) {
+        fn usdc_is_zero_matches_exact_decimal_is_zero(decimal in arb_exact_decimal()) {
             let usdc = Usdc(decimal);
+            let is_zero = decimal.is_zero().map_err(|error| {
+                TestCaseError::Fail(format!("is_zero() failed: {error}").into())
+            })?;
 
-            prop_assert_eq!(usdc.is_zero(), decimal.is_zero());
+            prop_assert_eq!(usdc.is_zero(), is_zero);
         }
 
         #[test]
-        fn usdc_is_negative_matches_decimal_is_sign_negative(decimal in arb_decimal()) {
+        fn usdc_is_negative_matches_exact_decimal_is_negative(decimal in arb_exact_decimal()) {
             let usdc = Usdc(decimal);
+            let is_negative = decimal.is_negative().map_err(|error| {
+                TestCaseError::Fail(format!("is_negative() failed: {error}").into())
+            })?;
 
-            prop_assert_eq!(usdc.is_negative(), decimal.is_sign_negative());
+            prop_assert_eq!(usdc.is_negative(), is_negative);
         }
     }
 
     #[test]
     fn whole_share_matches_smart_constructor() {
         let from_whole_share = ExecutionThreshold::whole_share();
-        let from_constructor = ExecutionThreshold::Shares(Positive::<FractionalShares>::ONE);
+        let from_constructor =
+            ExecutionThreshold::Shares(Positive::new(FractionalShares::new(ed("1"))).unwrap());
         assert_eq!(from_whole_share, from_constructor);
     }
 
     #[test]
     fn shares_threshold_accepts_positive() {
-        let threshold = ExecutionThreshold::shares(Positive::<FractionalShares>::ONE);
+        let threshold =
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(ed("1"))).unwrap());
         assert!(matches!(threshold, ExecutionThreshold::Shares(_)));
     }
 
     #[test]
     fn dollar_threshold_rejects_zero() {
-        let result = ExecutionThreshold::dollar_value(Usdc(Decimal::ZERO));
+        let result = ExecutionThreshold::dollar_value(Usdc(ExactDecimal::zero()));
         assert_eq!(result.unwrap_err(), InvalidThresholdError::ZeroDollarValue);
     }
 
     #[test]
     fn dollar_threshold_rejects_negative() {
-        let negative = Usdc(Decimal::NEGATIVE_ONE);
+        let negative = Usdc(ed("-1"));
         let result = ExecutionThreshold::dollar_value(negative);
         assert_eq!(
             result.unwrap_err(),
@@ -227,49 +221,27 @@ mod tests {
 
     #[test]
     fn dollar_threshold_accepts_positive() {
-        ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
+        ExecutionThreshold::dollar_value(Usdc(ed("1"))).unwrap();
     }
 
     #[test]
     fn usdc_add_succeeds() {
-        let smaller = Usdc(Decimal::ONE);
-        let larger = Usdc(Decimal::TWO);
+        let smaller = Usdc(ed("1"));
+        let larger = Usdc(ed("2"));
 
         let result = (smaller + larger).unwrap();
 
-        assert_eq!(result.0, Decimal::from(3));
+        assert_eq!(result.0, ed("3"));
     }
 
     #[test]
     fn usdc_sub_succeeds() {
-        let larger = Usdc(Decimal::from(5));
-        let smaller = Usdc(Decimal::TWO);
+        let larger = Usdc(ed("5"));
+        let smaller = Usdc(ed("2"));
 
         let result = (larger - smaller).unwrap();
 
-        assert_eq!(result.0, Decimal::from(3));
-    }
-
-    #[test]
-    fn usdc_add_overflow_returns_error() {
-        let max = Usdc(Decimal::MAX);
-        let one = Usdc(Decimal::ONE);
-
-        let error = (max + one).unwrap_err();
-        assert_eq!(error.operation, "+");
-        assert_eq!(error.lhs, max);
-        assert_eq!(error.rhs, one);
-    }
-
-    #[test]
-    fn usdc_sub_overflow_returns_error() {
-        let min = Usdc(Decimal::MIN);
-        let one = Usdc(Decimal::ONE);
-
-        let error = (min - one).unwrap_err();
-        assert_eq!(error.operation, "-");
-        assert_eq!(error.lhs, min);
-        assert_eq!(error.rhs, one);
+        assert_eq!(result.0, ed("3"));
     }
 
     #[test]
@@ -278,44 +250,32 @@ mod tests {
     }
 
     #[test]
-    fn usdc_into_decimal_extracts_inner_value() {
-        let usdc = Usdc(Decimal::from(42));
-        let decimal: Decimal = usdc.into();
-        assert_eq!(decimal, Decimal::from(42));
+    fn usdc_into_exact_decimal_extracts_inner_value() {
+        let usdc = Usdc(ed("42"));
+        let exact: ExactDecimal = usdc.into();
+        assert_eq!(exact, ed("42"));
     }
 
     #[test]
-    fn usdc_mul_decimal_succeeds() {
-        let usdc = Usdc(Decimal::from(100));
-        let ratio = dec!(0.5);
+    fn usdc_mul_exact_decimal_succeeds() {
+        let usdc = Usdc(ed("100"));
+        let ratio = ed("0.5");
 
         let result = (usdc * ratio).unwrap();
 
-        assert_eq!(result.0, Decimal::from(50));
-    }
-
-    #[test]
-    fn usdc_mul_decimal_overflow_returns_error() {
-        let max = Usdc(Decimal::MAX);
-        let two = Decimal::TWO;
-
-        let error = (max * two).unwrap_err();
-
-        assert_eq!(error.operation, "*");
-        assert_eq!(error.lhs, max);
-        assert_eq!(error.rhs, Usdc(two));
+        assert_eq!(result.0, ed("50"));
     }
 
     #[test]
     fn from_cents_converts_positive_cents_to_dollars() {
         let usdc = Usdc::from_cents(12345).unwrap();
-        assert_eq!(usdc.0, dec!(123.45));
+        assert_eq!(usdc.0, ed("123.45"));
     }
 
     #[test]
     fn from_cents_converts_negative_cents_to_dollars() {
         let usdc = Usdc::from_cents(-500).unwrap();
-        assert_eq!(usdc.0, dec!(-5));
+        assert_eq!(usdc.0, ed("-5"));
     }
 
     #[test]
@@ -327,6 +287,7 @@ mod tests {
     #[test]
     fn from_cents_handles_large_values() {
         let usdc = Usdc::from_cents(i64::MAX).unwrap();
-        assert_eq!(usdc.0, Decimal::from(i64::MAX) / Decimal::from(100));
+        let expected = (ed(&i64::MAX.to_string()) / ed("100")).unwrap();
+        assert_eq!(usdc.0, expected);
     }
 }

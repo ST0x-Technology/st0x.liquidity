@@ -19,9 +19,8 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use chrono::Utc;
 use rain_math_float::Float;
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
+use st0x_exact_decimal::ExactDecimal;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -54,6 +53,10 @@ use crate::threshold::{ExecutionThreshold, Usdc};
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::vault_registry::VaultRegistryId;
 
+fn ed(value: &str) -> ExactDecimal {
+    ExactDecimal::parse(value).unwrap()
+}
+
 const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";
 const AAPL_PRICE: u32 = 100;
@@ -71,7 +74,7 @@ async fn assert_position(
     accumulated_long: FractionalShares,
     accumulated_short: FractionalShares,
     #[builder(required)] pending: Option<OffchainOrderId>,
-    last_price_usdc: Decimal,
+    last_price_usdc: ExactDecimal,
 ) {
     let position = query
         .load(symbol)
@@ -399,7 +402,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
     async fn take_order(
         &mut self,
         symbol: &str,
-        amount: Decimal,
+        amount: ExactDecimal,
         direction: Direction,
         price: u32,
     ) -> AnvilTrade {
@@ -413,7 +416,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
 
         let is_sell = direction == Direction::Sell;
         let usdc_addr = self.usdc_addr;
-        let usdc_total = amount * Decimal::from(price);
+        let usdc_total = (amount * ed(&price.to_string())).unwrap();
 
         let amount_str = amount.to_string();
         let usdc_total_str = usdc_total.to_string();
@@ -673,7 +676,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.5))
+        .amount(ed("0.5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -688,11 +691,11 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-0.5)))
+        .net(FractionalShares::new(ed("-0.5")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(0.5)))
+        .accumulated_short(FractionalShares::new(ed("0.5")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -707,7 +710,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.7))
+        .amount(ed("0.7"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -722,11 +725,11 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-1.2)))
+        .net(FractionalShares::new(ed("-1.2")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.2)))
+        .accumulated_short(FractionalShares::new(ed("1.2")))
         .pending(Some(order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -780,9 +783,9 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .symbol(&symbol)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.2)))
+        .accumulated_short(FractionalShares::new(ed("1.2")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -816,7 +819,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.5))
+        .amount(ed("0.5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -827,7 +830,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.7))
+        .amount(ed("0.7"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -858,11 +861,11 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-1.2)))
+        .net(FractionalShares::new(ed("-1.2")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.2)))
+        .accumulated_short(FractionalShares::new(ed("1.2")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -908,9 +911,9 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .symbol(&symbol)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.2)))
+        .accumulated_short(FractionalShares::new(ed("1.2")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -952,7 +955,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.6))
+        .amount(ed("0.6"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -962,7 +965,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_MSFT)
-        .amount(dec!(0.4))
+        .amount(ed("0.4"))
         .direction(Direction::Sell)
         .price(MSFT_PRICE)
         .call()
@@ -980,7 +983,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let trade3 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.6))
+        .amount(ed("0.6"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -995,21 +998,21 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_position()
         .query(&position_query)
         .symbol(&aapl)
-        .net(FractionalShares::new(dec!(-1.2)))
+        .net(FractionalShares::new(ed("-1.2")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.2)))
+        .accumulated_short(FractionalShares::new(ed("1.2")))
         .pending(Some(aapl_order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
     assert_position()
         .query(&position_query)
         .symbol(&msft)
-        .net(FractionalShares::new(dec!(-0.4)))
+        .net(FractionalShares::new(ed("-0.4")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(0.4)))
+        .accumulated_short(FractionalShares::new(ed("0.4")))
         .pending(None)
-        .last_price_usdc(Decimal::from(MSFT_PRICE))
+        .last_price_usdc(ed(&MSFT_PRICE.to_string()))
         .call()
         .await;
 
@@ -1077,19 +1080,19 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .symbol(&aapl)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.2)))
+        .accumulated_short(FractionalShares::new(ed("1.2")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
     assert_position()
         .query(&position_query)
         .symbol(&msft)
-        .net(FractionalShares::new(dec!(-0.4)))
+        .net(FractionalShares::new(ed("-0.4")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(0.4)))
+        .accumulated_short(FractionalShares::new(ed("0.4")))
         .pending(None)
-        .last_price_usdc(Decimal::from(MSFT_PRICE))
+        .last_price_usdc(ed(&MSFT_PRICE.to_string()))
         .call()
         .await;
 
@@ -1107,7 +1110,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let trade4 = orderbook
         .take_order()
         .symbol(TEST_MSFT)
-        .amount(dec!(0.6))
+        .amount(ed("0.6"))
         .direction(Direction::Sell)
         .price(MSFT_PRICE)
         .call()
@@ -1122,11 +1125,11 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_position()
         .query(&position_query)
         .symbol(&msft)
-        .net(FractionalShares::new(dec!(-1.0)))
+        .net(FractionalShares::new(ed("-1.0")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.0)))
+        .accumulated_short(FractionalShares::new(ed("1.0")))
         .pending(Some(msft_order_id))
-        .last_price_usdc(Decimal::from(MSFT_PRICE))
+        .last_price_usdc(ed(&MSFT_PRICE.to_string()))
         .call()
         .await;
     assert_ne!(
@@ -1155,7 +1158,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let msft_placed = &events[16].payload["Placed"];
     assert_eq!(msft_placed["symbol"].as_str().unwrap(), TEST_MSFT);
     assert_eq!(msft_placed["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(msft_placed["shares"].as_str().unwrap(), "1.0");
+    assert_eq!(msft_placed["shares"].as_str().unwrap(), "1");
 
     // Poll and fill MSFT, both positions end fully hedged
     poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
@@ -1165,9 +1168,9 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .symbol(&aapl)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.2)))
+        .accumulated_short(FractionalShares::new(ed("1.2")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
     assert_position()
@@ -1175,9 +1178,9 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .symbol(&msft)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.0)))
+        .accumulated_short(FractionalShares::new(ed("1.0")))
         .pending(None)
-        .last_price_usdc(Decimal::from(MSFT_PRICE))
+        .last_price_usdc(ed(&MSFT_PRICE.to_string()))
         .call()
         .await;
 
@@ -1208,7 +1211,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.5))
+        .amount(ed("0.5"))
         .direction(Direction::Buy)
         .price(AAPL_PRICE)
         .call()
@@ -1220,11 +1223,11 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(0.5)))
-        .accumulated_long(FractionalShares::new(dec!(0.5)))
+        .net(FractionalShares::new(ed("0.5")))
+        .accumulated_long(FractionalShares::new(ed("0.5")))
         .accumulated_short(FractionalShares::ZERO)
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1232,7 +1235,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.7))
+        .amount(ed("0.7"))
         .direction(Direction::Buy)
         .price(AAPL_PRICE)
         .call()
@@ -1247,11 +1250,11 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(1.2)))
-        .accumulated_long(FractionalShares::new(dec!(1.2)))
+        .net(FractionalShares::new(ed("1.2")))
+        .accumulated_long(FractionalShares::new(ed("1.2")))
         .accumulated_short(FractionalShares::ZERO)
         .pending(Some(order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1303,10 +1306,10 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .query(&position_query)
         .symbol(&symbol)
         .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::new(dec!(1.2)))
+        .accumulated_long(FractionalShares::new(ed("1.2")))
         .accumulated_short(FractionalShares::ZERO)
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1330,7 +1333,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(1))
+        .amount(ed("1"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1344,11 +1347,11 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-1.0)))
+        .net(FractionalShares::new(ed("-1.0")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.0)))
+        .accumulated_short(FractionalShares::new(ed("1.0")))
         .pending(Some(order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1400,7 +1403,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(1))
+        .amount(ed("1"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1449,7 +1452,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(1))
+        .amount(ed("1"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1466,9 +1469,9 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .symbol(&symbol)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.0)))
+        .accumulated_short(FractionalShares::new(ed("1.0")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1476,7 +1479,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(1.5))
+        .amount(ed("1.5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1491,11 +1494,11 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-1.5)))
+        .net(FractionalShares::new(ed("-1.5")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(2.5)))
+        .accumulated_short(FractionalShares::new(ed("2.5")))
         .pending(Some(order2))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1506,9 +1509,9 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .symbol(&symbol)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(2.5)))
+        .accumulated_short(FractionalShares::new(ed("2.5")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1556,7 +1559,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(1))
+        .amount(ed("1"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1647,7 +1650,7 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.001))
+        .amount(ed("0.001"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1659,11 +1662,11 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-0.001)))
+        .net(FractionalShares::new(ed("-0.001")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(0.001)))
+        .accumulated_short(FractionalShares::new(ed("0.001")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1692,7 +1695,7 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(500))
+        .amount(ed("500"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1706,11 +1709,11 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-500)))
+        .net(FractionalShares::new(ed("-500")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(500)))
+        .accumulated_short(FractionalShares::new(ed("500")))
         .pending(Some(order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1750,7 +1753,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.8))
+        .amount(ed("0.8"))
         .direction(Direction::Buy)
         .price(AAPL_PRICE)
         .call()
@@ -1761,11 +1764,11 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(0.8)))
-        .accumulated_long(FractionalShares::new(dec!(0.8)))
+        .net(FractionalShares::new(ed("0.8")))
+        .accumulated_long(FractionalShares::new(ed("0.8")))
         .accumulated_short(FractionalShares::ZERO)
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1773,7 +1776,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.5))
+        .amount(ed("0.5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1784,11 +1787,11 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(0.3)))
-        .accumulated_long(FractionalShares::new(dec!(0.8)))
-        .accumulated_short(FractionalShares::new(dec!(0.5)))
+        .net(FractionalShares::new(ed("0.3")))
+        .accumulated_long(FractionalShares::new(ed("0.8")))
+        .accumulated_short(FractionalShares::new(ed("0.5")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1796,7 +1799,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let trade3 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.8))
+        .amount(ed("0.8"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1807,11 +1810,11 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-0.5)))
-        .accumulated_long(FractionalShares::new(dec!(0.8)))
-        .accumulated_short(FractionalShares::new(dec!(1.3)))
+        .net(FractionalShares::new(ed("-0.5")))
+        .accumulated_long(FractionalShares::new(ed("0.8")))
+        .accumulated_short(FractionalShares::new(ed("1.3")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1819,7 +1822,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let trade4 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.6))
+        .amount(ed("0.6"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1834,11 +1837,11 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-1.1)))
-        .accumulated_long(FractionalShares::new(dec!(0.8)))
-        .accumulated_short(FractionalShares::new(dec!(1.9)))
+        .net(FractionalShares::new(ed("-1.1")))
+        .accumulated_long(FractionalShares::new(ed("0.8")))
+        .accumulated_short(FractionalShares::new(ed("1.9")))
         .pending(Some(order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1878,10 +1881,10 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .query(&position_query)
         .symbol(&symbol)
         .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::new(dec!(0.8)))
-        .accumulated_short(FractionalShares::new(dec!(1.9)))
+        .accumulated_long(FractionalShares::new(ed("0.8")))
+        .accumulated_short(FractionalShares::new(ed("1.9")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1901,7 +1904,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(1.5))
+        .amount(ed("1.5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1916,11 +1919,11 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-1.5)))
+        .net(FractionalShares::new(ed("-1.5")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(1.5)))
+        .accumulated_short(FractionalShares::new(ed("1.5")))
         .pending(Some(order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1928,7 +1931,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.5))
+        .amount(ed("0.5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -1943,11 +1946,11 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-2.0)))
+        .net(FractionalShares::new(ed("-2.0")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(2.0)))
+        .accumulated_short(FractionalShares::new(ed("2.0")))
         .pending(Some(order_id))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -1988,7 +1991,7 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(0.5))
+        .amount(ed("0.5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -2051,11 +2054,11 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-0.5)))
+        .net(FractionalShares::new(ed("-0.5")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(0.5)))
+        .accumulated_short(FractionalShares::new(ed("0.5")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -2086,8 +2089,8 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     // max_shares=2, max_amount=$100, price=$100/share
     // Dollar cap in shares = $100 / $100 = 1 share (tighter than max_shares=2)
     let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(2))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+        max_shares: Positive::new(FractionalShares::new(ed("2"))).unwrap(),
+        max_amount: Positive::new(Usdc(ed("100"))).unwrap(),
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs_with_limits(&pool, limits.clone()).await;
@@ -2097,7 +2100,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(3))
+        .amount(ed("3"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -2110,11 +2113,11 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-3)))
+        .net(FractionalShares::new(ed("-3")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(3)))
+        .accumulated_short(FractionalShares::new(ed("3")))
         .pending(Some(order1))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -2136,11 +2139,11 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-2)))
+        .net(FractionalShares::new(ed("-2")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(3)))
+        .accumulated_short(FractionalShares::new(ed("3")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -2207,9 +2210,9 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         .symbol(&symbol)
         .net(FractionalShares::ZERO)
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(3)))
+        .accumulated_short(FractionalShares::new(ed("3")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -2248,8 +2251,8 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
 
     // max_shares=2 (binding), max_amount=$10000 (100-share equivalent, not binding)
     let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(2))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(10000))).unwrap(),
+        max_shares: Positive::new(FractionalShares::new(ed("2"))).unwrap(),
+        max_amount: Positive::new(Usdc(ed("10000"))).unwrap(),
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs_with_limits(&pool, limits.clone()).await;
@@ -2259,7 +2262,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     let trade1 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
-        .amount(dec!(5))
+        .amount(ed("5"))
         .direction(Direction::Sell)
         .price(AAPL_PRICE)
         .call()
@@ -2272,11 +2275,11 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-5)))
+        .net(FractionalShares::new(ed("-5")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(5)))
+        .accumulated_short(FractionalShares::new(ed("5")))
         .pending(Some(order1))
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -2311,11 +2314,11 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-5)))
+        .net(FractionalShares::new(ed("-5")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(5)))
+        .accumulated_short(FractionalShares::new(ed("5")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
@@ -2376,11 +2379,11 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-3)))
+        .net(FractionalShares::new(ed("-3")))
         .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(5)))
+        .accumulated_short(FractionalShares::new(ed("5")))
         .pending(None)
-        .last_price_usdc(Decimal::from(AAPL_PRICE))
+        .last_price_usdc(ed(&AAPL_PRICE.to_string()))
         .call()
         .await;
 

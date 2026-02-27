@@ -15,7 +15,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolEvent as _;
 use rain_math_float::Float;
-use rust_decimal::Decimal;
+use st0x_exact_decimal::ExactDecimal;
 use std::collections::HashMap;
 use url::Url;
 
@@ -363,8 +363,8 @@ impl<P: Provider + Clone> BaseChain<P> {
     pub async fn setup_order(
         &self,
         symbol: &str,
-        amount: Decimal,
-        price: Decimal,
+        amount: ExactDecimal,
+        price: ExactDecimal,
         direction: TakeDirection,
         usdc_vault_id: Option<B256>,
         rain_expression_override: Option<String>,
@@ -379,9 +379,9 @@ impl<P: Provider + Clone> BaseChain<P> {
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
-        let usdc_total = amount * price;
-        let amount_str = format!("{amount:.6}");
-        let usdc_total_str = format!("{usdc_total:.6}");
+        let usdc_total = (amount * price)?;
+        let amount_str = amount.round_dp(6)?.to_string();
+        let usdc_total_str = usdc_total.round_dp(6)?.to_string();
 
         let (input_token, output_token) = if is_sell {
             (USDC_BASE, equity_vault_addr)
@@ -606,8 +606,8 @@ impl<P: Provider + Clone> BaseChain<P> {
     pub async fn take_order(
         &self,
         symbol: &str,
-        amount: Decimal,
-        price: Decimal,
+        amount: ExactDecimal,
+        price: ExactDecimal,
         direction: TakeDirection,
         rain_expression_override: Option<String>,
     ) -> anyhow::Result<TakeOrderResult> {
@@ -621,9 +621,9 @@ impl<P: Provider + Clone> BaseChain<P> {
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
-        let usdc_total = amount * price;
-        let amount_str = format!("{amount:.6}");
-        let usdc_total_str = format!("{usdc_total:.6}");
+        let usdc_total = (amount * price)?;
+        let amount_str = amount.round_dp(6)?.to_string();
+        let usdc_total_str = usdc_total.round_dp(6)?.to_string();
 
         // Order: input = what order receives, output = what order gives
         let (input_token, output_token) = if is_sell {

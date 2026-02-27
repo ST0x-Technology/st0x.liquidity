@@ -4,13 +4,15 @@
 //! validates compatibility, and assembles the runtime [`Ctx`] that the rest
 //! of the application consumes.
 
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
 use alloy::primitives::{Address, FixedBytes};
 use clap::Parser;
-use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use std::path::{Path, PathBuf};
+use st0x_exact_decimal::ExactDecimal;
 use std::collections::HashMap;
 use tracing::Level;
 use url::Url;
@@ -30,6 +32,21 @@ use crate::rebalancing::{
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 use crate::wrapper::EquityTokenAddresses;
+
+/// Schwab minimum execution threshold: 1 share.
+static SCHWAB_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(|| {
+    Positive::new(FractionalShares::new(
+        ExactDecimal::parse("1").unwrap_or_else(|_| ExactDecimal::zero()),
+    ))
+    .unwrap_or_else(|_| {
+        // Positive::new only fails for zero/negative — "1" is always positive.
+        unreachable!()
+    })
+});
+
+/// Alpaca minimum execution threshold: $2.
+static ALPACA_MIN_DOLLARS: LazyLock<Usdc> =
+    LazyLock::new(|| Usdc(ExactDecimal::parse("2").unwrap_or_else(|_| ExactDecimal::zero())));
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -164,11 +181,9 @@ impl BrokerCtx {
 
     pub fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
-            Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(
-                Positive::<FractionalShares>::ONE,
-            )),
+            Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(*SCHWAB_MIN_SHARES)),
             Self::AlpacaTradingApi(_) | Self::AlpacaBrokerApi(_) => {
-                Ok(ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))?)
+                Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?)
             }
         }
     }
@@ -406,7 +421,7 @@ impl Ctx {
         if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits
             && usdc_rebalancing_enabled
         {
-            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+            let minimum = *crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
             if max_amount.inner() < minimum {
                 return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
                     configured: max_amount.inner(),
@@ -571,7 +586,6 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
-    use rust_decimal_macros::dec;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -580,6 +594,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -817,8 +835,8 @@ pub(crate) mod tests {
         else {
             panic!("Expected Enabled, got {:?}", ctx.operational_limits);
         };
-        assert_eq!(max_amount.inner(), Usdc(dec!(100)));
-        assert_eq!(max_shares.inner(), FractionalShares::new(dec!(2)));
+        assert_eq!(max_amount.inner(), Usdc(ed("100")));
+        assert_eq!(max_shares.inner(), FractionalShares::new(ed("2")));
     }
 
     #[tokio::test]
@@ -872,7 +890,7 @@ pub(crate) mod tests {
         let OperationalLimits::Enabled { max_amount, .. } = ctx.operational_limits else {
             panic!("Expected Enabled");
         };
-        assert_eq!(max_amount.inner(), Usdc(dec!(50)));
+        assert_eq!(max_amount.inner(), Usdc(ed("50")));
     }
 
     #[tokio::test]
@@ -1233,7 +1251,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             ctx.execution_threshold,
-            ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(ed("1"))).unwrap())
         );
     }
 
@@ -1246,7 +1264,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             ctx.execution_threshold,
-            ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(ed("1"))).unwrap())
         );
     }
 
@@ -1268,7 +1286,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc(ed("2"))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 
@@ -1291,7 +1309,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc(ed("2"))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 

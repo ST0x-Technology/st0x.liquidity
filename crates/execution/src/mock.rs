@@ -1,11 +1,18 @@
-use async_trait::async_trait;
-use rust_decimal_macros::dec;
+use std::sync::LazyLock;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+
+use async_trait::async_trait;
+use rain_math_float::FloatError;
+use st0x_exact_decimal::ExactDecimal;
 use tokio::task::JoinHandle;
 use tracing::warn;
+
+/// Hardcoded mock price returned by `MockExecutor::get_order_status`.
+static MOCK_FILL_PRICE: LazyLock<Result<ExactDecimal, FloatError>> =
+    LazyLock::new(|| ExactDecimal::parse("100"));
 
 use crate::{
     ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement, OrderState,
@@ -142,10 +149,18 @@ impl Executor for MockExecutor {
         warn!("[TEST] Returning mock FILLED status with test price");
 
         // Always return filled status in test mode with mock price
+        let price =
+            MOCK_FILL_PRICE
+                .as_ref()
+                .copied()
+                .map_err(|error| ExecutionError::MockFailure {
+                    message: format!("mock fill price parse failed: {error}"),
+                })?;
+
         Ok(OrderState::Filled {
             executed_at: chrono::Utc::now(),
             order_id: order_id.clone(),
-            price: dec!(100.00),
+            price,
         })
     }
 
@@ -186,11 +201,16 @@ impl TryIntoExecutor for MockExecutorCtx {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
-
     use super::*;
     use crate::{Direction, FractionalShares, Positive, Symbol};
+
+    fn shares(value: &str) -> FractionalShares {
+        FractionalShares::new(ExactDecimal::parse(value).unwrap())
+    }
+
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        Positive::new(shares(value)).unwrap()
+    }
 
     #[tokio::test]
     async fn test_try_from_ctx_success() {
@@ -216,10 +236,9 @@ mod tests {
     #[tokio::test]
     async fn test_place_market_order_success() {
         let executor = MockExecutor::new();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares,
+            shares: positive_shares("10"),
             direction: Direction::Buy,
         };
 
@@ -227,10 +246,7 @@ mod tests {
 
         assert!(placement.order_id.starts_with("TEST_"));
         assert_eq!(placement.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(
-            placement.shares,
-            Positive::new(FractionalShares::new(Decimal::from(10))).unwrap()
-        );
+        assert_eq!(placement.shares, positive_shares("10"));
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -239,7 +255,7 @@ mod tests {
         let executor = MockExecutor::with_failure("Simulated API error");
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(10))).unwrap(),
+            shares: positive_shares("10"),
             direction: Direction::Buy,
         };
 
@@ -287,8 +303,8 @@ mod tests {
         let inventory = crate::Inventory {
             positions: vec![crate::EquityPosition {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(Decimal::from(100)),
-                market_value: Some(dec!(15000)),
+                quantity: shares("100"),
+                market_value: Some(ExactDecimal::parse("15000").unwrap()),
             }],
             cash_balance_cents: 5_000_000,
         };
@@ -301,10 +317,7 @@ mod tests {
             InventoryResult::Fetched(fetched) => {
                 assert_eq!(fetched.positions.len(), 1);
                 assert_eq!(fetched.positions[0].symbol, Symbol::new("AAPL").unwrap());
-                assert_eq!(
-                    fetched.positions[0].quantity,
-                    FractionalShares::new(Decimal::from(100))
-                );
+                assert_eq!(fetched.positions[0].quantity, shares("100"));
                 assert_eq!(fetched.cash_balance_cents, 5_000_000);
             }
             InventoryResult::Unimplemented => {

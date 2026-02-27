@@ -247,9 +247,8 @@ mod tests {
     use alloy::primitives::{B256, TxHash, address, b256};
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Provider, ProviderBuilder};
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use sqlx::{Row, SqlitePool};
+    use st0x_exact_decimal::ExactDecimal;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
@@ -281,8 +280,12 @@ mod tests {
         Symbol::new(s).unwrap()
     }
 
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
+
     fn test_shares(n: i64) -> FractionalShares {
-        FractionalShares::new(Decimal::from(n))
+        FractionalShares::new(ed(&n.to_string()))
     }
 
     async fn create_test_raindex_service(
@@ -315,12 +318,12 @@ mod tests {
                 EquityPosition {
                     symbol: test_symbol("AAPL"),
                     quantity: test_shares(100),
-                    market_value: Some(dec!(15000)),
+                    market_value: Some(ed("15000")),
                 },
                 EquityPosition {
                     symbol: test_symbol("MSFT"),
                     quantity: test_shares(50),
-                    market_value: Some(dec!(20000)),
+                    market_value: Some(ed("20000")),
                 },
             ],
             cash_balance_cents: 10_000_000,
@@ -499,7 +502,7 @@ mod tests {
             positions: vec![EquityPosition {
                 symbol: test_symbol("AAPL"),
                 quantity: test_shares(1000),
-                market_value: Some(dec!(150000)),
+                market_value: Some(ed("150000")),
             }],
             cash_balance_cents: -5_000_000, // -$50,000 (margin debt)
         };
@@ -541,12 +544,12 @@ mod tests {
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
-        let fractional_qty = FractionalShares::new(dec!(12.345)); // 12.345 shares
+        let fractional_qty = FractionalShares::new(ed("12.345")); // 12.345 shares
         let inventory = Inventory {
             positions: vec![EquityPosition {
                 symbol: test_symbol("AAPL"),
                 quantity: fractional_qty,
-                market_value: Some(dec!(1851.75)),
+                market_value: Some(ed("1851.75")),
             }],
             cash_balance_cents: 1_000_000,
         };
