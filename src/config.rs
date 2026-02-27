@@ -10,13 +10,15 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::Level;
 use url::Url;
 
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
-    AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
+    AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
+    TimeInForce,
 };
 
 use crate::offchain::order_poller::OrderPollerCtx;
@@ -27,6 +29,7 @@ use crate::rebalancing::{
 };
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
+use crate::wrapper::EquityTokenAddresses;
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -66,6 +69,7 @@ struct Config {
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
+    equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 /// Secret credentials deserialized from the encrypted secrets TOML.
@@ -132,6 +136,7 @@ pub struct Ctx {
     pub telemetry: Option<TelemetryCtx>,
     pub(crate) trading_mode: TradingMode,
     pub(crate) execution_threshold: ExecutionThreshold,
+    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -277,6 +282,7 @@ impl std::fmt::Debug for Ctx {
             .field("telemetry", &self.telemetry)
             .field("trading_mode", &self.trading_mode)
             .field("execution_threshold", &self.execution_threshold)
+            .field("equities", &self.equities)
             .finish()
     }
 }
@@ -415,6 +421,7 @@ impl Ctx {
             telemetry,
             trading_mode,
             execution_threshold,
+            equities: config.equities,
         })
     }
 
@@ -446,6 +453,16 @@ impl Ctx {
             TradingMode::Standalone { order_owner } => *order_owner,
             TradingMode::Rebalancing(ctx) => ctx.base_wallet().address(),
         }
+    }
+
+    /// Returns whether the given asset is enabled for trading and rebalancing.
+    ///
+    /// Assets not present in the equity config are treated as enabled
+    /// by default.
+    pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
+        self.equities
+            .get(symbol)
+            .is_none_or(|equity| equity.enabled)
     }
 }
 
@@ -587,6 +604,7 @@ pub(crate) mod tests {
             telemetry: None,
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 
@@ -595,8 +613,12 @@ pub(crate) mod tests {
         file.write_all(
             br#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -613,6 +635,7 @@ pub(crate) mod tests {
             br#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "dry-run"
         "#,
@@ -627,6 +650,7 @@ pub(crate) mod tests {
             br#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "schwab"
             app_key = "test_key"
@@ -643,8 +667,12 @@ pub(crate) mod tests {
         file.write_all(
             br#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
@@ -750,10 +778,14 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "enabled"
             max_amount = "100"
             max_shares = "2"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -781,6 +813,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -804,10 +837,14 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "enabled"
             max_amount = "50"
             max_shares = "2"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -834,8 +871,12 @@ pub(crate) mod tests {
             server_port = 9090
             order_polling_interval = 30
             order_polling_max_jitter = 10
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -859,6 +900,7 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "schwab"
             app_key = "test_key"
@@ -876,11 +918,16 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
@@ -890,8 +937,6 @@ pub(crate) mod tests {
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
-
-            [rebalancing.equities]
 
             [rebalancing.equity]
             target = "0.5"
@@ -955,27 +1000,36 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities.tEXAMPLE]
+            enabled = true
+            unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
             deployment_block = 1
+
             [hyperdx]
             service_name = "st0x-hedge"
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
+
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"
-            [rebalancing.equities.tEXAMPLE]
-            unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
+
             [rebalancing.usdc]
             mode = "disabled"
         "#,
@@ -995,12 +1049,17 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
+
             [hyperdx]
             service_name = "test-service"
         "#,
@@ -1010,8 +1069,10 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "dry-run"
+
             [hyperdx]
             api_key = "test-api-key"
         "#,
@@ -1030,12 +1091,17 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
+
             [hyperdx]
             service_name = "test-service"
         "#,
@@ -1061,8 +1127,10 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "dry-run"
+
             [hyperdx]
             api_key = "test-api-key"
         "#,
@@ -1085,11 +1153,16 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
@@ -1099,8 +1172,6 @@ pub(crate) mod tests {
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
-
-            [rebalancing.equities]
 
             [rebalancing.equity]
             target = "0.5"
@@ -1115,6 +1186,7 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "alpaca-broker-api"
             api_key = "test-key"
@@ -1163,6 +1235,7 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "alpaca-trading-api"
             api_key = "test-key"
@@ -1184,6 +1257,7 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "alpaca-broker-api"
             api_key = "test-key"
@@ -1217,11 +1291,13 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "schwab"
             app_key = "test_key"
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
@@ -1233,23 +1309,30 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+
+            [equities]
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
+
             [rebalancing.fireblocks_chain_asset_ids]
             1 = "ETH"
             8453 = "BASECHAIN_ETH"
-            [rebalancing.equities]
+
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
+
             [rebalancing.usdc]
             mode = "enabled"
             target = "0.5"
@@ -1293,8 +1376,10 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
             bogus_field = "should fail"
+
             [operational_limits]
             mode = "disabled"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1320,6 +1405,7 @@ pub(crate) mod tests {
             [evm]
             ws_rpc_url = "ws://localhost:8545"
             extra_secret = "should fail"
+
             [broker]
             type = "dry-run"
         "#,
@@ -1341,6 +1427,7 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+
             [broker]
             type = "alpaca-broker-api"
             api_key = "key"

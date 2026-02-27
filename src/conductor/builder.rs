@@ -206,6 +206,7 @@ where
             self.common.frameworks.offchain_order.clone(),
             self.common.execution_threshold,
             self.common.ctx.operational_limits.clone(),
+            self.common.ctx.clone(),
         );
         let trade_cqrs = super::TradeProcessingCqrs {
             onchain_trade: self.common.frameworks.onchain_trade,

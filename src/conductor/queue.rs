@@ -170,7 +170,18 @@ where
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
 
-    process_queued_trade(executor, pool, &queued_event, event_id, trade, cqrs).await
+    let asset_enabled = ctx.is_asset_enabled(trade.symbol.base());
+
+    process_queued_trade(
+        executor,
+        pool,
+        &queued_event,
+        event_id,
+        trade,
+        cqrs,
+        asset_enabled,
+    )
+    .await
 }
 
 fn event_type_name(event: &TradeEvent) -> &'static str {
@@ -195,6 +206,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
     event_id: i64,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
+    asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
@@ -217,6 +229,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
         base_symbol,
         executor_type,
         &cqrs.operational_limits,
+        asset_enabled,
     )
     .await?
     else {
@@ -402,6 +415,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await;
 
@@ -450,6 +464,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await;
 
@@ -501,6 +516,7 @@ mod tests {
             event_id_1,
             trade_1,
             &cqrs,
+            true,
         )
         .await;
 
@@ -520,6 +536,7 @@ mod tests {
             event_id_2,
             trade_2,
             &cqrs,
+            true,
         )
         .await;
 
@@ -561,6 +578,7 @@ mod tests {
             event_id,
             trade,
             &cqrs,
+            true,
         )
         .await
         .unwrap();
@@ -569,6 +587,55 @@ mod tests {
         assert_eq!(
             unprocessed_after, 0,
             "Event should be marked processed regardless of threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_asset_accumulates_position_without_placing_order() {
+        let pool = setup_test_db().await;
+        let frameworks = create_test_cqrs_frameworks(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_test_event(&pool, 50).await;
+        let trade = test_trade(5.0, 50);
+
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.unwrap().is_none(),
+            "Disabled asset should not trigger execution even above threshold"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(
+            position.net.inner(),
+            dec!(5.0),
+            "Position should still accumulate despite asset being disabled"
+        );
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "No offchain order should be pending for disabled asset"
+        );
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "Event should be marked processed even for disabled asset"
         );
     }
 }

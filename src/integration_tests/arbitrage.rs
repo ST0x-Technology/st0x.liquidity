@@ -123,6 +123,7 @@ impl AnvilTrade {
             event_id,
             self.trade.clone(),
             cqrs,
+            true,
         )
         .await
     }
@@ -895,6 +896,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &OperationalLimits::Disabled,
+        |_| true,
     )
     .await?;
 
@@ -1419,6 +1421,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &OperationalLimits::Disabled,
+        |_| true,
     )
     .await?;
 
@@ -2149,6 +2152,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &limits,
+        |_| true,
     )
     .await?;
 
@@ -2177,6 +2181,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &limits,
+        |_| true,
     )
     .await?;
 
@@ -2217,6 +2222,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &limits,
+        |_| true,
     )
     .await?;
     let events_after = fetch_events(&pool).await;
@@ -2321,6 +2327,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &limits,
+        |_| true,
     )
     .await?;
 
@@ -2353,6 +2360,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &limits,
+        |_| true,
     )
     .await?;
     let events_after = fetch_events(&pool).await;

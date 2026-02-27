@@ -20,6 +20,8 @@
   [#315 go live prod configuration](https://github.com/ST0x-Technology/st0x.liquidity/pull/315)
 
 - [ ] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
+  - PR (draft):
+    [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
 
 #### Wrapped Token Handling
 

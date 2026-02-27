@@ -21,6 +21,7 @@ const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0,
 pub struct EquityTokenAddresses {
     pub wrapped: Address,
     pub unwrapped: Address,
+    pub enabled: bool,
 }
 
 /// Service for managing ERC-4626 token wrapping/unwrapping operations.
@@ -220,6 +221,7 @@ mod tests {
         EquityTokenAddresses {
             wrapped: Address::random(),
             unwrapped: Address::random(),
+            enabled: true,
         }
     }
 
@@ -319,6 +321,16 @@ mod tests {
                     if symbol.to_string() == "tXYZ"
             ),
             "expected SymbolNotConfigured for tXYZ, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn enabled_is_required() {
+        let json = r#"{"wrapped": "0x1111111111111111111111111111111111111111", "unwrapped": "0x2222222222222222222222222222222222222222"}"#;
+        let result = serde_json::from_str::<EquityTokenAddresses>(json);
+        assert!(
+            result.is_err(),
+            "omitting `enabled` should fail deserialization"
         );
     }
 }

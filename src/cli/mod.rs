@@ -800,6 +800,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
@@ -1289,6 +1290,7 @@ mod tests {
             telemetry: None,
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 
@@ -2327,8 +2329,12 @@ mod tests {
             &config_path,
             r#"
                 database_url = ":memory:"
+
+                [equities]
+
                 [operational_limits]
                 mode = "disabled"
+
                 [evm]
                 orderbook = "0x1111111111111111111111111111111111111111"
                 deployment_block = 1
@@ -2343,6 +2349,7 @@ mod tests {
             r#"
                 [evm]
                 ws_rpc_url = "ws://localhost:8545"
+
                 [broker]
                 type = "dry-run"
             "#,

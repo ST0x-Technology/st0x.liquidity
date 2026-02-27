@@ -16,6 +16,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
@@ -115,6 +116,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             deviation: dec!(0.2),
         },
         limits: OperationalLimits::Disabled,
+        disabled_assets: HashSet::new(),
     }
 }
 
@@ -1095,6 +1097,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             deviation: dec!(0.2),
         },
         limits,
+        disabled_assets: HashSet::new(),
     };
 
     let (sender, mut receiver) = mpsc::channel(10);
@@ -1205,6 +1208,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             deviation: dec!(0.2),
         },
         limits,
+        disabled_assets: HashSet::new(),
     };
 
     let (sender, mut receiver) = mpsc::channel(10);
@@ -1297,6 +1301,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: dec!(0.4),
             },
             limits: OperationalLimits::Disabled,
+            disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -1344,6 +1349,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: dec!(0.1),
             },
             limits: OperationalLimits::Disabled,
+            disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());

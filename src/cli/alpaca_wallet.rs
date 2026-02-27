@@ -555,6 +555,7 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 
@@ -609,6 +610,7 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
+            equities: HashMap::new(),
             trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
                 ImbalanceThreshold {
                     target: dec!(0.5),
@@ -625,7 +627,6 @@ mod tests {
                     asset_cache_ttl: std::time::Duration::from_secs(3600),
                     time_in_force: TimeInForce::default(),
                 },
-                HashMap::new(),
             ))),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
