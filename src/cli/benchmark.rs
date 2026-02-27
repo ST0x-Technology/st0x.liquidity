@@ -22,6 +22,7 @@ use st0x_execution::{
 };
 
 use crate::config::{BrokerCtx, Ctx};
+use crate::onchain::io::{OneToOneTokenizedShares, TokenizedSymbol};
 use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
 use crate::tokenized_equity_mint::IssuerRequestId;
 
@@ -53,7 +54,16 @@ pub(super) async fn alpaca_benchmark_command<W: Write>(
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
-    let tokenized_key = Symbol::new(format!("t{symbol}"))?;
+    if let Ok(parsed) = TokenizedSymbol::<OneToOneTokenizedShares>::parse(&symbol.to_string()) {
+        anyhow::bail!(
+            "Expected underlying symbol but got tokenized symbol \
+             {symbol}. Use the underlying symbol instead, e.g. -s {}",
+            parsed.base(),
+        );
+    }
+
+    let tokenized = TokenizedSymbol::<OneToOneTokenizedShares>::from_base(symbol.clone());
+    let tokenized_key = Symbol::new(tokenized.to_string())?;
     let token_addresses = ctx.equities.get(&tokenized_key).ok_or_else(|| {
         anyhow::anyhow!(
             "No equity configured for {symbol} (looked up {tokenized_key} in equities config)"
