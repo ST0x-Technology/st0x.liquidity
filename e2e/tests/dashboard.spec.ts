@@ -18,7 +18,7 @@ test.describe('dashboard', () => {
     await expect(page.getByText('Spreads')).toBeVisible()
     await expect(page.getByText('Trade Log')).toBeVisible()
     await expect(page.getByText('Inventory')).toBeVisible()
-    await expect(page.getByText('Rebalancing')).toBeVisible()
+    await expect(page.getByText('Rebalancing', { exact: true })).toBeVisible()
 
     await expect(page).toHaveScreenshot('dashboard-full.png', { fullPage: true })
   })
@@ -30,7 +30,7 @@ test.describe('dashboard', () => {
     await expect(placeholders.first()).toBeVisible()
 
     for (const label of ['P&L', 'Volume', 'Trades', 'Hedge Lag', 'Uptime', 'Sharpe']) {
-      await expect(page.getByText(label)).toBeVisible()
+      await expect(page.getByText(label, { exact: true })).toBeVisible()
     }
   })
 

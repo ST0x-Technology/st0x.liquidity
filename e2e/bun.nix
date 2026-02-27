@@ -6,25 +6,25 @@
 # or `pkgs.callPackage` if you wish to handle
 # it manually.
 { copyPathToStore, fetchFromGitHub, fetchgit, fetchurl, ... }: {
-  "@playwright/test@1.58.2" = fetchurl {
-    url = "https://registry.npmjs.org/@playwright/test/-/test-1.58.2.tgz";
+  "@playwright/test@1.54.1" = fetchurl {
+    url = "https://registry.npmjs.org/@playwright/test/-/test-1.54.1.tgz";
     hash =
-      "sha512-akea+6bHYBBfA9uQqSYmlJXn61cTa+jbO87xVLCWbTqbWadRVmhxlXATaOjOgcBaWU4ePo0wB41KMFv3o35IXA==";
+      "sha512-FS8hQ12acieG2dYSksmLOF7BNxnVf2afRJdCuM1eMSxj6QTSE6G4InGF7oApGgDb65MX7AwMVlIkpru0yZA4Xw==";
   };
   "fsevents@2.3.2" = fetchurl {
     url = "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz";
     hash =
       "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==";
   };
-  "playwright-core@1.58.2" = fetchurl {
+  "playwright-core@1.54.1" = fetchurl {
     url =
-      "https://registry.npmjs.org/playwright-core/-/playwright-core-1.58.2.tgz";
+      "https://registry.npmjs.org/playwright-core/-/playwright-core-1.54.1.tgz";
     hash =
-      "sha512-yZkEtftgwS8CsfYo7nm0KE8jsvm6i/PTgVtB8DL726wNf6H2IMsDuxCpJj59KDaxCtSnrWan2AeDqM7JBaultg==";
+      "sha512-Nbjs2zjj0htNhzgiy5wu+3w09YetDx5pkrpI/kZotDlDUaYk0HVA5xrBVPdow4SAUIlhgKcJeJg4GRKW6xHusA==";
   };
-  "playwright@1.58.2" = fetchurl {
-    url = "https://registry.npmjs.org/playwright/-/playwright-1.58.2.tgz";
+  "playwright@1.54.1" = fetchurl {
+    url = "https://registry.npmjs.org/playwright/-/playwright-1.54.1.tgz";
     hash =
-      "sha512-vA30H8Nvkq/cPBnNw4Q8TWz1EJyqgpuinBcHET0YVJVFldr8JDNiU9LaWAE1KqSkRYazuaBhTpB5ZzShOezQ6A==";
+      "sha512-peWpSwIBmSLi6aW2auvrUtf2DqY16YYcCMO8rTVx486jKmDTJg7UAhyrraP98GB8BoPURZP8+nxO7TSd4cPr5g==";
   };
 }
