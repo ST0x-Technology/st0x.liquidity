@@ -587,6 +587,15 @@ assignments is useless; test actual behavior like
   subsequent code changes will introduce new lint issues. Complete every task on
   the list first (`cargo check` + `cargo test` passing), then run clippy as a
   final pass before handing over.
+- **Mandatory refactoring pass**: After getting code working (check + test
+  passing), review ALL new code for useless abstractions before running clippy.
+  Remove: one-liner wrapper functions, traits with a single implementation that
+  just delegate, enum/struct hierarchies that mirror another type 1:1 without
+  adding information, indirection layers that exist "for structure" but carry no
+  semantic meaning. If a function body is a single call/expression, inline it.
+  If an abstraction doesn't make invalid states unrepresentable or decouple
+  independent concerns, delete it. Getting something working is step one; making
+  it not embarrassing is step two.
 
 #### CRITICAL: Quality Control Policy
 

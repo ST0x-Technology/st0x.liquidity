@@ -14,6 +14,24 @@ use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Positive};
 use std::ops::{Add, Mul, Sub};
 use std::str::FromStr;
 
+/// A USD dollar amount (e.g., fees from Alpaca tokenization).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Usd(pub(crate) Decimal);
+
+impl Display for Usd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for Usd {
+    type Err = rust_decimal::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Decimal::from_str(s).map(Self)
+    }
+}
+
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Usdc(pub(crate) Decimal);

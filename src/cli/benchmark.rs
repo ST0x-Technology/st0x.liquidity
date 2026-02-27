@@ -1,0 +1,724 @@
+//! Alpaca tokenization benchmarking command.
+//!
+//! Runs N round trips (buy -> mint -> redeem -> sell) for a given
+//! symbol and produces a TSV report with timing data and a CLI
+//! summary with min/max/avg/median statistics.
+
+use alloy::primitives::Address;
+use chrono::{DateTime, Utc};
+use csv::WriterBuilder;
+use serde::Serialize;
+use std::fmt::Display;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::info;
+
+use st0x_evm::Wallet;
+use st0x_execution::{
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Direction, Executor,
+    FractionalShares, MarketOrder, OrderState, Positive, Symbol, TimeInForce,
+};
+
+use crate::config::{BrokerCtx, Ctx};
+use crate::threshold::Usd;
+use crate::tokenization::{AlpacaTokenizationService, TokenizationRequestStatus, Tokenizer};
+use crate::tokenized_equity_mint::IssuerRequestId;
+
+/// Direction of a single benchmark measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BenchmarkDirection {
+    Mint,
+    Redeem,
+}
+
+impl Display for BenchmarkDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mint => write!(f, "mint"),
+            Self::Redeem => write!(f, "redeem"),
+        }
+    }
+}
+
+/// A single row in the benchmark TSV report.
+#[derive(Debug, Clone)]
+pub(crate) struct BenchmarkRow {
+    pub(crate) trip: usize,
+    pub(crate) direction: BenchmarkDirection,
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) completed_at: DateTime<Utc>,
+    pub(crate) duration: Duration,
+    pub(crate) fees: Option<Usd>,
+    pub(crate) status: TokenizationRequestStatus,
+}
+
+/// Benchmark results for a series of round trips.
+pub(crate) struct BenchmarkSummary {
+    pub(crate) symbol: Symbol,
+    pub(crate) round_trips: usize,
+    pub(crate) rows: Vec<BenchmarkRow>,
+}
+
+/// Flat record for csv crate serialization.
+#[derive(Serialize)]
+struct TsvRecord {
+    trip: usize,
+    direction: String,
+    started_at: String,
+    completed_at: String,
+    duration_secs: String,
+    fees: String,
+    status: String,
+}
+
+impl From<&BenchmarkRow> for TsvRecord {
+    fn from(row: &BenchmarkRow) -> Self {
+        Self {
+            trip: row.trip,
+            direction: row.direction.to_string(),
+            started_at: row.started_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            completed_at: row.completed_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            duration_secs: format!("{:.1}", row.duration.as_secs_f64()),
+            fees: row
+                .fees
+                .as_ref()
+                .map_or_else(String::new, ToString::to_string),
+            status: row.status.to_string(),
+        }
+    }
+}
+
+fn tsv_writer<W: Write>(writer: W) -> csv::Writer<W> {
+    WriterBuilder::new().delimiter(b'\t').from_writer(writer)
+}
+
+/// Duration statistics (min, max, avg, median).
+struct DurationStats {
+    min: Duration,
+    max: Duration,
+    avg: Duration,
+    median: Duration,
+}
+
+impl DurationStats {
+    fn compute(durations: &mut [Duration]) -> Option<Self> {
+        if durations.is_empty() {
+            return None;
+        }
+
+        durations.sort();
+
+        let min = durations[0];
+        let max = durations[durations.len() - 1];
+
+        let total: Duration = durations.iter().sum();
+        let count = u32::try_from(durations.len()).unwrap_or(u32::MAX);
+        let avg = total / count;
+
+        let median = if durations.len() % 2 == 0 {
+            let midpoint = durations.len() / 2;
+            (durations[midpoint - 1] + durations[midpoint]) / 2
+        } else {
+            durations[durations.len() / 2]
+        };
+
+        Some(Self {
+            min,
+            max,
+            avg,
+            median,
+        })
+    }
+}
+
+impl BenchmarkSummary {
+    /// Write the full TSV report (header + all rows).
+    #[cfg(test)]
+    fn write_tsv<W: Write>(&self, writer: W) -> csv::Result<()> {
+        let mut tsv = tsv_writer(writer);
+
+        for row in &self.rows {
+            tsv.serialize(TsvRecord::from(row))?;
+        }
+
+        tsv.flush()?;
+        Ok(())
+    }
+
+    /// Write the CLI summary table to the given writer.
+    pub(crate) fn write_summary<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writeln!(
+            writer,
+            "Benchmark complete: {} round trips for {}",
+            self.round_trips, self.symbol,
+        )?;
+        writeln!(writer)?;
+
+        let mut mint_durations: Vec<Duration> = self
+            .rows
+            .iter()
+            .filter(|row| row.direction == BenchmarkDirection::Mint)
+            .map(|row| row.duration)
+            .collect();
+
+        let mut redeem_durations: Vec<Duration> = self
+            .rows
+            .iter()
+            .filter(|row| row.direction == BenchmarkDirection::Redeem)
+            .map(|row| row.duration)
+            .collect();
+
+        let mut full_trip_durations: Vec<Duration> =
+            (1..=self.round_trips)
+                .filter_map(|trip| {
+                    let mint = self.rows.iter().find(|row| {
+                        row.trip == trip && row.direction == BenchmarkDirection::Mint
+                    })?;
+                    let redeem = self.rows.iter().find(|row| {
+                        row.trip == trip && row.direction == BenchmarkDirection::Redeem
+                    })?;
+                    Some(mint.duration + redeem.duration)
+                })
+                .collect();
+
+        writeln!(
+            writer,
+            "{:<11}| {:<8}| {:<8}| {:<8}| Median",
+            "Direction", "Min", "Max", "Avg",
+        )?;
+        writeln!(writer, "-----------+---------+---------+---------+--------",)?;
+
+        if let Some(stats) = DurationStats::compute(&mut mint_durations) {
+            write_stats_row(writer, "Mint", &stats)?;
+        }
+
+        if let Some(stats) = DurationStats::compute(&mut redeem_durations) {
+            write_stats_row(writer, "Redeem", &stats)?;
+        }
+
+        if let Some(stats) = DurationStats::compute(&mut full_trip_durations) {
+            write_stats_row(writer, "Full trip", &stats)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn format_duration(duration: &Duration) -> String {
+    format!("{:.1}s", duration.as_secs_f64())
+}
+
+fn write_stats_row<W: Write>(
+    writer: &mut W,
+    label: &str,
+    stats: &DurationStats,
+) -> std::io::Result<()> {
+    writeln!(
+        writer,
+        "{:<11}| {:<8}| {:<8}| {:<8}| {}",
+        label,
+        format_duration(&stats.min),
+        format_duration(&stats.max),
+        format_duration(&stats.avg),
+        format_duration(&stats.median),
+    )
+}
+
+/// Default order polling interval.
+const ORDER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum order polling attempts before giving up.
+const ORDER_POLL_MAX_ATTEMPTS: usize = 150;
+
+/// Poll an executor order until it reaches a terminal state.
+async fn poll_order_until_filled(
+    executor: &AlpacaBrokerApi,
+    order_id: &<AlpacaBrokerApi as Executor>::OrderId,
+) -> anyhow::Result<()> {
+    for _attempt in 0..ORDER_POLL_MAX_ATTEMPTS {
+        let state = executor.get_order_status(order_id).await?;
+
+        match state {
+            OrderState::Filled { .. } => return Ok(()),
+            OrderState::Failed { error_reason, .. } => {
+                anyhow::bail!(
+                    "Order failed: {}",
+                    error_reason.unwrap_or_else(|| "unknown".to_string()),
+                );
+            }
+            OrderState::Pending | OrderState::Submitted { .. } => {
+                tokio::time::sleep(ORDER_POLL_INTERVAL).await;
+            }
+        }
+    }
+
+    anyhow::bail!("Order polling timed out after {ORDER_POLL_MAX_ATTEMPTS} attempts")
+}
+
+/// Measure a single mint operation and return the benchmark row.
+async fn measure_mint(
+    tokenization_service: &AlpacaTokenizationService<impl Wallet>,
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    wallet: Address,
+    trip: usize,
+) -> anyhow::Result<BenchmarkRow> {
+    let started_at = Utc::now();
+    let start_instant = tokio::time::Instant::now();
+
+    let issuer_request_id = IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
+
+    let mint_request = tokenization_service
+        .request_mint(symbol.clone(), quantity, wallet, issuer_request_id)
+        .await?;
+
+    let completed = tokenization_service
+        .poll_mint_until_complete(&mint_request.id)
+        .await?;
+
+    let duration = start_instant.elapsed();
+
+    Ok(BenchmarkRow {
+        trip,
+        direction: BenchmarkDirection::Mint,
+        started_at,
+        completed_at: Utc::now(),
+        duration,
+        fees: completed.fees,
+        status: completed.status,
+    })
+}
+
+/// Measure a single redemption operation and return the benchmark row.
+async fn measure_redeem(
+    tokenization_service: &AlpacaTokenizationService<impl Wallet>,
+    token: Address,
+    quantity: FractionalShares,
+    trip: usize,
+) -> anyhow::Result<BenchmarkRow> {
+    let started_at = Utc::now();
+    let start_instant = tokio::time::Instant::now();
+
+    let amount = quantity.to_u256_18_decimals()?;
+
+    let tx_hash = Tokenizer::send_for_redemption(tokenization_service, token, amount).await?;
+    info!(tx_hash = %tx_hash, "Redemption transfer sent");
+
+    let redemption_request = Tokenizer::poll_for_redemption(tokenization_service, &tx_hash).await?;
+
+    let completed =
+        Tokenizer::poll_redemption_until_complete(tokenization_service, &redemption_request.id)
+            .await?;
+
+    let duration = start_instant.elapsed();
+
+    Ok(BenchmarkRow {
+        trip,
+        direction: BenchmarkDirection::Redeem,
+        started_at,
+        completed_at: Utc::now(),
+        duration,
+        fees: completed.fees,
+        status: completed.status,
+    })
+}
+
+/// Run the Alpaca tokenization benchmark.
+pub(super) async fn alpaca_benchmark_command<W: Write>(
+    stdout: &mut W,
+    symbol: Symbol,
+    round_trips: usize,
+    quantity: Positive<FractionalShares>,
+    output_path: Option<PathBuf>,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-benchmark requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+
+    let token_addresses = ctx.equities.get(&symbol).ok_or_else(|| {
+        anyhow::anyhow!("No token addresses configured for {symbol} in equities config")
+    })?;
+
+    let token = token_addresses.unwrapped;
+    let wallet = rebalancing_ctx.base_wallet().address();
+
+    writeln!(stdout, "Starting Alpaca tokenization benchmark")?;
+    writeln!(stdout, "   Symbol: {symbol}")?;
+    writeln!(stdout, "   Round trips: {round_trips}")?;
+    writeln!(stdout, "   Quantity per trip: {quantity}")?;
+    writeln!(stdout, "   Token: {token}")?;
+    writeln!(stdout, "   Wallet: {wallet}")?;
+    writeln!(stdout)?;
+
+    let broker_mode = if alpaca_auth.is_sandbox() {
+        AlpacaBrokerApiMode::Sandbox
+    } else {
+        AlpacaBrokerApiMode::Production
+    };
+
+    let broker_auth = AlpacaBrokerApiCtx {
+        api_key: alpaca_auth.api_key.clone(),
+        api_secret: alpaca_auth.api_secret.clone(),
+        account_id: rebalancing_ctx.alpaca_broker_auth.account_id,
+        mode: Some(broker_mode),
+        asset_cache_ttl: std::time::Duration::from_secs(3600),
+        time_in_force: TimeInForce::default(),
+    };
+
+    let executor = AlpacaBrokerApi::try_from_ctx(broker_auth).await?;
+
+    let tokenization_service = AlpacaTokenizationService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_ctx.alpaca_broker_auth.account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+        rebalancing_ctx.base_wallet().clone(),
+        rebalancing_ctx.redemption_wallet,
+    );
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%S");
+    let report_path =
+        output_path.unwrap_or_else(|| PathBuf::from(format!("benchmark-{symbol}-{timestamp}.tsv")));
+
+    let report_file = File::create(&report_path)?;
+    let mut tsv = tsv_writer(report_file);
+
+    let mut rows = Vec::new();
+
+    for trip in 1..=round_trips {
+        writeln!(stdout, "--- Round trip {trip}/{round_trips} ---")?;
+
+        // Step 1: Buy equity
+        writeln!(stdout, "   Buying {quantity} {symbol}...")?;
+        let buy_order = MarketOrder {
+            symbol: symbol.clone(),
+            shares: quantity,
+            direction: Direction::Buy,
+        };
+
+        let buy_placement = executor.place_market_order(buy_order).await?;
+        info!(order_id = %buy_placement.order_id, "Buy order placed");
+        poll_order_until_filled(&executor, &buy_placement.order_id).await?;
+        writeln!(stdout, "   Buy filled")?;
+
+        // Step 2: Mint (timed)
+        writeln!(stdout, "   Minting...")?;
+        let mint_row = measure_mint(
+            &tokenization_service,
+            &symbol,
+            quantity.inner(),
+            wallet,
+            trip,
+        )
+        .await?;
+
+        writeln!(
+            stdout,
+            "   Mint {}: {:.1}s",
+            mint_row.status,
+            mint_row.duration.as_secs_f64(),
+        )?;
+
+        tsv.serialize(TsvRecord::from(&mint_row))?;
+        tsv.flush()?;
+        rows.push(mint_row);
+
+        // Step 3: Redeem (timed)
+        writeln!(stdout, "   Redeeming...")?;
+        let redeem_row =
+            measure_redeem(&tokenization_service, token, quantity.inner(), trip).await?;
+
+        writeln!(
+            stdout,
+            "   Redeem {}: {:.1}s",
+            redeem_row.status,
+            redeem_row.duration.as_secs_f64(),
+        )?;
+
+        tsv.serialize(TsvRecord::from(&redeem_row))?;
+        tsv.flush()?;
+        rows.push(redeem_row);
+
+        // Step 4: Sell equity
+        writeln!(stdout, "   Selling {quantity} {symbol}...")?;
+        let sell_order = MarketOrder {
+            symbol: symbol.clone(),
+            shares: quantity,
+            direction: Direction::Sell,
+        };
+
+        let sell_placement = executor.place_market_order(sell_order).await?;
+        info!(order_id = %sell_placement.order_id, "Sell order placed");
+        poll_order_until_filled(&executor, &sell_placement.order_id).await?;
+        writeln!(stdout, "   Sell filled")?;
+
+        writeln!(stdout)?;
+    }
+
+    let summary = BenchmarkSummary {
+        symbol: symbol.clone(),
+        round_trips,
+        rows,
+    };
+
+    writeln!(stdout)?;
+    summary.write_summary(stdout)?;
+    writeln!(stdout)?;
+    writeln!(stdout, "Report saved to {}", report_path.display())?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    fn make_row(
+        trip: usize,
+        direction: BenchmarkDirection,
+        duration_secs: f64,
+        fees: Option<Usd>,
+    ) -> BenchmarkRow {
+        let started_at = Utc.with_ymd_and_hms(2026, 2, 27, 18, 30, 0).unwrap();
+        let duration = Duration::from_secs_f64(duration_secs);
+        let completed_at = started_at + chrono::Duration::from_std(duration).unwrap();
+
+        BenchmarkRow {
+            trip,
+            direction,
+            started_at,
+            completed_at,
+            duration,
+            fees,
+            status: TokenizationRequestStatus::Completed,
+        }
+    }
+
+    #[test]
+    fn tsv_record_with_fees() {
+        let row = make_row(1, BenchmarkDirection::Mint, 75.2, Some(Usd(dec!(1.50))));
+        let mut output = Vec::new();
+        let mut writer = tsv_writer(&mut output);
+        writer.serialize(TsvRecord::from(&row)).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let tsv = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(lines.len(), 2, "header + 1 data row");
+        assert_eq!(
+            lines[0],
+            "trip\tdirection\tstarted_at\tcompleted_at\tduration_secs\tfees\tstatus",
+        );
+        assert_eq!(
+            lines[1],
+            "1\tmint\t2026-02-27T18:30:00Z\t2026-02-27T18:31:15Z\t75.2\t1.50\tcompleted",
+        );
+    }
+
+    #[test]
+    fn tsv_record_without_fees() {
+        let row = make_row(1, BenchmarkDirection::Redeem, 89.1, None);
+        let mut output = Vec::new();
+        let mut writer = tsv_writer(&mut output);
+        writer.serialize(TsvRecord::from(&row)).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let tsv = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(
+            lines[1],
+            "1\tredeem\t2026-02-27T18:30:00Z\t2026-02-27T18:31:29Z\t89.1\t\tcompleted",
+        );
+    }
+
+    #[test]
+    fn tsv_full_report_includes_header_and_rows() {
+        let rows = vec![
+            make_row(1, BenchmarkDirection::Mint, 75.2, None),
+            make_row(1, BenchmarkDirection::Redeem, 89.1, None),
+            make_row(2, BenchmarkDirection::Mint, 80.0, None),
+            make_row(2, BenchmarkDirection::Redeem, 91.0, None),
+        ];
+
+        let summary = BenchmarkSummary {
+            symbol: Symbol::new("AAPL").unwrap(),
+            round_trips: 2,
+            rows,
+        };
+
+        let mut output = Vec::new();
+        summary.write_tsv(&mut output).unwrap();
+        let tsv = String::from_utf8(output).unwrap();
+
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(lines.len(), 5, "header + 4 data rows");
+        assert_eq!(
+            lines[0],
+            "trip\tdirection\tstarted_at\tcompleted_at\tduration_secs\tfees\tstatus",
+        );
+
+        assert!(lines[1].starts_with("1\tmint\t"));
+        assert!(lines[2].starts_with("1\tredeem\t"));
+        assert!(lines[3].starts_with("2\tmint\t"));
+        assert!(lines[4].starts_with("2\tredeem\t"));
+    }
+
+    #[test]
+    fn summary_stats_correct_for_known_values() {
+        let rows = vec![
+            make_row(1, BenchmarkDirection::Mint, 72.1, None),
+            make_row(1, BenchmarkDirection::Redeem, 88.0, None),
+            make_row(2, BenchmarkDirection::Mint, 85.3, None),
+            make_row(2, BenchmarkDirection::Redeem, 95.2, None),
+            make_row(3, BenchmarkDirection::Mint, 77.1, None),
+            make_row(3, BenchmarkDirection::Redeem, 91.1, None),
+        ];
+
+        let summary = BenchmarkSummary {
+            symbol: Symbol::new("AAPL").unwrap(),
+            round_trips: 3,
+            rows,
+        };
+
+        let mut output = Vec::new();
+        summary.write_summary(&mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+
+        assert!(
+            text.contains("Benchmark complete: 3 round trips for AAPL"),
+            "Missing header line in: {text}",
+        );
+        assert!(text.contains("Mint"), "Missing Mint row in: {text}");
+        assert!(text.contains("Redeem"), "Missing Redeem row in: {text}");
+        assert!(
+            text.contains("Full trip"),
+            "Missing Full trip row in: {text}",
+        );
+    }
+
+    #[test]
+    fn duration_stats_min_max_avg_median_odd_count() {
+        let mut durations = vec![
+            Duration::from_secs_f64(72.1),
+            Duration::from_secs_f64(85.3),
+            Duration::from_secs_f64(77.1),
+        ];
+
+        let stats = DurationStats::compute(&mut durations).unwrap();
+
+        assert!(
+            (stats.min.as_secs_f64() - 72.1).abs() < 0.01,
+            "min: {}",
+            stats.min.as_secs_f64(),
+        );
+        assert!(
+            (stats.max.as_secs_f64() - 85.3).abs() < 0.01,
+            "max: {}",
+            stats.max.as_secs_f64(),
+        );
+
+        let expected_avg = (72.1 + 85.3 + 77.1) / 3.0;
+        assert!(
+            (stats.avg.as_secs_f64() - expected_avg).abs() < 0.1,
+            "avg: {} expected: {expected_avg}",
+            stats.avg.as_secs_f64(),
+        );
+
+        assert!(
+            (stats.median.as_secs_f64() - 77.1).abs() < 0.01,
+            "median: {}",
+            stats.median.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    fn duration_stats_min_max_avg_median_even_count() {
+        let mut durations = vec![
+            Duration::from_secs_f64(72.0),
+            Duration::from_secs_f64(85.0),
+            Duration::from_secs_f64(77.0),
+            Duration::from_secs_f64(80.0),
+        ];
+
+        let stats = DurationStats::compute(&mut durations).unwrap();
+
+        assert!(
+            (stats.min.as_secs_f64() - 72.0).abs() < 0.01,
+            "min: {}",
+            stats.min.as_secs_f64(),
+        );
+        assert!(
+            (stats.max.as_secs_f64() - 85.0).abs() < 0.01,
+            "max: {}",
+            stats.max.as_secs_f64(),
+        );
+
+        let expected_median = f64::midpoint(77.0, 80.0);
+        assert!(
+            (stats.median.as_secs_f64() - expected_median).abs() < 0.01,
+            "median: {} expected: {expected_median}",
+            stats.median.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    fn duration_stats_empty_returns_none() {
+        assert!(DurationStats::compute(&mut []).is_none());
+    }
+
+    #[test]
+    fn duration_stats_single_element() {
+        let mut durations = vec![Duration::from_secs_f64(42.5)];
+        let stats = DurationStats::compute(&mut durations).unwrap();
+
+        assert!(
+            (stats.min.as_secs_f64() - 42.5).abs() < 0.01,
+            "single element min",
+        );
+        assert!(
+            (stats.max.as_secs_f64() - 42.5).abs() < 0.01,
+            "single element max",
+        );
+        assert!(
+            (stats.avg.as_secs_f64() - 42.5).abs() < 0.01,
+            "single element avg",
+        );
+        assert!(
+            (stats.median.as_secs_f64() - 42.5).abs() < 0.01,
+            "single element median",
+        );
+    }
+
+    #[test]
+    fn benchmark_direction_display() {
+        assert_eq!(BenchmarkDirection::Mint.to_string(), "mint");
+        assert_eq!(BenchmarkDirection::Redeem.to_string(), "redeem");
+    }
+
+    #[test]
+    fn streaming_tsv_writes_incrementally() {
+        let mut output = Vec::new();
+        let mut writer = tsv_writer(&mut output);
+
+        let row = make_row(1, BenchmarkDirection::Mint, 75.0, None);
+        writer.serialize(TsvRecord::from(&row)).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("trip\t"));
+        assert!(lines[1].starts_with("1\tmint\t"));
+    }
+}

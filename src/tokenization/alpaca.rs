@@ -27,7 +27,6 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -41,6 +40,7 @@ use super::{Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::onchain::io::{OneToOneTokenizedShares, TokenizedSymbol};
+use crate::threshold::Usd;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
@@ -185,6 +185,16 @@ pub(crate) enum TokenizationRequestStatus {
     Rejected,
 }
 
+impl std::fmt::Display for TokenizationRequestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Completed => write!(f, "completed"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
 /// Token issuer identifier.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Issuer(String);
@@ -215,7 +225,7 @@ pub(crate) struct TokenizationRequest {
     pub(crate) issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub(crate) tx_hash: Option<TxHash>,
-    fees: Option<Decimal>,
+    pub(crate) fees: Option<Usd>,
     pub(crate) created_at: DateTime<Utc>,
     updated_at: Option<DateTime<Utc>>,
 }
