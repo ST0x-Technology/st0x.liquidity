@@ -156,9 +156,13 @@ execution timing, market conditions, and operational metrics.
 
 ## Backlog: Testing
 
-- [ ] [#292 Work Plan: E2E Test Infrastructure while liquidity bot stabilizes](https://github.com/ST0x-Technology/st0x.liquidity/issues/292)
+- [x] [#292 Work Plan: E2E Test Infrastructure while liquidity bot stabilizes](https://github.com/ST0x-Technology/st0x.liquidity/issues/292)
+  - PR:
+    [#328 add E2E test suite for dashboard](https://github.com/ST0x-Technology/st0x.liquidity/pull/328)
 - [ ] [#285 Integration test plan](https://github.com/ST0x-Technology/st0x.liquidity/issues/285)
-- [ ] [#264 Set up end-to-end testing infrastructure](https://github.com/ST0x-Technology/st0x.liquidity/issues/264)
+- [x] [#264 Set up end-to-end testing infrastructure](https://github.com/ST0x-Technology/st0x.liquidity/issues/264)
+  - PR:
+    [#328 add E2E test suite for dashboard](https://github.com/ST0x-Technology/st0x.liquidity/pull/328)
 
 ---
 
