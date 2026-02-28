@@ -84,6 +84,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             usdc_base: USDC_BASE,
             ethereum_wallet,
             base_wallet: base_wallet.clone(),
+            circle_api_base: ctx.circle_api_base.clone(),
+            token_messenger: ctx.token_messenger,
+            message_transmitter: ctx.message_transmitter,
         })?);
 
         let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
@@ -329,6 +332,9 @@ mod tests {
                 usdc_base: USDC_BASE,
                 ethereum_wallet,
                 base_wallet: base_wallet.clone(),
+                circle_api_base: None,
+                token_messenger: None,
+                message_transmitter: None,
             })
             .unwrap(),
         );
