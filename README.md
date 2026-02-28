@@ -296,7 +296,7 @@ dashboard/                 # SvelteKit operations dashboard
 
 ```bash
 cargo check                  # fast compilation check
-cargo test --workspace -q    # run all tests
+cargo nextest run --workspace # run all tests
 cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt                    # format Rust code
 nix fmt                      # format Nix code (when editing .nix files)

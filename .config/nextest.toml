@@ -1,0 +1,8 @@
+[[profile.default.overrides]]
+filter = "kind(test)"
+slow-timeout = { period = "120s" }
+retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }
+
+[[profile.default.overrides]]
+filter = "package(e2e-tests)"
+slow-timeout = { period = "60s", terminate-after = 3 }
