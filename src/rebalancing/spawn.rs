@@ -195,26 +195,28 @@ mod tests {
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_ctx() -> RebalancingCtx {
-        RebalancingCtx::stub(
-            ImbalanceThreshold {
+        RebalancingCtx::stub()
+            .equity(ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
-            },
-            UsdcRebalancing::Enabled {
+            })
+            .usdc(UsdcRebalancing::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
-            },
-            address!("0x1234567890123456789012345678901234567890"),
-            b256!("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
-            AlpacaBrokerApiCtx {
+            })
+            .redemption_wallet(address!("0x1234567890123456789012345678901234567890"))
+            .usdc_vault_id(b256!(
+                "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            ))
+            .alpaca_broker_auth(AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
                 account_id: AlpacaAccountId::new(Uuid::nil()),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
-            },
-        )
+            })
+            .call()
     }
 
     #[test]

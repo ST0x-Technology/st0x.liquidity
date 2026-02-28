@@ -48,7 +48,7 @@ pub(crate) struct Equity {
 /// `EquityRedemption` (market-making -> hedging) need Raindex for
 /// vault operations and Tokenizer for Alpaca API interactions.
 #[derive(Clone)]
-pub(crate) struct EquityTransferServices {
+pub struct EquityTransferServices {
     pub(crate) raindex: Arc<dyn Raindex>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
