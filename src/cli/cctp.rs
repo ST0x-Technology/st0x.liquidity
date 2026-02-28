@@ -90,6 +90,9 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
         usdc_base: USDC_BASE,
         ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
         base_wallet: rebalancing_ctx.base_wallet().clone(),
+        circle_api_base: None,
+        token_messenger: None,
+        message_transmitter: None,
     })?;
 
     let direction = from.to_bridge_direction();
@@ -144,6 +147,9 @@ pub(super) async fn cctp_recover_command<Writer: Write>(
         usdc_base: USDC_BASE,
         ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
         base_wallet: rebalancing_ctx.base_wallet().clone(),
+        circle_api_base: None,
+        token_messenger: None,
+        message_transmitter: None,
     })?;
 
     // Use the V2 API which returns both message and attestation from tx hash
@@ -254,6 +260,8 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone {
