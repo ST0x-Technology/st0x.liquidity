@@ -98,8 +98,6 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for MockCrossVenueEquit
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use super::*;
 
     #[test]
@@ -124,7 +122,7 @@ mod tests {
             &mock,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100)),
+                quantity: FractionalShares::new(float!("100")),
             },
         )
         .await
@@ -142,7 +140,7 @@ mod tests {
             &mock,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(float!("50")),
             },
         )
         .await
@@ -160,7 +158,7 @@ mod tests {
             &mock,
             Equity {
                 symbol: Symbol::new("TSLA").unwrap(),
-                quantity: FractionalShares::new(dec!(42.5)),
+                quantity: FractionalShares::new(float!("42.5")),
             },
         )
         .await
@@ -168,7 +166,7 @@ mod tests {
 
         let call = mock.last_mint_call().unwrap();
         assert_eq!(call.symbol, Symbol::new("TSLA").unwrap());
-        assert_eq!(call.quantity, FractionalShares::new(dec!(42.5)));
+        assert_eq!(call.quantity, FractionalShares::new(float!("42.5")));
     }
 
     #[tokio::test]
@@ -179,7 +177,7 @@ mod tests {
             &mock,
             Equity {
                 symbol: Symbol::new("GOOG").unwrap(),
-                quantity: FractionalShares::new(dec!(7.25)),
+                quantity: FractionalShares::new(float!("7.25")),
             },
         )
         .await
@@ -187,7 +185,7 @@ mod tests {
 
         let call = mock.last_redeem_call().unwrap();
         assert_eq!(call.symbol, Symbol::new("GOOG").unwrap());
-        assert_eq!(call.quantity, FractionalShares::new(dec!(7.25)));
+        assert_eq!(call.quantity, FractionalShares::new(float!("7.25")));
     }
 
     #[tokio::test]
@@ -198,7 +196,7 @@ mod tests {
             &mock,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(10)),
+                quantity: FractionalShares::new(float!("10")),
             },
         )
         .await
@@ -208,7 +206,7 @@ mod tests {
             &mock,
             Equity {
                 symbol: Symbol::new("TSLA").unwrap(),
-                quantity: FractionalShares::new(dec!(20)),
+                quantity: FractionalShares::new(float!("20")),
             },
         )
         .await

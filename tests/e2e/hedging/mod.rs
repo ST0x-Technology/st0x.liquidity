@@ -10,6 +10,7 @@
 
 mod assertions;
 
+use rain_math_float::Float;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 
 use self::assertions::*;
@@ -17,9 +18,9 @@ use self::assertions::*;
 #[test_log::test(tokio::test)]
 async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     let equity_symbol = "AAPL";
-    let onchain_price = dec!(155.00);
-    let broker_fill_price = dec!(150.25);
-    let sell_amount = dec!(10.75);
+    let onchain_price = float!("155.00");
+    let broker_fill_price = float!("150.25");
+    let sell_amount = float!("10.75");
 
     let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)], vec![]).await?;
 
@@ -29,9 +30,9 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
+        .expected_accumulated_long(float!("0"))
         .expected_accumulated_short(sell_amount)
-        .expected_net(dec!(0))
+        .expected_net(float!("0"))
         .build();
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
@@ -82,9 +83,10 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
 /// from direct price literal handling in the hedging path.
 #[test_log::test(tokio::test)]
 async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
-    let onchain_price = Decimal::from_str("112.50000000000000000000000002")?;
-    let broker_fill_price = dec!(113.57);
-    let trade_amount = dec!(12.5);
+    let onchain_price = Float::parse("112.50000000000000000000000002".to_string())
+        .map_err(|err| anyhow::anyhow!("Float parse: {err:?}"))?;
+    let broker_fill_price = float!("113.57");
+    let trade_amount = float!("12.5");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -135,9 +137,14 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
         FractionalShares::ZERO,
         "Position should be fully hedged after offchain fill",
     );
-    assert_eq!(
-        position.last_price_usdc.map(|price| price.round_dp(2)),
-        Some(dec!(112.50)),
+    let last_price_rounded = crate::assert::round_float(
+        position
+            .last_price_usdc
+            .expect("last_price_usdc should be set"),
+        2,
+    )?;
+    assert!(
+        last_price_rounded.eq(float!("112.50")).unwrap(),
         "High-precision direct onchain price should still round to expected cents",
     );
 
@@ -148,13 +155,13 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test)]
 async fn multi_asset_sustained_load() -> anyhow::Result<()> {
-    let aapl_onchain = dec!(190.00);
-    let aapl_broker = dec!(185.50);
-    let tsla_onchain = dec!(250.00);
-    let tsla_broker = dec!(245.00);
-    let msft_onchain = dec!(415.00);
-    let msft_broker = dec!(410.75);
-    let trade_amount = dec!(5.25);
+    let aapl_onchain = float!("190.00");
+    let aapl_broker = float!("185.50");
+    let tsla_onchain = float!("250.00");
+    let tsla_broker = float!("245.00");
+    let msft_onchain = float!("415.00");
+    let msft_broker = float!("410.75");
+    let trade_amount = float!("5.25");
 
     let infra = TestInfra::start(
         vec![
@@ -174,9 +181,9 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
             .direction(TakeDirection::SellEquity)
             .onchain_price(aapl_onchain)
             .broker_fill_price(aapl_broker)
-            .expected_accumulated_long(dec!(0))
+            .expected_accumulated_long(float!("0"))
             .expected_accumulated_short(trade_amount)
-            .expected_net(dec!(0))
+            .expected_net(float!("0"))
             .build(),
         ExpectedPosition::builder()
             .symbol("TSLA")
@@ -185,8 +192,8 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
             .onchain_price(tsla_onchain)
             .broker_fill_price(tsla_broker)
             .expected_accumulated_long(trade_amount)
-            .expected_accumulated_short(dec!(0))
-            .expected_net(dec!(0))
+            .expected_accumulated_short(float!("0"))
+            .expected_net(float!("0"))
             .build(),
         ExpectedPosition::builder()
             .symbol("MSFT")
@@ -194,9 +201,9 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
             .direction(TakeDirection::SellEquity)
             .onchain_price(msft_onchain)
             .broker_fill_price(msft_broker)
-            .expected_accumulated_long(dec!(0))
+            .expected_accumulated_long(float!("0"))
             .expected_accumulated_short(trade_amount)
-            .expected_net(dec!(0))
+            .expected_net(float!("0"))
             .build(),
     ];
 
@@ -249,9 +256,9 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test)]
 async fn backfilling() -> anyhow::Result<()> {
-    let onchain_price = dec!(155.00);
-    let broker_fill_price = dec!(150.00);
-    let sell_amount = dec!(4.5);
+    let onchain_price = float!("155.00");
+    let broker_fill_price = float!("150.00");
+    let sell_amount = float!("4.5");
     let trade_count: i64 = 3;
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
@@ -310,13 +317,13 @@ async fn backfilling() -> anyhow::Result<()> {
 
     let expected_position = ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount(dec!(13.5))
+        .amount(float!("13.5"))
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
-        .expected_accumulated_short(dec!(13.5))
-        .expected_net(dec!(0))
+        .expected_accumulated_long(float!("0"))
+        .expected_accumulated_short(float!("13.5"))
+        .expected_net(float!("0"))
         .build();
 
     assert_full_hedging_flow(
@@ -336,9 +343,9 @@ async fn backfilling() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test)]
 async fn resumption_after_shutdown() -> anyhow::Result<()> {
-    let onchain_price = dec!(155.00);
-    let broker_fill_price = dec!(150.00);
-    let sell_amount = dec!(8.3);
+    let onchain_price = float!("155.00");
+    let broker_fill_price = float!("150.00");
+    let sell_amount = float!("8.3");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -423,13 +430,13 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
 
     let expected_position = ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount(dec!(16.6))
+        .amount(float!("16.6"))
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
-        .expected_accumulated_short(dec!(16.6))
-        .expected_net(dec!(0))
+        .expected_accumulated_long(float!("0"))
+        .expected_accumulated_short(float!("16.6"))
+        .expected_net(float!("0"))
         .build();
 
     assert_full_hedging_flow(
@@ -449,9 +456,9 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test)]
 async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
-    let onchain_price = dec!(155.00);
-    let broker_fill_price = dec!(150.00);
-    let sell_amount = dec!(6.75);
+    let onchain_price = float!("155.00");
+    let broker_fill_price = float!("150.00");
+    let sell_amount = float!("6.75");
 
     let expected_positions = [
         ExpectedPosition::builder()
@@ -460,9 +467,9 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
             .direction(TakeDirection::SellEquity)
             .onchain_price(onchain_price)
             .broker_fill_price(broker_fill_price)
-            .expected_accumulated_long(dec!(0))
+            .expected_accumulated_long(float!("0"))
             .expected_accumulated_short(sell_amount)
-            .expected_net(dec!(0))
+            .expected_net(float!("0"))
             .build(),
         ExpectedPosition::builder()
             .symbol("TSLA")
@@ -470,9 +477,9 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
             .direction(TakeDirection::SellEquity)
             .onchain_price(onchain_price)
             .broker_fill_price(broker_fill_price)
-            .expected_accumulated_long(dec!(0))
+            .expected_accumulated_long(float!("0"))
             .expected_accumulated_short(sell_amount)
-            .expected_net(dec!(0))
+            .expected_net(float!("0"))
             .build(),
     ];
 
@@ -675,9 +682,9 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test)]
 async fn market_hours_transitions() -> anyhow::Result<()> {
-    let onchain_price = dec!(155.00);
-    let broker_fill_price = dec!(150.00);
-    let sell_amount = dec!(12.5);
+    let onchain_price = float!("155.00");
+    let broker_fill_price = float!("150.00");
+    let sell_amount = float!("12.5");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -751,9 +758,9 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
+        .expected_accumulated_long(float!("0"))
         .expected_accumulated_short(sell_amount)
-        .expected_net(dec!(0))
+        .expected_net(float!("0"))
         .build();
 
     assert_full_hedging_flow(
@@ -787,31 +794,31 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
 /// and no offchain orders should exist.
 #[test_log::test(tokio::test)]
 async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
-    // Price must have an exact decimal reciprocal (1/200 = 0.005) so the
+    // Price must have an exact reciprocal (1/200 = 0.005) so the
     // BuyEquity ioRatio round-trips without precision artifacts. Otherwise
     // sell 14.75 + buy 14.75 won't net to exactly zero onchain.
-    let onchain_price = dec!(200.00);
-    let broker_fill_price = dec!(195.00);
-    let trade_amount = dec!(14.75);
+    let onchain_price = float!("200.00");
+    let broker_fill_price = float!("195.00");
+    let trade_amount = float!("14.75");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
     let expected_position = ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount(dec!(0))
+        .amount(float!("0"))
         .direction(TakeDirection::NetZero)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
         .expected_accumulated_long(trade_amount)
         .expected_accumulated_short(trade_amount)
-        .expected_net(dec!(0))
+        .expected_net(float!("0"))
         .build();
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
     // High threshold: 200 shares -- well above any single trade, so
     // individual trades won't trigger hedging.
-    let high_threshold = Positive::<FractionalShares>::new(FractionalShares::new(dec!(200)))?;
+    let high_threshold = Positive::<FractionalShares>::new(FractionalShares::new(float!("200")))?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
         .broker(&infra.broker_service)
@@ -875,9 +882,9 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
 /// transitions to Failed and no broker orders are created.
 #[test_log::test(tokio::test)]
 async fn broker_placement_fails() -> anyhow::Result<()> {
-    let onchain_price = dec!(150.00);
-    let broker_fill_price = dec!(150.00);
-    let sell_amount = dec!(7.5);
+    let onchain_price = float!("150.00");
+    let broker_fill_price = float!("150.00");
+    let sell_amount = float!("7.5");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -964,9 +971,9 @@ async fn broker_placement_fails() -> anyhow::Result<()> {
 /// the broker order actually exists and is polled before failing.
 #[test_log::test(tokio::test)]
 async fn broker_order_rejected() -> anyhow::Result<()> {
-    let onchain_price = dec!(150.00);
-    let broker_fill_price = dec!(150.00);
-    let sell_amount = dec!(5.25);
+    let onchain_price = float!("150.00");
+    let broker_fill_price = float!("150.00");
+    let sell_amount = float!("5.25");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -1061,9 +1068,9 @@ async fn broker_order_rejected() -> anyhow::Result<()> {
 /// "new" status for 3 polls before transitioning to "filled".
 #[test_log::test(tokio::test)]
 async fn delayed_fill() -> anyhow::Result<()> {
-    let onchain_price = dec!(155.00);
-    let broker_fill_price = dec!(150.25);
-    let sell_amount = dec!(10.75);
+    let onchain_price = float!("155.00");
+    let broker_fill_price = float!("150.25");
+    let sell_amount = float!("10.75");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -1139,9 +1146,12 @@ async fn delayed_fill() -> anyhow::Result<()> {
         "Should have exactly one broker order"
     );
     assert_eq!(broker_orders[0].status, OrderStatus::Filled);
-    assert_eq!(
-        broker_orders[0].filled_price,
-        Some(dec!(150.25)),
+    assert!(
+        broker_orders[0]
+            .filled_price
+            .unwrap()
+            .eq(float!("150.25"))
+            .unwrap(),
         "Should fill at configured broker price"
     );
 
@@ -1165,9 +1175,9 @@ async fn delayed_fill() -> anyhow::Result<()> {
 /// the Alpaca $2.00 execution threshold ($2500 x 0.001 = $2.50).
 #[test_log::test(tokio::test)]
 async fn small_fractional_amounts() -> anyhow::Result<()> {
-    let onchain_price = dec!(2500.00);
-    let broker_fill_price = dec!(2490.00);
-    let tiny_amount = dec!(0.001);
+    let onchain_price = float!("2500.00");
+    let broker_fill_price = float!("2490.00");
+    let tiny_amount = float!("0.001");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -1177,9 +1187,9 @@ async fn small_fractional_amounts() -> anyhow::Result<()> {
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
+        .expected_accumulated_long(float!("0"))
         .expected_accumulated_short(tiny_amount)
-        .expected_net(dec!(0))
+        .expected_net(float!("0"))
         .build();
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
@@ -1227,10 +1237,10 @@ async fn small_fractional_amounts() -> anyhow::Result<()> {
 /// fully hedged regardless of fill ordering.
 #[test_log::test(tokio::test)]
 async fn out_of_order_fills() -> anyhow::Result<()> {
-    let onchain_price = dec!(155.00);
-    let aapl_broker = dec!(150.25);
-    let tsla_broker = dec!(245.00);
-    let trade_amount = dec!(5.25);
+    let onchain_price = float!("155.00");
+    let aapl_broker = float!("150.25");
+    let tsla_broker = float!("245.00");
+    let trade_amount = float!("5.25");
 
     let infra =
         TestInfra::start(vec![("AAPL", aapl_broker), ("TSLA", tsla_broker)], vec![]).await?;
@@ -1247,9 +1257,9 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
             .direction(TakeDirection::SellEquity)
             .onchain_price(onchain_price)
             .broker_fill_price(aapl_broker)
-            .expected_accumulated_long(dec!(0))
+            .expected_accumulated_long(float!("0"))
             .expected_accumulated_short(trade_amount)
-            .expected_net(dec!(0))
+            .expected_net(float!("0"))
             .build(),
         ExpectedPosition::builder()
             .symbol("TSLA")
@@ -1257,9 +1267,9 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
             .direction(TakeDirection::SellEquity)
             .onchain_price(onchain_price)
             .broker_fill_price(tsla_broker)
-            .expected_accumulated_long(dec!(0))
+            .expected_accumulated_long(float!("0"))
             .expected_accumulated_short(trade_amount)
-            .expected_net(dec!(0))
+            .expected_net(float!("0"))
             .build(),
     ];
 
@@ -1341,9 +1351,9 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
 /// and verify the position projection converges to the same state.
 #[test_log::test(tokio::test)]
 async fn duplicate_event_delivery() -> anyhow::Result<()> {
-    let onchain_price = dec!(155.00);
-    let broker_fill_price = dec!(150.00);
-    let sell_amount = dec!(8.3);
+    let onchain_price = float!("155.00");
+    let broker_fill_price = float!("150.00");
+    let sell_amount = float!("8.3");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 

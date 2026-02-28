@@ -83,6 +83,7 @@ mod tests {
     use st0x_execution::Symbol;
     use uuid::Uuid;
 
+    use rain_math_float::Float;
     use st0x_event_sorcery::ReactorHarness;
 
     use super::*;
@@ -93,7 +94,7 @@ mod tests {
     fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new(symbol).unwrap(),
-            quantity: quantity.into(),
+            quantity: Float::parse(quantity.to_string()).unwrap(),
             wallet: Address::ZERO,
             requested_at: chrono::Utc::now(),
         }

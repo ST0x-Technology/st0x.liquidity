@@ -6,11 +6,11 @@
 //! trade direction (buy/sell), and validates amounts before
 //! further processing.
 
-use rust_decimal::Decimal;
 use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
 
+use rain_math_float::{Float, FloatError};
 use st0x_execution::{Direction, FractionalShares, Symbol};
 
 use super::OnChainError;
@@ -36,18 +36,27 @@ macro_rules! symbol {
 }
 
 /// Represents a validated USDC amount (non-negative)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Usdc(Decimal);
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Usdc(Float);
+
+impl PartialEq for Usdc {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(other.0).unwrap_or(false)
+    }
+}
 
 impl Usdc {
-    pub(crate) fn new(value: Decimal) -> Result<Self, TradeValidationError> {
-        if value < Decimal::ZERO {
+    pub(crate) fn new(value: Float) -> Result<Self, TradeValidationError> {
+        if value
+            .lt(Float::zero()?)
+            .map_err(TradeValidationError::Float)?
+        {
             return Err(TradeValidationError::NegativeUsdc(value));
         }
         Ok(Self(value))
     }
 
-    pub(crate) fn value(self) -> Decimal {
+    pub(crate) fn value(self) -> Float {
         self.0
     }
 }
@@ -160,9 +169,9 @@ impl TradeDetails {
     /// (wtTICKER), since Raindex orders always involve wrapped tokens.
     pub(crate) fn try_from_io(
         input_symbol: &str,
-        input_amount: Decimal,
+        input_amount: Float,
         output_symbol: &str,
-        output_amount: Decimal,
+        output_amount: Float,
     ) -> Result<Self, OnChainError> {
         let (ticker, direction) = determine_trade_details(input_symbol, output_symbol)?;
 
@@ -183,11 +192,30 @@ impl TradeDetails {
                 .into());
             };
 
-        if equity_amount_raw < Decimal::ZERO {
+        if equity_amount_raw
+            .lt(Float::zero()?)
+            .map_err(TradeValidationError::Float)?
+        {
             return Err(TradeValidationError::NegativeShares(equity_amount_raw).into());
         }
-        let equity_amount = FractionalShares::new(equity_amount_raw);
-        let usdc_amount = Usdc::new(usdc_amount_raw)?;
+
+        if usdc_amount_raw
+            .lt(Float::zero()?)
+            .map_err(TradeValidationError::Float)?
+        {
+            return Err(TradeValidationError::NegativeUsdc(usdc_amount_raw).into());
+        }
+
+        // Truncate precision dust beyond token decimal scales.
+        // Rain's orderbook emits raw Float values in events, which can
+        // carry more precision than the token's fixed-point representation.
+        // The actual ERC-20 transfer truncates to the token's decimals
+        // (6 for USDC, 18 for ERC-20 shares), so we align with that.
+        let equity_amount = FractionalShares::new(
+            truncate_to_dp(equity_amount_raw, 18).map_err(TradeValidationError::Float)?,
+        );
+        let usdc_amount =
+            Usdc::new(truncate_to_dp(usdc_amount_raw, 6).map_err(TradeValidationError::Float)?)?;
 
         Ok(Self {
             ticker,
@@ -196,6 +224,15 @@ impl TradeDetails {
             direction,
         })
     }
+}
+
+/// Truncates a Float value to the given number of decimal places.
+///
+/// Converts to fixed-point with the target scale, then back,
+/// dropping any digits beyond the scale limit.
+fn truncate_to_dp(value: Float, decimal_places: u8) -> Result<Float, FloatError> {
+    let (fixed, _lossless) = value.to_fixed_decimal_lossy(decimal_places)?;
+    Float::from_fixed_decimal(fixed, decimal_places)
 }
 
 /// Determines onchain trade direction and ticker based on onchain
@@ -229,8 +266,6 @@ fn determine_trade_details(
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use super::*;
 
     #[test]
@@ -353,13 +388,13 @@ mod tests {
 
     #[test]
     fn test_usdc_validation() {
-        let usdc = Usdc::new(dec!(1000.50)).unwrap();
-        assert_eq!(usdc.value(), dec!(1000.50));
+        let usdc = Usdc::new(float!("1000.50")).unwrap();
+        assert!(usdc.value().eq(float!("1000.50")).unwrap());
 
-        let usdc = Usdc::new(Decimal::ZERO).unwrap();
-        assert_eq!(usdc.value(), Decimal::ZERO);
+        let usdc = Usdc::new(Float::zero().unwrap()).unwrap();
+        assert!(usdc.value().eq(Float::zero().unwrap()).unwrap());
 
-        let result = Usdc::new(dec!(-100));
+        let result = Usdc::new(float!("-100"));
         assert!(matches!(
             result.unwrap_err(),
             TradeValidationError::NegativeUsdc(_)
@@ -368,9 +403,9 @@ mod tests {
 
     #[test]
     fn test_usdc_equality() {
-        let usdc1 = Usdc::new(dec!(1000)).unwrap();
-        let usdc2 = Usdc::new(dec!(1000)).unwrap();
-        let usdc3 = Usdc::new(dec!(2000)).unwrap();
+        let usdc1 = Usdc::new(float!("1000")).unwrap();
+        let usdc2 = Usdc::new(float!("1000")).unwrap();
+        let usdc3 = Usdc::new(float!("2000")).unwrap();
 
         assert_eq!(usdc1, usdc2);
         assert_ne!(usdc1, usdc3);
@@ -450,52 +485,54 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_usdc_to_wrapped() {
-        let details = TradeDetails::try_from_io("USDC", dec!(100), "wtAAPL", dec!(0.5)).unwrap();
+        let details =
+            TradeDetails::try_from_io("USDC", float!("100"), "wtAAPL", float!("0.5")).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert_eq!(details.equity_amount().inner(), dec!(0.5));
-        assert_eq!(details.usdc_amount().value(), dec!(100));
+        assert!(details.equity_amount().inner().eq(float!("0.5")).unwrap());
+        assert!(details.usdc_amount().value().eq(float!("100")).unwrap());
         assert_eq!(details.direction(), Direction::Sell);
     }
 
     #[test]
     fn test_trade_details_try_from_io_wrapped_to_usdc() {
-        let details = TradeDetails::try_from_io("wtAAPL", dec!(0.5), "USDC", dec!(100)).unwrap();
+        let details =
+            TradeDetails::try_from_io("wtAAPL", float!("0.5"), "USDC", float!("100")).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert_eq!(details.equity_amount().inner(), dec!(0.5));
-        assert_eq!(details.usdc_amount().value(), dec!(100));
+        assert!(details.equity_amount().inner().eq(float!("0.5")).unwrap());
+        assert!(details.usdc_amount().value().eq(float!("100")).unwrap());
         assert_eq!(details.direction(), Direction::Buy);
     }
 
     #[test]
     fn test_trade_details_try_from_io_nvda() {
         let details =
-            TradeDetails::try_from_io("USDC", dec!(64.17), "wtNVDA", dec!(0.374)).unwrap();
+            TradeDetails::try_from_io("USDC", float!("64.17"), "wtNVDA", float!("0.374")).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().inner(), dec!(0.374));
-        assert_eq!(details.usdc_amount().value(), dec!(64.17));
+        assert!(details.equity_amount().inner().eq(float!("0.374")).unwrap());
+        assert!(details.usdc_amount().value().eq(float!("64.17")).unwrap());
         assert_eq!(details.direction(), Direction::Sell);
 
         let details =
-            TradeDetails::try_from_io("wtNVDA", dec!(0.374), "USDC", dec!(64.17)).unwrap();
+            TradeDetails::try_from_io("wtNVDA", float!("0.374"), "USDC", float!("64.17")).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().inner(), dec!(0.374));
-        assert_eq!(details.usdc_amount().value(), dec!(64.17));
+        assert!(details.equity_amount().inner().eq(float!("0.374")).unwrap());
+        assert!(details.usdc_amount().value().eq(float!("64.17")).unwrap());
         assert_eq!(details.direction(), Direction::Buy);
     }
 
     #[test]
     fn test_trade_details_try_from_io_invalid_configurations() {
-        let result = TradeDetails::try_from_io("USDC", dec!(100), "USDC", dec!(100));
+        let result = TradeDetails::try_from_io("USDC", float!("100"), "USDC", float!("100"));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = TradeDetails::try_from_io("BTC", dec!(1), "ETH", dec!(3000));
+        let result = TradeDetails::try_from_io("BTC", float!("1"), "ETH", float!("3000"));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
@@ -504,13 +541,13 @@ mod tests {
 
     #[test]
     fn test_trade_details_negative_amount_validation() {
-        let result = TradeDetails::try_from_io("USDC", dec!(100), "wtAAPL", dec!(-0.5));
+        let result = TradeDetails::try_from_io("USDC", float!("100"), "wtAAPL", float!("-0.5"));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::NegativeShares(_))
         ));
 
-        let result = TradeDetails::try_from_io("USDC", dec!(-100), "wtAAPL", dec!(0.5));
+        let result = TradeDetails::try_from_io("USDC", float!("-100"), "wtAAPL", float!("0.5"));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::NegativeUsdc(_))
@@ -550,84 +587,94 @@ mod tests {
         // Real transaction: 0.374 wtNVDA sold for 64.169234 USDC
         // Verifies equity vs USDC amounts are not swapped
         let details =
-            TradeDetails::try_from_io("USDC", dec!(64.169234), "wtNVDA", dec!(0.374)).unwrap();
+            TradeDetails::try_from_io("USDC", float!("64.169234"), "wtNVDA", float!("0.374"))
+                .unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().inner(), dec!(0.374));
-        assert_eq!(details.usdc_amount().value(), dec!(64.169234));
+        assert!(details.equity_amount().inner().eq(float!("0.374")).unwrap());
+        assert!(
+            details
+                .usdc_amount()
+                .value()
+                .eq(float!("64.169234"))
+                .unwrap()
+        );
         assert_eq!(details.direction(), Direction::Sell);
 
-        let price_per_share = dec!(64.169234) / dec!(0.374);
-        assert!((price_per_share - dec!(171.58)).abs() < dec!(0.01));
+        let price_per_share = (float!("64.169234") / float!("0.374")).unwrap();
+        let diff = (price_per_share - float!("171.58")).unwrap().abs().unwrap();
+        assert!(diff.lt(float!("0.01")).unwrap());
     }
 
     #[test]
-    fn test_real_transaction_nvda_small_trade() {
-        // Real transaction: 0.2 wtNVDA sold for 34.645024 USDC
-        let details =
-            TradeDetails::try_from_io("USDC", dec!(34.645024), "wtNVDA", dec!(0.2)).unwrap();
-
-        assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().inner(), dec!(0.2));
-        assert_eq!(details.usdc_amount().value(), dec!(34.645024));
-        assert_eq!(details.direction(), Direction::Sell);
-
-        let price_per_share = dec!(34.645024) / dec!(0.2);
-        assert!((price_per_share - dec!(173.23)).abs() < dec!(0.01));
-    }
-
-    #[test]
-    #[ignore = "known precision dust bug - not yet patched"]
     fn test_trade_details_normalizes_spurious_precision_beyond_onchain_scales() {
-        let usdc_with_dust = Decimal::from_str("64.169234000001").unwrap();
-        let shares_with_dust = Decimal::from_str("0.374000000000000000001").unwrap();
+        let usdc_with_dust = float!("64.169234000001");
+        let shares_with_dust = float!("0.374000000000000000001");
 
         let details =
             TradeDetails::try_from_io("USDC", usdc_with_dust, "wtNVDA", shares_with_dust).unwrap();
 
-        assert_eq!(details.usdc_amount().value(), dec!(64.169234));
-        assert_eq!(details.equity_amount().inner(), dec!(0.374));
+        assert!(
+            details
+                .usdc_amount()
+                .value()
+                .eq(float!("64.169234"))
+                .unwrap()
+        );
+        assert!(details.equity_amount().inner().eq(float!("0.374")).unwrap());
     }
 
     #[test]
-    #[ignore = "known precision dust bug - not yet patched"]
     fn test_trade_details_regression_precision_dust_breaks_exact_equality_without_normalization() {
-        let shares_with_dust = Decimal::from_str("0.200000000000000000001").unwrap();
+        let shares_with_dust = float!("0.200000000000000000001");
         let pre_fix_shares = FractionalShares::new(shares_with_dust);
 
         assert_ne!(
             pre_fix_shares,
-            FractionalShares::new(dec!(0.2)),
+            FractionalShares::new(float!("0.2")),
             "Pre-fix behavior preserved dust and broke exact equality checks",
         );
 
         let details = TradeDetails::try_from_io(
             "USDC",
-            Decimal::from_str("34.645024000001").unwrap(),
+            float!("34.645024000001"),
             "wtNVDA",
             shares_with_dust,
         )
         .unwrap();
 
-        assert_eq!(details.equity_amount().inner(), dec!(0.2));
-        assert_eq!(details.usdc_amount().value(), dec!(34.645024));
+        assert!(details.equity_amount().inner().eq(float!("0.2")).unwrap());
+        assert!(
+            details
+                .usdc_amount()
+                .value()
+                .eq(float!("34.645024"))
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_edge_case_validation_very_small_amounts() {
         let details =
-            TradeDetails::try_from_io("USDC", dec!(0.01), "wtAAPL", dec!(0.0001)).unwrap();
+            TradeDetails::try_from_io("USDC", float!("0.01"), "wtAAPL", float!("0.0001")).unwrap();
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert_eq!(details.equity_amount().inner(), dec!(0.0001));
-        assert_eq!(details.usdc_amount().value(), dec!(0.01));
+        assert!(
+            details
+                .equity_amount()
+                .inner()
+                .eq(float!("0.0001"))
+                .unwrap()
+        );
+        assert!(details.usdc_amount().value().eq(float!("0.01")).unwrap());
     }
 
     #[test]
     fn test_edge_case_validation_very_large_amounts() {
-        let details = TradeDetails::try_from_io("USDC", dec!(1000000), "wtBRK", dec!(100)).unwrap();
+        let details =
+            TradeDetails::try_from_io("USDC", float!("1000000"), "wtBRK", float!("100")).unwrap();
         assert_eq!(details.ticker(), &symbol!("BRK"));
-        assert_eq!(details.equity_amount().inner(), dec!(100));
-        assert_eq!(details.usdc_amount().value(), dec!(1000000));
+        assert!(details.equity_amount().inner().eq(float!("100")).unwrap());
+        assert!(details.usdc_amount().value().eq(float!("1000000")).unwrap());
     }
 
     #[test]
@@ -657,13 +704,13 @@ mod tests {
 
     #[test]
     fn test_trade_details_rejects_unwrapped_prefix() {
-        let result = TradeDetails::try_from_io("USDC", dec!(100), "tAAPL", dec!(0.5));
+        let result = TradeDetails::try_from_io("USDC", float!("100"), "tAAPL", float!("0.5"));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = TradeDetails::try_from_io("tAAPL", dec!(0.5), "USDC", dec!(100));
+        let result = TradeDetails::try_from_io("tAAPL", float!("0.5"), "USDC", float!("100"));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))

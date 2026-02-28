@@ -484,7 +484,6 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
-    use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
@@ -541,7 +540,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100.0")),
             },
         )
         .await
@@ -566,7 +565,7 @@ mod tests {
                 &transfer,
                 Equity {
                     symbol: Symbol::new("TEST").unwrap(),
-                    quantity: FractionalShares::new(dec!(50)),
+                    quantity: FractionalShares::new(float!("50")),
                 },
             ),
         )
@@ -588,7 +587,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(float!("50")),
             },
         )
         .await
@@ -613,7 +612,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(float!("50")),
             },
         )
         .await
@@ -641,7 +640,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(float!("50")),
             },
         )
         .await
@@ -669,7 +668,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(dec!(50)),
+                quantity: FractionalShares::new(float!("50")),
             },
         )
         .await
@@ -694,7 +693,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100.0")),
             },
         )
         .await
@@ -719,7 +718,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100.0")),
             },
         )
         .await
@@ -757,7 +756,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100")),
             },
         )
         .await
@@ -790,7 +789,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100.0")),
             },
         )
         .await
@@ -821,7 +820,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100.0")),
             },
         )
         .await
@@ -852,7 +851,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100.0")),
             },
         )
         .await
@@ -883,7 +882,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(float!("100.0")),
             },
         )
         .await

@@ -113,7 +113,6 @@ impl Rebalancer {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use rust_decimal_macros::dec;
     use std::sync::Arc;
 
     use st0x_execution::{FractionalShares, Symbol};
@@ -151,7 +150,7 @@ mod tests {
     async fn execute_mint_calls_equity_to_market_making() {
         let (equity, usdc) = execute(vec![TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(10)),
+            quantity: FractionalShares::new(float!("10")),
         }])
         .await;
 
@@ -165,7 +164,7 @@ mod tests {
     async fn execute_redemption_calls_equity_to_hedging() {
         let (equity, usdc) = execute(vec![TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(50)),
+            quantity: FractionalShares::new(float!("50")),
             wrapped_token: address!("0x1234567890123456789012345678901234567890"),
             unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
         }])
@@ -180,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn execute_usdc_alpaca_to_base_calls_usdc_to_market_making() {
         let (equity, usdc) = execute(vec![TriggeredOperation::UsdcAlpacaToBase {
-            amount: Usdc(dec!(1000)),
+            amount: Usdc(float!("1000")),
         }])
         .await;
 
@@ -193,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn execute_usdc_base_to_alpaca_calls_usdc_to_hedging() {
         let (equity, usdc) = execute(vec![TriggeredOperation::UsdcBaseToAlpaca {
-            amount: Usdc(dec!(2000)),
+            amount: Usdc(float!("2000")),
         }])
         .await;
 
@@ -208,23 +207,23 @@ mod tests {
         let (equity, usdc) = execute(vec![
             TriggeredOperation::Mint {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(10)),
+                quantity: FractionalShares::new(float!("10")),
             },
             TriggeredOperation::Mint {
                 symbol: Symbol::new("TSLA").unwrap(),
-                quantity: FractionalShares::new(dec!(20)),
+                quantity: FractionalShares::new(float!("20")),
             },
             TriggeredOperation::Redemption {
                 symbol: Symbol::new("GOOG").unwrap(),
-                quantity: FractionalShares::new(dec!(5)),
+                quantity: FractionalShares::new(float!("5")),
                 wrapped_token: address!("0x1234567890123456789012345678901234567890"),
                 unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
             },
             TriggeredOperation::UsdcAlpacaToBase {
-                amount: Usdc(dec!(500)),
+                amount: Usdc(float!("500")),
             },
             TriggeredOperation::UsdcBaseToAlpaca {
-                amount: Usdc(dec!(300)),
+                amount: Usdc(float!("300")),
             },
         ])
         .await;

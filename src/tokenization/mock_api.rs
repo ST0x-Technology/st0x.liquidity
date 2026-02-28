@@ -16,7 +16,7 @@ use alloy::sol;
 use alloy::sol_types::SolEvent;
 use chrono::Utc;
 use httpmock::prelude::*;
-use rust_decimal::Decimal;
+use rain_math_float::Float;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -29,6 +29,7 @@ use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::TEST_ACCOUNT_ID;
 
 use crate::bindings::DeployableERC20;
+use crate::float_serde::format_float;
 
 sol! {
     #[sol(all_derives = true)]
@@ -76,7 +77,7 @@ struct MockTokenizationRequest {
     tokenization_request_id: String,
     issuer_request_id: String,
     underlying_symbol: String,
-    quantity: Decimal,
+    quantity: Float,
     wallet_address: Address,
     status: TokenizationStatus,
     poll_count: usize,
@@ -104,7 +105,7 @@ pub struct MockTokenizationRequestSnapshot {
     pub request_id: String,
     pub request_type: TokenizationRequestType,
     pub symbol: String,
-    pub quantity: Decimal,
+    pub quantity: Float,
     pub status: TokenizationStatus,
 }
 
@@ -233,7 +234,7 @@ impl AlpacaTokenizationMock {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
                 // Collect pending mints that need onchain execution.
-                let pending_mints: Vec<(usize, Decimal, Address, Address)> = {
+                let pending_mints: Vec<(usize, Float, Address, Address)> = {
                     let mut guard = lock(&state);
                     let mut valid = Vec::new();
 
@@ -274,9 +275,9 @@ impl AlpacaTokenizationMock {
 
                 for (idx, quantity, wallet, token_addr) in pending_mints {
                     // Convert decimal quantity to U256 with 18 decimals
-                    let quantity_str = quantity.to_string();
+                    let quantity_str = format_float(&quantity);
                     let Ok(amount_signed) = parse_units(&quantity_str, 18) else {
-                        warn!(%wallet, %quantity, %token_addr, "failed to parse quantity as 18-decimal units, skipping mint");
+                        warn!(%wallet, ?quantity, %token_addr, "failed to parse quantity as 18-decimal units, skipping mint");
                         continue;
                     };
                     let amount: U256 = amount_signed.into();
@@ -451,7 +452,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
             let Some(quantity_str) = body["qty"].as_str() else {
                 return json_response(400, &json!({"message": "missing or non-string field: qty"}));
             };
-            let Ok(quantity) = quantity_str.parse::<Decimal>() else {
+            let Ok(quantity) = Float::parse(quantity_str.to_string()) else {
                 return json_response(
                     400,
                     &json!({"message": format!("invalid qty: {quantity_str}")}),
@@ -503,7 +504,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                     "status": "pending",
                     "underlying_symbol": underlying_symbol,
                     "token_symbol": format!("t{underlying_symbol}"),
-                    "qty": quantity.to_string(),
+                    "qty": format_float(&quantity),
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": wallet_address,
@@ -585,7 +586,7 @@ fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
         "status": request.status.to_string(),
         "underlying_symbol": request.underlying_symbol,
         "token_symbol": format!("t{}", request.underlying_symbol),
-        "qty": request.quantity.to_string(),
+        "qty": format_float(&request.quantity),
         "issuer": "st0x",
         "network": "base",
         "wallet_address": request.wallet_address,

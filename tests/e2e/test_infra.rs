@@ -9,11 +9,11 @@ use std::path::PathBuf;
 
 use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
-use rust_decimal::Decimal;
+use rain_math_float::Float;
+use st0x_execution::Symbol;
 use tempfile::TempDir;
 
 use st0x_bridge::cctp::CctpAttestationMock;
-use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
 use st0x_hedge::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
@@ -62,8 +62,8 @@ impl<P> TestInfra<P> {
 
 impl TestInfra<()> {
     pub async fn start(
-        equity_prices: Vec<(&str, Decimal)>,
-        equity_positions: Vec<(&str, Decimal)>,
+        equity_prices: Vec<(&str, Float)>,
+        equity_positions: Vec<(&str, Float)>,
     ) -> anyhow::Result<TestInfra<impl Provider + Clone>> {
         let db_dir = tempfile::tempdir()?;
         let db_path = db_dir.path().join("e2e.sqlite");
@@ -87,12 +87,15 @@ impl TestInfra<()> {
                 .await?;
         }
 
-        let symbol_prices: Vec<(Symbol, Decimal)> = equity_prices
+        let symbol_prices: Vec<(Symbol, Float)> = equity_prices
             .iter()
             .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
             .collect::<anyhow::Result<_>>()?;
 
-        let price_lookup: HashMap<Symbol, Decimal> = symbol_prices.iter().cloned().collect();
+        let price_lookup: HashMap<Symbol, Float> = equity_prices
+            .iter()
+            .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
+            .collect::<anyhow::Result<_>>()?;
 
         let symbol_positions: Vec<MockPosition> = equity_positions
             .iter()
@@ -101,10 +104,12 @@ impl TestInfra<()> {
                 let price = price_lookup.get(&sym).ok_or_else(|| {
                     anyhow::anyhow!("no price configured for position symbol {symbol}")
                 })?;
+                let market_value = (*quantity * *price)
+                    .map_err(|err| anyhow::anyhow!("Float mul failed: {err:?}"))?;
                 Ok(MockPosition {
                     symbol: sym,
                     quantity: *quantity,
-                    market_value: quantity * price,
+                    market_value,
                 })
             })
             .collect::<anyhow::Result<_>>()?;

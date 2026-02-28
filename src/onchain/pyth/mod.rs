@@ -9,8 +9,7 @@ use alloy::rpc::types::trace::geth::{
 };
 use alloy::sol_types::{SolCall, SolType};
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
+use rain_math_float::{Float, FloatError};
 use tracing::{debug, error, info, warn};
 
 use crate::bindings::IPyth::{
@@ -32,8 +31,6 @@ pub enum PythError {
     NoMatchingFeedId(B256),
     #[error("Failed to decode Pyth return data: {0}")]
     AbiDecode(#[from] alloy::sol_types::Error),
-    #[error("Pyth response structure invalid: {0}")]
-    InvalidResponse(&'static str),
     #[error("Trace is not CallTracer variant")]
     InvalidTraceVariant,
     #[error("Arithmetic overflow in price conversion")]
@@ -44,8 +41,8 @@ pub enum PythError {
     InvalidTimestamp(U256),
     #[error("Exponent conversion failed: {0}")]
     ExponentConversion(#[from] std::num::TryFromIntError),
-    #[error("Decimal creation failed: {0}")]
-    DecimalCreation(#[from] rust_decimal::Error),
+    #[error("Float error: {0}")]
+    Float(#[from] FloatError),
 }
 
 #[derive(Debug, Clone)]
@@ -56,8 +53,8 @@ pub struct PythCall {
 }
 
 pub(super) struct PythPricing {
-    pub price: Decimal,
-    pub confidence: Decimal,
+    pub price: Float,
+    pub confidence: Float,
     pub exponent: i32,
     pub publish_time: DateTime<Utc>,
 }
@@ -71,8 +68,8 @@ impl PythPricing {
     ) -> Result<Self, PythError> {
         let pyth_price = extract_pyth_price(tx_hash, &provider, symbol, feed_id_cache).await?;
 
-        let price = pyth_price.to_decimal()?;
-        let confidence = scale_with_exponent(pyth_price.conf, pyth_price.expo)?;
+        let price = pyth_price.to_float()?;
+        let confidence = scale_with_exponent(&pyth_price.conf, pyth_price.expo)?;
 
         let publish_time_i64 = i64::try_from(pyth_price.publishTime)
             .map_err(|_| PythError::InvalidTimestamp(pyth_price.publishTime))?;
@@ -89,31 +86,27 @@ impl PythPricing {
     }
 }
 
-fn scale_with_exponent(value: u64, exponent: i32) -> Result<Decimal, PythError> {
-    let decimal_value = Decimal::from(value);
+fn scale_with_exponent(value: &impl ToString, exponent: i32) -> Result<Float, PythError> {
+    let decimal_value = Float::parse(value.to_string())?;
 
     if exponent >= 0 {
-        let multiplier = (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
-            acc.checked_mul(Decimal::from(10_i64))
-                .ok_or(PythError::ArithmeticOverflow)
+        let ten = Float::parse("10".to_string())?;
+        let multiplier = (0..exponent).try_fold(Float::parse("1".to_string())?, |acc, _| {
+            (acc * ten).map_err(PythError::Float)
         })?;
 
-        decimal_value
-            .checked_mul(multiplier)
-            .ok_or(PythError::ArithmeticOverflow)
+        (decimal_value * multiplier).map_err(PythError::Float)
     } else {
         let abs_exponent = exponent
             .checked_abs()
             .ok_or(PythError::ArithmeticOverflow)?;
 
-        let divisor = (0..abs_exponent).try_fold(Decimal::from(1_i64), |acc, _| {
-            acc.checked_mul(Decimal::from(10_i64))
-                .ok_or(PythError::ArithmeticOverflow)
+        let ten = Float::parse("10".to_string())?;
+        let divisor = (0..abs_exponent).try_fold(Float::parse("1".to_string())?, |acc, _| {
+            (acc * ten).map_err(PythError::Float)
         })?;
 
-        decimal_value
-            .checked_div(divisor)
-            .ok_or(PythError::ArithmeticOverflow)
+        (decimal_value / divisor).map_err(PythError::Float)
     }
 }
 
@@ -175,31 +168,8 @@ pub fn decode_pyth_price(output: &Bytes) -> Result<Price, PythError> {
 }
 
 impl Price {
-    pub(crate) fn to_decimal(&self) -> Result<Decimal, PythError> {
-        let exponent = self.expo;
-
-        let result = if exponent >= 0 {
-            let price_value = Decimal::from_i64(self.price)
-                .ok_or(PythError::InvalidResponse("price value too large"))?;
-
-            let multiplier = (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
-                acc.checked_mul(Decimal::from(10_i64))
-                    .ok_or(PythError::ArithmeticOverflow)
-            })?;
-
-            price_value
-                .checked_mul(multiplier)
-                .ok_or(PythError::ArithmeticOverflow)?
-        } else {
-            let decimals = exponent
-                .checked_abs()
-                .ok_or(PythError::ArithmeticOverflow)?
-                .try_into()?;
-
-            Decimal::try_new(self.price, decimals)?
-        };
-
-        Ok(result.normalize())
+    pub(crate) fn to_float(&self) -> Result<Float, PythError> {
+        scale_with_exponent(&self.price, self.expo)
     }
 }
 
@@ -334,7 +304,8 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::trace::geth::FourByteFrame;
-    use rust_decimal_macros::dec;
+
+    use crate::float_serde::format_float;
 
     fn create_test_call_frame(
         to: Address,
@@ -611,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_decimal_negative_exponent() {
+    fn test_to_float_negative_exponent() {
         let price = Price {
             price: 123_456_789,
             conf: 1000,
@@ -619,13 +590,13 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let decimal = price.to_decimal().unwrap();
+        let exact = price.to_float().unwrap();
 
-        assert_eq!(decimal.to_string(), "1.23456789");
+        assert_eq!(format_float(&exact), "1.23456789");
     }
 
     #[test]
-    fn test_to_decimal_zero_exponent() {
+    fn test_to_float_zero_exponent() {
         let price = Price {
             price: 42,
             conf: 1,
@@ -633,13 +604,13 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let decimal = price.to_decimal().unwrap();
+        let exact = price.to_float().unwrap();
 
-        assert_eq!(decimal.to_string(), "42");
+        assert_eq!(format_float(&exact), "42");
     }
 
     #[test]
-    fn test_to_decimal_positive_exponent() {
+    fn test_to_float_positive_exponent() {
         let price = Price {
             price: 123,
             conf: 10,
@@ -647,13 +618,13 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let decimal = price.to_decimal().unwrap();
+        let exact = price.to_float().unwrap();
 
-        assert_eq!(decimal.to_string(), "123000");
+        assert_eq!(format_float(&exact), "123000");
     }
 
     #[test]
-    fn test_to_decimal_various_exponents() {
+    fn test_to_float_various_exponents() {
         let test_cases = vec![
             (100_000_000, -6, "100"),
             (1_500_000, -6, "1.5"),
@@ -671,10 +642,10 @@ mod tests {
                 publishTime: U256::from(1_700_000_000u64),
             };
 
-            let decimal = price.to_decimal().unwrap();
+            let exact = price.to_float().unwrap();
 
             assert_eq!(
-                decimal.to_string(),
+                format_float(&exact),
                 expected,
                 "Failed for price={price_value}, expo={expo}"
             );
@@ -682,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_decimal_negative_price() {
+    fn test_to_float_negative_price() {
         let price = Price {
             price: -50_000_000,
             conf: 1000,
@@ -690,13 +661,13 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let decimal = price.to_decimal().unwrap();
+        let exact = price.to_float().unwrap();
 
-        assert_eq!(decimal.to_string(), "-50");
+        assert_eq!(format_float(&exact), "-50");
     }
 
     #[test]
-    fn test_to_decimal_equity_price() {
+    fn test_to_float_equity_price() {
         let price = Price {
             price: 18_250,
             conf: 10,
@@ -704,9 +675,9 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let decimal = price.to_decimal().unwrap();
+        let exact = price.to_float().unwrap();
 
-        assert_eq!(decimal.to_string(), "182.5");
+        assert_eq!(format_float(&exact), "182.5");
     }
 
     #[test]
@@ -722,37 +693,38 @@ mod tests {
         let encoded_bytes = Bytes::from(encoded);
 
         let decoded = decode_pyth_price(&encoded_bytes).unwrap();
-        let decimal = decoded.to_decimal().unwrap();
+        let exact = decoded.to_float().unwrap();
 
         assert_eq!(decoded.price, original_price.price);
         assert_eq!(decoded.conf, original_price.conf);
         assert_eq!(decoded.expo, original_price.expo);
         assert_eq!(decoded.publishTime, original_price.publishTime);
-        assert_eq!(decimal.to_string(), "9.99999999");
+        assert_eq!(format_float(&exact), "9.99999999");
     }
 
     #[test]
     fn test_scale_with_exponent_negative() {
-        let result = scale_with_exponent(123_456_789, -8).unwrap();
-        assert_eq!(result, dec!(1.23456789));
+        let result = scale_with_exponent(&123_456_789, -8).unwrap();
+        assert!(result.eq(float!("1.23456789")).unwrap());
     }
 
     #[test]
     fn test_scale_with_exponent_positive() {
-        let result = scale_with_exponent(123, 3).unwrap();
-        assert_eq!(result, dec!(123000));
+        let result = scale_with_exponent(&123, 3).unwrap();
+        assert!(result.eq(float!("123000")).unwrap());
     }
 
     #[test]
     fn test_scale_with_exponent_zero() {
-        let result = scale_with_exponent(42, 0).unwrap();
-        assert_eq!(result, dec!(42));
+        let result = scale_with_exponent(&42, 0).unwrap();
+        assert!(result.eq(float!("42")).unwrap());
     }
 
     #[test]
-    fn test_scale_with_exponent_decimal_overflow() {
-        let result = scale_with_exponent(u64::MAX, 10);
-        result.unwrap_err();
+    fn test_scale_with_exponent_large_value() {
+        // Float handles large values that Decimal couldn't
+        let result = scale_with_exponent(&u64::MAX, 10).unwrap();
+        assert!(result.eq(float!("184467440737095516150000000000")).unwrap());
     }
 
     #[test]
@@ -794,17 +766,17 @@ mod tests {
         };
 
         let pricing = PythPricing {
-            price: dec!(182.50),
-            confidence: dec!(0.10),
+            price: float!("182.50"),
+            confidence: float!("0.10"),
             exponent: -8,
             publish_time: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         };
 
-        let price_decimal = price.to_decimal().unwrap();
-        assert_eq!(price_decimal, pricing.price);
+        let price_exact = price.to_float().unwrap();
+        assert!(price_exact.eq(pricing.price).unwrap());
 
-        let confidence_decimal = scale_with_exponent(price.conf, price.expo).unwrap();
-        assert_eq!(confidence_decimal, pricing.confidence);
+        let confidence_exact = scale_with_exponent(&price.conf, price.expo).unwrap();
+        assert!(confidence_exact.eq(pricing.confidence).unwrap());
     }
 
     #[tokio::test]

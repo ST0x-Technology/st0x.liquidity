@@ -58,11 +58,11 @@
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::{info, warn};
 
+use rain_math_float::Float;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::Symbol;
 
@@ -183,7 +183,7 @@ pub(crate) enum EquityRedemptionCommand {
     /// Emits WithdrawnFromRaindex.
     Redeem {
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: Float,
         token: Address,
         amount: U256,
     },
@@ -210,12 +210,16 @@ pub(crate) enum DetectionFailure {
     ApiError { status_code: Option<u16> },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum EquityRedemptionEvent {
     /// Tokens withdrawn from Raindex vault to wallet.
     WithdrawnFromRaindex {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "crate::float_serde::serialize_float_as_string",
+            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         token: Address,
         wrapped_amount: U256,
         raindex_withdraw_tx: TxHash,
@@ -263,6 +267,111 @@ pub(crate) enum EquityRedemptionEvent {
     },
 }
 
+/// Required by `cqrs_es::DomainEvent`.
+impl PartialEq for EquityRedemptionEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::WithdrawnFromRaindex {
+                    symbol: s1,
+                    quantity: q1,
+                    token: t1,
+                    wrapped_amount: w1,
+                    raindex_withdraw_tx: r1,
+                    withdrawn_at: wa1,
+                },
+                Self::WithdrawnFromRaindex {
+                    symbol: s2,
+                    quantity: q2,
+                    token: t2,
+                    wrapped_amount: w2,
+                    raindex_withdraw_tx: r2,
+                    withdrawn_at: wa2,
+                },
+            ) => {
+                s1 == s2
+                    && q1.eq(*q2).unwrap_or(false)
+                    && t1 == t2
+                    && w1 == w2
+                    && r1 == r2
+                    && wa1 == wa2
+            }
+            (
+                Self::TokensUnwrapped {
+                    underlying_token: u1,
+                    unwrap_tx_hash: h1,
+                    unwrapped_amount: a1,
+                    unwrapped_at: t1,
+                },
+                Self::TokensUnwrapped {
+                    underlying_token: u2,
+                    unwrap_tx_hash: h2,
+                    unwrapped_amount: a2,
+                    unwrapped_at: t2,
+                },
+            ) => u1 == u2 && h1 == h2 && a1 == a2 && t1 == t2,
+            (
+                Self::TransferFailed {
+                    tx_hash: h1,
+                    failed_at: f1,
+                },
+                Self::TransferFailed {
+                    tx_hash: h2,
+                    failed_at: f2,
+                },
+            ) => h1 == h2 && f1 == f2,
+            (
+                Self::TokensSent {
+                    redemption_wallet: w1,
+                    redemption_tx: t1,
+                    sent_at: s1,
+                },
+                Self::TokensSent {
+                    redemption_wallet: w2,
+                    redemption_tx: t2,
+                    sent_at: s2,
+                },
+            ) => w1 == w2 && t1 == t2 && s1 == s2,
+            (
+                Self::DetectionFailed {
+                    failure: f1,
+                    failed_at: fa1,
+                },
+                Self::DetectionFailed {
+                    failure: f2,
+                    failed_at: fa2,
+                },
+            ) => f1 == f2 && fa1 == fa2,
+            (
+                Self::Detected {
+                    tokenization_request_id: t1,
+                    detected_at: d1,
+                },
+                Self::Detected {
+                    tokenization_request_id: t2,
+                    detected_at: d2,
+                },
+            ) => t1 == t2 && d1 == d2,
+            (
+                Self::RedemptionRejected {
+                    reason: r1,
+                    rejected_at: ra1,
+                },
+                Self::RedemptionRejected {
+                    reason: r2,
+                    rejected_at: ra2,
+                },
+            ) => r1 == r2 && ra1 == ra2,
+            (Self::Completed { completed_at: c1 }, Self::Completed { completed_at: c2 }) => {
+                c1 == c2
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for EquityRedemptionEvent {}
+
 impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
         use EquityRedemptionEvent::*;
@@ -289,12 +398,16 @@ impl DomainEvent for EquityRedemptionEvent {
 ///
 /// Uses the typestate pattern via enum variants to make invalid states unrepresentable.
 /// Each variant contains exactly the data valid for that state.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum EquityRedemption {
     /// Tokens withdrawn from Raindex vault to wallet, not yet sent to Alpaca
     WithdrawnFromRaindex {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "crate::float_serde::serialize_float_as_string",
+            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         token: Address,
         wrapped_amount: U256,
         raindex_withdraw_tx: TxHash,
@@ -304,7 +417,11 @@ pub(crate) enum EquityRedemption {
     /// Wrapped tokens have been unwrapped, ready to send to Alpaca
     TokensUnwrapped {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "crate::float_serde::serialize_float_as_string",
+            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         token: Address,
         underlying_token: Address,
         raindex_withdraw_tx: TxHash,
@@ -317,7 +434,11 @@ pub(crate) enum EquityRedemption {
     /// Tokens sent to Alpaca's redemption wallet
     TokensSent {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "crate::float_serde::serialize_float_as_string",
+            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         token: Address,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: Option<TxHash>,
@@ -329,7 +450,11 @@ pub(crate) enum EquityRedemption {
     /// Alpaca detected the token transfer and returned tracking identifier
     Pending {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "crate::float_serde::serialize_float_as_string",
+            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         redemption_tx: TxHash,
         tokenization_request_id: TokenizationRequestId,
         sent_at: DateTime<Utc>,
@@ -339,7 +464,11 @@ pub(crate) enum EquityRedemption {
     /// Redemption successfully completed and account credited (terminal state)
     Completed {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "crate::float_serde::serialize_float_as_string",
+            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         redemption_tx: TxHash,
         tokenization_request_id: TokenizationRequestId,
         completed_at: DateTime<Utc>,
@@ -353,7 +482,11 @@ pub(crate) enum EquityRedemption {
     /// - `tokenization_request_id`: Present if Alpaca detected the transfer
     Failed {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "crate::float_serde::serialize_float_as_string",
+            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         raindex_withdraw_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
@@ -802,7 +935,6 @@ impl EventSourced for EquityRedemption {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
@@ -823,7 +955,7 @@ mod tests {
     fn withdrawn_from_raindex_event() -> EquityRedemptionEvent {
         EquityRedemptionEvent::WithdrawnFromRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(50.25),
+            quantity: float!("50.25"),
             token: Address::random(),
             wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             raindex_withdraw_tx: TxHash::random(),
@@ -852,7 +984,7 @@ mod tests {
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Redeem {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: dec!(50.25),
+                quantity: float!("50.25"),
                 token: Address::random(),
                 amount: U256::from(50_250_000_000_000_000_000_u128),
             })
@@ -906,7 +1038,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
-                    quantity: dec!(50.25),
+                    quantity: float!("50.25"),
                     token: Address::random(),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                 },
@@ -962,7 +1094,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
-                    quantity: dec!(10),
+                    quantity: float!("10"),
                     token: wrapped_token,
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                 },
@@ -1086,7 +1218,7 @@ mod tests {
         let entity = replay::<EquityRedemption>(vec![
             EquityRedemptionEvent::WithdrawnFromRaindex {
                 symbol: symbol.clone(),
-                quantity: dec!(50.25),
+                quantity: float!("50.25"),
                 token: Address::random(),
                 wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
                 raindex_withdraw_tx: TxHash::random(),
@@ -1121,7 +1253,7 @@ mod tests {
         };
 
         assert_eq!(failed_symbol, symbol);
-        assert_eq!(quantity, dec!(50.25));
+        assert!(quantity.eq(float!("50.25")).unwrap());
         assert_eq!(failed_redemption_tx, Some(redemption_tx));
         assert_eq!(
             tokenization_request_id,
@@ -1165,7 +1297,7 @@ mod tests {
     fn test_evolve_detected_rejects_wrong_state() {
         let completed = EquityRedemption::Completed {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(50.25),
+            quantity: float!("50.25"),
             redemption_tx: TxHash::random(),
             tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
             completed_at: Utc::now(),
@@ -1177,14 +1309,14 @@ mod tests {
         };
 
         let result = EquityRedemption::evolve(&completed, &event).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_evolve_completed_rejects_wrong_state() {
         let tokens_sent = EquityRedemption::TokensSent {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(50.25),
+            quantity: float!("50.25"),
             token: Address::random(),
             raindex_withdraw_tx: TxHash::random(),
             unwrap_tx_hash: None,
@@ -1198,14 +1330,14 @@ mod tests {
         };
 
         let result = EquityRedemption::evolve(&tokens_sent, &event).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_evolve_detection_failed_rejects_non_tokens_sent_states() {
         let pending = EquityRedemption::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(50.25),
+            quantity: float!("50.25"),
             redemption_tx: TxHash::random(),
             tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
             sent_at: Utc::now(),
@@ -1218,14 +1350,14 @@ mod tests {
         };
 
         let result = EquityRedemption::evolve(&pending, &event).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_evolve_redemption_rejected_rejects_non_pending_states() {
         let tokens_sent = EquityRedemption::TokensSent {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(50.25),
+            quantity: float!("50.25"),
             token: Address::random(),
             raindex_withdraw_tx: TxHash::random(),
             unwrap_tx_hash: None,
@@ -1240,14 +1372,14 @@ mod tests {
         };
 
         let result = EquityRedemption::evolve(&tokens_sent, &event).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_evolve_rejects_tokens_sent_event_on_live_state() {
         let tokens_sent = EquityRedemption::TokensSent {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(50.25),
+            quantity: float!("50.25"),
             token: Address::random(),
             raindex_withdraw_tx: TxHash::random(),
             unwrap_tx_hash: None,
@@ -1263,7 +1395,7 @@ mod tests {
         };
 
         let result = EquityRedemption::evolve(&tokens_sent, &event).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -1274,7 +1406,7 @@ mod tests {
         };
 
         let result = EquityRedemption::originate(&event);
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -1293,7 +1425,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
-                    quantity: dec!(50.25),
+                    quantity: float!("50.25"),
                     token: Address::random(),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                 },
@@ -1374,7 +1506,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
-                    quantity: dec!(10),
+                    quantity: float!("10"),
                     token: Address::random(),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                 },
@@ -1387,7 +1519,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
-                    quantity: dec!(10),
+                    quantity: float!("10"),
                     token: Address::random(),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                 },
@@ -1411,7 +1543,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
-                    quantity: dec!(10),
+                    quantity: float!("10"),
                     token: Address::random(),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                 },
@@ -1444,7 +1576,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
-                    quantity: dec!(10),
+                    quantity: float!("10"),
                     token: Address::random(),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                 },

@@ -136,7 +136,7 @@ impl Executor for Schwab {
         if order_response.is_filled() {
             let price =
                 order_response
-                    .price()
+                    .price()?
                     .ok_or_else(|| ExecutionError::IncompleteOrderResponse {
                         field: "price".to_string(),
                         status: OrderStatus::Filled,

@@ -10,13 +10,13 @@ mod vault;
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
-use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
+use rain_math_float::Float;
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 
@@ -56,6 +56,10 @@ pub enum CctpChain {
 pub enum CliError {
     #[error("Invalid quantity: {value}. Quantity must be greater than zero")]
     InvalidQuantity { value: u64 },
+}
+
+fn parse_float(input: &str) -> Result<Float, String> {
+    Float::parse(input.to_string()).map_err(|err| format!("{err}"))
 }
 
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
@@ -204,8 +208,8 @@ pub enum Commands {
     /// It handles ERC20 approval and the vault deposit in sequence.
     VaultDeposit {
         /// Amount of tokens to deposit (human-readable, e.g., 100 for 100 tokens)
-        #[arg(short = 'a', long = "amount")]
-        amount: Decimal,
+        #[arg(short = 'a', long = "amount", value_parser = parse_float)]
+        amount: Float,
 
         /// Token contract address
         #[arg(short = 't', long = "token")]
@@ -468,7 +472,7 @@ enum ProviderCommand {
         amount: Usdc,
     },
     VaultDeposit {
-        amount: Decimal,
+        amount: Float,
         token: Address,
         vault_id: B256,
         decimals: u8,
@@ -797,8 +801,6 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use rain_math_float::Float;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use serde_json::json;
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -2027,7 +2029,10 @@ mod tests {
         let (order_id, order) = &executions[0];
         assert_eq!(
             order.shares(),
-            Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
+            Positive::new(FractionalShares::new(
+                Float::parse("9".to_string()).unwrap()
+            ))
+            .unwrap()
         );
         assert_eq!(order.direction(), Direction::Buy);
         assert!(
@@ -2127,7 +2132,10 @@ mod tests {
         let order = &executions[0].1;
         assert_eq!(
             order.shares(),
-            Positive::new(FractionalShares::new(dec!(5))).unwrap()
+            Positive::new(FractionalShares::new(
+                Float::parse("5".to_string()).unwrap()
+            ))
+            .unwrap()
         );
 
         let stdout_str1 = String::from_utf8(stdout1).unwrap();

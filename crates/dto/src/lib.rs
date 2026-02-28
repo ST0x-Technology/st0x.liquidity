@@ -5,10 +5,16 @@
 //! for the full workspace.
 
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use ts_rs::TS;
+
+use rain_math_float::Float;
+use st0x_float_serde::{float_string_serde, option_float_string_serde};
+
+fn zero_float() -> Float {
+    Float::parse("0".to_string()).unwrap_or_else(|_| unreachable!())
+}
 
 /// Messages sent from the server to WebSocket clients.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -66,35 +72,38 @@ pub struct Trade {
 }
 
 /// Per-symbol net position.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Position {
     pub symbol: String,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub net: Decimal,
+    pub net: Float,
 }
 
 /// Per-symbol onchain/offchain/net balances.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct SymbolInventory {
     pub symbol: String,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub onchain: Decimal,
+    pub onchain: Float,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub offchain: Decimal,
+    pub offchain: Float,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub net: Decimal,
+    pub net: Float,
 }
 
 /// Onchain and offchain USDC balances.
-#[derive(Debug, Clone, Copy, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 pub struct UsdcInventory {
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub onchain: Decimal,
+    pub onchain: Float,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub offchain: Decimal,
+    pub offchain: Float,
 }
 
 /// Full inventory snapshot across all symbols and USDC.
@@ -110,59 +119,70 @@ impl Inventory {
         Self {
             per_symbol: Vec::new(),
             usdc: UsdcInventory {
-                onchain: Decimal::ZERO,
-                offchain: Decimal::ZERO,
+                onchain: zero_float(),
+                offchain: zero_float(),
             },
         }
     }
 }
 
 /// Absolute and percentage profit/loss.
-#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 pub struct PnL {
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub absolute: Decimal,
+    pub absolute: Float,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub percent: Decimal,
+    pub percent: Float,
 }
 
 /// Performance metrics for a single time window.
-#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeframeMetrics {
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub aum: Decimal,
+    pub aum: Float,
     pub pnl: PnL,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub volume: Decimal,
+    pub volume: Float,
     #[ts(type = "number")]
     pub trade_count: u64,
+    #[serde(default, with = "option_float_string_serde")]
     #[ts(type = "string | null")]
-    pub sharpe_ratio: Option<Decimal>,
+    pub sharpe_ratio: Option<Float>,
+    #[serde(default, with = "option_float_string_serde")]
     #[ts(type = "string | null")]
-    pub sortino_ratio: Option<Decimal>,
+    pub sortino_ratio: Option<Float>,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub max_drawdown: Decimal,
+    pub max_drawdown: Float,
     #[ts(type = "number | null")]
     pub hedge_lag_ms: Option<u64>,
+    #[serde(
+        default,
+        with = "option_float_string_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[ts(optional, type = "string")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uptime_percent: Option<Decimal>,
+    pub uptime_percent: Option<Float>,
 }
 
 impl TimeframeMetrics {
     pub fn zero() -> Self {
         Self {
-            aum: Decimal::ZERO,
+            aum: zero_float(),
             pnl: PnL {
-                absolute: Decimal::ZERO,
-                percent: Decimal::ZERO,
+                absolute: zero_float(),
+                percent: zero_float(),
             },
-            volume: Decimal::ZERO,
+            volume: zero_float(),
             trade_count: 0,
             sharpe_ratio: None,
             sortino_ratio: None,
-            max_drawdown: Decimal::ZERO,
+            max_drawdown: zero_float(),
             hedge_lag_ms: None,
             uptime_percent: None,
         }
@@ -197,35 +217,48 @@ impl PerformanceMetrics {
 }
 
 /// Current bid/ask spread for a symbol.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadSummary {
     pub symbol: String,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub last_buy_price: Decimal,
+    pub last_buy_price: Float,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub last_sell_price: Decimal,
+    pub last_sell_price: Float,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub pyth_price: Decimal,
+    pub pyth_price: Float,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub spread_bps: Decimal,
+    pub spread_bps: Float,
     pub updated_at: DateTime<Utc>,
 }
 
 /// Incremental spread change for a symbol.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadUpdate {
     pub symbol: String,
     pub timestamp: DateTime<Utc>,
+    #[serde(
+        default,
+        with = "option_float_string_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[ts(optional, type = "string")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub buy_price: Option<Decimal>,
+    pub buy_price: Option<Float>,
+    #[serde(
+        default,
+        with = "option_float_string_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[ts(optional, type = "string")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sell_price: Option<Decimal>,
+    pub sell_price: Option<Float>,
+    #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
-    pub pyth_price: Decimal,
+    pub pyth_price: Float,
 }
 
 /// Active or completed rebalance operation.
@@ -283,10 +316,16 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
 mod tests {
     use std::path::PathBuf;
 
+    use serde_json::json;
+
     use super::*;
 
     fn default_bindings_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api")
+    }
+
+    fn float(value: &str) -> Float {
+        Float::parse(value.to_string()).unwrap()
     }
 
     #[test]
@@ -298,6 +337,82 @@ mod tests {
         assert!(json.contains("metrics"));
         assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
+        assert!(
+            !json.contains("\"0x"),
+            "dashboard DTOs should serialize decimal strings, got: {json}"
+        );
+    }
+
+    #[test]
+    fn position_serializes_float_as_decimal_string() {
+        let position = Position {
+            symbol: "AAPL".to_string(),
+            net: float("1.25"),
+        };
+
+        let json = serde_json::to_value(position).expect("serialization should succeed");
+        assert_eq!(
+            json,
+            json!({
+                "symbol": "AAPL",
+                "net": "1.25"
+            })
+        );
+    }
+
+    #[test]
+    fn timeframe_metrics_serializes_decimal_strings_and_optional_fields() {
+        let metrics = TimeframeMetrics {
+            aum: float("100.5"),
+            pnl: PnL {
+                absolute: float("12.25"),
+                percent: float("3.5"),
+            },
+            volume: float("2500.75"),
+            trade_count: 4,
+            sharpe_ratio: Some(float("1.2")),
+            sortino_ratio: None,
+            max_drawdown: float("0.15"),
+            hedge_lag_ms: None,
+            uptime_percent: None,
+        };
+
+        let json = serde_json::to_value(metrics).expect("serialization should succeed");
+
+        assert_eq!(json["aum"], json!("100.5"));
+        assert_eq!(json["pnl"]["absolute"], json!("12.25"));
+        assert_eq!(json["pnl"]["percent"], json!("3.5"));
+        assert_eq!(json["volume"], json!("2500.75"));
+        assert_eq!(json["sharpeRatio"], json!("1.2"));
+        assert_eq!(json["sortinoRatio"], serde_json::Value::Null);
+        assert_eq!(json["maxDrawdown"], json!("0.15"));
+        assert_eq!(json["hedgeLagMs"], serde_json::Value::Null);
+        assert!(
+            json.get("uptimePercent").is_none(),
+            "uptimePercent should be omitted when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn spread_update_skips_missing_optional_prices_and_formats_present_values() {
+        let timestamp = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let update = SpreadUpdate {
+            symbol: "NVDA".to_string(),
+            timestamp,
+            buy_price: None,
+            sell_price: Some(float("125.75")),
+            pyth_price: float("125.5"),
+        };
+
+        let json = serde_json::to_value(update).expect("serialization should succeed");
+
+        assert_eq!(json["symbol"], json!("NVDA"));
+        assert_eq!(json["sellPrice"], json!("125.75"));
+        assert_eq!(json["pythPrice"], json!("125.5"));
+        assert!(
+            json.get("buyPrice").is_none(),
+            "buyPrice should be omitted when None, got: {json}"
+        );
     }
 
     #[derive(TS)]

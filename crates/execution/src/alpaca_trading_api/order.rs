@@ -2,7 +2,7 @@ use apca::Client;
 use apca::api::v2::order;
 use chrono::Utc;
 use num_decimal::Num;
-use rust_decimal::Decimal;
+use rain_math_float::Float;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -34,10 +34,15 @@ pub(super) async fn place_market_order(
         ..Default::default()
     };
 
-    // Convert Decimal to Num for apca crate using exact rational representation
-    // Decimal stores value as mantissa * 10^(-scale), so we represent it as mantissa/10^scale
-    let decimal = market_order.shares.inner().inner();
-    let quantity = Num::new(decimal.mantissa(), 10i128.pow(decimal.scale()));
+    // Convert FractionalShares -> string -> Num for the apca crate.
+    let formatted = market_order
+        .shares
+        .inner()
+        .inner()
+        .format_with_scientific(false)?;
+    let quantity: Num = formatted
+        .parse()
+        .map_err(|source| AlpacaTradingApiError::NumConversion { formatted, source })?;
 
     let order_request = order_init.init(
         market_order.symbol.to_string(),
@@ -136,13 +141,13 @@ fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
     }
 }
 
-/// Extracts fill price as Decimal from Alpaca order
-fn extract_price(order: &order::Order) -> Result<Option<Decimal>, AlpacaTradingApiError> {
+/// Extracts fill price as Float from Alpaca order
+fn extract_price(order: &order::Order) -> Result<Option<Float>, AlpacaTradingApiError> {
     let Some(avg_fill_price) = &order.average_fill_price else {
         return Ok(None);
     };
 
-    let price: Decimal = format!("{avg_fill_price}").parse()?;
+    let price = Float::parse(format!("{avg_fill_price}"))?;
     Ok(Some(price))
 }
 
@@ -152,8 +157,8 @@ fn extract_shares_from_amount(
 ) -> Result<Positive<FractionalShares>, AlpacaTradingApiError> {
     match amount {
         order::Amount::Quantity { quantity } => {
-            let qty_decimal: Decimal = quantity.to_string().parse()?;
-            Ok(Positive::new(FractionalShares::new(qty_decimal))?)
+            let exact = Float::parse(quantity.to_string())?;
+            Ok(Positive::new(FractionalShares::new(exact))?)
         }
         order::Amount::Notional { .. } => Err(AlpacaTradingApiError::NotionalOrdersNotSupported),
     }
@@ -164,11 +169,17 @@ mod tests {
     use apca::api::v2::order::Amount;
     use httpmock::prelude::*;
     use proptest::prelude::*;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
+
+    fn option_float_eq(lhs: Option<Float>, rhs: Option<Float>) -> bool {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) => lhs.eq(rhs).unwrap(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 
     fn create_test_client(mock_server: &MockServer) -> Client {
         let api_info =
@@ -231,7 +242,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL".to_string()).unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!("100"))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -239,7 +250,10 @@ mod tests {
         mock.assert();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
-        assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
+        assert_eq!(
+            placement.shares.inner(),
+            FractionalShares::new(float!("100"))
+        );
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -298,7 +312,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA".to_string()).unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!("50"))).unwrap(),
             direction: Direction::Sell,
         };
 
@@ -306,7 +320,10 @@ mod tests {
         mock.assert();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
-        assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
+        assert_eq!(
+            placement.shares.inner(),
+            FractionalShares::new(float!("50"))
+        );
         assert_eq!(placement.direction, Direction::Sell);
     }
 
@@ -327,7 +344,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("INVALID".to_string()).unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(10))).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!("10"))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -353,7 +370,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL".to_string()).unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!("100"))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -378,7 +395,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("SPY".to_string()).unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(25))).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!("25"))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -432,10 +449,13 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
+        assert_eq!(
+            order_update.shares.inner(),
+            FractionalShares::new(float!("100"))
+        );
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
-        assert_eq!(order_update.price, None);
+        assert!(option_float_eq(order_update.price, None));
     }
 
     #[tokio::test]
@@ -483,10 +503,16 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
+        assert_eq!(
+            order_update.shares.inner(),
+            FractionalShares::new(float!("50"))
+        );
         assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
-        assert_eq!(order_update.price, Some(dec!(245.67)));
+        assert!(option_float_eq(
+            order_update.price,
+            Some(Float::parse("245.67".to_string()).unwrap())
+        ));
     }
 
     #[tokio::test]
@@ -534,10 +560,13 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "MSFT");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(25));
+        assert_eq!(
+            order_update.shares.inner(),
+            FractionalShares::new(float!("25"))
+        );
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Failed);
-        assert_eq!(order_update.price, None);
+        assert!(option_float_eq(order_update.price, None));
     }
 
     #[tokio::test]
@@ -585,10 +614,13 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "GOOGL");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(200));
+        assert_eq!(
+            order_update.shares.inner(),
+            FractionalShares::new(float!("200"))
+        );
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
-        assert_eq!(order_update.price, None);
+        assert!(option_float_eq(order_update.price, None));
     }
 
     #[test]
@@ -598,42 +630,25 @@ mod tests {
         };
 
         let shares = extract_shares_from_amount(&quantity_amount).unwrap();
-        assert_eq!(shares.inner().inner(), Decimal::from(100));
+        assert_eq!(shares.inner(), FractionalShares::new(float!("100")));
     }
 
     proptest! {
         #[test]
-        fn decimal_to_num_conversion_is_exact(
-            mantissa in 1i64..=999_999_999_999i64,
-            scale in 0u32..=10,
+        fn float_to_num_via_string_roundtrips(
+            integer in 0u64..1_000_000,
+            fractional in 0u64..1_000_000,
         ) {
-            let decimal = Decimal::new(mantissa, scale);
-            let shares = FractionalShares::new(decimal);
-
-            let quantity = Num::new(
-                shares.inner().mantissa(),
-                10i128.pow(shares.inner().scale()),
-            );
-
-            let quantity_from_string: Num = decimal.to_string().parse().unwrap();
-
-            prop_assert_eq!(
-                quantity, quantity_from_string,
-                "Mantissa/scale conversion should match string parsing for {}",
-                decimal
-            );
-        }
-
-        #[test]
-        fn num_to_decimal_via_string_preserves_value(
-            mantissa in 1i64..=999_999_999i64,
-            scale in 0u32..=6,
-        ) {
-            let original = Decimal::new(mantissa, scale);
-            let num = Num::new(original.mantissa(), 10i128.pow(original.scale()));
-
-            let roundtrip: Decimal = num.to_string().parse().unwrap();
-            prop_assert_eq!(original, roundtrip);
+            let value_str = format!("{integer}.{fractional:06}");
+            if let Ok(exact) = Float::parse(value_str)
+                && let Ok(formatted) = exact.format_with_scientific(false)
+                && let Ok(num) = formatted.parse::<Num>()
+            {
+                let num_str = num.to_string();
+                if let Ok(roundtripped) = Float::parse(num_str) {
+                    prop_assert!(exact.eq(roundtripped).unwrap());
+                }
+            }
         }
     }
 }

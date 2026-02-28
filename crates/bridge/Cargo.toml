@@ -8,11 +8,12 @@ default = []
 test-support = []
 cctp = [
   "dep:backon",
+  "dep:rain-math-float",
   "dep:reqwest",
-  "dep:rust_decimal",
   "dep:serde",
   "dep:serde_json",
   "dep:st0x-evm",
+  "dep:st0x-float-serde",
   "dep:thiserror",
   "dep:tokio",
   "dep:tracing",
@@ -28,20 +29,20 @@ async-trait.workspace = true
 backon = { workspace = true, optional = true }
 httpmock = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+rain-math-float = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-rust_decimal = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 st0x-evm = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+st0x-float-serde = { version = "0.1.0", path = "../float-serde", optional = true }
 
 [dev-dependencies]
 httpmock.workspace = true
 proptest.workspace = true
 itertools = "0.14.0"
-rust_decimal_macros = "1.38.0"
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 rand.workspace = true

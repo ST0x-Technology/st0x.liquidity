@@ -1,10 +1,11 @@
 //! Generic venue balance tracking for inventory management.
 
+use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Sub};
 use tracing::{debug, warn};
 
-use st0x_execution::{ArithmeticError, HasZero};
+use st0x_execution::HasZero;
 
 impl<T: HasZero> Default for VenueBalance<T> {
     fn default() -> Self {
@@ -16,7 +17,7 @@ impl<T: HasZero> Default for VenueBalance<T> {
 }
 
 /// Error type for inventory operations.
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum InventoryError<T> {
     #[error(
         "insufficient available balance: requested {requested:?}, but only {available:?} available"
@@ -26,8 +27,8 @@ pub(crate) enum InventoryError<T> {
         "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
     )]
     InsufficientInflight { requested: T, inflight: T },
-    #[error(transparent)]
-    Arithmetic(#[from] ArithmeticError<T>),
+    #[error("arithmetic error: {0}")]
+    Arithmetic(#[from] FloatError),
 }
 
 /// Balance at a single venue, tracking available and inflight amounts.
@@ -43,11 +44,9 @@ pub(super) struct VenueBalance<T> {
 
 impl<T> VenueBalance<T>
 where
-    T: Add<Output = Result<T, ArithmeticError<T>>>
-        + Sub<Output = Result<T, ArithmeticError<T>>>
-        + Copy,
+    T: Add<Output = Result<T, FloatError>> + Sub<Output = Result<T, FloatError>> + Copy,
 {
-    pub(super) fn total(self) -> Result<T, ArithmeticError<T>> {
+    pub(super) fn total(self) -> Result<T, FloatError> {
         self.available + self.inflight
     }
 
@@ -71,21 +70,21 @@ where
 
 impl<T> VenueBalance<T>
 where
-    T: Add<Output = Result<T, ArithmeticError<T>>>
-        + Sub<Output = Result<T, ArithmeticError<T>>>
+    T: Add<Output = Result<T, FloatError>>
+        + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
         + std::fmt::Debug,
 {
-    pub(super) fn has_inflight(self) -> bool {
-        !self.inflight.is_zero()
+    pub(super) fn has_inflight(self) -> Result<bool, FloatError> {
+        self.inflight.is_zero().map(|zero| !zero)
     }
 
     /// Move amount from available to inflight (assets leaving this venue).
     pub(super) fn move_to_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_available = (self.available - amount)?;
 
-        if new_available.is_negative() {
+        if new_available.is_negative()? {
             return Err(InventoryError::InsufficientAvailable {
                 requested: amount,
                 available: self.available,
@@ -104,7 +103,7 @@ where
     pub(super) fn confirm_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_inflight = (self.inflight - amount)?;
 
-        if new_inflight.is_negative() {
+        if new_inflight.is_negative()? {
             return Err(InventoryError::InsufficientInflight {
                 requested: amount,
                 inflight: self.inflight,
@@ -121,7 +120,7 @@ where
     pub(super) fn cancel_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_inflight = (self.inflight - amount)?;
 
-        if new_inflight.is_negative() {
+        if new_inflight.is_negative()? {
             return Err(InventoryError::InsufficientInflight {
                 requested: amount,
                 inflight: self.inflight,
@@ -150,7 +149,7 @@ where
     pub(super) fn remove_available(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_available = (self.available - amount)?;
 
-        if new_available.is_negative() {
+        if new_available.is_negative()? {
             return Err(InventoryError::InsufficientAvailable {
                 requested: amount,
                 available: self.available,
@@ -169,19 +168,19 @@ where
     /// When inflight is non-zero, returns self unchanged - we cannot safely reconcile
     /// while transfers are in progress because the snapshot alone cannot distinguish
     /// between "transfer completed" vs "unrelated inventory change".
-    pub(super) fn apply_snapshot(self, snapshot_balance: T) -> Self {
-        if !self.inflight.is_zero() {
+    pub(super) fn apply_snapshot(self, snapshot_balance: T) -> Result<Self, FloatError> {
+        if !self.inflight.is_zero()? {
             debug!(
                 inflight = ?self.inflight,
                 "Skipping snapshot reconciliation due to non-zero inflight"
             );
-            return self;
+            return Ok(self);
         }
 
-        Self {
+        Ok(Self {
             available: snapshot_balance,
             inflight: self.inflight,
-        }
+        })
     }
 
     /// Force-apply a snapshot, clearing inflight and setting
@@ -215,8 +214,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-
     use st0x_execution::FractionalShares;
 
     use super::*;
@@ -224,51 +221,51 @@ mod tests {
 
     fn equity_balance(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
         VenueBalance::new(
-            FractionalShares::new(Decimal::from(available)),
-            FractionalShares::new(Decimal::from(inflight)),
+            FractionalShares::new(float!(&available.to_string())),
+            FractionalShares::new(float!(&inflight.to_string())),
         )
     }
 
     fn usdc_balance(available: i64, inflight: i64) -> VenueBalance<Usdc> {
         VenueBalance::new(
-            Usdc(Decimal::from(available)),
-            Usdc(Decimal::from(inflight)),
+            Usdc(float!(&available.to_string())),
+            Usdc(float!(&inflight.to_string())),
         )
     }
 
     #[test]
     fn total_sums_available_and_inflight() {
         let balance = equity_balance(100, 50);
-        assert_eq!(balance.total().unwrap().inner(), Decimal::from(150));
+        assert!(balance.total().unwrap().inner().eq(float!("150")).unwrap());
     }
 
     #[test]
     fn has_inflight_true_when_nonzero() {
         let balance = equity_balance(100, 50);
-        assert!(balance.has_inflight());
+        assert!(balance.has_inflight().unwrap());
     }
 
     #[test]
     fn has_inflight_false_when_zero() {
         let balance = equity_balance(100, 0);
-        assert!(!balance.has_inflight());
+        assert!(!balance.has_inflight().unwrap());
     }
 
     #[test]
     fn move_to_inflight_transfers_from_available() {
         let balance = equity_balance(100, 0);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.move_to_inflight(amount).unwrap();
 
-        assert_eq!(result.available().inner(), Decimal::from(70));
-        assert_eq!(result.inflight().inner(), Decimal::from(30));
+        assert!(result.available().inner().eq(float!("70")).unwrap());
+        assert!(result.inflight().inner().eq(float!("30")).unwrap());
     }
 
     #[test]
     fn move_to_inflight_fails_when_insufficient() {
         let balance = equity_balance(10, 0);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.move_to_inflight(amount);
 
@@ -281,18 +278,18 @@ mod tests {
     #[test]
     fn confirm_inflight_removes_from_inflight() {
         let balance = equity_balance(100, 50);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.confirm_inflight(amount).unwrap();
 
-        assert_eq!(result.available().inner(), Decimal::from(100));
-        assert_eq!(result.inflight().inner(), Decimal::from(20));
+        assert!(result.available().inner().eq(float!("100")).unwrap());
+        assert!(result.inflight().inner().eq(float!("20")).unwrap());
     }
 
     #[test]
     fn confirm_inflight_fails_when_insufficient() {
         let balance = equity_balance(100, 10);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.confirm_inflight(amount);
 
@@ -305,18 +302,18 @@ mod tests {
     #[test]
     fn cancel_inflight_returns_to_available() {
         let balance = equity_balance(100, 50);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.cancel_inflight(amount).unwrap();
 
-        assert_eq!(result.available().inner(), Decimal::from(130));
-        assert_eq!(result.inflight().inner(), Decimal::from(20));
+        assert!(result.available().inner().eq(float!("130")).unwrap());
+        assert!(result.inflight().inner().eq(float!("20")).unwrap());
     }
 
     #[test]
     fn cancel_inflight_fails_when_insufficient() {
         let balance = equity_balance(100, 10);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.cancel_inflight(amount);
 
@@ -329,29 +326,29 @@ mod tests {
     #[test]
     fn add_available_increases_available() {
         let balance = equity_balance(100, 50);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.add_available(amount).unwrap();
 
-        assert_eq!(result.available().inner(), Decimal::from(130));
-        assert_eq!(result.inflight().inner(), Decimal::from(50));
+        assert!(result.available().inner().eq(float!("130")).unwrap());
+        assert!(result.inflight().inner().eq(float!("50")).unwrap());
     }
 
     #[test]
     fn remove_available_decreases_available() {
         let balance = equity_balance(100, 50);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.remove_available(amount).unwrap();
 
-        assert_eq!(result.available().inner(), Decimal::from(70));
-        assert_eq!(result.inflight().inner(), Decimal::from(50));
+        assert!(result.available().inner().eq(float!("70")).unwrap());
+        assert!(result.inflight().inner().eq(float!("50")).unwrap());
     }
 
     #[test]
     fn remove_available_fails_when_insufficient() {
         let balance = equity_balance(10, 50);
-        let amount = FractionalShares::new(Decimal::from(30));
+        let amount = FractionalShares::new(float!("30"));
 
         let result = balance.remove_available(amount);
 
@@ -364,46 +361,50 @@ mod tests {
     #[test]
     fn usdc_balance_works_same_as_equity() {
         let balance = usdc_balance(100, 0);
-        let amount = Usdc(Decimal::from(30));
+        let amount = Usdc(float!("30"));
 
         let result = balance.move_to_inflight(amount).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(70));
-        assert_eq!(result.inflight().0, Decimal::from(30));
+        let Usdc(available) = result.available();
+        let Usdc(inflight) = result.inflight();
+        assert!(available.eq(float!("70")).unwrap());
+        assert!(inflight.eq(float!("30")).unwrap());
     }
 
     #[test]
     fn apply_snapshot_skips_when_inflight_nonzero() {
         let balance = equity_balance(90, 10);
-        let snapshot_balance = FractionalShares::new(Decimal::from(95));
+        let snapshot_balance = FractionalShares::new(float!("95"));
 
-        let result = balance.apply_snapshot(snapshot_balance);
+        let result = balance.apply_snapshot(snapshot_balance).unwrap();
 
         // Balance unchanged when inflight is non-zero
-        assert_eq!(result.available().inner(), Decimal::from(90));
-        assert_eq!(result.inflight().inner(), Decimal::from(10));
+        assert!(result.available().inner().eq(float!("90")).unwrap());
+        assert!(result.inflight().inner().eq(float!("10")).unwrap());
     }
 
     #[test]
     fn apply_snapshot_sets_available_when_inflight_zero() {
         let balance = equity_balance(100, 0);
-        let snapshot_balance = FractionalShares::new(Decimal::from(75));
+        let snapshot_balance = FractionalShares::new(float!("75"));
 
-        let result = balance.apply_snapshot(snapshot_balance);
+        let result = balance.apply_snapshot(snapshot_balance).unwrap();
 
-        assert_eq!(result.available().inner(), Decimal::from(75));
-        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+        assert!(result.available().inner().eq(float!("75")).unwrap());
+        assert!(result.inflight().is_zero().unwrap());
     }
 
     #[test]
     fn apply_snapshot_works_with_usdc_when_inflight_zero() {
         let balance = usdc_balance(1000, 0);
-        let snapshot_balance = Usdc(Decimal::from(950));
+        let snapshot_balance = Usdc(float!("950"));
 
-        let result = balance.apply_snapshot(snapshot_balance);
+        let result = balance.apply_snapshot(snapshot_balance).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(950));
-        assert_eq!(result.inflight().0, Decimal::ZERO);
+        let Usdc(available) = result.available();
+        let Usdc(inflight) = result.inflight();
+        assert!(available.eq(float!("950")).unwrap());
+        assert!(inflight.is_zero().unwrap());
     }
 
     #[derive(Debug)]
@@ -414,42 +415,44 @@ mod tests {
     #[test]
     fn force_apply_snapshot_clears_inflight() {
         let balance = equity_balance(90, 10);
-        let snapshot_balance = FractionalShares::new(Decimal::from(95));
+        let snapshot_balance = FractionalShares::new(float!("95"));
         let error = TestError {
             _reason: "stuck inflight",
         };
 
         let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
-        assert_eq!(result.available().inner(), Decimal::from(95));
-        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+        assert!(result.available().inner().eq(float!("95")).unwrap());
+        assert!(result.inflight().is_zero().unwrap());
     }
 
     #[test]
     fn force_apply_snapshot_works_when_inflight_zero() {
         let balance = equity_balance(100, 0);
-        let snapshot_balance = FractionalShares::new(Decimal::from(75));
+        let snapshot_balance = FractionalShares::new(float!("75"));
         let error = TestError {
             _reason: "recovery",
         };
 
         let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
-        assert_eq!(result.available().inner(), Decimal::from(75));
-        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+        assert!(result.available().inner().eq(float!("75")).unwrap());
+        assert!(result.inflight().is_zero().unwrap());
     }
 
     #[test]
     fn force_apply_snapshot_works_with_usdc() {
         let balance = usdc_balance(1000, 200);
-        let snapshot_balance = Usdc(Decimal::from(950));
+        let snapshot_balance = Usdc(float!("950"));
         let error = TestError {
             _reason: "usdc corruption",
         };
 
         let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
-        assert_eq!(result.available().0, Decimal::from(950));
-        assert_eq!(result.inflight().0, Decimal::ZERO);
+        let Usdc(available) = result.available();
+        let Usdc(inflight) = result.inflight();
+        assert!(available.eq(float!("950")).unwrap());
+        assert!(inflight.is_zero().unwrap());
     }
 }

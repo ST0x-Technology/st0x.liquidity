@@ -7,8 +7,7 @@ use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::{Log, TransactionReceipt};
 use async_trait::async_trait;
 use chrono::Utc;
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -173,9 +172,9 @@ impl OnchainTradeBuilder {
                     .parse::<TokenizedSymbol<WrappedTokenizedShares>>()
                     .unwrap(),
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                amount: FractionalShares::new(Decimal::ONE),
+                amount: FractionalShares::new(Float::parse("1".to_string()).unwrap()),
                 direction: Direction::Buy,
-                price: Usdc::new(dec!(150)).unwrap(),
+                price: Usdc::new(Float::parse("150".to_string()).unwrap()).unwrap(),
                 block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: None,
@@ -203,13 +202,13 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_amount(mut self, amount: Decimal) -> Self {
+    pub(crate) fn with_amount(mut self, amount: Float) -> Self {
         self.trade.amount = FractionalShares::new(amount);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_price(mut self, price: Decimal) -> Self {
+    pub(crate) fn with_price(mut self, price: Float) -> Self {
         self.trade.price = Usdc::new(price).unwrap();
         self
     }

@@ -313,11 +313,20 @@ pub(crate) struct Instrument {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use rain_math_float::Float;
+
+    use super::*;
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
+
+    fn option_float_eq(lhs: Option<Float>, rhs: Option<Float>) -> bool {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) => lhs.eq(rhs).unwrap(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 
     #[test]
     fn test_new_buy() {
@@ -862,8 +871,17 @@ mod tests {
 
         assert_eq!(order_status.order_id, Some("1004055538123".to_string()));
         assert!(order_status.is_filled());
-        assert_eq!(order_status.filled_quantity.unwrap(), dec!(100.0));
-        assert_eq!(order_status.price(), Some(dec!(150.25)));
+        assert!(
+            order_status
+                .filled_quantity
+                .unwrap()
+                .eq(float!("100"))
+                .unwrap()
+        );
+        assert!(option_float_eq(
+            order_status.price().unwrap(),
+            Some(float!("150.25"))
+        ));
     }
 
     #[tokio::test]
@@ -911,8 +929,11 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538456".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert_eq!(order_status.filled_quantity, Some(dec!(0.0)));
-        assert_eq!(order_status.price(), None);
+        assert!(option_float_eq(
+            order_status.filled_quantity,
+            Some(float!("0"))
+        ));
+        assert!(option_float_eq(order_status.price().unwrap(), None));
     }
 
     #[tokio::test]
@@ -976,10 +997,22 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538789".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert_eq!(order_status.filled_quantity.unwrap(), dec!(75.0));
-        // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75 = 100.33333
-        let expected_price = (dec!(50) * dec!(100.00) + dec!(25) * dec!(101.00)) / dec!(75);
-        assert_eq!(order_status.price(), Some(expected_price));
+        assert!(
+            order_status
+                .filled_quantity
+                .unwrap()
+                .eq(float!("75"))
+                .unwrap()
+        );
+        // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75 = 100.333...
+        let expected_price = ((float!("50") * float!("100")).unwrap()
+            + (float!("25") * float!("101")).unwrap())
+        .unwrap();
+        let expected_price = (expected_price / float!("75")).unwrap();
+        assert!(option_float_eq(
+            order_status.price().unwrap(),
+            Some(expected_price)
+        ));
     }
 
     #[tokio::test]

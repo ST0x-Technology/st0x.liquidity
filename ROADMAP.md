@@ -96,6 +96,12 @@ Everything below has not been organized into epics yet.
   - PR:
     [#241 Wrapped Token Handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/241)
 
+#### Precision & Numeric Types
+
+- [x] [#312 Decimal precision artifacts from Rain Float and U256 conversions cause production failures](https://github.com/ST0x-Technology/st0x.liquidity/issues/312)
+  - PR:
+    [#347 Use rain Float instead of Decimal](https://github.com/ST0x-Technology/st0x.liquidity/pull/347)
+
 #### Alpaca Trading Improvements
 
 - [x] PR:

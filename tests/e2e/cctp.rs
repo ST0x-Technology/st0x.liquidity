@@ -10,7 +10,6 @@ use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
-use rust_decimal_macros::dec;
 use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::{
@@ -173,7 +172,7 @@ impl CctpInfra {
         // USDC/USD conversion is a 1:1 stablecoin pair on Alpaca
         infra
             .broker_service
-            .set_symbol_fill_price(Symbol::force_new("USDCUSD".to_string()), dec!(1.0));
+            .set_symbol_fill_price(Symbol::force_new("USDCUSD".to_string()), float!("1"));
 
         let eth_watcher_provider = alloy::providers::ProviderBuilder::new()
             .connect(&ethereum_endpoint)

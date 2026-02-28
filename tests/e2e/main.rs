@@ -3,6 +3,11 @@
 //! Tests the full bot lifecycle from onchain event detection through CQRS
 //! processing to offchain order execution and rebalancing operations.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+#[macro_use]
+extern crate st0x_execution;
+
 mod assert;
 mod base_chain;
 mod cctp;

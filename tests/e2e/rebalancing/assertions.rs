@@ -4,6 +4,10 @@
 //! assertion helpers (`assert_equity_rebalancing_flow`,
 //! `assert_usdc_rebalancing_flow`) used by the rebalancing e2e tests.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+pub(crate) use std::time::Duration;
+
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
 pub(crate) use alloy::primitives::{U256, utils::parse_units};
@@ -17,13 +21,7 @@ use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use rain_math_float::Float;
-pub(crate) use rust_decimal::Decimal;
-pub(crate) use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
-pub(crate) use std::str::FromStr;
-use std::sync::Arc;
-pub(crate) use std::time::Duration;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_evm::{Evm, EvmError, Wallet};
@@ -185,7 +183,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     )?);
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(dec!(0.5), dec!(0.1))?)
+        .equity(ImbalanceThreshold::new(float!("0.5"), float!("0.1"))?)
         .usdc(usdc_rebalancing)
         .redemption_wallet(redemption_wallet)
         .alpaca_broker_auth(alpaca_auth)
@@ -265,10 +263,10 @@ where
     );
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(dec!(0.5), Decimal::from(100))?)
+        .equity(ImbalanceThreshold::new(float!("0.5"), float!("100"))?)
         .usdc(UsdcRebalancing::Enabled {
-            target: dec!(0.5),
-            deviation: dec!(0.1),
+            target: float!("0.5"),
+            deviation: float!("0.1"),
         })
         .redemption_wallet(Address::random())
         .alpaca_broker_auth(alpaca_auth)
@@ -377,9 +375,8 @@ async fn assert_inventory_snapshots(
             .unwrap_or_else(|| {
                 panic!("OnchainEquity missing symbol {symbol}, got: {onchain_balances}")
             });
-        let _parsed_balance: Decimal = balance_str
-            .parse()
-            .unwrap_or_else(|err| panic!("Failed to parse onchain balance for {symbol}: {err}"));
+        let _parsed_balance = Float::parse(balance_str.to_string())
+            .unwrap_or_else(|err| panic!("Failed to parse onchain balance for {symbol}: {err:?}"));
     }
 
     let last_offchain_equity = events
@@ -400,9 +397,9 @@ async fn assert_inventory_snapshots(
             .unwrap_or_else(|| {
                 panic!("OffchainEquity missing symbol {symbol}, got: {offchain_positions}")
             });
-        let _position: Decimal = position_str
-            .parse()
-            .unwrap_or_else(|err| panic!("Failed to parse offchain position for {symbol}: {err}"));
+        let _position = Float::parse(position_str.to_string()).unwrap_or_else(|err| {
+            panic!("Failed to parse offchain position for {symbol}: {err:?}")
+        });
     }
 
     if assert_cash {
@@ -417,9 +414,8 @@ async fn assert_inventory_snapshots(
             .and_then(|val| val.get("usdc_balance"))
             .and_then(|val| val.as_str())
             .ok_or_else(|| anyhow::anyhow!("OnchainCash payload missing usdc_balance"))?;
-        let _usdc_balance: Decimal = usdc_balance_str
-            .parse()
-            .unwrap_or_else(|err| panic!("Failed to parse onchain USDC balance: {err}"));
+        let _usdc_balance = Float::parse(usdc_balance_str.to_string())
+            .unwrap_or_else(|err| panic!("Failed to parse onchain USDC balance: {err:?}"));
     }
 
     Ok(())
@@ -533,7 +529,14 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
     let wrapped_shares: U256 = wrapped_shares_str.parse().map_err(|error| {
         anyhow::anyhow!("Invalid wrapped_shares '{wrapped_shares_str}': {error}")
     })?;
-    let mint_quantity_units: U256 = parse_units(&completed_mint.quantity.to_string(), 18)?.into();
+    let mint_quantity_units: U256 = parse_units(
+        &completed_mint
+            .quantity
+            .format_with_scientific(false)
+            .unwrap_or_else(|err| panic!("Failed to format mint quantity: {err}")),
+        18,
+    )?
+    .into();
     assert_eq!(
         mint_quantity_units, wrapped_shares,
         "Tokenization completed mint quantity should match TokensWrapped.wrapped_shares"
@@ -599,8 +602,14 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     let redemption_wallet_delta = redemption_wallet_balance_after
         .checked_sub(redemption_wallet_balance_before)
         .ok_or_else(|| anyhow::anyhow!("Redemption wallet balance underflow"))?;
-    let expected_wallet_delta: U256 =
-        parse_units(&completed_redeem.quantity.to_string(), 18)?.into();
+    let expected_wallet_delta: U256 = parse_units(
+        &completed_redeem
+            .quantity
+            .format_with_scientific(false)
+            .unwrap_or_else(|err| panic!("Failed to format redeem quantity: {err}")),
+        18,
+    )?
+    .into();
     assert_eq!(
         redemption_wallet_delta, expected_wallet_delta,
         "Redemption wallet delta should match completed redeem quantity (18 decimals)"
@@ -989,12 +998,26 @@ fn assert_usdc_rebalancing_broker_state(
         UsdcRebalanceType::AlpacaToBase => event_amounts.initiated_amount,
         UsdcRebalanceType::BaseToAlpaca => event_amounts.bridged_amount_received,
     };
-    let order_quantity_units: U256 = parse_units(&matched_order.quantity.to_string(), 6)?.into();
+    let order_quantity_units: U256 = parse_units(
+        &matched_order
+            .quantity
+            .format_with_scientific(false)
+            .unwrap_or_else(|err| panic!("Failed to format order quantity: {err}")),
+        6,
+    )?
+    .into();
     assert_eq!(
         order_quantity_units, expected_rebalance_usdc_units,
         "USDCUSD conversion order quantity should match USDC rebalance amount"
     );
-    let transfer_units: U256 = parse_units(&transfer.amount.to_string(), 6)?.into();
+    let transfer_units: U256 = parse_units(
+        &transfer
+            .amount
+            .format_with_scientific(false)
+            .unwrap_or_else(|err| panic!("Failed to format transfer amount: {err}")),
+        6,
+    )?
+    .into();
     assert_eq!(
         transfer_units, expected_rebalance_usdc_units,
         "{} wallet transfer amount should match USDC rebalance event amount",
@@ -1025,8 +1048,16 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
 
     let pre_balance_float = Float::from_raw(usdc_vault_balance_before_rebalance);
     let post_balance_float = Float::from_raw(vault_balance);
-    let pre_usdc_units = pre_balance_float.to_fixed_decimal(6)?;
-    let post_usdc_units = post_balance_float.to_fixed_decimal(6)?;
+    let (pre_usdc_units, pre_lossless) = pre_balance_float.to_fixed_decimal_lossy(6)?;
+    assert!(
+        pre_lossless,
+        "Pre-rebalance USDC balance should convert losslessly to 6 decimals"
+    );
+    let (post_usdc_units, post_lossless) = post_balance_float.to_fixed_decimal_lossy(6)?;
+    assert!(
+        post_lossless,
+        "Post-rebalance USDC balance should convert losslessly to 6 decimals"
+    );
 
     // Trades also modify the USDC vault concurrently with rebalancing,
     // but only if the trade uses the same vault_id. Filter to trades
