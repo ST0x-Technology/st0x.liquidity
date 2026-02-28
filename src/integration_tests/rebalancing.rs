@@ -428,7 +428,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let mint_mock = server.mock(|when, then| {
         when.method(POST)
             .path(tokenization_mint_path())
-            .json_body_partial(r#"{"underlying_symbol":"AAPL","qty":"30.500000000","wallet_address":"0x0000000000000000000000000000000000000000"}"#);
+            .json_body_includes(r#"{"underlying_symbol":"AAPL","qty":"30.500000000","wallet_address":"0x0000000000000000000000000000000000000000"}"#);
         then.status(200)
             .header("content-type", "application/json")
             .json_body(sample_pending_response("mint_int_test"));

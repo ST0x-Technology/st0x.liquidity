@@ -424,7 +424,7 @@ mod tests {
 
         assert!(matches!(error, AlpacaWalletError::TransferTimeout { .. }));
 
-        assert!(status_mock.hits() >= 2);
+        assert!(status_mock.calls() >= 2);
     }
 
     #[tokio::test]
@@ -458,7 +458,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            error_mock.hits() >= 1,
+            error_mock.calls() >= 1,
             "Expected at least one retry attempt"
         );
         assert!(
@@ -514,7 +514,7 @@ mod tests {
             poll_transfer_status(&client_clone, &transfer_id_clone, &config).await
         });
 
-        while processing_mock.hits() < 1 {
+        while processing_mock.calls() < 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -722,7 +722,7 @@ mod tests {
                 async move { poll_deposit_by_tx_hash(&client_clone, &tx_hash, &config).await },
             );
 
-        while empty_mock.hits() < 1 {
+        while empty_mock.calls() < 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -793,7 +793,10 @@ mod tests {
             "Expected DepositTimeout error, got: {error:?}"
         );
 
-        assert!(empty_mock.hits() >= 1, "Expected at least one poll attempt");
+        assert!(
+            empty_mock.calls() >= 1,
+            "Expected at least one poll attempt"
+        );
     }
 
     #[tokio::test]
