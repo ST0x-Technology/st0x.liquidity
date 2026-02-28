@@ -133,7 +133,7 @@ impl Sub for Usdc {
 
 /// Threshold configuration that determines when to trigger offchain execution.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ExecutionThreshold {
+pub enum ExecutionThreshold {
     Shares(Positive<FractionalShares>),
     DollarValue(Usdc),
 }
