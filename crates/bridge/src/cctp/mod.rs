@@ -117,11 +117,20 @@ impl BridgeDirection {
 }
 
 /// CCTP TokenMessengerV2 contract address (same on all supported chains).
+#[cfg(any(test, feature = "test-support"))]
+pub const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
+#[cfg(not(any(test, feature = "test-support")))]
 const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
 
 /// CCTP MessageTransmitterV2 contract address (same on all supported chains).
+#[cfg(any(test, feature = "test-support"))]
+pub const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
+#[cfg(not(any(test, feature = "test-support")))]
 const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
 
+#[cfg(any(test, feature = "test-support"))]
+pub const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";
+#[cfg(not(any(test, feature = "test-support")))]
 const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";
 
 /// Minimum finality threshold for CCTP V2 fast transfer (enables ~30 second transfers)
@@ -223,9 +232,9 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 /// Runtime context for constructing a [`CctpBridge`].
 ///
 /// Provides the minimal set of values needed to construct the bridge.
-/// CCTP contract addresses are hardcoded internally since they're the
-/// same on all supported chains. Providers are obtained from the wallets
-/// via [`Wallet::provider()`].
+/// CCTP contract addresses default to production addresses but can be
+/// overridden for testing with locally deployed contracts.
+/// Providers are obtained from the wallets via [`Wallet::provider()`].
 pub struct CctpCtx<EthWallet, BaseWallet> {
     /// USDC token address on Ethereum
     pub usdc_ethereum: Address,
@@ -235,6 +244,15 @@ pub struct CctpCtx<EthWallet, BaseWallet> {
     pub ethereum_wallet: EthWallet,
     /// Wallet for submitting transactions on Base
     pub base_wallet: BaseWallet,
+    /// Circle attestation/fee API base URL (test-only override).
+    #[cfg(any(test, feature = "test-support"))]
+    pub circle_api_base: String,
+    /// `TokenMessengerV2` contract address (test-only override).
+    #[cfg(any(test, feature = "test-support"))]
+    pub token_messenger: Address,
+    /// `MessageTransmitterV2` contract address (test-only override).
+    #[cfg(any(test, feature = "test-support"))]
+    pub message_transmitter: Address,
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
@@ -329,20 +347,38 @@ struct FeeEntry {
 impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Constructs a `CctpBridge` from a runtime context.
     pub fn try_from_ctx(ctx: CctpCtx<EthWallet, BaseWallet>) -> Result<Self, CctpError> {
+        #[cfg(any(test, feature = "test-support"))]
+        let token_messenger = ctx.token_messenger;
+        #[cfg(not(any(test, feature = "test-support")))]
+        let token_messenger = TOKEN_MESSENGER_V2;
+
+        #[cfg(any(test, feature = "test-support"))]
+        let message_transmitter = ctx.message_transmitter;
+        #[cfg(not(any(test, feature = "test-support")))]
+        let message_transmitter = MESSAGE_TRANSMITTER_V2;
+
         let ethereum = CctpEndpoint::new(
             ctx.usdc_ethereum,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
+            token_messenger,
+            message_transmitter,
             ctx.ethereum_wallet,
         );
 
         let base = CctpEndpoint::new(
             ctx.usdc_base,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
+            token_messenger,
+            message_transmitter,
             ctx.base_wallet,
         );
 
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut bridge = Self::new(ethereum, base)?;
+            bridge.circle_api_base = ctx.circle_api_base;
+            Ok(bridge)
+        }
+
+        #[cfg(not(any(test, feature = "test-support")))]
         Self::new(ethereum, base)
     }
 

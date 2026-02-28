@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 default = []
+test-support = []
 cctp = [
   "dep:backon",
   "dep:reqwest",

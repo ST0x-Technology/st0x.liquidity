@@ -194,6 +194,12 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         usdc_base: USDC_BASE,
         ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
         base_wallet: rebalancing_ctx.base_wallet().clone(),
+        #[cfg(feature = "test-support")]
+        circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+        #[cfg(feature = "test-support")]
+        token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+        #[cfg(feature = "test-support")]
+        message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
     })?);
 
     let (_vault_store, vault_registry_projection) =
@@ -556,6 +562,8 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone {

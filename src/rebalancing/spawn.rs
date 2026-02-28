@@ -84,6 +84,12 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             usdc_base: USDC_BASE,
             ethereum_wallet,
             base_wallet: base_wallet.clone(),
+            #[cfg(feature = "test-support")]
+            circle_api_base: ctx.circle_api_base.clone(),
+            #[cfg(feature = "test-support")]
+            token_messenger: ctx.token_messenger,
+            #[cfg(feature = "test-support")]
+            message_transmitter: ctx.message_transmitter,
         })?);
 
         let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
@@ -329,6 +335,12 @@ mod tests {
                 usdc_base: USDC_BASE,
                 ethereum_wallet,
                 base_wallet: base_wallet.clone(),
+                #[cfg(feature = "test-support")]
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                #[cfg(feature = "test-support")]
+                token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+                #[cfg(feature = "test-support")]
+                message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
             })
             .unwrap(),
         );

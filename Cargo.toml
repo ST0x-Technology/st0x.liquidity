@@ -91,6 +91,10 @@ name = "st0x-hedge"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+test-support = ["st0x-bridge/test-support"]
+
 [dependencies]
 alloy.workspace = true
 anyhow = "1.0.98"
