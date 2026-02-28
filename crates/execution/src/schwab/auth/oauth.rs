@@ -345,9 +345,9 @@ mod tests {
                     "Basic dGVzdF9hcHBfa2V5OnRlc3RfYXBwX3NlY3JldA==",
                 )
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body_contains("grant_type=authorization_code")
-                .body_contains("code=test_code")
-                .body_contains("redirect_uri=https%3A%2F%2F127.0.0.1%2F");
+                .body_includes("grant_type=authorization_code")
+                .body_includes("code=test_code")
+                .body_includes("redirect_uri=https%3A%2F%2F127.0.0.1%2F");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(mock_response);
@@ -477,8 +477,8 @@ mod tests {
                     "Basic dGVzdF9hcHBfa2V5OnRlc3RfYXBwX3NlY3JldA==",
                 )
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=old_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=old_refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(mock_response);
@@ -734,7 +734,7 @@ mod tests {
 
         let error = ctx.get_tokens_from_code("test_code").await.unwrap_err();
 
-        assert_eq!(mock.hits(), 1);
+        assert_eq!(mock.calls(), 1);
         match error {
             SchwabError::RequestFailed { action, status, .. } => {
                 assert_eq!(action, "get tokens");
