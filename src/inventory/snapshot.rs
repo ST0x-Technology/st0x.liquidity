@@ -223,7 +223,7 @@ pub(crate) enum InventorySnapshotEvent {
 }
 
 impl InventorySnapshotEvent {
-    fn timestamp(&self) -> DateTime<Utc> {
+    pub(crate) fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::OnchainEquity { fetched_at, .. }
             | Self::OnchainCash { fetched_at, .. }

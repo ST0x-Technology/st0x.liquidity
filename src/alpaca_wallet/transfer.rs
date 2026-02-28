@@ -346,11 +346,11 @@ mod tests {
 
         assert_eq!(transfer.id, AlpacaTransferId::new(transfer_id));
         assert_eq!(transfer.direction, TransferDirection::Outgoing);
-        assert_eq!(transfer.amount, Decimal::new(1005, 1));
+        assert_eq!(transfer.amount, dec!(100.5));
         assert_eq!(transfer.asset.as_ref(), "USDC");
         assert_eq!(transfer.to, expected_address);
         assert_eq!(transfer.status, TransferStatus::Pending);
-        assert_eq!(transfer.network_fee, Decimal::new(5, 1));
+        assert_eq!(transfer.network_fee, dec!(0.5));
 
         withdrawal_mock.assert();
     }
@@ -366,8 +366,8 @@ mod tests {
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
         assert!(matches!(
-            Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::new(-100, 0)
+            Positive::new(Usdc(dec!(-100))).unwrap_err(),
+            InvalidSharesError::NonPositive(value) if value == dec!(-100)
         ));
     }
 
@@ -860,7 +860,7 @@ mod tests {
         );
         assert_eq!(
             transfer.amount,
-            Decimal::new(100, 0),
+            dec!(100),
             "Should return the 100 USDC withdrawal, not a 0.01 USDC deposit"
         );
         assert_eq!(transfer.direction, TransferDirection::Outgoing);

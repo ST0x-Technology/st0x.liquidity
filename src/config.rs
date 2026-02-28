@@ -415,6 +415,20 @@ impl Ctx {
             }
         }
 
+        let position_check_interval = config.position_check_interval.unwrap_or(60);
+        if position_check_interval == 0 {
+            return Err(CtxError::ZeroPollingInterval {
+                field: "position_check_interval",
+            });
+        }
+
+        let inventory_poll_interval = config.inventory_poll_interval.unwrap_or(60);
+        if inventory_poll_interval == 0 {
+            return Err(CtxError::ZeroPollingInterval {
+                field: "inventory_poll_interval",
+            });
+        }
+
         Ok(Self {
             database_url: config.database_url,
             log_level,
@@ -423,8 +437,8 @@ impl Ctx {
             evm,
             order_polling_interval: config.order_polling_interval.unwrap_or(15),
             order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
-            position_check_interval: config.position_check_interval.unwrap_or(60),
-            inventory_poll_interval: config.inventory_poll_interval.unwrap_or(60),
+            position_check_interval,
+            inventory_poll_interval,
             broker,
             telemetry,
             trading_mode,
@@ -520,6 +534,8 @@ pub enum CtxError {
          minimum withdrawal of {minimum}"
     )]
     OperationalLimitBelowMinimumWithdrawal { configured: Usdc, minimum: Usdc },
+    #[error("{field} must be greater than 0")]
+    ZeroPollingInterval { field: &'static str },
 }
 
 #[cfg(test)]
@@ -543,6 +559,7 @@ impl CtxError {
             Self::OperationalLimitBelowMinimumWithdrawal { .. } => {
                 "operational limit below minimum withdrawal"
             }
+            Self::ZeroPollingInterval { .. } => "zero polling interval",
         }
     }
 }

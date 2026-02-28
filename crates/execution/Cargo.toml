@@ -7,6 +7,8 @@ edition = "2024"
 default = []
 # Enable mock mode for testing from downstream crates
 mock = []
+# Expose test-only constructors (e.g. Symbol::force_new)
+test-support = []
 
 [dependencies]
 alloy.workspace = true
