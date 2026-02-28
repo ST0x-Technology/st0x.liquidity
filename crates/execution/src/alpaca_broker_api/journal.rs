@@ -2,12 +2,16 @@
 //! between accounts under the same firm.
 
 use chrono::NaiveDate;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use rain_math_float::Float;
+
 use super::auth::AlpacaAccountId;
-use crate::{FractionalShares, Positive, Symbol};
+use crate::{
+    FractionalShares, Positive, Symbol, deserialize_float_from_number_or_string,
+    deserialize_option_float_from_number_or_string,
+};
 
 /// Type of journal entry in the Alpaca Broker API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -37,7 +41,12 @@ fn serialize_positive_shares<S>(
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&shares.inner().inner().to_string())
+    let formatted = shares
+        .inner()
+        .inner()
+        .format_with_scientific(false)
+        .map_err(serde::ser::Error::custom)?;
+    serializer.serialize_str(&formatted)
 }
 
 impl JournalRequest {
@@ -68,8 +77,11 @@ pub struct JournalResponse {
         deserialize_with = "deserialize_positive_fractional_shares"
     )]
     pub quantity: Positive<FractionalShares>,
-    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
-    pub price: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    pub price: Option<Float>,
     pub from_account: AlpacaAccountId,
     pub to_account: AlpacaAccountId,
     pub settle_date: Option<NaiveDate>,
@@ -83,20 +95,8 @@ fn deserialize_positive_fractional_shares<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let string = String::deserialize(deserializer)?;
-    let decimal: Decimal = string.parse().map_err(serde::de::Error::custom)?;
-    let shares = FractionalShares::new(decimal);
-    Positive::new(shares).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let maybe_string: Option<String> = Option::deserialize(deserializer)?;
-    maybe_string
-        .map(|string| string.parse().map_err(serde::de::Error::custom))
-        .transpose()
+    let exact = deserialize_float_from_number_or_string(deserializer)?;
+    Positive::new(FractionalShares::new(exact)).map_err(serde::de::Error::custom)
 }
 
 /// Status of an Alpaca journal entry.
@@ -134,7 +134,6 @@ impl std::fmt::Display for JournalStatus {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use uuid::uuid;
 
     use super::*;
@@ -192,7 +191,10 @@ mod tests {
         let response: JournalResponse = serde_json::from_value(json).unwrap();
         assert_eq!(
             response.quantity,
-            Positive::new(FractionalShares::new(dec!(10.5))).unwrap()
+            Positive::new(FractionalShares::new(
+                Float::parse("10.5".to_string()).unwrap()
+            ))
+            .unwrap()
         );
     }
 
@@ -201,7 +203,10 @@ mod tests {
         let from = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
         let to = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = Positive::new(FractionalShares::new(dec!(10.5))).unwrap();
+        let quantity = Positive::new(FractionalShares::new(
+            Float::parse("10.5".to_string()).unwrap(),
+        ))
+        .unwrap();
 
         let request = JournalRequest::security(from, to, symbol, quantity);
         let json = serde_json::to_value(&request).unwrap();

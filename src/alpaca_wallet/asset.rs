@@ -4,11 +4,10 @@
 //! whitelist behavior.
 
 use alloy::primitives::Address;
-use rust_decimal::Decimal;
+use rain_math_float::Float;
 use serde::Deserialize;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
-use super::serde::deserialize_decimal_from_string;
 use super::transfer::{Network, TokenSymbol};
 
 /// A single asset entry returned by Alpaca's crypto wallet listing endpoint.
@@ -16,11 +15,15 @@ use super::transfer::{Network, TokenSymbol};
 /// The account has one crypto wallet context, but that wallet can hold multiple
 /// assets such as USDC or BTC. This type models one asset row from
 /// `GET /v1/accounts/{account_id}/wallets`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+
 pub(super) struct WalletAsset {
     pub(super) asset: TokenSymbol,
-    #[serde(alias = "qty", deserialize_with = "deserialize_decimal_from_string")]
-    pub(super) balance: Decimal,
+    #[serde(
+        alias = "qty",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub(super) balance: Float,
 }
 
 impl AlpacaWalletClient {
@@ -75,12 +78,12 @@ impl AlpacaWalletClient {
 mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
-    use std::str::FromStr;
     use uuid::uuid;
 
     use st0x_execution::AlpacaAccountId;
 
     use super::*;
+    use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -188,9 +191,9 @@ mod tests {
 
         assert_eq!(assets.len(), 2);
         assert_eq!(assets[0].asset, TokenSymbol::new("USDC"));
-        assert_eq!(assets[0].balance, Decimal::from_str("1250.75").unwrap());
+        assert!(assets[0].balance.eq(float!(1250.75)).unwrap());
         assert_eq!(assets[1].asset, TokenSymbol::new("BTC"));
-        assert_eq!(assets[1].balance, Decimal::from_str("0.50").unwrap());
+        assert!(assets[1].balance.eq(float!(0.50)).unwrap());
         mock.assert();
     }
 

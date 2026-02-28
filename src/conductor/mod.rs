@@ -1628,9 +1628,8 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
     use futures_util::stream;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
-    use std::collections::{HashMap, HashSet};
+    use rain_math_float::Float;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
@@ -1646,8 +1645,8 @@ mod tests {
     };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::config::{AssetsConfig, EquitiesConfig};
-    use crate::config::{EquityAssetConfig, OperationMode};
+    use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
     use crate::onchain::trade::OnchainTrade;
@@ -1656,6 +1655,7 @@ mod tests {
     use crate::threshold::ExecutionThreshold;
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
+    use st0x_float_macro::float;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
@@ -2827,7 +2827,7 @@ mod tests {
             .build()
     }
 
-    fn test_trade_with_amount(amount: Decimal, log_index: u64) -> OnchainTrade {
+    fn test_trade_with_amount(amount: Float, log_index: u64) -> OnchainTrade {
         OnchainTradeBuilder::default()
             .with_symbol("wtAAPL")
             .with_equity_token(TEST_EQUITY_TOKEN)
@@ -3140,7 +3140,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_and_fetch(&pool, 10).await;
-        let trade = test_trade_with_amount(dec!(0.5), 10);
+        let trade = test_trade_with_amount(float!(0.5), 10);
 
         let result = process_queued_trade(
             &MockExecutor::new(),
@@ -3166,9 +3166,8 @@ mod tests {
             .unwrap()
             .expect("position should exist");
 
-        assert_eq!(
-            position.net.inner(),
-            dec!(0.5),
+        assert!(
+            position.net.inner().eq(float!(0.5)).unwrap(),
             "Position net should reflect the accumulated trade"
         );
         assert!(
@@ -3192,7 +3191,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_and_fetch(&pool, 20).await;
-        let trade = test_trade_with_amount(dec!(1.5), 20);
+        let trade = test_trade_with_amount(float!(1.5), 20);
 
         let result = process_queued_trade(
             &MockExecutor::new(),
@@ -3216,7 +3215,7 @@ mod tests {
             .unwrap()
             .expect("position should exist");
 
-        assert_eq!(position.net.inner(), dec!(1.5));
+        assert!(position.net.inner().eq(float!(1.5)).unwrap());
         assert_eq!(
             position.pending_offchain_order_id,
             Some(offchain_order_id),
@@ -3244,7 +3243,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 30).await;
-        let trade_1 = test_trade_with_amount(dec!(0.5), 30);
+        let trade_1 = test_trade_with_amount(float!(0.5), 30);
 
         let result_1 = process_queued_trade(
             &MockExecutor::new(),
@@ -3264,7 +3263,7 @@ mod tests {
         );
 
         let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 31).await;
-        let trade_2 = test_trade_with_amount(dec!(0.7), 31);
+        let trade_2 = test_trade_with_amount(float!(0.7), 31);
 
         let result_2 = process_queued_trade(
             &MockExecutor::new(),
@@ -3289,7 +3288,7 @@ mod tests {
             .unwrap()
             .expect("position should exist");
 
-        assert_eq!(position.net.inner(), dec!(1.2));
+        assert!(position.net.inner().eq(float!(1.2)).unwrap());
         assert!(position.pending_offchain_order_id.is_some());
     }
 
@@ -3302,7 +3301,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 40).await;
-        let trade_1 = test_trade_with_amount(dec!(1.5), 40);
+        let trade_1 = test_trade_with_amount(float!(1.5), 40);
 
         let first_order_id = process_queued_trade(
             &MockExecutor::new(),
@@ -3318,7 +3317,7 @@ mod tests {
         .expect("first trade should place an order");
 
         let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 41).await;
-        let trade_2 = test_trade_with_amount(dec!(1.5), 41);
+        let trade_2 = test_trade_with_amount(float!(1.5), 41);
 
         let result_2 = process_queued_trade(
             &MockExecutor::new(),
@@ -3344,9 +3343,8 @@ mod tests {
             .unwrap()
             .expect("position should exist");
 
-        assert_eq!(
-            position.net.inner(),
-            dec!(3.0),
+        assert!(
+            position.net.inner().eq(float!(3.0)).unwrap(),
             "Both fills should be accumulated"
         );
         assert_eq!(
@@ -3366,7 +3364,7 @@ mod tests {
 
         // Process first trade -> places order
         let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 50).await;
-        let trade_1 = test_trade_with_amount(dec!(1.5), 50);
+        let trade_1 = test_trade_with_amount(float!(1.5), 50);
 
         let first_order_id = process_queued_trade(
             &MockExecutor::new(),
@@ -3383,7 +3381,7 @@ mod tests {
 
         // Process second trade -> blocked by pending order
         let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 51).await;
-        let trade_2 = test_trade_with_amount(dec!(1.5), 51);
+        let trade_2 = test_trade_with_amount(float!(1.5), 51);
 
         process_queued_trade(
             &MockExecutor::new(),
@@ -3405,10 +3403,10 @@ mod tests {
                 &symbol,
                 PositionCommand::CompleteOffChainOrder {
                     offchain_order_id: first_order_id,
-                    shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+                    shares_filled: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
                     direction: Direction::Sell,
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
-                    price: Usd::new(dec!(150)),
+                    price: Usd::new(float!(150)),
                     broker_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3471,7 +3469,7 @@ mod tests {
 
         // Enqueue an event (simulating events persisted before a crash)
         let (queued_event, event_id) = enqueue_and_fetch(&pool, 60).await;
-        let trade = test_trade_with_amount(dec!(2.0), 60);
+        let trade = test_trade_with_amount(float!(2.0), 60);
 
         // Simulate restart: process the unprocessed event
         let result = process_queued_trade(
@@ -3497,7 +3495,7 @@ mod tests {
             .unwrap()
             .expect("position should exist");
 
-        assert_eq!(position.net.inner(), dec!(2.0));
+        assert!(position.net.inner().eq(float!(2.0)).unwrap());
         assert!(position.pending_offchain_order_id.is_some());
 
         assert_eq!(
@@ -3572,13 +3570,13 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
+            .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000)))
             .update_equity(
                 symbol,
                 Inventory::available(
                     Venue::MarketMaking,
                     Operator::Add,
-                    FractionalShares::new(dec!(20)),
+                    FractionalShares::new(float!(20)),
                 ),
                 chrono::Utc::now(),
             )
@@ -3588,7 +3586,7 @@ mod tests {
                 Inventory::available(
                     Venue::Hedging,
                     Operator::Add,
-                    FractionalShares::new(dec!(80)),
+                    FractionalShares::new(float!(80)),
                 ),
                 chrono::Utc::now(),
             )
@@ -3631,13 +3629,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 },
                 usdc: Some(ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
+
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -3669,9 +3668,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 99,
                     },
-                    amount: FractionalShares::new(dec!(1)),
+                    amount: FractionalShares::new(float!(1)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3694,8 +3693,8 @@ mod tests {
         let order_owner = address!("0x0000000000000000000000000000000000000002");
 
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: float!(0.5),
+            deviation: float!(0.2),
         };
 
         // Seed inventory with 50 offchain shares and USDC. CQRS will add 50 onchain.
@@ -3705,13 +3704,13 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
+            .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(
                     Venue::Hedging,
                     Operator::Add,
-                    FractionalShares::new(dec!(50)),
+                    FractionalShares::new(float!(50)),
                 ),
                 chrono::Utc::now(),
             )
@@ -3726,6 +3725,7 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: threshold,
                 usdc: Some(threshold),
+
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -3757,9 +3757,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 0,
                     },
-                    amount: FractionalShares::new(dec!(50)),
+                    amount: FractionalShares::new(float!(50)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3793,13 +3793,16 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc::new(Decimal::ZERO), Usdc::new(Decimal::ZERO))
+            .with_usdc(
+                Usdc::new(Float::zero().unwrap()),
+                Usdc::new(Float::zero().unwrap()),
+            )
             .update_equity(
                 &symbol,
                 Inventory::available(
                     Venue::MarketMaking,
                     Operator::Add,
-                    FractionalShares::new(dec!(50)),
+                    FractionalShares::new(float!(50)),
                 ),
                 chrono::Utc::now(),
             )
@@ -3809,18 +3812,18 @@ mod tests {
                 Inventory::available(
                     Venue::Hedging,
                     Operator::Add,
-                    FractionalShares::new(dec!(50)),
+                    FractionalShares::new(float!(50)),
                 ),
                 chrono::Utc::now(),
             )
             .unwrap()
             .update_usdc(
-                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc::new(dec!(50))),
+                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc::new(float!(50))),
                 chrono::Utc::now(),
             )
             .unwrap()
             .update_usdc(
-                Inventory::available(Venue::Hedging, Operator::Add, Usdc::new(dec!(50))),
+                Inventory::available(Venue::Hedging, Operator::Add, Usdc::new(float!(50))),
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -3833,13 +3836,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 },
                 usdc: Some(ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
+
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -3871,9 +3875,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 99,
                     },
-                    amount: FractionalShares::new(dec!(5)),
+                    amount: FractionalShares::new(float!(5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3929,13 +3933,13 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
+            .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(
                     Venue::MarketMaking,
                     Operator::Add,
-                    FractionalShares::new(dec!(65)),
+                    FractionalShares::new(float!(65)),
                 ),
                 chrono::Utc::now(),
             )
@@ -3945,7 +3949,7 @@ mod tests {
                 Inventory::available(
                     Venue::Hedging,
                     Operator::Add,
-                    FractionalShares::new(dec!(35)),
+                    FractionalShares::new(float!(35)),
                 ),
                 chrono::Utc::now(),
             )
@@ -3959,13 +3963,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 },
                 usdc: Some(ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
+
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -4015,9 +4020,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 99,
                     },
-                    amount: FractionalShares::new(dec!(20)),
+                    amount: FractionalShares::new(float!(20)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -4035,7 +4040,7 @@ mod tests {
             panic!("Expected Redemption, got {triggered:?}");
         };
         assert_eq!(redeemed_symbol, symbol);
-        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(quantity, FractionalShares::new(float!(25)));
         assert_eq!(wrapped_token, test_token);
     }
 
@@ -4055,9 +4060,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(20)),
+                    amount: FractionalShares::new(float!(20)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -4075,7 +4080,7 @@ mod tests {
             panic!("Expected Redemption, got {first:?}");
         };
         assert_eq!(redeemed_symbol, symbol);
-        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(quantity, FractionalShares::new(float!(25)));
         assert_eq!(wrapped_token, test_token);
 
         // Second fill while in-progress NOT cleared -> no second trigger.
@@ -4089,9 +4094,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },
-                    amount: FractionalShares::new(dec!(5)),
+                    amount: FractionalShares::new(float!(5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -4126,9 +4131,9 @@ mod tests {
                             tx_hash: TxHash::random(),
                             log_index: 0,
                         },
-                        amount: FractionalShares::new(dec!(10)),
+                        amount: FractionalShares::new(float!(10)),
                         direction: Direction::Buy,
-                        price_usdc: dec!(150.0),
+                        price_usdc: float!(150.0),
                         block_timestamp: chrono::Utc::now(),
                     },
                 )
@@ -4141,8 +4146,8 @@ mod tests {
                 .unwrap()
                 .expect("position should exist after first session");
 
-            assert_eq!(position.net, FractionalShares::new(dec!(10)));
-            assert_eq!(position.accumulated_long, FractionalShares::new(dec!(10)));
+            assert_eq!(position.net, FractionalShares::new(float!(10)));
+            assert_eq!(position.accumulated_long, FractionalShares::new(float!(10)));
         }
         // position_store dropped here, simulating shutdown.
 
@@ -4158,12 +4163,12 @@ mod tests {
 
             assert_eq!(
                 position.net,
-                FractionalShares::new(dec!(10)),
+                FractionalShares::new(float!(10)),
                 "Net position should survive restart via persisted view"
             );
             assert_eq!(
                 position.accumulated_long,
-                FractionalShares::new(dec!(10)),
+                FractionalShares::new(float!(10)),
                 "Accumulated long should survive restart via persisted view"
             );
         }
@@ -4195,7 +4200,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_and_fetch(&pool, 70).await;
-        let trade = test_trade_with_amount(dec!(1.5), 70);
+        let trade = test_trade_with_amount(float!(1.5), 70);
 
         process_queued_trade(
             &MockExecutor::new(),
@@ -4300,9 +4305,9 @@ mod tests {
                         tx_hash: B256::ZERO,
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(5)),
+                    amount: FractionalShares::new(float!(5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150),
+                    price_usdc: float!(150),
                     block_timestamp: chrono::Utc::now(),
                 },
             )

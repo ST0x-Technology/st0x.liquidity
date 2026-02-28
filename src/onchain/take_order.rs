@@ -55,7 +55,6 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
-    use rust_decimal_macros::dec;
 
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::FractionalShares;
@@ -68,6 +67,7 @@ mod tests {
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
+    use st0x_float_macro::float;
 
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV6::OrderV4,
@@ -161,7 +161,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(float!(9)));
         assert_eq!(
             trade.tx_hash,
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
@@ -267,7 +267,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(5)));
+        assert_eq!(trade.amount, FractionalShares::new(float!(5)));
     }
 
     #[tokio::test]
@@ -338,9 +338,15 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(15)));
+        assert_eq!(trade.amount, FractionalShares::new(float!(15)));
         // Price should be 200 USDC / 15 shares = 13.333... USDC per share
-        assert_eq!(trade.price.value(), dec!(200) / dec!(15));
+        assert!(
+            trade
+                .price
+                .value()
+                .eq((float!(200) / float!(15)).unwrap())
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -397,7 +403,7 @@ mod tests {
         .await;
 
         // Zero amounts should deterministically return Ok(None)
-        assert_eq!(result.unwrap(), None);
+        assert!(result.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+
+use rain_math_float::Float;
 
 use super::OrderStatus;
 
 /// Runtime representation of an offchain order's lifecycle state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum OrderState {
     Pending,
     Submitted {
@@ -13,13 +14,51 @@ pub enum OrderState {
     Filled {
         executed_at: DateTime<Utc>,
         order_id: String,
-        price: Decimal,
+        price: Float,
     },
     Failed {
         failed_at: DateTime<Utc>,
         error_reason: Option<String>,
     },
 }
+
+impl PartialEq for OrderState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pending, Self::Pending) => true,
+            (Self::Submitted { order_id: lhs }, Self::Submitted { order_id: rhs }) => lhs == rhs,
+            (
+                Self::Filled {
+                    executed_at: lhs_executed_at,
+                    order_id: lhs_order_id,
+                    price: lhs_price,
+                },
+                Self::Filled {
+                    executed_at: rhs_executed_at,
+                    order_id: rhs_order_id,
+                    price: rhs_price,
+                },
+            ) => {
+                lhs_executed_at == rhs_executed_at
+                    && lhs_order_id == rhs_order_id
+                    && lhs_price.eq(*rhs_price).unwrap_or(false)
+            }
+            (
+                Self::Failed {
+                    failed_at: lhs_failed_at,
+                    error_reason: lhs_error_reason,
+                },
+                Self::Failed {
+                    failed_at: rhs_failed_at,
+                    error_reason: rhs_error_reason,
+                },
+            ) => lhs_failed_at == rhs_failed_at && lhs_error_reason == rhs_error_reason,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for OrderState {}
 
 impl OrderState {
     pub const fn status(&self) -> OrderStatus {
@@ -34,8 +73,6 @@ impl OrderState {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use super::*;
 
     #[test]
@@ -52,7 +89,7 @@ mod tests {
             OrderState::Filled {
                 executed_at: Utc::now(),
                 order_id: "ORDER123".to_string(),
-                price: dec!(150.00),
+                price: Float::parse("150.00".to_string()).unwrap(),
             }
             .status(),
             OrderStatus::Filled

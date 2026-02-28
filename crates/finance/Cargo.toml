@@ -6,20 +6,16 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-alloy-primitives = { workspace = true, optional = true }
-num-traits.workspace = true
-rust_decimal = { workspace = true, features = ["serde"] }
-rust_decimal_macros.workspace = true
+alloy-primitives.workspace = true
+rain-math-float.workspace = true
 serde = { workspace = true, features = ["derive"] }
+st0x-float-macro.workspace = true
+st0x-float-serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-rust_decimal_macros.workspace = true
 serde_json.workspace = true
 
 [lints]
 workspace = true
-
-[features]
-alloy = ["dep:alloy-primitives"]

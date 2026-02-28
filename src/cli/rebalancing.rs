@@ -542,8 +542,7 @@ fn format_tokenization_request<Writer: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
-    use rust_decimal::Decimal;
-    use std::str::FromStr;
+    use rain_math_float::Float;
     use url::Url;
     use uuid::uuid;
 
@@ -603,7 +602,7 @@ mod tests {
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
@@ -628,7 +627,7 @@ mod tests {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
@@ -652,7 +651,7 @@ mod tests {
     async fn test_transfer_usdc_requires_alpaca_broker() {
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -682,7 +681,7 @@ mod tests {
             operational_limit: None,
         });
         let pool = setup_test_db().await;
-        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -705,7 +704,7 @@ mod tests {
     async fn test_transfer_usdc_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         transfer_usdc_command(
@@ -777,7 +776,7 @@ mod tests {
     async fn test_transfer_usdc_requires_vault_id_when_cash_is_none() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -805,7 +804,7 @@ mod tests {
             operational_limit: None,
         });
         let pool = setup_test_db().await;
-        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -834,7 +833,7 @@ mod tests {
             operational_limit: None,
         });
         let pool = setup_test_db().await;
-        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
         let mut stdout = Vec::new();
         // Will fail at rebalancing_ctx, but vault_id check passes first

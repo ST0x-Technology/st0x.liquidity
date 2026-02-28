@@ -137,9 +137,13 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for MockUsdcRebalance {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
+    use std::str::FromStr;
 
     use super::*;
+
+    fn usdc(value: &str) -> Usdc {
+        Usdc::from_str(value).unwrap()
+    }
 
     #[test]
     fn new_mock_starts_with_zero_counts() {
@@ -159,21 +163,15 @@ mod tests {
     async fn alpaca_to_base_increments_count() {
         let mock = MockUsdcRebalance::new();
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(100)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, usdc("100"))
+            .await
+            .unwrap();
 
         assert_eq!(mock.alpaca_to_base_calls(), 1);
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(200)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, usdc("200"))
+            .await
+            .unwrap();
 
         assert_eq!(mock.alpaca_to_base_calls(), 2);
     }
@@ -182,21 +180,15 @@ mod tests {
     async fn base_to_alpaca_increments_count() {
         let mock = MockUsdcRebalance::new();
 
-        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(100)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&mock, usdc("100"))
+            .await
+            .unwrap();
 
         assert_eq!(mock.base_to_alpaca_calls(), 1);
 
-        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(200)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&mock, usdc("200"))
+            .await
+            .unwrap();
 
         assert_eq!(mock.base_to_alpaca_calls(), 2);
     }
@@ -205,41 +197,32 @@ mod tests {
     async fn alpaca_to_base_captures_parameters() {
         let mock = MockUsdcRebalance::new();
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(999.99)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, usdc("999.99"))
+            .await
+            .unwrap();
 
         let call = mock.last_alpaca_to_base_call().unwrap();
-        assert_eq!(call.amount, Usdc::new(dec!(999.99)));
+        assert_eq!(call.amount, usdc("999.99"));
     }
 
     #[tokio::test]
     async fn base_to_alpaca_captures_parameters() {
         let mock = MockUsdcRebalance::new();
 
-        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(1234.56)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&mock, usdc("1234.56"))
+            .await
+            .unwrap();
 
         let call = mock.last_base_to_alpaca_call().unwrap();
-        assert_eq!(call.amount, Usdc::new(dec!(1234.56)));
+        assert_eq!(call.amount, usdc("1234.56"));
     }
 
     #[tokio::test]
     async fn failing_alpaca_to_base_returns_error() {
         let mock = MockUsdcRebalance::failing_alpaca_to_base();
 
-        let result = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(1)),
-        )
-        .await;
+        let result =
+            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, usdc("1")).await;
 
         assert!(matches!(
             result,
@@ -251,11 +234,8 @@ mod tests {
     async fn failing_base_to_alpaca_returns_error() {
         let mock = MockUsdcRebalance::failing_base_to_alpaca();
 
-        let result = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(1)),
-        )
-        .await;
+        let result =
+            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&mock, usdc("1")).await;
 
         assert!(matches!(
             result,
@@ -267,7 +247,7 @@ mod tests {
     async fn failing_mock_still_increments_count() {
         let mock = MockUsdcRebalance::failing_alpaca_to_base();
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, Usdc::new(dec!(1)))
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, usdc("1"))
             .await
             .unwrap_err();
 
@@ -278,31 +258,25 @@ mod tests {
     async fn failing_mock_still_captures_last_call() {
         let mock = MockUsdcRebalance::failing_alpaca_to_base();
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, Usdc::new(dec!(42)))
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, usdc("42"))
             .await
             .unwrap_err();
 
         let call = mock.last_alpaca_to_base_call().unwrap();
-        assert_eq!(call.amount, Usdc::new(dec!(42)));
+        assert_eq!(call.amount, usdc("42"));
     }
 
     #[tokio::test]
     async fn operations_are_independent() {
         let mock = MockUsdcRebalance::new();
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(100)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&mock, usdc("100"))
+            .await
+            .unwrap();
 
-        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &mock,
-            Usdc::new(dec!(200)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&mock, usdc("200"))
+            .await
+            .unwrap();
 
         assert_eq!(mock.alpaca_to_base_calls(), 1);
         assert_eq!(mock.base_to_alpaca_calls(), 1);
@@ -310,7 +284,7 @@ mod tests {
         let atb = mock.last_alpaca_to_base_call().unwrap();
         let bta = mock.last_base_to_alpaca_call().unwrap();
 
-        assert_eq!(atb.amount, Usdc::new(dec!(100)));
-        assert_eq!(bta.amount, Usdc::new(dec!(200)));
+        assert_eq!(atb.amount, usdc("100"));
+        assert_eq!(bta.amount, usdc("200"));
     }
 }

@@ -115,7 +115,6 @@ impl QueryManifest {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
-    use rust_decimal_macros::dec;
     use std::collections::HashSet;
     use tokio::sync::{RwLock, broadcast, mpsc};
 
@@ -130,21 +129,23 @@ mod tests {
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
+    use st0x_float_macro::float;
 
     fn test_trigger_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
             equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
+                target: float!(0.5),
+                deviation: float!(0.2),
             },
             usdc: Some(ImbalanceThreshold {
-                target: dec!(0.6),
-                deviation: dec!(0.15),
+                target: float!(0.6),
+                deviation: float!(0.15),
             }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+
             disabled_assets: HashSet::new(),
         }
     }

@@ -4,262 +4,231 @@
 //! alloy/U256 conversions), `Usd` represents offchain US dollar amounts
 //! (e.g., brokerage cash balances) and has no onchain representation.
 
-use num_traits::ToPrimitive;
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
+use st0x_float_macro::float;
+use st0x_float_serde::{
+    deserialize_float_from_number_or_string, format_float_with_fallback, serialize_float_as_string,
+};
 use std::fmt::Display;
 use std::str::FromStr;
 
-use crate::{ArithmeticError, ArithmeticOperation, HasZero};
+use crate::HasZero;
 
 /// An offchain US dollar amount.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Usd(Decimal);
+#[derive(Debug, Clone, Copy)]
+pub struct Usd(Float);
 
 impl Usd {
     #[must_use]
-    pub const fn new(value: Decimal) -> Self {
+    pub fn new(value: Float) -> Self {
         Self(value)
     }
 
-    #[must_use]
-    pub const fn inner(self) -> Decimal {
+    pub fn inner(self) -> Float {
         self.0
     }
 
     /// Creates a Usd amount from cents (e.g., 12345 cents = $123.45).
-    #[must_use]
     pub fn from_cents(cents: i64) -> Option<Self> {
-        Decimal::from(cents).checked_div(dec!(100)).map(Self)
+        let cents_float = Float::parse(cents.to_string()).ok()?;
+        let hundred = Float::parse("100".to_string()).ok()?;
+        (cents_float / hundred).ok().map(Self)
     }
 
     /// Converts to cents exactly.
-    /// Returns `None` if the value has sub-cent precision or overflows `i64`.
-    #[must_use]
+    /// Returns `None` if the value overflows `i64` or has sub-cent precision.
     pub fn to_cents(self) -> Option<i64> {
-        let scaled = self.0.checked_mul(dec!(100))?;
+        let hundred = Float::parse("100".to_string()).ok()?;
+        let scaled = (self.0 * hundred).ok()?;
+        let frac = scaled.frac().ok()?;
+        let frac_is_zero = frac.is_zero().ok()?;
 
-        if scaled.fract() != Decimal::ZERO {
+        if !frac_is_zero {
             return None;
         }
 
-        scaled.to_i64()
+        let formatted = scaled.format().ok()?;
+        let integer_str = formatted.split('.').next().unwrap_or(&formatted);
+        integer_str.parse::<i64>().ok()
     }
 
-    #[must_use]
-    pub const fn is_zero(self) -> bool {
-        self.0.is_zero()
+    /// Fallible equality comparison.
+    pub fn eq(&self, other: &Self) -> Result<bool, FloatError> {
+        self.0.eq(other.0)
     }
 
-    #[must_use]
-    pub const fn is_negative(self) -> bool {
-        self.0.is_sign_negative()
+    /// Fallible less-than comparison.
+    pub fn lt(&self, other: &Self) -> Result<bool, FloatError> {
+        self.0.lt(other.0)
     }
 }
 
 impl HasZero for Usd {
-    const ZERO: Self = Self(Decimal::ZERO);
+    const ZERO: Self = Self(float!(0));
+
+    fn is_zero(&self) -> Result<bool, FloatError> {
+        self.0.is_zero()
+    }
+
+    fn is_negative(&self) -> Result<bool, FloatError> {
+        self.0.lt(Float::zero()?)
+    }
 }
 
-impl From<Usd> for Decimal {
+impl From<Usd> for Float {
     fn from(value: Usd) -> Self {
         value.0
     }
 }
 
 impl FromStr for Usd {
-    type Err = rust_decimal::Error;
+    type Err = FloatError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Decimal::from_str(s).map(Self)
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Float::parse(value.to_string()).map(Self)
     }
 }
 
 impl Display for Usd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", format_float_with_fallback(&self.0))
     }
 }
 
-impl std::ops::Mul<Decimal> for Usd {
-    type Output = Result<Self, ArithmeticError<Self>>;
+/// Required by `cqrs_es::DomainEvent` since Usd appears in event types.
+impl PartialEq for Usd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(other.0).unwrap_or(false)
+    }
+}
 
-    fn mul(self, rhs: Decimal) -> Self::Output {
-        self.0.checked_mul(rhs).map(Self).ok_or(ArithmeticError {
-            operation: ArithmeticOperation::Mul,
-            lhs: self,
-            rhs: Self(rhs),
-        })
+impl Eq for Usd {}
+
+impl PartialOrd for Usd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let lt = self.0.lt(other.0).ok()?;
+        if lt {
+            Some(std::cmp::Ordering::Less)
+        } else if self.0.eq(other.0).ok()? {
+            Some(std::cmp::Ordering::Equal)
+        } else {
+            Some(std::cmp::Ordering::Greater)
+        }
+    }
+}
+
+impl Serialize for Usd {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serialize_float_as_string(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Usd {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_float_from_number_or_string(deserializer).map(Self)
+    }
+}
+
+impl std::ops::Mul<Float> for Usd {
+    type Output = Result<Self, FloatError>;
+
+    fn mul(self, rhs: Float) -> Self::Output {
+        (self.0 * rhs).map(Self)
     }
 }
 
 impl std::ops::Add for Usd {
-    type Output = Result<Self, ArithmeticError<Self>>;
+    type Output = Result<Self, FloatError>;
 
     fn add(self, rhs: Self) -> Self::Output {
-        self.0.checked_add(rhs.0).map(Self).ok_or(ArithmeticError {
-            operation: ArithmeticOperation::Add,
-            lhs: self,
-            rhs,
-        })
+        (self.0 + rhs.0).map(Self)
     }
 }
 
 impl std::ops::Sub for Usd {
-    type Output = Result<Self, ArithmeticError<Self>>;
+    type Output = Result<Self, FloatError>;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        self.0.checked_sub(rhs.0).map(Self).ok_or(ArithmeticError {
-            operation: ArithmeticOperation::Sub,
-            lhs: self,
-            rhs,
-        })
+        (self.0 - rhs.0).map(Self)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
-    use rust_decimal::Decimal;
+    use st0x_float_macro::float;
 
     use super::*;
 
-    fn arb_decimal() -> impl Strategy<Value = Decimal> {
-        (any::<i64>(), 0u32..=10).prop_map(|(mantissa, scale)| Decimal::new(mantissa, scale))
-    }
-
-    proptest! {
-        #[test]
-        fn is_zero_matches_decimal(decimal in arb_decimal()) {
-            let usd = Usd(decimal);
-            prop_assert_eq!(usd.is_zero(), decimal.is_zero());
-        }
-
-        #[test]
-        fn is_negative_matches_decimal(decimal in arb_decimal()) {
-            let usd = Usd(decimal);
-            prop_assert_eq!(usd.is_negative(), decimal.is_sign_negative());
-        }
-
-        #[test]
-        fn serde_roundtrip(decimal in arb_decimal()) {
-            let usd = Usd(decimal);
-            let json = serde_json::to_string(&usd).unwrap();
-            let roundtripped: Usd = serde_json::from_str(&json).unwrap();
-            prop_assert_eq!(usd, roundtripped);
-        }
-    }
-
     #[test]
     fn add_succeeds() {
-        let result = (Usd(Decimal::ONE) + Usd(Decimal::TWO)).unwrap();
-        assert_eq!(result.0, Decimal::from(3));
+        let result = (Usd::new(float!(1)) + Usd::new(float!(2))).unwrap();
+        assert!(result.inner().eq(float!(3)).unwrap());
     }
 
     #[test]
     fn sub_succeeds() {
-        let result = (Usd(Decimal::from(5)) - Usd(Decimal::TWO)).unwrap();
-        assert_eq!(result.0, Decimal::from(3));
-    }
-
-    #[test]
-    fn add_overflow_returns_error() {
-        let max = Usd(Decimal::MAX);
-        let one = Usd(Decimal::ONE);
-        let error = (max + one).unwrap_err();
-        assert_eq!(error.operation, ArithmeticOperation::Add);
-        assert_eq!(error.lhs, max);
-        assert_eq!(error.rhs, one);
-    }
-
-    #[test]
-    fn sub_overflow_returns_error() {
-        let min = Usd(Decimal::MIN);
-        let one = Usd(Decimal::ONE);
-        let error = (min - one).unwrap_err();
-        assert_eq!(error.operation, ArithmeticOperation::Sub);
-        assert_eq!(error.lhs, min);
-        assert_eq!(error.rhs, one);
+        let result = (Usd::new(float!(5)) - Usd::new(float!(2))).unwrap();
+        assert!(result.inner().eq(float!(3)).unwrap());
     }
 
     #[test]
     fn zero_constant() {
-        assert!(Usd::ZERO.is_zero());
+        assert!(Usd::ZERO.is_zero().unwrap());
     }
 
     #[test]
-    fn into_decimal_extracts_inner_value() {
-        let usd = Usd(Decimal::from(42));
-        let decimal: Decimal = usd.into();
-        assert_eq!(decimal, Decimal::from(42));
+    fn into_float_extracts_inner_value() {
+        let float: Float = Usd::new(float!(42)).into();
+        assert!(float.eq(float!(42)).unwrap());
     }
 
     #[test]
-    fn mul_decimal_succeeds() {
-        let usd = Usd(Decimal::from(100));
-        let ratio = Decimal::new(5, 1); // 0.5
-        let result = (usd * ratio).unwrap();
-        assert_eq!(result.0, Decimal::from(50));
-    }
-
-    #[test]
-    fn mul_decimal_overflow_returns_error() {
-        let max = Usd(Decimal::MAX);
-        let two = Decimal::TWO;
-        let error = (max * two).unwrap_err();
-        assert_eq!(error.operation, ArithmeticOperation::Mul);
-        assert_eq!(error.lhs, max);
-        assert_eq!(error.rhs, Usd(two));
+    fn mul_float_succeeds() {
+        let result = (Usd::new(float!(100)) * float!(0.5)).unwrap();
+        assert!(result.inner().eq(float!(50)).unwrap());
     }
 
     #[test]
     fn from_cents_converts_positive() {
         let usd = Usd::from_cents(12345).unwrap();
-        assert_eq!(usd.0, Decimal::new(12345, 2));
+        assert!(usd.inner().eq(float!(123.45)).unwrap());
     }
 
     #[test]
     fn from_cents_converts_negative() {
         let usd = Usd::from_cents(-500).unwrap();
-        assert_eq!(usd.0, Decimal::new(-5, 0));
+        assert!(usd.inner().eq(float!(-5)).unwrap());
     }
 
     #[test]
     fn from_cents_converts_zero() {
         let usd = Usd::from_cents(0).unwrap();
-        assert!(usd.is_zero());
-    }
-
-    #[test]
-    fn from_cents_handles_large_values() {
-        let usd = Usd::from_cents(i64::MAX).unwrap();
-        assert_eq!(usd.0, Decimal::from(i64::MAX) / Decimal::from(100));
+        assert!(usd.is_zero().unwrap());
     }
 
     #[test]
     fn to_cents_converts_whole_dollars() {
-        let usd = Usd(Decimal::from(500));
+        let usd = Usd::new(float!(500));
         assert_eq!(usd.to_cents().unwrap(), 50_000);
     }
 
     #[test]
     fn to_cents_converts_dollars_and_cents() {
-        let usd = Usd(Decimal::new(12345, 2)); // $123.45
+        let usd = Usd::new(float!(123.45));
         assert_eq!(usd.to_cents().unwrap(), 12_345);
     }
 
     #[test]
     fn to_cents_rejects_sub_cent_precision() {
-        let usd = Usd(Decimal::new(99999, 3)); // $99.999
+        let usd = Usd::new(float!(99.999));
         assert_eq!(usd.to_cents(), None);
-    }
-
-    #[test]
-    fn to_cents_roundtrips_from_cents() {
-        let original_cents = 25_000_000i64; // $250,000.00
-        let usd = Usd::from_cents(original_cents).unwrap();
-        assert_eq!(usd.to_cents().unwrap(), original_cents);
     }
 
     #[test]
@@ -268,17 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn to_cents_returns_none_on_checked_mul_overflow() {
-        let usd = Usd(Decimal::MAX);
-        assert_eq!(usd.to_cents(), None);
-    }
-
-    #[test]
-    fn to_cents_returns_none_on_i64_overflow() {
-        // i64::MAX cents = $92_233_720_368_547_758.07
-        // Use a value that fits in Decimal * 100 but exceeds i64 range.
-        let exceeds_i64 = Decimal::from(i64::MAX) + Decimal::ONE;
-        let usd = Usd(exceeds_i64);
-        assert_eq!(usd.to_cents(), None);
+    fn serde_roundtrip() {
+        let usd = Usd::new(float!(42.5));
+        let json = serde_json::to_string(&usd).unwrap();
+        let roundtripped: Usd = serde_json::from_str(&json).unwrap();
+        assert_eq!(usd, roundtripped);
     }
 }

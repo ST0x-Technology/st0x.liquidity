@@ -1,0 +1,7 @@
+error: float!(5.) failed: Decimal Float error selector: Err(0x7bfa48af)
+ --> tests/compile_fail/trailing_dot.rs:5:13
+  |
+5 |     let _ = float!(5.);
+  |             ^^^^^^^^^^
+  |
+  = note: this error originates in the macro `float` (in Nightly builds, run with -Z macro-backtrace for more info)

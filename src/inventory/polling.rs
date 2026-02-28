@@ -462,8 +462,6 @@ mod tests {
     use alloy::sol_types::SolValue;
     use async_trait::async_trait;
     use httpmock::prelude::*;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlx::{Row, SqlitePool};
     use uuid::uuid;
@@ -479,7 +477,7 @@ mod tests {
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
-    use st0x_finance::Usdc;
+    use st0x_float_macro::float;
 
     struct MockEthereumWallet {
         address: Address,
@@ -592,7 +590,7 @@ mod tests {
     }
 
     fn test_shares(n: i64) -> FractionalShares {
-        FractionalShares::new(Decimal::from(n))
+        FractionalShares::new(float!(&n.to_string()))
     }
 
     async fn create_test_raindex_service(
@@ -625,12 +623,12 @@ mod tests {
                 EquityPosition {
                     symbol: test_symbol("AAPL"),
                     quantity: test_shares(100),
-                    market_value: Some(dec!(15000)),
+                    market_value: Some(float!(15000)),
                 },
                 EquityPosition {
                     symbol: test_symbol("MSFT"),
                     quantity: test_shares(50),
-                    market_value: Some(dec!(20000)),
+                    market_value: Some(float!(20000)),
                 },
             ],
             cash_balance_cents: 10_000_000,
@@ -811,7 +809,7 @@ mod tests {
             positions: vec![EquityPosition {
                 symbol: test_symbol("AAPL"),
                 quantity: test_shares(1000),
-                market_value: Some(dec!(150000)),
+                market_value: Some(float!(150000)),
             }],
             cash_balance_cents: -5_000_000, // -$50,000 (margin debt)
         };
@@ -854,12 +852,12 @@ mod tests {
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
-        let fractional_qty = FractionalShares::new(dec!(12.345)); // 12.345 shares
+        let fractional_qty = FractionalShares::new(float!(12.345)); // 12.345 shares
         let inventory = Inventory {
             positions: vec![EquityPosition {
                 symbol: test_symbol("AAPL"),
                 quantity: fractional_qty,
-                market_value: Some(dec!(1851.75)),
+                market_value: Some(float!(1851.75)),
             }],
             cash_balance_cents: 1_000_000,
         };
@@ -1373,7 +1371,7 @@ mod tests {
         else {
             panic!("Expected AlpacaWalletCash event, got {alpaca_wallet_cash_event:?}");
         };
-        assert_eq!(*usdc_balance, Usdc::new(dec!(1250.75)));
+        assert!(usdc_balance.inner().eq(float!(1250.75)).unwrap());
         wallets_mock.assert();
     }
 
@@ -1863,9 +1861,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                InventoryPollingError::SharesConversion(SharesConversionError::DecimalConversion(
-                    _
-                ))
+                InventoryPollingError::SharesConversion(SharesConversionError::FloatConversion(_))
             ),
             "Expected shares conversion error, got {error:?}"
         );

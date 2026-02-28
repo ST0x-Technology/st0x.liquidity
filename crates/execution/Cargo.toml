@@ -11,36 +11,38 @@ mock = ["test-support", "dep:anyhow", "dep:bon", "dep:httpmock"]
 test-support = []
 
 [dependencies]
+aes-gcm.workspace = true
 alloy.workspace = true
+alloy-primitives.workspace = true
+anyhow = { workspace = true, optional = true }
+apca.workspace = true
 async-trait.workspace = true
-sqlx.workspace = true
+backon.workspace = true
+base64.workspace = true
+bon = { workspace = true, optional = true }
 chrono.workspace = true
-thiserror.workspace = true
+chrono-tz.workspace = true
+cqrs-es.workspace = true
+flate2.workspace = true
+httpmock = { workspace = true, optional = true }
+num-decimal.workspace = true
+num-traits.workspace = true
+rain-math-float.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
-base64.workspace = true
-backon.workspace = true
-tracing.workspace = true
-urlencoding.workspace = true
-flate2.workspace = true
-tokio.workspace = true
-url.workspace = true
-rand.workspace = true
 serde_json.workspace = true
-chrono-tz.workspace = true
-num-traits.workspace = true
-apca = "0.30.0"
-uuid = { version = "1.10.0", features = ["v4", "serde"] }
-aes-gcm = "0.10.3"
-cqrs-es.workspace = true
 sqlite-es.workspace = true
-rust_decimal = { workspace = true, features = ["serde-with-float"] }
-num-decimal.workspace = true
-rust_decimal_macros.workspace = true
-bon = { version = "3.9.0", optional = true }
-httpmock = { workspace = true, optional = true }
-anyhow = { version = "1.0.102", optional = true }
+sqlx.workspace = true
 st0x-finance.workspace = true
+st0x-float-macro.workspace = true
+st0x-float-serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true

@@ -117,8 +117,6 @@ pub(crate) enum OnChainError {
     SharesConversion(#[from] SharesConversionError),
     #[error(transparent)]
     NotPositive(#[from] NotPositive<FractionalShares>),
-    #[error("Decimal parse error: {0}")]
-    DecimalParse(#[from] rust_decimal::Error),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("UUID parse error: {0}")]

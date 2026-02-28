@@ -140,7 +140,7 @@ impl Executor for Schwab {
         if order_response.is_filled() {
             let price =
                 order_response
-                    .price()
+                    .price()?
                     .ok_or_else(|| ExecutionError::IncompleteOrderResponse {
                         field: "price".to_string(),
                         status: OrderStatus::Filled,
@@ -411,10 +411,9 @@ mod tests {
         let auth = create_test_auth_env();
         let broker = Schwab { auth, pool };
 
-        let fractional = st0x_finance::Positive::new(st0x_finance::FractionalShares::new(
-            rust_decimal_macros::dec!(1.5),
-        ))
-        .unwrap();
+        let fractional =
+            st0x_finance::Positive::new(st0x_finance::FractionalShares::new(crate::float!(1.5)))
+                .unwrap();
 
         let order = MarketOrder {
             symbol: st0x_finance::Symbol::new("AAPL").unwrap(),
