@@ -518,8 +518,8 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/oauth/token")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=valid_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=valid_refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(mock_response);
@@ -611,8 +611,8 @@ mod tests {
                     "Basic dGVzdF9hcHBfa2V5OnRlc3RfYXBwX3NlY3JldA==",
                 )
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=valid_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=valid_refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(mock_response);
@@ -708,8 +708,8 @@ mod tests {
                     "Basic dGVzdF9hcHBfa2V5OnRlc3RfYXBwX3NlY3JldA==",
                 )
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=valid_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=valid_refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(mock_response);
@@ -756,8 +756,8 @@ mod tests {
                     "Basic dGVzdF9hcHBfa2V5OnRlc3RfYXBwX3NlY3JldA==",
                 )
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body_contains("grant_type=refresh_token")
-                .body_contains("refresh_token=valid_refresh_token");
+                .body_includes("grant_type=refresh_token")
+                .body_includes("refresh_token=valid_refresh_token");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(mock_response);
