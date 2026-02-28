@@ -192,7 +192,7 @@ enum BrokerSecrets {
 /// `Standalone`: order_owner comes from config, no rebalancing.
 /// `Rebalancing`: order_owner resolved from Fireblocks at runtime.
 #[derive(Clone, Debug)]
-pub(crate) enum TradingMode {
+pub enum TradingMode {
     Standalone { order_owner: Address },
     Rebalancing(Box<RebalancingCtx>),
 }
@@ -211,8 +211,8 @@ pub struct Ctx {
     pub(crate) inventory_poll_interval: u64,
     pub(crate) broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    pub(crate) trading_mode: TradingMode,
-    pub(crate) execution_threshold: ExecutionThreshold,
+    pub trading_mode: TradingMode,
+    pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
 }
 
@@ -563,6 +563,91 @@ impl Ctx {
             .symbols
             .get(symbol)
             .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
+    }
+}
+
+/// Test-only constructor for `Ctx` that internalizes fields e2e tests
+/// don't need to control (log level, operational limits, EVM wrapping,
+/// polling intervals). This keeps `Ctx` fields `pub(crate)` while
+/// providing a stable construction API for the e2e test crate.
+#[cfg(any(test, feature = "test-support"))]
+#[bon::bon]
+impl Ctx {
+    #[builder]
+    pub fn for_test(
+        database_url: String,
+        ws_rpc_url: Url,
+        orderbook: Address,
+        deployment_block: u64,
+        broker: BrokerCtx,
+        trading_mode: TradingMode,
+        #[builder(default)] equities: HashMap<Symbol, crate::wrapper::EquityTokenAddresses>,
+        #[builder(default = 2)] inventory_poll_interval: u64,
+        execution_threshold_override: Option<ExecutionThreshold>,
+        cash_vault_id: Option<B256>,
+    ) -> Result<Self, CtxError> {
+        let execution_threshold = match execution_threshold_override {
+            Some(threshold) => threshold,
+            None => broker.execution_threshold()?,
+        };
+
+        let assets = AssetsConfig {
+            equities: EquitiesConfig {
+                symbols: equities
+                    .into_iter()
+                    .map(|(symbol, addrs)| {
+                        let trading = if addrs.enabled {
+                            OperationMode::Enabled
+                        } else {
+                            OperationMode::Disabled
+                        };
+
+                        let rebalancing = if addrs.rebalancing {
+                            OperationMode::Enabled
+                        } else {
+                            OperationMode::Disabled
+                        };
+
+                        (
+                            symbol,
+                            EquityAssetConfig {
+                                tokenized_equity: addrs.unwrapped,
+                                tokenized_equity_derivative: addrs.wrapped,
+                                vault_id: addrs.vault_id,
+                                trading,
+                                rebalancing,
+                                operational_limit: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            cash: cash_vault_id.map(|vault_id| CashAssetConfig {
+                vault_id: Some(vault_id),
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            }),
+        };
+
+        Ok(Self {
+            database_url,
+            log_level: LogLevel::Debug,
+            server_port: 0,
+            evm: EvmCtx {
+                ws_rpc_url,
+                orderbook,
+                deployment_block,
+            },
+            order_polling_interval: 1,
+            order_polling_max_jitter: 0,
+            position_check_interval: 2,
+            inventory_poll_interval,
+            broker,
+            telemetry: None,
+            trading_mode,
+            execution_threshold,
+            assets,
+        })
     }
 }
 
@@ -932,6 +1017,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -944,6 +1030,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1028,6 +1115,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1040,6 +1128,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1117,6 +1206,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1128,6 +1218,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1254,6 +1345,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1266,6 +1358,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1407,6 +1500,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1419,6 +1513,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,

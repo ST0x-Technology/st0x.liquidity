@@ -260,13 +260,15 @@ visualization. This subsystem is currently being reworked.
 
 ### Cargo Workspace
 
-Two Rust crates:
+Three Rust crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
   conductor, reporter, CLI
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
   abstraction with Schwab, Alpaca Trading API, Alpaca Broker API, and mock
   implementations
+- **`e2e-tests`** (`crates/e2e-tests/`) - End-to-end test suite with mock Alpaca
+  broker, tokenization, CCTP, and local Anvil chain infrastructure
 
 ### Infrastructure
 
@@ -296,7 +298,7 @@ dashboard/                 # SvelteKit operations dashboard
 
 ```bash
 cargo check                  # fast compilation check
-cargo test --workspace -q    # run all tests
+cargo nextest run --workspace # run all tests
 cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt                    # format Rust code
 nix fmt                      # format Nix code (when editing .nix files)
