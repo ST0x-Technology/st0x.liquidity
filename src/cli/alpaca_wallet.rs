@@ -614,23 +614,25 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
-            trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
-                ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.1),
-                },
-                UsdcRebalancing::Disabled,
-                Address::ZERO,
-                B256::ZERO,
-                AlpacaBrokerApiCtx {
-                    api_key: "test-key".to_string(),
-                    api_secret: "test-secret".to_string(),
-                    account_id: alpaca_account_id,
-                    mode: Some(AlpacaBrokerApiMode::Sandbox),
-                    asset_cache_ttl: std::time::Duration::from_secs(3600),
-                    time_in_force: TimeInForce::default(),
-                },
-            ))),
+            trading_mode: TradingMode::Rebalancing(Box::new(
+                RebalancingCtx::stub()
+                    .equity(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.1),
+                    })
+                    .usdc(UsdcRebalancing::Disabled)
+                    .redemption_wallet(Address::ZERO)
+                    .usdc_vault_id(B256::ZERO)
+                    .alpaca_broker_auth(AlpacaBrokerApiCtx {
+                        api_key: "test-key".to_string(),
+                        api_secret: "test-secret".to_string(),
+                        account_id: alpaca_account_id,
+                        mode: Some(AlpacaBrokerApiMode::Sandbox),
+                        asset_cache_ttl: std::time::Duration::from_secs(3600),
+                        time_in_force: TimeInForce::default(),
+                    })
+                    .call(),
+            )),
             execution_threshold: ExecutionThreshold::whole_share(),
             equities: HashMap::new(),
         }

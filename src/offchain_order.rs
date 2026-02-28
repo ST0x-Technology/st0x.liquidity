@@ -29,8 +29,8 @@ pub(crate) async fn build_offchain_order_cqrs(
     Ok((store, projection))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) enum OffchainOrder {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OffchainOrder {
     Pending {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
@@ -431,7 +431,7 @@ impl OffchainOrder {
 /// allowing different executor implementations to be used
 /// via `Arc<dyn OrderPlacer>`.
 #[async_trait]
-pub(crate) trait OrderPlacer: Send + Sync {
+pub trait OrderPlacer: Send + Sync {
     async fn place_market_order(
         &self,
         order: MarketOrder,
@@ -471,10 +471,10 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct Dollars(pub(crate) Decimal);
+pub struct Dollars(pub Decimal);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum OffchainOrderCommand {
+pub enum OffchainOrderCommand {
     Place {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
@@ -494,7 +494,7 @@ pub(crate) enum OffchainOrderCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum OffchainOrderEvent {
+pub enum OffchainOrderEvent {
     Placed {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
@@ -539,7 +539,7 @@ impl DomainEvent for OffchainOrderEvent {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
-pub(crate) struct OffchainOrderId(Uuid);
+pub struct OffchainOrderId(Uuid);
 
 impl std::fmt::Display for OffchainOrderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -562,7 +562,7 @@ impl OffchainOrderId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum OffchainOrderError {
+pub enum OffchainOrderError {
     #[error("Cannot place order: order has already been placed")]
     AlreadyPlaced,
     #[error(

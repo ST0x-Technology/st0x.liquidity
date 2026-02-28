@@ -78,7 +78,7 @@ impl FromStr for IssuerRequestId {
 
 /// Alpaca tokenization request identifier used to track the mint operation through their API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct TokenizationRequestId(pub(crate) String);
+pub struct TokenizationRequestId(pub(crate) String);
 
 impl std::fmt::Display for TokenizationRequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

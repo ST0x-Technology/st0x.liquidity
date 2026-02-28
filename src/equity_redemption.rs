@@ -75,7 +75,7 @@ const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// Unique identifier for a redemption aggregate instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct RedemptionAggregateId(pub(crate) String);
+pub struct RedemptionAggregateId(pub(crate) String);
 
 impl RedemptionAggregateId {
     pub(crate) fn new(id: impl Into<String>) -> Self {
@@ -101,7 +101,7 @@ impl FromStr for RedemptionAggregateId {
 ///
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum EquityRedemptionError {
+pub enum EquityRedemptionError {
     /// Raindex vault lookup failed for the given token
     #[error("Token {0} not found in Raindex vault registry")]
     RaindexVaultNotFound(Address),
@@ -178,7 +178,7 @@ pub(crate) enum EquityRedemptionError {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum EquityRedemptionCommand {
+pub enum EquityRedemptionCommand {
     /// Withdraws wrapped tokens from the Raindex vault.
     /// Emits WithdrawnFromRaindex.
     Redeem {
@@ -205,13 +205,13 @@ pub(crate) enum EquityRedemptionCommand {
 
 /// Reason for detection failure when polling Alpaca for redemption detection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum DetectionFailure {
+pub enum DetectionFailure {
     Timeout,
     ApiError { status_code: Option<u16> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum EquityRedemptionEvent {
+pub enum EquityRedemptionEvent {
     /// Tokens withdrawn from Raindex vault to wallet.
     WithdrawnFromRaindex {
         symbol: Symbol,
@@ -290,7 +290,7 @@ impl DomainEvent for EquityRedemptionEvent {
 /// Uses the typestate pattern via enum variants to make invalid states unrepresentable.
 /// Each variant contains exactly the data valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum EquityRedemption {
+pub enum EquityRedemption {
     /// Tokens withdrawn from Raindex vault to wallet, not yet sent to Alpaca
     WithdrawnFromRaindex {
         symbol: Symbol,
