@@ -182,6 +182,7 @@ where
             self.common.ctx.evm.orderbook,
             order_owner,
             self.common.frameworks.snapshot,
+            std::time::Duration::from_secs(self.common.ctx.inventory_poll_interval),
         ));
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 
@@ -199,15 +200,18 @@ where
         );
         let event_processor =
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
-        let position_checker = spawn_periodic_accumulated_position_check(
-            self.common.executor.clone(),
-            self.common.frameworks.position.clone(),
-            self.common.frameworks.position_projection.clone(),
-            self.common.frameworks.offchain_order.clone(),
-            self.common.execution_threshold,
-            self.common.ctx.operational_limits.clone(),
-            self.common.ctx.clone(),
-        );
+        let position_checker = spawn_periodic_accumulated_position_check()
+            .executor(self.common.executor.clone())
+            .position(self.common.frameworks.position.clone())
+            .position_projection(self.common.frameworks.position_projection.clone())
+            .offchain_order(self.common.frameworks.offchain_order.clone())
+            .execution_threshold(self.common.execution_threshold)
+            .check_interval(std::time::Duration::from_secs(
+                self.common.ctx.position_check_interval,
+            ))
+            .operational_limits(self.common.ctx.operational_limits.clone())
+            .ctx(self.common.ctx.clone())
+            .call();
         let trade_cqrs = super::TradeProcessingCqrs {
             onchain_trade: self.common.frameworks.onchain_trade,
             position: self.common.frameworks.position,
