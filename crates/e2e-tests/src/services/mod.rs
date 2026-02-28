@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
-use rust_decimal::Decimal;
+use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::Symbol;
 use tempfile::TempDir;
 
@@ -37,8 +37,8 @@ pub struct TestInfra<P> {
 
 impl TestInfra<()> {
     pub async fn start(
-        equity_prices: Vec<(&str, Decimal)>,
-        equity_positions: Vec<(&str, Decimal)>,
+        equity_prices: Vec<(&str, ExactDecimal)>,
+        equity_positions: Vec<(&str, ExactDecimal)>,
     ) -> anyhow::Result<TestInfra<impl Provider + Clone>> {
         let db_dir = tempfile::tempdir()?;
         let db_path = db_dir.path().join("e2e.sqlite");
@@ -62,12 +62,12 @@ impl TestInfra<()> {
                 .await?;
         }
 
-        let symbol_prices: Vec<(Symbol, Decimal)> = equity_prices
+        let symbol_prices: Vec<(Symbol, ExactDecimal)> = equity_prices
             .iter()
             .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
             .collect::<anyhow::Result<_>>()?;
 
-        let price_lookup: HashMap<Symbol, Decimal> = symbol_prices.iter().cloned().collect();
+        let price_lookup: HashMap<Symbol, ExactDecimal> = symbol_prices.iter().cloned().collect();
 
         let symbol_positions: Vec<MockPosition> = equity_positions
             .iter()
@@ -79,7 +79,7 @@ impl TestInfra<()> {
                 Ok(MockPosition {
                     symbol: sym,
                     qty: *qty,
-                    market_value: qty * price,
+                    market_value: (*qty * *price)?,
                 })
             })
             .collect::<anyhow::Result<_>>()?;

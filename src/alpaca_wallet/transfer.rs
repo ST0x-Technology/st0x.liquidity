@@ -6,8 +6,8 @@
 
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
+use st0x_exact_decimal::ExactDecimal;
 use uuid::Uuid;
 
 use st0x_execution::Positive;
@@ -99,10 +99,10 @@ pub(crate) struct Transfer {
     #[serde(rename = "tx_hash", default)]
     pub(crate) tx: Option<TxHash>,
     pub(crate) direction: TransferDirection,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) amount: Decimal,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) usd_value: Decimal,
+    #[serde(deserialize_with = "deserialize_exact_decimal_from_string")]
+    pub(crate) amount: ExactDecimal,
+    #[serde(deserialize_with = "deserialize_exact_decimal_from_string")]
+    pub(crate) usd_value: ExactDecimal,
     pub(crate) chain: String,
     pub(crate) asset: TokenSymbol,
     #[serde(rename = "from_address")]
@@ -111,10 +111,10 @@ pub(crate) struct Transfer {
     pub(crate) to: Address,
     pub(crate) status: TransferStatus,
     pub(crate) created_at: DateTime<Utc>,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) network_fee: Decimal,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) fees: Decimal,
+    #[serde(deserialize_with = "deserialize_exact_decimal_from_string")]
+    pub(crate) network_fee: ExactDecimal,
+    #[serde(deserialize_with = "deserialize_exact_decimal_from_string")]
+    pub(crate) fees: ExactDecimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -154,18 +154,18 @@ impl std::fmt::Display for Network {
     }
 }
 
-fn deserialize_decimal_from_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+fn deserialize_exact_decimal_from_string<'de, D>(deserializer: D) -> Result<ExactDecimal, D::Error>
 where
     D: Deserializer<'de>,
 {
     let raw = String::deserialize(deserializer)?;
-    raw.parse::<Decimal>().map_err(serde::de::Error::custom)
+    ExactDecimal::parse(&raw).map_err(serde::de::Error::custom)
 }
 
 #[derive(Serialize)]
 struct WithdrawalRequest<'a> {
-    #[serde(serialize_with = "serialize_decimal_as_string")]
-    amount: Decimal,
+    #[serde(serialize_with = "serialize_exact_decimal_as_string")]
+    amount: ExactDecimal,
     asset: &'a TokenSymbol,
     #[serde(serialize_with = "serialize_address_checksummed")]
     address: &'a Address,
@@ -181,7 +181,10 @@ where
     serializer.serialize_str(&address.to_checksum(None))
 }
 
-fn serialize_decimal_as_string<S>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_exact_decimal_as_string<S>(
+    value: &ExactDecimal,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -261,15 +264,20 @@ pub(super) async fn find_transfer_by_tx_hash(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use alloy::primitives::{address, fixed_bytes};
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_exact_decimal::ExactDecimal;
     use st0x_execution::{AlpacaAccountId, InvalidSharesError};
-    use std::str::FromStr;
     use uuid::uuid;
 
     use super::*;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -280,7 +288,7 @@ mod tests {
         let asset = TokenSymbol::new("USDC");
 
         let request = WithdrawalRequest {
-            amount: dec!(100),
+            amount: ed("100"),
             asset: &asset,
             address: &address,
         };
@@ -334,7 +342,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100.5))).unwrap();
+        let amount = Positive::new(Usdc(ed("100.5"))).unwrap();
         let asset = TokenSymbol::new("USDC");
 
         let transfer = initiate_withdrawal(&client, amount, &asset, &to_address)
@@ -346,11 +354,11 @@ mod tests {
 
         assert_eq!(transfer.id, AlpacaTransferId::new(transfer_id));
         assert_eq!(transfer.direction, TransferDirection::Outgoing);
-        assert_eq!(transfer.amount, dec!(100.5));
+        assert_eq!(transfer.amount, ed("100.5"));
         assert_eq!(transfer.asset.as_ref(), "USDC");
         assert_eq!(transfer.to, expected_address);
         assert_eq!(transfer.status, TransferStatus::Pending);
-        assert_eq!(transfer.network_fee, dec!(0.5));
+        assert_eq!(transfer.network_fee, ed("0.5"));
 
         withdrawal_mock.assert();
     }
@@ -358,16 +366,16 @@ mod tests {
     #[test]
     fn test_initiate_withdrawal_zero_amount() {
         assert!(matches!(
-            Positive::new(Usdc(Decimal::ZERO)).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::ZERO
+            Positive::new(Usdc(ExactDecimal::zero())).unwrap_err(),
+            InvalidSharesError::NonPositive(value) if value == ExactDecimal::zero()
         ));
     }
 
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
         assert!(matches!(
-            Positive::new(Usdc(dec!(-100))).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == dec!(-100)
+            Positive::new(Usdc(ed("-100"))).unwrap_err(),
+            InvalidSharesError::NonPositive(value) if value == ed("-100")
         ));
     }
 
@@ -391,7 +399,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc(ed("100"))).unwrap();
         let asset = TokenSymbol::new("INVALID");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -427,7 +435,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc(ed("100"))).unwrap();
         let asset = TokenSymbol::new("USDC");
         let addr = address!("0x0000000000000000000000000000000000000000");
 
@@ -459,7 +467,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc(ed("100"))).unwrap();
         let asset = TokenSymbol::new("USDC");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -860,7 +868,7 @@ mod tests {
         );
         assert_eq!(
             transfer.amount,
-            dec!(100),
+            ed("100"),
             "Should return the 100 USDC withdrawal, not a 0.01 USDC deposit"
         );
         assert_eq!(transfer.direction, TransferDirection::Outgoing);

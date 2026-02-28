@@ -6,13 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 
 use st0x_event_sorcery::Projection;
+use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::{Direction, SupportedExecutor, Symbol};
 use st0x_hedge::config::Ctx;
 use st0x_hedge::{Dollars, OffchainOrder, Position, launch};
@@ -32,13 +31,13 @@ use crate::services::base_chain::TakeDirection;
 /// - `broker_fill_price`: the offchain hedge fill price from the broker mock
 pub struct ExpectedPosition {
     pub symbol: &'static str,
-    pub amount: Decimal,
+    pub amount: ExactDecimal,
     pub direction: TakeDirection,
-    pub onchain_price: Decimal,
-    pub broker_fill_price: Decimal,
-    pub expected_accumulated_long: Decimal,
-    pub expected_accumulated_short: Decimal,
-    pub expected_net: Decimal,
+    pub onchain_price: ExactDecimal,
+    pub broker_fill_price: ExactDecimal,
+    pub expected_accumulated_long: ExactDecimal,
+    pub expected_accumulated_short: ExactDecimal,
+    pub expected_net: ExactDecimal,
 }
 
 #[bon::bon]
@@ -46,13 +45,13 @@ impl ExpectedPosition {
     #[builder]
     pub fn new(
         symbol: &'static str,
-        amount: Decimal,
+        amount: ExactDecimal,
         direction: TakeDirection,
-        onchain_price: Decimal,
-        broker_fill_price: Decimal,
-        expected_accumulated_long: Decimal,
-        expected_accumulated_short: Decimal,
-        expected_net: Decimal,
+        onchain_price: ExactDecimal,
+        broker_fill_price: ExactDecimal,
+        expected_accumulated_long: ExactDecimal,
+        expected_accumulated_short: ExactDecimal,
+        expected_net: ExactDecimal,
     ) -> Self {
         Self {
             symbol,
@@ -365,9 +364,9 @@ fn assert_broker_order(expected_position: &ExpectedPosition, order: &MockOrderSn
     assert_eq!(order.symbol, expected_position.symbol);
     assert_eq!(order.side, expected_position.expected_broker_side());
     assert_eq!(order.status, "filled");
-    let _parsed_order_qty: Decimal = order.qty.parse().unwrap_or_else(|error| {
+    let _parsed_order_qty: ExactDecimal = order.qty.parse().unwrap_or_else(|error| {
         panic!(
-            "Broker order qty for {} should be a valid Decimal, got '{}': {error}",
+            "Broker order qty for {} should be a valid decimal, got '{}': {error}",
             expected_position.symbol, order.qty
         )
     });
@@ -383,20 +382,25 @@ fn assert_total_broker_order_qty(
     expected_position: &ExpectedPosition,
     symbol_orders: &[&MockOrderSnapshot],
 ) {
-    let total_qty = symbol_orders.iter().fold(Decimal::ZERO, |acc, order| {
-        let qty: Decimal = order.qty.parse().unwrap_or_else(|error| {
-            panic!(
-                "Broker order qty for {} should be a valid Decimal, got '{}': {error}",
-                expected_position.symbol, order.qty
-            )
+    let total_qty = symbol_orders
+        .iter()
+        .fold(ExactDecimal::zero(), |acc, order| {
+            let qty: ExactDecimal = order.qty.parse().unwrap_or_else(|error| {
+                panic!(
+                    "Broker order qty for {} should be a valid decimal, got '{}': {error}",
+                    expected_position.symbol, order.qty
+                )
+            });
+            match acc + qty {
+                Ok(sum) => sum,
+                Err(error) => panic!("ExactDecimal addition failed: {error}"),
+            }
         });
-        acc + qty
-    });
 
     assert_decimal_eq!(
         total_qty,
         expected_position.amount,
-        DEFAULT_EPSILON,
+        *DEFAULT_EPSILON,
         "Total broker order qty for {} should match expected hedge amount",
         expected_position.symbol
     );
@@ -410,9 +414,9 @@ fn assert_broker_position(expected_position: &ExpectedPosition, position: &MockP
     // (equity mint/redeem) modify the broker position qty independently of
     // the original hedge amount. Total order qty is validated separately by
     // `assert_total_broker_order_qty`.
-    let _parsed_qty: Decimal = position.qty.parse().unwrap_or_else(|error| {
+    let _parsed_qty: ExactDecimal = position.qty.parse().unwrap_or_else(|error| {
         panic!(
-            "Broker position qty for {} should be a valid Decimal, got '{}': {error}",
+            "Broker position qty for {} should be a valid decimal, got '{}': {error}",
             expected_position.symbol, position.qty
         )
     });
@@ -480,7 +484,7 @@ fn assert_onchain_trade_events(
         for trade in &symbol_trades {
             assert_eq!(trade.event_type, "OnChainTradeEvent::Filled");
 
-            let recorded_price: Decimal = trade.payload["Filled"]["price_usdc"]
+            let recorded_price: ExactDecimal = trade.payload["Filled"]["price_usdc"]
                 .as_str()
                 .unwrap_or_else(|| {
                     panic!(
@@ -490,18 +494,24 @@ fn assert_onchain_trade_events(
                 })
                 .parse()
                 .unwrap_or_else(|parse_error| {
-                    panic!("price_usdc should be a valid Decimal: {parse_error}")
+                    panic!("price_usdc should be a valid decimal: {parse_error}")
                 });
             // Round to 2 dp (cents) because buy-side ioRatio (1/price)
             // introduces tiny precision artifacts in the onchain representation.
+            let recorded_rounded = match recorded_price.round_dp(2) {
+                Ok(value) => value,
+                Err(error) => panic!("round_dp failed for recorded_price: {error}"),
+            };
+            let expected_rounded = match expected_position.onchain_price.round_dp(2) {
+                Ok(value) => value,
+                Err(error) => panic!("round_dp failed for onchain_price: {error}"),
+            };
             assert_eq!(
-                recorded_price.round_dp(2),
-                expected_position.onchain_price.round_dp(2),
+                recorded_rounded, expected_rounded,
                 "OnChainTrade price_usdc for {} should match onchain execution \
                  price (rounded to cents): recorded={recorded_price}, \
                  expected={}",
-                expected_position.symbol,
-                expected_position.onchain_price
+                expected_position.symbol, expected_position.onchain_price
             );
         }
     }
@@ -691,21 +701,21 @@ async fn assert_position_view(
     assert_decimal_eq!(
         position.net.inner(),
         expected_net,
-        DEFAULT_EPSILON,
+        *DEFAULT_EPSILON,
         "net position mismatch for {}",
         expected_position.symbol
     );
     assert_decimal_eq!(
         position.accumulated_long.inner(),
         expected_long,
-        DEFAULT_EPSILON,
+        *DEFAULT_EPSILON,
         "accumulated_long mismatch for {}",
         expected_position.symbol
     );
     assert_decimal_eq!(
         position.accumulated_short.inner(),
         expected_short,
-        DEFAULT_EPSILON,
+        *DEFAULT_EPSILON,
         "accumulated_short mismatch for {}",
         expected_position.symbol
     );
@@ -716,8 +726,11 @@ async fn assert_position_view(
         expected_position.symbol
     );
     assert_eq!(
-        position.last_price_usdc.map(|price| price.round_dp(2)),
-        Some(expected_position.onchain_price.round_dp(2)),
+        position
+            .last_price_usdc
+            .map(|price| price.round_dp(2))
+            .transpose()?,
+        Some(expected_position.onchain_price.round_dp(2)?),
         "last_price_usdc for {} should match onchain execution price",
         expected_position.symbol
     );
@@ -760,7 +773,7 @@ async fn assert_offchain_order_views(
         let expected_amount = expected_position.amount;
         let expected_price = expected_position.broker_fill_price;
 
-        let mut total_shares = Decimal::ZERO;
+        let mut total_shares = ExactDecimal::zero();
         let mut found_any = false;
 
         for (order_id, order) in &all_orders {
@@ -781,7 +794,7 @@ async fn assert_offchain_order_views(
             }
 
             found_any = true;
-            total_shares += shares.inner().inner();
+            total_shares = (total_shares + shares.inner().inner())?;
 
             assert_eq!(
                 direction,
@@ -811,7 +824,7 @@ async fn assert_offchain_order_views(
         assert_decimal_eq!(
             total_shares,
             expected_amount,
-            dec!(0.000_001),
+            ed("0.000001"),
             "Total hedge shares for {} should match expected amount",
             expected_position.symbol
         );
@@ -915,7 +928,13 @@ pub fn assert_single_clean_aggregate(events: &[StoredEvent], error_substrings: &
 macro_rules! assert_decimal_eq {
     ($left:expr, $right:expr, $epsilon:expr $(,)?) => {
         let (l, r, eps) = ($left, $right, $epsilon);
-        let diff = (l - r).abs();
+        let diff = match (l - r) {
+            Ok(sub) => match sub.abs() {
+                Ok(abs) => abs,
+                Err(error) => panic!("ExactDecimal abs failed: {error}"),
+            },
+            Err(error) => panic!("ExactDecimal subtraction failed: {error}"),
+        };
         if diff > eps {
             panic!(
                 "assertion failed: `(left == right)` (within epsilon {})\n  left: `{:?}`\n right: `{:?}`\n delta: `{:?}`",
@@ -925,7 +944,13 @@ macro_rules! assert_decimal_eq {
     };
     ($left:expr, $right:expr, $epsilon:expr, $($arg:tt)+) => {
         let (l, r, eps) = ($left, $right, $epsilon);
-        let diff = (l - r).abs();
+        let diff = match (l - r) {
+            Ok(sub) => match sub.abs() {
+                Ok(abs) => abs,
+                Err(error) => panic!("ExactDecimal abs failed: {error}"),
+            },
+            Err(error) => panic!("ExactDecimal subtraction failed: {error}"),
+        };
         if diff > eps {
             panic!(
                 "assertion failed: `(left == right)` (within epsilon {})\n  left: `{:?}`\n right: `{:?}`\n delta: `{:?}`\n{}",
@@ -934,13 +959,22 @@ macro_rules! assert_decimal_eq {
         }
     };
 }
-const DEFAULT_EPSILON: Decimal = dec!(0.000000000000001);
+
+fn ed(value: &str) -> ExactDecimal {
+    match ExactDecimal::parse(value) {
+        Ok(decimal) => decimal,
+        Err(error) => panic!("Failed to parse ExactDecimal from '{value}': {error}"),
+    }
+}
+
+static DEFAULT_EPSILON: std::sync::LazyLock<ExactDecimal> =
+    std::sync::LazyLock::new(|| ed("0.000000000000001"));
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use rust_decimal_macros::dec;
+    use st0x_exact_decimal::ExactDecimal;
 
     use super::{
         ExpectedPosition, MockOrderSnapshot, MockPositionSnapshot, StoredEvent,
@@ -948,19 +982,20 @@ mod tests {
     };
     use crate::services::base_chain::TakeDirection;
 
-    fn expected_position(
-        direction: TakeDirection,
-        amount: rust_decimal::Decimal,
-    ) -> ExpectedPosition {
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
+
+    fn expected_position(direction: TakeDirection, amount: ExactDecimal) -> ExpectedPosition {
         ExpectedPosition::builder()
             .symbol("AAPL")
             .amount(amount)
             .direction(direction)
-            .onchain_price(dec!(100))
-            .broker_fill_price(dec!(99))
-            .expected_accumulated_long(dec!(0))
-            .expected_accumulated_short(dec!(0))
-            .expected_net(dec!(0))
+            .onchain_price(ed("100"))
+            .broker_fill_price(ed("99"))
+            .expected_accumulated_long(ed("0"))
+            .expected_accumulated_short(ed("0"))
+            .expected_net(ed("0"))
             .build()
     }
 
@@ -1007,7 +1042,7 @@ mod tests {
 
     #[test]
     fn assert_broker_position_parses_qty() {
-        let buy_hedge = expected_position(TakeDirection::SellEquity, dec!(7.5));
+        let buy_hedge = expected_position(TakeDirection::SellEquity, ed("7.5"));
         let long_position = MockPositionSnapshot {
             symbol: "AAPL".to_string(),
             qty: "7.5".to_string(),
@@ -1015,7 +1050,7 @@ mod tests {
         };
         assert_broker_position(&buy_hedge, &long_position);
 
-        let any_position = expected_position(TakeDirection::BuyEquity, dec!(7.5));
+        let any_position = expected_position(TakeDirection::BuyEquity, ed("7.5"));
         let signed_position = MockPositionSnapshot {
             symbol: "AAPL".to_string(),
             qty: "-7.5".to_string(),
@@ -1026,7 +1061,7 @@ mod tests {
 
     #[test]
     fn assert_total_broker_order_qty_sums_multiple_orders() {
-        let expected = expected_position(TakeDirection::SellEquity, dec!(10.75));
+        let expected = expected_position(TakeDirection::SellEquity, ed("10.75"));
         let first = MockOrderSnapshot {
             order_id: "1".to_string(),
             symbol: "AAPL".to_string(),
@@ -1052,7 +1087,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Total broker order qty for AAPL should match expected hedge amount")]
     fn assert_total_broker_order_qty_rejects_wrong_total() {
-        let expected = expected_position(TakeDirection::SellEquity, dec!(10.75));
+        let expected = expected_position(TakeDirection::SellEquity, ed("10.75"));
         let only = MockOrderSnapshot {
             order_id: "1".to_string(),
             symbol: "AAPL".to_string(),

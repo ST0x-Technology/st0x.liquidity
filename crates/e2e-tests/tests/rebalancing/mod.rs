@@ -33,9 +33,9 @@ use self::utils::*;
 /// that direct decimal price literals do not block the mint pipeline.
 #[test_log::test(tokio::test)]
 async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Result<()> {
-    let onchain_price = Decimal::from_str("112.50000000000000000000000002")?;
-    let broker_fill_price = dec!(110);
-    let amount_per_trade = dec!(7.5);
+    let onchain_price = ed("112.50000000000000000000000002");
+    let broker_fill_price = ed("110");
+    let amount_per_trade = ed("7.5");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -87,13 +87,13 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount(dec!(22.5))
+        .amount(ed("22.5"))
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
-        .expected_accumulated_short(dec!(22.5))
-        .expected_net(dec!(0))
+        .expected_accumulated_long(ed("0"))
+        .expected_accumulated_short(ed("22.5"))
+        .expected_net(ed("0"))
         .build()];
 
     assert_equity_rebalancing_flow()
@@ -133,9 +133,9 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
 /// ERC-4626 wrapping and Raindex vault deposit.
 #[test_log::test(tokio::test)]
 async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
-    let onchain_price = dec!(150.00);
-    let broker_fill_price = dec!(148.00);
-    let amount_per_trade = dec!(7.5);
+    let onchain_price = ed("150.00");
+    let broker_fill_price = ed("148.00");
+    let amount_per_trade = ed("7.5");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -191,13 +191,13 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount(dec!(22.5))
+        .amount(ed("22.5"))
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
-        .expected_accumulated_short(dec!(22.5))
-        .expected_net(dec!(0))
+        .expected_accumulated_long(ed("0"))
+        .expected_accumulated_short(ed("22.5"))
+        .expected_net(ed("0"))
         .build()];
 
     assert_equity_rebalancing_flow()
@@ -235,12 +235,12 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
 /// API mock endpoints for redemption detection/completion polling.
 #[test_log::test(tokio::test)]
 async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
-    let onchain_price = dec!(112.50);
-    let broker_fill_price = dec!(113.60);
-    let trade_amount = dec!(12.5);
+    let onchain_price = ed("112.50");
+    let broker_fill_price = ed("113.60");
+    let trade_amount = ed("12.5");
 
     let infra =
-        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", dec!(20))]).await?;
+        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", ed("20"))]).await?;
 
     // Set up order and deposit extra equity before bot starts.
     let prepared = infra
@@ -304,9 +304,9 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .direction(TakeDirection::BuyEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(12.5))
-        .expected_accumulated_short(dec!(0))
-        .expected_net(dec!(0))
+        .expected_accumulated_long(ed("12.5"))
+        .expected_accumulated_short(ed("0"))
+        .expected_net(ed("0"))
         .build()];
 
     let redemption_wallet_balance_after =
@@ -350,12 +350,12 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 #[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
 #[test_log::test(tokio::test)]
 async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::Result<()> {
-    let onchain_price = dec!(115);
-    let broker_fill_price = dec!(113.57);
-    let trade_amount = dec!(12.5);
+    let onchain_price = ed("115");
+    let broker_fill_price = ed("113.57");
+    let trade_amount = ed("12.5");
 
     let infra =
-        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", dec!(20))]).await?;
+        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", ed("20"))]).await?;
 
     let prepared = infra
         .base_chain
@@ -415,8 +415,8 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
         .expected_accumulated_long(trade_amount)
-        .expected_accumulated_short(dec!(0))
-        .expected_net(dec!(0))
+        .expected_accumulated_short(ed("0"))
+        .expected_net(ed("0"))
         .build()];
 
     let redemption_wallet_balance_after =
@@ -447,7 +447,7 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
 }
 
 /// Diagnostic repro using the historical harness behavior: precompute the
-/// buy-side reciprocal in Rust `Decimal` and inject it as a Rainlang literal.
+/// buy-side reciprocal in `ExactDecimal` and inject it as a Rainlang literal.
 ///
 /// This uses the same rebalancing redemption setup as the `inv(price)` repro
 /// but replaces the generated Rainlang expression with a direct reciprocal
@@ -455,17 +455,17 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
 #[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
 #[test_log::test(tokio::test)]
 async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result<()> {
-    let onchain_price = dec!(112);
-    let broker_fill_price = dec!(113.57);
-    let trade_amount = dec!(12.5);
+    let onchain_price = ed("112");
+    let broker_fill_price = ed("113.57");
+    let trade_amount = ed("12.5");
 
-    let reciprocal_literal = (dec!(1.0) / onchain_price).to_string();
-    let usdc_total = trade_amount * onchain_price;
-    let max_amount_base: U256 = parse_units(&format!("{usdc_total:.6}"), 6)?.into();
+    let reciprocal_literal = (ed("1.0") / onchain_price).unwrap().to_string();
+    let usdc_total = (trade_amount * onchain_price).unwrap();
+    let max_amount_base: U256 = parse_units(&usdc_total.round_dp(6)?.to_string(), 6)?.into();
     let rain_expression_override = format!("_ _: {max_amount_base} {reciprocal_literal};:;");
 
     let infra =
-        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", dec!(20))]).await?;
+        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", ed("20"))]).await?;
 
     let prepared = infra
         .base_chain
@@ -526,8 +526,8 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
         .expected_accumulated_long(trade_amount)
-        .expected_accumulated_short(dec!(0))
-        .expected_net(dec!(0))
+        .expected_accumulated_short(ed("0"))
+        .expected_net(ed("0"))
         .build()];
 
     let redemption_wallet_balance_after =
@@ -575,9 +575,9 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
 /// for `MessageSent` events using a test attester key.
 #[test_log::test(tokio::test)]
 async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
-    let onchain_price = dec!(158.39);
-    let broker_fill_price = dec!(155.00);
-    let amount_per_trade = dec!(7.5);
+    let onchain_price = ed("158.39");
+    let broker_fill_price = ed("155.00");
+    let amount_per_trade = ed("7.5");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
     let cctp = CctpInfra::start(&infra).await?;
@@ -663,13 +663,13 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount(amount_per_trade * dec!(3))
+        .amount((amount_per_trade * ed("3")).unwrap())
         .direction(TakeDirection::BuyEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(amount_per_trade * dec!(3))
-        .expected_accumulated_short(dec!(0))
-        .expected_net(dec!(0))
+        .expected_accumulated_long((amount_per_trade * ed("3")).unwrap())
+        .expected_accumulated_short(ed("0"))
+        .expected_net(ed("0"))
         .build()];
 
     assert_usdc_rebalancing_flow()
@@ -709,9 +709,9 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 /// Raindex USDC vault is pre-funded so the bot can withdraw from it.
 #[test_log::test(tokio::test)]
 async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
-    let onchain_price = dec!(158.39);
-    let broker_fill_price = dec!(155.00);
-    let amount_per_trade = dec!(7.5);
+    let onchain_price = ed("158.39");
+    let broker_fill_price = ed("155.00");
+    let amount_per_trade = ed("7.5");
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
     let cctp = CctpInfra::start(&infra).await?;
@@ -820,13 +820,13 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount(amount_per_trade * dec!(3))
+        .amount((amount_per_trade * ed("3")).unwrap())
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long(dec!(0))
-        .expected_accumulated_short(amount_per_trade * dec!(3))
-        .expected_net(dec!(0))
+        .expected_accumulated_long(ed("0"))
+        .expected_accumulated_short((amount_per_trade * ed("3")).unwrap())
+        .expected_net(ed("0"))
         .build()];
 
     assert_usdc_rebalancing_flow()

@@ -211,7 +211,7 @@ impl AlpacaBrokerApiClient {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
+    use st0x_exact_decimal::ExactDecimal;
     use uuid::uuid;
 
     use super::*;
@@ -421,7 +421,8 @@ mod tests {
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = Positive::new(FractionalShares::new(dec!(10.5))).unwrap();
+        let quantity =
+            Positive::new(FractionalShares::new(ExactDecimal::parse("10.5").unwrap())).unwrap();
         let response = client
             .create_journal(DESTINATION_ACCOUNT_ID, &symbol, quantity)
             .await
@@ -440,9 +441,9 @@ mod tests {
         assert_eq!(response.symbol, Symbol::new("AAPL").unwrap());
         assert_eq!(
             response.quantity,
-            Positive::new(FractionalShares::new(dec!(10.5))).unwrap()
+            Positive::new(FractionalShares::new(ExactDecimal::parse("10.5").unwrap())).unwrap()
         );
-        assert_eq!(response.price, Some(dec!(150.25)));
+        assert_eq!(response.price, Some(ExactDecimal::parse("150.25").unwrap()));
     }
 
     #[tokio::test]
@@ -462,7 +463,10 @@ mod tests {
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = Positive::new(FractionalShares::new(dec!(999999))).unwrap();
+        let quantity = Positive::new(FractionalShares::new(
+            ExactDecimal::parse("999999").unwrap(),
+        ))
+        .unwrap();
         let err = client
             .create_journal(DESTINATION_ACCOUNT_ID, &symbol, quantity)
             .await
@@ -491,7 +495,8 @@ mod tests {
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = Positive::new(FractionalShares::new(dec!(10))).unwrap();
+        let quantity =
+            Positive::new(FractionalShares::new(ExactDecimal::parse("10").unwrap())).unwrap();
         let err = client
             .create_journal(DESTINATION_ACCOUNT_ID, &symbol, quantity)
             .await

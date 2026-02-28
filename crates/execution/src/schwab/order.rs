@@ -316,6 +316,7 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_exact_decimal::ExactDecimal;
 
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
 
@@ -863,7 +864,10 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538123".to_string()));
         assert!(order_status.is_filled());
         assert_eq!(order_status.filled_quantity.unwrap(), dec!(100.0));
-        assert_eq!(order_status.price(), Some(dec!(150.25)));
+        assert_eq!(
+            order_status.price(),
+            Some(ExactDecimal::parse("150.25").unwrap())
+        );
     }
 
     #[tokio::test]
@@ -977,8 +981,11 @@ mod tests {
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
         assert_eq!(order_status.filled_quantity.unwrap(), dec!(75.0));
-        // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75 = 100.33333
-        let expected_price = (dec!(50) * dec!(100.00) + dec!(25) * dec!(101.00)) / dec!(75);
+        // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75
+        // The internal Schwab computation uses Decimal arithmetic, then converts
+        // to ExactDecimal via string roundtrip at the boundary.
+        let expected_decimal = (dec!(50) * dec!(100.00) + dec!(25) * dec!(101.00)) / dec!(75);
+        let expected_price = ExactDecimal::parse(&expected_decimal.to_string()).unwrap();
         assert_eq!(order_status.price(), Some(expected_price));
     }
 

@@ -55,10 +55,13 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
-    use rust_decimal_macros::dec;
-
     use st0x_evm::ReadOnlyEvm;
+    use st0x_exact_decimal::ExactDecimal;
     use st0x_execution::FractionalShares;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -161,7 +164,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
         assert_eq!(
             trade.tx_hash,
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
@@ -267,7 +270,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(5)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("5")));
     }
 
     #[tokio::test]
@@ -338,9 +341,9 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(15)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("15")));
         // Price should be 200 USDC / 15 shares = 13.333... USDC per share
-        assert_eq!(trade.price.value(), dec!(200) / dec!(15));
+        assert_eq!(trade.price.value(), (ed("200") / ed("15")).unwrap());
     }
 
     #[tokio::test]

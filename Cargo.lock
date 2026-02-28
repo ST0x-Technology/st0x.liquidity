@@ -2305,6 +2305,7 @@ dependencies = [
  "sqlx",
  "st0x-event-sorcery",
  "st0x-evm",
+ "st0x-exact-decimal",
  "st0x-execution",
  "st0x-hedge",
  "tempfile",
@@ -6555,6 +6556,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "st0x-exact-decimal",
  "ts-rs",
 ]
 
@@ -6596,6 +6598,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-exact-decimal"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "proptest",
+ "rain-math-float",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "st0x-execution"
 version = "0.1.0"
 dependencies = [
@@ -6613,6 +6627,7 @@ dependencies = [
  "num-decimal",
  "num-traits",
  "proptest",
+ "rain-math-float",
  "rand 0.8.5",
  "reqwest 0.12.24",
  "rust_decimal",
@@ -6622,6 +6637,7 @@ dependencies = [
  "serial_test",
  "sqlite-es",
  "sqlx",
+ "st0x-exact-decimal",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -6673,6 +6689,7 @@ dependencies = [
  "st0x-dto",
  "st0x-event-sorcery",
  "st0x-evm",
+ "st0x-exact-decimal",
  "st0x-execution",
  "st0x-hedge",
  "temp-env",

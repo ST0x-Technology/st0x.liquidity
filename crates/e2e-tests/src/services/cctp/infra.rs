@@ -11,7 +11,7 @@ use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use rust_decimal_macros::dec;
+use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::Symbol;
 use tokio::task::JoinHandle;
 
@@ -175,9 +175,10 @@ impl CctpInfra {
             .register_wallet_endpoints(infra.base_chain.owner);
 
         // USDC/USD conversion is a 1:1 stablecoin pair on Alpaca
-        infra
-            .broker_service
-            .set_symbol_fill_price(Symbol::force_new("USDCUSD".to_string()), dec!(1.0));
+        infra.broker_service.set_symbol_fill_price(
+            Symbol::force_new("USDCUSD".to_string()),
+            ExactDecimal::parse("1")?,
+        );
 
         let eth_watcher_provider = alloy::providers::ProviderBuilder::new()
             .connect(&ethereum_endpoint)

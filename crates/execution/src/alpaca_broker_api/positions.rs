@@ -3,6 +3,7 @@
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
+use st0x_exact_decimal::ExactDecimal;
 use tracing::{debug, error};
 
 use super::AlpacaBrokerApiError;
@@ -41,10 +42,17 @@ pub(super) async fn fetch_inventory(
                 );
             })?;
 
+            let quantity = FractionalShares::from_decimal(position.quantity)?;
+
+            let market_value = position
+                .market_value
+                .map(|decimal| ExactDecimal::parse(&decimal.to_string()))
+                .transpose()?;
+
             Ok(EquityPosition {
                 symbol,
-                quantity: FractionalShares::new(position.quantity),
-                market_value: position.market_value,
+                quantity,
+                market_value,
             })
         })
         .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
@@ -109,6 +117,11 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
 
+    /// Helper to create FractionalShares from a Decimal in tests
+    fn shares_from_dec(value: Decimal) -> FractionalShares {
+        FractionalShares::from_decimal(value).unwrap()
+    }
+
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
@@ -171,8 +184,11 @@ mod tests {
             .iter()
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
-        assert_eq!(aapl.quantity, FractionalShares::new(dec!(10.5)));
-        assert_eq!(aapl.market_value, Some(dec!(1575.00)));
+        assert_eq!(aapl.quantity, shares_from_dec(dec!(10.5)));
+        assert_eq!(
+            aapl.market_value,
+            Some(ExactDecimal::parse("1575.00").unwrap())
+        );
     }
 
     #[tokio::test]
@@ -288,8 +304,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             aapl.market_value,
-            Some(dec!(1575.005)),
-            "Sub-cent market value 1575.005 should be preserved as Decimal"
+            Some(ExactDecimal::parse("1575.005").unwrap()),
+            "Sub-cent market value 1575.005 should be preserved as ExactDecimal"
         );
     }
 
@@ -366,6 +382,9 @@ mod tests {
             .iter()
             .find(|position| position.symbol.to_string() == "RKLB")
             .unwrap();
-        assert_eq!(rklb.market_value, Some(dec!(511.6476)));
+        assert_eq!(
+            rklb.market_value,
+            Some(ExactDecimal::parse("511.6476").unwrap())
+        );
     }
 }
