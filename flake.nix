@@ -91,9 +91,9 @@
             body = ''
               set -euxo pipefail
               cargo check --workspace
-              cargo test --workspace -q
+              cargo nextest run --workspace
               cargo clippy --workspace --all-targets --all-features
-              cargo fmt
+              cargo fmt -- --check
             '';
           };
 
@@ -210,6 +210,7 @@
               sqlx-cli
               cargo-expand
               cargo-chef
+              cargo-nextest
               terraform
               ragenix.packages.${system}.default
               packages.ci
