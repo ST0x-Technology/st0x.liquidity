@@ -12,3 +12,5 @@ tarpaulin-report.html
 !.claude/skills
 .sqlx/
 .idea/
+out/
+cache/

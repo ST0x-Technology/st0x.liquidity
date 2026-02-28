@@ -140,7 +140,7 @@ pub struct Ctx {
     pub telemetry: Option<TelemetryCtx>,
     pub trading_mode: TradingMode,
     pub execution_threshold: ExecutionThreshold,
-    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
+    pub equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
