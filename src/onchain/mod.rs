@@ -118,8 +118,6 @@ pub(crate) enum OnChainError {
     Position(#[from] PositionError),
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] SharesConversionError),
-    #[error("Decimal parse error: {0}")]
-    DecimalParse(#[from] rust_decimal::Error),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("UUID parse error: {0}")]

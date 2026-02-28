@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use rust_decimal::Decimal;
 use serde::Deserialize;
+use st0x_exact_decimal::ExactDecimal;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -204,7 +204,7 @@ impl AlpacaBrokerApi {
     /// Returns the completed order response after the order is filled.
     pub async fn convert_usdc_usd(
         &self,
-        amount: Decimal,
+        amount: ExactDecimal,
         direction: ConversionDirection,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
         let order = super::order::convert_usdc_usd(&self.client, amount, direction).await?;
@@ -622,7 +622,8 @@ mod tests {
 
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ExactDecimal::parse("100").unwrap()))
+                .unwrap(),
             direction: Direction::Buy,
         };
 
@@ -653,7 +654,8 @@ mod tests {
 
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ExactDecimal::parse("100").unwrap()))
+                .unwrap(),
             direction: Direction::Buy,
         };
 
@@ -684,7 +686,8 @@ mod tests {
 
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ExactDecimal::parse("100").unwrap()))
+                .unwrap(),
             direction: Direction::Buy,
         };
 
@@ -739,7 +742,8 @@ mod tests {
         // Place first order
         let order1 = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ExactDecimal::parse("100").unwrap()))
+                .unwrap(),
             direction: Direction::Buy,
         };
         executor.place_market_order(order1).await.unwrap();
@@ -747,7 +751,8 @@ mod tests {
         // Place second order for same symbol - should use cached asset info
         let order2 = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ExactDecimal::parse("50").unwrap()))
+                .unwrap(),
             direction: Direction::Buy,
         };
         executor.place_market_order(order2).await.unwrap();
@@ -808,7 +813,8 @@ mod tests {
         // Place first order
         let order1 = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ExactDecimal::parse("100").unwrap()))
+                .unwrap(),
             direction: Direction::Buy,
         };
         executor.place_market_order(order1).await.unwrap();
@@ -819,7 +825,8 @@ mod tests {
         // Place second order - cache should be expired, so asset API called again
         let order2 = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ExactDecimal::parse("50").unwrap()))
+                .unwrap(),
             direction: Direction::Buy,
         };
         executor.place_market_order(order2).await.unwrap();

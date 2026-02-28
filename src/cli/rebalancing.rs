@@ -535,9 +535,8 @@ fn format_tokenization_request<Writer: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
-    use rust_decimal::Decimal;
+    use st0x_exact_decimal::ExactDecimal;
     use std::collections::HashMap;
-    use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
 
@@ -592,7 +591,7 @@ mod tests {
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(ExactDecimal::parse("10.5").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
@@ -617,7 +616,7 @@ mod tests {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(ExactDecimal::parse("10.5").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
@@ -641,7 +640,7 @@ mod tests {
     async fn test_transfer_usdc_requires_alpaca_broker() {
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(ExactDecimal::parse("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -664,7 +663,7 @@ mod tests {
     async fn test_transfer_usdc_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(ExactDecimal::parse("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -687,7 +686,7 @@ mod tests {
     async fn test_transfer_usdc_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(ExactDecimal::parse("100").unwrap());
 
         let mut stdout = Vec::new();
         transfer_usdc_command(

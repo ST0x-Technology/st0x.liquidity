@@ -1,0 +1,18 @@
+[package]
+name = "st0x-exact-decimal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy.workspace = true
+rain-math-float.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -115,7 +115,7 @@ impl QueryManifest {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
-    use rust_decimal_macros::dec;
+    use st0x_exact_decimal::ExactDecimal;
     use std::collections::HashSet;
     use tokio::sync::{RwLock, broadcast, mpsc};
 
@@ -132,15 +132,19 @@ mod tests {
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
 
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
+
     fn test_trigger_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
             equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
+                target: ed("0.5"),
+                deviation: ed("0.2"),
             },
             usdc: UsdcRebalancing::Enabled {
-                target: dec!(0.6),
-                deviation: dec!(0.15),
+                target: ed("0.6"),
+                deviation: ed("0.15"),
             },
             limits: OperationalLimits::Disabled,
             disabled_assets: HashSet::new(),

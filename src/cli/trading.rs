@@ -4,8 +4,8 @@ use alloy::primitives::TxHash;
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use sqlx::SqlitePool;
+use st0x_exact_decimal::ExactDecimal;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -145,7 +145,9 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: Positive::new(FractionalShares::new(Decimal::from(quantity)))?,
+        shares: Positive::new(FractionalShares::new(ExactDecimal::parse(
+            &quantity.to_string(),
+        )?))?,
         direction,
     };
 
@@ -421,7 +423,7 @@ async fn update_position_aggregate(
 
 fn extract_fill_params(
     onchain_trade: &OnchainTrade,
-) -> Option<(FractionalShares, Decimal, DateTime<Utc>)> {
+) -> Option<(FractionalShares, ExactDecimal, DateTime<Utc>)> {
     let Some(block_timestamp) = onchain_trade.block_timestamp else {
         error!(
             tx_hash = %onchain_trade.tx_hash,

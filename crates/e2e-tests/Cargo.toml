@@ -13,9 +13,7 @@ chrono.workspace = true
 httpmock.workspace = true
 rain-math-float.workspace = true
 rand.workspace = true
-rust_decimal.workspace = true
 serde.workspace = true
-rust_decimal_macros = "1.38.0"
 serde_json.workspace = true
 sqlx.workspace = true
 tempfile = "3.24.0"
@@ -31,6 +29,7 @@ st0x-evm = { workspace = true, features = ["local-signer"] }
 st0x-execution = { path = "../execution", features = ["mock", "test-support"] }
 st0x-hedge = { path = "../..", features = ["test-support"] }
 reqwest.workspace = true
+st0x-exact-decimal = { version = "0.1.0", path = "../exact-decimal" }
 
 [lints]
 workspace = true

@@ -64,9 +64,8 @@ use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::sol;
 use async_trait::async_trait;
 use backon::Retryable;
-use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
+use st0x_exact_decimal::ExactDecimal;
 use tracing::{debug, info, warn};
 
 use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
@@ -299,6 +298,8 @@ pub enum CctpError {
     MessageTooShort { length: usize },
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
+    #[error("Float operation error: {0}")]
+    Float(#[from] rain_math_float::FloatError),
     #[error("Amount too large for fee calculation: {0}")]
     AmountConversion(#[from] alloy::primitives::ruint::FromUintError<u128>),
     #[error("Fast transfer fee not available for {direction:?}")]
@@ -341,7 +342,7 @@ struct FeeEntry {
     /// Finality threshold: 1000 = fast transfer, 2000 = standard transfer
     finality_threshold: u32,
     /// Minimum fee in basis points (1 = 0.01%). May be fractional (e.g., 1.3).
-    minimum_fee: Decimal,
+    minimum_fee: ExactDecimal,
 }
 
 impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
@@ -435,18 +436,18 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             "Retrieved fast transfer fee (bps)"
         );
 
-        // Calculate maxFee: amount * fee_bps / 10000
-        // Using Decimal arithmetic to handle fractional basis points
-        let amount_u128: u128 = amount.try_into()?;
-        let amount_decimal =
-            Decimal::from_u128(amount_u128).ok_or(CctpError::FeeCalculationOverflow)?;
-        let max_fee_decimal = amount_decimal * fast_fee / Decimal::from(10_000);
-        let max_fee_rounded = max_fee_decimal.ceil();
-        let max_fee = U256::from(
-            max_fee_rounded
-                .to_u128()
-                .ok_or(CctpError::FeeCalculationOverflow)?,
-        );
+        // Calculate maxFee: amount * fee_bps / 10000, ceiling
+        let amount_ed = ExactDecimal::from_fixed_decimal(amount, 0)?;
+        let divisor = ExactDecimal::parse("10000").map_err(CctpError::Float)?;
+        let max_fee_ed = ((amount_ed * fast_fee)? / divisor)?;
+
+        // Ceiling: truncate to integer, add 1 if there was a fractional part
+        let (truncated, lossless) = max_fee_ed.to_fixed_decimal_lossy(0)?;
+        let max_fee = if lossless {
+            truncated
+        } else {
+            truncated + U256::from(1)
+        };
 
         Ok(max_fee)
     }
@@ -663,8 +664,6 @@ mod tests {
     use itertools::Itertools;
     use proptest::prelude::*;
     use rand::Rng;
-    use rust_decimal_macros::dec;
-
     use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
 
@@ -2013,7 +2012,7 @@ mod tests {
         let entry: FeeEntry = serde_json::from_str(json).unwrap();
 
         assert_eq!(entry.finality_threshold, 1000);
-        assert_eq!(entry.minimum_fee, dec!(1.3));
+        assert_eq!(entry.minimum_fee, ExactDecimal::parse("1.3").unwrap());
     }
 
     proptest! {
