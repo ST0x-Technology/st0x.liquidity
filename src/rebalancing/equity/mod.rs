@@ -27,7 +27,8 @@ use crate::equity_redemption::{
 };
 use crate::onchain::raindex::{Raindex, RaindexError};
 use crate::tokenization::{
-    AlpacaTokenizationError, TokenizationRequestStatus, Tokenizer, TokenizerError,
+    AlpacaTokenizationError, MintVerificationError, TokenizationRequestStatus, Tokenizer,
+    TokenizerError,
 };
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TOKENIZED_EQUITY_DECIMALS, TokenizationRequestId, TokenizedEquityMint,
@@ -40,6 +41,15 @@ use crate::wrapper::{Wrapper, WrapperError};
 pub(crate) struct Equity {
     pub(crate) symbol: Symbol,
     pub(crate) quantity: FractionalShares,
+}
+
+/// Data extracted from the TokensReceived aggregate state for
+/// onchain verification and subsequent wrapping.
+struct TokensReceivedData {
+    shares_minted: U256,
+    tx_hash: TxHash,
+    symbol: Symbol,
+    wallet: Address,
 }
 
 /// Services shared by both equity transfer aggregates.
@@ -62,6 +72,8 @@ pub(crate) enum MintError {
     Wrapper(#[from] WrapperError),
     #[error("Raindex error: {0}")]
     Raindex(#[from] RaindexError),
+    #[error("Onchain mint verification failed: {0}")]
+    Verification(#[from] MintVerificationError),
     #[error(
         "Entity not found after command: expected {expected_state} \
          for {issuer_request_id}"
@@ -144,12 +156,12 @@ impl CrossVenueEquityTransfer {
         }
     }
 
-    /// Loads the aggregate after Poll and extracts shares_minted from
-    /// the TokensReceived state.
-    async fn load_shares_minted(
+    /// Loads the aggregate after Poll and extracts fields from the
+    /// TokensReceived state needed for verification and wrapping.
+    async fn load_tokens_received(
         &self,
         issuer_request_id: &IssuerRequestId,
-    ) -> Result<U256, MintError> {
+    ) -> Result<TokensReceivedData, MintError> {
         let entity = self
             .mint_store
             .load(issuer_request_id)
@@ -160,7 +172,18 @@ impl CrossVenueEquityTransfer {
             })?;
 
         match entity {
-            TokenizedEquityMint::TokensReceived { shares_minted, .. } => Ok(shares_minted),
+            TokenizedEquityMint::TokensReceived {
+                shares_minted,
+                tx_hash,
+                symbol,
+                wallet,
+                ..
+            } => Ok(TokensReceivedData {
+                shares_minted,
+                tx_hash,
+                symbol,
+                wallet,
+            }),
             other => Err(MintError::UnexpectedState {
                 issuer_request_id: issuer_request_id.clone(),
                 expected_state: "TokensReceived",
@@ -239,6 +262,13 @@ impl CrossVenueEquityTransfer {
                     TokenizerError::Alpaca(other) => DetectionFailure::ApiError {
                         status_code: other.status_code().map(|status| status.as_u16()),
                     },
+                    TokenizerError::MintVerification(verification_error) => {
+                        warn!(
+                            %verification_error,
+                            "Unexpected MintVerification error during redemption detection"
+                        );
+                        DetectionFailure::ApiError { status_code: None }
+                    }
                 };
 
                 self.redemption_store
@@ -348,14 +378,33 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
             .await?;
 
-        let shares_minted = self.load_shares_minted(&issuer_request_id).await?;
+        let tokens_received = self.load_tokens_received(&issuer_request_id).await?;
 
-        info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
+        info!(
+            shares_minted = %tokens_received.shares_minted,
+            tx_hash = %tokens_received.tx_hash,
+            "Tokens received, verifying onchain"
+        );
 
-        let wrapped_token = self.wrapper.lookup_wrapped(&symbol)?;
+        let unwrapped_token = self.wrapper.lookup_unwrapped(&tokens_received.symbol)?;
+        self.tokenizer
+            .verify_mint_tx(
+                tokens_received.tx_hash,
+                unwrapped_token,
+                tokens_received.wallet,
+                tokens_received.shares_minted,
+            )
+            .await
+            .inspect_err(|error| {
+                warn!(%error, "Onchain mint verification failed");
+            })?;
+
+        info!("Onchain verification passed, wrapping into ERC-4626 shares");
+
+        let wrapped_token = self.wrapper.lookup_wrapped(&tokens_received.symbol)?;
         let (wrap_tx_hash, wrapped_shares) = self
             .wrapper
-            .to_wrapped(wrapped_token, shares_minted, self.wallet)
+            .to_wrapped(wrapped_token, tokens_received.shares_minted, self.wallet)
             .await?;
 
         self.mint_store
@@ -442,7 +491,9 @@ mod tests {
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
-    use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
+    use crate::tokenization::mock::{
+        MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
+    };
     use crate::wrapper::mock::MockWrapper;
 
     fn mock_services() -> EquityTransferServices {
@@ -675,6 +726,99 @@ mod tests {
         assert!(
             matches!(error, MintError::Raindex(_)),
             "Expected Raindex error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_receipt_not_found() {
+        let tokenizer = MockTokenizer::new()
+            .with_verification_outcome(MockVerificationOutcome::ReceiptNotFound);
+
+        let transfer = create_equity_transfer(
+            Arc::new(tokenizer),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintError::Verification(MintVerificationError::ReceiptNotFound { .. })
+            ),
+            "Expected Verification(ReceiptNotFound) error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_transaction_reverted() {
+        let tokenizer = MockTokenizer::new()
+            .with_verification_outcome(MockVerificationOutcome::TransactionReverted);
+
+        let transfer = create_equity_transfer(
+            Arc::new(tokenizer),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintError::Verification(MintVerificationError::TransactionReverted { .. })
+            ),
+            "Expected Verification(TransactionReverted) error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_no_matching_transfer() {
+        let tokenizer = MockTokenizer::new()
+            .with_verification_outcome(MockVerificationOutcome::NoMatchingTransfer);
+
+        let transfer = create_equity_transfer(
+            Arc::new(tokenizer),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintError::Verification(MintVerificationError::NoMatchingTransfer { .. })
+            ),
+            "Expected Verification(NoMatchingTransfer) error, got: {error:?}"
         );
     }
 }

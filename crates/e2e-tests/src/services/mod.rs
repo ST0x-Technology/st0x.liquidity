@@ -107,6 +107,15 @@ impl TestInfra<()> {
             REDEMPTION_WALLET,
             token_symbols,
         )?;
+
+        // Map symbol -> underlying token address so the mint executor can
+        // transfer real ERC-20 tokens on Anvil when a mint request completes.
+        let mint_token_addresses: HashMap<String, Address> = equity_addresses
+            .iter()
+            .map(|(symbol, _vault_addr, underlying_addr)| (symbol.clone(), *underlying_addr))
+            .collect();
+        tokenization_service.start_mint_executor(base_chain.provider.clone(), mint_token_addresses);
+
         let attestation_service = CctpAttestationMock::start().await;
 
         Ok(TestInfra {
