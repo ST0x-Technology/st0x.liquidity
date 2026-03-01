@@ -24,6 +24,37 @@ use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 pub(crate) enum TokenizerError {
     #[error(transparent)]
     Alpaca(#[from] AlpacaTokenizationError),
+    #[error(transparent)]
+    MintVerification(#[from] MintVerificationError),
+}
+
+/// Errors from verifying a mint transaction onchain.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MintVerificationError {
+    #[error("Transaction receipt not found for {tx_hash}")]
+    ReceiptNotFound { tx_hash: TxHash },
+    #[error("Transaction {tx_hash} reverted")]
+    TransactionReverted { tx_hash: TxHash },
+    #[error(
+        "No matching ERC20 Transfer event in tx {tx_hash} \
+         to wallet {wallet} for token {token}"
+    )]
+    NoMatchingTransfer {
+        tx_hash: TxHash,
+        wallet: Address,
+        token: Address,
+    },
+    #[error(
+        "Transfer amount insufficient in tx {tx_hash}: \
+         expected {expected}, found {actual}"
+    )]
+    InsufficientTransferAmount {
+        tx_hash: TxHash,
+        expected: U256,
+        actual: U256,
+    },
+    #[error("Provider error during mint verification: {0}")]
+    Provider(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
 }
 
 /// Abstraction for equity tokenization operations.
@@ -69,4 +100,17 @@ pub(crate) trait Tokenizer: Send + Sync {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError>;
+
+    /// Verify that a mint transaction landed onchain.
+    ///
+    /// Checks that the transaction receipt exists and was not reverted,
+    /// then parses Transfer event logs to confirm the expected tokens
+    /// were transferred to the destination wallet.
+    async fn verify_mint_tx(
+        &self,
+        tx_hash: TxHash,
+        token_address: Address,
+        wallet: Address,
+        expected_amount: U256,
+    ) -> Result<(), MintVerificationError>;
 }

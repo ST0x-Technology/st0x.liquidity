@@ -249,7 +249,7 @@ fn sample_pending_response(id: &str) -> serde_json::Value {
     })
 }
 
-fn sample_completed_response(id: &str) -> serde_json::Value {
+fn sample_completed_response(id: &str, tx_hash: TxHash) -> serde_json::Value {
     json!({
         "tokenization_request_id": id,
         "type": "mint",
@@ -261,7 +261,7 @@ fn sample_completed_response(id: &str) -> serde_json::Value {
         "network": "base",
         "wallet_address": "0x0000000000000000000000000000000000000000",
         "issuer_request_id": "issuer_123",
-        "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+        "tx_hash": tx_hash,
         "created_at": "2024-01-15T10:30:00Z"
     })
 }
@@ -356,6 +356,7 @@ fn build_equity_transfer_with_wrapper(
     raindex: Arc<dyn crate::onchain::raindex::Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
+    wallet: Address,
 ) -> Arc<CrossVenueEquityTransfer> {
     let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
 
@@ -376,7 +377,7 @@ fn build_equity_transfer_with_wrapper(
         raindex,
         tokenizer,
         wrapper,
-        Address::ZERO,
+        wallet,
         mint_store,
         redemption_store,
     ))
@@ -409,18 +410,56 @@ async fn equity_offchain_imbalance_triggers_mint() {
     })
     .await;
 
-    // Now seed VaultRegistry so the next Position event triggers a real Mint.
-    let token = Address::from_slice(&keccak256(symbol.to_string().as_bytes())[..20]);
-    seed_vault_registry(&pool, &symbol, token).await;
-
     let server = MockServer::start();
     let (_anvil, endpoint, key) = setup_anvil();
+
+    // Deploy a real ERC20 on Anvil so that verify_mint_tx can find the
+    // transaction receipt and confirm the token balance.
+    let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+    let wallet = EthereumWallet::from(signer.clone());
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect(&endpoint)
+        .await
+        .unwrap();
+
+    let token_contract = TestERC20::deploy(&provider).await.unwrap();
+    let token_address = *token_contract.address();
+
+    // The imbalance produces a 30.5 share mint (19 onchain, 80 offchain,
+    // target 49.5). Mint the equivalent amount to the signer's address so
+    // balanceOf passes the verification check.
+    let mint_amount = U256::from(30_500_000_000_000_000_000_u128);
+    let mint_receipt = token_contract
+        .mint(signer.address(), mint_amount)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let mint_tx_hash = mint_receipt.transaction_hash;
+
+    // Seed VaultRegistry so the next Position event triggers a real Mint.
+    seed_vault_registry(&pool, &symbol, token_address).await;
+
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-    let equity_transfer =
-        build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, MockWrapper::new());
+
+    // Configure MockWrapper to return the real TestERC20 address for
+    // lookup_unwrapped so that verify_mint_tx checks the correct contract.
+    let mock_wrapper = MockWrapper::new().with_unwrapped_token(token_address);
+    let equity_transfer = build_equity_transfer_with_wrapper(
+        &pool,
+        raindex,
+        tokenizer,
+        mock_wrapper,
+        signer.address(),
+    );
+
+    let wallet_hex = format!("{:#x}", signer.address());
 
     // json_body_partial acts as an implicit assertion: the mock only matches if
     // the request contains these exact fields. mint_mock.assert() below then
@@ -428,7 +467,14 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let mint_mock = server.mock(|when, then| {
         when.method(POST)
             .path(tokenization_mint_path())
-            .json_body_partial(r#"{"underlying_symbol":"AAPL","qty":"30.500000000","wallet_address":"0x0000000000000000000000000000000000000000"}"#);
+            .json_body_partial(
+                json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "30.500000000",
+                    "wallet_address": wallet_hex,
+                })
+                .to_string(),
+            );
         then.status(200)
             .header("content-type", "application/json")
             .json_body(sample_pending_response("mint_int_test"));
@@ -438,7 +484,10 @@ async fn equity_offchain_imbalance_triggers_mint() {
         when.method(GET).path(tokenization_requests_path());
         then.status(200)
             .header("content-type", "application/json")
-            .json_body(json!([sample_completed_response("mint_int_test")]));
+            .json_body(json!([sample_completed_response(
+                "mint_int_test",
+                mint_tx_hash
+            )]));
     });
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -630,7 +679,8 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new().with_token(token_address));
     let wrapper = MockWrapper::new().with_unwrapped_token(token_address);
-    let equity_transfer = build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper);
+    let equity_transfer =
+        build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper, Address::ZERO);
 
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
@@ -974,8 +1024,13 @@ async fn mint_api_failure_produces_rejected_event() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-    let equity_transfer =
-        build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, MockWrapper::new());
+    let equity_transfer = build_equity_transfer_with_wrapper(
+        &pool,
+        raindex,
+        tokenizer,
+        MockWrapper::new(),
+        Address::ZERO,
+    );
 
     // Mock returns HTTP 500 for the mint request
     let mint_mock = server.mock(|when, then| {
