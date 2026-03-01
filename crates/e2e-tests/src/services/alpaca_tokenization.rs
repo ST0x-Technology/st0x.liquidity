@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use alloy::primitives::utils::parse_units;
 use alloy::primitives::{Address, U256, address};
 use alloy::providers::Provider;
 use alloy::sol;
@@ -21,11 +22,13 @@ use chrono::Utc;
 use httpmock::prelude::*;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use tracing::warn;
 use uuid::Uuid;
 
 use st0x_execution::FractionalShares;
 
 use super::alpaca_broker::TEST_ACCOUNT_ID;
+use super::base_chain::DeployableERC20;
 
 sol! {
     #[sol(all_derives = true)]
@@ -49,6 +52,11 @@ struct MockTokenizationRequest {
     request_type: String,
     /// Transaction hash (for redemption detection).
     tx_hash: String,
+    /// Whether the background mint executor still needs to run the onchain
+    /// transfer. Set to `true` when `poll_count` crosses the threshold for
+    /// mint requests; the mint executor clears it after executing a real
+    /// ERC-20 transfer and recording the tx hash.
+    needs_mint_execution: bool,
 }
 
 struct TokenizationState {
@@ -74,11 +82,15 @@ pub struct MockTokenizationRequestSnapshot {
 pub struct AlpacaTokenizationMock {
     state: Arc<Mutex<TokenizationState>>,
     redemption_watcher: Option<JoinHandle<()>>,
+    mint_executor: Option<JoinHandle<()>>,
 }
 
 impl Drop for AlpacaTokenizationMock {
     fn drop(&mut self) {
         if let Some(handle) = self.redemption_watcher.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.mint_executor.take() {
             handle.abort();
         }
     }
@@ -99,6 +111,7 @@ impl AlpacaTokenizationMock {
         Self {
             state,
             redemption_watcher: None,
+            mint_executor: None,
         }
     }
 
@@ -191,6 +204,7 @@ impl AlpacaTokenizationMock {
                                 polls_until_complete,
                                 request_type: "redeem".to_string(),
                                 tx_hash: tx_hash_hex,
+                                needs_mint_execution: false,
                             });
                         }
                     }
@@ -201,6 +215,113 @@ impl AlpacaTokenizationMock {
         });
         self.redemption_watcher = Some(handle);
         Ok(())
+    }
+
+    /// Starts a background task that executes real ERC-20 transfers on the
+    /// Anvil chain when mint requests reach the "completed" threshold.
+    ///
+    /// `token_addresses` maps underlying symbol -> token contract address.
+    /// When a mint request has `needs_mint_execution`, this task transfers
+    /// the requested quantity from the chain owner to the bot's wallet,
+    /// records the real tx hash, and marks the request as completed.
+    pub fn start_mint_executor<P: Provider + Clone + Send + Sync + 'static>(
+        &mut self,
+        provider: P,
+        token_addresses: HashMap<String, Address>,
+    ) {
+        let state = self.state.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Collect pending mints that need onchain execution.
+                let pending_mints: Vec<(usize, String, String, Address)> = {
+                    let mut guard = lock(&state);
+                    let mut valid = Vec::new();
+
+                    for (idx, req) in guard.requests.iter().enumerate() {
+                        if !req.needs_mint_execution {
+                            continue;
+                        }
+
+                        match token_addresses.get(&req.underlying_symbol) {
+                            Some(token_addr) => {
+                                valid.push((
+                                    idx,
+                                    req.qty.clone(),
+                                    req.wallet_address.clone(),
+                                    *token_addr,
+                                ));
+                            }
+                            None => {
+                                warn!(
+                                    symbol = %req.underlying_symbol,
+                                    wallet = %req.wallet_address,
+                                    idx,
+                                    "unknown symbol in mint request, marking as failed"
+                                );
+                            }
+                        }
+                    }
+
+                    // Mark unknown-symbol requests as failed so they don't
+                    // spin forever with needs_mint_execution = true.
+                    for (_idx, req) in guard.requests.iter_mut().enumerate() {
+                        if req.needs_mint_execution
+                            && !token_addresses.contains_key(&req.underlying_symbol)
+                        {
+                            req.needs_mint_execution = false;
+                            req.status = "failed".to_string();
+                        }
+                    }
+
+                    drop(guard);
+                    valid
+                };
+
+                for (idx, qty_str, wallet_str, token_addr) in pending_mints {
+                    // Parse wallet address from the request
+                    let Ok(wallet) = wallet_str.parse::<Address>() else {
+                        warn!(%wallet_str, %qty_str, %token_addr, "invalid wallet address, skipping mint");
+                        continue;
+                    };
+
+                    // Convert decimal qty string to U256 with 18 decimals
+                    let Ok(amount_signed) = parse_units(&qty_str, 18) else {
+                        warn!(%wallet_str, %qty_str, %token_addr, "failed to parse qty as 18-decimal units, skipping mint");
+                        continue;
+                    };
+                    let amount: U256 = amount_signed.into();
+
+                    // Execute real ERC-20 transfer on Anvil
+                    let token = DeployableERC20::new(token_addr, &provider);
+                    let Ok(pending_tx) = token.transfer(wallet, amount).send().await else {
+                        warn!(%wallet, %amount, %token_addr, "ERC-20 transfer send failed, skipping mint");
+                        continue;
+                    };
+                    let Ok(receipt) = pending_tx.get_receipt().await else {
+                        warn!(%token_addr, "failed to get transfer receipt, skipping mint");
+                        continue;
+                    };
+
+                    let real_tx_hash = format!("{:#x}", receipt.transaction_hash);
+
+                    let mut guard = lock(&state);
+                    if let Some(req) = guard.requests.get_mut(idx) {
+                        req.tx_hash = real_tx_hash;
+                        if receipt.status() {
+                            req.status = "completed".to_string();
+                        } else {
+                            warn!(%token_addr, "mint transfer reverted on-chain");
+                            req.status = "failed".to_string();
+                        }
+                        req.needs_mint_execution = false;
+                    }
+                }
+            }
+        });
+        self.mint_executor = Some(handle);
     }
 
     /// Returns a snapshot of all tokenization requests (mint + redeem).
@@ -280,6 +401,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                     polls_until_complete,
                     request_type: "mint".to_string(),
                     tx_hash: String::new(),
+                    needs_mint_execution: false,
                 });
             }
 
@@ -327,10 +449,17 @@ fn register_tokenization_requests_with_filter_endpoint(
                 let mut state = lock(&state);
 
                 for req in &mut state.requests {
-                    if req.status == "pending" {
+                    if req.status == "pending" && !req.needs_mint_execution {
                         req.poll_count += 1;
                         if req.poll_count >= req.polls_until_complete {
-                            req.status = "completed".to_string();
+                            if req.request_type == "mint" {
+                                // Mint requests need a real onchain transfer
+                                // before they can report as "completed".
+                                // The background mint executor will handle it.
+                                req.needs_mint_execution = true;
+                            } else {
+                                req.status = "completed".to_string();
+                            }
                         }
                     }
                 }
@@ -350,13 +479,7 @@ fn register_tokenization_requests_with_filter_endpoint(
 
 /// Converts a `MockTokenizationRequest` to its JSON representation.
 fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
-    // Completed requests include a tx_hash. For mints, generate a fake one
-    // if the request didn't already have one (from redemption detection).
-    let tx_hash = if request.status == "completed" && request.tx_hash.is_empty() {
-        format!("0x{}", "ab".repeat(32))
-    } else {
-        request.tx_hash.clone()
-    };
+    let tx_hash = request.tx_hash.clone();
 
     json!({
         "tokenization_request_id": request.tokenization_request_id,
