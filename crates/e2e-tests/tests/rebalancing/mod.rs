@@ -68,10 +68,12 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
 
     tokio::time::sleep(Duration::from_secs(8)).await;
 
+    // Submit all takes rapidly so all fills are processed before the
+    // inventory poll triggers a mint. Using a taker account avoids
+    // nonce collisions with the bot.
     let mut take_results = Vec::new();
     for prepared in &prepared_orders {
         take_results.push(infra.base_chain.take_prepared_order(prepared).await?);
-        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
     poll_for_events_with_timeout(
@@ -170,11 +172,12 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     // Let bot finish coordination before submitting takes.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Take orders from taker account (separate nonces).
+    // Submit all takes rapidly so all fills are processed before the
+    // inventory poll triggers a mint. Using a taker account avoids
+    // nonce collisions with the bot.
     let mut take_results = Vec::new();
     for prepared in &prepared_orders {
         take_results.push(infra.base_chain.take_prepared_order(prepared).await?);
-        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
     poll_for_events_with_timeout(

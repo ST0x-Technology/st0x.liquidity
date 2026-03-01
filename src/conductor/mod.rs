@@ -1184,7 +1184,10 @@ async fn place_offchain_order(
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     let offchain_order_id = OffchainOrderId::new();
 
-    execute_place_offchain_order(execution, cqrs, offchain_order_id).await;
+    if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await {
+        return Ok(None);
+    }
+
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
     let aggregate = cqrs.offchain_order.load(&offchain_order_id).await;
@@ -1228,11 +1231,13 @@ async fn execute_fail_offchain_order_position(
     }
 }
 
+/// Returns `true` if the Position aggregate accepted the order, `false` if it
+/// was rejected (e.g. already has a pending execution).
 async fn execute_place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
-) {
+) -> bool {
     let command = PositionCommand::PlaceOffChainOrder {
         offchain_order_id,
         shares: execution.shares,
@@ -1242,16 +1247,22 @@ async fn execute_place_offchain_order(
     };
 
     match cqrs.position.send(&execution.symbol, command).await {
-        Ok(()) => info!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "Position::PlaceOffChainOrder succeeded"
-        ),
-        Err(error) => error!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "Position::PlaceOffChainOrder failed: {error}"
-        ),
+        Ok(()) => {
+            info!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Position::PlaceOffChainOrder succeeded"
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Position::PlaceOffChainOrder rejected: {error}"
+            );
+            false
+        }
     }
 }
 
@@ -1362,18 +1373,21 @@ where
             threshold: *threshold,
         };
 
-        match position.send(&execution.symbol, command).await {
-            Ok(()) => info!(
+        if let Err(error) = position.send(&execution.symbol, command).await {
+            warn!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder succeeded"
-            ),
-            Err(error) => error!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder failed: {error}"
-            ),
+                "Position::PlaceOffChainOrder rejected (likely pending execution), \
+                 skipping OffchainOrder creation: {error}"
+            );
+            continue;
         }
+
+        info!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            "Position::PlaceOffChainOrder succeeded"
+        );
 
         let command = OffchainOrderCommand::Place {
             symbol: execution.symbol.clone(),
