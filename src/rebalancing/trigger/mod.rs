@@ -665,6 +665,7 @@ impl Reactor for RebalancingTrigger {
                 drop(inventory);
 
                 self.check_and_trigger_equity(&symbol).await?;
+                self.check_and_trigger_usdc().await;
 
                 Ok::<(), RebalancingTriggerError>(())
             })
@@ -4269,5 +4270,45 @@ mod tests {
         .unwrap();
 
         assert_eq!(wallet.address(), expected_address);
+    }
+
+    #[tokio::test]
+    async fn position_fill_triggers_usdc_rebalancing_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Pre-fill: 2000 onchain, 2000 offchain (balanced at 50%).
+        // Onchain buy of 10 shares at $150 = $1500 USDC spent onchain.
+        // Post-fill: 500 onchain, 2000 offchain = 20% ratio.
+        // With target 50%, deviation 20%, lower bound 30%.
+        // 20% < 30% -> should trigger USDC rebalancing (AlpacaToBase).
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(usdc(2000), usdc(2000));
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        let event = make_onchain_fill(shares(10), Direction::Buy);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let mut operations = Vec::new();
+        while let Ok(operation) = receiver.try_recv() {
+            operations.push(operation);
+        }
+
+        // Onchain buy spends USDC onchain, making the onchain ratio drop below
+        // the lower bound. The system should move USDC from Alpaca to Base.
+        operations
+            .iter()
+            .find(|op| matches!(op, TriggeredOperation::UsdcAlpacaToBase { .. }))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected UsdcAlpacaToBase (onchain USDC too low after buy), \
+                     got operations: {operations:?}"
+                )
+            });
     }
 }
