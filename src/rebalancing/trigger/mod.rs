@@ -687,6 +687,7 @@ impl Reactor for RebalancingTrigger {
                 drop(inventory);
 
                 self.check_and_trigger_equity(&symbol).await?;
+                self.check_and_trigger_usdc().await;
 
                 Ok::<(), RebalancingTriggerError>(())
             })
@@ -1079,8 +1080,12 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
     use chrono::Utc;
+    use httpmock::MockServer;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
@@ -1088,12 +1093,22 @@ mod tests {
     use st0x_execution::{Direction, ExecutorOrderId, Positive};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
+    use std::sync::LazyLock;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
 
     use super::*;
+
+    /// RSA private key generated at test time for Fireblocks JWT
+    /// signing. The mock server does not validate signatures.
+    static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        pem.as_bytes().to_vec()
+    });
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::config::{CashAssetConfig, EquitiesConfig, OperationMode};
     use crate::equity_redemption::DetectionFailure;
@@ -4248,5 +4263,130 @@ mod tests {
             logs_contain("Triggered equity rebalancing"),
             "Should trigger rebalancing once both venues have data"
         );
+    }
+
+    #[tokio::test]
+    async fn build_wallet_returns_missing_chain_asset_id_for_unknown_chain() {
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new(0),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: None,
+        };
+
+        let error = RebalancingCtx::build_wallet(
+            &config,
+            &FireblocksApiUserId::new("test-user"),
+            b"fake-rsa-key",
+            rpc_url,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::MissingChainAssetId { chain_id: 31337 }
+            ),
+            "Expected MissingChainAssetId for Anvil's default chain 31337, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_wallet_resolves_address_from_fireblocks() {
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+        let server = MockServer::start();
+        let expected_address = address!("0x1111111111111111111111111111111111111111");
+
+        server.mock(|when, then| {
+            when.method("GET")
+                .path("/vault/accounts/0/ETH/addresses_paginated");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "addresses": [{
+                        "assetId": "ETH",
+                        "address": expected_address
+                    }]
+                }));
+        });
+
+        // Anvil's default chain ID is 31337
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new(0),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({
+                "31337": "ETH"
+            }))
+            .unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: Some(server.base_url().parse().unwrap()),
+        };
+
+        let wallet = RebalancingCtx::build_wallet(
+            &config,
+            &FireblocksApiUserId::new("test-api-key"),
+            &TEST_RSA_PEM,
+            rpc_url,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(wallet.address(), expected_address);
+    }
+
+    #[tokio::test]
+    async fn position_fill_triggers_usdc_rebalancing_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Pre-fill: 2000 onchain, 2000 offchain (balanced at 50%).
+        // Onchain buy of 10 shares at $150 = $1500 USDC spent onchain.
+        // Post-fill: 500 onchain, 2000 offchain = 20% ratio.
+        // With target 50%, deviation 20%, lower bound 30%.
+        // 20% < 30% -> should trigger USDC rebalancing (AlpacaToBase).
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(usdc(2000), usdc(2000));
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        let event = make_onchain_fill(shares(10), Direction::Buy);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let mut operations = Vec::new();
+        while let Ok(operation) = receiver.try_recv() {
+            operations.push(operation);
+        }
+
+        // Onchain buy spends USDC onchain, making the onchain ratio drop below
+        // the lower bound. The system should move USDC from Alpaca to Base.
+        operations
+            .iter()
+            .find(|op| matches!(op, TriggeredOperation::UsdcAlpacaToBase { .. }))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected UsdcAlpacaToBase (onchain USDC too low after buy), \
+                     got operations: {operations:?}"
+                )
+            });
     }
 }
