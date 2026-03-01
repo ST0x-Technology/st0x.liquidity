@@ -347,7 +347,6 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 /// Run explicitly when validating the decimal-normalization fix:
 /// `cargo test -p e2e-tests --test rebalancing -- --ignored --nocapture \
 ///   equity_redemption_buy_inv_repeating_reciprocal_regression`
-#[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
 #[test_log::test(tokio::test)]
 async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::Result<()> {
     let onchain_price = ed("115");
@@ -452,7 +451,6 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
 /// This uses the same rebalancing redemption setup as the `inv(price)` repro
 /// but replaces the generated Rainlang expression with a direct reciprocal
 /// string, matching the old harness path.
-#[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
 #[test_log::test(tokio::test)]
 async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result<()> {
     let onchain_price = ed("112");

@@ -850,12 +850,17 @@ impl RebalancingTrigger {
                 TransferOp::Cancel,
                 quantity,
             )),
-            TokensReceived { received_at, .. } => {
+            TokensReceived { .. } => {
                 // Compose TransferOp::Complete with with_last_rebalancing so that the
                 // staleness guard is active the instant inflight is cleared. Without this,
                 // a stale snapshot fetched before the mint could slip through between
                 // inflight clearing and DepositedIntoRaindex.
-                let received_at = *received_at;
+                //
+                // Uses Utc::now() (wall-clock) instead of the block timestamp because
+                // the staleness guard compares against snapshot fetched_at which is also
+                // wall-clock. On Anvil, block timestamps can lag behind wall-clock,
+                // allowing stale snapshots to slip through.
+                let now = Utc::now();
                 let composed: Box<
                     dyn FnOnce(
                             Inventory<FractionalShares>,
@@ -866,13 +871,11 @@ impl RebalancingTrigger {
                         Inventory::transfer(Venue::Hedging, TransferOp::Complete, quantity)(
                             inventory,
                         )?;
-                    Inventory::with_last_rebalancing(received_at)(transferred)
+                    Inventory::with_last_rebalancing(now)(transferred)
                 });
                 Some(composed)
             }
-            DepositedIntoRaindex { deposited_at, .. } => {
-                Some(Inventory::with_last_rebalancing(*deposited_at))
-            }
+            DepositedIntoRaindex { .. } => Some(Inventory::with_last_rebalancing(Utc::now())),
             MintRequested { .. }
             | MintRejected { .. }
             | TokensWrapped { .. }
@@ -925,8 +928,8 @@ impl RebalancingTrigger {
                 quantity,
             )),
 
-            Completed { completed_at } => {
-                let completed_at = *completed_at;
+            Completed { .. } => {
+                let now = Utc::now();
                 let composed: Box<
                     dyn FnOnce(
                             Inventory<FractionalShares>,
@@ -937,7 +940,7 @@ impl RebalancingTrigger {
                         Inventory::transfer(Venue::MarketMaking, TransferOp::Complete, quantity)(
                             inventory,
                         )?;
-                    Inventory::with_last_rebalancing(completed_at)(transferred)
+                    Inventory::with_last_rebalancing(now)(transferred)
                 });
                 Some(composed)
             }

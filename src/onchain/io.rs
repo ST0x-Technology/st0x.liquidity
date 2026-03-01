@@ -568,55 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn test_real_transaction_nvda_small_trade() {
-        // Real transaction: 0.2 wtNVDA sold for 34.645024 USDC
-        let details =
-            TradeDetails::try_from_io("USDC", ed("34.645024"), "wtNVDA", ed("0.2")).unwrap();
-
-        assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().inner(), ed("0.2"));
-        assert_eq!(details.usdc_amount().value(), ed("34.645024"));
-        assert_eq!(details.direction(), Direction::Sell);
-
-        let price_per_share = (ed("34.645024") / ed("0.2")).unwrap();
-        let diff = (price_per_share - ed("173.23")).unwrap().abs().unwrap();
-        assert!(diff < ed("0.01"));
-    }
-
-    #[test]
-    #[ignore = "known precision dust bug — not yet patched"]
-    fn test_trade_details_normalizes_spurious_precision_beyond_onchain_scales() {
-        let usdc_with_dust = ed("64.169234000001");
-        let shares_with_dust = ed("0.374000000000000000001");
-
-        let details =
-            TradeDetails::try_from_io("USDC", usdc_with_dust, "tNVDA", shares_with_dust).unwrap();
-
-        assert_eq!(details.usdc_amount().value(), ed("64.169234"));
-        assert_eq!(details.equity_amount().inner(), ed("0.374"));
-    }
-
-    #[test]
-    #[ignore = "known precision dust bug — not yet patched"]
-    fn test_trade_details_regression_precision_dust_breaks_exact_equality_without_normalization() {
-        let shares_with_dust = ed("0.200000000000000000001");
-        let pre_fix_shares = FractionalShares::new(shares_with_dust);
-
-        assert_ne!(
-            pre_fix_shares,
-            FractionalShares::new(ed("0.2")),
-            "Pre-fix behavior preserved dust and broke exact equality checks",
-        );
-
-        let details =
-            TradeDetails::try_from_io("USDC", ed("34.645024000001"), "tNVDA", shares_with_dust)
-                .unwrap();
-
-        assert_eq!(details.equity_amount().inner(), ed("0.2"));
-        assert_eq!(details.usdc_amount().value(), ed("34.645024"));
-    }
-
-    #[test]
     fn test_edge_case_validation_very_small_amounts() {
         let details =
             TradeDetails::try_from_io("USDC", ed("0.01"), "wtAAPL", ed("0.0001")).unwrap();

@@ -801,7 +801,7 @@ fn apply_happy_path_fill(
     let qty = ExactDecimal::parse(&qty_str)
         .unwrap_or_else(|_| panic!("order {order_id} has invalid qty '{qty_str}' in mock state"));
     let symbol_key = Symbol::force_new(symbol);
-    let cost = (qty * fill_price)?;
+    let cost = (qty * fill_price)?.round_dp(2)?;
 
     if let Some(order) = state.orders.get_mut(order_id) {
         order.status = "filled".to_string();

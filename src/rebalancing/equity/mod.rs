@@ -750,7 +750,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(ed("100.0")),
             },
         )
         .await
@@ -781,7 +781,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(ed("100.0")),
             },
         )
         .await
@@ -812,7 +812,7 @@ mod tests {
             &transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(dec!(100.0)),
+                quantity: FractionalShares::new(ed("100.0")),
             },
         )
         .await
