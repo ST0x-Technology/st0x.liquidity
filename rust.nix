@@ -112,7 +112,7 @@ in {
     preBuild = sqlxSetup;
     nativeCheckInputs = sol-build-inputs;
     doCheck = true;
-    cargoTestExtraArgs = "--workspace";
+    cargoTestExtraArgs = "--workspace --all-targets --all-features";
 
     meta = {
       description = "st0x liquidity market making system";
