@@ -112,6 +112,7 @@ in {
     preBuild = sqlxSetup;
     nativeCheckInputs = sol-build-inputs;
     doCheck = true;
+    cargoTestExtraArgs = "--workspace";
 
     meta = {
       description = "st0x liquidity market making system";
@@ -123,6 +124,6 @@ in {
   clippy = craneLib.cargoClippy (commonArgs // {
     inherit cargoArtifacts;
     preBuild = sqlxSetup;
-    cargoClippyExtraArgs = "--all-targets --all-features -- -D clippy::all";
+    cargoClippyExtraArgs = "--workspace --all-targets --all-features";
   });
 }
