@@ -229,12 +229,16 @@ mod tests {
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
-    use rust_decimal_macros::dec;
     use serde_json::json;
     use url::Url;
 
     use st0x_evm::ReadOnlyEvm;
+    use st0x_exact_decimal::ExactDecimal;
     use st0x_execution::FractionalShares;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -391,7 +395,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
@@ -475,7 +479,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
@@ -829,7 +833,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
@@ -983,7 +987,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
     }
 
     #[tokio::test]
@@ -1131,7 +1135,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
     }
 
     fn create_after_clear_log_data() -> (Vec<B256>, Bytes) {
@@ -1203,7 +1207,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
     }
@@ -1281,7 +1285,7 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
     }
 
     #[tokio::test]
@@ -1568,6 +1572,6 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
+        assert_eq!(trade.amount, FractionalShares::new(ed("9")));
     }
 }

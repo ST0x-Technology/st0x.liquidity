@@ -1,5 +1,6 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
+use st0x_exact_decimal::ExactDecimal;
 
 /// Deserialize orderId from Schwab API as int64 and convert to string for database compatibility.
 ///
@@ -74,7 +75,10 @@ pub(crate) struct ExecutionLeg {
 
 impl OrderStatusResponse {
     /// Weighted average fill price from execution legs.
-    pub(crate) fn price(&self) -> Option<Decimal> {
+    ///
+    /// Internal arithmetic uses `Decimal`; the result is converted to
+    /// `ExactDecimal` at the boundary.
+    pub(crate) fn price(&self) -> Option<ExactDecimal> {
         let activities = self.order_activity_collection.as_ref()?;
 
         let (total_value, total_quantity) = activities
@@ -89,7 +93,8 @@ impl OrderStatusResponse {
             );
 
         if total_quantity > Decimal::ZERO {
-            Some(total_value / total_quantity)
+            let price_decimal = total_value / total_quantity;
+            ExactDecimal::parse(&price_decimal.to_string()).ok()
         } else {
             None
         }
@@ -198,7 +203,10 @@ mod tests {
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(150.25)));
+        assert_eq!(
+            response.price(),
+            Some(ExactDecimal::parse("150.25").unwrap())
+        );
     }
 
     #[test]
@@ -225,7 +233,10 @@ mod tests {
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(150.5)));
+        assert_eq!(
+            response.price(),
+            Some(ExactDecimal::parse("150.5").unwrap())
+        );
     }
 
     #[test]
@@ -252,7 +263,7 @@ mod tests {
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(151.0)));
+        assert_eq!(response.price(), Some(ExactDecimal::parse("151").unwrap()));
     }
 
     #[test]
@@ -288,7 +299,10 @@ mod tests {
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(150.254)));
+        assert_eq!(
+            response.price(),
+            Some(ExactDecimal::parse("150.254").unwrap())
+        );
     }
 
     #[test]
@@ -454,7 +468,10 @@ mod tests {
         );
 
         // Test weighted average: (150 * 100.25 + 50 * 100.75) / 200 = (15037.5 + 5037.5) / 200 = 100.375
-        assert_eq!(response.price(), Some(dec!(100.375)));
+        assert_eq!(
+            response.price(),
+            Some(ExactDecimal::parse("100.375").unwrap())
+        );
     }
 
     #[test]
@@ -549,7 +566,10 @@ mod tests {
         );
 
         // Verify price extraction from orderActivityCollection
-        assert_eq!(parsed.price(), Some(dec!(22.7299)));
+        assert_eq!(
+            parsed.price(),
+            Some(ExactDecimal::parse("22.7299").unwrap())
+        );
     }
 
     #[test]
@@ -659,6 +679,6 @@ mod tests {
         assert_eq!(parsed.filled_quantity.unwrap(), dec!(2.0));
         assert_eq!(parsed.remaining_quantity.unwrap(), dec!(0.0));
 
-        assert_eq!(parsed.price(), Some(dec!(101.0)));
+        assert_eq!(parsed.price(), Some(ExactDecimal::parse("101").unwrap()));
     }
 }

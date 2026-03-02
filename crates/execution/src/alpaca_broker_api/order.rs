@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use st0x_exact_decimal::ExactDecimal;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -180,7 +181,8 @@ where
 {
     let s = String::deserialize(deserializer)?;
     let value: Decimal = s.parse().map_err(serde::de::Error::custom)?;
-    Positive::new(FractionalShares::new(value)).map_err(serde::de::Error::custom)
+    let shares = FractionalShares::from_decimal(value).map_err(serde::de::Error::custom)?;
+    Positive::new(shares).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
@@ -247,7 +249,10 @@ pub(super) async fn get_order_status(
     };
 
     let status = map_broker_status_to_order_status(response.status);
-    let price = response.filled_average_price;
+    let price = response
+        .filled_average_price
+        .map(|decimal| ExactDecimal::parse(&decimal.to_string()))
+        .transpose()?;
 
     if response.status == BrokerOrderStatus::PartiallyFilled {
         debug!(
@@ -429,7 +434,8 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::from_decimal(Decimal::from(100)).unwrap())
+                .unwrap(),
             direction: Direction::Buy,
         };
 
@@ -440,7 +446,10 @@ mod tests {
         mock.assert();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
-        assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
+        assert_eq!(
+            placement.shares.inner(),
+            FractionalShares::from_decimal(Decimal::from(100)).unwrap()
+        );
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -475,7 +484,8 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
+            shares: Positive::new(FractionalShares::from_decimal(Decimal::from(50)).unwrap())
+                .unwrap(),
             direction: Direction::Sell,
         };
 
@@ -486,7 +496,10 @@ mod tests {
         mock.assert();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
-        assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
+        assert_eq!(
+            placement.shares.inner(),
+            FractionalShares::from_decimal(Decimal::from(50)).unwrap()
+        );
         assert_eq!(placement.direction, Direction::Sell);
     }
 
@@ -518,7 +531,10 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
+        assert_eq!(
+            order_update.shares.inner(),
+            FractionalShares::from_decimal(Decimal::from(100)).unwrap()
+        );
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price, None);
@@ -552,10 +568,16 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
+        assert_eq!(
+            order_update.shares.inner(),
+            FractionalShares::from_decimal(Decimal::from(50)).unwrap()
+        );
         assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
-        assert_eq!(order_update.price, Some(dec!(245.67)));
+        assert_eq!(
+            order_update.price,
+            Some(ExactDecimal::parse("245.67").unwrap())
+        );
     }
 
     #[tokio::test]

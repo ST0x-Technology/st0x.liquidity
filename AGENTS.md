@@ -28,7 +28,9 @@ the limit:
 - [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
   `::random()`, mocks, encoding, compile-time macros
 - [docs/cqrs.md](docs/cqrs.md) - Event sourcing with st0x-event-sorcery
-  (EventSourced trait, Store, Projection, testing, cqrs-es internals)
+- [docs/exact-decimal.md](docs/exact-decimal.md) - ExactDecimal type, Float
+  migration, precision-safe financial arithmetic (EventSourced trait, Store,
+  Projection, testing, cqrs-es internals)
 
 **Update at the end:**
 

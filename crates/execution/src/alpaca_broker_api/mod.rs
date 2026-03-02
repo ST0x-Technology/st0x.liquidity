@@ -1,3 +1,4 @@
+use rain_math_float::FloatError;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::fmt;
@@ -139,4 +140,7 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Invalid symbol in position: {0}")]
     InvalidSymbol(#[from] crate::EmptySymbolError),
+
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
 }

@@ -31,6 +31,7 @@ st0x-evm = { workspace = true, features = ["local-signer"] }
 st0x-execution = { path = "../execution", features = ["mock", "test-support"] }
 st0x-hedge = { path = "../..", features = ["test-support"] }
 reqwest.workspace = true
+st0x-exact-decimal = { version = "0.1.0", path = "../exact-decimal" }
 
 [lints]
 workspace = true

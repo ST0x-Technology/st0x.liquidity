@@ -6,7 +6,6 @@
 //! state via the builder — no per-request mock setup needed.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -17,8 +16,8 @@ use alloy::sol_types::SolEvent;
 use bon::bon;
 use chrono::Utc;
 use httpmock::prelude::*;
-use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::Symbol;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -26,6 +25,11 @@ use uuid::Uuid;
 sol! {
     #[sol(all_derives = true)]
     event Transfer(address indexed from, address indexed to, uint256 value);
+}
+
+/// Shorthand for parsing an `ExactDecimal` from a static literal in mock code.
+fn ed(value: &str) -> ExactDecimal {
+    ExactDecimal::parse(value).unwrap_or_else(|_| ExactDecimal::zero())
 }
 
 pub const TEST_ACCOUNT_ID: &str = "904837e3-3b76-47ec-b432-046db621571b";
@@ -48,13 +52,13 @@ pub enum MockMode {
 
 pub struct MockPosition {
     pub symbol: Symbol,
-    pub qty: Decimal,
-    pub market_value: Decimal,
+    pub qty: ExactDecimal,
+    pub market_value: ExactDecimal,
 }
 
 struct MockAccount {
-    cash: Decimal,
-    buying_power: Decimal,
+    cash: ExactDecimal,
+    buying_power: ExactDecimal,
     positions: HashMap<Symbol, MockPosition>,
 }
 
@@ -92,7 +96,7 @@ struct MockWalletTransfer {
 struct MockState {
     account: MockAccount,
     orders: HashMap<String, MockOrder>,
-    symbol_fill_prices: HashMap<Symbol, Decimal>,
+    symbol_fill_prices: HashMap<Symbol, ExactDecimal>,
     mode: MockMode,
     /// Per-symbol fill delays: number of polls before filling.
     /// Symbols without an entry fill immediately in `HappyPath` mode.
@@ -157,7 +161,7 @@ impl AlpacaBrokerMock {
     /// registered. Optionally configure per-symbol fill prices.
     #[builder]
     pub async fn start(
-        symbol_fill_prices: Vec<(Symbol, Decimal)>,
+        symbol_fill_prices: Vec<(Symbol, ExactDecimal)>,
         symbol_positions: Vec<MockPosition>,
     ) -> Self {
         let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -176,8 +180,8 @@ impl AlpacaBrokerMock {
 
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
-                cash: Decimal::from(100_000),
-                buying_power: Decimal::from(100_000),
+                cash: ed("100000"),
+                buying_power: ed("100000"),
                 positions,
             },
             orders: HashMap::new(),
@@ -212,7 +216,7 @@ impl AlpacaBrokerMock {
     }
 
     /// Sets a fill price for a specific symbol.
-    pub fn set_symbol_fill_price(&self, symbol: Symbol, price: Decimal) {
+    pub fn set_symbol_fill_price(&self, symbol: Symbol, price: ExactDecimal) {
         lock(&self.state).symbol_fill_prices.insert(symbol, price);
     }
 
@@ -609,14 +613,23 @@ fn handle_crypto_order(
     qty: &str,
     side: &str,
 ) -> HttpMockResponse {
-    let Ok(qty_dec) = Decimal::from_str(qty) else {
+    let Ok(qty_dec) = ExactDecimal::parse(qty) else {
         return json_response(400, &json!({"message": format!("invalid qty: {qty}")}));
     };
 
-    if side == "buy" {
-        state.account.cash -= qty_dec;
+    let updated_cash = if side == "buy" {
+        state.account.cash - qty_dec
     } else {
-        state.account.cash += qty_dec;
+        state.account.cash + qty_dec
+    };
+    match updated_cash {
+        Ok(cash) => state.account.cash = cash,
+        Err(error) => {
+            return json_response(
+                500,
+                &json!({"message": format!("cash arithmetic error: {error}")}),
+            );
+        }
     }
 
     state.orders.insert(
@@ -692,7 +705,14 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                                 );
                             };
 
-                            apply_happy_path_fill(&mut state, &order_id, fill_price);
+                            if let Err(error) =
+                                apply_happy_path_fill(&mut state, &order_id, fill_price)
+                            {
+                                return json_response(
+                                    500,
+                                    &json!({"message": format!("fill arithmetic error: {error}")}),
+                                );
+                            }
                         }
                     }
                     MockMode::OrderRejected => {
@@ -719,7 +739,14 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                                 );
                             };
 
-                            apply_happy_path_fill(&mut state, &order_id, fill_price);
+                            if let Err(error) =
+                                apply_happy_path_fill(&mut state, &order_id, fill_price)
+                            {
+                                return json_response(
+                                    500,
+                                    &json!({"message": format!("fill arithmetic error: {error}")}),
+                                );
+                            }
                         }
                     }
                     MockMode::PlacementFails => {
@@ -754,22 +781,27 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
 }
 
 /// Transitions a "new" order to "filled" and updates account balances.
-fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price: Decimal) {
+fn apply_happy_path_fill(
+    state: &mut MockState,
+    order_id: &str,
+    fill_price: ExactDecimal,
+) -> Result<(), rain_math_float::FloatError> {
     let should_fill = state
         .orders
         .get(order_id)
         .is_some_and(|o| o.status == "new");
     if !should_fill {
-        return;
+        return Ok(());
     }
 
     let symbol = state.orders[order_id].symbol.clone();
     let qty_str = state.orders[order_id].qty.clone();
     let side = state.orders[order_id].side.clone();
 
-    let qty = Decimal::from_str(&qty_str)
+    let qty = ExactDecimal::parse(&qty_str)
         .unwrap_or_else(|_| panic!("order {order_id} has invalid qty '{qty_str}' in mock state"));
     let symbol_key = Symbol::force_new(symbol);
+    let cost = (qty * fill_price)?.round_dp(2)?;
 
     if let Some(order) = state.orders.get_mut(order_id) {
         order.status = "filled".to_string();
@@ -777,32 +809,34 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price: Deci
     }
 
     if side == "buy" {
-        state.account.cash -= qty * fill_price;
+        state.account.cash = (state.account.cash - cost)?;
         let position = state
             .account
             .positions
             .entry(symbol_key.clone())
             .or_insert_with(|| MockPosition {
                 symbol: symbol_key,
-                qty: Decimal::ZERO,
-                market_value: Decimal::ZERO,
+                qty: ExactDecimal::zero(),
+                market_value: ExactDecimal::zero(),
             });
-        position.qty += qty;
-        position.market_value += qty * fill_price;
+        position.qty = (position.qty + qty)?;
+        position.market_value = (position.market_value + cost)?;
     } else {
-        state.account.cash += qty * fill_price;
+        state.account.cash = (state.account.cash + cost)?;
         let position = state
             .account
             .positions
             .entry(symbol_key.clone())
             .or_insert_with(|| MockPosition {
                 symbol: symbol_key,
-                qty: Decimal::ZERO,
-                market_value: Decimal::ZERO,
+                qty: ExactDecimal::zero(),
+                market_value: ExactDecimal::zero(),
             });
-        position.qty -= qty;
-        position.market_value -= qty * fill_price;
+        position.qty = (position.qty - qty)?;
+        position.market_value = (position.market_value - cost)?;
     }
+
+    Ok(())
 }
 
 fn register_whitelist_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {

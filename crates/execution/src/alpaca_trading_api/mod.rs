@@ -1,3 +1,4 @@
+use rain_math_float::FloatError;
 use thiserror::Error;
 
 mod auth;
@@ -34,6 +35,8 @@ pub enum AlpacaTradingApiError {
     DecimalParse(#[from] rust_decimal::Error),
     #[error("Num parse error: {0}")]
     NumParse(#[from] num_decimal::ParseNumError),
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
     #[error("Notional orders not supported")]
     NotionalOrdersNotSupported,
     #[error("Filled order {order_id} is missing required field: {field}")]

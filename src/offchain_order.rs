@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use st0x_exact_decimal::ExactDecimal;
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -471,7 +471,8 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Dollars(pub Decimal);
+#[serde(transparent)]
+pub struct Dollars(pub ExactDecimal);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OffchainOrderCommand {
@@ -578,11 +579,13 @@ pub enum OffchainOrderError {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestStore, replay};
 
     use super::*;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     fn failing_order_placer() -> Arc<dyn OrderPlacer> {
         struct Failing;
@@ -603,7 +606,7 @@ mod tests {
     fn place_command() -> OffchainOrderCommand {
         OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ed("100"))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
         }
@@ -658,7 +661,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Dollars(dec!(150.00)),
+                    price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -704,8 +707,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price: Dollars(dec!(150.00)),
+                    shares_filled: FractionalShares::new(ed("50")),
+                    avg_price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -725,8 +728,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price: Dollars(dec!(150.00)),
+                    shares_filled: FractionalShares::new(ed("50")),
+                    avg_price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -735,8 +738,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(75)),
-                    avg_price: Dollars(dec!(150.50)),
+                    shares_filled: FractionalShares::new(ed("75")),
+                    avg_price: Dollars(ed("150.50")),
                 },
             )
             .await
@@ -747,7 +750,7 @@ mod tests {
         else {
             panic!("Expected PartiallyFilled state");
         };
-        assert_eq!(shares_filled, FractionalShares::new(dec!(75)));
+        assert_eq!(shares_filled, FractionalShares::new(ed("75")));
     }
 
     #[tokio::test]
@@ -760,7 +763,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Dollars(dec!(150.00)),
+                    price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -780,8 +783,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(75)),
-                    avg_price: Dollars(dec!(150.00)),
+                    shares_filled: FractionalShares::new(ed("75")),
+                    avg_price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -790,7 +793,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Dollars(dec!(150.25)),
+                    price: Dollars(ed("150.25")),
                 },
             )
             .await
@@ -809,7 +812,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Dollars(dec!(150.00)),
+                    price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -830,7 +833,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Dollars(dec!(150.00)),
+                    price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -840,7 +843,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Dollars(dec!(150.00)),
+                    price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -881,8 +884,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price: Dollars(dec!(150.00)),
+                    shares_filled: FractionalShares::new(ed("50")),
+                    avg_price: Dollars(ed("150.00")),
                 },
             )
             .await
@@ -911,7 +914,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Dollars(dec!(150.00)),
+                    price: Dollars(ed("150.00")),
                 },
             )
             .await

@@ -1,7 +1,6 @@
 //! CCTP bridge and recovery CLI commands.
 
 use alloy::primitives::{B256, U256};
-use rust_decimal::Decimal;
 use std::io::Write;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
@@ -77,7 +76,7 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
         CctpChain::Ethereum => CctpChain::Base,
         CctpChain::Base => CctpChain::Ethereum,
     };
-    let amount_display = Decimal::from(amount_u256.to::<u128>()) / Decimal::from(1_000_000u64);
+    let amount_display = st0x_exact_decimal::ExactDecimal::from_fixed_decimal(amount_u256, 6)?;
     writeln!(
         stdout,
         "CCTP Bridge: {from:?} -> {dest:?}, Amount: {amount_display} USDC"
@@ -235,9 +234,8 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
-    use rust_decimal::Decimal;
+    use st0x_exact_decimal::ExactDecimal;
     use std::collections::HashMap;
-    use std::str::FromStr;
     use url::Url;
 
     use st0x_evm::OpenChainErrorRegistry;
@@ -275,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn test_cctp_bridge_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
+        let amount = Some(Usdc(ExactDecimal::parse("100").unwrap()));
 
         let mut stdout = Vec::new();
         let error = cctp_bridge_command::<OpenChainErrorRegistry, _>(

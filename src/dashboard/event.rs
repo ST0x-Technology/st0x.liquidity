@@ -84,6 +84,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::ReactorHarness;
+    use st0x_exact_decimal::ExactDecimal;
 
     use super::*;
     use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
@@ -93,7 +94,7 @@ mod tests {
     fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new(symbol).unwrap(),
-            quantity: quantity.into(),
+            quantity: ExactDecimal::parse(&quantity.to_string()).unwrap(),
             wallet: Address::ZERO,
             requested_at: chrono::Utc::now(),
         }

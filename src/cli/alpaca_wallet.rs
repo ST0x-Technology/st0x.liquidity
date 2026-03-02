@@ -447,7 +447,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
         ConvertDirection::ToUsdc => ConversionDirection::UsdToUsdc,
     };
 
-    let amount_decimal: Decimal = amount.into();
+    let amount_decimal: Decimal = amount.to_string().parse()?;
 
     writeln!(stdout, "   Placing market order...")?;
 
@@ -518,8 +518,8 @@ pub(super) async fn alpaca_journal_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_exact_decimal::ExactDecimal;
     use std::collections::HashMap;
     use url::Url;
     use uuid::uuid;
@@ -535,6 +535,10 @@ mod tests {
     use crate::rebalancing::RebalancingCtx;
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     fn create_ctx_without_alpaca() -> Ctx {
         Ctx {
@@ -617,8 +621,8 @@ mod tests {
             trading_mode: TradingMode::Rebalancing(Box::new(
                 RebalancingCtx::stub()
                     .equity(ImbalanceThreshold {
-                        target: dec!(0.5),
-                        deviation: dec!(0.1),
+                        target: ed("0.5"),
+                        deviation: ed("0.1"),
                     })
                     .usdc(UsdcRebalancing::Disabled)
                     .redemption_wallet(Address::ZERO)
@@ -641,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_deposit_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(100));
+        let amount = Usdc(ed("100"));
 
         let mut stdout = Vec::new();
         let err_msg = alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
@@ -657,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_deposit_writes_amount_to_stdout() {
         let ctx = create_full_alpaca_ctx();
-        let amount = Usdc(dec!(500.50));
+        let amount = Usdc(ed("500.5"));
 
         let mut stdout = Vec::new();
         alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
@@ -666,7 +670,7 @@ mod tests {
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
-            output.contains("500.50 USDC"),
+            output.contains("500.5 USDC"),
             "Expected amount in output, got: {output}"
         );
     }
@@ -674,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_withdraw_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(100));
+        let amount = Usdc(ed("100"));
 
         let mut stdout = Vec::new();
         let err_msg =
@@ -706,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_convert_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(500.50));
+        let amount = Usdc(ed("500.5"));
 
         let mut stdout = Vec::new();
         alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &ctx)
@@ -719,7 +723,7 @@ mod tests {
             "Expected USDC to USD in output, got: {output}"
         );
         assert!(
-            output.contains("500.50 USDC"),
+            output.contains("500.5 USDC"),
             "Expected amount in output, got: {output}"
         );
     }
@@ -727,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_convert_to_usdc_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(250));
+        let amount = Usdc(ed("250"));
 
         let mut stdout = Vec::new();
         alpaca_convert_command(&mut stdout, ConvertDirection::ToUsdc, amount, &ctx)
@@ -746,7 +750,7 @@ mod tests {
         let ctx = create_ctx_without_alpaca();
         let destination = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = Positive::new(FractionalShares::new(dec!(10))).unwrap();
+        let quantity = Positive::new(FractionalShares::new(ed("10"))).unwrap();
 
         let mut stdout = Vec::new();
         let err_msg = alpaca_journal_command(&mut stdout, destination, symbol, quantity, &ctx)
@@ -796,7 +800,7 @@ mod tests {
 
         let destination = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
         let symbol = Symbol::new("TSLA").unwrap();
-        let quantity = Positive::new(FractionalShares::new(dec!(5.5))).unwrap();
+        let quantity = Positive::new(FractionalShares::new(ed("5.5"))).unwrap();
 
         let mut stdout = Vec::new();
         alpaca_journal_command(&mut stdout, destination, symbol, quantity, &ctx)

@@ -242,8 +242,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, Bytes, TxHash, U256, address};
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
+    use st0x_exact_decimal::ExactDecimal;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{Projection, StoreBuilder, test_store};
@@ -258,6 +257,10 @@ mod tests {
     use crate::position::Position;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     struct TestCqrsFrameworks {
         onchain_trade: Arc<Store<OnChainTrade>>,
@@ -332,11 +335,11 @@ mod tests {
         }
     }
 
-    fn test_trade(amount: Decimal, log_index: u64) -> OnchainTrade {
+    fn test_trade(amount: ExactDecimal, log_index: u64) -> OnchainTrade {
         OnchainTradeBuilder::default()
             .with_symbol("wtAAPL")
             .with_amount(amount)
-            .with_price(dec!(150.0))
+            .with_price(ed("150.0"))
             .with_log_index(log_index)
             .build()
     }
@@ -406,7 +409,7 @@ mod tests {
         let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_test_event(&pool, 10).await;
-        let trade = test_trade(0.5, 10);
+        let trade = test_trade(ed("0.5"), 10);
 
         let result = process_queued_trade(
             &MockExecutor::new(),
@@ -433,7 +436,7 @@ mod tests {
 
         assert_eq!(
             position.net.inner(),
-            dec!(0.5),
+            ed("0.5"),
             "Position net should reflect the accumulated trade"
         );
         assert!(
@@ -455,7 +458,7 @@ mod tests {
         let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_test_event(&pool, 20).await;
-        let trade = test_trade(1.5, 20);
+        let trade = test_trade(ed("1.5"), 20);
 
         let result = process_queued_trade(
             &MockExecutor::new(),
@@ -479,7 +482,7 @@ mod tests {
             .unwrap()
             .expect("position should exist");
 
-        assert_eq!(position.net.inner(), dec!(1.5));
+        assert_eq!(position.net.inner(), ed("1.5"));
         assert_eq!(
             position.pending_offchain_order_id,
             Some(offchain_order_id),
@@ -507,7 +510,7 @@ mod tests {
 
         // First trade: 0.5 shares - below threshold
         let (queued_event_1, event_id_1) = enqueue_test_event(&pool, 30).await;
-        let trade_1 = test_trade(0.5, 30);
+        let trade_1 = test_trade(ed("0.5"), 30);
 
         let result_1 = process_queued_trade(
             &MockExecutor::new(),
@@ -527,7 +530,7 @@ mod tests {
 
         // Second trade: 0.7 shares - pushes total to 1.2, above threshold
         let (queued_event_2, event_id_2) = enqueue_test_event(&pool, 31).await;
-        let trade_2 = test_trade(0.7, 31);
+        let trade_2 = test_trade(ed("0.7"), 31);
 
         let result_2 = process_queued_trade(
             &MockExecutor::new(),
@@ -554,7 +557,7 @@ mod tests {
 
         assert_eq!(
             position.net.inner(),
-            dec!(1.2),
+            ed("1.2"),
             "Position should reflect both trades"
         );
     }
@@ -566,7 +569,7 @@ mod tests {
         let cqrs = trade_processing_cqrs(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_test_event(&pool, 40).await;
-        let trade = test_trade(0.1, 40);
+        let trade = test_trade(ed("0.1"), 40);
 
         let unprocessed_before = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(unprocessed_before, 1);

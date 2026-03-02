@@ -9,12 +9,12 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
-use rain_math_float::Float;
-use rust_decimal::Decimal;
+use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use st0x_evm::Evm;
+use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::{Direction, FractionalShares};
 
 use super::pyth::PythPricing;
@@ -148,8 +148,8 @@ pub struct OnchainTrade {
     pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) gas_used: Option<u64>,
     pub(crate) effective_gas_price: Option<u128>,
-    pub(crate) pyth_price: Option<Decimal>,
-    pub(crate) pyth_confidence: Option<Decimal>,
+    pub(crate) pyth_price: Option<ExactDecimal>,
+    pub(crate) pyth_confidence: Option<ExactDecimal>,
     pub(crate) pyth_exponent: Option<i32>,
     pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
 }
@@ -184,10 +184,10 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        let onchain_input_amount = float_to_decimal(fill.input_amount)?;
+        let onchain_input_amount = ExactDecimal::from_raw(fill.input_amount);
         let onchain_input_symbol = cache.get_io_symbol(evm, input).await?;
 
-        let onchain_output_amount = float_to_decimal(fill.output_amount)?;
+        let onchain_output_amount = ExactDecimal::from_raw(fill.output_amount);
         let onchain_output_symbol = cache.get_io_symbol(evm, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -198,15 +198,15 @@ impl OnchainTrade {
             onchain_output_amount,
         )?;
 
-        if trade_details.equity_amount().inner().is_zero() {
+        if trade_details.equity_amount().is_zero() {
             return Ok(None);
         }
 
         // Calculate price per share in USDC (always USDC amount / equity amount)
         let price_per_share_usdc =
-            trade_details.usdc_amount().value() / trade_details.equity_amount().inner();
+            (trade_details.usdc_amount().value() / trade_details.equity_amount().inner())?;
 
-        if price_per_share_usdc <= Decimal::ZERO {
+        if price_per_share_usdc.is_negative()? || price_per_share_usdc.is_zero()? {
             return Ok(None);
         }
 
@@ -363,16 +363,6 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     Ok(None)
 }
 
-/// Converts a Float (bytes32) amount to Decimal.
-///
-/// Uses the rain-math-float library's format() method to convert the Float to
-/// a string, then parses it to Decimal for precision-safe arithmetic.
-fn float_to_decimal(float: B256) -> Result<Decimal, OnChainError> {
-    let float = Float::from_raw(float);
-    let formatted = float.format_with_scientific(false)?;
-    Ok(formatted.parse::<Decimal>()?)
-}
-
 /// Business logic validation errors for trade processing rules.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TradeValidationError {
@@ -416,9 +406,11 @@ pub(crate) enum TradeValidationError {
         clear_log_index: u64,
     },
     #[error("Negative shares amount: {0}")]
-    NegativeShares(Decimal),
+    NegativeShares(ExactDecimal),
     #[error("Negative USDC amount: {0}")]
-    NegativeUsdc(Decimal),
+    NegativeUsdc(ExactDecimal),
+    #[error("Float error: {0}")]
+    Float(#[from] FloatError),
     #[error(
         "symbol '{symbol_provided}' is not a tokenized equity \
          (must have 't' or 'wt' prefix, e.g. tAAPL, wtCOIN)"
@@ -431,7 +423,6 @@ mod tests {
     use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
-    use rust_decimal_macros::dec;
 
     use st0x_evm::ReadOnlyEvm;
 
@@ -440,36 +431,59 @@ mod tests {
     use crate::onchain::EvmCtx;
     use crate::symbol::cache::SymbolCache;
 
+    fn ed(value: &str) -> ExactDecimal {
+        match ExactDecimal::parse(value) {
+            Ok(val) => val,
+            Err(error) => panic!("ed({value:?}) failed: {error}"),
+        }
+    }
+
+    fn float_to_exact_decimal(float: B256) -> ExactDecimal {
+        ExactDecimal::from_raw(float)
+    }
+
     #[test]
     fn test_float_constants_from_v5_interface() {
         // Verify our implementation matches Float constants from LibDecimalFloat.sol
 
-        // FLOAT_ONE = bytes32(uint256(1)) = coefficient=1, exponent=0 → 1.0
+        // FLOAT_ONE = bytes32(uint256(1)) = coefficient=1, exponent=0 -> 1.0
         let float_one = B256::from([
             0x00, 0x00, 0x00, 0x00, // exponent = 0
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x01, // coefficient = 1
         ]);
-        assert!((float_to_decimal(float_one).unwrap() - dec!(1.0)).abs() < dec!(0.000001));
+        let diff = (float_to_exact_decimal(float_one) - ed("1.0"))
+            .unwrap()
+            .abs()
+            .unwrap();
+        assert!(diff < ed("0.000001"));
 
-        // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
+        // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 -> 0.5
         let float_half = B256::from([
             0xff, 0xff, 0xff, 0xff, // exponent = -1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x05, // coefficient = 5
         ]);
-        assert!((float_to_decimal(float_half).unwrap() - dec!(0.5)).abs() < dec!(0.000001));
+        let diff = (float_to_exact_decimal(float_half) - ed("0.5"))
+            .unwrap()
+            .abs()
+            .unwrap();
+        assert!(diff < ed("0.000001"));
 
-        // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
+        // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 -> 2.0
         let float_two = B256::from([
             0x00, 0x00, 0x00, 0x00, // exponent = 0
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x02, // coefficient = 2
         ]);
-        assert!((float_to_decimal(float_two).unwrap() - dec!(2.0)).abs() < dec!(0.000001));
+        let diff = (float_to_exact_decimal(float_two) - ed("2.0"))
+            .unwrap()
+            .abs()
+            .unwrap();
+        assert!(diff < ed("0.000001"));
     }
 
     /// Test with real production event data from tx
@@ -479,14 +493,15 @@ mod tests {
     /// - event.input = amount the order GAVE = 2 tSPLG shares
     /// - event.output = amount the order RECEIVED = ~160 USDC
     #[test]
-    fn test_float_to_decimal_production_event_data() {
+    fn test_float_to_exact_decimal_production_event_data() {
         // event.input Float: 2 shares the order gave
         // Raw bytes: ffffffee00000000000000000000000000000000000000001bc16d674ec80000
         let event_input_float =
             fixed_bytes!("ffffffee00000000000000000000000000000000000000001bc16d674ec80000");
-        let shares_amount = float_to_decimal(event_input_float).unwrap();
+        let shares_amount = float_to_exact_decimal(event_input_float);
+        let diff = (shares_amount - ed("2.0")).unwrap().abs().unwrap();
         assert!(
-            (shares_amount - dec!(2.0)).abs() < dec!(0.000001),
+            diff < ed("0.000001"),
             "Expected 2.0 shares but got {shares_amount}"
         );
 
@@ -494,9 +509,10 @@ mod tests {
         // Raw bytes: ffffffe500000000000000000000000000000002057d2cd516a29b6174400000
         let event_output_float =
             fixed_bytes!("ffffffe500000000000000000000000000000002057d2cd516a29b6174400000");
-        let usdc_amount = float_to_decimal(event_output_float).unwrap();
+        let usdc_amount = float_to_exact_decimal(event_output_float);
+        let diff = (usdc_amount - ed("160.15507752")).unwrap().abs().unwrap();
         assert!(
-            (usdc_amount - dec!(160.155_077_52)).abs() < dec!(0.00001),
+            diff < ed("0.00001"),
             "Expected ~160.15 USDC but got {usdc_amount}"
         );
 
@@ -509,82 +525,99 @@ mod tests {
     }
 
     #[test]
-    fn test_float_to_decimal_edge_cases() {
+    fn test_float_to_exact_decimal_edge_cases() {
         let float_zero = Float::from_fixed_decimal(uint!(0_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_decimal(float_zero).unwrap() - dec!(0.0)).abs() < dec!(0.000001));
+        let diff = (float_to_exact_decimal(float_zero) - ed("0"))
+            .unwrap()
+            .abs()
+            .unwrap();
+        assert!(diff < ed("0.000001"));
 
         let float_one = Float::from_fixed_decimal(uint!(1_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_decimal(float_one).unwrap() - dec!(1.0)).abs() < dec!(0.000001));
+        let diff = (float_to_exact_decimal(float_one) - ed("1"))
+            .unwrap()
+            .abs()
+            .unwrap();
+        assert!(diff < ed("0.000001"));
 
         let float_nine = Float::from_fixed_decimal(uint!(9_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_decimal(float_nine).unwrap();
-        assert!((result - dec!(9.0)).abs() < dec!(0.000001));
+        let result = float_to_exact_decimal(float_nine);
+        let diff = (result - ed("9")).unwrap().abs().unwrap();
+        assert!(diff < ed("0.000001"));
 
         let float_hundred = Float::from_fixed_decimal(uint!(100_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_decimal(float_hundred).unwrap();
-        assert!((result - dec!(100.0)).abs() < dec!(0.000001));
+        let result = float_to_exact_decimal(float_hundred);
+        let diff = (result - ed("100")).unwrap().abs().unwrap();
+        assert!(diff < ed("0.000001"));
 
         let float_half = Float::from_fixed_decimal(uint!(5_U256), 1)
             .unwrap()
             .get_inner();
-        let result = float_to_decimal(float_half).unwrap();
-        assert!((result - dec!(0.5)).abs() < dec!(0.000001));
+        let result = float_to_exact_decimal(float_half);
+        let diff = (result - ed("0.5")).unwrap().abs().unwrap();
+        assert!(diff < ed("0.000001"));
     }
 
     #[test]
-    fn test_float_to_decimal_precision_loss() {
+    fn test_float_to_exact_decimal_large_values() {
         // Test with very large coefficient
         let large_coeff = 1_000_000_000_000_000_i128;
         let float_large = Float::from_fixed_decimal_lossy(U256::from(large_coeff), 0)
             .unwrap()
             .0
             .get_inner();
-        let result = float_to_decimal(float_large).unwrap();
-        assert!((result - dec!(1_000_000_000_000_000.0)).abs() < dec!(1.0));
+        let result = float_to_exact_decimal(float_large);
+        let diff = (result - ed("1000000000000000")).unwrap().abs().unwrap();
+        assert!(diff < ed("1"));
 
         // Test with very small value (high negative exponent)
-        // 1e-50 exceeds Decimal's 28-digit precision, so it truncates to zero
+        // ExactDecimal preserves small values that Decimal truncated to zero
         let float_small = Float::from_fixed_decimal_lossy(uint!(1_U256), 50)
             .unwrap()
             .0
             .get_inner();
-        let result = float_to_decimal(float_small).unwrap();
-        assert_eq!(result, dec!(0.0));
+        let result = float_to_exact_decimal(float_small);
+        let diff = result.abs().unwrap();
+        assert!(diff < ed("0.000001"));
     }
 
     #[test]
-    fn test_float_to_decimal_formatting_edge_cases() {
+    fn test_float_to_exact_decimal_formatting_edge_cases() {
         let float_amount = Float::from_fixed_decimal(uint!(123_456_U256), 6)
             .unwrap()
             .get_inner();
-        let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - dec!(0.123_456)).abs() < dec!(0.000001));
+        let result = float_to_exact_decimal(float_amount);
+        let diff = (result - ed("0.123456")).unwrap().abs().unwrap();
+        assert!(diff < ed("0.000001"));
 
         let float_amount = Float::from_fixed_decimal(uint!(5_U256), 10)
             .unwrap()
             .get_inner();
-        let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - dec!(0.0000000005)).abs() < dec!(0.000000000000001));
+        let result = float_to_exact_decimal(float_amount);
+        let diff = (result - ed("0.0000000005")).unwrap().abs().unwrap();
+        assert!(diff < ed("0.000000000000001"));
 
         let float_amount = Float::from_fixed_decimal(uint!(12_345_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - dec!(12_345.0)).abs() < dec!(0.000001));
+        let result = float_to_exact_decimal(float_amount);
+        let diff = (result - ed("12345")).unwrap().abs().unwrap();
+        assert!(diff < ed("0.000001"));
 
         let float_amount = Float::from_fixed_decimal(uint!(5000_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - dec!(5000.0)).abs() < dec!(0.000001));
+        let result = float_to_exact_decimal(float_amount);
+        let diff = (result - ed("5000")).unwrap().abs().unwrap();
+        assert!(diff < ed("0.000001"));
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ pub(crate) mod mock;
 
 pub(crate) use manager::CrossVenueCashTransfer;
 
-use alloy::primitives::ruint::FromUintError;
+use rain_math_float::FloatError;
 use thiserror::Error;
 
 use st0x_bridge::cctp::CctpError;
@@ -19,7 +19,7 @@ use st0x_execution::{AlpacaBrokerApiError, InvalidSharesError};
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::onchain::raindex::RaindexError;
-use crate::threshold::Usdc;
+use crate::threshold::UsdcConversionError;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcTransferError {
@@ -32,19 +32,17 @@ pub(crate) enum UsdcTransferError {
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] SendError<crate::usdc_rebalance::UsdcRebalance>),
+    Aggregate(Box<SendError<crate::usdc_rebalance::UsdcRebalance>>),
     #[error("Withdrawal failed with terminal status: {status}")]
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]
     DepositFailed { status: String },
-    #[error("USDC amount cannot be negative: {amount}")]
-    NegativeAmount { amount: Usdc },
-    #[error("USDC amount overflow during scaling: {amount}")]
-    ArithmeticOverflow { amount: Usdc },
-    #[error("U256 parse error: {0}")]
-    U256Parse(#[from] alloy::primitives::ruint::ParseError),
-    #[error("U256 to u128 conversion error: {0}")]
-    U256ToU128(#[from] FromUintError<u128>),
+    #[error("USDC conversion error: {0}")]
+    UsdcConversion(#[from] UsdcConversionError),
+    #[error("Float operation error: {0}")]
+    Float(#[from] FloatError),
+    #[error("Decimal parse error: {0}")]
+    DecimalParse(#[from] rust_decimal::Error),
     #[error("Invalid shares: {0}")]
     InvalidShares(#[from] InvalidSharesError),
     #[error(
@@ -52,4 +50,10 @@ pub(crate) enum UsdcTransferError {
          filled_quantity is missing"
     )]
     MissingFilledQuantity { order_id: uuid::Uuid },
+}
+
+impl From<SendError<crate::usdc_rebalance::UsdcRebalance>> for UsdcTransferError {
+    fn from(error: SendError<crate::usdc_rebalance::UsdcRebalance>) -> Self {
+        Self::Aggregate(Box::new(error))
+    }
 }
