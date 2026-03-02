@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{
-    AlpacaTokenizationError, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
-    TokenizerError,
+    AlpacaTokenizationError, MintVerificationError, TokenizationRequest, TokenizationRequestStatus,
+    Tokenizer, TokenizerError,
 };
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
@@ -46,6 +46,15 @@ pub(crate) enum MockCompletionOutcome {
     Pending,
 }
 
+/// Configurable outcome for mint verification.
+#[derive(Clone, Copy)]
+pub(crate) enum MockVerificationOutcome {
+    Success,
+    ReceiptNotFound,
+    TransactionReverted,
+    NoMatchingTransfer,
+}
+
 pub(crate) struct MockTokenizer {
     redemption_wallet: Address,
     redemption_tx: TxHash,
@@ -53,6 +62,7 @@ pub(crate) struct MockTokenizer {
     mint_poll_outcome: MockMintPollOutcome,
     detection_outcome: Option<MockDetectionOutcome>,
     completion_outcome: Option<MockCompletionOutcome>,
+    verification_outcome: MockVerificationOutcome,
     should_fail_send: bool,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
 }
@@ -66,6 +76,7 @@ impl MockTokenizer {
             mint_poll_outcome: MockMintPollOutcome::Completed,
             detection_outcome: None,
             completion_outcome: None,
+            verification_outcome: MockVerificationOutcome::Success,
             should_fail_send: false,
             last_issuer_request_id: Mutex::new(None),
         }
@@ -88,6 +99,11 @@ impl MockTokenizer {
 
     pub(crate) fn with_completion_outcome(mut self, outcome: MockCompletionOutcome) -> Self {
         self.completion_outcome = Some(outcome);
+        self
+    }
+
+    pub(crate) fn with_verification_outcome(mut self, outcome: MockVerificationOutcome) -> Self {
+        self.verification_outcome = outcome;
         self
     }
 
@@ -206,6 +222,31 @@ impl Tokenizer for MockTokenizer {
                 unimplemented!(
                     "MockTokenizer::poll_redemption_until_complete - no outcome configured"
                 )
+            }
+        }
+    }
+
+    async fn verify_mint_tx(
+        &self,
+        tx_hash: TxHash,
+        token_address: Address,
+        wallet: Address,
+        _expected_amount: U256,
+    ) -> Result<(), MintVerificationError> {
+        match self.verification_outcome {
+            MockVerificationOutcome::Success => Ok(()),
+            MockVerificationOutcome::ReceiptNotFound => {
+                Err(MintVerificationError::ReceiptNotFound { tx_hash })
+            }
+            MockVerificationOutcome::TransactionReverted => {
+                Err(MintVerificationError::TransactionReverted { tx_hash })
+            }
+            MockVerificationOutcome::NoMatchingTransfer => {
+                Err(MintVerificationError::NoMatchingTransfer {
+                    tx_hash,
+                    wallet,
+                    token: token_address,
+                })
             }
         }
     }

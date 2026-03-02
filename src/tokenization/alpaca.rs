@@ -24,6 +24,8 @@
 //! 3. Poll until status is `Completed` or `Rejected`
 
 use alloy::primitives::{Address, TxHash, U256};
+use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
@@ -32,12 +34,12 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
 
-use super::{Tokenizer, TokenizerError};
+use super::{MintVerificationError, Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::onchain::io::{OneToOneTokenizedShares, TokenizedSymbol};
@@ -148,6 +150,66 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         self.client
             .list_requests(ListRequestsParams::default())
             .await
+    }
+
+    /// Verify that a mint transaction landed onchain by parsing
+    /// Transfer event logs from the receipt.
+    pub(crate) async fn verify_mint_tx(
+        &self,
+        tx_hash: TxHash,
+        token_address: Address,
+        wallet: Address,
+        expected_amount: U256,
+    ) -> Result<(), MintVerificationError> {
+        let receipt = self
+            .client
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or(MintVerificationError::ReceiptNotFound { tx_hash })?;
+
+        if !receipt.status() {
+            return Err(MintVerificationError::TransactionReverted { tx_hash });
+        }
+
+        info!(%tx_hash, "Mint transaction receipt verified (status: success)");
+
+        // Sum all Transfer events from the token contract to the expected wallet.
+        let total_transferred: U256 = receipt
+            .inner
+            .logs()
+            .iter()
+            .filter(|log| log.address() == token_address)
+            .filter(|log| log.topics().first() == Some(&IERC20::Transfer::SIGNATURE_HASH))
+            .filter_map(|log| log.log_decode::<IERC20::Transfer>().ok())
+            .filter(|decoded| decoded.data().to == wallet)
+            .map(|decoded| decoded.data().value)
+            .fold(U256::ZERO, U256::wrapping_add);
+
+        if total_transferred.is_zero() {
+            return Err(MintVerificationError::NoMatchingTransfer {
+                tx_hash,
+                wallet,
+                token: token_address,
+            });
+        }
+
+        if total_transferred < expected_amount {
+            return Err(MintVerificationError::InsufficientTransferAmount {
+                tx_hash,
+                expected: expected_amount,
+                actual: total_transferred,
+            });
+        }
+
+        info!(
+            %tx_hash,
+            %total_transferred,
+            %expected_amount,
+            "Onchain mint verification passed (Transfer events confirmed)"
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -716,6 +778,16 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
         Ok(Self::poll_redemption_until_complete(self, id).await?)
+    }
+
+    async fn verify_mint_tx(
+        &self,
+        tx_hash: TxHash,
+        token_address: Address,
+        wallet: Address,
+        expected_amount: U256,
+    ) -> Result<(), MintVerificationError> {
+        Self::verify_mint_tx(self, tx_hash, token_address, wallet, expected_amount).await
     }
 }
 
@@ -1565,6 +1637,152 @@ pub(crate) mod tests {
         );
 
         mint_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_verify_mint_tx_no_matching_transfer_event() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let provider = wallet.provider().clone();
+        let token = TestERC20::deploy(&provider).await.unwrap();
+
+        // Mint tokens to the signer (creates a Transfer event from 0x0 -> signer)
+        let mint_amount = U256::from(1_000_000u64);
+        let receipt = token
+            .mint(wallet.address(), mint_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        // Verify with a different token address -- the Transfer event in the
+        // receipt came from the real token contract, not this unrelated address,
+        // so no matching Transfer should be found.
+        let unrelated_token = Address::random();
+        let error = service
+            .verify_mint_tx(
+                receipt.transaction_hash,
+                unrelated_token,
+                wallet.address(),
+                mint_amount,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintVerificationError::NoMatchingTransfer {
+                    token,
+                    ..
+                } if token == unrelated_token
+            ),
+            "Expected NoMatchingTransfer for unrelated token address, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_mint_tx_insufficient_transfer_amount() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let provider = wallet.provider().clone();
+        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token_address = *token.address();
+
+        let mint_amount = U256::from(500u64);
+        let receipt = token
+            .mint(wallet.address(), mint_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        // Expect more than what was actually transferred
+        let expected_amount = U256::from(1_000u64);
+        let error = service
+            .verify_mint_tx(
+                receipt.transaction_hash,
+                token_address,
+                wallet.address(),
+                expected_amount,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintVerificationError::InsufficientTransferAmount {
+                    expected,
+                    actual,
+                    ..
+                } if expected == expected_amount && actual == mint_amount
+            ),
+            "Expected InsufficientTransferAmount, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_mint_tx_success_with_transfer_events() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let provider = wallet.provider().clone();
+        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token_address = *token.address();
+
+        let mint_amount = U256::from(1_000_000u64);
+        let receipt = token
+            .mint(wallet.address(), mint_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        service
+            .verify_mint_tx(
+                receipt.transaction_hash,
+                token_address,
+                wallet.address(),
+                mint_amount,
+            )
+            .await
+            .unwrap();
     }
 
     #[test]
