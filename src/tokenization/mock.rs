@@ -53,7 +53,6 @@ pub(crate) enum MockVerificationOutcome {
     ReceiptNotFound,
     TransactionReverted,
     NoMatchingTransfer,
-    #[allow(dead_code)]
     InsufficientTransferAmount,
 }
 

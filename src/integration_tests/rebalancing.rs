@@ -469,7 +469,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
     // Configure MockWrapper to return the real TestERC20 address for
-    // lookup_unwrapped so that verify_mint_tx checks the correct contract.
+    // lookup_tokenized_equity so that verify_mint_tx checks the correct contract.
     let mock_wrapper = MockWrapper::new().with_unwrapped_token(token_address);
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
