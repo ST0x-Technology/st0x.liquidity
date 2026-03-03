@@ -64,24 +64,24 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        self.get_ratio::<OpenChainErrorRegistry>(asset.tokenized_equity_derivative)
+        self.get_ratio::<OpenChainErrorRegistry>(asset.total_return_derivative)
             .await
     }
 
-    fn lookup_tokenized_equity(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_tokenized_share(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
         let asset = self
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        Ok(asset.tokenized_equity)
+        Ok(asset.tokenized_share)
     }
 
-    fn lookup_tokenized_equity_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_total_return_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
         let asset = self
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        Ok(asset.tokenized_equity_derivative)
+        Ok(asset.total_return_derivative)
     }
 
     async fn to_wrapped(
@@ -212,8 +212,8 @@ mod tests {
 
     fn test_asset_config() -> EquityAssetConfig {
         EquityAssetConfig {
-            tokenized_equity: Address::random(),
-            tokenized_equity_derivative: Address::random(),
+            tokenized_share: Address::random(),
+            total_return_derivative: Address::random(),
             vault_id: None,
             trading: OperationMode::Enabled,
             rebalancing: OperationMode::Disabled,
@@ -231,67 +231,67 @@ mod tests {
     #[test]
     fn lookup_equity_returns_configured_symbol() {
         let config = test_asset_config();
-        let expected_tokenized = config.tokenized_equity;
-        let expected_trd = config.tokenized_equity_derivative;
-        let service = service_with_symbol("AAPL", config);
+        let expected_tokenized = config.tokenized_share;
+        let expected_trd = config.total_return_derivative;
+        let service = service_with_symbol("tAAPL", config);
 
-        let result = service.lookup_equity(&"AAPL".parse().unwrap());
+        let result = service.lookup_equity(&"tAAPL".parse().unwrap());
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().tokenized_equity_derivative, expected_trd);
-        assert_eq!(result.unwrap().tokenized_equity, expected_tokenized);
+        assert_eq!(result.unwrap().total_return_derivative, expected_trd);
+        assert_eq!(result.unwrap().tokenized_share, expected_tokenized);
     }
 
     #[test]
     fn lookup_equity_returns_none_for_unconfigured() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("tAAPL", test_asset_config());
 
-        let result = service.lookup_equity(&"TSLA".parse().unwrap());
+        let result = service.lookup_equity(&"tTSLA".parse().unwrap());
 
         assert!(result.is_none());
     }
 
     #[test]
-    fn lookup_tokenized_equity_derivative_returns_vault_address() {
+    fn lookup_total_return_derivative_returns_vault_address() {
         let config = test_asset_config();
-        let expected = config.tokenized_equity_derivative;
-        let service = service_with_symbol("AAPL", config);
+        let expected = config.total_return_derivative;
+        let service = service_with_symbol("tAAPL", config);
 
         let result = service
-            .lookup_tokenized_equity_derivative(&"AAPL".parse().unwrap())
+            .lookup_total_return_derivative(&"tAAPL".parse().unwrap())
             .unwrap();
 
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn lookup_tokenized_equity_returns_underlying_address() {
+    fn lookup_tokenized_share_returns_underlying_address() {
         let config = test_asset_config();
-        let expected = config.tokenized_equity;
-        let service = service_with_symbol("AAPL", config);
+        let expected = config.tokenized_share;
+        let service = service_with_symbol("tAAPL", config);
 
         let result = service
-            .lookup_tokenized_equity(&"AAPL".parse().unwrap())
+            .lookup_tokenized_share(&"tAAPL".parse().unwrap())
             .unwrap();
 
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn lookup_tokenized_equity_derivative_errors_on_unconfigured_symbol() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+    fn lookup_total_return_derivative_errors_on_unconfigured_symbol() {
+        let service = service_with_symbol("tAAPL", test_asset_config());
 
         let error = service
-            .lookup_tokenized_equity_derivative(&"MSFT".parse().unwrap())
+            .lookup_total_return_derivative(&"tMSFT".parse().unwrap())
             .unwrap_err();
 
         assert!(
             matches!(
                 error,
                 WrapperError::SymbolNotConfigured(ref symbol)
-                    if symbol.to_string() == "MSFT"
+                    if symbol.to_string() == "tMSFT"
             ),
-            "expected SymbolNotConfigured for MSFT, got: {error:?}"
+            "expected SymbolNotConfigured for tMSFT, got: {error:?}"
         );
     }
 
@@ -306,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_ratio_for_symbol_errors_on_unconfigured() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("tAAPL", test_asset_config());
 
         let error = service
             .get_ratio_for_symbol(&"tXYZ".parse().unwrap())

@@ -74,7 +74,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
         base_caller.clone(),
-        ctx.assets.equities.symbols.clone(),
+        ctx.assets.equities.clone(),
     ));
 
     let raindex = Arc::new(RaindexService::new(
@@ -163,14 +163,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let owner = rebalancing_ctx.base_wallet().address();
 
-    let usdc_vault_id = ctx
-        .assets
-        .cash
-        .as_ref()
-        .and_then(|cash| cash.vault_id)
-        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
-
-    writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
+    writeln!(stdout, "   Vault ID: {:?}", rebalancing_ctx.usdc_vault_id)?;
 
     let broker_mode = if alpaca_auth.is_sandbox() {
         AlpacaBrokerApiMode::Sandbox
@@ -232,7 +225,9 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         vault_service,
         usdc_store,
         owner,
-        RaindexVaultId(usdc_vault_id),
+        RaindexVaultId(rebalancing_ctx.usdc_vault_id.ok_or_else(|| {
+            anyhow::anyhow!("USDC vault ID is required for transfer-usdc but not configured")
+        })?),
     );
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
@@ -543,6 +538,7 @@ fn format_tokenization_request<Writer: Write>(
 mod tests {
     use alloy::primitives::{Address, address};
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
@@ -550,7 +546,7 @@ mod tests {
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
+    use crate::config::{AssetsConfig, LogLevel, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -560,6 +556,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -576,7 +573,7 @@ mod tests {
             },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: HashMap::new(),
                 cash: None,
             },
         }

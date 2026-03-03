@@ -5,7 +5,7 @@ mod usdc;
 
 pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::fs;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -23,12 +22,12 @@ use url::Url;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
 use st0x_evm::Wallet;
 use st0x_evm::fireblocks::{
-    ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment,
+    ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment, FireblocksError,
     FireblocksVaultAccountId, FireblocksWallet,
 };
-use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
+use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
-use crate::config::{AssetsConfig, OperationMode};
+use crate::config::OperationalLimits;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
@@ -70,20 +69,22 @@ pub(crate) enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
+    #[error("failed to read Fireblocks secret file: {0}")]
+    FireblocksSecretRead(#[from] std::io::Error),
     #[error(transparent)]
-    Fireblocks(#[from] st0x_evm::fireblocks::FireblocksError),
-    #[error("failed to read Fireblocks secret file at {path:?}")]
-    FireblocksSecretRead {
-        path: PathBuf,
-        #[source]
-        error: std::io::Error,
-    },
-    #[error("missing Fireblocks asset ID for chain ID {chain_id}")]
-    MissingChainAssetId { chain_id: u64 },
+    Fireblocks(#[from] FireblocksError),
     #[error("RPC error during wallet setup: {0}")]
     Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
-    #[error(transparent)]
-    Evm(#[from] st0x_evm::EvmError),
+    #[error("no Fireblocks asset ID configured for chain {chain_id}")]
+    MissingChainAssetId { chain_id: u64 },
+}
+
+/// USDC rebalancing configuration with explicit enable/disable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum UsdcRebalancing {
+    Enabled { target: Decimal, deviation: Decimal },
+    Disabled,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,28 +100,33 @@ pub(crate) struct RebalancingSecrets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
+    pub(crate) usdc_vault_id: Option<B256>,
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
-    pub(crate) fireblocks_environment: FireblocksEnvironment,
     pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
+    pub(crate) fireblocks_environment: FireblocksEnvironment,
+    /// Override the Fireblocks API base URL. When absent, determined
+    /// by `fireblocks_environment`.
+    pub(crate) fireblocks_base_url: Option<Url>,
 }
 
 /// Runtime configuration for rebalancing operations.
 ///
-/// Constructed asynchronously from `RebalancingConfig`,
-/// `RebalancingSecrets`, and broker auth. During construction, Fireblocks
-/// wallets are pre-built for both chains. After construction, all
-/// fields are immutable.
+/// Constructed asynchronously from `RebalancingConfig`, `RebalancingSecrets`,
+/// and broker auth. During construction, Fireblocks wallets are pre-built for
+/// both chains (each resolving the vault address from the Fireblocks API).
+/// After construction, all fields are immutable.
 ///
 /// Read-only provider access for either chain is available via
 /// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
+    pub(crate) usdc_vault_id: Option<B256>,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Pre-built wallet for the base chain (e.g. Base mainnet).
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
@@ -140,47 +146,43 @@ pub(crate) struct RebalancingCtx {
 impl RebalancingCtx {
     /// Construct from config, secrets, and broker auth.
     ///
-    /// Builds Fireblocks wallets for both chains and stores them
-    /// immutably. Read-only provider access for either chain is
-    /// available via `base_wallet().provider()` and
+    /// Reads the Fireblocks RSA secret, builds wallets for both chains
+    /// (resolving the vault address from the Fireblocks API), and
+    /// stores them immutably. Read-only provider access for either
+    /// chain is available via `base_wallet().provider()` and
     /// `ethereum_wallet().provider()`.
     pub(crate) async fn new(
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
-        let fireblocks_secret =
-            fs::read(&secrets.fireblocks_secret_path)
-                .await
-                .map_err(|error| RebalancingCtxError::FireblocksSecretRead {
-                    path: secrets.fireblocks_secret_path.clone(),
-                    error,
-                })?;
+        let fireblocks_secret = tokio::fs::read(&secrets.fireblocks_secret_path).await?;
 
         let (base_wallet, ethereum_wallet) = tokio::try_join!(
             Self::build_wallet(
                 &config,
-                &secrets.fireblocks_api_user_id,
                 &fireblocks_secret,
+                &secrets.fireblocks_api_user_id,
                 secrets.base_rpc_url,
             ),
             Self::build_wallet(
                 &config,
-                &secrets.fireblocks_api_user_id,
                 &fireblocks_secret,
+                &secrets.fireblocks_api_user_id,
                 secrets.ethereum_rpc_url,
             ),
         )?;
 
         info!(
             wallet = %base_wallet.address(),
-            "Initialized Fireblocks wallet"
+            "Resolved market maker wallet from Fireblocks"
         );
 
         Ok(Self {
             equity: config.equity,
             usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
+            usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
             base_wallet: Arc::new(base_wallet),
             ethereum_wallet: Arc::new(ethereum_wallet),
@@ -195,27 +197,31 @@ impl RebalancingCtx {
 
     async fn build_wallet(
         config: &RebalancingConfig,
+        fireblocks_secret: &[u8],
         api_user_id: &FireblocksApiUserId,
-        api_secret: &[u8],
         rpc_url: Url,
     ) -> Result<FireblocksWallet<RootProvider>, RebalancingCtxError> {
         let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
         let chain_id = provider.get_chain_id().await?;
+
         let asset_id = config
             .fireblocks_chain_asset_ids
             .get(chain_id)
             .cloned()
-            .ok_or(RebalancingCtxError::MissingChainAssetId { chain_id })?;
+            .ok_or_else(|| {
+                warn!(chain_id, "No Fireblocks asset ID configured for chain");
+                RebalancingCtxError::MissingChainAssetId { chain_id }
+            })?;
 
         Ok(FireblocksWallet::new(FireblocksCtx {
             api_user_id: api_user_id.clone(),
-            secret: api_secret.to_vec(),
-            vault_account_id: config.fireblocks_vault_account_id,
+            secret: fireblocks_secret.to_vec(),
+            vault_account_id: config.fireblocks_vault_account_id.clone(),
             environment: config.fireblocks_environment,
             asset_id,
-            base_url: None,
             provider,
             required_confirmations: REQUIRED_CONFIRMATIONS,
+            base_url: config.fireblocks_base_url.clone(),
         })
         .await?)
     }
@@ -235,8 +241,9 @@ impl RebalancingCtx {
     #[cfg(test)]
     pub(crate) fn stub(
         equity: ImbalanceThreshold,
-        usdc: ImbalanceThreshold,
+        usdc: UsdcRebalancing,
         redemption_wallet: Address,
+        usdc_vault_id: Option<B256>,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
         let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
@@ -245,6 +252,7 @@ impl RebalancingCtx {
             equity,
             usdc,
             redemption_wallet,
+            usdc_vault_id,
             alpaca_broker_auth,
             base_wallet: wallet.clone(),
             ethereum_wallet: wallet,
@@ -264,6 +272,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
+            .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("wallet", &self.base_wallet.address())
             .finish_non_exhaustive()
@@ -274,8 +283,8 @@ impl std::fmt::Debug for RebalancingCtx {
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
-    pub(crate) assets: AssetsConfig,
+    pub(crate) usdc: UsdcRebalancing,
+    pub(crate) limits: OperationalLimits,
     pub(crate) disabled_assets: HashSet<Symbol>,
 }
 
@@ -670,23 +679,8 @@ impl RebalancingTrigger {
             .await?
             .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
 
-        let unwrapped_token = self.wrapper.lookup_tokenized_equity(symbol)?;
+        let unwrapped_token = self.wrapper.lookup_tokenized_share(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
-
-        let shares_limit = self
-            .config
-            .assets
-            .equities
-            .symbols
-            .get(symbol)
-            .and_then(|config| config.operational_limit.map(Positive::inner))
-            .or_else(|| {
-                self.config
-                    .assets
-                    .equities
-                    .operational_limit
-                    .map(Positive::inner)
-            });
 
         let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
@@ -695,7 +689,7 @@ impl RebalancingTrigger {
             wrapped_token,
             unwrapped_token,
             &vault_ratio,
-            shares_limit,
+            &self.config.limits,
         )
         .await?
         else {
@@ -730,33 +724,9 @@ impl RebalancingTrigger {
         Ok(registry.token_by_symbol(symbol))
     }
 
-    /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
-    fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
-        let cash_rebalancing_disabled = self
-            .config
-            .assets
-            .cash
-            .as_ref()
-            .is_some_and(|cash| matches!(cash.rebalancing, OperationMode::Disabled));
-
-        if cash_rebalancing_disabled {
-            debug!("USDC rebalancing disabled via assets.cash config");
-            return None;
-        }
-
-        let usdc_limit = self
-            .config
-            .assets
-            .cash
-            .as_ref()
-            .and_then(|cash| cash.operational_limit.map(Positive::inner));
-
-        Some((self.config.usdc, usdc_limit))
-    }
-
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
-        let Some((threshold, usdc_limit)) = self.usdc_rebalancing_params() else {
+        let UsdcRebalancing::Enabled { target, deviation } = self.config.usdc else {
             return;
         };
 
@@ -766,10 +736,13 @@ impl RebalancingTrigger {
             return;
         };
 
-        let Ok(operation) =
-            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory, usdc_limit)
-                .await
-                .inspect_err(|skip| debug!(?skip, "Skipped USDC trigger"))
+        let threshold = ImbalanceThreshold { target, deviation };
+        let Ok(operation) = usdc::check_imbalance_and_build_operation(
+            &threshold,
+            &self.inventory,
+            &self.config.limits,
+        )
+        .await
         else {
             return;
         };
@@ -1017,23 +990,28 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
+    use alloy::node_bindings::Anvil;
+    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
     use chrono::Utc;
+    use httpmock::MockServer;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
     use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
-    use st0x_execution::{Direction, ExecutorOrderId, Positive};
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive, TimeInForce,
+    };
     use std::collections::{BTreeMap, HashSet};
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, LazyLock};
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
-    use uuid::Uuid;
+    use uuid::{Uuid, uuid};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::config::{CashAssetConfig, EquitiesConfig};
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
@@ -1046,20 +1024,26 @@ mod tests {
     use crate::vault_registry::VaultRegistryCommand;
     use crate::wrapper::mock::MockWrapper;
 
+    /// RSA private key generated at test time for Fireblocks JWT
+    /// signing. The mock server does not validate signatures.
+    static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        pem.as_bytes().to_vec()
+    });
+
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
             equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: ImbalanceThreshold {
+            usdc: UsdcRebalancing::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            limits: OperationalLimits::Disabled,
             disabled_assets: HashSet::new(),
         }
     }
@@ -1121,7 +1105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_usdc_disabled_via_cash_config_does_not_send() {
+    async fn test_usdc_disabled_does_not_send() {
         let (sender, mut receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let pool = crate::test_utils::setup_test_db().await;
@@ -1130,15 +1114,8 @@ mod tests {
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: test_config().equity,
-                usdc: test_config().usdc,
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: Some(CashAssetConfig {
-                        vault_id: Some(B256::ZERO),
-                        rebalancing: OperationMode::Disabled,
-                        operational_limit: None,
-                    }),
-                },
+                usdc: UsdcRebalancing::Disabled,
+                limits: OperationalLimits::Disabled,
                 disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
@@ -1171,11 +1148,8 @@ mod tests {
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: test_config().equity,
-                usdc: test_config().usdc,
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
+                usdc: UsdcRebalancing::Disabled,
+                limits: OperationalLimits::Disabled,
                 disabled_assets: HashSet::from([symbol.clone()]),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
@@ -3155,7 +3129,8 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3167,6 +3142,7 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#
@@ -3176,9 +3152,20 @@ mod tests {
         r#"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+            fireblocks_api_user_id = "test-api-user"
+            fireblocks_secret_path = "/tmp/test-fireblocks.key"
         "#
+    }
+
+    fn test_broker_auth() -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+        }
     }
 
     #[test]
@@ -3188,8 +3175,11 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.5));
         assert_eq!(config.equity.deviation, dec!(0.2));
 
-        assert_eq!(config.usdc.target, dec!(0.5));
-        assert_eq!(config.usdc.deviation, dec!(0.3));
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.5));
+        assert_eq!(deviation, dec!(0.3));
         assert_eq!(
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -3202,12 +3192,28 @@ mod tests {
             toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
     }
 
+    #[tokio::test]
+    async fn new_fails_when_secret_file_missing() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+
+        let error = RebalancingCtx::new(config, secrets, test_broker_auth())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::FireblocksSecretRead(_)),
+            "Expected FireblocksSecretRead error, got {error:?}"
+        );
+    }
+
     #[test]
     fn deserialize_with_custom_thresholds() {
         let config: RebalancingConfig = toml::from_str(
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3219,6 +3225,7 @@ mod tests {
             deviation = "0.1"
 
             [usdc]
+            mode = "enabled"
             target = "0.4"
             deviation = "0.15"
         "#,
@@ -3228,14 +3235,18 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.6));
         assert_eq!(config.equity.deviation, dec!(0.1));
 
-        assert_eq!(config.usdc.target, dec!(0.4));
-        assert_eq!(config.usdc.deviation, dec!(0.15));
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.4));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3247,8 +3258,7 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
-            target = "0.5"
-            deviation = "0.3"
+            mode = "disabled"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -3273,66 +3283,11 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_string_vault_account_id_fails() {
-        // Reproduces production error: Fireblocks API returns 400 with
-        // "vaultAccountId: should match format \"numeric\"" when a
-        // non-numeric value is used. The vault account ID must be a bare
-        // integer in TOML, not a quoted string.
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = "1"
-            fireblocks_environment = "sandbox"
-
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let result = toml::from_str::<RebalancingConfig>(toml_str);
-        assert!(
-            result.is_err(),
-            "String fireblocks_vault_account_id must be rejected — \
-             use a bare integer in TOML"
-        );
-    }
-
-    #[test]
-    fn deserialize_integer_vault_account_id_succeeds() {
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 1
-            fireblocks_environment = "sandbox"
-
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let config = toml::from_str::<RebalancingConfig>(toml_str).unwrap();
-        assert_eq!(config.fireblocks_vault_account_id.to_string(), "1");
-    }
-
-    #[test]
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3340,8 +3295,7 @@ mod tests {
             8453 = "BASECHAIN_ETH"
 
             [usdc]
-            target = "0.5"
-            deviation = "0.3"
+            mode = "disabled"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -3352,10 +3306,11 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_usdc_fails() {
+    fn deserialize_usdc_disabled() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3365,13 +3320,14 @@ mod tests {
             [equity]
             target = "0.5"
             deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
         "#;
 
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("usdc"),
-            "Expected missing usdc error, got: {error}"
-        );
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(matches!(config.usdc, UsdcRebalancing::Disabled));
     }
 
     /// Spy reactor that records all dispatched events for verification.
@@ -4173,5 +4129,98 @@ mod tests {
             logs_contain("Triggered equity rebalancing"),
             "Should trigger rebalancing once both venues have data"
         );
+    }
+
+    #[tokio::test]
+    async fn build_wallet_returns_missing_chain_asset_id_for_unknown_chain() {
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            usdc_vault_id: Some(fixed_bytes!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            )),
+
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: None,
+        };
+
+        let error = RebalancingCtx::build_wallet(
+            &config,
+            b"fake-rsa-key",
+            &FireblocksApiUserId::new("test-user"),
+            rpc_url,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::MissingChainAssetId { chain_id: 31337 }
+            ),
+            "Expected MissingChainAssetId for Anvil's default chain 31337, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_wallet_resolves_address_from_fireblocks() {
+        let anvil = Anvil::new().spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+        let server = MockServer::start();
+        let expected_address = address!("0x1111111111111111111111111111111111111111");
+
+        server.mock(|when, then| {
+            when.method("GET")
+                .path("/vault/accounts/0/ETH/addresses_paginated");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "addresses": [{
+                        "assetId": "ETH",
+                        "address": expected_address
+                    }]
+                }));
+        });
+
+        // Anvil's default chain ID is 31337
+        let config = RebalancingConfig {
+            equity: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc: UsdcRebalancing::Disabled,
+            redemption_wallet: Address::ZERO,
+            usdc_vault_id: Some(fixed_bytes!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            )),
+
+            fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
+            fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({
+                "31337": "ETH"
+            }))
+            .unwrap(),
+            fireblocks_environment: FireblocksEnvironment::Sandbox,
+            fireblocks_base_url: Some(server.base_url().parse().unwrap()),
+        };
+
+        let wallet = RebalancingCtx::build_wallet(
+            &config,
+            &TEST_RSA_PEM,
+            &FireblocksApiUserId::new("test-api-key"),
+            rpc_url,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(wallet.address(), expected_address);
     }
 }

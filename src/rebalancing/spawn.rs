@@ -33,9 +33,17 @@ pub(crate) enum SpawnRebalancerError {
     #[error("failed to create Alpaca broker API: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
-    Cctp(#[from] Box<CctpError>),
+    Cctp(Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
+    #[error("USDC vault ID is required for rebalancing but not configured")]
+    MissingUsdcVaultId,
+}
+
+impl From<CctpError> for SpawnRebalancerError {
+    fn from(error: CctpError) -> Self {
+        Self::Cctp(Box::new(error))
+    }
 }
 
 pub(crate) struct RebalancingCqrsFrameworks {
@@ -115,11 +123,15 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// processors.
     pub(crate) fn spawn(
         self,
+        ctx: &RebalancingCtx,
         market_maker_wallet: Address,
-        usdc_vault_id: RaindexVaultId,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
-    ) -> JoinHandle<()> {
+    ) -> Result<JoinHandle<()>, SpawnRebalancerError> {
+        let usdc_vault_id = ctx
+            .usdc_vault_id
+            .ok_or(SpawnRebalancerError::MissingUsdcVaultId)?;
+
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -136,7 +148,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             self.raindex,
             frameworks.usdc,
             market_maker_wallet,
-            usdc_vault_id,
+            RaindexVaultId(usdc_vault_id),
         ));
 
         let rebalancer = Rebalancer::new(
@@ -148,9 +160,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         );
 
         info!("Rebalancing infrastructure initialized");
-        tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             rebalancer.run().await;
-        })
+        }))
     }
 }
 
@@ -158,7 +170,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
 mod tests {
     use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, address, b256};
+    use alloy::primitives::{address, b256};
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
@@ -179,11 +191,12 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
-    use crate::config::{AssetsConfig, EquitiesConfig};
+    use crate::config::OperationalLimits;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::VaultRegistry;
@@ -206,11 +219,14 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            ImbalanceThreshold {
+            UsdcRebalancing::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
             address!("0x1234567890123456789012345678901234567890"),
+            Some(b256!(
+                "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            )),
             AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
@@ -243,10 +259,7 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            limits: OperationalLimits::Disabled,
             disabled_assets: HashSet::new(),
         };
 
@@ -261,15 +274,15 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            limits: OperationalLimits::Disabled,
             disabled_assets: HashSet::new(),
         };
 
-        assert_eq!(trigger_config.usdc.target, dec!(0.6));
-        assert_eq!(trigger_config.usdc.deviation, dec!(0.15));
+        let UsdcRebalancing::Enabled { target, deviation } = trigger_config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.6));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     async fn make_services_with_mock_wallet(
@@ -411,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_dispatches_mint_operation() {
         let server = MockServer::start();
-        let (services, _ctx) = make_services_with_mock_wallet(&server).await;
+        let (services, config) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
         let mock_services = EquityTransferServices {
@@ -432,12 +445,9 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let handle = services.spawn(
-            Address::random(),
-            RaindexVaultId(B256::ZERO),
-            rx,
-            frameworks,
-        );
+        let handle = services
+            .spawn(&config, Address::random(), rx, frameworks)
+            .unwrap();
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),

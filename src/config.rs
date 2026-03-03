@@ -23,6 +23,7 @@ use st0x_execution::{
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
+use crate::rebalancing::trigger::UsdcRebalancing;
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
 };
@@ -39,6 +40,20 @@ pub struct Env {
     pub secrets: PathBuf,
 }
 
+/// Configurable caps on operation sizes for safe deployment.
+///
+/// Required in config -- operators must explicitly choose
+/// between conservative limits or uncapped mode.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum OperationalLimits {
+    Enabled {
+        max_amount: Positive<Usdc>,
+        max_shares: Positive<FractionalShares>,
+    },
+    Disabled,
+}
+
 /// Whether a per-asset operation (trading or rebalancing) is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,16 +64,10 @@ pub(crate) enum OperationMode {
 
 /// Per-equity asset configuration.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct EquityAssetConfig {
-    /// Tokenized equity always one-to-one backed and redeemable with
-    /// real shares held in the issuer account
-    pub(crate) tokenized_equity: Address,
-    /// Wrapped version of tokenized shares to handle corporate actions in a
-    /// manner compatible with other DeFi protocols
-    pub(crate) tokenized_equity_derivative: Address,
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
+    pub(crate) tokenized_share: Address,
+    pub(crate) total_return_derivative: Address,
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
     pub(crate) vault_id: Option<B256>,
     pub(crate) trading: OperationMode,
@@ -68,34 +77,20 @@ pub(crate) struct EquityAssetConfig {
 
 /// Cash asset (USDC) configuration.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct CashAssetConfig {
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
     pub(crate) vault_id: Option<B256>,
     pub(crate) rebalancing: OperationMode,
     pub(crate) operational_limit: Option<Positive<Usdc>>,
 }
 
-/// Equity assets configuration with an optional global operational limit.
-///
-/// Uses `#[serde(flatten)]` so that per-symbol tables live alongside the
-/// `operational_limit` key under `[assets.equities]` in the TOML.
-/// `deny_unknown_fields` is intentionally absent because it is
-/// incompatible with `flatten`.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct EquitiesConfig {
-    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
-    #[serde(flatten)]
-    pub(crate) symbols: HashMap<Symbol, EquityAssetConfig>,
-}
-
 /// Top-level assets configuration containing equities and cash.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AssetsConfig {
-    pub(crate) equities: EquitiesConfig,
+    #[serde(default)]
+    pub(crate) equities: HashMap<Symbol, EquityAssetConfig>,
     pub(crate) cash: Option<CashAssetConfig>,
 }
 
@@ -138,7 +133,8 @@ struct Config {
     database_url: String,
     log_level: Option<LogLevel>,
     server_port: Option<u16>,
-    raindex: EvmConfig,
+    evm: EvmConfig,
+    operational_limits: OperationalLimits,
     order_polling_interval: Option<u64>,
     order_polling_max_jitter: Option<u64>,
     position_check_interval: Option<u64>,
@@ -205,6 +201,7 @@ pub struct Ctx {
     pub(crate) database_url: String,
     pub log_level: LogLevel,
     pub(crate) server_port: u16,
+    pub(crate) operational_limits: OperationalLimits,
     pub(crate) evm: EvmCtx,
     pub(crate) order_polling_interval: u64,
     pub(crate) order_polling_max_jitter: u64,
@@ -352,6 +349,7 @@ impl std::fmt::Debug for Ctx {
             .field("database_url", &self.database_url)
             .field("log_level", &self.log_level)
             .field("server_port", &self.server_port)
+            .field("operational_limits", &self.operational_limits)
             .field("evm", &self.evm)
             .field("order_polling_interval", &self.order_polling_interval)
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
@@ -436,31 +434,17 @@ impl Ctx {
         // - DryRun uses shares threshold for testing
         let execution_threshold = broker.execution_threshold()?;
 
-        let evm = EvmCtx::new(&config.raindex, secrets.evm);
+        let evm = EvmCtx::new(&config.evm, secrets.evm);
 
         let trading_mode = match (
             config.rebalancing,
             secrets.rebalancing,
-            config.raindex.order_owner,
+            config.evm.order_owner,
         ) {
             (Some(rebalancing_config), Some(rebalancing_secrets), None) => {
                 let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &broker else {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
                 };
-
-                let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
-
-                if let Some(cash) = &config.assets.cash
-                    && cash.rebalancing == OperationMode::Enabled
-                    && let Some(cash_limit) = &cash.operational_limit
-                    && cash_limit.inner() < minimum
-                {
-                    return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
-                        configured: cash_limit.inner(),
-                        minimum,
-                    });
-                }
-
                 TradingMode::Rebalancing(Box::new(
                     RebalancingCtx::new(
                         rebalancing_config,
@@ -495,10 +479,32 @@ impl Ctx {
             });
         }
 
+        let usdc = match &trading_mode {
+            TradingMode::Rebalancing(ctx) => Some(&ctx.usdc),
+            TradingMode::Standalone { .. } => None,
+        };
+        let usdc_rebalancing_enabled = match usdc {
+            Some(UsdcRebalancing::Enabled { .. }) => true,
+            Some(UsdcRebalancing::Disabled) | None => false,
+        };
+
+        if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits
+            && usdc_rebalancing_enabled
+        {
+            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+            if max_amount.inner() < minimum {
+                return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
+                    configured: max_amount.inner(),
+                    minimum,
+                });
+            }
+        }
+
         Ok(Self {
             database_url: config.database_url,
             log_level,
             server_port: config.server_port.unwrap_or(8080),
+            operational_limits: config.operational_limits,
             evm,
             order_polling_interval: config.order_polling_interval.unwrap_or(15),
             order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
@@ -542,16 +548,15 @@ impl Ctx {
         }
     }
 
-    /// Returns whether the given asset is enabled for trading and rebalancing.
+    /// Returns whether trading is enabled for the given equity.
     ///
-    /// Fail-closed: assets not present in the config are treated as
-    /// trading-disabled.
-    pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
+    /// Assets not present in the config are treated as trading-enabled
+    /// by default.
+    pub(crate) fn is_trading_enabled(&self, symbol: &Symbol) -> bool {
         self.assets
             .equities
-            .symbols
             .get(symbol)
-            .is_some_and(|config| config.trading == OperationMode::Enabled)
+            .is_none_or(|config| config.trading == OperationMode::Enabled)
     }
 
     /// Returns whether rebalancing is enabled for the given equity.
@@ -561,7 +566,6 @@ impl Ctx {
     pub(crate) fn is_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
         self.assets
             .equities
-            .symbols
             .get(symbol)
             .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
     }
@@ -570,7 +574,7 @@ impl Ctx {
 #[derive(Debug, thiserror::Error)]
 pub enum CtxError {
     #[error(transparent)]
-    Rebalancing(Box<RebalancingCtxError>),
+    Rebalancing(#[from] RebalancingCtxError),
     #[error("ORDER_OWNER required when rebalancing is disabled")]
     MissingOrderOwner,
     #[error("failed to read config file {path}")]
@@ -608,6 +612,11 @@ pub enum CtxError {
          rebalancing is enabled (address is derived from vault)"
     )]
     OrderOwnerConflictsWithFireblocks { configured: Address },
+    #[error(
+        "operational_limits max_amount {configured} is below Alpaca's \
+         minimum withdrawal of {minimum}"
+    )]
+    OperationalLimitBelowMinimumWithdrawal { configured: Usdc, minimum: Usdc },
     #[error(
         "assets.cash operational_limit {configured} is below Alpaca's \
          minimum withdrawal of {minimum}"
@@ -651,6 +660,9 @@ impl CtxError {
             Self::OrderOwnerConflictsWithFireblocks { .. } => {
                 "order_owner conflicts with fireblocks"
             }
+            Self::OperationalLimitBelowMinimumWithdrawal { .. } => {
+                "operational limit below minimum withdrawal"
+            }
             Self::CashOperationalLimitBelowMinimumWithdrawal { .. } => {
                 "cash operational limit below minimum withdrawal"
             }
@@ -685,6 +697,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
+    use rust_decimal_macros::dec;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -707,6 +720,7 @@ pub(crate) mod tests {
             database_url: ":memory:".to_owned(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -728,7 +742,7 @@ pub(crate) mod tests {
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: HashMap::new(),
                 cash: None,
             },
         }
@@ -740,9 +754,12 @@ pub(crate) mod tests {
             br#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
@@ -791,9 +808,12 @@ pub(crate) mod tests {
             br#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
         "#,
@@ -896,71 +916,92 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn rebalancing_with_low_cash_operational_limit_fails() {
-        let secrets = toml_file(
-            r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "alpaca-broker-api"
-            api_key = "test_key"
-            api_secret = "test_secret"
-            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
-            mode = "sandbox"
-
-            [rebalancing]
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
-        "#,
-        );
-
+    async fn operational_limits_enabled_parses_correctly() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [assets.cash]
-            rebalancing = "enabled"
-            operational_limit = 5
+            [operational_limits]
+            mode = "enabled"
+            max_amount = "100"
+            max_shares = "2"
 
-            [raindex]
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
-
-            [rebalancing]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
-
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [rebalancing.usdc]
-            target = "0.5"
-            deviation = "0.3"
         "#,
         );
+        let secrets = dry_run_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::CashOperationalLimitBelowMinimumWithdrawal { .. }
-            ),
-            "Expected CashOperationalLimitBelowMinimumWithdrawal for \
-             operational_limit=5, got: {error:?}"
+            .unwrap();
+        let OperationalLimits::Enabled {
+            max_amount,
+            max_shares,
+        } = ctx.operational_limits
+        else {
+            panic!("Expected Enabled, got {:?}", ctx.operational_limits);
+        };
+        assert_eq!(max_amount.inner(), Usdc(dec!(100)));
+        assert_eq!(max_shares.inner(), FractionalShares::new(dec!(2)));
+    }
+
+    #[tokio::test]
+    async fn operational_limits_missing_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
         );
+        let secrets = dry_run_secrets_toml();
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "Missing operational_limits should be a config parse error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_mode_skips_usdc_withdrawal_minimum_check() {
+        // max_amount below ALPACA_MINIMUM_WITHDRAWAL is fine in standalone
+        // mode because USDC rebalancing transfers don't apply.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets]
+
+            [operational_limits]
+            mode = "enabled"
+            max_amount = "50"
+            max_shares = "2"
+
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+        let OperationalLimits::Enabled { max_amount, .. } = ctx.operational_limits else {
+            panic!("Expected Enabled");
+        };
+        assert_eq!(max_amount.inner(), Usdc(dec!(50)));
     }
 
     #[tokio::test]
@@ -975,9 +1016,12 @@ pub(crate) mod tests {
             position_check_interval = 120
             inventory_poll_interval = 90
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
@@ -1021,15 +1065,19 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [rebalancing.fireblocks_chain_asset_ids]
@@ -1041,20 +1089,17 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
-            target = "0.5"
-            deviation = "0.3"
+            mode = "disabled"
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
         assert!(
             matches!(
-                error,
-                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::NotAlpacaBroker)
+                result,
+                Err(CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker))
             ),
-            "Expected NotAlpacaBroker error for rebalancing with Schwab broker, got {error:?}"
+            "Expected NotAlpacaBroker error for rebalancing with Schwab broker, got {result:?}"
         );
     }
 
@@ -1090,7 +1135,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 error,
-                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::FireblocksSecretRead { .. })
+                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead(_))
             ),
             "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
         );
@@ -1103,12 +1148,15 @@ pub(crate) mod tests {
             database_url = ":memory:"
 
             [assets.equities.EXAMPLE]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             rebalancing = "disabled"
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
             deployment_block = 1
@@ -1118,7 +1166,8 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [rebalancing.fireblocks_chain_asset_ids]
@@ -1129,8 +1178,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
-            target = "0.5"
-            deviation = "0.3"
+            mode = "disabled"
         "#,
         );
 
@@ -1149,9 +1197,12 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
@@ -1188,9 +1239,12 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
@@ -1247,15 +1301,19 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [rebalancing.fireblocks_chain_asset_ids]
@@ -1267,8 +1325,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
-            target = "0.5"
-            deviation = "0.3"
+            mode = "disabled"
         "#,
         );
 
@@ -1365,7 +1422,7 @@ pub(crate) mod tests {
 
     #[test]
     fn config_error_kind_rebalancing() {
-        let err = CtxError::Rebalancing(Box::new(RebalancingCtxError::NotAlpacaBroker));
+        let err = CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker);
         assert_eq!(err.kind(), "rebalancing configuration error");
     }
 
@@ -1400,15 +1457,19 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [assets.equities]
+            [assets]
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
+            fireblocks_vault_account_id = "0"
             fireblocks_environment = "sandbox"
 
             [rebalancing.fireblocks_chain_asset_ids]
@@ -1420,6 +1481,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1432,7 +1494,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 error,
-                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::NotAlpacaBroker)
+                CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker)
             ),
             "expected NotAlpacaBroker, got: {error:?}"
         );
@@ -1452,93 +1514,7 @@ pub(crate) mod tests {
     #[test]
     fn server_config_toml_is_valid() {
         let config_str = include_str!("../config/st0x-hedge.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
-
-        let global_limit = config
-            .assets
-            .equities
-            .operational_limit
-            .map(Positive::inner);
-
-        for (symbol, equity) in &config.assets.equities.symbols {
-            if equity.rebalancing == OperationMode::Enabled
-                && let Some(limit) = &equity.operational_limit
-                && let Some(global) = global_limit
-            {
-                assert!(
-                    limit.inner() < global,
-                    "{symbol}: per-asset operational_limit ({}) must be \
-                     stricter than global equities operational_limit ({global}) \
-                     to provide meaningful per-asset safety",
-                    limit.inner()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn example_config_toml_is_valid() {
-        let config_str = include_str!("../example.config.toml");
-        let _: Config = toml::from_str(config_str).unwrap();
-    }
-
-    #[test]
-    fn example_secrets_toml_is_valid() {
-        let secrets_str = include_str!("../example.secrets.toml");
-        let _: Secrets = toml::from_str(secrets_str).unwrap();
-    }
-
-    #[test]
-    fn e2e_config_toml_is_valid() {
-        let config_str = include_str!("../e2e/config.toml");
-        let _: Config = toml::from_str(config_str).unwrap();
-    }
-
-    #[test]
-    fn e2e_secrets_toml_is_valid() {
-        let secrets_str = include_str!("../e2e/secrets.toml");
-        let _: Secrets = toml::from_str(secrets_str).unwrap();
-    }
-
-    #[test]
-    fn all_repo_config_tomls_are_valid() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut config_paths: Vec<PathBuf> = std::fs::read_dir(repo_root.join("config"))
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-            .collect();
-
-        config_paths.push(repo_root.join("example.config.toml"));
-        config_paths.push(repo_root.join("e2e/config.toml"));
-
-        for path in config_paths {
-            let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-                panic!("Failed to read config {path:?}: {error}");
-            });
-            toml::from_str::<Config>(&contents).unwrap_or_else(|error| {
-                panic!("Invalid config {path:?}: {error}");
-            });
-        }
-    }
-
-    #[test]
-    fn all_repo_secrets_tomls_are_valid() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let secret_paths = [
-            repo_root.join("example.secrets.toml"),
-            repo_root.join("e2e/secrets.toml"),
-        ];
-
-        for path in secret_paths {
-            let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-                panic!("Failed to read secrets {path:?}: {error}");
-            });
-            toml::from_str::<Secrets>(&contents).unwrap_or_else(|error| {
-                panic!("Invalid secrets {path:?}: {error}");
-            });
-        }
+        toml::from_str::<Config>(config_str).unwrap();
     }
 
     #[tokio::test]
@@ -1548,7 +1524,10 @@ pub(crate) mod tests {
             database_url = ":memory:"
             bogus_field = "should fail"
 
-            [raindex]
+            [operational_limits]
+            mode = "disabled"
+
+            [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
@@ -1562,91 +1541,6 @@ pub(crate) mod tests {
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_assets_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets]
-            bogus_field = "should fail"
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown assets field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_equity_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            trading = "enabled"
-            rebalancing = "disabled"
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown equity field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_cash_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.cash]
-            rebalancing = "disabled"
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown cash field, got {err:?}"
         );
     }
 
@@ -1670,66 +1564,6 @@ pub(crate) mod tests {
         assert!(
             matches!(err, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_error_display_includes_file_path() {
-        let config = minimal_config_toml();
-        let secrets = toml_file(
-            r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-            extra_secret = "should fail"
-
-            [broker]
-            type = "dry-run"
-        "#,
-        );
-
-        let secrets_path = secrets.path().to_path_buf();
-        let err = Ctx::load_files(config.path(), &secrets_path)
-            .await
-            .unwrap_err();
-        let display = err.to_string();
-        assert!(
-            display.contains(&secrets_path.display().to_string()),
-            "Error display must include the file path so operators can \
-             identify which file failed to parse. Got: {display}"
-        );
-
-        let source = std::error::Error::source(&err).unwrap();
-        let source_display = source.to_string();
-        assert!(
-            source_display.contains("extra_secret"),
-            "Error source must contain the TOML parse details. Got: {source_display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn config_parse_error_display_includes_file_path() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let config_path = config.path().to_path_buf();
-        let err = Ctx::load_files(&config_path, secrets.path())
-            .await
-            .unwrap_err();
-        let display = err.to_string();
-        assert!(
-            display.contains(&config_path.display().to_string()),
-            "Config error display must include the file path so operators \
-             can identify which file failed to parse. Got: {display}"
         );
     }
 
@@ -1763,32 +1597,32 @@ pub(crate) mod tests {
     fn assets_config_parses_equities_and_cash() {
         let toml_str = r#"
             [equities.RKLB]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            vault_id = "0xfab"
+            tokenized-share = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            total-return-derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            vault-id = "0xfab"
             trading = "disabled"
             rebalancing = "enabled"
-            operational_limit = 5
+            operational-limit = "5"
 
             [equities.SPYM]
-            tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
-            tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+            tokenized-share = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
+            total-return-derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
             trading = "disabled"
             rebalancing = "disabled"
 
             [cash]
-            vault_id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
+            vault-id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
             rebalancing = "disabled"
-            operational_limit = 100
+            operational-limit = "100"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
 
-        assert_eq!(config.equities.symbols.len(), 2);
+        assert_eq!(config.equities.len(), 2);
 
-        let rklb = &config.equities.symbols[&Symbol::new("RKLB").unwrap()];
+        let rklb = &config.equities[&Symbol::new("RKLB").unwrap()];
         assert_eq!(
-            rklb.tokenized_equity,
+            rklb.tokenized_share,
             "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
                 .parse::<Address>()
                 .unwrap()
@@ -1807,15 +1641,15 @@ pub(crate) mod tests {
     fn short_vault_id_left_pads_to_b256() {
         let toml_str = r#"
             [equities.RKLB]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            vault_id = "0xfab"
+            tokenized-share = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            total-return-derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            vault-id = "0xfab"
             trading = "disabled"
             rebalancing = "enabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
-        let rklb = &config.equities.symbols[&Symbol::new("RKLB").unwrap()];
+        let rklb = &config.equities[&Symbol::new("RKLB").unwrap()];
         let expected: B256 = "0000000000000000000000000000000000000000000000000000000000000fab"
             .parse()
             .unwrap();
@@ -1826,8 +1660,8 @@ pub(crate) mod tests {
     fn equity_missing_trading_field_rejects() {
         let toml_str = r#"
             [equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             rebalancing = "disabled"
         "#;
 
@@ -1842,8 +1676,8 @@ pub(crate) mod tests {
     fn equity_missing_rebalancing_field_rejects() {
         let toml_str = r#"
             [equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
         "#;
 
@@ -1858,22 +1692,22 @@ pub(crate) mod tests {
     fn per_asset_operational_limits_parsed_independently() {
         let toml_str = r#"
             [equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             rebalancing = "disabled"
-            operational_limit = 10
+            operational-limit = "10"
 
             [equities.TSLA]
-            tokenized_equity = "0xcccccccccccccccccccccccccccccccccccccccc"
-            tokenized_equity_derivative = "0xdddddddddddddddddddddddddddddddddddddddd"
+            tokenized-share = "0xcccccccccccccccccccccccccccccccccccccccc"
+            total-return-derivative = "0xdddddddddddddddddddddddddddddddddddddddd"
             trading = "enabled"
             rebalancing = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
-        let aapl = &config.equities.symbols[&Symbol::new("AAPL").unwrap()];
-        let tsla = &config.equities.symbols[&Symbol::new("TSLA").unwrap()];
+        let aapl = &config.equities[&Symbol::new("AAPL").unwrap()];
+        let tsla = &config.equities[&Symbol::new("TSLA").unwrap()];
         assert!(
             aapl.operational_limit.is_some(),
             "AAPL should have an operational limit"
@@ -1885,13 +1719,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn is_asset_enabled_returns_configured_value() {
-        let mut symbols = HashMap::new();
-        symbols.insert(
+    fn is_trading_enabled_returns_configured_value() {
+        let mut equities = HashMap::new();
+        equities.insert(
             Symbol::new("RKLB").unwrap(),
             EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
                 vault_id: None,
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -1901,10 +1735,7 @@ pub(crate) mod tests {
 
         let ctx = Ctx {
             assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
+                equities,
                 cash: None,
             },
             ..create_test_ctx_with_order_owner(address!(
@@ -1913,31 +1744,31 @@ pub(crate) mod tests {
         };
 
         assert!(
-            !ctx.is_asset_enabled(&Symbol::new("RKLB").unwrap()),
+            !ctx.is_trading_enabled(&Symbol::new("RKLB").unwrap()),
             "RKLB trading should be disabled"
         );
     }
 
     #[test]
-    fn is_asset_enabled_defaults_to_false_for_unknown() {
+    fn is_trading_enabled_defaults_to_true_for_unknown() {
         let ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
 
         assert!(
-            !ctx.is_asset_enabled(&Symbol::new("UNKNOWN").unwrap()),
-            "Unknown assets should default to trading disabled (fail-closed)"
+            ctx.is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to trading enabled"
         );
     }
 
     #[test]
     fn is_rebalancing_enabled_returns_configured_value() {
-        let mut symbols = HashMap::new();
-        symbols.insert(
+        let mut equities = HashMap::new();
+        equities.insert(
             Symbol::new("RKLB").unwrap(),
             EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
                 vault_id: None,
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -1947,10 +1778,7 @@ pub(crate) mod tests {
 
         let ctx = Ctx {
             assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
+                equities,
                 cash: None,
             },
             ..create_test_ctx_with_order_owner(address!(
@@ -1979,14 +1807,14 @@ pub(crate) mod tests {
     #[test]
     fn base_symbol_config_keys_fix_lookup_bug() {
         // Config keys use base symbols (SPYM not tSPYM).
-        // is_asset_enabled uses Symbol directly, which matches
+        // is_trading_enabled uses Symbol directly, which matches
         // base symbol keys. This verifies the bug fix.
-        let mut symbols = HashMap::new();
-        symbols.insert(
+        let mut equities = HashMap::new();
+        equities.insert(
             Symbol::new("SPYM").unwrap(),
             EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
                 vault_id: None,
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
@@ -1996,10 +1824,7 @@ pub(crate) mod tests {
 
         let ctx = Ctx {
             assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
+                equities,
                 cash: None,
             },
             ..create_test_ctx_with_order_owner(address!(
@@ -2009,7 +1834,7 @@ pub(crate) mod tests {
 
         // The lookup uses base symbol "SPYM" which matches the config key
         assert!(
-            !ctx.is_asset_enabled(&Symbol::new("SPYM").unwrap()),
+            !ctx.is_trading_enabled(&Symbol::new("SPYM").unwrap()),
             "SPYM trading should be disabled per config"
         );
     }
@@ -2038,11 +1863,11 @@ pub(crate) mod tests {
             #[test]
             fn padded_b256_roundtrip(hex_digits in arb_hex_digits()) {
                 let toml_str = format!(
-                    r#"vault_id = "0x{hex_digits}""#,
+                    r#"vault-id = "0x{hex_digits}""#,
                 );
 
                 #[derive(Deserialize)]
-                #[serde(rename_all = "snake_case")]
+                #[serde(rename_all = "kebab-case")]
                 struct Wrapper {
                     #[serde(deserialize_with = "deserialize_padded_b256")]
                     vault_id: Option<B256>,
@@ -2064,11 +1889,11 @@ pub(crate) mod tests {
             ) {
                 let hex_str = format!("{prefix}{bad_char}");
                 let toml_str = format!(
-                    r#"vault_id = "0x{hex_str}""#,
+                    r#"vault-id = "0x{hex_str}""#,
                 );
 
                 #[derive(Debug, Deserialize)]
-                #[serde(rename_all = "snake_case")]
+                #[serde(rename_all = "kebab-case")]
                 struct Wrapper {
                     #[serde(deserialize_with = "deserialize_padded_b256")]
                     vault_id: Option<B256>,
@@ -2077,9 +1902,7 @@ pub(crate) mod tests {
                 let result = toml::from_str::<Wrapper>(&toml_str);
                 prop_assert!(
                     result.is_err(),
-                    "Expected error for invalid hex '{hex_str}', got {result:?}. \
-                     Parsed vault_id: {:?}",
-                    result.as_ref().ok().map(|w| w.vault_id),
+                    "Expected error for invalid hex '{hex_str}', got {result:?}"
                 );
             }
 
@@ -2140,8 +1963,8 @@ pub(crate) mod tests {
                 let rebalancing = if rebalancing_enabled { "enabled" } else { "disabled" };
                 let toml_str = format!(
                     r#"
-                    tokenized_equity = "0x{share_byte:02x}{:0>38}"
-                    tokenized_equity_derivative = "0x{derivative_byte:02x}{:0>38}"
+                    tokenized-share = "0x{share_byte:02x}{:0>38}"
+                    total-return-derivative = "0x{derivative_byte:02x}{:0>38}"
                     trading = "{trading}"
                     rebalancing = "{rebalancing}"
                     "#,
@@ -2173,9 +1996,9 @@ pub(crate) mod tests {
         #[test]
         fn cash_asset_config_parses_without_token_addresses() {
             let toml_str = r#"
-                vault_id = "0xfab"
+                vault-id = "0xfab"
                 rebalancing = "disabled"
-                operational_limit = 100
+                operational-limit = "100"
             "#;
 
             let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
@@ -2184,37 +2007,37 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn equity_asset_config_rejects_missing_tokenized_equity() {
+        fn equity_asset_config_rejects_missing_tokenized_share() {
             let toml_str = r#"
-                tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             "#;
 
             let result = toml::from_str::<EquityAssetConfig>(toml_str);
             assert!(
                 result.is_err(),
-                "Expected error for missing tokenized_equity, got {result:?}"
+                "Expected error for missing tokenized-share, got {result:?}"
             );
         }
 
         #[test]
-        fn equity_asset_config_rejects_missing_tokenized_equity_derivative() {
+        fn equity_asset_config_rejects_missing_total_return_derivative() {
             let toml_str = r#"
-                tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             "#;
 
             let result = toml::from_str::<EquityAssetConfig>(toml_str);
             assert!(
                 result.is_err(),
-                "Expected error for missing tokenized_equity_derivative, got {result:?}"
+                "Expected error for missing total-return-derivative, got {result:?}"
             );
         }
 
         #[test]
         fn padded_b256_rejects_empty_hex() {
-            let toml_str = r#"vault_id = "0x""#;
+            let toml_str = r#"vault-id = "0x""#;
 
             #[derive(Debug, Deserialize)]
-            #[serde(rename_all = "snake_case")]
+            #[serde(rename_all = "kebab-case")]
             struct Wrapper {
                 #[serde(deserialize_with = "deserialize_padded_b256")]
                 #[allow(dead_code)]
@@ -2231,10 +2054,10 @@ pub(crate) mod tests {
         #[test]
         fn padded_b256_rejects_too_long_hex() {
             let long_hex = "a".repeat(65);
-            let toml_str = format!(r#"vault_id = "0x{long_hex}""#);
+            let toml_str = format!(r#"vault-id = "0x{long_hex}""#);
 
             #[derive(Debug, Deserialize)]
-            #[serde(rename_all = "snake_case")]
+            #[serde(rename_all = "kebab-case")]
             struct Wrapper {
                 #[serde(deserialize_with = "deserialize_padded_b256")]
                 #[allow(dead_code)]
@@ -2268,112 +2091,6 @@ pub(crate) mod tests {
 
             let wrapper: Wrapper = toml::from_str(r#"mode = "disabled""#).unwrap();
             assert_eq!(wrapper.mode, OperationMode::Disabled);
-        }
-    }
-
-    #[test]
-    fn broker_type_tag_uses_kebab_case() {
-        let variants = [
-            ("dry-run", "DryRun"),
-            ("schwab", "Schwab"),
-            ("alpaca-trading-api", "AlpacaTradingApi"),
-            ("alpaca-broker-api", "AlpacaBrokerApi"),
-        ];
-
-        for (kebab_value, variant_name) in variants {
-            let toml_str = format!(
-                r#"
-                [evm]
-                ws_rpc_url = "ws://localhost:8545"
-
-                [broker]
-                type = "{kebab_value}"
-                "#,
-            );
-
-            // Only dry-run and schwab parse without extra fields;
-            // alpaca variants need credentials but the tag itself
-            // must be accepted before field validation runs.
-            let result = toml::from_str::<Secrets>(&toml_str);
-            match result {
-                Ok(_) => {}
-                Err(error) => {
-                    let msg = error.to_string();
-                    assert!(
-                        !msg.contains("unknown variant"),
-                        "Broker type tag \"{kebab_value}\" ({variant_name}) \
-                         was rejected as unknown variant. BrokerSecrets must \
-                         use rename_all = \"kebab-case\". Error: {msg}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn secrets_evm_section_uses_evm_not_raindex() {
-        // The secrets TOML section for EVM RPC URLs must be [evm], not
-        // [raindex]. These are generic EVM secrets (RPC endpoints), not
-        // Raindex-specific. The config TOML correctly uses [raindex] because
-        // those fields (orderbook, deployment_block) are Raindex-specific.
-        let with_evm = r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "dry-run"
-        "#;
-
-        let result = toml::from_str::<Secrets>(with_evm);
-        assert!(
-            result.is_ok(),
-            "Secrets TOML with [evm] section should parse successfully, \
-             but got error: {}",
-            result.err().unwrap()
-        );
-
-        let with_raindex = r#"
-            [raindex]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "dry-run"
-        "#;
-
-        let result = toml::from_str::<Secrets>(with_raindex);
-        assert!(
-            result.is_err(),
-            "Secrets TOML with [raindex] section should be rejected \
-             (deny_unknown_fields); the correct section name is [evm]"
-        );
-    }
-
-    #[test]
-    fn broker_type_tag_rejects_snake_case() {
-        let snake_values = ["dry_run", "alpaca_trading_api", "alpaca_broker_api"];
-
-        for snake_value in snake_values {
-            let toml_str = format!(
-                r#"
-                [evm]
-                ws_rpc_url = "ws://localhost:8545"
-
-                [broker]
-                type = "{snake_value}"
-                "#,
-            );
-
-            let result = toml::from_str::<Secrets>(&toml_str);
-            assert!(
-                result.is_err(),
-                "Snake_case broker type \"{snake_value}\" should be rejected"
-            );
-            let error = result.err().unwrap();
-            assert!(
-                error.to_string().contains("unknown variant"),
-                "Snake_case broker type \"{snake_value}\" should be rejected \
-                 as unknown variant (kebab-case required), but got: {error}"
-            );
         }
     }
 }

@@ -31,12 +31,6 @@ pub(crate) enum VaultCliError {
 
     #[error("failed to parse scaled amount as U256")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
-
-    #[error(
-        "assets.cash.vault_id is required for USDC withdrawal \
-         but not configured"
-    )]
-    MissingCashVaultId,
 }
 
 fn decimal_to_u256(amount: Decimal, decimals: u8) -> Result<U256, VaultCliError> {
@@ -119,14 +113,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
-    let usdc_vault_id = ctx
-        .assets
-        .cash
-        .as_ref()
-        .and_then(|cash| cash.vault_id)
-        .ok_or(VaultCliError::MissingCashVaultId)?;
-
-    writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
+    writeln!(stdout, "   Vault ID: {:?}", rebalancing_ctx.usdc_vault_id)?;
 
     let (_vault_store, vault_registry_projection) =
         StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -140,7 +127,9 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         sender_address,
     );
 
-    let vault_id = RaindexVaultId(usdc_vault_id);
+    let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id.ok_or_else(|| {
+        anyhow::anyhow!("USDC vault ID is required for vault withdrawal but not configured")
+    })?);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -158,11 +147,12 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 mod tests {
     use alloy::primitives::{Address, address, b256};
     use rust_decimal_macros::dec;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
+    use crate::config::{AssetsConfig, BrokerCtx, LogLevel, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -171,6 +161,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -187,7 +178,7 @@ mod tests {
             },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: HashMap::new(),
                 cash: None,
             },
         }

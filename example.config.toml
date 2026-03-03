@@ -1,23 +1,40 @@
-server_port = 8080
-log_level = "debug"
 database_url = ":memory:"
-hyperdx.service_name = "st0x-hedge"
+log_level = "debug"
+server_port = 8080
 
-[raindex]
+[assets.equities.EXAMPLE]
+tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+trading = "enabled"
+rebalancing = "disabled"
+
+[operational_limits]
+mode = "enabled"
+max_amount = "100"
+max_shares = "2"
+
+[evm]
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 
+[hyperdx]
+service_name = "st0x-hedge"
+
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-fireblocks_vault_account_id = 0
+usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+fireblocks_vault_account_id = "0"
 fireblocks_environment = "sandbox"
 
-fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
-equity = { target = 0.5, deviation = 0.2 }
-usdc = { target = 0.5, deviation = 0.3 }
+[rebalancing.fireblocks_chain_asset_ids]
+1 = "ETH"
+8453 = "BASECHAIN_ETH"
 
-[assets.equities.EXAMPLE]
-trading = "enabled"
-rebalancing = "disabled"
-tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[rebalancing.equity]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc]
+mode = "enabled"
+target = "0.5"
+deviation = "0.3"
