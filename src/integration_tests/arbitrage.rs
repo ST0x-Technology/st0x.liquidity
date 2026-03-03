@@ -39,7 +39,7 @@ use crate::conductor::{
     EventProcessingError, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::config::OperationalLimits;
+use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
 use crate::onchain::OnchainTrade;
@@ -50,7 +50,7 @@ use crate::position::Position;
 use crate::queue::{self, QueuedEvent};
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
-use crate::threshold::{ExecutionThreshold, Usdc};
+use crate::threshold::ExecutionThreshold;
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::vault_registry::VaultRegistryId;
 
@@ -610,12 +610,19 @@ async fn create_test_cqrs(
     Arc<Store<crate::offchain_order::OffchainOrder>>,
     Arc<Projection<OffchainOrder>>,
 ) {
-    create_test_cqrs_with_limits(pool, OperationalLimits::Disabled).await
+    create_test_cqrs_with_assets(
+        pool,
+        AssetsConfig {
+            equities: EquitiesConfig::default(),
+            cash: None,
+        },
+    )
+    .await
 }
 
-async fn create_test_cqrs_with_limits(
+async fn create_test_cqrs_with_assets(
     pool: &SqlitePool,
-    limits: OperationalLimits,
+    assets: AssetsConfig,
 ) -> (
     TradeProcessingCqrs,
     Arc<Store<Position>>,
@@ -645,7 +652,7 @@ async fn create_test_cqrs_with_limits(
         position_projection: position_projection.clone(),
         offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
-        operational_limits: limits,
+        assets,
     };
 
     (
@@ -895,7 +902,10 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
-        &OperationalLimits::Disabled,
+        &AssetsConfig {
+            equities: EquitiesConfig::default(),
+            cash: None,
+        },
         |_| true,
     )
     .await?;
@@ -1420,7 +1430,10 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
-        &OperationalLimits::Disabled,
+        &AssetsConfig {
+            equities: EquitiesConfig::default(),
+            cash: None,
+        },
         |_| true,
     )
     .await?;
@@ -2083,14 +2096,27 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
 
-    // max_shares=2, max_amount=$100, price=$100/share
-    // Dollar cap in shares = $100 / $100 = 1 share (tighter than max_shares=2)
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(2))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+    // Per-asset limit = 1 share. A 3-share onchain sell requires
+    // 3 cycles of 1-share hedges to fully close.
+    let assets = AssetsConfig {
+        equities: EquitiesConfig {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                Symbol::new(TEST_AAPL).unwrap(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    operational_limit: Some(Positive::new(FractionalShares::new(dec!(1))).unwrap()),
+                },
+            )]),
+        },
+        cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_limits(&pool, limits.clone()).await;
+        create_test_cqrs_with_assets(&pool, assets.clone()).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 3-share sell -> net = -3
@@ -2151,7 +2177,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
-        &limits,
+        &assets,
         |_| true,
     )
     .await?;
@@ -2180,7 +2206,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
-        &limits,
+        &assets,
         |_| true,
     )
     .await?;
@@ -2221,7 +2247,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
-        &limits,
+        &assets,
         |_| true,
     )
     .await?;
@@ -2246,13 +2272,28 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
 
-    // max_shares=2 (binding), max_amount=$10000 (100-share equivalent, not binding)
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(2))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(10000))).unwrap(),
+    // Per-asset shares limit = 2. A 5-share onchain sell hedges 2 shares,
+    // fails, retries (also capped to 2), and the pending order blocks
+    // concurrent checker cycles.
+    let assets = AssetsConfig {
+        equities: EquitiesConfig {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                Symbol::new(TEST_AAPL).unwrap(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    operational_limit: Some(Positive::new(FractionalShares::new(dec!(2))).unwrap()),
+                },
+            )]),
+        },
+        cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_limits(&pool, limits.clone()).await;
+        create_test_cqrs_with_assets(&pool, assets.clone()).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 5-share sell -> net = -5, capped to 2 shares by max_shares
@@ -2326,7 +2367,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
-        &limits,
+        &assets,
         |_| true,
     )
     .await?;
@@ -2359,7 +2400,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &position_query,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
-        &limits,
+        &assets,
         |_| true,
     )
     .await?;

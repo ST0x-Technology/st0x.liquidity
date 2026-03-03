@@ -14,7 +14,7 @@ use st0x_evm::EvmError;
 use st0x_execution::Symbol;
 
 pub(crate) use ratio::{RatioError, UnderlyingPerWrapped};
-pub(crate) use share::{EquityTokenAddresses, WrapperService};
+pub(crate) use share::WrapperService;
 
 #[cfg(test)]
 pub(crate) use ratio::RATIO_ONE;
@@ -45,11 +45,11 @@ pub(crate) trait Wrapper: Send + Sync {
         symbol: &Symbol,
     ) -> Result<UnderlyingPerWrapped, WrapperError>;
 
-    /// Gets the unwrapped (underlying) token address for a symbol.
-    fn lookup_unwrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
+    /// Gets the tokenized equity (underlying) token address for a symbol.
+    fn lookup_tokenized_equity(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
 
-    /// Gets the wrapped (ERC-4626 vault) token address for a symbol.
-    fn lookup_wrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
+    /// Gets the tokenized equity derivative (ERC-4626 vault) token address for a symbol.
+    fn lookup_tokenized_equity_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
 
     /// Deposits underlying tokens to receive wrapped tokens.
     async fn to_wrapped(

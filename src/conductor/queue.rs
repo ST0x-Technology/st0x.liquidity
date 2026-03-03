@@ -170,7 +170,7 @@ where
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
 
-    let asset_enabled = ctx.is_asset_enabled(trade.symbol.base());
+    let trading_enabled = ctx.is_asset_enabled(trade.symbol.base());
 
     process_queued_trade(
         executor,
@@ -179,7 +179,7 @@ where
         event_id,
         trade,
         cqrs,
-        asset_enabled,
+        trading_enabled,
     )
     .await
 }
@@ -228,7 +228,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
         &cqrs.position_projection,
         base_symbol,
         executor_type,
-        &cqrs.operational_limits,
+        &cqrs.assets,
         asset_enabled,
     )
     .await?
@@ -251,7 +251,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV6::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::config::OperationalLimits;
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::offchain_order::noop_order_placer;
     use crate::offchain_order::{OffchainOrder, OrderPlacer};
     use crate::onchain_trade::OnChainTrade;
@@ -328,7 +328,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
-            operational_limits: OperationalLimits::Disabled,
+            assets: AssetsConfig { equities: EquitiesConfig::default(), cash: None },
         }
     }
 
