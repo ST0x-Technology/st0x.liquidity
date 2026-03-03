@@ -264,11 +264,10 @@ pub(super) async fn find_transfer_by_tx_hash(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use alloy::primitives::{address, fixed_bytes};
     use httpmock::prelude::*;
     use serde_json::json;
+    use std::str::FromStr;
     use uuid::uuid;
 
     use st0x_exact_decimal::ExactDecimal;

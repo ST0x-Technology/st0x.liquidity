@@ -13,8 +13,6 @@ use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::Symbol;
 use tempfile::TempDir;
 
-use st0x_execution::Symbol;
-
 use crate::services::alpaca_broker::{AlpacaBrokerMock, MockPosition};
 use crate::services::alpaca_tokenization::{AlpacaTokenizationMock, REDEMPTION_WALLET};
 use crate::services::base_chain::{BaseChain, DeployableERC20};

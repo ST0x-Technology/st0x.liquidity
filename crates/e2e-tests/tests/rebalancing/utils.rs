@@ -22,10 +22,6 @@ use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
-pub(crate) use std::str::FromStr;
-use std::sync::Arc;
-pub(crate) use std::time::Duration;
 
 use st0x_evm::{Evm, EvmError, Wallet};
 pub(crate) use st0x_exact_decimal::ExactDecimal;
@@ -976,8 +972,16 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
 
     let pre_balance_float = Float::from_raw(usdc_vault_balance_before_rebalance);
     let post_balance_float = Float::from_raw(vault_balance);
-    let pre_usdc_units = pre_balance_float.to_fixed_decimal_lossy(6)?.0;
-    let post_usdc_units = post_balance_float.to_fixed_decimal_lossy(6)?.0;
+    let (pre_usdc_units, pre_lossless) = pre_balance_float.to_fixed_decimal_lossy(6)?;
+    assert!(
+        pre_lossless,
+        "Pre-rebalance USDC balance should convert losslessly to 6 decimals"
+    );
+    let (post_usdc_units, post_lossless) = post_balance_float.to_fixed_decimal_lossy(6)?;
+    assert!(
+        post_lossless,
+        "Post-rebalance USDC balance should convert losslessly to 6 decimals"
+    );
 
     let expected_post_units = match rebalance_type {
         UsdcRebalanceType::AlpacaToBase => pre_usdc_units

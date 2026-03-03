@@ -198,16 +198,15 @@ mod tests {
     use st0x_execution::{FractionalShares, Positive};
 
     use super::*;
-
-    fn ed(value: &str) -> ExactDecimal {
-        ExactDecimal::parse(value).unwrap()
-    }
-
     use crate::config::OperationalLimits;
     use crate::inventory::view::Operator;
     use crate::inventory::{Inventory, TransferOp, Venue};
     use crate::threshold::Usdc;
     use crate::wrapper::RATIO_ONE;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
