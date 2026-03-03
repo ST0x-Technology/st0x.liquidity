@@ -237,7 +237,9 @@ mod tests {
     use st0x_evm::OpenChainErrorRegistry;
 
     use super::*;
-    use crate::config::{BrokerCtx, CtxError, LogLevel, OperationalLimits, TradingMode};
+    use crate::config::{
+        AssetsConfig, BrokerCtx, CtxError, LogLevel, OperationalLimits, TradingMode,
+    };
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -260,7 +262,10 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 

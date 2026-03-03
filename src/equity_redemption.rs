@@ -673,7 +673,7 @@ impl EventSourced for EquityRedemption {
                 } => {
                     let underlying_token = services
                         .wrapper
-                        .lookup_unwrapped(symbol)
+                        .lookup_tokenized_share(symbol)
                         .inspect_err(|error| {
                             warn!(%error, %symbol, "Underlying token lookup failed");
                         })

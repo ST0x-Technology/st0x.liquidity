@@ -352,7 +352,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
 
-        let wrapped_token = self.wrapper.lookup_wrapped(&symbol)?;
+        let wrapped_token = self.wrapper.lookup_total_return_derivative(&symbol)?;
         let (wrap_tx_hash, wrapped_shares) = self
             .wrapper
             .to_wrapped(wrapped_token, shares_minted, self.wallet)

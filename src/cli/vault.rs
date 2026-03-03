@@ -113,7 +113,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
-    writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
+    writeln!(stdout, "   Vault ID: {:?}", rebalancing_ctx.usdc_vault_id)?;
 
     let (_vault_store, vault_registry_projection) =
         StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -127,7 +127,9 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         sender_address,
     );
 
-    let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id);
+    let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id.ok_or_else(|| {
+        anyhow::anyhow!("USDC vault ID is required for vault withdrawal but not configured")
+    })?);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -150,7 +152,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{BrokerCtx, LogLevel, OperationalLimits, TradingMode};
+    use crate::config::{AssetsConfig, BrokerCtx, LogLevel, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -173,7 +175,10 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 
