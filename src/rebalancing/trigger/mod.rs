@@ -102,7 +102,7 @@ pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
-    pub(crate) usdc_vault_id: B256,
+    pub(crate) usdc_vault_id: Option<B256>,
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
     pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
     pub(crate) fireblocks_environment: FireblocksEnvironment,
@@ -126,7 +126,7 @@ pub(crate) struct RebalancingCtx {
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    pub(crate) usdc_vault_id: B256,
+    pub(crate) usdc_vault_id: Option<B256>,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Pre-built wallet for the base chain (e.g. Base mainnet).
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
@@ -228,7 +228,7 @@ impl RebalancingCtx {
         equity: ImbalanceThreshold,
         usdc: UsdcRebalancing,
         redemption_wallet: Address,
-        usdc_vault_id: B256,
+        usdc_vault_id: Option<B256>,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
         let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
@@ -658,7 +658,7 @@ impl RebalancingTrigger {
             .await?
             .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
 
-        let unwrapped_token = self.wrapper.lookup_unwrapped(symbol)?;
+        let unwrapped_token = self.wrapper.lookup_tokenized_share(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
         let Some(operation) = equity::check_imbalance_and_build_operation(
@@ -4122,9 +4122,9 @@ mod tests {
             },
             usdc: UsdcRebalancing::Disabled,
             redemption_wallet: Address::ZERO,
-            usdc_vault_id: fixed_bytes!(
+            usdc_vault_id: Some(fixed_bytes!(
                 "0x0000000000000000000000000000000000000000000000000000000000000001"
-            ),
+            )),
 
             fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
             fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({})).unwrap(),
@@ -4178,9 +4178,9 @@ mod tests {
             },
             usdc: UsdcRebalancing::Disabled,
             redemption_wallet: Address::ZERO,
-            usdc_vault_id: fixed_bytes!(
+            usdc_vault_id: Some(fixed_bytes!(
                 "0x0000000000000000000000000000000000000000000000000000000000000001"
-            ),
+            )),
 
             fireblocks_vault_account_id: FireblocksVaultAccountId::new("0"),
             fireblocks_chain_asset_ids: serde_json::from_value(serde_json::json!({

@@ -74,7 +74,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
         base_caller.clone(),
-        ctx.equities.clone(),
+        ctx.assets.equities.clone(),
     ));
 
     let raindex = Arc::new(RaindexService::new(
@@ -163,7 +163,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let owner = rebalancing_ctx.base_wallet().address();
 
-    writeln!(stdout, "   Vault ID: {}", rebalancing_ctx.usdc_vault_id)?;
+    writeln!(stdout, "   Vault ID: {:?}", rebalancing_ctx.usdc_vault_id)?;
 
     let broker_mode = if alpaca_auth.is_sandbox() {
         AlpacaBrokerApiMode::Sandbox
@@ -219,7 +219,9 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         vault_service,
         usdc_store,
         owner,
-        RaindexVaultId(rebalancing_ctx.usdc_vault_id),
+        RaindexVaultId(rebalancing_ctx.usdc_vault_id.ok_or_else(|| {
+            anyhow::anyhow!("USDC vault ID is required for transfer-usdc but not configured")
+        })?),
     );
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
@@ -538,7 +540,7 @@ mod tests {
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
     use super::*;
-    use crate::config::{LogLevel, OperationalLimits, TradingMode};
+    use crate::config::{AssetsConfig, LogLevel, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -562,7 +564,10 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 

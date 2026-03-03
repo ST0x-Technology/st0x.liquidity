@@ -812,7 +812,9 @@ mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-    use crate::config::{BrokerCtx, LogLevel, OperationalLimits, SchwabAuth, TradingMode};
+    use crate::config::{
+        AssetsConfig, BrokerCtx, LogLevel, OperationalLimits, SchwabAuth, TradingMode,
+    };
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
@@ -1290,7 +1292,10 @@ mod tests {
             telemetry: None,
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 
@@ -2330,7 +2335,7 @@ mod tests {
             r#"
                 database_url = ":memory:"
 
-                [equities]
+                [assets]
 
                 [operational_limits]
                 mode = "disabled"

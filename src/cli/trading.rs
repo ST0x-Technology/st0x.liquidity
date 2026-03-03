@@ -337,7 +337,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let base_symbol = onchain_trade.symbol.base();
 
     // CLI test command uses MockExecutor (market always open)
-    let asset_enabled = ctx.is_asset_enabled(base_symbol);
+    let trading_enabled = ctx.is_trading_enabled(base_symbol);
     let executor = MockExecutor::new();
     let Some(params) = check_execution_readiness(
         &executor,
@@ -345,7 +345,7 @@ pub(super) async fn process_found_trade<W: Write>(
         base_symbol,
         executor_type,
         &ctx.operational_limits,
-        asset_enabled,
+        trading_enabled,
     )
     .await?
     else {
@@ -508,7 +508,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{LogLevel, OperationalLimits, SchwabAuth, TradingMode};
+    use crate::config::{AssetsConfig, LogLevel, OperationalLimits, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
@@ -541,7 +541,10 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 

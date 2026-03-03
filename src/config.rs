@@ -4,10 +4,10 @@
 //! validates compatibility, and assembles the runtime [`Ctx`] that the rest
 //! of the application consumes.
 
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, B256, FixedBytes};
 use clap::Parser;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use std::collections::HashMap;
@@ -29,7 +29,6 @@ use crate::rebalancing::{
 };
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
-use crate::wrapper::EquityTokenAddresses;
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -55,6 +54,78 @@ pub(crate) enum OperationalLimits {
     Disabled,
 }
 
+/// Whether a per-asset operation (trading or rebalancing) is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OperationMode {
+    Enabled,
+    Disabled,
+}
+
+/// Per-equity asset configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct EquityAssetConfig {
+    pub(crate) tokenized_share: Address,
+    pub(crate) total_return_derivative: Address,
+    #[serde(default, deserialize_with = "deserialize_padded_b256")]
+    pub(crate) vault_id: Option<B256>,
+    pub(crate) trading: OperationMode,
+    pub(crate) rebalancing: OperationMode,
+    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
+}
+
+/// Cash asset (USDC) configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct CashAssetConfig {
+    #[serde(default, deserialize_with = "deserialize_padded_b256")]
+    pub(crate) vault_id: Option<B256>,
+    pub(crate) rebalancing: OperationMode,
+    pub(crate) operational_limit: Option<Positive<Usdc>>,
+}
+
+/// Top-level assets configuration containing equities and cash.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssetsConfig {
+    #[serde(default)]
+    pub(crate) equities: HashMap<Symbol, EquityAssetConfig>,
+    pub(crate) cash: Option<CashAssetConfig>,
+}
+
+/// Deserializes a hex string (possibly short, e.g. `"0xfab"`) into a
+/// left-padded `B256`. Missing values deserialize as `None`.
+fn deserialize_padded_b256<'de, D>(deserializer: D) -> Result<Option<B256>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(hex_str) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    let stripped = hex_str
+        .strip_prefix("0x")
+        .or_else(|| hex_str.strip_prefix("0X"))
+        .unwrap_or(&hex_str);
+
+    if stripped.len() > 64 {
+        return Err(serde::de::Error::custom(format!(
+            "hex string too long for B256: {stripped}"
+        )));
+    }
+
+    if stripped.is_empty() {
+        return Err(serde::de::Error::custom("empty hex string for B256"));
+    }
+
+    let padded = format!("{stripped:0>64}");
+    padded
+        .parse::<B256>()
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 /// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,7 +140,7 @@ struct Config {
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
-    equities: HashMap<Symbol, EquityTokenAddresses>,
+    assets: AssetsConfig,
 }
 
 /// Secret credentials deserialized from the encrypted secrets TOML.
@@ -136,7 +207,7 @@ pub struct Ctx {
     pub telemetry: Option<TelemetryCtx>,
     pub(crate) trading_mode: TradingMode,
     pub(crate) execution_threshold: ExecutionThreshold,
-    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
+    pub(crate) assets: AssetsConfig,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -282,7 +353,7 @@ impl std::fmt::Debug for Ctx {
             .field("telemetry", &self.telemetry)
             .field("trading_mode", &self.trading_mode)
             .field("execution_threshold", &self.execution_threshold)
-            .field("equities", &self.equities)
+            .field("assets", &self.assets)
             .finish()
     }
 }
@@ -421,7 +492,7 @@ impl Ctx {
             telemetry,
             trading_mode,
             execution_threshold,
-            equities: config.equities,
+            assets: config.assets,
         })
     }
 
@@ -455,14 +526,26 @@ impl Ctx {
         }
     }
 
-    /// Returns whether the given asset is enabled for trading and rebalancing.
+    /// Returns whether trading is enabled for the given equity.
     ///
-    /// Assets not present in the equity config are treated as enabled
+    /// Assets not present in the config are treated as trading-enabled
     /// by default.
-    pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
-        self.equities
+    pub(crate) fn is_trading_enabled(&self, symbol: &Symbol) -> bool {
+        self.assets
+            .equities
             .get(symbol)
-            .is_none_or(|equity| equity.enabled)
+            .is_none_or(|config| config.trading == OperationMode::Enabled)
+    }
+
+    /// Returns whether rebalancing is enabled for the given equity.
+    ///
+    /// Assets not present in the config are treated as rebalancing-disabled
+    /// by default.
+    pub(crate) fn is_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
+        self.assets
+            .equities
+            .get(symbol)
+            .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
     }
 }
 
@@ -604,7 +687,10 @@ pub(crate) mod tests {
             telemetry: None,
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 
@@ -614,7 +700,7 @@ pub(crate) mod tests {
             br#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -668,7 +754,7 @@ pub(crate) mod tests {
             br#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -779,7 +865,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "enabled"
@@ -838,7 +924,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "enabled"
@@ -872,7 +958,7 @@ pub(crate) mod tests {
             order_polling_interval = 30
             order_polling_max_jitter = 10
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -919,7 +1005,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -1001,10 +1087,11 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities.tEXAMPLE]
-            enabled = true
-            unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [assets.equities.EXAMPLE]
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+            rebalancing = "disabled"
 
             [operational_limits]
             mode = "disabled"
@@ -1050,7 +1137,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -1092,7 +1179,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -1154,7 +1241,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -1310,7 +1397,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-            [equities]
+            [assets]
 
             [operational_limits]
             mode = "disabled"
@@ -1444,5 +1531,506 @@ pub(crate) mod tests {
             matches!(err, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown broker field, got {err:?}"
         );
+    }
+
+    #[test]
+    fn assets_config_parses_equities_and_cash() {
+        let toml_str = r#"
+            [equities.RKLB]
+            tokenized-share = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            total-return-derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            vault-id = "0xfab"
+            trading = "disabled"
+            rebalancing = "enabled"
+            operational-limit = "5"
+
+            [equities.SPYM]
+            tokenized-share = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
+            total-return-derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+            trading = "disabled"
+            rebalancing = "disabled"
+
+            [cash]
+            vault-id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
+            rebalancing = "disabled"
+            operational-limit = "100"
+        "#;
+
+        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.equities.len(), 2);
+
+        let rklb = &config.equities[&Symbol::new("RKLB").unwrap()];
+        assert_eq!(
+            rklb.tokenized_share,
+            "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+                .parse::<Address>()
+                .unwrap()
+        );
+        assert_eq!(rklb.trading, OperationMode::Disabled);
+        assert_eq!(rklb.rebalancing, OperationMode::Enabled);
+        assert!(rklb.vault_id.is_some());
+        assert!(rklb.operational_limit.is_some());
+
+        let cash = config.cash.unwrap();
+        assert_eq!(cash.rebalancing, OperationMode::Disabled);
+        assert!(cash.vault_id.is_some());
+    }
+
+    #[test]
+    fn short_vault_id_left_pads_to_b256() {
+        let toml_str = r#"
+            [equities.RKLB]
+            tokenized-share = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            total-return-derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            vault-id = "0xfab"
+            trading = "disabled"
+            rebalancing = "enabled"
+        "#;
+
+        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
+        let rklb = &config.equities[&Symbol::new("RKLB").unwrap()];
+        let expected: B256 = "0000000000000000000000000000000000000000000000000000000000000fab"
+            .parse()
+            .unwrap();
+        assert_eq!(rklb.vault_id.unwrap(), expected);
+    }
+
+    #[test]
+    fn equity_missing_trading_field_rejects() {
+        let toml_str = r#"
+            [equities.AAPL]
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            rebalancing = "disabled"
+        "#;
+
+        let result = toml::from_str::<AssetsConfig>(toml_str);
+        assert!(
+            result.is_err(),
+            "Expected error for missing trading field, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn equity_missing_rebalancing_field_rejects() {
+        let toml_str = r#"
+            [equities.AAPL]
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+        "#;
+
+        let result = toml::from_str::<AssetsConfig>(toml_str);
+        assert!(
+            result.is_err(),
+            "Expected error for missing rebalancing field, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn per_asset_operational_limits_parsed_independently() {
+        let toml_str = r#"
+            [equities.AAPL]
+            tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+            rebalancing = "disabled"
+            operational-limit = "10"
+
+            [equities.TSLA]
+            tokenized-share = "0xcccccccccccccccccccccccccccccccccccccccc"
+            total-return-derivative = "0xdddddddddddddddddddddddddddddddddddddddd"
+            trading = "enabled"
+            rebalancing = "disabled"
+        "#;
+
+        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
+        let aapl = &config.equities[&Symbol::new("AAPL").unwrap()];
+        let tsla = &config.equities[&Symbol::new("TSLA").unwrap()];
+        assert!(
+            aapl.operational_limit.is_some(),
+            "AAPL should have an operational limit"
+        );
+        assert!(
+            tsla.operational_limit.is_none(),
+            "TSLA should not have an operational limit"
+        );
+    }
+
+    #[test]
+    fn is_trading_enabled_returns_configured_value() {
+        let mut equities = HashMap::new();
+        equities.insert(
+            Symbol::new("RKLB").unwrap(),
+            EquityAssetConfig {
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities,
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        };
+
+        assert!(
+            !ctx.is_trading_enabled(&Symbol::new("RKLB").unwrap()),
+            "RKLB trading should be disabled"
+        );
+    }
+
+    #[test]
+    fn is_trading_enabled_defaults_to_true_for_unknown() {
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+
+        assert!(
+            ctx.is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to trading enabled"
+        );
+    }
+
+    #[test]
+    fn is_rebalancing_enabled_returns_configured_value() {
+        let mut equities = HashMap::new();
+        equities.insert(
+            Symbol::new("RKLB").unwrap(),
+            EquityAssetConfig {
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities,
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        };
+
+        assert!(
+            ctx.is_rebalancing_enabled(&Symbol::new("RKLB").unwrap()),
+            "RKLB rebalancing should be enabled"
+        );
+    }
+
+    #[test]
+    fn is_rebalancing_enabled_defaults_to_false_for_unknown() {
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+
+        assert!(
+            !ctx.is_rebalancing_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to rebalancing disabled"
+        );
+    }
+
+    #[test]
+    fn base_symbol_config_keys_fix_lookup_bug() {
+        // Config keys use base symbols (SPYM not tSPYM).
+        // is_trading_enabled uses Symbol directly, which matches
+        // base symbol keys. This verifies the bug fix.
+        let mut equities = HashMap::new();
+        equities.insert(
+            Symbol::new("SPYM").unwrap(),
+            EquityAssetConfig {
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities,
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        };
+
+        // The lookup uses base symbol "SPYM" which matches the config key
+        assert!(
+            !ctx.is_trading_enabled(&Symbol::new("SPYM").unwrap()),
+            "SPYM trading should be disabled per config"
+        );
+    }
+
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Generates a valid hex digit string of length 1..=64.
+        fn arb_hex_digits() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop::sample::select(vec![
+                    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+                ]),
+                1..=64,
+            )
+            .prop_map(|chars| chars.into_iter().collect::<String>())
+        }
+
+        proptest! {
+            /// Arbitrary short hex strings left-pad to correct B256.
+            ///
+            /// The padded result should equal the hex digits
+            /// zero-filled on the left to 64 chars.
+            #[test]
+            fn padded_b256_roundtrip(hex_digits in arb_hex_digits()) {
+                let toml_str = format!(
+                    r#"vault-id = "0x{hex_digits}""#,
+                );
+
+                #[derive(Deserialize)]
+                #[serde(rename_all = "kebab-case")]
+                struct Wrapper {
+                    #[serde(deserialize_with = "deserialize_padded_b256")]
+                    vault_id: Option<B256>,
+                }
+
+                let wrapper: Wrapper = toml::from_str(&toml_str).unwrap();
+                let parsed = wrapper.vault_id.unwrap();
+
+                let expected_hex = format!("{hex_digits:0>64}");
+                let expected: B256 = expected_hex.parse().unwrap();
+                prop_assert_eq!(parsed, expected);
+            }
+
+            /// Invalid hex characters must produce a deserialization error.
+            #[test]
+            fn padded_b256_rejects_invalid_hex(
+                bad_char in "[g-zG-Z!@#$%^&*]",
+                prefix in arb_hex_digits(),
+            ) {
+                let hex_str = format!("{prefix}{bad_char}");
+                let toml_str = format!(
+                    r#"vault-id = "0x{hex_str}""#,
+                );
+
+                #[derive(Debug, Deserialize)]
+                #[serde(rename_all = "kebab-case")]
+                struct Wrapper {
+                    #[serde(deserialize_with = "deserialize_padded_b256")]
+                    vault_id: Option<B256>,
+                }
+
+                let result = toml::from_str::<Wrapper>(&toml_str);
+                prop_assert!(
+                    result.is_err(),
+                    "Expected error for invalid hex '{hex_str}', got {result:?}"
+                );
+            }
+
+            /// OperationMode serializes and deserializes as lowercase strings.
+            #[test]
+            fn operation_mode_serde_roundtrip(enabled in any::<bool>()) {
+                #[derive(Debug, PartialEq, Serialize, Deserialize)]
+                struct Wrapper {
+                    mode: OperationMode,
+                }
+
+                let wrapper = Wrapper {
+                    mode: if enabled {
+                        OperationMode::Enabled
+                    } else {
+                        OperationMode::Disabled
+                    },
+                };
+
+                let serialized = toml::to_string(&wrapper).unwrap();
+                let deserialized: Wrapper = toml::from_str(&serialized).unwrap();
+                prop_assert_eq!(wrapper, deserialized);
+            }
+
+            /// OperationMode rejects strings that are not "enabled" or
+            /// "disabled".
+            #[test]
+            fn operation_mode_rejects_invalid_strings(
+                invalid in "[a-z]{3,10}"
+                    .prop_filter("must not be a valid mode", |value| {
+                        value != "enabled" && value != "disabled"
+                    })
+            ) {
+                let toml_str = format!(r#"mode = "{invalid}""#);
+
+                #[derive(Debug, Deserialize)]
+                struct Wrapper {
+                    #[allow(dead_code)]
+                    mode: OperationMode,
+                }
+
+                let result = toml::from_str::<Wrapper>(&toml_str);
+                prop_assert!(
+                    result.is_err(),
+                    "Expected error for invalid mode '{invalid}', got {result:?}"
+                );
+            }
+
+            /// EquityAssetConfig parses when all required fields are present.
+            #[test]
+            fn equity_asset_config_parses_with_addresses(
+                share_byte in any::<u8>(),
+                derivative_byte in any::<u8>(),
+                trading_enabled in any::<bool>(),
+                rebalancing_enabled in any::<bool>(),
+            ) {
+                let trading = if trading_enabled { "enabled" } else { "disabled" };
+                let rebalancing = if rebalancing_enabled { "enabled" } else { "disabled" };
+                let toml_str = format!(
+                    r#"
+                    tokenized-share = "0x{share_byte:02x}{:0>38}"
+                    total-return-derivative = "0x{derivative_byte:02x}{:0>38}"
+                    trading = "{trading}"
+                    rebalancing = "{rebalancing}"
+                    "#,
+                    "", "",
+                );
+
+                let result = toml::from_str::<EquityAssetConfig>(&toml_str);
+                prop_assert!(
+                    result.is_ok(),
+                    "Expected successful parse, got {result:?}"
+                );
+
+                let config = result.unwrap();
+                let expected_trading = if trading_enabled {
+                    OperationMode::Enabled
+                } else {
+                    OperationMode::Disabled
+                };
+                let expected_rebalancing = if rebalancing_enabled {
+                    OperationMode::Enabled
+                } else {
+                    OperationMode::Disabled
+                };
+                prop_assert_eq!(config.trading, expected_trading);
+                prop_assert_eq!(config.rebalancing, expected_rebalancing);
+            }
+        }
+
+        #[test]
+        fn cash_asset_config_parses_without_token_addresses() {
+            let toml_str = r#"
+                vault-id = "0xfab"
+                rebalancing = "disabled"
+                operational-limit = "100"
+            "#;
+
+            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
+            assert_eq!(config.rebalancing, OperationMode::Disabled);
+            assert!(config.vault_id.is_some());
+        }
+
+        #[test]
+        fn equity_asset_config_rejects_missing_tokenized_share() {
+            let toml_str = r#"
+                total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            "#;
+
+            let result = toml::from_str::<EquityAssetConfig>(toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for missing tokenized-share, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn equity_asset_config_rejects_missing_total_return_derivative() {
+            let toml_str = r#"
+                tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "#;
+
+            let result = toml::from_str::<EquityAssetConfig>(toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for missing total-return-derivative, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn padded_b256_rejects_empty_hex() {
+            let toml_str = r#"vault-id = "0x""#;
+
+            #[derive(Debug, Deserialize)]
+            #[serde(rename_all = "kebab-case")]
+            struct Wrapper {
+                #[serde(deserialize_with = "deserialize_padded_b256")]
+                #[allow(dead_code)]
+                vault_id: Option<B256>,
+            }
+
+            let result = toml::from_str::<Wrapper>(toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for empty hex string, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn padded_b256_rejects_too_long_hex() {
+            let long_hex = "a".repeat(65);
+            let toml_str = format!(r#"vault-id = "0x{long_hex}""#);
+
+            #[derive(Debug, Deserialize)]
+            #[serde(rename_all = "kebab-case")]
+            struct Wrapper {
+                #[serde(deserialize_with = "deserialize_padded_b256")]
+                #[allow(dead_code)]
+                vault_id: Option<B256>,
+            }
+
+            let result = toml::from_str::<Wrapper>(&toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for too-long hex string, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn operation_mode_enabled_from_string() {
+            #[derive(Debug, Deserialize)]
+            struct Wrapper {
+                mode: OperationMode,
+            }
+
+            let wrapper: Wrapper = toml::from_str(r#"mode = "enabled""#).unwrap();
+            assert_eq!(wrapper.mode, OperationMode::Enabled);
+        }
+
+        #[test]
+        fn operation_mode_disabled_from_string() {
+            #[derive(Debug, Deserialize)]
+            struct Wrapper {
+                mode: OperationMode,
+            }
+
+            let wrapper: Wrapper = toml::from_str(r#"mode = "disabled""#).unwrap();
+            assert_eq!(wrapper.mode, OperationMode::Disabled);
+        }
     }
 }
