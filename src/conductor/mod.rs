@@ -357,7 +357,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let wrapper = Arc::new(WrapperService::new(
             base_wallet.clone(),
-            deps.ctx.equities.clone(),
+            deps.ctx.assets.equities.clone(),
         ));
 
         let equity_transfer_services = EquityTransferServices {
@@ -368,10 +368,11 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let disabled_assets = deps
             .ctx
+            .assets
             .equities
-            .iter()
-            .filter(|(_, config)| !config.enabled)
-            .map(|(symbol, _)| symbol.clone())
+            .keys()
+            .filter(|symbol| !deps.ctx.is_rebalancing_enabled(symbol))
+            .cloned()
             .collect();
 
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
@@ -404,7 +405,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let services = RebalancerServices::new(
             rebalancing_ctx.clone(),
-            deps.ctx.equities.clone(),
+            deps.ctx.assets.equities.clone(),
             ethereum_wallet,
             base_wallet,
             raindex_service,
@@ -417,7 +418,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             market_maker_wallet,
             operation_receiver,
             frameworks,
-        );
+        )?;
 
         Ok(RebalancingInfrastructure {
             position: built.position,
@@ -623,7 +624,7 @@ where
                 &offchain_order,
                 &execution_threshold,
                 &operational_limits,
-                |symbol| ctx.is_asset_enabled(symbol),
+                |symbol| ctx.is_trading_enabled(symbol),
             )
             .await
             {
@@ -928,7 +929,7 @@ async fn process_next_queued_event<E: Executor>(
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
 
-    let asset_enabled = ctx.is_asset_enabled(trade.symbol.base());
+    let trading_enabled = ctx.is_trading_enabled(trade.symbol.base());
 
     process_queued_trade(
         queue_context.executor,
@@ -937,7 +938,7 @@ async fn process_next_queued_event<E: Executor>(
         event_id,
         trade,
         cqrs,
-        asset_enabled,
+        trading_enabled,
     )
     .await
 }
@@ -1318,7 +1319,7 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     offchain_order: &Arc<Store<OffchainOrder>>,
     threshold: &ExecutionThreshold,
     limits: &OperationalLimits,
-    is_asset_enabled: impl Fn(&Symbol) -> bool,
+    is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
@@ -1330,7 +1331,7 @@ where
         position_projection,
         executor_type,
         limits,
-        is_asset_enabled,
+        is_trading_enabled,
     )
     .await?;
 

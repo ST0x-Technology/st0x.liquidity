@@ -16,13 +16,14 @@ use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
 use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
+use crate::config::EquityAssetConfig;
 use crate::equity_redemption::EquityRedemption;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::wrapper::{EquityTokenAddresses, WrapperService};
+use crate::wrapper::WrapperService;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -32,9 +33,17 @@ pub(crate) enum SpawnRebalancerError {
     #[error("failed to create Alpaca broker API: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
-    Cctp(#[from] CctpError),
+    Cctp(Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
+    #[error("USDC vault ID is required for rebalancing but not configured")]
+    MissingUsdcVaultId,
+}
+
+impl From<CctpError> for SpawnRebalancerError {
+    fn from(error: CctpError) -> Self {
+        Self::Cctp(Box::new(error))
+    }
 }
 
 pub(crate) struct RebalancingCqrsFrameworks {
@@ -64,7 +73,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// must happen before this constructor is called.
     pub(crate) async fn new(
         ctx: RebalancingCtx,
-        equities: HashMap<Symbol, EquityTokenAddresses>,
+        equities: HashMap<Symbol, EquityAssetConfig>,
         ethereum_wallet: Chain,
         base_wallet: Chain,
         raindex: Arc<RaindexService<Chain>>,
@@ -109,7 +118,11 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         market_maker_wallet: Address,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
-    ) -> JoinHandle<()> {
+    ) -> Result<JoinHandle<()>, SpawnRebalancerError> {
+        let usdc_vault_id = ctx
+            .usdc_vault_id
+            .ok_or(SpawnRebalancerError::MissingUsdcVaultId)?;
+
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -126,7 +139,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             self.raindex,
             frameworks.usdc,
             market_maker_wallet,
-            RaindexVaultId(ctx.usdc_vault_id),
+            RaindexVaultId(usdc_vault_id),
         ));
 
         let rebalancer = Rebalancer::new(
@@ -138,9 +151,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         );
 
         info!("Rebalancing infrastructure initialized");
-        tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             rebalancer.run().await;
-        })
+        }))
     }
 }
 
@@ -202,7 +215,9 @@ mod tests {
                 deviation: dec!(0.15),
             },
             address!("0x1234567890123456789012345678901234567890"),
-            b256!("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            Some(b256!(
+                "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            )),
             AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
@@ -415,7 +430,9 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let handle = services.spawn(&config, Address::random(), rx, frameworks);
+        let handle = services
+            .spawn(&config, Address::random(), rx, frameworks)
+            .unwrap();
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),

@@ -99,7 +99,7 @@ mod tests {
 
     use super::*;
     use crate::config::SchwabAuth;
-    use crate::config::{BrokerCtx, Ctx, OperationalLimits, TradingMode};
+    use crate::config::{AssetsConfig, BrokerCtx, Ctx, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -132,7 +132,10 @@ mod tests {
                 order_owner: address!("0x2222222222222222222222222222222222222222"),
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 

@@ -89,7 +89,7 @@ async fn check_market_open<E: Executor>(
 /// against its configured threshold. Skips disabled assets.
 /// Returns execution parameters for positions that are ready.
 #[tracing::instrument(
-    skip(executor, position_projection, is_asset_enabled),
+    skip(executor, position_projection, is_trading_enabled),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
@@ -98,14 +98,14 @@ pub(crate) async fn check_all_positions<E: Executor>(
     position_projection: &Projection<Position>,
     executor_type: SupportedExecutor,
     limits: &OperationalLimits,
-    is_asset_enabled: impl Fn(&Symbol) -> bool,
+    is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<ExecutionCtx>, OnChainError> {
     let all_positions = position_projection.load_all().await?;
 
     let mut ready = Vec::new();
 
     for (symbol, position) in &all_positions {
-        if !is_asset_enabled(symbol) {
+        if !is_trading_enabled(symbol) {
             debug!(symbol = %symbol, "Asset disabled, skipping periodic check");
             continue;
         }

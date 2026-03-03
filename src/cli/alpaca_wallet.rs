@@ -529,7 +529,7 @@ mod tests {
 
     use super::*;
     use crate::cli::ConvertDirection;
-    use crate::config::{LogLevel, OperationalLimits, TradingMode};
+    use crate::config::{AssetsConfig, LogLevel, OperationalLimits, TradingMode};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
@@ -555,7 +555,10 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 
@@ -610,7 +613,10 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
             trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
                 ImbalanceThreshold {
                     target: dec!(0.5),
@@ -618,7 +624,7 @@ mod tests {
                 },
                 UsdcRebalancing::Disabled,
                 Address::ZERO,
-                B256::ZERO,
+                Some(B256::ZERO),
                 AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
