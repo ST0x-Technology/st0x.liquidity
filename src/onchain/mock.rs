@@ -2,6 +2,8 @@
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
+use std::sync::Mutex;
+
 use st0x_execution::Symbol;
 
 use super::raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -12,6 +14,7 @@ pub(crate) struct MockRaindex {
     withdraw_tx: TxHash,
     deposit_tx: TxHash,
     deposit_fails: bool,
+    deposited_token: Mutex<Option<Address>>,
 }
 
 impl MockRaindex {
@@ -22,6 +25,7 @@ impl MockRaindex {
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
             deposit_fails: false,
+            deposited_token: Mutex::new(None),
         }
     }
 
@@ -32,7 +36,13 @@ impl MockRaindex {
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
             deposit_fails: true,
+            deposited_token: Mutex::new(None),
         }
+    }
+
+    /// Returns the token address that was passed to the last `deposit()` call.
+    pub(crate) fn last_deposited_token(&self) -> Option<Address> {
+        *self.deposited_token.lock().unwrap()
     }
 
     pub(crate) fn with_token(mut self, token: Address) -> Self {
@@ -56,7 +66,7 @@ impl Raindex for MockRaindex {
 
     async fn deposit(
         &self,
-        _token: Address,
+        token: Address,
         _vault_id: RaindexVaultId,
         _amount: U256,
         _decimals: u8,
@@ -64,6 +74,7 @@ impl Raindex for MockRaindex {
         if self.deposit_fails {
             return Err(RaindexError::ZeroAmount);
         }
+        *self.deposited_token.lock().unwrap() = Some(token);
         Ok(self.deposit_tx)
     }
 

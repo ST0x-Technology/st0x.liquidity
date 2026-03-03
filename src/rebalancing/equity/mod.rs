@@ -352,7 +352,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
 
-        let wrapped_token = self.wrapper.lookup_wrapped(&symbol)?;
+        let wrapped_token = self.wrapper.lookup_tokenized_equity_derivative(&symbol)?;
         let (wrap_tx_hash, wrapped_shares) = self
             .wrapper
             .to_wrapped(wrapped_token, shares_minted, self.wallet)
@@ -675,6 +675,49 @@ mod tests {
         assert!(
             matches!(error, MintError::Raindex(_)),
             "Expected Raindex error, got: {error:?}"
+        );
+    }
+
+    /// Verifies that mint deposits the derivative token (from
+    /// `lookup_tokenized_equity_derivative`) to the Raindex vault, not the
+    /// base tokenized share (from `lookup_tokenized_equity`).
+    #[tokio::test]
+    async fn mint_deposits_derivative_token_not_base_tokenized_share() {
+        let base_share = Address::random();
+        let derivative = Address::random();
+
+        let raindex = Arc::new(MockRaindex::new());
+        let wrapper = Arc::new(
+            MockWrapper::new()
+                .with_unwrapped_token(base_share)
+                .with_wrapped_token(derivative),
+        );
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::clone(&raindex) as Arc<dyn Raindex>,
+            wrapper,
+        )
+        .await;
+
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deposited = raindex.last_deposited_token().expect("deposit was called");
+        assert_eq!(
+            deposited, derivative,
+            "Deposit should use the derivative token, not the base tokenized share"
+        );
+        assert_ne!(
+            deposited, base_share,
+            "Deposit must not use the base tokenized share"
         );
     }
 }
