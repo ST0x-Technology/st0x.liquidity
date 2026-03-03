@@ -106,6 +106,14 @@ impl<Form: TokenizationForm> TokenizedSymbol<Form> {
         })
     }
 
+    /// Construct a tokenized symbol from its underlying base symbol.
+    pub(crate) fn from_base(symbol: Symbol) -> Self {
+        Self {
+            _form: PhantomData,
+            symbol,
+        }
+    }
+
     pub(crate) fn base(&self) -> &Symbol {
         &self.symbol
     }
@@ -532,6 +540,27 @@ mod tests {
             tokenized_symbol!(WrappedTokenizedShares, "wtGOOG"),
             tokenized_symbol!(WrappedTokenizedShares, "wtTSLA"),
         ];
+    }
+
+    #[test]
+    fn from_base_produces_prefixed_display() {
+        let coin = TokenizedSymbol::<OneToOneTokenizedShares>::from_base(symbol!("COIN"));
+        assert_eq!(coin.to_string(), "tCOIN");
+        assert_eq!(coin.base(), &symbol!("COIN"));
+
+        let aapl = TokenizedSymbol::<WrappedTokenizedShares>::from_base(symbol!("AAPL"));
+        assert_eq!(aapl.to_string(), "wtAAPL");
+        assert_eq!(aapl.base(), &symbol!("AAPL"));
+    }
+
+    #[test]
+    fn from_base_roundtrips_with_parse() {
+        let original = symbol!("NVDA");
+        let tokenized = TokenizedSymbol::<OneToOneTokenizedShares>::from_base(original.clone());
+        let reparsed =
+            TokenizedSymbol::<OneToOneTokenizedShares>::parse(&tokenized.to_string()).unwrap();
+
+        assert_eq!(reparsed.base(), &original);
     }
 
     #[test]

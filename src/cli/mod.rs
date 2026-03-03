@@ -2,6 +2,7 @@
 
 mod alpaca_wallet;
 mod auth;
+mod benchmark;
 mod cctp;
 mod rebalancing;
 mod trading;
@@ -13,7 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
-use std::sync::Arc;
+use std::path::PathBuf;
 use thiserror::Error;
 use tracing::info;
 
@@ -21,7 +22,6 @@ use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 
 use crate::config::{Ctx, Env};
-use crate::offchain_order::OrderPlacer;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 
@@ -341,6 +341,26 @@ pub enum Commands {
     /// Useful for debugging tokenization status without creating new requests.
     AlpacaTokenizationRequests,
 
+    /// Benchmark Alpaca tokenization round trips
+    ///
+    /// Runs N round trips (buy -> mint -> redeem -> sell) for a given symbol,
+    /// measuring tokenization and detokenization latency. Produces a TSV
+    /// report file and prints summary statistics.
+    AlpacaBenchmark {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of round trips to perform
+        #[arg(short = 'n', long = "round-trips")]
+        round_trips: usize,
+        /// Number of shares per trip (default: 1)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares, default_value = "1")]
+        quantity: Positive<FractionalShares>,
+        /// Output file path (default: benchmark-{symbol}-{timestamp}.tsv)
+        #[arg(long = "output")]
+        output: Option<PathBuf>,
+    },
+
     /// Check the status of a Schwab order by order ID
     OrderStatus {
         /// The Schwab order ID to check
@@ -409,227 +429,15 @@ async fn execute_order<W: Write>(
     .await
 }
 
-/// Commands that don't require a WebSocket provider.
-enum SimpleCommand {
-    Buy {
-        symbol: Symbol,
-        quantity: u64,
-        time_in_force: Option<TimeInForce>,
-    },
-    Sell {
-        symbol: Symbol,
-        quantity: u64,
-        time_in_force: Option<TimeInForce>,
-    },
-    Auth,
-    TransferEquity {
-        direction: TransferDirection,
-        symbol: Symbol,
-        quantity: FractionalShares,
-    },
-    AlpacaDeposit {
-        amount: Usdc,
-    },
-    AlpacaWithdraw {
-        amount: Usdc,
-        to_address: Option<Address>,
-    },
-    AlpacaWhitelist {
-        address: Option<Address>,
-    },
-    AlpacaWhitelistList,
-    AlpacaUnwhitelist {
-        address: Address,
-    },
-    AlpacaTransfers {
-        pending: bool,
-    },
-    AlpacaConvert {
-        direction: ConvertDirection,
-        amount: Usdc,
-    },
-    AlpacaJournal {
-        destination: AlpacaAccountId,
-        symbol: Symbol,
-        quantity: Positive<FractionalShares>,
-    },
-    OrderStatus {
-        order_id: String,
-    },
-}
-
-/// Commands that require a WebSocket provider.
-enum ProviderCommand {
-    ProcessTx {
-        tx_hash: TxHash,
-    },
-    TransferUsdc {
-        direction: TransferDirection,
-        amount: Usdc,
-    },
-    VaultDeposit {
-        amount: Decimal,
-        token: Address,
-        vault_id: B256,
-        decimals: u8,
-    },
-    VaultWithdraw {
-        amount: Usdc,
-    },
-    CctpBridge {
-        amount: Option<Usdc>,
-        all: bool,
-        from: CctpChain,
-    },
-    CctpRecover {
-        burn_tx: TxHash,
-        source_chain: CctpChain,
-    },
-    ResetAllowance {
-        chain: CctpChain,
-    },
-    AlpacaTokenize {
-        symbol: Symbol,
-        quantity: FractionalShares,
-        token: Address,
-        recipient: Option<Address>,
-    },
-    AlpacaRedeem {
-        symbol: Symbol,
-        quantity: FractionalShares,
-        token: Address,
-    },
-    AlpacaTokenizationRequests,
-}
-
+#[allow(clippy::cognitive_complexity)]
 async fn run_command_with_writers<W: Write>(
     ctx: Ctx,
     command: Commands,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    match classify_command(command) {
-        Ok(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
-        Err(provider_cmd) => {
-            let order_placer = trading::create_order_placer(&ctx, pool);
-            run_provider_command(provider_cmd, &ctx, pool, stdout, order_placer).await?;
-        }
-    }
-
-    info!("CLI operation completed successfully");
-    Ok(())
-}
-
-fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
         Commands::Buy {
-            symbol,
-            quantity,
-            time_in_force,
-        } => Ok(SimpleCommand::Buy {
-            symbol,
-            quantity,
-            time_in_force,
-        }),
-        Commands::Sell {
-            symbol,
-            quantity,
-            time_in_force,
-        } => Ok(SimpleCommand::Sell {
-            symbol,
-            quantity,
-            time_in_force,
-        }),
-        Commands::Auth => Ok(SimpleCommand::Auth),
-        Commands::TransferEquity {
-            direction,
-            symbol,
-            quantity,
-        } => Ok(SimpleCommand::TransferEquity {
-            direction,
-            symbol,
-            quantity,
-        }),
-        Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
-        Commands::AlpacaWithdraw { amount, to_address } => {
-            Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
-        }
-        Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
-        Commands::AlpacaWhitelistList => Ok(SimpleCommand::AlpacaWhitelistList),
-        Commands::AlpacaUnwhitelist { address } => Ok(SimpleCommand::AlpacaUnwhitelist { address }),
-        Commands::AlpacaTransfers { pending } => Ok(SimpleCommand::AlpacaTransfers { pending }),
-        Commands::AlpacaConvert { direction, amount } => {
-            Ok(SimpleCommand::AlpacaConvert { direction, amount })
-        }
-        Commands::AlpacaJournal {
-            destination,
-            symbol,
-            quantity,
-        } => Ok(SimpleCommand::AlpacaJournal {
-            destination,
-            symbol,
-            quantity,
-        }),
-        Commands::AlpacaTokenizationRequests => Err(ProviderCommand::AlpacaTokenizationRequests),
-        Commands::ProcessTx { tx_hash } => Err(ProviderCommand::ProcessTx { tx_hash }),
-        Commands::TransferUsdc { direction, amount } => {
-            Err(ProviderCommand::TransferUsdc { direction, amount })
-        }
-        Commands::VaultDeposit {
-            amount,
-            token,
-            vault_id,
-            decimals,
-        } => Err(ProviderCommand::VaultDeposit {
-            amount,
-            token,
-            vault_id,
-            decimals,
-        }),
-        Commands::VaultWithdraw { amount } => Err(ProviderCommand::VaultWithdraw { amount }),
-        Commands::CctpBridge { amount, all, from } => {
-            Err(ProviderCommand::CctpBridge { amount, all, from })
-        }
-        Commands::CctpRecover {
-            burn_tx,
-            source_chain,
-        } => Err(ProviderCommand::CctpRecover {
-            burn_tx,
-            source_chain,
-        }),
-        Commands::ResetAllowance { chain } => Err(ProviderCommand::ResetAllowance { chain }),
-        Commands::AlpacaTokenize {
-            symbol,
-            quantity,
-            token,
-            recipient,
-        } => Err(ProviderCommand::AlpacaTokenize {
-            symbol,
-            quantity,
-            token,
-            recipient,
-        }),
-        Commands::AlpacaRedeem {
-            symbol,
-            quantity,
-            token,
-        } => Err(ProviderCommand::AlpacaRedeem {
-            symbol,
-            quantity,
-            token,
-        }),
-        Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
-    }
-}
-
-async fn run_simple_command<W: Write>(
-    command: SimpleCommand,
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    stdout: &mut W,
-) -> anyhow::Result<()> {
-    match command {
-        SimpleCommand::Buy {
             symbol,
             quantity,
             time_in_force,
@@ -639,13 +447,13 @@ async fn run_simple_command<W: Write>(
                 quantity,
                 Direction::Buy,
                 time_in_force,
-                ctx,
+                &ctx,
                 pool,
                 stdout,
             )
-            .await
+            .await?;
         }
-        SimpleCommand::Sell {
+        Commands::Sell {
             symbol,
             quantity,
             time_in_force,
@@ -655,89 +463,95 @@ async fn run_simple_command<W: Write>(
                 quantity,
                 Direction::Sell,
                 time_in_force,
-                ctx,
+                &ctx,
                 pool,
                 stdout,
             )
-            .await
+            .await?;
         }
-        SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
-        SimpleCommand::TransferEquity {
+        Commands::Auth => auth::auth_command(stdout, &ctx.broker, pool).await?,
+        Commands::TransferEquity {
             direction,
             symbol,
             quantity,
         } => {
-            rebalancing::transfer_equity_command(stdout, direction, &symbol, quantity, ctx, pool)
-                .await
+            rebalancing::transfer_equity_command(stdout, direction, &symbol, quantity, &ctx, pool)
+                .await?;
         }
-        SimpleCommand::AlpacaDeposit { amount } => {
-            alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
-                .await
-        }
-        SimpleCommand::AlpacaWhitelist { address } => {
-            alpaca_wallet::alpaca_whitelist_command(stdout, address, ctx).await
-        }
-        SimpleCommand::AlpacaWhitelistList => {
-            alpaca_wallet::alpaca_whitelist_list_command(stdout, ctx).await
-        }
-        SimpleCommand::AlpacaUnwhitelist { address } => {
-            alpaca_wallet::alpaca_unwhitelist_command(stdout, address, ctx).await
-        }
-        SimpleCommand::AlpacaWithdraw { amount, to_address } => {
-            alpaca_wallet::alpaca_withdraw_command::<OpenChainErrorRegistry, _>(
-                stdout, amount, to_address, ctx,
+        Commands::AlpacaDeposit { amount } => {
+            alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(
+                stdout, amount, &ctx,
             )
-            .await
+            .await?;
         }
-        SimpleCommand::AlpacaTransfers { pending } => {
-            alpaca_wallet::alpaca_transfers_command(stdout, pending, ctx).await
+        Commands::AlpacaWhitelist { address } => {
+            alpaca_wallet::alpaca_whitelist_command(stdout, address, &ctx).await?;
         }
-        SimpleCommand::AlpacaConvert { direction, amount } => {
-            alpaca_wallet::alpaca_convert_command(stdout, direction, amount, ctx).await
+        Commands::AlpacaWhitelistList => {
+            alpaca_wallet::alpaca_whitelist_list_command(stdout, &ctx).await?;
         }
-        SimpleCommand::AlpacaJournal {
+        Commands::AlpacaUnwhitelist { address } => {
+            alpaca_wallet::alpaca_unwhitelist_command(stdout, address, &ctx).await?;
+        }
+        Commands::AlpacaWithdraw { amount, to_address } => {
+            alpaca_wallet::alpaca_withdraw_command::<OpenChainErrorRegistry, _>(
+                stdout, amount, to_address, &ctx,
+            )
+            .await?;
+        }
+        Commands::AlpacaTransfers { pending } => {
+            alpaca_wallet::alpaca_transfers_command(stdout, pending, &ctx).await?;
+        }
+        Commands::AlpacaConvert { direction, amount } => {
+            alpaca_wallet::alpaca_convert_command(stdout, direction, amount, &ctx).await?;
+        }
+        Commands::AlpacaJournal {
             destination,
             symbol,
             quantity,
         } => {
-            alpaca_wallet::alpaca_journal_command(stdout, destination, symbol, quantity, ctx).await
+            alpaca_wallet::alpaca_journal_command(stdout, destination, symbol, quantity, &ctx)
+                .await?;
         }
-        SimpleCommand::OrderStatus { order_id } => {
-            trading::order_status_command(stdout, &order_id, ctx, pool).await
+        Commands::AlpacaBenchmark {
+            symbol,
+            round_trips,
+            quantity,
+            output,
+        } => {
+            benchmark::alpaca_benchmark_command(
+                stdout,
+                symbol,
+                round_trips,
+                quantity,
+                output,
+                &ctx,
+            )
+            .await?;
         }
-    }
-}
-
-async fn run_provider_command<W: Write>(
-    command: ProviderCommand,
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    stdout: &mut W,
-    order_placer: Arc<dyn OrderPlacer>,
-) -> anyhow::Result<()> {
-    let provider = ProviderBuilder::new()
-        .connect_ws(WsConnect::new(ctx.evm.ws_rpc_url.as_str()))
-        .await?;
-
-    match command {
-        ProviderCommand::ProcessTx { tx_hash } => {
+        Commands::OrderStatus { order_id } => {
+            trading::order_status_command(stdout, &order_id, &ctx, pool).await?;
+        }
+        Commands::ProcessTx { tx_hash } => {
             info!("Processing transaction: tx_hash={tx_hash}");
+            let provider = connect_ws_provider(&ctx).await?;
             let cache = SymbolCache::default();
+            let order_placer = trading::create_order_placer(&ctx, pool);
             trading::process_tx_with_provider(
                 tx_hash,
-                ctx,
+                &ctx,
                 pool,
                 stdout,
                 &provider,
                 &cache,
                 order_placer,
             )
-            .await
+            .await?;
         }
-        ProviderCommand::TransferUsdc { direction, amount } => {
-            rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
+        Commands::TransferUsdc { direction, amount } => {
+            rebalancing::transfer_usdc_command(stdout, direction, amount, &ctx, pool).await?;
         }
-        ProviderCommand::VaultDeposit {
+        Commands::VaultDeposit {
             amount,
             token,
             vault_id,
@@ -749,42 +563,54 @@ async fn run_provider_command<W: Write>(
                 vault_id,
                 decimals,
             };
-            vault::vault_deposit_command(stdout, deposit, ctx, pool).await
+            vault::vault_deposit_command(stdout, deposit, &ctx, pool).await?;
         }
-        ProviderCommand::VaultWithdraw { amount } => {
-            vault::vault_withdraw_command(stdout, amount, ctx, pool).await
+        Commands::VaultWithdraw { amount } => {
+            vault::vault_withdraw_command(stdout, amount, &ctx, pool).await?;
         }
-        ProviderCommand::CctpBridge { amount, all, from } => {
-            cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)
-                .await
+        Commands::CctpBridge { amount, all, from } => {
+            cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, &ctx)
+                .await?;
         }
-        ProviderCommand::CctpRecover {
+        Commands::CctpRecover {
             burn_tx,
             source_chain,
-        } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, ctx).await,
-        ProviderCommand::ResetAllowance { chain } => {
-            cctp::reset_allowance_command::<OpenChainErrorRegistry, _>(stdout, chain, ctx).await
+        } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, &ctx).await?,
+        Commands::ResetAllowance { chain } => {
+            cctp::reset_allowance_command::<OpenChainErrorRegistry, _>(stdout, chain, &ctx).await?;
         }
-        ProviderCommand::AlpacaTokenize {
+        Commands::AlpacaTokenize {
             symbol,
             quantity,
             token,
             recipient,
         } => {
+            let provider = connect_ws_provider(&ctx).await?;
             rebalancing::alpaca_tokenize_command(
-                stdout, symbol, quantity, token, recipient, ctx, provider,
+                stdout, symbol, quantity, token, recipient, &ctx, provider,
             )
-            .await
+            .await?;
         }
-        ProviderCommand::AlpacaRedeem {
+        Commands::AlpacaRedeem {
             symbol,
             quantity,
             token,
-        } => rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, ctx).await,
-        ProviderCommand::AlpacaTokenizationRequests => {
-            rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
+        } => rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, &ctx).await?,
+        Commands::AlpacaTokenizationRequests => {
+            rebalancing::alpaca_tokenization_requests_command(stdout, &ctx).await?;
         }
     }
+
+    info!("CLI operation completed successfully");
+    Ok(())
+}
+
+async fn connect_ws_provider(
+    ctx: &Ctx,
+) -> anyhow::Result<impl alloy::providers::Provider + Clone + 'static> {
+    Ok(ProviderBuilder::new()
+        .connect_ws(WsConnect::new(ctx.evm.ws_rpc_url.as_str()))
+        .await?)
 }
 
 #[cfg(test)]

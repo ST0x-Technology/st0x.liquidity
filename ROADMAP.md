@@ -2,6 +2,12 @@
 
 ## Current Development Focus
 
+### Alpaca Tokenization Benchmarking
+
+- [x] [#338 Benchmark Alpaca tokenization pipeline latency for external partners](https://github.com/ST0x-Technology/st0x.liquidity/issues/338)
+  - PR:
+    [#339 benchmark Alpaca tokenization pipeline latency](https://github.com/ST0x-Technology/st0x.liquidity/pull/339)
+
 ### Fireblocks Contract Calls
 
 - [x] [#325 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/issues/325)

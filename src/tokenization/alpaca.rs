@@ -27,7 +27,6 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -41,6 +40,7 @@ use super::{Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::onchain::io::{OneToOneTokenizedShares, TokenizedSymbol};
+use crate::threshold::Usd;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
@@ -185,6 +185,16 @@ pub(crate) enum TokenizationRequestStatus {
     Rejected,
 }
 
+impl std::fmt::Display for TokenizationRequestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Completed => write!(f, "completed"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
 /// Token issuer identifier.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Issuer(String);
@@ -215,7 +225,7 @@ pub(crate) struct TokenizationRequest {
     pub(crate) issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub(crate) tx_hash: Option<TxHash>,
-    fees: Option<Decimal>,
+    pub(crate) fees: Option<Usd>,
     pub(crate) created_at: DateTime<Utc>,
     updated_at: Option<DateTime<Utc>>,
 }
@@ -1585,5 +1595,58 @@ pub(crate) mod tests {
             request.token_symbol, None,
             "Empty token_symbol string should deserialize as None"
         );
+    }
+
+    #[test]
+    fn fees_absent_deserializes_as_none() {
+        let json = json!({
+            "tokenization_request_id": "req_no_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "5",
+            "issuer": "alpaca",
+            "network": "base",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.fees, None);
+    }
+
+    #[test]
+    fn fees_null_deserializes_as_none() {
+        let json = json!({
+            "tokenization_request_id": "req_null_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "5",
+            "issuer": "alpaca",
+            "network": "base",
+            "fees": null,
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.fees, None);
+    }
+
+    #[test]
+    fn fees_with_value_deserializes_as_some() {
+        let json = json!({
+            "tokenization_request_id": "req_with_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "5",
+            "issuer": "alpaca",
+            "network": "base",
+            "fees": "1.50",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.fees, Some(Usd(dec!(1.50))));
     }
 }

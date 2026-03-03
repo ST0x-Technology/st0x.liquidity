@@ -52,18 +52,21 @@ through. Work until all tasks complete unless blocked needing user input.
 
 ## Planning Hierarchy
 
-The project uses a strict document hierarchy:
+Follow the global workflow (see `~/.claude/CLAUDE.md` "Starting Work" section)
+for the complete step-by-step process. This project adds a document hierarchy on
+top:
 
 1. **SPEC.md** - Source of truth for system behavior. Features documented here
    before implementation.
-2. **ROADMAP.md / GitHub Issues** - Downstream from spec. Describe problems, not
-   solutions.
+2. **ROADMAP.md / GitHub Issues** - Downstream from spec. Describe only target
+   outcomes, desired behaviors, and invariants — no solution proposals.
 3. **Planning** - Downstream from issues. Implementation plans before coding.
-4. **Tests** - Downstream from plan. Written before implementation (TDD).
+4. **Tests** - Downstream from plan. Written before implementation, must fail at
+   runtime for the expected reason before any implementation is written.
 5. **Implementation** - Makes the tests pass.
 
 **Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
-plan the implementation.
+branch + PR created (per global workflow) -> plan approved -> tests failing.
 
 ## Plan & Review
 
@@ -523,59 +526,53 @@ reviewing code that uses configuration instead of reading secrets directly.
 
 ### Testing Strategy
 
-- **Mock Blockchain Interactions**: Uses `alloy::providers::mock::Asserter` for
-  deterministic testing
-- **HTTP API Mocking**: `httpmock` crate for Charles Schwab API testing
-- **Database Isolation**: In-memory SQLite databases for test isolation
-- **Edge Case Coverage**: Comprehensive error scenario testing for trade
-  conversion logic
-- **Testing Principle**: Follow the testing pyramid — most coverage in unit
-  tests, fewer integration tests, fewest e2e tests. Integration tests may cover
-  failure scenarios when those failures can only be triggered by wiring multiple
-  components together
-- **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: Tests
-  exist to verify the system works correctly. If code is broken or incomplete,
-  tests MUST assert the correct expected behavior and FAIL until the code is
-  fixed. NEVER write tests that assert incorrect behavior with comments like
-  "documenting the gap" or "will fix later". A failing test is the correct way
-  to flag broken code - it forces the issue to be addressed. Tests that pass
-  while asserting wrong behavior are worse than no tests at all.
-- **CRITICAL: NEVER delete, skip, or bypass existing tests or checks to make a
-  refactor easier.** If a refactor breaks existing tests, you MUST either: (1)
-  adapt the tests to the new design while preserving their coverage, (2) find a
-  design that keeps the tests passing, or (3) stop and ask the user how to
-  proceed. Replacing tests with comments like "these no longer apply" or
-  "validated by other means" is strictly forbidden. Tests are constraints on
-  correctness -- if your change can't satisfy them, the change is wrong.
-- **Debugging failing tests**: When debugging tests with failing assert! macros,
-  add additional context to the assert! macro instead of adding temporary
-  println! statements
-- **No ad-hoc debugging scripts**: Never write ad-hoc scripts, code snippets, or
-  temporary files outside the project for debugging. If you need to debug an
-  issue, write a proper test function within the project's test suite and remove
-  it once you've obtained the information you need.
-- **Test Quality**: Never write tests that only exercise language features
-  without testing our application logic. Tests should verify actual business
-  logic, not just struct field assignments or basic language operations
-- **Property-Based Testing**: Use `proptest` for property-based tests whenever
-  there are clear invariants to verify. Property tests are excellent for:
-  - Parsing/serialization roundtrips
-  - Boundary conditions (e.g., message length validation)
-  - Invariants that should hold for all inputs (e.g., extracted data matches
-    input regardless of surrounding bytes)
-  - Numeric operations where edge cases are hard to enumerate manually
+Follow the global workflow's testing pyramid (see `~/.claude/CLAUDE.md` Phase
+3). Below are project-specific tooling and rules.
 
-#### Writing Meaningful Tests
+#### Project-Specific Tooling
 
-Tests must verify application logic, not language features. Testing struct field
-assignments is useless; test actual behavior like
-`config.calculate_next_poll_delay()` returning expected values.
+- **Blockchain mocking**: `alloy::providers::mock::Asserter`
+- **HTTP API mocking**: `httpmock` for brokerage APIs (Schwab, Alpaca)
+- **Database isolation**: In-memory SQLite (`":memory:"`)
+- **Logging assertions**: `tracing-test` for integration tests
+- **Property testing**: `proptest` — mandatory for financial calculations,
+  parsing roundtrips, invariants, boundary conditions
+- **Error conversion**: Always `#[from]` with thiserror, never `.map_err`
+
+#### Testing Pyramid (this project)
+
+- **Property-based tests**: Mandatory for financial calculations, numeric
+  conversions, parsing roundtrips, and any input-independent invariant.
+- **Unit tests**: Happy path + error paths (exact variants) + BDD-style.
+- **Integration tests**: Happy path, integration failures, concurrency footguns
+  (multi-venue trading system — concurrency testing is critical).
+- **E2E tests**: Blackbox tests with randomized mock venues, random error
+  injection, unstable latencies. Dashboard tests for operator experience. E2E
+  lives outside the module under test, uses only consumer-facing interfaces.
+  CQRS/ES: may insert events into event store only (not snapshots/projections).
+- **Nevereprod**: Failing tests proving the issue before touching non-test code.
+
+#### Test Discipline
+
+- **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: If
+  code is broken or incomplete, tests MUST assert the correct expected behavior
+  and FAIL until fixed. Tests that pass while asserting wrong behavior are worse
+  than no tests at all.
+- **CRITICAL: NEVER delete, skip, or bypass existing tests to make a refactor
+  easier.** Either: (1) adapt tests to the new design preserving coverage, (2)
+  find a design that keeps tests passing, or (3) stop and ask the user.
+- **Test quality**: Tests must verify business logic, not language features.
+  Testing struct field assignments is useless.
+- **Debugging**: Add context to `assert!` macros instead of `println!`.
+- **No ad-hoc scripts**: Debug via proper test functions in the test suite.
 
 ### Workflow Best Practices
 
-- **Always run verification steps before handing over a piece of work** (skip if
-  only documentation/markdown files were changed). Run them in this order to
-  fail fast:
+Follow the global workflow's Phase 5 (Quality) for the general process. Below
+are this project's specific verification steps.
+
+- **Verification order** (skip if only documentation/markdown changed). Run in
+  this order to fail fast:
   1. `cargo check` - fastest, catches compilation errors first
   2. `cargo test --workspace -q` - only run after check passes
   3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
@@ -587,6 +584,15 @@ assignments is useless; test actual behavior like
   subsequent code changes will introduce new lint issues. Complete every task on
   the list first (`cargo check` + `cargo test` passing), then run clippy as a
   final pass before handing over.
+- **Mandatory refactoring pass**: After getting code working (check + test
+  passing), review ALL new code for useless abstractions before running clippy.
+  Remove: one-liner wrapper functions, traits with a single implementation that
+  just delegate, enum/struct hierarchies that mirror another type 1:1 without
+  adding information, indirection layers that exist "for structure" but carry no
+  semantic meaning. If a function body is a single call/expression, inline it.
+  If an abstraction doesn't make invalid states unrepresentable or decouple
+  independent concerns, delete it. Getting something working is step one; making
+  it excellent is step two.
 
 #### CRITICAL: Quality Control Policy
 
