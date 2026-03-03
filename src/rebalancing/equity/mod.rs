@@ -386,7 +386,9 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             "Tokens received, verifying onchain"
         );
 
-        let unwrapped_token = self.wrapper.lookup_unwrapped(&tokens_received.symbol)?;
+        let unwrapped_token = self
+            .wrapper
+            .lookup_tokenized_equity(&tokens_received.symbol)?;
         self.tokenizer
             .verify_mint_tx(
                 tokens_received.tx_hash,
@@ -862,6 +864,37 @@ mod tests {
                 MintError::Verification(MintVerificationError::NoMatchingTransfer { .. })
             ),
             "Expected Verification(NoMatchingTransfer) error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_fails_when_insufficient_transfer_amount() {
+        let tokenizer = MockTokenizer::new()
+            .with_verification_outcome(MockVerificationOutcome::InsufficientTransferAmount);
+
+        let transfer = create_equity_transfer(
+            Arc::new(tokenizer),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintError::Verification(MintVerificationError::InsufficientTransferAmount { .. })
+            ),
+            "Expected Verification(InsufficientTransferAmount) error, got: {error:?}"
         );
     }
 }

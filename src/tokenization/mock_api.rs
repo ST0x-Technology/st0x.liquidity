@@ -9,10 +9,6 @@
 //! content. Mint requests transition from "pending" to "completed" after a
 //! configurable number of polls.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
-
 use alloy::primitives::utils::parse_units;
 use alloy::primitives::{Address, U256, address};
 use alloy::providers::Provider;
@@ -22,12 +18,17 @@ use chrono::Utc;
 use httpmock::prelude::*;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
 
 use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::TEST_ACCOUNT_ID;
+
+use crate::bindings::DeployableERC20;
 
 sol! {
     #[sol(all_derives = true)]
@@ -41,6 +42,7 @@ pub const REDEMPTION_WALLET: Address = address!("0x12345678901234567890123456789
 pub enum TokenizationStatus {
     Pending,
     Completed,
+    Failed,
 }
 
 impl std::fmt::Display for TokenizationStatus {
@@ -48,6 +50,7 @@ impl std::fmt::Display for TokenizationStatus {
         match self {
             Self::Pending => write!(formatter, "pending"),
             Self::Completed => write!(formatter, "completed"),
+            Self::Failed => write!(formatter, "failed"),
         }
     }
 }
@@ -210,6 +213,103 @@ impl AlpacaTokenizationMock {
             })
             .collect()
     }
+
+    /// Starts a background task that executes real ERC-20 transfers on the
+    /// Anvil chain when mint requests reach the "completed" threshold.
+    ///
+    /// `token_addresses` maps underlying symbol -> token contract address.
+    /// When a mint request has `needs_mint_execution`, this task transfers
+    /// the requested quantity from the chain owner to the bot's wallet,
+    /// records the real tx hash, and marks the request as completed.
+    pub fn start_mint_executor<P: Provider + Clone + Send + Sync + 'static>(
+        &mut self,
+        provider: P,
+        token_addresses: HashMap<String, Address>,
+    ) {
+        let state = self.state.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Collect pending mints that need onchain execution.
+                let pending_mints: Vec<(usize, Decimal, Address, Address)> = {
+                    let mut guard = lock(&state);
+                    let mut valid = Vec::new();
+
+                    for (idx, req) in guard.requests.iter().enumerate() {
+                        if !req.needs_mint_execution {
+                            continue;
+                        }
+
+                        match token_addresses.get(&req.underlying_symbol) {
+                            Some(token_addr) => {
+                                valid.push((idx, req.quantity, req.wallet_address, *token_addr));
+                            }
+                            None => {
+                                warn!(
+                                    symbol = %req.underlying_symbol,
+                                    wallet = %req.wallet_address,
+                                    idx,
+                                    "unknown symbol in mint request, marking as failed"
+                                );
+                            }
+                        }
+                    }
+
+                    // Mark unknown-symbol requests as failed so they don't
+                    // spin forever with needs_mint_execution = true.
+                    for req in &mut guard.requests {
+                        if req.needs_mint_execution
+                            && !token_addresses.contains_key(&req.underlying_symbol)
+                        {
+                            req.needs_mint_execution = false;
+                            req.status = TokenizationStatus::Failed;
+                        }
+                    }
+
+                    drop(guard);
+                    valid
+                };
+
+                for (idx, quantity, wallet, token_addr) in pending_mints {
+                    // Convert decimal quantity to U256 with 18 decimals
+                    let quantity_str = quantity.to_string();
+                    let Ok(amount_signed) = parse_units(&quantity_str, 18) else {
+                        warn!(%wallet, %quantity, %token_addr, "failed to parse quantity as 18-decimal units, skipping mint");
+                        continue;
+                    };
+                    let amount: U256 = amount_signed.into();
+
+                    // Execute real ERC-20 transfer on Anvil
+                    let token = DeployableERC20::new(token_addr, &provider);
+                    let Ok(pending_tx) = token.transfer(wallet, amount).send().await else {
+                        warn!(%wallet, %amount, %token_addr, "ERC-20 transfer send failed, skipping mint");
+                        continue;
+                    };
+                    let Ok(receipt) = pending_tx.get_receipt().await else {
+                        warn!(%token_addr, "failed to get transfer receipt, skipping mint");
+                        continue;
+                    };
+
+                    let real_tx_hash = format!("{:#x}", receipt.transaction_hash);
+
+                    let mut guard = lock(&state);
+                    if let Some(req) = guard.requests.get_mut(idx) {
+                        req.tx_hash = real_tx_hash;
+                        if receipt.status() {
+                            req.status = TokenizationStatus::Completed;
+                        } else {
+                            warn!(%token_addr, "mint transfer reverted on-chain");
+                            req.status = TokenizationStatus::Failed;
+                        }
+                        req.needs_mint_execution = false;
+                    }
+                }
+            }
+        });
+        self.mint_executor = Some(handle);
+    }
 }
 
 /// Scans a single block for ERC-20 Transfer events to `redemption_wallet`
@@ -314,128 +414,6 @@ async fn scan_redemption_range<P: Provider>(
         }
     }
 
-    /// Starts a background task that executes real ERC-20 transfers on the
-    /// Anvil chain when mint requests reach the "completed" threshold.
-    ///
-    /// `token_addresses` maps underlying symbol -> token contract address.
-    /// When a mint request has `needs_mint_execution`, this task transfers
-    /// the requested quantity from the chain owner to the bot's wallet,
-    /// records the real tx hash, and marks the request as completed.
-    pub fn start_mint_executor<P: Provider + Clone + Send + Sync + 'static>(
-        &mut self,
-        provider: P,
-        token_addresses: HashMap<String, Address>,
-    ) {
-        let state = self.state.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                // Collect pending mints that need onchain execution.
-                let pending_mints: Vec<(usize, String, String, Address)> = {
-                    let mut guard = lock(&state);
-                    let mut valid = Vec::new();
-
-                    for (idx, req) in guard.requests.iter().enumerate() {
-                        if !req.needs_mint_execution {
-                            continue;
-                        }
-
-                        match token_addresses.get(&req.underlying_symbol) {
-                            Some(token_addr) => {
-                                valid.push((
-                                    idx,
-                                    req.qty.clone(),
-                                    req.wallet_address.clone(),
-                                    *token_addr,
-                                ));
-                            }
-                            None => {
-                                warn!(
-                                    symbol = %req.underlying_symbol,
-                                    wallet = %req.wallet_address,
-                                    idx,
-                                    "unknown symbol in mint request, marking as failed"
-                                );
-                            }
-                        }
-                    }
-
-                    // Mark unknown-symbol requests as failed so they don't
-                    // spin forever with needs_mint_execution = true.
-                    for (_idx, req) in guard.requests.iter_mut().enumerate() {
-                        if req.needs_mint_execution
-                            && !token_addresses.contains_key(&req.underlying_symbol)
-                        {
-                            req.needs_mint_execution = false;
-                            req.status = "failed".to_string();
-                        }
-                    }
-
-                    drop(guard);
-                    valid
-                };
-
-                for (idx, qty_str, wallet_str, token_addr) in pending_mints {
-                    // Parse wallet address from the request
-                    let Ok(wallet) = wallet_str.parse::<Address>() else {
-                        warn!(%wallet_str, %qty_str, %token_addr, "invalid wallet address, skipping mint");
-                        continue;
-                    };
-
-                    // Convert decimal qty string to U256 with 18 decimals
-                    let Ok(amount_signed) = parse_units(&qty_str, 18) else {
-                        warn!(%wallet_str, %qty_str, %token_addr, "failed to parse qty as 18-decimal units, skipping mint");
-                        continue;
-                    };
-                    let amount: U256 = amount_signed.into();
-
-                    // Execute real ERC-20 transfer on Anvil
-                    let token = DeployableERC20::new(token_addr, &provider);
-                    let Ok(pending_tx) = token.transfer(wallet, amount).send().await else {
-                        warn!(%wallet, %amount, %token_addr, "ERC-20 transfer send failed, skipping mint");
-                        continue;
-                    };
-                    let Ok(receipt) = pending_tx.get_receipt().await else {
-                        warn!(%token_addr, "failed to get transfer receipt, skipping mint");
-                        continue;
-                    };
-
-                    let real_tx_hash = format!("{:#x}", receipt.transaction_hash);
-
-                    let mut guard = lock(&state);
-                    if let Some(req) = guard.requests.get_mut(idx) {
-                        req.tx_hash = real_tx_hash;
-                        if receipt.status() {
-                            req.status = "completed".to_string();
-                        } else {
-                            warn!(%token_addr, "mint transfer reverted on-chain");
-                            req.status = "failed".to_string();
-                        }
-                        req.needs_mint_execution = false;
-                    }
-                }
-            }
-        });
-        self.mint_executor = Some(handle);
-    }
-
-    /// Returns a snapshot of all tokenization requests (mint + redeem).
-    pub fn tokenization_requests(&self) -> Vec<MockTokenizationRequestSnapshot> {
-        let state = lock(&self.state);
-        state
-            .requests
-            .iter()
-            .map(|request| MockTokenizationRequestSnapshot {
-                request_id: request.tokenization_request_id.clone(),
-                request_type: request.request_type.clone(),
-                symbol: request.underlying_symbol.clone(),
-                qty: request.qty.clone(),
-                status: request.status.clone(),
-            })
-            .collect()
-    }
     true
 }
 
