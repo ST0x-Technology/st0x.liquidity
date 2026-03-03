@@ -183,23 +183,26 @@ pub async fn poll_for_events_with_timeout(
             continue;
         };
 
-        let count = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM events WHERE event_type = ?")
-            .bind(event_type)
-            .fetch_one(&pool)
-            .await
-            .map(|row| row.0)
-            .unwrap_or(0);
+        let query_result =
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind(event_type)
+                .fetch_one(&pool)
+                .await;
 
         pool.close().await;
 
-        if count >= expected_count {
-            return;
+        match query_result {
+            Ok((count,)) if count >= expected_count => return,
+            Ok((count,)) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (found {count})",
+            ),
+            Err(query_error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} \
+                 (query failed: {query_error})",
+            ),
         }
-
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Timed out after {timeout:?} waiting for {context} (found {count})",
-        );
     }
 }
 
@@ -232,31 +235,33 @@ pub async fn poll_for_aggregate_events_containing(
             continue;
         };
 
-        let count = sqlx::query_as::<_, (i64,)>(
+        let query_result = sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM events \
              WHERE aggregate_type = ? AND event_type LIKE '%' || ? || '%'",
         )
         .bind(aggregate_type)
         .bind(type_substring)
         .fetch_one(&pool)
-        .await
-        .map(|row| row.0)
-        .unwrap_or(0);
+        .await;
 
         pool.close().await;
 
-        if count >= expected_count {
-            return;
+        match query_result {
+            Ok((count,)) if count >= expected_count => return,
+            Ok((count,)) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (found {count})",
+            ),
+            Err(query_error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} \
+                 (query failed: {query_error})",
+            ),
         }
-
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Timed out after {timeout:?} waiting for {context} (found {count})",
-        );
     }
 }
 
-/// Opens a read-only SQLite connection to the test database.
+/// Opens a SQLite connection to the test database.
 pub async fn connect_db(db_path: &std::path::Path) -> anyhow::Result<SqlitePool> {
     let url = format!("sqlite:{}", db_path.display());
     Ok(SqlitePool::connect(&url).await?)

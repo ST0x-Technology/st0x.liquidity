@@ -14,5 +14,6 @@ pub(crate) use rebalancer::Rebalancer;
 pub(crate) use spawn::{RebalancerServices, RebalancingCqrsFrameworks};
 #[cfg(any(test, feature = "test-support"))]
 pub use trigger::UsdcRebalancing;
-pub use trigger::{RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets};
+pub(crate) use trigger::{RebalancingConfig, RebalancingSecrets};
+pub use trigger::{RebalancingCtx, RebalancingCtxError};
 pub(crate) use trigger::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};

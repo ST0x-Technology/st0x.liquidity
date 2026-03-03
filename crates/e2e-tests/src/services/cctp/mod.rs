@@ -5,7 +5,7 @@
 //! wires everything together for USDC rebalancing tests.
 
 pub mod attestation;
-pub mod contracts;
+pub(crate) mod contracts;
 mod infra;
 
 pub use infra::{CctpInfra, CctpOverrides, USDC_ETHEREUM};

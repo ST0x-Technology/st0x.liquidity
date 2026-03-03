@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
 use rust_decimal::Decimal;
-use st0x_execution::Symbol;
 use tempfile::TempDir;
+
+use st0x_execution::Symbol;
 
 use crate::services::alpaca_broker::{AlpacaBrokerMock, MockPosition};
 use crate::services::alpaca_tokenization::{AlpacaTokenizationMock, REDEMPTION_WALLET};

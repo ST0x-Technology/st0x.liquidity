@@ -19,8 +19,11 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use url::Url;
 
-pub use st0x_hedge::USDC_BASE;
 pub use st0x_hedge::bindings::{DeployableERC20, IERC20};
+
+/// Base chain USDC address, defined locally so e2e tests don't
+/// need `st0x_hedge` to export the constant.
+pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -597,7 +600,7 @@ impl<P: Provider + Clone> BaseChain<P> {
     ///
     /// The order is created with the owner account and immediately taken by
     /// the same account. This emits a `TakeOrderV3` event that the bot
-    /// detects. Price is hardcoded to 100 (1 equity token = 100 USDC).
+    /// detects.
     ///
     /// `rain_expression_override`: Optional raw Rainlang expression string for
     /// the whole order expression. Used by regression tests that need exact

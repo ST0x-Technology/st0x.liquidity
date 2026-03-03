@@ -4,11 +4,6 @@
 //! assertion helpers (`assert_equity_rebalancing_flow`,
 //! `assert_usdc_rebalancing_flow`) used by the rebalancing e2e tests.
 
-use std::collections::HashMap;
-pub(crate) use std::str::FromStr;
-use std::sync::Arc;
-pub(crate) use std::time::Duration;
-
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
 pub(crate) use alloy::primitives::{U256, utils::parse_units};
@@ -25,16 +20,19 @@ use rain_math_float::Float;
 pub(crate) use rust_decimal::Decimal;
 pub(crate) use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
+pub(crate) use std::str::FromStr;
+use std::sync::Arc;
+pub(crate) use std::time::Duration;
 
-use st0x_event_sorcery::Store;
 use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Symbol, TimeInForce,
 };
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{BrokerCtx, Ctx, LogLevel, OperationalLimits};
-use st0x_hedge::{EquityTokenAddresses, EvmCtx, ImbalanceThreshold, TradingMode};
+use st0x_hedge::config::{BrokerCtx, Ctx};
+use st0x_hedge::{EquityTokenAddresses, ImbalanceThreshold, TradingMode};
 
 pub(crate) use e2e_tests::common::ExpectedPosition;
 use e2e_tests::common::{
@@ -153,7 +151,6 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         time_in_force: TimeInForce::Day,
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
-    let execution_threshold = broker_ctx.execution_threshold()?;
 
     let equities: HashMap<Symbol, EquityTokenAddresses> = equity_tokens
         .iter()
@@ -185,26 +182,16 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .ethereum_wallet(wallet)
         .call();
 
-    Ok(Ctx {
-        database_url: db_path.display().to_string(),
-        log_level: LogLevel::Debug,
-        server_port: 0,
-        operational_limits: OperationalLimits::Disabled,
-        evm: EvmCtx {
-            ws_rpc_url: chain.ws_endpoint()?,
-            orderbook: chain.orderbook_addr,
-            deployment_block,
-        },
-        order_polling_interval: 1,
-        order_polling_max_jitter: 0,
-        position_check_interval: 2,
-        inventory_poll_interval: 2,
-        broker: broker_ctx,
-        telemetry: None,
-        trading_mode: TradingMode::Rebalancing(Box::new(rebalancing_ctx)),
-        execution_threshold,
-        equities,
-    })
+    Ctx::for_test()
+        .database_url(db_path.display().to_string())
+        .ws_rpc_url(chain.ws_endpoint()?)
+        .orderbook(chain.orderbook_addr)
+        .deployment_block(deployment_block)
+        .broker(broker_ctx)
+        .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .equities(equities)
+        .call()
+        .map_err(Into::into)
 }
 
 /// Builds a `Ctx` with USDC rebalancing enabled and both chain endpoints.
@@ -231,7 +218,6 @@ where
         time_in_force: TimeInForce::Day,
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
-    let execution_threshold = broker_ctx.execution_threshold()?;
 
     let equities: HashMap<Symbol, EquityTokenAddresses> = equity_tokens
         .iter()
@@ -270,26 +256,17 @@ where
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
 
-    Ok(Ctx {
-        database_url: db_path.display().to_string(),
-        log_level: LogLevel::Debug,
-        server_port: 0,
-        operational_limits: OperationalLimits::Disabled,
-        evm: EvmCtx {
-            ws_rpc_url: base_chain.ws_endpoint()?,
-            orderbook: base_chain.orderbook_addr,
-            deployment_block,
-        },
-        order_polling_interval: 1,
-        order_polling_max_jitter: 0,
-        position_check_interval: 2,
-        inventory_poll_interval: 15,
-        broker: broker_ctx,
-        telemetry: None,
-        trading_mode: TradingMode::Rebalancing(Box::new(rebalancing_ctx)),
-        execution_threshold,
-        equities,
-    })
+    Ctx::for_test()
+        .database_url(db_path.display().to_string())
+        .ws_rpc_url(base_chain.ws_endpoint()?)
+        .orderbook(base_chain.orderbook_addr)
+        .deployment_block(deployment_block)
+        .broker(broker_ctx)
+        .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .equities(equities)
+        .inventory_poll_interval(15)
+        .call()
+        .map_err(Into::into)
 }
 
 pub(crate) enum EquityRebalanceType<'a> {
@@ -689,20 +666,31 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
         "Redeemed Raindex vault net share delta should match completed redeem qty minus concurrent mint wrapped shares"
     );
 
-    let aggregate_id = redeem_events[0].aggregate_id.clone();
-    let redemption_id = aggregate_id.parse::<st0x_hedge::RedemptionAggregateId>()?;
-    let redemption =
-        Store::<st0x_hedge::EquityRedemption>::load_from_pool(pool.clone(), &redemption_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Redemption aggregate should exist after events"))?;
-    let redemption_json = serde_json::to_value(&redemption)?;
-    let completed = redemption_json.get("Completed").ok_or_else(|| {
-        anyhow::anyhow!("Redemption should be in Completed state, got: {redemption_json}")
-    })?;
+    let last_event = redeem_events
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Expected at least one redemption event"))?;
     assert_eq!(
-        completed.get("symbol").and_then(|val| val.as_str()),
+        last_event.event_type, "EquityRedemptionEvent::Completed",
+        "Last redemption event should be Completed, got: {}",
+        last_event.event_type,
+    );
+
+    // Verify the symbol from the first event (WithdrawnFromRaindex carries
+    // it; the terminal Completed event only has a timestamp).
+    let first_event = &redeem_events[0];
+    let withdrawn = first_event
+        .payload
+        .get("WithdrawnFromRaindex")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "First redemption event payload missing WithdrawnFromRaindex, got: {:?}",
+                first_event.payload
+            )
+        })?;
+    assert_eq!(
+        withdrawn.get("symbol").and_then(|val| val.as_str()),
         Some(symbol),
-        "Completed redemption should be for {symbol}, got: {completed}"
+        "Redemption should be for {symbol}, got: {withdrawn}"
     );
 
     Ok(())

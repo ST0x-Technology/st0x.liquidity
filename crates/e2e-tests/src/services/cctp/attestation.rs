@@ -151,11 +151,18 @@ impl CctpAttestationMock {
 
         tokio::spawn(async move {
             let Ok(signer) = PrivateKeySigner::from_bytes(&attester_key) else {
-                return;
+                panic!("invalid attester private key");
             };
 
-            let mut eth_last_block = ethereum_provider.get_block_number().await.unwrap_or(0);
-            let mut base_last_block = base_provider.get_block_number().await.unwrap_or(0);
+            let Ok(eth_last_block) = ethereum_provider.get_block_number().await else {
+                panic!("failed to get initial Ethereum block number");
+            };
+            let mut eth_last_block = eth_last_block;
+
+            let Ok(base_last_block) = base_provider.get_block_number().await else {
+                panic!("failed to get initial Base block number");
+            };
+            let mut base_last_block = base_last_block;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;

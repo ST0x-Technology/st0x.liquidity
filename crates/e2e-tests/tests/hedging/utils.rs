@@ -1,13 +1,12 @@
 use alloy::primitives::{Address, B256, U256};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 use tokio::task::JoinHandle;
 
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+use st0x_hedge::TradingMode;
 use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{BrokerCtx, Ctx, LogLevel, OperationalLimits};
-use st0x_hedge::{EvmCtx, TradingMode};
+use st0x_hedge::config::{BrokerCtx, Ctx};
 
 use e2e_tests::common::{assert_broker_state, assert_cqrs_state};
 use e2e_tests::services::alpaca_broker;
@@ -40,6 +39,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     broker: &AlpacaBrokerMock,
     db_path: &std::path::Path,
     deployment_block: u64,
+    execution_threshold_override: Option<st0x_hedge::ExecutionThreshold>,
 ) -> anyhow::Result<Ctx> {
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         api_key: alpaca_broker::TEST_API_KEY.to_owned(),
@@ -49,30 +49,19 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
     });
-    let execution_threshold = broker_ctx.execution_threshold()?;
 
-    Ok(Ctx {
-        database_url: db_path.display().to_string(),
-        log_level: LogLevel::Debug,
-        server_port: 0,
-        operational_limits: OperationalLimits::Disabled,
-        evm: EvmCtx {
-            ws_rpc_url: chain.ws_endpoint()?,
-            orderbook: chain.orderbook_addr,
-            deployment_block,
-        },
-        order_polling_interval: 1,
-        order_polling_max_jitter: 0,
-        position_check_interval: 2,
-        inventory_poll_interval: 2,
-        broker: broker_ctx,
-        telemetry: None,
-        trading_mode: TradingMode::Standalone {
+    Ctx::for_test()
+        .database_url(db_path.display().to_string())
+        .ws_rpc_url(chain.ws_endpoint()?)
+        .orderbook(chain.orderbook_addr)
+        .deployment_block(deployment_block)
+        .broker(broker_ctx)
+        .trading_mode(TradingMode::Standalone {
             order_owner: chain.owner,
-        },
-        execution_threshold,
-        equities: HashMap::new(),
-    })
+        })
+        .maybe_execution_threshold_override(execution_threshold_override)
+        .call()
+        .map_err(Into::into)
 }
 
 /// Polls until the Position projection for `symbol` has `net == 0`,
@@ -101,12 +90,12 @@ pub(crate) async fn poll_for_hedged_position(
 
         let is_hedged = {
             let projection = Projection::<Position>::sqlite(pool.clone());
-            projection
-                .load(&target_symbol)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|position| position.net == FractionalShares::ZERO)
+            match projection.load(&target_symbol).await {
+                Ok(maybe_position) => {
+                    maybe_position.is_some_and(|position| position.net == FractionalShares::ZERO)
+                }
+                Err(load_error) => panic!("failed to load Position projection: {load_error}"),
+            }
         };
 
         pool.close().await;

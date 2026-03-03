@@ -166,10 +166,13 @@ impl AlpacaTokenizationMock {
 
                             // Decode quantity from Transfer event value (18 decimals)
                             let value = U256::from_be_slice(log.data().data.as_ref());
-                            let qty = FractionalShares::from_u256_18_decimals(value).map_or_else(
-                                |_| "0".to_string(),
-                                |shares| shares.inner().to_string(),
-                            );
+                            let Ok(shares) = FractionalShares::from_u256_18_decimals(value) else {
+                                panic!(
+                                    "failed to decode redemption quantity \
+                                     from Transfer event value: {value}"
+                                );
+                            };
+                            let qty = shares.inner().to_string();
 
                             let tx_hash_hex = format!("{tx_hash:#x}");
                             let wallet_hex = format!("{redemption_wallet:#x}");
@@ -233,15 +236,32 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
         when.method(POST)
             .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/mint"));
         then.respond_with(move |request: &HttpMockRequest| {
-            let body: Value = serde_json::from_slice(request.body().as_ref()).unwrap_or(json!({}));
+            let Ok(body) = serde_json::from_slice::<Value>(request.body().as_ref()) else {
+                return json_response(
+                    400,
+                    &json!({"message": "mint request body is not valid JSON"}),
+                );
+            };
 
-            let underlying_symbol = body["underlying_symbol"]
+            let Some(underlying_symbol) = body["underlying_symbol"].as_str() else {
+                return json_response(
+                    400,
+                    &json!({"message": "missing or non-string field: underlying_symbol"}),
+                );
+            };
+            let underlying_symbol = underlying_symbol.to_string();
+
+            let Some(qty) = body["qty"].as_str() else {
+                return json_response(400, &json!({"message": "missing or non-string field: qty"}));
+            };
+            let qty = qty.to_string();
+
+            let wallet_address = body["wallet_address"]
                 .as_str()
-                .unwrap_or("UNKNOWN")
-                .to_string();
-            let qty = body["qty"].as_str().unwrap_or("0").to_string();
-            let wallet_address = body["wallet_address"].as_str().unwrap_or("").to_string();
-            let issuer_request_id = body["issuer_request_id"].as_str().unwrap_or("").to_string();
+                .map_or_else(String::new, ToString::to_string);
+            let issuer_request_id = body["issuer_request_id"]
+                .as_str()
+                .map_or_else(String::new, ToString::to_string);
 
             let tokenization_request_id = Uuid::new_v4().to_string();
 

@@ -89,26 +89,26 @@ pub enum UsdcRebalancing {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RebalancingSecrets {
-    pub base_rpc_url: Url,
-    pub ethereum_rpc_url: Url,
-    pub fireblocks_api_user_id: FireblocksApiUserId,
-    pub fireblocks_secret_path: PathBuf,
+pub(crate) struct RebalancingSecrets {
+    pub(crate) base_rpc_url: Url,
+    pub(crate) ethereum_rpc_url: Url,
+    pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
+    pub(crate) fireblocks_secret_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RebalancingConfig {
-    pub equity: ImbalanceThreshold,
-    pub usdc: UsdcRebalancing,
-    pub redemption_wallet: Address,
-    pub usdc_vault_id: B256,
-    pub fireblocks_vault_account_id: FireblocksVaultAccountId,
-    pub fireblocks_chain_asset_ids: ChainAssetIds,
-    pub fireblocks_environment: FireblocksEnvironment,
+pub(crate) struct RebalancingConfig {
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancing,
+    pub(crate) redemption_wallet: Address,
+    pub(crate) usdc_vault_id: B256,
+    pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
+    pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
+    pub(crate) fireblocks_environment: FireblocksEnvironment,
     /// Override the Fireblocks API base URL. When absent, determined
     /// by `fireblocks_environment`.
-    pub fireblocks_base_url: Option<Url>,
+    pub(crate) fireblocks_base_url: Option<Url>,
 }
 
 /// Runtime configuration for rebalancing operations.

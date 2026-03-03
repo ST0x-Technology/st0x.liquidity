@@ -47,7 +47,7 @@ pub struct Env {
 /// between conservative limits or uncapped mode.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "lowercase")]
-pub enum OperationalLimits {
+pub(crate) enum OperationalLimits {
     Enabled {
         max_amount: Positive<Usdc>,
         max_shares: Positive<FractionalShares>,
@@ -127,20 +127,20 @@ pub enum TradingMode {
 /// encrypted secrets, and derived runtime state.
 #[derive(Clone)]
 pub struct Ctx {
-    pub database_url: String,
+    pub(crate) database_url: String,
     pub log_level: LogLevel,
-    pub server_port: u16,
-    pub operational_limits: OperationalLimits,
-    pub evm: EvmCtx,
-    pub order_polling_interval: u64,
-    pub order_polling_max_jitter: u64,
-    pub position_check_interval: u64,
-    pub inventory_poll_interval: u64,
-    pub broker: BrokerCtx,
+    pub(crate) server_port: u16,
+    pub(crate) operational_limits: OperationalLimits,
+    pub(crate) evm: EvmCtx,
+    pub(crate) order_polling_interval: u64,
+    pub(crate) order_polling_max_jitter: u64,
+    pub(crate) position_check_interval: u64,
+    pub(crate) inventory_poll_interval: u64,
+    pub(crate) broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    pub trading_mode: TradingMode,
-    pub execution_threshold: ExecutionThreshold,
-    pub equities: HashMap<Symbol, EquityTokenAddresses>,
+    pub(crate) trading_mode: TradingMode,
+    pub(crate) execution_threshold: ExecutionThreshold,
+    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -162,7 +162,7 @@ impl BrokerCtx {
         }
     }
 
-    pub fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
+    fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
             Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(
                 Positive::<FractionalShares>::ONE,
@@ -485,6 +485,53 @@ impl Ctx {
         self.equities
             .get(symbol)
             .is_none_or(|equity| equity.enabled)
+    }
+}
+
+/// Test-only constructor for `Ctx` that internalizes fields e2e tests
+/// don't need to control (log level, operational limits, EVM wrapping,
+/// polling intervals). This keeps `Ctx` fields `pub(crate)` while
+/// providing a stable construction API for the e2e test crate.
+#[cfg(any(test, feature = "test-support"))]
+#[bon::bon]
+impl Ctx {
+    #[builder]
+    pub fn for_test(
+        database_url: String,
+        ws_rpc_url: Url,
+        orderbook: Address,
+        deployment_block: u64,
+        broker: BrokerCtx,
+        trading_mode: TradingMode,
+        #[builder(default)] equities: HashMap<Symbol, EquityTokenAddresses>,
+        #[builder(default = 2)] inventory_poll_interval: u64,
+        execution_threshold_override: Option<ExecutionThreshold>,
+    ) -> Result<Self, CtxError> {
+        let execution_threshold = match execution_threshold_override {
+            Some(threshold) => threshold,
+            None => broker.execution_threshold()?,
+        };
+
+        Ok(Self {
+            database_url,
+            log_level: LogLevel::Debug,
+            server_port: 0,
+            operational_limits: OperationalLimits::Disabled,
+            evm: EvmCtx {
+                ws_rpc_url,
+                orderbook,
+                deployment_block,
+            },
+            order_polling_interval: 1,
+            order_polling_max_jitter: 0,
+            position_check_interval: 2,
+            inventory_poll_interval,
+            broker,
+            telemetry: None,
+            trading_mode,
+            execution_threshold,
+            equities,
+        })
     }
 }
 

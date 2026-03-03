@@ -12,8 +12,9 @@ use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use rust_decimal_macros::dec;
-use st0x_execution::Symbol;
 use tokio::task::JoinHandle;
+
+use st0x_execution::Symbol;
 
 sol!(
     #![sol(all_derives = true, rpc)]

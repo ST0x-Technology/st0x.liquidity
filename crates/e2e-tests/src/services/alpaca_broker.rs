@@ -19,9 +19,10 @@ use chrono::Utc;
 use httpmock::prelude::*;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use st0x_execution::Symbol;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+use st0x_execution::Symbol;
 
 sol! {
     #[sol(all_derives = true)]
@@ -321,7 +322,7 @@ impl AlpacaBrokerMock {
             .positions
             .values()
             .map(|pos| MockPositionSnapshot {
-                symbol: pos.symbol.inner(),
+                symbol: pos.symbol.to_string(),
                 qty: pos.qty.to_string(),
                 market_value: pos.market_value.to_string(),
             })

@@ -796,17 +796,17 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
         .build();
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
-    let mut ctx = build_ctx()
-        .chain(&infra.base_chain)
-        .broker(&infra.broker_service)
-        .db_path(&infra.db_path)
-        .deployment_block(current_block)
-        .call()?;
 
     // High threshold: 200 shares -- well above any single trade, so
     // individual trades won't trigger hedging.
     let high_threshold = Positive::<FractionalShares>::new(FractionalShares::new(dec!(200)))?;
-    ctx.execution_threshold = ExecutionThreshold::Shares(high_threshold);
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .execution_threshold_override(ExecutionThreshold::Shares(high_threshold))
+        .call()?;
 
     let mut bot = spawn_bot(ctx);
 
