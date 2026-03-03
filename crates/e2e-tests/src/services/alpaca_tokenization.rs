@@ -267,7 +267,7 @@ impl AlpacaTokenizationMock {
 
                     // Mark unknown-symbol requests as failed so they don't
                     // spin forever with needs_mint_execution = true.
-                    for (_idx, req) in guard.requests.iter_mut().enumerate() {
+                    for req in &mut guard.requests {
                         if req.needs_mint_execution
                             && !token_addresses.contains_key(&req.underlying_symbol)
                         {
