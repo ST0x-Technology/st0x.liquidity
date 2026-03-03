@@ -242,6 +242,7 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
 mod tests {
     use alloy::primitives::{Address, address};
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
@@ -249,7 +250,9 @@ mod tests {
     use st0x_finance::Usdc;
 
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel, TradingMode};
+    use crate::config::{
+        AssetsConfig, BrokerCtx, CtxError, LogLevel, OperationalLimits, TradingMode,
+    };
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -258,6 +261,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
+            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -274,7 +278,7 @@ mod tests {
             },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: HashMap::new(),
                 cash: None,
             },
         }
