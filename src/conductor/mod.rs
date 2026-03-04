@@ -361,17 +361,17 @@ async fn seed_vault_registry_from_config(
             .await?;
     }
 
-    if let Some(cash) = &ctx.assets.cash {
-        if let Some(vault_id) = cash.vault_id {
-            info!(%vault_id, "Seeding USDC vault from config");
+    if let Some(cash) = &ctx.assets.cash
+        && let Some(vault_id) = cash.vault_id
+    {
+        info!(%vault_id, "Seeding USDC vault from config");
 
-            vault_registry
-                .send(
-                    &vault_registry_id,
-                    VaultRegistryCommand::SeedUsdcVaultFromConfig { vault_id },
-                )
-                .await?;
-        }
+        vault_registry
+            .send(
+                &vault_registry_id,
+                VaultRegistryCommand::SeedUsdcVaultFromConfig { vault_id },
+            )
+            .await?;
     }
 
     Ok(())
