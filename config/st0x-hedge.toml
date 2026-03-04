@@ -101,8 +101,8 @@ deployment_block = 40850446
 
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
-fireblocks_environment = "production"
-fireblocks_vault_account_id = "1"
+turnkey_organization_id = "REPLACE_WITH_TURNKEY_ORG_ID"
+turnkey_address = "0x0000000000000000000000000000000000000000"
 
 [rebalancing.equity]
 target = "0.5"
@@ -112,7 +112,3 @@ deviation = "0.2"
 mode = "disabled"
 # target = "0.5"
 # deviation = "0.3"
-
-[rebalancing.fireblocks_chain_asset_ids]
-1 = "ETH"
-8453 = "BASECHAIN_ETH"
