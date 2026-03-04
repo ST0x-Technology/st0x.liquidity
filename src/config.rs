@@ -1842,7 +1842,9 @@ pub(crate) mod tests {
                 let result = toml::from_str::<Wrapper>(&toml_str);
                 prop_assert!(
                     result.is_err(),
-                    "Expected error for invalid hex '{hex_str}', got {result:?}"
+                    "Expected error for invalid hex '{hex_str}', got {result:?}. \
+                     Parsed vault_id: {:?}",
+                    result.as_ref().ok().map(|w| w.vault_id),
                 );
             }
 
