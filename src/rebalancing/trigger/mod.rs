@@ -6,22 +6,25 @@ mod usdc;
 pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
 use alloy::primitives::{Address, B256};
-use alloy::providers::RootProvider;
+use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::fs;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
 use st0x_evm::Wallet;
-use st0x_evm::turnkey::{
-    TurnkeyApiPrivateKey, TurnkeyCtx, TurnkeyError, TurnkeyOrganizationId, TurnkeyWallet,
+use st0x_evm::fireblocks::{
+    ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment,
+    FireblocksVaultAccountId, FireblocksWallet,
 };
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
@@ -68,7 +71,15 @@ pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
     #[error(transparent)]
-    Turnkey(#[from] TurnkeyError),
+    Fireblocks(#[from] st0x_evm::fireblocks::FireblocksError),
+    #[error("failed to read Fireblocks secret file at {path:?}")]
+    FireblocksSecretRead {
+        path: PathBuf,
+        #[source]
+        error: std::io::Error,
+    },
+    #[error("missing Fireblocks asset ID for chain ID {chain_id}")]
+    MissingChainAssetId { chain_id: u64 },
     #[error("RPC error during wallet setup: {0}")]
     Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
     #[error(transparent)]
@@ -88,7 +99,8 @@ pub(crate) enum UsdcRebalancing {
 pub(crate) struct RebalancingSecrets {
     pub(crate) base_rpc_url: Url,
     pub(crate) ethereum_rpc_url: Url,
-    pub(crate) turnkey_api_private_key: TurnkeyApiPrivateKey,
+    pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
+    pub(crate) fireblocks_secret_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -98,8 +110,9 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: Option<B256>,
-    pub(crate) turnkey_organization_id: TurnkeyOrganizationId,
-    pub(crate) turnkey_address: Address,
+    pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
+    pub(crate) fireblocks_environment: FireblocksEnvironment,
+    pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -137,7 +150,7 @@ pub(crate) struct RebalancingCtx {
 impl RebalancingCtx {
     /// Construct from config, secrets, and broker auth.
     ///
-    /// Builds Turnkey wallets for both chains and stores them
+    /// Builds Fireblocks wallets for both chains and stores them
     /// immutably. Read-only provider access for either chain is
     /// available via `base_wallet().provider()` and
     /// `ethereum_wallet().provider()`.
@@ -146,22 +159,39 @@ impl RebalancingCtx {
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
+        let fireblocks_secret = match fs::read(&secrets.fireblocks_secret_path).await {
+            Ok(secret) => secret,
+            Err(error) => {
+                error!(
+                    ?error,
+                    path = ?secrets.fireblocks_secret_path,
+                    "Failed to read Fireblocks secret file"
+                );
+                return Err(RebalancingCtxError::FireblocksSecretRead {
+                    path: secrets.fireblocks_secret_path,
+                    error,
+                });
+            }
+        };
+
         let (base_wallet, ethereum_wallet) = tokio::try_join!(
             Self::build_wallet(
                 &config,
-                &secrets.turnkey_api_private_key,
+                &secrets.fireblocks_api_user_id,
+                &fireblocks_secret,
                 secrets.base_rpc_url,
             ),
             Self::build_wallet(
                 &config,
-                &secrets.turnkey_api_private_key,
+                &secrets.fireblocks_api_user_id,
+                &fireblocks_secret,
                 secrets.ethereum_rpc_url,
             ),
         )?;
 
         info!(
             wallet = %base_wallet.address(),
-            "Initialized Turnkey wallet"
+            "Initialized Fireblocks wallet"
         );
 
         Ok(Self {
@@ -183,15 +213,24 @@ impl RebalancingCtx {
 
     async fn build_wallet(
         config: &RebalancingConfig,
-        api_private_key: &TurnkeyApiPrivateKey,
+        api_user_id: &FireblocksApiUserId,
+        api_secret: &[u8],
         rpc_url: Url,
-    ) -> Result<TurnkeyWallet<RootProvider>, RebalancingCtxError> {
+    ) -> Result<FireblocksWallet<RootProvider>, RebalancingCtxError> {
         let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
+        let chain_id = provider.get_chain_id().await?;
+        let asset_id = config
+            .fireblocks_chain_asset_ids
+            .get(chain_id)
+            .cloned()
+            .ok_or(RebalancingCtxError::MissingChainAssetId { chain_id })?;
 
-        Ok(TurnkeyWallet::new(TurnkeyCtx {
-            api_private_key: api_private_key.clone(),
-            organization_id: config.turnkey_organization_id.clone(),
-            address: config.turnkey_address,
+        Ok(FireblocksWallet::new(FireblocksCtx {
+            api_user_id: api_user_id.clone(),
+            secret: api_secret.to_vec(),
+            vault_account_id: config.fireblocks_vault_account_id.clone(),
+            environment: config.fireblocks_environment,
+            asset_id,
             provider,
             required_confirmations: REQUIRED_CONFIRMATIONS,
         })
@@ -3119,8 +3158,12 @@ mod tests {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            turnkey_organization_id = "org-test"
-            turnkey_address = "0x2222222222222222222222222222222222222222"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equity]
             target = "0.5"
@@ -3137,7 +3180,8 @@ mod tests {
         r#"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
-            turnkey_api_private_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            fireblocks_api_user_id = "test-user"
+            fireblocks_secret_path = "/tmp/test.key"
         "#
     }
 
@@ -3171,8 +3215,12 @@ mod tests {
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            turnkey_organization_id = "org-test"
-            turnkey_address = "0x2222222222222222222222222222222222222222"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equity]
             target = "0.6"
@@ -3200,8 +3248,12 @@ mod tests {
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            turnkey_organization_id = "org-test"
-            turnkey_address = "0x2222222222222222222222222222222222222222"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equity]
             target = "0.5"
@@ -3219,7 +3271,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_turnkey_fields_fails() {
+    fn deserialize_missing_fireblocks_fields_fails() {
         let toml_str = r#"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
@@ -3227,8 +3279,8 @@ mod tests {
 
         let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
         assert!(
-            error.message().contains("turnkey_api_private_key"),
-            "Expected missing turnkey_api_private_key error, got: {error}"
+            error.message().contains("fireblocks_api_user_id"),
+            "Expected missing fireblocks_api_user_id error, got: {error}"
         );
     }
 
@@ -3237,8 +3289,12 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            turnkey_organization_id = "org-test"
-            turnkey_address = "0x2222222222222222222222222222222222222222"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [usdc]
             mode = "disabled"
@@ -3256,8 +3312,12 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            turnkey_organization_id = "org-test"
-            turnkey_address = "0x2222222222222222222222222222222222222222"
+            fireblocks_vault_account_id = "0"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
 
             [equity]
             target = "0.5"

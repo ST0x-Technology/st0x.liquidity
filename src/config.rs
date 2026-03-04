@@ -1135,7 +1135,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 error,
-                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead(_))
+                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead { .. })
             ),
             "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
         );
