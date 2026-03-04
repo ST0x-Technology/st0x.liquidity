@@ -574,7 +574,7 @@ impl Ctx {
 #[derive(Debug, thiserror::Error)]
 pub enum CtxError {
     #[error(transparent)]
-    Rebalancing(#[from] RebalancingCtxError),
+    Rebalancing(Box<RebalancingCtxError>),
     #[error("ORDER_OWNER required when rebalancing is disabled")]
     MissingOrderOwner,
     #[error("failed to read config file {path}")]
@@ -634,6 +634,12 @@ pub enum CtxError {
     MissingEquityVaultId { symbol: Symbol },
     #[error("{field} polling interval must be non-zero")]
     ZeroPollingInterval { field: &'static str },
+}
+
+impl From<RebalancingCtxError> for CtxError {
+    fn from(error: RebalancingCtxError) -> Self {
+        Self::Rebalancing(Box::new(error))
+    }
 }
 
 impl From<RebalancingCtxError> for CtxError {
@@ -1093,13 +1099,15 @@ pub(crate) mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
         assert!(
             matches!(
-                result,
-                Err(CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker))
+                error,
+                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::NotAlpacaBroker)
             ),
-            "Expected NotAlpacaBroker error for rebalancing with Schwab broker, got {result:?}"
+            "Expected NotAlpacaBroker error for rebalancing with Schwab broker, got {error:?}"
         );
     }
 
@@ -1135,7 +1143,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 error,
-                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead { .. })
+                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::FireblocksSecretRead { .. })
             ),
             "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
         );
@@ -1422,7 +1430,7 @@ pub(crate) mod tests {
 
     #[test]
     fn config_error_kind_rebalancing() {
-        let err = CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker);
+        let err = CtxError::Rebalancing(Box::new(RebalancingCtxError::NotAlpacaBroker));
         assert_eq!(err.kind(), "rebalancing configuration error");
     }
 
@@ -1494,7 +1502,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 error,
-                CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker)
+                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::NotAlpacaBroker)
             ),
             "expected NotAlpacaBroker, got: {error:?}"
         );

@@ -42,7 +42,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     let shares_limit = assets
         .equities
         .get(symbol)
-        .and_then(|config| config.operational_limit.map(|limit| limit.inner()));
+        .and_then(|config| config.operational_limit.map(Positive::inner));
 
     let Some((direction, shares)) = position.is_ready_for_execution(executor_type, shares_limit)?
     else {
@@ -119,7 +119,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
         let shares_limit = assets
             .equities
             .get(symbol)
-            .and_then(|config| config.operational_limit.map(|limit| limit.inner()));
+            .and_then(|config| config.operational_limit.map(Positive::inner));
 
         if let Some((direction, shares)) =
             position.is_ready_for_execution(executor_type, shares_limit)?

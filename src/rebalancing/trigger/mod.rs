@@ -26,7 +26,7 @@ use st0x_evm::fireblocks::{
     ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment,
     FireblocksVaultAccountId, FireblocksWallet,
 };
-use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
+use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
 
 use crate::config::{AssetsConfig, OperationMode};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
@@ -231,6 +231,7 @@ impl RebalancingCtx {
             vault_account_id: config.fireblocks_vault_account_id.clone(),
             environment: config.fireblocks_environment,
             asset_id,
+            base_url: None,
             provider,
             required_confirmations: REQUIRED_CONFIRMATIONS,
         })
@@ -698,7 +699,7 @@ impl RebalancingTrigger {
             .assets
             .equities
             .get(symbol)
-            .and_then(|config| config.operational_limit.map(|limit| limit.inner()));
+            .and_then(|config| config.operational_limit.map(Positive::inner));
 
         let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
@@ -742,8 +743,8 @@ impl RebalancingTrigger {
         Ok(registry.token_by_symbol(symbol))
     }
 
-    /// Checks inventory for USDC imbalance and triggers operation if needed.
-    pub(crate) async fn check_and_trigger_usdc(&self) {
+    /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
+    fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
         let cash_rebalancing_disabled = self
             .config
             .assets
@@ -753,17 +754,11 @@ impl RebalancingTrigger {
 
         if cash_rebalancing_disabled {
             debug!("USDC rebalancing disabled via assets.cash config");
-            return;
+            return None;
         }
 
         let UsdcRebalancing::Enabled { target, deviation } = self.config.usdc else {
-            return;
-        };
-
-        let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
-        else {
-            debug!("Skipped USDC trigger: already in progress");
-            return;
+            return None;
         };
 
         let threshold = ImbalanceThreshold { target, deviation };
@@ -772,7 +767,22 @@ impl RebalancingTrigger {
             .assets
             .cash
             .as_ref()
-            .and_then(|cash| cash.operational_limit.map(|limit| limit.inner()));
+            .and_then(|cash| cash.operational_limit.map(Positive::inner));
+
+        Some((threshold, usdc_limit))
+    }
+
+    /// Checks inventory for USDC imbalance and triggers operation if needed.
+    pub(crate) async fn check_and_trigger_usdc(&self) {
+        let Some((threshold, usdc_limit)) = self.usdc_rebalancing_params() else {
+            return;
+        };
+
+        let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
+        else {
+            debug!("Skipped USDC trigger: already in progress");
+            return;
+        };
 
         let Ok(operation) =
             usdc::check_imbalance_and_build_operation(&threshold, &self.inventory, usdc_limit)
