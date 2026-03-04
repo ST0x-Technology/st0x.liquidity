@@ -228,7 +228,7 @@ pub(super) async fn process_queued_trade<E: Executor>(
         &cqrs.position_projection,
         base_symbol,
         executor_type,
-        &cqrs.operational_limits,
+        &cqrs.assets,
         asset_enabled,
     )
     .await?
@@ -249,9 +249,11 @@ mod tests {
     use st0x_event_sorcery::{Projection, StoreBuilder, test_store};
     use st0x_execution::{ExecutorOrderId, MarketOrder, MockExecutor, Symbol};
 
+    use std::collections::HashMap;
+
     use super::*;
     use crate::bindings::IOrderBookV6::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::config::OperationalLimits;
+    use crate::config::AssetsConfig;
     use crate::offchain_order::noop_order_placer;
     use crate::offchain_order::{OffchainOrder, OrderPlacer};
     use crate::onchain_trade::OnChainTrade;
@@ -328,7 +330,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
-            operational_limits: OperationalLimits::Disabled,
+            assets: AssetsConfig { equities: HashMap::new(), cash: None },
         }
     }
 

@@ -182,7 +182,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
-    use crate::config::OperationalLimits;
+    use crate::config::AssetsConfig;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -250,7 +250,10 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
-            limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
             disabled_assets: HashSet::new(),
         };
 
@@ -265,7 +268,10 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
-            limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
             disabled_assets: HashSet::new(),
         };
 
