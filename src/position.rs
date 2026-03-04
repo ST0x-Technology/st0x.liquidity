@@ -377,7 +377,7 @@ impl Position {
             Some(TriggerReason::SharesThreshold { .. } | TriggerReason::DollarThreshold { .. }) => {
                 let raw_shares = self.net.abs();
 
-                let capped_shares = shares_limit.map_or(raw_shares, |cap| {
+                let capped_shares = if let Some(cap) = shares_limit {
                     if raw_shares > cap {
                         warn!(
                             symbol = %self.symbol,
@@ -389,7 +389,9 @@ impl Position {
                     } else {
                         raw_shares
                     }
-                });
+                } else {
+                    raw_shares
+                };
 
                 let executable_shares = if executor.supports_fractional_shares() {
                     capped_shares

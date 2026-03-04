@@ -39,7 +39,7 @@ use crate::conductor::{
     EventProcessingError, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+use crate::config::{AssetsConfig, EquityAssetConfig, OperationMode};
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
 use crate::onchain::OnchainTrade;
@@ -613,7 +613,7 @@ async fn create_test_cqrs(
     create_test_cqrs_with_assets(
         pool,
         AssetsConfig {
-            equities: EquitiesConfig::default(),
+            equities: HashMap::new(),
             cash: None,
         },
     )
@@ -903,7 +903,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
-            equities: EquitiesConfig::default(),
+            equities: HashMap::new(),
             cash: None,
         },
         |_| true,
@@ -1431,7 +1431,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
-            equities: EquitiesConfig::default(),
+            equities: HashMap::new(),
             cash: None,
         },
         |_| true,
@@ -2099,20 +2099,17 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     // Per-asset limit = 1 share. A 3-share onchain sell requires
     // 3 cycles of 1-share hedges to fully close.
     let assets = AssetsConfig {
-        equities: EquitiesConfig {
-            operational_limit: None,
-            symbols: HashMap::from([(
-                Symbol::new(TEST_AAPL).unwrap(),
-                EquityAssetConfig {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_id: None,
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    operational_limit: Some(Positive::new(FractionalShares::new(dec!(1))).unwrap()),
-                },
-            )]),
-        },
+        equities: HashMap::from([(
+            Symbol::new(TEST_AAPL).unwrap(),
+            EquityAssetConfig {
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
+                vault_id: None,
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: Some(Positive::new(FractionalShares::new(dec!(1))).unwrap()),
+            },
+        )]),
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
@@ -2276,20 +2273,17 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     // fails, retries (also capped to 2), and the pending order blocks
     // concurrent checker cycles.
     let assets = AssetsConfig {
-        equities: EquitiesConfig {
-            operational_limit: None,
-            symbols: HashMap::from([(
-                Symbol::new(TEST_AAPL).unwrap(),
-                EquityAssetConfig {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_id: None,
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    operational_limit: Some(Positive::new(FractionalShares::new(dec!(2))).unwrap()),
-                },
-            )]),
-        },
+        equities: HashMap::from([(
+            Symbol::new(TEST_AAPL).unwrap(),
+            EquityAssetConfig {
+                tokenized_share: Address::ZERO,
+                total_return_derivative: Address::ZERO,
+                vault_id: None,
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: Some(Positive::new(FractionalShares::new(dec!(2))).unwrap()),
+            },
+        )]),
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =

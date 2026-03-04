@@ -25,7 +25,7 @@ use st0x_evm::turnkey::{
 };
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
-use crate::config::OperationalLimits;
+use crate::config::{AssetsConfig, OperationMode};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
@@ -256,7 +256,7 @@ impl std::fmt::Debug for RebalancingCtx {
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
-    pub(crate) limits: OperationalLimits,
+    pub(crate) assets: AssetsConfig,
     pub(crate) disabled_assets: HashSet<Symbol>,
 }
 
@@ -654,6 +654,13 @@ impl RebalancingTrigger {
         let unwrapped_token = self.wrapper.lookup_tokenized_share(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
+        let shares_limit = self
+            .config
+            .assets
+            .equities
+            .get(symbol)
+            .and_then(|config| config.operational_limit.map(|limit| limit.inner()));
+
         let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
@@ -661,7 +668,7 @@ impl RebalancingTrigger {
             wrapped_token,
             unwrapped_token,
             &vault_ratio,
-            &self.config.limits,
+            shares_limit,
         )
         .await?
         else {
@@ -698,6 +705,18 @@ impl RebalancingTrigger {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
+        let cash_rebalancing_disabled = self
+            .config
+            .assets
+            .cash
+            .as_ref()
+            .is_some_and(|cash| matches!(cash.rebalancing, OperationMode::Disabled));
+
+        if cash_rebalancing_disabled {
+            debug!("USDC rebalancing disabled via assets.cash config");
+            return;
+        }
+
         let UsdcRebalancing::Enabled { target, deviation } = self.config.usdc else {
             return;
         };
@@ -709,12 +728,16 @@ impl RebalancingTrigger {
         };
 
         let threshold = ImbalanceThreshold { target, deviation };
-        let Ok(operation) = usdc::check_imbalance_and_build_operation(
-            &threshold,
-            &self.inventory,
-            &self.config.limits,
-        )
-        .await
+        let usdc_limit = self
+            .config
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.operational_limit.map(|limit| limit.inner()));
+
+        let Ok(operation) =
+            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory, usdc_limit)
+                .await
         else {
             return;
         };
@@ -1000,7 +1023,10 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
             disabled_assets: HashSet::new(),
         }
     }
@@ -1072,7 +1098,10 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: test_config().equity,
                 usdc: UsdcRebalancing::Disabled,
-                limits: OperationalLimits::Disabled,
+                assets: AssetsConfig {
+                    equities: HashMap::new(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
@@ -1106,7 +1135,10 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: test_config().equity,
                 usdc: UsdcRebalancing::Disabled,
-                limits: OperationalLimits::Disabled,
+                assets: AssetsConfig {
+                    equities: HashMap::new(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::from([symbol.clone()]),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),

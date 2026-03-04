@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
@@ -27,7 +27,7 @@ use st0x_execution::{
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
-use crate::config::{AssetsConfig, CashAssetConfig, EquitiesConfig, OperationMode};
+use crate::config::{AssetsConfig, CashAssetConfig, OperationMode};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
@@ -36,6 +36,7 @@ use crate::onchain::raindex::Raindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use crate::rebalancing::trigger::UsdcRebalancing;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
     Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation,
@@ -110,17 +111,13 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: ImbalanceThreshold {
+        usdc: UsdcRebalancing::Enabled {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
         assets: AssetsConfig {
-            equities: EquitiesConfig::default(),
-            cash: Some(CashAssetConfig {
-                vault_id: None,
-                rebalancing: OperationMode::Enabled,
-                operational_limit: None,
-            }),
+            equities: HashMap::new(),
+            cash: None,
         },
         disabled_assets: HashSet::new(),
     }
@@ -1095,7 +1092,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     ));
 
     let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
+        equities: HashMap::new(),
         cash: Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
@@ -1108,7 +1105,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: ImbalanceThreshold {
+        usdc: UsdcRebalancing::Enabled {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
@@ -1211,7 +1208,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     ));
 
     let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
+        equities: HashMap::new(),
         cash: Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
@@ -1223,7 +1220,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: ImbalanceThreshold {
+        usdc: UsdcRebalancing::Enabled {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
@@ -1316,17 +1313,13 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
             },
-            usdc: ImbalanceThreshold {
+            usdc: UsdcRebalancing::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
             },
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: Some(CashAssetConfig {
-                    vault_id: None,
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
-                }),
+                equities: HashMap::new(),
+                cash: None,
             },
             disabled_assets: HashSet::new(),
         };
@@ -1371,17 +1364,13 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
             },
-            usdc: ImbalanceThreshold {
+            usdc: UsdcRebalancing::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
             },
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: Some(CashAssetConfig {
-                    vault_id: None,
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
-                }),
+                equities: HashMap::new(),
+                cash: None,
             },
             disabled_assets: HashSet::new(),
         };
