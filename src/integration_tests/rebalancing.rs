@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
@@ -27,7 +27,7 @@ use st0x_execution::{
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
-use crate::config::OperationalLimits;
+use crate::config::{AssetsConfig, CashAssetConfig, OperationMode};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
@@ -115,7 +115,10 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        limits: OperationalLimits::Disabled,
+        assets: AssetsConfig {
+            equities: HashMap::new(),
+            cash: None,
+        },
         disabled_assets: HashSet::new(),
     }
 }
@@ -1088,9 +1091,13 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         InventoryView::default().with_usdc(Usdc(dec!(50)), Usdc(dec!(950))),
     ));
 
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+    let assets = AssetsConfig {
+        equities: HashMap::new(),
+        cash: Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
+        }),
     };
 
     let config = RebalancingTriggerConfig {
@@ -1102,7 +1109,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        limits,
+        assets,
         disabled_assets: HashSet::new(),
     };
 
@@ -1200,9 +1207,13 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(900))),
     ));
 
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+    let assets = AssetsConfig {
+        equities: HashMap::new(),
+        cash: Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
+        }),
     };
     let config = RebalancingTriggerConfig {
         equity: ImbalanceThreshold {
@@ -1213,7 +1224,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        limits,
+        assets,
         disabled_assets: HashSet::new(),
     };
 
@@ -1306,7 +1317,10 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
             },
-            limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
             disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
@@ -1354,7 +1368,10 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
             },
-            limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
             disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));

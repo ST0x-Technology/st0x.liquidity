@@ -10,7 +10,6 @@ use tracing::{trace, warn};
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{TokenAddressError, TriggeredOperation};
-use crate::config::OperationalLimits;
 use crate::inventory::{EquityImbalanceError, Imbalance, ImbalanceThreshold, InventoryView};
 use crate::wrapper::{UnderlyingPerWrapped, WrapperError};
 
@@ -101,7 +100,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     wrapped_token: Address,
     unwrapped_token: Address,
     vault_ratio: &UnderlyingPerWrapped,
-    limits: &OperationalLimits,
+    shares_limit: Option<FractionalShares>,
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
     let imbalance = {
         let inventory = inventory.read().await;
@@ -115,14 +114,14 @@ pub(super) async fn check_imbalance_and_build_operation(
 
     Ok(Some(match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), limits);
+            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), shares_limit);
             TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
             }
         }
         Imbalance::TooMuchOnchain { excess } => {
-            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), limits);
+            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), shares_limit);
             TriggeredOperation::Redemption {
                 symbol: symbol.clone(),
                 quantity,
@@ -136,13 +135,12 @@ pub(super) async fn check_imbalance_and_build_operation(
 fn cap_shares(
     symbol: &Symbol,
     quantity: FractionalShares,
-    limits: &OperationalLimits,
+    shares_limit: Option<FractionalShares>,
 ) -> FractionalShares {
-    let OperationalLimits::Enabled { max_shares, .. } = limits else {
+    let Some(cap) = shares_limit else {
         return quantity;
     };
 
-    let cap = max_shares.inner();
     if quantity > cap {
         warn!(
             %symbol,
@@ -185,13 +183,11 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::str::FromStr;
 
-    use st0x_execution::{FractionalShares, Positive};
+    use st0x_execution::FractionalShares;
 
     use super::*;
-    use crate::config::OperationalLimits;
     use crate::inventory::view::Operator;
     use crate::inventory::{Inventory, TransferOp, Venue};
-    use crate::threshold::Usdc;
     use crate::wrapper::RATIO_ONE;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
@@ -285,7 +281,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await;
 
@@ -309,7 +305,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await;
 
@@ -335,7 +331,7 @@ mod tests {
             wrapped_addr,
             unwrapped_addr,
             &ratio,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await;
 
@@ -375,7 +371,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio_1_to_1,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await;
         assert_eq!(result_1_to_1.unwrap(), None);
@@ -390,7 +386,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio_1_5,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await;
         assert!(
@@ -461,7 +457,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &vault_ratio,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await
         .unwrap()
@@ -563,7 +559,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &vault_ratio,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await
         .unwrap()
@@ -629,7 +625,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &vault_ratio,
-            &OperationalLimits::Disabled,
+            None,
         )
         .await;
 
@@ -678,10 +674,7 @@ mod tests {
             deviation: dec!(0.2),
         };
         let ratio = one_to_one_ratio();
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(10))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
-        };
+        let shares_limit = Some(FractionalShares::new(dec!(10)));
 
         let result = check_imbalance_and_build_operation(
             &symbol,
@@ -690,7 +683,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
-            &limits,
+            shares_limit,
         )
         .await;
 
@@ -712,10 +705,7 @@ mod tests {
             deviation: dec!(0.2),
         };
         let ratio = one_to_one_ratio();
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(10))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
-        };
+        let shares_limit = Some(FractionalShares::new(dec!(10)));
 
         // 80 onchain / 20 offchain -> 80% onchain, above 70% -> excess ~30
         let inventory = make_imbalanced_view(&symbol, 80, 20);
@@ -727,7 +717,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
-            &limits,
+            shares_limit,
         )
         .await;
 
@@ -750,7 +740,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
-            &limits,
+            shares_limit,
         )
         .await;
 
@@ -768,7 +758,7 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             &ratio,
-            &limits,
+            shares_limit,
         )
         .await;
 

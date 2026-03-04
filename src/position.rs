@@ -19,7 +19,6 @@ use st0x_execution::{
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
-use crate::config::OperationalLimits;
 use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
@@ -366,7 +365,7 @@ impl Position {
     pub(crate) fn is_ready_for_execution(
         &self,
         executor: SupportedExecutor,
-        limits: &OperationalLimits,
+        shares_limit: Option<FractionalShares>,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
         if self.pending_offchain_order_id.is_some() {
             return Ok(None);
@@ -378,25 +377,7 @@ impl Position {
             Some(TriggerReason::SharesThreshold { .. } | TriggerReason::DollarThreshold { .. }) => {
                 let raw_shares = self.net.abs();
 
-                let capped_shares = if let OperationalLimits::Enabled {
-                    max_shares,
-                    max_amount,
-                } = limits
-                {
-                    let shares_cap = max_shares.inner();
-
-                    let dollar_cap_in_shares = self.last_price_usdc.and_then(|price| {
-                        let Usdc(amount) = max_amount.inner();
-                        if price.is_zero() {
-                            None
-                        } else {
-                            Some(FractionalShares::new(amount / price))
-                        }
-                    });
-
-                    let cap = dollar_cap_in_shares
-                        .map_or(shares_cap, |dollar_cap| shares_cap.min(dollar_cap));
-
+                let capped_shares = if let Some(cap) = shares_limit {
                     if raw_shares > cap {
                         warn!(
                             symbol = %self.symbol,
@@ -616,7 +597,6 @@ mod tests {
     use st0x_event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
 
     use super::*;
-    use crate::config::OperationalLimits;
     use crate::threshold::Usdc;
 
     fn one_share_threshold() -> ExecutionThreshold {
@@ -1220,7 +1200,7 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab, &OperationalLimits::Disabled)
+            .is_ready_for_execution(SupportedExecutor::Schwab, None)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1248,7 +1228,7 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab, &OperationalLimits::Disabled)
+            .is_ready_for_execution(SupportedExecutor::Schwab, None)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1276,10 +1256,7 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(
-                SupportedExecutor::AlpacaTradingApi,
-                &OperationalLimits::Disabled,
-            )
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, None)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1307,10 +1284,7 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(
-                SupportedExecutor::AlpacaTradingApi,
-                &OperationalLimits::Disabled,
-            )
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, None)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1337,13 +1311,10 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100000))).unwrap(),
-        };
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1370,13 +1341,10 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100000))).unwrap(),
-        };
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1403,13 +1371,10 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50.7))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100000))).unwrap(),
-        };
+        let shares_limit = FractionalShares::new(dec!(50.7));
 
         let (_, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab, &limits)
+            .is_ready_for_execution(SupportedExecutor::Schwab, Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1423,11 +1388,8 @@ mod tests {
     }
 
     #[test]
-    fn operational_limits_dollar_cap_constrains_when_tighter_than_shares_cap() {
-        // Price = $150/share, max_amount = $100, max_shares = 50
-        // max_amount share-equivalent = $100 / $150 = 0.666... shares
-        // Net = 10 shares, above max_amount equivalent but below max_shares
-        // max_amount is the binding constraint
+    fn operational_limits_fractional_cap_constrains_position() {
+        // Fractional shares cap of 7.5 should constrain a 10-share position
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: FractionalShares::new(dec!(10)),
@@ -1439,33 +1401,25 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-        };
+        let shares_limit = FractionalShares::new(dec!(7.5));
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, &limits)
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
         assert_eq!(direction, Direction::Sell);
-
-        // $100 / $150 per share = 0.666... shares
-        let expected = dec!(100) / dec!(150);
         assert_eq!(
             shares.inner(),
-            expected,
-            "max_amount should limit to {expected} shares, got {}",
+            dec!(7.5),
+            "Fractional shares cap should limit to 7.5 shares, got {}",
             shares.inner()
         );
     }
 
     #[test]
-    fn operational_limits_dollar_cap_not_binding_when_shares_cap_is_tighter() {
-        // Price = $150/share, max_amount = $10000, max_shares = 5
-        // max_amount share-equivalent = $10000 / $150 = 66.666... shares
-        // Shares cap (5) is tighter, so it should be the binding constraint
+    fn operational_limits_cap_fractional_executor_to_exact_limit() {
+        // Fractional executor with shares cap (5) tighter than position (10)
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: FractionalShares::new(dec!(10)),
@@ -1477,13 +1431,10 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(5))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(10000))).unwrap(),
-        };
+        let shares_limit = FractionalShares::new(dec!(5));
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, &limits)
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1497,8 +1448,8 @@ mod tests {
     }
 
     #[test]
-    fn operational_limits_dollar_cap_skipped_when_no_price() {
-        // No last_price_usdc -> dollar cap can't be computed, falls back to shares cap only
+    fn operational_limits_cap_applies_without_price() {
+        // Shares cap works regardless of whether last_price_usdc is available
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: FractionalShares::new(dec!(100)),
@@ -1510,13 +1461,10 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-        };
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1580,10 +1528,7 @@ mod tests {
 
     #[test]
     fn capped_execution_leaves_remaining_exposure_triggerable() {
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100000))).unwrap(),
-        };
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1597,7 +1542,7 @@ mod tests {
         };
 
         let (_, first_shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
             .unwrap()
             .expect("first check should trigger");
         assert_eq!(
@@ -1614,7 +1559,7 @@ mod tests {
         };
 
         let (_, second_shares) = after_first
-            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
             .unwrap()
             .expect("remaining 70 shares still exceeds threshold");
         assert_eq!(
@@ -1631,7 +1576,7 @@ mod tests {
         };
 
         let (_, third_shares) = after_second
-            .is_ready_for_execution(SupportedExecutor::DryRun, &limits)
+            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
             .unwrap()
             .expect("remaining 20 shares still exceeds threshold");
         assert_eq!(

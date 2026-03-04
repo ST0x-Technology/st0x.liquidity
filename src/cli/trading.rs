@@ -344,7 +344,7 @@ pub(super) async fn process_found_trade<W: Write>(
         &position_projection,
         base_symbol,
         executor_type,
-        &ctx.operational_limits,
+        &ctx.assets,
         trading_enabled,
     )
     .await?

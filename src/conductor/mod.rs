@@ -30,7 +30,7 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
-use crate::config::{Ctx, CtxError, OperationalLimits};
+use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
@@ -72,7 +72,7 @@ pub(crate) struct TradeProcessingCqrs {
     pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) execution_threshold: ExecutionThreshold,
-    pub(crate) operational_limits: OperationalLimits,
+    pub(crate) assets: AssetsConfig,
 }
 
 pub(crate) struct Conductor {
@@ -176,6 +176,8 @@ impl Conductor {
                 StoreBuilder::<VaultRegistry>::new(pool.clone())
                     .build(())
                     .await?;
+
+            seed_vault_registry_from_config(&vault_registry, &ctx).await?;
 
             let rebalancing = match ctx.rebalancing_ctx() {
                 Ok(ctx) => Some(ctx.clone()),
@@ -321,6 +323,60 @@ struct RebalancingDeps {
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
 }
 
+/// Pre-seeds the vault registry with vault IDs from config.
+///
+/// Assets with a `vault_id` in config get their vaults registered
+/// immediately at startup, so rebalancing can work even before any
+/// onchain trades have been observed.
+async fn seed_vault_registry_from_config(
+    vault_registry: &Store<VaultRegistry>,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let vault_registry_id = VaultRegistryId {
+        orderbook: ctx.evm.orderbook,
+        owner: ctx.order_owner(),
+    };
+
+    for (symbol, equity_config) in &ctx.assets.equities {
+        let Some(vault_id) = equity_config.vault_id else {
+            continue;
+        };
+
+        info!(
+            %symbol,
+            %vault_id,
+            token = %equity_config.tokenized_share,
+            "Seeding equity vault from config"
+        );
+
+        vault_registry
+            .send(
+                &vault_registry_id,
+                VaultRegistryCommand::SeedEquityVaultFromConfig {
+                    token: equity_config.tokenized_share,
+                    vault_id,
+                    symbol: symbol.clone(),
+                },
+            )
+            .await?;
+    }
+
+    if let Some(cash) = &ctx.assets.cash {
+        if let Some(vault_id) = cash.vault_id {
+            info!(%vault_id, "Seeding USDC vault from config");
+
+            vault_registry
+                .send(
+                    &vault_registry_id,
+                    VaultRegistryCommand::SeedUsdcVaultFromConfig { vault_id },
+                )
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     ethereum_wallet: Chain,
@@ -379,7 +435,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             RebalancingTriggerConfig {
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc.clone(),
-                limits: deps.ctx.operational_limits.clone(),
+                assets: deps.ctx.assets.clone(),
                 disabled_assets,
             },
             deps.vault_registry,
@@ -599,7 +655,6 @@ fn spawn_periodic_accumulated_position_check<E>(
     position_projection: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
-    operational_limits: OperationalLimits,
     ctx: Ctx,
 ) -> JoinHandle<()>
 where
@@ -623,7 +678,7 @@ where
                 &position_projection,
                 &offchain_order,
                 &execution_threshold,
-                &operational_limits,
+                &ctx.assets,
                 |symbol| ctx.is_trading_enabled(symbol),
             )
             .await
@@ -1169,7 +1224,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
         &cqrs.position_projection,
         base_symbol,
         executor_type,
-        &cqrs.operational_limits,
+        &cqrs.assets,
         asset_enabled,
     )
     .await?
@@ -1318,7 +1373,7 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     position_projection: &Projection<Position>,
     offchain_order: &Arc<Store<OffchainOrder>>,
     threshold: &ExecutionThreshold,
-    limits: &OperationalLimits,
+    assets: &AssetsConfig,
     is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<(), EventProcessingError>
 where
@@ -1330,7 +1385,7 @@ where
         executor,
         position_projection,
         executor_type,
-        limits,
+        assets,
         is_trading_enabled,
     )
     .await?;
@@ -1497,7 +1552,7 @@ mod tests {
     use futures_util::stream;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
@@ -1511,6 +1566,7 @@ mod tests {
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4,
     };
     use crate::conductor::builder::CqrsFrameworks;
+    use crate::config::AssetsConfig;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
@@ -1534,7 +1590,10 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
-            operational_limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 
@@ -2809,7 +2868,10 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
-            operational_limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: HashMap::new(),
+                cash: None,
+            },
         }
     }
 
@@ -3153,7 +3215,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
-            &cqrs.operational_limits,
+            &cqrs.assets,
             |_| true,
         )
         .await
@@ -3355,7 +3417,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                limits: OperationalLimits::Disabled,
+                assets: AssetsConfig {
+                    equities: HashMap::new(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3443,7 +3508,10 @@ mod tests {
                     target: threshold.target,
                     deviation: threshold.deviation,
                 },
-                limits: OperationalLimits::Disabled,
+                assets: AssetsConfig {
+                    equities: HashMap::new(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3554,7 +3622,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                limits: OperationalLimits::Disabled,
+                assets: AssetsConfig {
+                    equities: HashMap::new(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3678,7 +3749,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                limits: OperationalLimits::Disabled,
+                assets: AssetsConfig {
+                    equities: HashMap::new(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3951,7 +4025,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
-            &cqrs.operational_limits,
+            &cqrs.assets,
             |_| true,
         )
         .await
@@ -4035,7 +4109,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
-            &cqrs.operational_limits,
+            &cqrs.assets,
             |_| true,
         )
         .await

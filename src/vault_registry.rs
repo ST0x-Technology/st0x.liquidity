@@ -190,6 +190,35 @@ impl VaultRegistry {
                     discovered_at: *discovered_at,
                 });
             }
+
+            VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token,
+                vault_id,
+                seeded_at,
+                symbol,
+            } => {
+                self.equity_vaults.insert(
+                    *token,
+                    DiscoveredEquityVault {
+                        token: *token,
+                        vault_id: *vault_id,
+                        discovered_in: TxHash::ZERO,
+                        discovered_at: *seeded_at,
+                        symbol: symbol.clone(),
+                    },
+                );
+            }
+
+            VaultRegistryEvent::UsdcVaultSeededFromConfig {
+                vault_id,
+                seeded_at,
+            } => {
+                self.usdc_vault = Some(DiscoveredUsdcVault {
+                    vault_id: *vault_id,
+                    discovered_in: TxHash::ZERO,
+                    discovered_at: *seeded_at,
+                });
+            }
         }
     }
 
@@ -216,6 +245,24 @@ impl VaultRegistry {
                 discovered_in,
                 discovered_at: now,
             },
+
+            VaultRegistryCommand::SeedEquityVaultFromConfig {
+                token,
+                vault_id,
+                symbol,
+            } => VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token,
+                vault_id,
+                seeded_at: now,
+                symbol,
+            },
+
+            VaultRegistryCommand::SeedUsdcVaultFromConfig { vault_id } => {
+                VaultRegistryEvent::UsdcVaultSeededFromConfig {
+                    vault_id,
+                    seeded_at: now,
+                }
+            }
         }
     }
 }
@@ -232,6 +279,14 @@ pub(crate) enum VaultRegistryCommand {
         vault_id: B256,
         discovered_in: TxHash,
     },
+    /// Pre-seed an equity vault from config (no onchain discovery).
+    SeedEquityVaultFromConfig {
+        token: Address,
+        vault_id: B256,
+        symbol: Symbol,
+    },
+    /// Pre-seed the USDC vault from config (no onchain discovery).
+    SeedUsdcVaultFromConfig { vault_id: B256 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -248,6 +303,18 @@ pub(crate) enum VaultRegistryEvent {
         discovered_in: TxHash,
         discovered_at: DateTime<Utc>,
     },
+    /// Equity vault pre-seeded from config (no onchain transaction).
+    EquityVaultSeededFromConfig {
+        token: Address,
+        vault_id: B256,
+        seeded_at: DateTime<Utc>,
+        symbol: Symbol,
+    },
+    /// USDC vault pre-seeded from config (no onchain transaction).
+    UsdcVaultSeededFromConfig {
+        vault_id: B256,
+        seeded_at: DateTime<Utc>,
+    },
 }
 
 impl VaultRegistryEvent {
@@ -255,6 +322,8 @@ impl VaultRegistryEvent {
         match self {
             Self::EquityVaultDiscovered { discovered_at, .. }
             | Self::UsdcVaultDiscovered { discovered_at, .. } => *discovered_at,
+            Self::EquityVaultSeededFromConfig { seeded_at, .. }
+            | Self::UsdcVaultSeededFromConfig { seeded_at, .. } => *seeded_at,
         }
     }
 }
@@ -267,6 +336,12 @@ impl DomainEvent for VaultRegistryEvent {
             }
             Self::UsdcVaultDiscovered { .. } => {
                 "VaultRegistryEvent::UsdcVaultDiscovered".to_string()
+            }
+            Self::EquityVaultSeededFromConfig { .. } => {
+                "VaultRegistryEvent::EquityVaultSeededFromConfig".to_string()
+            }
+            Self::UsdcVaultSeededFromConfig { .. } => {
+                "VaultRegistryEvent::UsdcVaultSeededFromConfig".to_string()
             }
         }
     }
