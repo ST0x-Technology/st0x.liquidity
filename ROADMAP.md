@@ -83,12 +83,8 @@ All auto-rebalancing logic uses ES/CQRS. Time to disable legacy:
 ## Backlog: Admin Dashboard
 
 Unified web dashboard for monitoring and controlling the liquidity bot.
-Eliminates jumping between Grafana, HyperDX, and CLI for Schwab OAuth. Supports
-both Schwab and Alpaca bot instances.
 
-**Panels:**
-
-- [ ] [#233 Make the dashboard display not only live events happening but also get historical data so that it's clear what's been happening in the system](https://github.com/ST0x-Technology/st0x.liquidity/issues/233)
+- [ ] [#299 Redesign dashboard layout: hierarchical panels replacing uniform grid](https://github.com/ST0x-Technology/st0x.liquidity/issues/299)
 - [ ] [#178 Dashboard: Performance Metrics Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/178)
 - [ ] [#179 Dashboard: Inventory Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/179)
 - [ ] [#180 Dashboard: Spreads Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/180)

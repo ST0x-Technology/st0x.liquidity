@@ -9,7 +9,7 @@ describe('reactive', () => {
 
   it('updates value via update function', () => {
     const count = reactive(0)
-    count.update(n => n + 1)
+    count.update((n) => n + 1)
     expect(count.current).toBe(1)
   })
 
@@ -23,7 +23,7 @@ describe('reactive', () => {
     type State = { name: string; count: number }
     const state = reactive<State>({ name: 'test', count: 0 })
 
-    state.update(s => ({ ...s, count: s.count + 1 }))
+    state.update((s) => ({ ...s, count: s.count + 1 }))
 
     expect(state.current).toEqual({ name: 'test', count: 1 })
   })
@@ -43,9 +43,9 @@ describe('reactive', () => {
   it('chains multiple updates', () => {
     const count = reactive(0)
 
-    count.update(n => n + 1)
-    count.update(n => n * 2)
-    count.update(n => n + 3)
+    count.update((n) => n + 1)
+    count.update((n) => n * 2)
+    count.update((n) => n + 3)
 
     expect(count.current).toBe(5)
   })
