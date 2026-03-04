@@ -114,7 +114,7 @@ enum BrokerSecrets {
 /// Encodes the two mutually exclusive operating modes at the type level.
 ///
 /// `Standalone`: order_owner comes from config, no rebalancing.
-/// `Rebalancing`: order_owner resolved from Fireblocks at runtime.
+/// `Rebalancing`: order_owner comes from Turnkey wallet config.
 #[derive(Clone, Debug)]
 pub(crate) enum TradingMode {
     Standalone { order_owner: Address },
@@ -378,7 +378,7 @@ impl Ctx {
                 ))
             }
             (Some(_), Some(_), Some(configured)) => {
-                return Err(CtxError::OrderOwnerConflictsWithFireblocks { configured });
+                return Err(CtxError::OrderOwnerConflictsWithTurnkey { configured });
             }
             (None, None, Some(order_owner)) => TradingMode::Standalone { order_owner },
             (None, None, None) => return Err(CtxError::MissingOrderOwner),
@@ -446,8 +446,8 @@ impl Ctx {
     /// Returns the wallet address that owns orders on the orderbook.
     ///
     /// In `Standalone` mode this is the statically-configured order owner.
-    /// In `Rebalancing` mode this is the Fireblocks wallet address resolved
-    /// during async construction.
+    /// In `Rebalancing` mode this is the Turnkey wallet address from
+    /// rebalancing config.
     pub(crate) fn order_owner(&self) -> Address {
         match &self.trading_mode {
             TradingMode::Standalone { order_owner } => *order_owner,
@@ -503,10 +503,10 @@ pub enum CtxError {
     #[error("rebalancing secrets present but rebalancing config missing in config")]
     RebalancingConfigMissing,
     #[error(
-        "order_owner {configured} must not be set when Fireblocks \
-         rebalancing is enabled (address is derived from vault)"
+        "order_owner {configured} must not be set when Turnkey \
+         rebalancing is enabled (address is in rebalancing config)"
     )]
-    OrderOwnerConflictsWithFireblocks { configured: Address },
+    OrderOwnerConflictsWithTurnkey { configured: Address },
     #[error(
         "operational_limits max_amount {configured} is below Alpaca's \
          minimum withdrawal of {minimum}"
@@ -529,9 +529,7 @@ impl CtxError {
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",
-            Self::OrderOwnerConflictsWithFireblocks { .. } => {
-                "order_owner conflicts with fireblocks"
-            }
+            Self::OrderOwnerConflictsWithTurnkey { .. } => "order_owner conflicts with turnkey",
             Self::OperationalLimitBelowMinimumWithdrawal { .. } => {
                 "operational limit below minimum withdrawal"
             }
@@ -680,10 +678,6 @@ pub(crate) mod tests {
         )
         .unwrap();
         file
-    }
-
-    fn example_config_toml() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.config.toml"))
     }
 
     fn example_secrets_toml() -> &'static Path {
@@ -910,8 +904,7 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+            turnkey_api_private_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
 
@@ -931,12 +924,8 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            fireblocks_vault_account_id = "0"
-            fireblocks_environment = "sandbox"
-
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
+            turnkey_organization_id = "org-test"
+            turnkey_address = "0x2222222222222222222222222222222222222222"
 
             [rebalancing.equity]
             target = "0.5"
@@ -982,20 +971,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn rebalancing_with_missing_secret_file_fails() {
-        let error = Ctx::load_files(example_config_toml(), example_secrets_toml())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(RebalancingCtxError::FireblocksSecretRead(_))
-            ),
-            "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn rebalancing_with_order_owner_configured_fails() {
         let config = toml_file(
             r#"
@@ -1020,11 +995,8 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            fireblocks_vault_account_id = "0"
-            fireblocks_environment = "sandbox"
-
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
+            turnkey_organization_id = "org-test"
+            turnkey_address = "0x2222222222222222222222222222222222222222"
 
             [rebalancing.equity]
             target = "0.5"
@@ -1039,8 +1011,8 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, CtxError::OrderOwnerConflictsWithFireblocks { .. }),
-            "Expected OrderOwnerConflictsWithFireblocks, got: {error:?}"
+            matches!(error, CtxError::OrderOwnerConflictsWithTurnkey { .. }),
+            "Expected OrderOwnerConflictsWithTurnkey, got: {error:?}"
         );
     }
 
@@ -1166,12 +1138,8 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            fireblocks_vault_account_id = "0"
-            fireblocks_environment = "sandbox"
-
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
+            turnkey_organization_id = "org-test"
+            turnkey_address = "0x2222222222222222222222222222222222222222"
 
             [rebalancing.equity]
             target = "0.5"
@@ -1301,8 +1269,7 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+            turnkey_api_private_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
 
@@ -1322,12 +1289,8 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            fireblocks_vault_account_id = "0"
-            fireblocks_environment = "sandbox"
-
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
+            turnkey_organization_id = "org-test"
+            turnkey_address = "0x2222222222222222222222222222222222222222"
 
             [rebalancing.equity]
             target = "0.5"

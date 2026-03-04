@@ -9,7 +9,7 @@
 //!
 //! - [`Wallet`] -- extends `Evm` with a signing identity and
 //!   transaction submission. Implementations handle key management
-//!   and signing (Fireblocks MPC in production,
+//!   and signing (Turnkey secure enclaves in production,
 //!   `RawPrivateKeyWallet` in tests).
 //!
 //! Error decoding is built into both `Evm::call` (view calls) and
@@ -38,6 +38,9 @@ pub mod fireblocks;
 #[cfg(feature = "local-signer")]
 pub mod local;
 
+#[cfg(feature = "turnkey")]
+pub mod turnkey;
+
 /// Errors that can occur during EVM operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EvmError {
@@ -58,6 +61,9 @@ pub enum EvmError {
     #[cfg(feature = "fireblocks")]
     #[error("Fireblocks error: {0}")]
     Fireblocks(#[from] fireblocks::FireblocksError),
+    #[cfg(feature = "turnkey")]
+    #[error("Turnkey error: {0}")]
+    Turnkey(#[from] turnkey::TurnkeyError),
 }
 
 #[cfg(feature = "fireblocks")]
@@ -78,6 +84,13 @@ impl From<fireblocks_sdk::apis::Error<CreateTransactionError>> for EvmError {
 impl From<alloy::hex::FromHexError> for EvmError {
     fn from(error: alloy::hex::FromHexError) -> Self {
         Self::Fireblocks(fireblocks::FireblocksError::from(error))
+    }
+}
+
+#[cfg(feature = "turnkey")]
+impl From<alloy_signer_turnkey::TurnkeySignerError> for EvmError {
+    fn from(error: alloy_signer_turnkey::TurnkeySignerError) -> Self {
+        Self::Turnkey(turnkey::TurnkeyError::from(error))
     }
 }
 
@@ -122,8 +135,8 @@ pub trait Evm: Send + Sync + 'static {
 /// it with typed encoding and revert decoding.
 ///
 /// Key management varies by implementation:
-/// [`FireblocksWallet`](fireblocks::FireblocksWallet) uses MPC-based
-/// signing via the Fireblocks API, while
+/// [`TurnkeyWallet`](turnkey::TurnkeyWallet) signs via Turnkey's
+/// secure enclaves (production), while
 /// [`RawPrivateKeyWallet`](local::RawPrivateKeyWallet) signs locally
 /// (test-only).
 #[async_trait]

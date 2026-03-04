@@ -138,7 +138,7 @@ ts-rs = { version = "11.1.0", features = [
 rocket_ws = "0.1.1"
 toml = "0.9.11"
 rust_decimal_macros = "1.38.0"
-st0x-evm = { workspace = true, features = ["fireblocks"] }
+st0x-evm = { workspace = true, features = ["turnkey"] }
 
 [dev-dependencies]
 httpmock.workspace = true
