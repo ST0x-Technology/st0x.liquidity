@@ -1875,6 +1875,69 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn parse_error_display_includes_file_path() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+            extra_secret = "should fail"
+
+            [broker]
+            type = "dry-run"
+        "#,
+        );
+
+        let secrets_path = secrets.path().to_path_buf();
+        let err = Ctx::load_files(config.path(), &secrets_path)
+            .await
+            .unwrap_err();
+        let display = err.to_string();
+        assert!(
+            display.contains(&secrets_path.display().to_string()),
+            "Error display must include the file path so operators can \
+             identify which file failed to parse. Got: {display}"
+        );
+
+        let source = std::error::Error::source(&err).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("extra_secret"),
+            "Error source must contain the TOML parse details. Got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_parse_error_display_includes_file_path() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            bogus_field = "should fail"
+
+            [operational_limits]
+            mode = "disabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let config_path = config.path().to_path_buf();
+        let err = Ctx::load_files(&config_path, secrets.path())
+            .await
+            .unwrap_err();
+        let display = err.to_string();
+        assert!(
+            display.contains(&config_path.display().to_string()),
+            "Config error display must include the file path so operators \
+             can identify which file failed to parse. Got: {display}"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_broker_secrets_fields_rejected() {
         let config = minimal_config_toml();
         let secrets = toml_file(
