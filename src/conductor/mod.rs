@@ -337,7 +337,7 @@ async fn seed_vault_registry_from_config(
         owner: ctx.order_owner(),
     };
 
-    for (symbol, equity_config) in &ctx.assets.equities {
+    for (symbol, equity_config) in &ctx.assets.equities.symbols {
         let Some(vault_id) = equity_config.vault_id else {
             continue;
         };
@@ -345,7 +345,7 @@ async fn seed_vault_registry_from_config(
         info!(
             %symbol,
             %vault_id,
-            token = %equity_config.tokenized_share,
+            token = %equity_config.tokenized_equity_derivative,
             "Seeding equity vault from config"
         );
 
@@ -353,7 +353,7 @@ async fn seed_vault_registry_from_config(
             .send(
                 &vault_registry_id,
                 VaultRegistryCommand::SeedEquityVaultFromConfig {
-                    token: equity_config.tokenized_share,
+                    token: equity_config.tokenized_equity_derivative,
                     vault_id,
                     symbol: symbol.clone(),
                 },
@@ -413,7 +413,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let wrapper = Arc::new(WrapperService::new(
             base_wallet.clone(),
-            deps.ctx.assets.equities.clone(),
+            deps.ctx.assets.equities.symbols.clone(),
         ));
 
         let equity_transfer_services = EquityTransferServices {
@@ -426,6 +426,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .ctx
             .assets
             .equities
+            .symbols
             .keys()
             .filter(|symbol| !deps.ctx.is_rebalancing_enabled(symbol))
             .cloned()
@@ -461,7 +462,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let services = RebalancerServices::new(
             rebalancing_ctx.clone(),
-            deps.ctx.assets.equities.clone(),
+            deps.ctx.assets.equities.symbols.clone(),
             ethereum_wallet,
             base_wallet,
             raindex_service,
@@ -1565,7 +1566,7 @@ mod tests {
     use futures_util::stream;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
@@ -1579,8 +1580,8 @@ mod tests {
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4,
     };
     use crate::conductor::builder::CqrsFrameworks;
-    use crate::config::AssetsConfig;
     use crate::config::tests::create_test_ctx_with_order_owner;
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
     use crate::offchain_order::Dollars;
@@ -1603,7 +1604,7 @@ mod tests {
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
         }
@@ -2881,7 +2882,7 @@ mod tests {
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
         }
@@ -3430,7 +3431,7 @@ mod tests {
                     deviation: dec!(0.2),
                 },
                 assets: AssetsConfig {
-                    equities: HashMap::new(),
+                    equities: EquitiesConfig::default(),
                     cash: None,
                 },
                 disabled_assets: HashSet::new(),
@@ -3518,7 +3519,7 @@ mod tests {
                 equity: threshold,
                 usdc: threshold,
                 assets: AssetsConfig {
-                    equities: HashMap::new(),
+                    equities: EquitiesConfig::default(),
                     cash: None,
                 },
                 disabled_assets: HashSet::new(),
@@ -3632,7 +3633,7 @@ mod tests {
                     deviation: dec!(0.2),
                 },
                 assets: AssetsConfig {
-                    equities: HashMap::new(),
+                    equities: EquitiesConfig::default(),
                     cash: None,
                 },
                 disabled_assets: HashSet::new(),
@@ -3759,7 +3760,7 @@ mod tests {
                     deviation: dec!(0.2),
                 },
                 assets: AssetsConfig {
-                    equities: HashMap::new(),
+                    equities: EquitiesConfig::default(),
                     cash: None,
                 },
                 disabled_assets: HashSet::new(),

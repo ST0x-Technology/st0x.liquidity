@@ -21,7 +21,7 @@ use fireblocks_sdk::{Client, ClientBuilder};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{Evm, EvmError, Wallet};
@@ -70,8 +70,7 @@ impl FireblocksVaultAccountId {
 
 impl std::fmt::Display for FireblocksVaultAccountId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self(id) = self;
-        write!(formatter, "{id}")
+        write!(formatter, "{}", self.0)
     }
 }
 
@@ -253,8 +252,8 @@ impl<P> FireblocksWallet<P> {
         let client = ctx.build_client()?;
 
         let params = GetVaultAccountAssetAddressesPaginatedParams {
-            vault_account_id: ctx.vault_account_id.to_string(),
-            asset_id: ctx.asset_id.to_string(),
+            vault_account_id: ctx.vault_account_id.0.clone(),
+            asset_id: ctx.asset_id.0.clone(),
             limit: None,
             before: None,
             after: None,
@@ -269,9 +268,16 @@ impl<P> FireblocksWallet<P> {
             .addresses
             .and_then(|addrs| addrs.into_iter().next())
             .and_then(|entry| entry.address)
-            .ok_or(FireblocksError::NoDepositAddress {
-                vault_account_id: ctx.vault_account_id,
-                asset_id: ctx.asset_id.clone(),
+            .ok_or_else(|| {
+                warn!(
+                    vault_id = ctx.vault_account_id.as_str(),
+                    asset_id = ctx.asset_id.as_str(),
+                    "No deposit address found"
+                );
+                FireblocksError::NoDepositAddress {
+                    vault_account_id: ctx.vault_account_id.clone(),
+                    asset_id: ctx.asset_id.clone(),
+                }
             })?;
 
         let address = address_str.parse()?;
@@ -352,8 +358,8 @@ where
         let external_tx_id = generate_external_tx_id(note);
 
         let tx_request = build_contract_call_request(
-            &self.asset_id,
-            self.vault_account_id,
+            self.asset_id.as_str(),
+            self.vault_account_id.as_str(),
             &wallet_id,
             &calldata,
             note,
@@ -424,8 +430,8 @@ where
 }
 
 fn build_contract_call_request(
-    asset_id: &AssetId,
-    vault_account_id: FireblocksVaultAccountId,
+    asset_id: &str,
+    vault_account_id: &str,
     wallet_id: &str,
     calldata: &Bytes,
     note: &str,
@@ -631,7 +637,7 @@ mod tests {
         FireblocksCtx {
             api_user_id: FireblocksApiUserId::new("test-api-key"),
             secret: TEST_RSA_PEM.to_vec(),
-            vault_account_id: FireblocksVaultAccountId::new(0),
+            vault_account_id: FireblocksVaultAccountId::new("0"),
             environment: FireblocksEnvironment::Sandbox,
             asset_id: AssetId("ETH".to_string()),
             provider,
@@ -646,7 +652,7 @@ mod tests {
     fn build_wallet<P>(client: Client, address: Address, provider: P) -> FireblocksWallet<P> {
         FireblocksWallet {
             client,
-            vault_account_id: FireblocksVaultAccountId::new(0),
+            vault_account_id: FireblocksVaultAccountId::new("0"),
             asset_id: AssetId("ETH".to_string()),
             provider,
             address,
@@ -990,8 +996,8 @@ mod tests {
     #[test]
     fn build_contract_call_request_sets_operation() {
         let request = build_contract_call_request(
-            &AssetId("ETH".to_string()),
-            FireblocksVaultAccountId::new(0),
+            "ETH",
+            "0",
             TEST_CONTRACT_WALLET_ID,
             &Bytes::from(vec![0x12, 0x34]),
             "test",
@@ -1004,8 +1010,8 @@ mod tests {
     #[test]
     fn build_contract_call_request_uses_whitelisted_wallet() {
         let request = build_contract_call_request(
-            &AssetId("ETH".to_string()),
-            FireblocksVaultAccountId::new(0),
+            "ETH",
+            "0",
             TEST_CONTRACT_WALLET_ID,
             &Bytes::new(),
             "test",
@@ -1028,8 +1034,8 @@ mod tests {
     fn build_contract_call_request_sets_calldata_without_0x() {
         let calldata = Bytes::from(vec![0xab, 0xcd, 0xef]);
         let request = build_contract_call_request(
-            &AssetId("ETH".to_string()),
-            FireblocksVaultAccountId::new(0),
+            "ETH",
+            "0",
             TEST_CONTRACT_WALLET_ID,
             &calldata,
             "test",
@@ -1052,8 +1058,8 @@ mod tests {
     #[test]
     fn build_contract_call_request_sets_zero_amount() {
         let request = build_contract_call_request(
-            &AssetId("ETH".to_string()),
-            FireblocksVaultAccountId::new(0),
+            "ETH",
+            "0",
             TEST_CONTRACT_WALLET_ID,
             &Bytes::new(),
             "test",
@@ -1330,20 +1336,20 @@ mod tests {
 
     #[test]
     fn fireblocks_vault_account_id_deserializes_from_integer() {
-        let FireblocksVaultAccountId(id) = serde_json::from_str("42").unwrap();
-        assert_eq!(id, 42);
+        let vault_id: FireblocksVaultAccountId = serde_json::from_str("42").unwrap();
+        assert_eq!(vault_id.0, 42);
     }
 
     #[test]
     fn fireblocks_vault_account_id_rejects_strings() {
-        // Vault account IDs are numeric - strings should not parse.
+        // Vault account IDs are numeric — strings should not parse.
         let string_values = ["\"REPLACE_WITH_FIREBLOCKS_VAULT_ID\"", "\"42\"", "\"abc\""];
 
         for value in string_values {
             let result = serde_json::from_str::<FireblocksVaultAccountId>(value);
             assert!(
                 result.is_err(),
-                "String vault account ID {value} must be rejected - \
+                "String vault account ID {value} must be rejected — \
                  use a bare integer"
             );
         }

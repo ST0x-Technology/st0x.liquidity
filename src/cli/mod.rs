@@ -800,7 +800,6 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
@@ -813,7 +812,7 @@ mod tests {
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{
-        AssetsConfig, BrokerCtx, LogLevel, OperationalLimits, SchwabAuth, TradingMode,
+        AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, SchwabAuth, TradingMode,
     };
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
@@ -1273,7 +1272,6 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: TEST_ORDERBOOK,
@@ -1295,7 +1293,7 @@ mod tests {
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
         }
@@ -2338,9 +2336,6 @@ mod tests {
                 database_url = ":memory:"
 
                 [assets]
-
-                [operational_limits]
-                mode = "disabled"
 
                 [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"
