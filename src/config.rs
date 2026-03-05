@@ -662,12 +662,6 @@ impl From<RebalancingCtxError> for CtxError {
     }
 }
 
-impl From<RebalancingCtxError> for CtxError {
-    fn from(error: RebalancingCtxError) -> Self {
-        Self::Rebalancing(Box::new(error))
-    }
-}
-
 #[cfg(test)]
 impl CtxError {
     fn kind(&self) -> &'static str {
