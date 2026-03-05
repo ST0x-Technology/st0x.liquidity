@@ -2470,4 +2470,72 @@ pub(crate) mod tests {
             assert_eq!(wrapper.mode, OperationMode::Disabled);
         }
     }
+
+    #[test]
+    fn broker_type_tag_uses_kebab_case() {
+        let variants = [
+            ("dry-run", "DryRun"),
+            ("schwab", "Schwab"),
+            ("alpaca-trading-api", "AlpacaTradingApi"),
+            ("alpaca-broker-api", "AlpacaBrokerApi"),
+        ];
+
+        for (kebab_value, variant_name) in variants {
+            let toml_str = format!(
+                r#"
+                [raindex]
+                ws_rpc_url = "ws://localhost:8545"
+
+                [broker]
+                type = "{kebab_value}"
+                "#,
+            );
+
+            // Only dry-run and schwab parse without extra fields;
+            // alpaca variants need credentials but the tag itself
+            // must be accepted before field validation runs.
+            let result = toml::from_str::<Secrets>(&toml_str);
+            match result {
+                Ok(_) => {}
+                Err(error) => {
+                    let msg = error.to_string();
+                    assert!(
+                        !msg.contains("unknown variant"),
+                        "Broker type tag \"{kebab_value}\" ({variant_name}) \
+                         was rejected as unknown variant. BrokerSecrets must \
+                         use rename_all = \"kebab-case\". Error: {msg}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn broker_type_tag_rejects_snake_case() {
+        let snake_values = ["dry_run", "alpaca_trading_api", "alpaca_broker_api"];
+
+        for snake_value in snake_values {
+            let toml_str = format!(
+                r#"
+                [raindex]
+                ws_rpc_url = "ws://localhost:8545"
+
+                [broker]
+                type = "{snake_value}"
+                "#,
+            );
+
+            let result = toml::from_str::<Secrets>(&toml_str);
+            assert!(
+                result.is_err(),
+                "Snake_case broker type \"{snake_value}\" should be rejected"
+            );
+            let error = result.err().unwrap();
+            assert!(
+                error.to_string().contains("unknown variant"),
+                "Snake_case broker type \"{snake_value}\" should be rejected \
+                 as unknown variant (kebab-case required), but got: {error}"
+            );
+        }
+    }
 }
