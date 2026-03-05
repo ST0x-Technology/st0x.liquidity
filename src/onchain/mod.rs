@@ -2,8 +2,8 @@
 //! parsing, event backfilling, position accumulation, and
 //! vault management.
 
+use alloy::primitives::Address;
 use alloy::primitives::ruint::FromUintError;
-use alloy::primitives::{Address, address};
 use alloy::rpc::client::RpcClient;
 use alloy::transports::layers::RetryBackoffLayer;
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -12,13 +12,13 @@ use serde::Deserialize;
 use std::num::TryFromIntError;
 use url::Url;
 
+use st0x_event_sorcery::ProjectionError;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::{
     EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
     InvalidSharesError, PersistenceError, SharesConversionError,
 };
-
-use st0x_event_sorcery::ProjectionError;
+use st0x_shared::TokenizedSymbolError;
 
 use crate::position::{Position, PositionError};
 use crate::queue::EventQueueError;
@@ -128,10 +128,18 @@ pub(crate) enum OnChainError {
     MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
-pub(crate) const USDC_ETHEREUM_SEPOLIA: Address =
-    address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+pub(crate) use st0x_shared::equity_token::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
+
+impl From<TokenizedSymbolError> for OnChainError {
+    fn from(error: TokenizedSymbolError) -> Self {
+        match error {
+            TokenizedSymbolError::NotTokenizedEquity {
+                symbol_provided, ..
+            } => Self::Validation(TradeValidationError::NotTokenizedEquity { symbol_provided }),
+            TokenizedSymbolError::EmptySymbol(empty) => Self::EmptySymbol(empty),
+        }
+    }
+}
 
 /// Number of block confirmations to wait after transactions before subsequent
 /// operations that depend on the state change. This ensures state propagates

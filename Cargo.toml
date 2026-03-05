@@ -8,6 +8,8 @@ members = [
   "crates/execution",
   "crates/bridge",
   "crates/evm",
+  "crates/shared",
+  "crates/taker",
 ]
 resolver = "2"
 
@@ -85,6 +87,7 @@ proptest = "1.7.0"
 rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
 st0x-exact-decimal = { path = "crates/exact-decimal" }
 st0x-evm = { path = "crates/evm" }
+st0x-shared = { path = "crates/shared" }
 num-decimal = { version = "0.2.5", default-features = false, features = [
   "num-v04",
 ] }
@@ -96,7 +99,7 @@ edition = "2024"
 
 [features]
 default = []
-test-support = ["st0x-bridge/test-support"]
+test-support = ["st0x-bridge/test-support", "st0x-shared/test-support"]
 
 [dependencies]
 alloy.workspace = true
@@ -107,6 +110,7 @@ st0x-event-sorcery = { path = "crates/event-sorcery" }
 st0x-dto = { path = "crates/dto" }
 st0x-bridge = { path = "crates/bridge", features = ["cctp"] }
 st0x-execution = { path = "crates/execution" }
+st0x-shared = { workspace = true }
 backon.workspace = true
 clap.workspace = true
 futures-util = "0.3.31"
@@ -166,6 +170,7 @@ tempfile = "3.24.0"
 tracing-test = "0.2.5"
 bon = "3.9.0"
 st0x-hedge = { path = ".", features = ["test-support"] }
+st0x-shared = { workspace = true, features = ["test-support"] }
 test-log = { version = "0.2.19", features = ["trace"] }
 approx = "0.5.1"
 rsa.workspace = true
