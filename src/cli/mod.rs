@@ -2358,7 +2358,7 @@ mod tests {
                 ws_rpc_url = "ws://localhost:8545"
 
                 [broker]
-                type = "dry_run"
+                type = "dry-run"
             "#,
         )
         .await

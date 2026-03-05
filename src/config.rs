@@ -158,7 +158,7 @@ struct Secrets {
 /// Broker type tag and all broker credentials.
 /// Deserialized from the `[broker]` section of the secrets TOML.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // isn't relevant for a brief startup step
 enum BrokerSecrets {
     Schwab {
@@ -798,7 +798,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "dry_run"
+            type = "dry-run"
         "#,
         )
         .unwrap();
@@ -1033,7 +1033,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "alpaca_broker_api"
+            type = "alpaca-broker-api"
             api_key = "test_key"
             api_secret = "test_secret"
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
@@ -1102,7 +1102,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "alpaca_broker_api"
+            type = "alpaca-broker-api"
             api_key = "test_key"
             api_secret = "test_secret"
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
@@ -1384,7 +1384,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "dry_run"
+            type = "dry-run"
 
             [hyperdx]
             api_key = "test-api-key"
@@ -1442,7 +1442,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "dry_run"
+            type = "dry-run"
 
             [hyperdx]
             api_key = "test-api-key"
@@ -1502,7 +1502,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "alpaca_broker_api"
+            type = "alpaca-broker-api"
             api_key = "test-key"
             api_secret = "test-secret"
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
@@ -1551,7 +1551,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "alpaca_trading_api"
+            type = "alpaca-trading-api"
             api_key = "test-key"
             api_secret = "test-secret"
         "#,
@@ -1573,7 +1573,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "alpaca_broker_api"
+            type = "alpaca-broker-api"
             api_key = "test-key"
             api_secret = "test-secret"
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
@@ -1890,7 +1890,7 @@ pub(crate) mod tests {
             extra_secret = "should fail"
 
             [broker]
-            type = "dry_run"
+            type = "dry-run"
         "#,
         );
 
@@ -1912,7 +1912,7 @@ pub(crate) mod tests {
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
-            type = "alpaca_broker_api"
+            type = "alpaca-broker-api"
             api_key = "key"
             api_secret = "secret"
             account_id = "id"
