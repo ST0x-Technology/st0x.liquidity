@@ -6,13 +6,8 @@ hyperdx.service_name = "st0x-hedge-e2e"
 [assets.equities.EXAMPLE]
 trading = "enabled"
 rebalancing = "disabled"
-tokenized_share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-total_return_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-[operational_limits]
-mode = "enabled"
-max_amount = 100
-max_shares = 2
+tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"

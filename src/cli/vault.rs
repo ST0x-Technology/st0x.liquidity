@@ -147,12 +147,11 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 mod tests {
     use alloy::primitives::{Address, address, b256};
     use rust_decimal_macros::dec;
-    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, LogLevel, OperationalLimits, TradingMode};
+    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
@@ -161,7 +160,6 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -176,7 +174,7 @@ mod tests {
             },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
         }
