@@ -86,14 +86,6 @@ pub enum RebalancingCtxError {
     Evm(#[from] st0x_evm::EvmError),
 }
 
-/// USDC rebalancing configuration with explicit enable/disable.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub(crate) enum UsdcRebalancing {
-    Enabled { target: Decimal, deviation: Decimal },
-    Disabled,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
@@ -107,7 +99,7 @@ pub(crate) struct RebalancingSecrets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancing,
+    pub(crate) usdc: ImbalanceThreshold,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: Option<B256>,
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
@@ -127,7 +119,7 @@ pub(crate) struct RebalancingConfig {
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancing,
+    pub(crate) usdc: ImbalanceThreshold,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: Option<B256>,
@@ -253,7 +245,7 @@ impl RebalancingCtx {
     #[cfg(test)]
     pub(crate) fn stub(
         equity: ImbalanceThreshold,
-        usdc: UsdcRebalancing,
+        usdc: ImbalanceThreshold,
         redemption_wallet: Address,
         usdc_vault_id: Option<B256>,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
@@ -295,7 +287,7 @@ impl std::fmt::Debug for RebalancingCtx {
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancing,
+    pub(crate) usdc: ImbalanceThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) disabled_assets: HashSet<Symbol>,
 }
@@ -1045,6 +1037,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
+    use crate::config::CashAssetConfig;
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
@@ -1063,7 +1056,7 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: UsdcRebalancing::Enabled {
+            usdc: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
@@ -1132,7 +1125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_usdc_disabled_does_not_send() {
+    async fn test_usdc_disabled_via_cash_config_does_not_send() {
         let (sender, mut receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let pool = crate::test_utils::setup_test_db().await;
@@ -1141,10 +1134,14 @@ mod tests {
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: test_config().equity,
-                usdc: UsdcRebalancing::Disabled,
+                usdc: test_config().usdc,
                 assets: AssetsConfig {
                     equities: HashMap::new(),
-                    cash: None,
+                    cash: Some(CashAssetConfig {
+                        vault_id: Some(B256::ZERO),
+                        rebalancing: OperationMode::Disabled,
+                        operational_limit: None,
+                    }),
                 },
                 disabled_assets: HashSet::new(),
             },
@@ -1178,7 +1175,7 @@ mod tests {
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: test_config().equity,
-                usdc: UsdcRebalancing::Disabled,
+                usdc: test_config().usdc,
                 assets: AssetsConfig {
                     equities: HashMap::new(),
                     cash: None,
@@ -3175,7 +3172,6 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
-            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#
@@ -3197,11 +3193,8 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.5));
         assert_eq!(config.equity.deviation, dec!(0.2));
 
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected enabled");
-        };
-        assert_eq!(target, dec!(0.5));
-        assert_eq!(deviation, dec!(0.3));
+        assert_eq!(config.usdc.target, dec!(0.5));
+        assert_eq!(config.usdc.deviation, dec!(0.3));
         assert_eq!(
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -3232,7 +3225,6 @@ mod tests {
             deviation = "0.1"
 
             [usdc]
-            mode = "enabled"
             target = "0.4"
             deviation = "0.15"
         "#,
@@ -3242,11 +3234,8 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.6));
         assert_eq!(config.equity.deviation, dec!(0.1));
 
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected enabled");
-        };
-        assert_eq!(target, dec!(0.4));
-        assert_eq!(deviation, dec!(0.15));
+        assert_eq!(config.usdc.target, dec!(0.4));
+        assert_eq!(config.usdc.deviation, dec!(0.15));
     }
 
     #[test]
@@ -3265,7 +3254,8 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
-            mode = "disabled"
+            target = "0.5"
+            deviation = "0.3"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -3302,7 +3292,8 @@ mod tests {
             8453 = "BASECHAIN_ETH"
 
             [usdc]
-            mode = "disabled"
+            target = "0.5"
+            deviation = "0.3"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -3313,7 +3304,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_usdc_disabled() {
+    fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
@@ -3327,14 +3318,13 @@ mod tests {
             [equity]
             target = "0.5"
             deviation = "0.2"
-
-            [usdc]
-            mode = "disabled"
         "#;
 
-        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
-
-        assert!(matches!(config.usdc, UsdcRebalancing::Disabled));
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("usdc"),
+            "Expected missing usdc error, got: {error}"
+        );
     }
 
     /// Spy reactor that records all dispatched events for verification.

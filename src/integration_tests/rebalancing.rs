@@ -36,7 +36,6 @@ use crate::onchain::raindex::Raindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
-use crate::rebalancing::trigger::UsdcRebalancing;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
     Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation,
@@ -111,7 +110,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: UsdcRebalancing::Enabled {
+        usdc: ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
@@ -1105,7 +1104,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: UsdcRebalancing::Enabled {
+        usdc: ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
@@ -1220,7 +1219,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: UsdcRebalancing::Enabled {
+        usdc: ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
@@ -1313,7 +1312,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
             },
-            usdc: UsdcRebalancing::Enabled {
+            usdc: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
             },
@@ -1364,7 +1363,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
             },
-            usdc: UsdcRebalancing::Enabled {
+            usdc: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
             },

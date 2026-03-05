@@ -196,7 +196,6 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::equity::EquityTransferServices;
-    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::VaultRegistry;
@@ -219,7 +218,7 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            UsdcRebalancing::Enabled {
+            ImbalanceThreshold {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
@@ -284,11 +283,8 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        let UsdcRebalancing::Enabled { target, deviation } = trigger_config.usdc else {
-            panic!("expected enabled");
-        };
-        assert_eq!(target, dec!(0.6));
-        assert_eq!(deviation, dec!(0.15));
+        assert_eq!(trigger_config.usdc.target, dec!(0.6));
+        assert_eq!(trigger_config.usdc.deviation, dec!(0.15));
     }
 
     async fn make_services_with_mock_wallet(
