@@ -8,6 +8,24 @@ mode = "enabled"
 max_amount = 500
 max_shares = 5
 
+[raindex]
+orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
+deployment_block = 40850446
+
+[rebalancing]
+redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+fireblocks_vault_account_id = "REPLACE_WITH_FIREBLOCKS_VAULT_ID"
+fireblocks_environment = "production"
+
+fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
+equity = { target = 0.5, deviation = 0.05 }
+usdc = { target = 0.5, deviation = 0.3 }
+
+[assets.cash]
+vault_id = "0xfab"
+rebalancing = "disabled"
+operational_limit = 100
+
 [assets.equities.SPYM]
 trading = "disabled"
 rebalancing = "disabled"
@@ -86,22 +104,3 @@ total_return_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
 vault_id = "0xfab"
 trading = "disabled"
 rebalancing = "enabled"
-operational_limit = 3
-
-[assets.cash]
-vault_id = "0xfab"
-rebalancing = "disabled"
-operational_limit = 100
-
-[raindex]
-orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
-deployment_block = 40850446
-
-[rebalancing]
-redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
-fireblocks_vault_account_id = "REPLACE_WITH_FIREBLOCKS_VAULT_ID"
-fireblocks_environment = "production"
-
-fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
-equity = { target = 0.5, deviation = 0.05 }
-usdc = { target = 0.5, deviation = 0.3 }
