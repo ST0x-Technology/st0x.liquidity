@@ -5,7 +5,7 @@ mod usdc;
 
 pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -101,7 +101,6 @@ pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: ImbalanceThreshold,
     pub(crate) redemption_wallet: Address,
-    pub(crate) usdc_vault_id: Option<B256>,
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
     pub(crate) fireblocks_environment: FireblocksEnvironment,
     pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
@@ -122,7 +121,6 @@ pub(crate) struct RebalancingCtx {
     pub(crate) usdc: ImbalanceThreshold,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    pub(crate) usdc_vault_id: Option<B256>,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Pre-built wallet for the base chain (e.g. Base mainnet).
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
@@ -174,7 +172,6 @@ impl RebalancingCtx {
             equity: config.equity,
             usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
-            usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
             base_wallet: Arc::new(base_wallet),
             ethereum_wallet: Arc::new(ethereum_wallet),
@@ -225,7 +222,6 @@ impl RebalancingCtx {
         equity: ImbalanceThreshold,
         usdc: ImbalanceThreshold,
         redemption_wallet: Address,
-        usdc_vault_id: Option<B256>,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
         let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
@@ -234,7 +230,6 @@ impl RebalancingCtx {
             equity,
             usdc,
             redemption_wallet,
-            usdc_vault_id,
             alpaca_broker_auth,
             base_wallet: wallet.clone(),
             ethereum_wallet: wallet,
@@ -248,7 +243,6 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("wallet", &self.base_wallet.address())
             .finish_non_exhaustive()
@@ -1002,7 +996,7 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -3140,7 +3134,6 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3193,7 +3186,6 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3222,7 +3214,6 @@ mod tests {
     #[test]
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3268,7 +3259,6 @@ mod tests {
         // integer in TOML, not a quoted string.
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = "1"
             fireblocks_environment = "sandbox"
 
@@ -3297,7 +3287,6 @@ mod tests {
     fn deserialize_integer_vault_account_id_succeeds() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = 1
             fireblocks_environment = "sandbox"
 
@@ -3322,7 +3311,6 @@ mod tests {
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3346,7 +3334,6 @@ mod tests {
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
