@@ -195,7 +195,7 @@ impl RebalancingCtx {
         Ok(FireblocksWallet::new(FireblocksCtx {
             api_user_id: api_user_id.clone(),
             secret: api_secret.to_vec(),
-            vault_account_id: config.fireblocks_vault_account_id.clone(),
+            vault_account_id: config.fireblocks_vault_account_id,
             environment: config.fireblocks_environment,
             asset_id,
             base_url: None,
