@@ -227,6 +227,10 @@ resolution and feature selection.
 See `.skills/gitbutler/` for version control workflow and
 `.github/PULL_REQUEST_TEMPLATE.md` for PR format requirements.
 
+**Default behavior:** After completing work, stage, commit, and push all changes
+unless the user explicitly says not to push (or there is a clear, stated reason
+to avoid pushing). Do not stop to ask for confirmation by default—proceed.
+
 ## Development Workflow Notes
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
