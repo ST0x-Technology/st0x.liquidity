@@ -110,7 +110,7 @@ pub(crate) struct RebalancingConfig {
 /// Runtime configuration for rebalancing operations.
 ///
 /// Constructed asynchronously from `RebalancingConfig`,
-/// `RebalancingSecrets`, and broker auth. During construction, Turnkey
+/// `RebalancingSecrets`, and broker auth. During construction, Fireblocks
 /// wallets are pre-built for both chains. After construction, all
 /// fields are immutable.
 ///
@@ -142,20 +142,13 @@ impl RebalancingCtx {
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
-        let fireblocks_secret = match fs::read(&secrets.fireblocks_secret_path).await {
-            Ok(secret) => secret,
-            Err(error) => {
-                error!(
-                    ?error,
-                    path = ?secrets.fireblocks_secret_path,
-                    "Failed to read Fireblocks secret file"
-                );
-                return Err(RebalancingCtxError::FireblocksSecretRead {
-                    path: secrets.fireblocks_secret_path,
+        let fireblocks_secret =
+            fs::read(&secrets.fireblocks_secret_path)
+                .await
+                .map_err(|error| RebalancingCtxError::FireblocksSecretRead {
+                    path: secrets.fireblocks_secret_path.clone(),
                     error,
-                });
-            }
-        };
+                })?;
 
         let (base_wallet, ethereum_wallet) = tokio::try_join!(
             Self::build_wallet(
@@ -761,6 +754,7 @@ impl RebalancingTrigger {
         let Ok(operation) =
             usdc::check_imbalance_and_build_operation(&threshold, &self.inventory, usdc_limit)
                 .await
+                .inspect_err(|skip| debug!(?skip, "Skipped USDC trigger"))
         else {
             return;
         };

@@ -56,6 +56,8 @@
         packages = let
           rainixPkgs = rainix.packages.${system};
           infraPkgs = import ./infra { inherit pkgs ragenix rainix system; };
+          rekeySecrets =
+            ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
 
           deployPkgs =
             (import ./deploy.nix { inherit deploy-rs self; }).wrappers {
@@ -159,7 +161,7 @@
                 keys.nix
 
               echo "Updated host key in keys.nix, rekeying secrets..."
-              ragenix --rules ./secret/secrets.nix -i "$identity" -r
+              ${rekeySecrets}
             '';
           };
 
@@ -169,7 +171,7 @@
             body = ''
               ${infraPkgs.parseIdentity}
               ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
-              exec ragenix --rules ./secret/secrets.nix -i "$identity" -r
+              exec ${rekeySecrets}
             '';
           };
 
@@ -178,7 +180,7 @@
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
               ${infraPkgs.parseIdentity}
-              exec ragenix --rules ./secret/secrets.nix -i "$identity" -r
+              exec ${rekeySecrets}
             '';
           };
 

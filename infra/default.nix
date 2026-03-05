@@ -16,6 +16,11 @@ let
       identity="$2"
       shift 2
     fi
+
+    if [ -z "$identity" ]; then
+      echo "ERROR: identity is empty -- pass -i <path> or set a default" >&2
+      exit 1
+    fi
   '';
 
   decryptState = ''
