@@ -41,8 +41,10 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
 
     let shares_limit = assets
         .equities
+        .symbols
         .get(symbol)
-        .and_then(|config| config.operational_limit.map(Positive::inner));
+        .and_then(|config| config.operational_limit.map(Positive::inner))
+        .or_else(|| assets.equities.operational_limit.map(Positive::inner));
 
     let Some((direction, shares)) = position.is_ready_for_execution(executor_type, shares_limit)?
     else {
@@ -118,8 +120,10 @@ pub(crate) async fn check_all_positions<E: Executor>(
 
         let shares_limit = assets
             .equities
+            .symbols
             .get(symbol)
-            .and_then(|config| config.operational_limit.map(Positive::inner));
+            .and_then(|config| config.operational_limit.map(Positive::inner))
+            .or_else(|| assets.equities.operational_limit.map(Positive::inner));
 
         if let Some((direction, shares)) =
             position.is_ready_for_execution(executor_type, shares_limit)?
@@ -170,7 +174,7 @@ mod tests {
     use st0x_execution::MockExecutor;
 
     use super::*;
-    use crate::config::{AssetsConfig, EquityAssetConfig, OperationMode};
+    use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -222,7 +226,7 @@ mod tests {
             &Symbol::new("AAPL").unwrap(),
             SupportedExecutor::Schwab,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -254,7 +258,7 @@ mod tests {
             &symbol,
             SupportedExecutor::Schwab,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -286,7 +290,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -340,7 +344,7 @@ mod tests {
             &query,
             SupportedExecutor::Schwab,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             |_| true,
@@ -384,7 +388,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -421,7 +425,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -461,7 +465,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -496,7 +500,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -517,7 +521,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             true,
@@ -550,19 +554,22 @@ mod tests {
         .await;
 
         let assets = AssetsConfig {
-            equities: HashMap::from([(
-                symbol.clone(),
-                EquityAssetConfig {
-                    tokenized_share: Address::ZERO,
-                    total_return_derivative: Address::ZERO,
-                    vault_id: None,
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    operational_limit: Some(
-                        Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
-                    ),
-                },
-            )]),
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols: HashMap::from([(
+                    symbol.clone(),
+                    EquityAssetConfig {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_id: None,
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        operational_limit: Some(
+                            Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
+                        ),
+                    },
+                )]),
+            },
             cash: None,
         };
 
@@ -607,7 +614,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             false,
@@ -652,7 +659,7 @@ mod tests {
             &query,
             SupportedExecutor::DryRun,
             &AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             |symbol| symbol != &aapl,

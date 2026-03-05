@@ -54,23 +54,23 @@ impl std::fmt::Display for FireblocksApiUserId {
 }
 
 /// Fireblocks vault account identifier.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Stored as `u64` internally; converted to a string only at the
+/// Fireblocks SDK boundary. The API rejects non-numeric values with
+/// `vaultAccountId: should match format "numeric"`.
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(transparent)]
-pub struct FireblocksVaultAccountId(String);
+pub struct FireblocksVaultAccountId(u64);
 
 impl FireblocksVaultAccountId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn new(id: u64) -> Self {
+        Self(id)
     }
 }
 
 impl std::fmt::Display for FireblocksVaultAccountId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        write!(formatter, "{}", self.0)
     }
 }
 
@@ -1335,8 +1335,34 @@ mod tests {
     }
 
     #[test]
-    fn fireblocks_vault_account_id_deserializes_from_string() {
-        let vault_id: FireblocksVaultAccountId = serde_json::from_str("\"42\"").unwrap();
-        assert_eq!(vault_id.as_str(), "42");
+    fn fireblocks_vault_account_id_deserializes_from_integer() {
+        let vault_id: FireblocksVaultAccountId = serde_json::from_str("42").unwrap();
+        assert_eq!(vault_id.0, 42);
+    }
+
+    #[test]
+    fn fireblocks_vault_account_id_rejects_strings() {
+        // Vault account IDs are numeric — strings should not parse.
+        let string_values = ["\"REPLACE_WITH_FIREBLOCKS_VAULT_ID\"", "\"42\"", "\"abc\""];
+
+        for value in string_values {
+            let result = serde_json::from_str::<FireblocksVaultAccountId>(value);
+            assert!(
+                result.is_err(),
+                "String vault account ID {value} must be rejected — \
+                 use a bare integer"
+            );
+        }
+    }
+
+    #[test]
+    fn fireblocks_vault_account_id_display_is_numeric_string() {
+        // The Fireblocks SDK expects string parameters, so Display
+        // must produce a numeric string for the API boundary.
+        let vault_id = FireblocksVaultAccountId(42);
+        assert_eq!(vault_id.to_string(), "42");
+
+        let vault_id = FireblocksVaultAccountId(0);
+        assert_eq!(vault_id.to_string(), "0");
     }
 }

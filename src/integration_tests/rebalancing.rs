@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
@@ -27,7 +27,7 @@ use st0x_execution::{
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
-use crate::config::{AssetsConfig, CashAssetConfig, OperationMode};
+use crate::config::{AssetsConfig, CashAssetConfig, EquitiesConfig, OperationMode};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
@@ -115,7 +115,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             deviation: dec!(0.2),
         },
         assets: AssetsConfig {
-            equities: HashMap::new(),
+            equities: EquitiesConfig::default(),
             cash: None,
         },
         disabled_assets: HashSet::new(),
@@ -1091,7 +1091,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     ));
 
     let assets = AssetsConfig {
-        equities: HashMap::new(),
+        equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
@@ -1207,7 +1207,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     ));
 
     let assets = AssetsConfig {
-        equities: HashMap::new(),
+        equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
@@ -1317,7 +1317,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: dec!(0.4),
             },
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             disabled_assets: HashSet::new(),
@@ -1368,7 +1368,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: dec!(0.1),
             },
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             disabled_assets: HashSet::new(),

@@ -102,13 +102,12 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
-    use std::collections::HashMap;
     use url::Url;
 
     use st0x_execution::SchwabTokens;
 
     use super::*;
-    use crate::config::{AssetsConfig, Ctx, LogLevel, OperationalLimits, TradingMode};
+    use crate::config::{AssetsConfig, Ctx, EquitiesConfig, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
@@ -129,7 +128,6 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -144,7 +142,7 @@ mod tests {
             },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
         };

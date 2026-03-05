@@ -116,14 +116,14 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use rust_decimal_macros::dec;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use tokio::sync::{RwLock, broadcast, mpsc};
 
     use st0x_event_sorcery::test_store;
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::config::AssetsConfig;
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -142,7 +142,7 @@ mod tests {
                 deviation: dec!(0.15),
             },
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             disabled_assets: HashSet::new(),
