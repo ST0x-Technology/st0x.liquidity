@@ -148,7 +148,7 @@ struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Secrets {
-    raindex: EvmSecrets,
+    evm: EvmSecrets,
     broker: BrokerSecrets,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetrySecrets>,
@@ -433,7 +433,7 @@ impl Ctx {
         // - DryRun uses shares threshold for testing
         let execution_threshold = broker.execution_threshold()?;
 
-        let evm = EvmCtx::new(&config.raindex, secrets.raindex);
+        let evm = EvmCtx::new(&config.raindex, secrets.evm);
 
         let trading_mode = match (
             config.rebalancing,
@@ -794,7 +794,7 @@ pub(crate) mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(
             br#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -809,7 +809,7 @@ pub(crate) mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(
             br#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1029,7 +1029,7 @@ pub(crate) mod tests {
     async fn rebalancing_with_low_operational_limit_fails() {
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1098,7 +1098,7 @@ pub(crate) mod tests {
     async fn rebalancing_with_low_cash_operational_limit_fails() {
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1206,7 +1206,7 @@ pub(crate) mod tests {
     async fn rebalancing_with_schwab_fails() {
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1380,7 +1380,7 @@ pub(crate) mod tests {
 
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1438,7 +1438,7 @@ pub(crate) mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1498,7 +1498,7 @@ pub(crate) mod tests {
 
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1547,7 +1547,7 @@ pub(crate) mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1569,7 +1569,7 @@ pub(crate) mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1603,7 +1603,7 @@ pub(crate) mod tests {
     async fn rebalancing_with_schwab_logs_error_kind() {
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -1688,18 +1688,17 @@ pub(crate) mod tests {
         };
 
         for (symbol, equity) in &config.assets.equities {
-            if equity.rebalancing == OperationMode::Enabled {
-                if let Some(limit) = &equity.operational_limit
-                    && let Some(global) = global_max_shares
-                {
-                    assert!(
-                        limit.inner() < global,
-                        "{symbol}: per-asset operational_limit ({}) must be \
-                         stricter than global max_shares ({global}) to provide \
-                         meaningful per-asset safety",
-                        limit.inner()
-                    );
-                }
+            if equity.rebalancing == OperationMode::Enabled
+                && let Some(limit) = &equity.operational_limit
+                && let Some(global) = global_max_shares
+            {
+                assert!(
+                    limit.inner() < global,
+                    "{symbol}: per-asset operational_limit ({}) must be \
+                     stricter than global max_shares ({global}) to provide \
+                     meaningful per-asset safety",
+                    limit.inner()
+                );
             }
         }
     }
@@ -1733,7 +1732,7 @@ pub(crate) mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut config_paths: Vec<PathBuf> = std::fs::read_dir(repo_root.join("config"))
             .unwrap()
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
             .collect();
@@ -1924,7 +1923,7 @@ pub(crate) mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
             extra_secret = "should fail"
 
@@ -1947,7 +1946,7 @@ pub(crate) mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [raindex]
+            [evm]
             ws_rpc_url = "ws://localhost:8545"
 
             [broker]
@@ -2483,7 +2482,7 @@ pub(crate) mod tests {
         for (kebab_value, variant_name) in variants {
             let toml_str = format!(
                 r#"
-                [raindex]
+                [evm]
                 ws_rpc_url = "ws://localhost:8545"
 
                 [broker]
@@ -2511,13 +2510,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn secrets_evm_section_uses_evm_not_raindex() {
+        // The secrets TOML section for EVM RPC URLs must be [evm], not
+        // [raindex]. These are generic EVM secrets (RPC endpoints), not
+        // Raindex-specific. The config TOML correctly uses [raindex] because
+        // those fields (orderbook, deployment_block) are Raindex-specific.
+        let with_evm = r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "dry-run"
+        "#;
+
+        let result = toml::from_str::<Secrets>(with_evm);
+        assert!(
+            result.is_ok(),
+            "Secrets TOML with [evm] section should parse successfully, \
+             but got error: {}",
+            result.err().unwrap()
+        );
+
+        let with_raindex = r#"
+            [raindex]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "dry-run"
+        "#;
+
+        let result = toml::from_str::<Secrets>(with_raindex);
+        assert!(
+            result.is_err(),
+            "Secrets TOML with [raindex] section should be rejected \
+             (deny_unknown_fields); the correct section name is [evm]"
+        );
+    }
+
+    #[test]
     fn broker_type_tag_rejects_snake_case() {
         let snake_values = ["dry_run", "alpaca_trading_api", "alpaca_broker_api"];
 
         for snake_value in snake_values {
             let toml_str = format!(
                 r#"
-                [raindex]
+                [evm]
                 ws_rpc_url = "ws://localhost:8545"
 
                 [broker]
