@@ -57,6 +57,8 @@ pub(crate) struct EquityAssetConfig {
     /// Wrapped version of tokenized shares to handle corporate actions in a
     /// manner compatible with other DeFi protocols
     pub(crate) tokenized_equity_derivative: Address,
+    /// Raindex vault ID. When set, the vault is seeded at startup;
+    /// when omitted, it is discovered from onchain trade events.
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
     pub(crate) vault_id: Option<B256>,
     pub(crate) trading: OperationMode,
@@ -68,6 +70,8 @@ pub(crate) struct EquityAssetConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CashAssetConfig {
+    /// Raindex vault ID. When set, the vault is seeded at startup;
+    /// when omitted, it is discovered from onchain trade events.
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
     pub(crate) vault_id: Option<B256>,
     pub(crate) rebalancing: OperationMode,
