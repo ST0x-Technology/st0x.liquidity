@@ -41,7 +41,7 @@ use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::raindex::RaindexService;
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
@@ -470,12 +470,25 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
+        let usdc_vault_id = deps
+            .ctx
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.vault_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "assets.cash.vault_id is required for rebalancing \
+                     but not configured"
+                )
+            })?;
+
         let handle = services.spawn(
-            &rebalancing_ctx,
             market_maker_wallet,
+            RaindexVaultId(usdc_vault_id),
             operation_receiver,
             frameworks,
-        )?;
+        );
 
         Ok(RebalancingInfrastructure {
             position: built.position,

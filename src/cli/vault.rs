@@ -113,7 +113,14 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
-    writeln!(stdout, "   Vault ID: {:?}", rebalancing_ctx.usdc_vault_id)?;
+    let usdc_vault_id = ctx
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.vault_id)
+        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
+
+    writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
 
     let (_vault_store, vault_registry_projection) =
         StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -127,9 +134,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         sender_address,
     );
 
-    let vault_id = RaindexVaultId(rebalancing_ctx.usdc_vault_id.ok_or_else(|| {
-        anyhow::anyhow!("USDC vault ID is required for vault withdrawal but not configured")
-    })?);
+    let vault_id = RaindexVaultId(usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;

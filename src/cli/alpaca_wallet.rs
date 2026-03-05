@@ -516,7 +516,7 @@ pub(super) async fn alpaca_journal_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, address};
+    use alloy::primitives::{Address, address};
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
@@ -627,7 +627,6 @@ mod tests {
                     deviation: dec!(0.3),
                 },
                 Address::ZERO,
-                Some(B256::ZERO),
                 AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),

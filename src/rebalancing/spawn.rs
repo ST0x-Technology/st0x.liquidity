@@ -33,17 +33,9 @@ pub(crate) enum SpawnRebalancerError {
     #[error("failed to create Alpaca broker API: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
-    Cctp(Box<CctpError>),
+    Cctp(#[from] Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
-    #[error("USDC vault ID is required for rebalancing but not configured")]
-    MissingUsdcVaultId,
-}
-
-impl From<CctpError> for SpawnRebalancerError {
-    fn from(error: CctpError) -> Self {
-        Self::Cctp(Box::new(error))
-    }
 }
 
 pub(crate) struct RebalancingCqrsFrameworks {
@@ -123,15 +115,11 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// processors.
     pub(crate) fn spawn(
         self,
-        ctx: &RebalancingCtx,
         market_maker_wallet: Address,
+        usdc_vault_id: RaindexVaultId,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
-    ) -> Result<JoinHandle<()>, SpawnRebalancerError> {
-        let usdc_vault_id = ctx
-            .usdc_vault_id
-            .ok_or(SpawnRebalancerError::MissingUsdcVaultId)?;
-
+    ) -> JoinHandle<()> {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -148,7 +136,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             self.raindex,
             frameworks.usdc,
             market_maker_wallet,
-            RaindexVaultId(usdc_vault_id),
+            usdc_vault_id,
         ));
 
         let rebalancer = Rebalancer::new(
@@ -160,9 +148,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         );
 
         info!("Rebalancing infrastructure initialized");
-        Ok(tokio::spawn(async move {
+        tokio::spawn(async move {
             rebalancer.run().await;
-        }))
+        })
     }
 }
 
@@ -170,7 +158,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
 mod tests {
     use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{B256, address, b256};
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
@@ -223,9 +211,6 @@ mod tests {
                 deviation: dec!(0.15),
             },
             address!("0x1234567890123456789012345678901234567890"),
-            Some(b256!(
-                "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            )),
             AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
@@ -426,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_dispatches_mint_operation() {
         let server = MockServer::start();
-        let (services, config) = make_services_with_mock_wallet(&server).await;
+        let (services, _ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
         let mock_services = EquityTransferServices {
@@ -447,9 +432,12 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let handle = services
-            .spawn(&config, Address::random(), rx, frameworks)
-            .unwrap();
+        let handle = services.spawn(
+            Address::random(),
+            RaindexVaultId(B256::ZERO),
+            rx,
+            frameworks,
+        );
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),

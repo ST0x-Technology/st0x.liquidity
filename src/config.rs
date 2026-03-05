@@ -954,7 +954,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1051,7 +1050,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1141,7 +1139,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1279,7 +1276,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1433,7 +1429,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
