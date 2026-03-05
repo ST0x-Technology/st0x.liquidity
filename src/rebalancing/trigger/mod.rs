@@ -662,15 +662,23 @@ impl RebalancingTrigger {
             .await?
             .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
 
-        let unwrapped_token = self.wrapper.lookup_tokenized_share(symbol)?;
+        let unwrapped_token = self.wrapper.lookup_tokenized_equity(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
         let shares_limit = self
             .config
             .assets
             .equities
+            .symbols
             .get(symbol)
-            .and_then(|config| config.operational_limit.map(Positive::inner));
+            .and_then(|config| config.operational_limit.map(Positive::inner))
+            .or_else(|| {
+                self.config
+                    .assets
+                    .equities
+                    .operational_limit
+                    .map(Positive::inner)
+            });
 
         let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
@@ -1016,7 +1024,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::config::CashAssetConfig;
+    use crate::config::{CashAssetConfig, EquitiesConfig};
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
@@ -1040,7 +1048,7 @@ mod tests {
                 deviation: dec!(0.2),
             },
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             disabled_assets: HashSet::new(),
@@ -1115,7 +1123,7 @@ mod tests {
                 equity: test_config().equity,
                 usdc: test_config().usdc,
                 assets: AssetsConfig {
-                    equities: HashMap::new(),
+                    equities: EquitiesConfig::default(),
                     cash: Some(CashAssetConfig {
                         vault_id: Some(B256::ZERO),
                         rebalancing: OperationMode::Disabled,
@@ -1156,7 +1164,7 @@ mod tests {
                 equity: test_config().equity,
                 usdc: test_config().usdc,
                 assets: AssetsConfig {
-                    equities: HashMap::new(),
+                    equities: EquitiesConfig::default(),
                     cash: None,
                 },
                 disabled_assets: HashSet::from([symbol.clone()]),
@@ -3139,7 +3147,7 @@ mod tests {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            fireblocks_vault_account_id = "0"
+            fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3192,7 +3200,7 @@ mod tests {
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            fireblocks_vault_account_id = "0"
+            fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3221,7 +3229,7 @@ mod tests {
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            fireblocks_vault_account_id = "0"
+            fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3259,11 +3267,69 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_string_vault_account_id_fails() {
+        // Reproduces production error: Fireblocks API returns 400 with
+        // "vaultAccountId: should match format \"numeric\"" when a
+        // non-numeric value is used. The vault account ID must be a bare
+        // integer in TOML, not a quoted string.
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = "1"
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let result = toml::from_str::<RebalancingConfig>(toml_str);
+        assert!(
+            result.is_err(),
+            "String fireblocks_vault_account_id must be rejected — \
+             use a bare integer in TOML"
+        );
+    }
+
+    #[test]
+    fn deserialize_integer_vault_account_id_succeeds() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            fireblocks_vault_account_id = 1
+            fireblocks_environment = "sandbox"
+
+            [fireblocks_chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let config = toml::from_str::<RebalancingConfig>(toml_str).unwrap();
+        assert_eq!(config.fireblocks_vault_account_id.to_string(), "1");
+    }
+
+    #[test]
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            fireblocks_vault_account_id = "0"
+            fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]
@@ -3287,7 +3353,7 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            fireblocks_vault_account_id = "0"
+            fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
             [fireblocks_chain_asset_ids]

@@ -182,7 +182,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
-    use crate::config::AssetsConfig;
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -250,7 +250,7 @@ mod tests {
             equity: ctx.equity,
             usdc: ctx.usdc,
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             disabled_assets: HashSet::new(),
@@ -268,7 +268,7 @@ mod tests {
             equity: ctx.equity,
             usdc: ctx.usdc,
             assets: AssetsConfig {
-                equities: HashMap::new(),
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             disabled_assets: HashSet::new(),

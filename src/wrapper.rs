@@ -45,11 +45,11 @@ pub(crate) trait Wrapper: Send + Sync {
         symbol: &Symbol,
     ) -> Result<UnderlyingPerWrapped, WrapperError>;
 
-    /// Gets the tokenized share (underlying) token address for a symbol.
-    fn lookup_tokenized_share(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
+    /// Gets the tokenized equity (underlying) token address for a symbol.
+    fn lookup_tokenized_equity(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
 
-    /// Gets the total return derivative (ERC-4626 vault) token address for a symbol.
-    fn lookup_total_return_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
+    /// Gets the tokenized equity derivative (ERC-4626 vault) token address for a symbol.
+    fn lookup_tokenized_equity_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
 
     /// Deposits underlying tokens to receive wrapped tokens.
     async fn to_wrapped(

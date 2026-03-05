@@ -47,7 +47,7 @@ impl MockWrapper {
         }
     }
 
-    /// Sets the address returned by `lookup_tokenized_share`.
+    /// Sets the address returned by `lookup_tokenized_equity`.
     pub(crate) fn with_unwrapped_token(mut self, token: Address) -> Self {
         self.unwrapped_token = token;
         self
@@ -105,14 +105,17 @@ impl Wrapper for MockWrapper {
         Ok(UnderlyingPerWrapped::new(self.ratio).expect("ratio is non-zero"))
     }
 
-    fn lookup_tokenized_share(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_tokenized_equity(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
         if self.lookup_fails {
             return Err(WrapperError::SymbolNotConfigured(symbol.clone()));
         }
         Ok(self.unwrapped_token)
     }
 
-    fn lookup_total_return_derivative(&self, _symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_tokenized_equity_derivative(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Address, WrapperError> {
         Ok(self.wrapped_token)
     }
 
