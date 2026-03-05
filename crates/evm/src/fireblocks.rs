@@ -275,7 +275,7 @@ impl<P> FireblocksWallet<P> {
                     "No deposit address found"
                 );
                 FireblocksError::NoDepositAddress {
-                    vault_account_id: ctx.vault_account_id.clone(),
+                    vault_account_id: ctx.vault_account_id,
                     asset_id: ctx.asset_id.clone(),
                 }
             })?;
