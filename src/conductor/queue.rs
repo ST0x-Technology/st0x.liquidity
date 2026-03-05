@@ -249,11 +249,9 @@ mod tests {
     use st0x_event_sorcery::{Projection, StoreBuilder, test_store};
     use st0x_execution::{ExecutorOrderId, MarketOrder, MockExecutor, Symbol};
 
-    use std::collections::HashMap;
-
     use super::*;
     use crate::bindings::IOrderBookV6::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::config::AssetsConfig;
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::offchain_order::noop_order_placer;
     use crate::offchain_order::{OffchainOrder, OrderPlacer};
     use crate::onchain_trade::OnChainTrade;
@@ -330,7 +328,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
-            assets: AssetsConfig { equities: HashMap::new(), cash: None },
+            assets: AssetsConfig { equities: EquitiesConfig::default(), cash: None },
         }
     }
 
