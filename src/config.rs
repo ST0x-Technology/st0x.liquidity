@@ -1663,6 +1663,47 @@ pub(crate) mod tests {
         let _: Secrets = toml::from_str(secrets_str).unwrap();
     }
 
+    #[test]
+    fn all_repo_config_tomls_are_valid() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut config_paths: Vec<PathBuf> = std::fs::read_dir(repo_root.join("config"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+
+        config_paths.push(repo_root.join("example.config.toml"));
+        config_paths.push(repo_root.join("e2e/config.toml"));
+
+        for path in config_paths {
+            let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("Failed to read config {path:?}: {error}");
+            });
+            toml::from_str::<Config>(&contents).unwrap_or_else(|error| {
+                panic!("Invalid config {path:?}: {error}");
+            });
+        }
+    }
+
+    #[test]
+    fn all_repo_secrets_tomls_are_valid() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let secret_paths = [
+            repo_root.join("example.secrets.toml"),
+            repo_root.join("e2e/secrets.toml"),
+        ];
+
+        for path in secret_paths {
+            let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("Failed to read secrets {path:?}: {error}");
+            });
+            toml::from_str::<Secrets>(&contents).unwrap_or_else(|error| {
+                panic!("Invalid secrets {path:?}: {error}");
+            });
+        }
+    }
+
     #[tokio::test]
     async fn unknown_config_fields_rejected() {
         let config = toml_file(
