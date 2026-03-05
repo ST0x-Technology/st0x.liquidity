@@ -2340,7 +2340,7 @@ mod tests {
                 [operational_limits]
                 mode = "disabled"
 
-                [evm]
+                [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"
                 deployment_block = 1
                 order_owner = "0x2222222222222222222222222222222222222222"
@@ -2352,11 +2352,11 @@ mod tests {
         tokio::fs::write(
             &secrets_path,
             r#"
-                [evm]
+                [raindex]
                 ws_rpc_url = "ws://localhost:8545"
 
                 [broker]
-                type = "dry-run"
+                type = "dry_run"
             "#,
         )
         .await

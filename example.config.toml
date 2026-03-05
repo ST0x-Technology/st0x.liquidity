@@ -3,17 +3,17 @@ log_level = "debug"
 server_port = 8080
 
 [assets.equities.EXAMPLE]
-tokenized-share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-total-return-derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+tokenized_share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+total_return_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 trading = "enabled"
 rebalancing = "disabled"
 
 [operational_limits]
 mode = "enabled"
-max_amount = "100"
-max_shares = "2"
+max_amount = 100
+max_shares = 2
 
-[evm]
+[raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 
@@ -31,10 +31,9 @@ fireblocks_environment = "sandbox"
 8453 = "BASECHAIN_ETH"
 
 [rebalancing.equity]
-target = "0.5"
-deviation = "0.2"
+target = 0.5
+deviation = 0.2
 
 [rebalancing.usdc]
-mode = "enabled"
-target = "0.5"
-deviation = "0.3"
+target = 0.5
+deviation = 0.3
