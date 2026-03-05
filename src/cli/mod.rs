@@ -2352,7 +2352,7 @@ mod tests {
         tokio::fs::write(
             &secrets_path,
             r#"
-                [raindex]
+                [evm]
                 ws_rpc_url = "ws://localhost:8545"
 
                 [broker]
