@@ -434,7 +434,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: rebalancing_ctx.equity,
-                usdc: rebalancing_ctx.usdc.clone(),
+                usdc: rebalancing_ctx.usdc,
                 assets: deps.ctx.assets.clone(),
                 disabled_assets,
             },
@@ -1572,7 +1572,6 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
     use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
-    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::{ExecutionThreshold, Usdc};
@@ -3413,7 +3412,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancing::Enabled {
+                usdc: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3504,10 +3503,7 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: threshold,
-                usdc: UsdcRebalancing::Enabled {
-                    target: threshold.target,
-                    deviation: threshold.deviation,
-                },
+                usdc: threshold,
                 assets: AssetsConfig {
                     equities: HashMap::new(),
                     cash: None,
@@ -3618,7 +3614,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancing::Enabled {
+                usdc: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3745,7 +3741,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancing::Enabled {
+                usdc: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },

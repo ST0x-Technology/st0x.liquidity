@@ -127,7 +127,6 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
-    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
@@ -138,7 +137,7 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: UsdcRebalancing::Enabled {
+            usdc: ImbalanceThreshold {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
