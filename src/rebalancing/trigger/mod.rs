@@ -736,11 +736,6 @@ impl RebalancingTrigger {
             return None;
         }
 
-        let UsdcRebalancing::Enabled { target, deviation } = self.config.usdc else {
-            return None;
-        };
-
-        let threshold = ImbalanceThreshold { target, deviation };
         let usdc_limit = self
             .config
             .assets
@@ -748,7 +743,7 @@ impl RebalancingTrigger {
             .as_ref()
             .and_then(|cash| cash.operational_limit.map(Positive::inner));
 
-        Some((threshold, usdc_limit))
+        Some((self.config.usdc, usdc_limit))
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
