@@ -1,15 +1,22 @@
-server_port = 8001
-log_level = "info"
 database_url = ":memory:"
-hyperdx.service_name = "st0x-hedge-e2e"
+log_level = "info"
+server_port = 8001
 
 [assets.equities.EXAMPLE]
+tokenized_share = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+total_return_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 trading = "enabled"
 rebalancing = "disabled"
-tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[operational_limits]
+mode = "enabled"
+max_amount = 100
+max_shares = 2
 
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
 order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
 deployment_block = 1
+
+[hyperdx]
+service_name = "st0x-hedge-e2e"
