@@ -168,7 +168,17 @@
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
               ${infraPkgs.parseIdentity}
-              exec ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
+              ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
+              exec ragenix --rules ./secret/secrets.nix -i "$identity" -r
+            '';
+          };
+
+          rekey = rainix.mkTask.${system} {
+            name = "rekey";
+            additionalBuildInputs = [ ragenix.packages.${system}.default ];
+            body = ''
+              ${infraPkgs.parseIdentity}
+              exec ragenix --rules ./secret/secrets.nix -i "$identity" -r
             '';
           };
 
@@ -214,6 +224,8 @@
               ragenix.packages.${system}.default
               packages.ci
               packages.prepSolArtifacts
+              packages.secret
+              packages.rekey
               packages.remote
               packages.deployNixos
               packages.deployService
