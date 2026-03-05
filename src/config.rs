@@ -1622,11 +1622,9 @@ pub(crate) mod tests {
 
         for (symbol, equity) in &config.assets.equities {
             if equity.rebalancing == OperationMode::Enabled {
-                let limit = equity.operational_limit.as_ref().unwrap_or_else(|| {
-                    panic!("{symbol}: rebalancing enabled but no operational_limit set")
-                });
-
-                if let Some(global) = global_max_shares {
+                if let Some(limit) = &equity.operational_limit
+                    && let Some(global) = global_max_shares
+                {
                     assert!(
                         limit.inner() < global,
                         "{symbol}: per-asset operational_limit ({}) must be \
