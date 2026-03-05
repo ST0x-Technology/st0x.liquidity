@@ -533,7 +533,6 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
-    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -622,7 +621,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                UsdcRebalancing::Disabled,
+                ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.3),
+                },
                 Address::ZERO,
                 Some(B256::ZERO),
                 AlpacaBrokerApiCtx {
