@@ -163,7 +163,14 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let owner = rebalancing_ctx.base_wallet().address();
 
-    writeln!(stdout, "   Vault ID: {:?}", rebalancing_ctx.usdc_vault_id)?;
+    let usdc_vault_id = ctx
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.vault_id)
+        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
+
+    writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
 
     let broker_mode = if alpaca_auth.is_sandbox() {
         AlpacaBrokerApiMode::Sandbox
@@ -219,9 +226,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         vault_service,
         usdc_store,
         owner,
-        RaindexVaultId(rebalancing_ctx.usdc_vault_id.ok_or_else(|| {
-            anyhow::anyhow!("USDC vault ID is required for transfer-usdc but not configured")
-        })?),
+        RaindexVaultId(usdc_vault_id),
     );
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
