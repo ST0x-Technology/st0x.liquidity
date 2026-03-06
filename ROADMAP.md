@@ -77,12 +77,12 @@ Everything below has not been organized into epics yet.
 - PR:
   [#315 go live prod configuration](https://github.com/ST0x-Technology/st0x.liquidity/pull/315)
 
-- [ ] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
-  - PR (draft):
-    [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
 - [ ] [#353 Per-asset operations config: independent trading/rebalancing toggles, vault IDs, operational limits](https://github.com/ST0x-Technology/st0x.liquidity/issues/353)
   - PR:
     [#355 per-asset operations config: independent trading/rebalancing toggles](https://github.com/ST0x-Technology/st0x.liquidity/pull/355)
+- [x] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
+  - PR:
+    [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
 
 #### Wrapped Token Handling
 

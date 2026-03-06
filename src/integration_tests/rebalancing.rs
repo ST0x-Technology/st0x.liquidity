@@ -632,7 +632,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new().with_token(token_address));
-    let wrapper = MockWrapper::new().with_unwrapped_token(token_address);
+    let wrapper = MockWrapper::new().with_tokenized_shares(token_address);
     let equity_transfer = build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper);
 
     build_imbalanced_inventory(Imbalance::Equity {

@@ -37,7 +37,7 @@ sqlite-es.workspace = true
 rust_decimal = { workspace = true, features = ["serde-with-float"] }
 num-decimal.workspace = true
 rust_decimal_macros.workspace = true
-st0x-finance = { version = "0.1.0", path = "../finance" }
+st0x-finance.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true

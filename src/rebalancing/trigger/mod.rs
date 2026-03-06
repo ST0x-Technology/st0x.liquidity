@@ -312,7 +312,7 @@ pub(crate) enum TriggeredOperation {
         /// Wrapped (ERC-4626) token address for vault withdrawal.
         wrapped_token: Address,
         /// Unwrapped (underlying) token address for sending to Alpaca.
-        unwrapped_token: Address,
+        tokenized_shares: Address,
     },
     /// Move USDC from Alpaca to Base (too much offchain).
     UsdcAlpacaToBase { amount: Usdc },
@@ -688,7 +688,7 @@ impl RebalancingTrigger {
             .await?
             .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
 
-        let unwrapped_token = self.wrapper.lookup_underlying(symbol)?;
+        let tokenized_shares = self.wrapper.lookup_underlying(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
         let shares_limit = self
@@ -711,7 +711,7 @@ impl RebalancingTrigger {
             &self.config.equity,
             &self.inventory,
             wrapped_token,
-            unwrapped_token,
+            tokenized_shares,
             &vault_ratio,
             shares_limit,
         )

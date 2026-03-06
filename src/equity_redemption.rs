@@ -951,7 +951,7 @@ mod tests {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new().with_unwrapped_token(underlying_token)),
+            wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
