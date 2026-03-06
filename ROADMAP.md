@@ -13,11 +13,12 @@ graph TD
     A["#355 per-asset-operations-config"] --> B["#381 roadmap update"]
     B --> C["#354 Turnkey wallet<br/>(evm crate)"]
     B --> D["#376 DTO schema update"]
-    C --> E["#380 wallet provider config<br/>(main crate, last)"]
     D --> F["#377 dashboard backend"]
     D --> G["#378 dashboard frontend"]
     F --> H["#379 dashboard integration"]
     G --> H
+    C --> E["#380 wallet provider config<br/>(main crate, last)"]
+    H --> E
 ```
 
 ### Turnkey wallet (evm crate, independent)
@@ -40,11 +41,11 @@ Turnkey work above, so both proceed in parallel.
 - [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
 - [ ] [#379 Dashboard integration: verify nix build, deployment, and end-to-end data flow](https://github.com/ST0x-Technology/st0x.liquidity/issues/379)
 
-### Wallet provider config (main crate, depends on Turnkey wallet)
+### Wallet provider config (main crate, depends on everything above)
 
 Wires Turnkey into the main crate config so operators can choose between Turnkey
-and Fireblocks. Deferred to last to avoid conflicts with dashboard work in the
-same crate.
+and Fireblocks. Final convergence point -- stacked on both the Turnkey and
+dashboard integration branches to avoid conflicts in the main crate.
 
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
 

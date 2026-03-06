@@ -104,6 +104,12 @@ independent parallel execution:
    other parallel branches also modify, schedule it after those branches merge
    to avoid conflict resolution overhead.
 
+7. **Converge to a single terminal node.** The dependency graph for an epic
+   should have one final PR that depends on all parallel streams. This is where
+   integration happens and it ensures the epic is complete when that node
+   merges. It also prevents conflicting branches from being active
+   simultaneously in a single worktree.
+
 ### Managing Epics in the Roadmap
 
 An epic is a roadmap subsection grouping related issues toward a single goal.
@@ -279,10 +285,6 @@ resolution and feature selection.
 
 See `.skills/gitbutler/` for version control workflow and
 `.github/PULL_REQUEST_TEMPLATE.md` for PR format requirements.
-
-**Default behavior:** After completing work, stage, commit, and push all changes
-unless the user explicitly says not to push (or there is a clear, stated reason
-to avoid pushing). Do not stop to ask for confirmation by default—proceed.
 
 ## Development Workflow Notes
 
