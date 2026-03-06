@@ -800,6 +800,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
 
@@ -812,7 +813,8 @@ mod tests {
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{
-        AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, SchwabAuth, TradingMode,
+        AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
+        SchwabAuth, TradingMode,
     };
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
@@ -1267,6 +1269,24 @@ mod tests {
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
 
+    fn enabled_equity() -> EquityAssetConfig {
+        EquityAssetConfig {
+            tokenized_equity: Address::ZERO,
+            tokenized_equity_derivative: Address::ZERO,
+            vault_id: None,
+            trading: OperationMode::Enabled,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        }
+    }
+
+    fn test_equity_symbols() -> HashMap<Symbol, EquityAssetConfig> {
+        HashMap::from([
+            (Symbol::new("AAPL").unwrap(), enabled_equity()),
+            (Symbol::new("TSLA").unwrap(), enabled_equity()),
+        ])
+    }
+
     fn create_test_ctx_for_cli(mock_server: &MockServer, order_owner: Address) -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
@@ -1293,7 +1313,10 @@ mod tests {
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols: test_equity_symbols(),
+                },
                 cash: None,
             },
         }
@@ -2335,7 +2358,7 @@ mod tests {
             r#"
                 database_url = ":memory:"
 
-                [assets]
+                [assets.equities]
 
                 [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"

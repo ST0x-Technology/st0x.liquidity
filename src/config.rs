@@ -942,6 +942,8 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
+            [assets.equities]
+
             [assets.cash]
             rebalancing = "enabled"
             operational_limit = 5
@@ -1938,14 +1940,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn is_trading_enabled_defaults_to_true_for_unknown() {
+    fn is_trading_disabled_for_unknown_assets() {
         let ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
 
         assert!(
-            ctx.is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
-            "Unknown assets should default to trading enabled"
+            !ctx.is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to trading disabled (fail-closed)"
         );
     }
 
