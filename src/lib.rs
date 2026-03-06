@@ -50,9 +50,7 @@ mod wrapper;
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 
 #[cfg(any(test, feature = "test-support"))]
-pub use config::TradingMode;
-#[cfg(any(test, feature = "test-support"))]
-pub use config::{AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+pub use config::{CashAssetConfig, EquityAssetConfig, OperationMode};
 #[cfg(any(test, feature = "test-support"))]
 pub use inventory::ImbalanceThreshold;
 #[cfg(any(test, feature = "test-support"))]

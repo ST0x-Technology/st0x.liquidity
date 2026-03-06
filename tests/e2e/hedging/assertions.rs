@@ -13,9 +13,8 @@ use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
-use st0x_hedge::TradingMode;
 use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{AssetsConfig, BrokerCtx, Ctx};
+use st0x_hedge::config::{AssetsConfig, BrokerCtx, Ctx, TradingMode};
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
@@ -68,12 +67,12 @@ pub(crate) async fn poll_for_hedged_position(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
     symbol: &str,
-) {
+) -> anyhow::Result<()> {
     let url = format!("sqlite:{}", db_path.display());
     let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
     let deadline = tokio::time::Instant::now() + timeout;
     let context = format!("hedged position for {symbol}");
-    let target_symbol = Symbol::new(symbol.to_owned()).unwrap();
+    let target_symbol = Symbol::new(symbol.to_owned())?;
 
     loop {
         sleep_or_crash(bot, &context).await;
@@ -99,7 +98,7 @@ pub(crate) async fn poll_for_hedged_position(
         pool.close().await;
 
         if is_hedged {
-            return;
+            return Ok(());
         }
 
         assert!(

@@ -1,3 +1,5 @@
+TODO: don't forget to update this
+
 # SPEC.md
 
 System specification for st0x liquidity. Covers architecture, behavior, and

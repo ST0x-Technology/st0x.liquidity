@@ -894,7 +894,7 @@ impl Reactor for RebalancingTrigger {
             })
             .on(|id, event| async move { self.on_mint(id, event).await })
             .on(|id, event| async move { self.on_redemption(id, event).await })
-            .on(|_id, event| async move {
+            .on(|id, event| async move {
                 if let UsdcRebalanceEvent::Initiated {
                     direction, amount, ..
                 } = &event
@@ -906,10 +906,17 @@ impl Reactor for RebalancingTrigger {
                     let update = Inventory::transfer(venue, TransferOp::Start, *amount);
 
                     let mut inventory = self.inventory.write().await;
-                    *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+                    *inventory = inventory
+                        .clone()
+                        .update_usdc(update, Utc::now())?
+                        .set_active_usdc_rebalance(id.clone());
                 }
 
                 if Self::is_terminal_usdc_rebalance_event(&event) {
+                    let mut inventory = self.inventory.write().await;
+                    *inventory = inventory.clone().clear_active_usdc_rebalance();
+                    drop(inventory);
+
                     self.clear_usdc_in_progress();
                     debug!("Cleared USDC in-progress flag after rebalance terminal event");
 
@@ -1066,12 +1073,7 @@ impl RebalancingTrigger {
         id: IssuerRequestId,
         event: TokenizedEquityMintEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        if let Some((symbol, quantity)) = Self::extract_mint_info(&event) {
-            self.mint_tracking
-                .write()
-                .await
-                .insert(id.clone(), (symbol, quantity));
-        }
+        self.track_mint(&id, &event).await;
 
         let Some((symbol, quantity)) = self.mint_tracking.read().await.get(&id).cloned() else {
             warn!(id = %id, "Mint event for untracked aggregate");
@@ -1108,12 +1110,22 @@ impl RebalancingTrigger {
 
         if let Some(update) = update {
             let mut inventory = self.inventory.write().await;
-            *inventory = inventory
+            let mut view = inventory
                 .clone()
                 .update_equity(&symbol, update, Utc::now())?;
+
+            if matches!(event, MintAccepted { .. }) {
+                view = view.set_active_mint(symbol.clone(), id.clone());
+            }
+
+            *inventory = view;
         }
 
         if Self::is_terminal_mint_event(&event) {
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory.clone().clear_active_mint(&symbol);
+            drop(inventory);
+
             self.mint_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
             debug!(%symbol, "Cleared equity in-progress flag after mint terminal event");
@@ -1129,12 +1141,7 @@ impl RebalancingTrigger {
         id: RedemptionAggregateId,
         event: EquityRedemptionEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        if let Some((symbol, quantity)) = Self::extract_redemption_info(&event) {
-            self.redemption_tracking
-                .write()
-                .await
-                .insert(id.clone(), (symbol, quantity));
-        }
+        self.track_redemption(&id, &event).await;
 
         let Some((symbol, quantity)) = self.redemption_tracking.read().await.get(&id).cloned()
         else {
@@ -1178,12 +1185,22 @@ impl RebalancingTrigger {
 
         if let Some(update) = update {
             let mut inventory = self.inventory.write().await;
-            *inventory = inventory
+            let mut view = inventory
                 .clone()
                 .update_equity(&symbol, update, Utc::now())?;
+
+            if matches!(event, WithdrawnFromRaindex { .. }) {
+                view = view.set_active_redemption(symbol.clone(), id.clone());
+            }
+
+            *inventory = view;
         }
 
         if Self::is_terminal_redemption_event(&event) {
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory.clone().clear_active_redemption(&symbol);
+            drop(inventory);
+
             self.redemption_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
             debug!(
@@ -1195,6 +1212,24 @@ impl RebalancingTrigger {
         }
 
         Ok(())
+    }
+
+    async fn track_mint(&self, id: &IssuerRequestId, event: &TokenizedEquityMintEvent) {
+        if let Some((symbol, quantity)) = Self::extract_mint_info(event) {
+            self.mint_tracking
+                .write()
+                .await
+                .insert(id.clone(), (symbol, quantity));
+        }
+    }
+
+    async fn track_redemption(&self, id: &RedemptionAggregateId, event: &EquityRedemptionEvent) {
+        if let Some((symbol, quantity)) = Self::extract_redemption_info(event) {
+            self.redemption_tracking
+                .write()
+                .await
+                .insert(id.clone(), (symbol, quantity));
+        }
     }
 
     fn extract_mint_info(event: &TokenizedEquityMintEvent) -> Option<(Symbol, FractionalShares)> {
@@ -4619,5 +4654,206 @@ mod tests {
             !debug.contains(&api_private_key),
             "debug output leaked the API private key: {debug}"
         );
+    }
+
+    #[tokio::test]
+    async fn usdc_initiated_stores_active_id_on_inventory() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.active_usdc_rebalance(),
+            Some(&id),
+            "Initiated event should store active USDC rebalance ID on inventory"
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn usdc_terminal_event_clears_active_id_on_inventory() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(id, make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.active_usdc_rebalance(),
+            None,
+            "Terminal event should clear active USDC rebalance ID"
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn mint_accepted_stores_active_id_on_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = IssuerRequestId::new("mint-active-id");
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, dec!(10)))
+            .await
+            .unwrap();
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.active_mint(&symbol),
+            Some(&id),
+            "MintAccepted should store active mint ID on inventory"
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn mint_terminal_event_clears_active_id_on_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = IssuerRequestId::new("mint-clear-id");
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, dec!(10)))
+            .await
+            .unwrap();
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
+            .await
+            .unwrap();
+
+        harness
+            .receive::<TokenizedEquityMint>(id, make_deposited_into_raindex())
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.active_mint(&symbol),
+            None,
+            "Terminal mint event should clear active mint ID"
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn redemption_withdrawn_stores_active_id_on_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("redemption-active-id");
+
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_withdrawn_from_raindex(&symbol, dec!(10)))
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.active_redemption(&symbol),
+            Some(&id),
+            "WithdrawnFromRaindex should store active redemption ID on inventory"
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn redemption_terminal_event_clears_active_id_on_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("redemption-clear-id");
+
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_withdrawn_from_raindex(&symbol, dec!(10)))
+            .await
+            .unwrap();
+
+        harness
+            .receive::<EquityRedemption>(id, make_redemption_completed())
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.active_redemption(&symbol),
+            None,
+            "Terminal redemption event should clear active redemption ID"
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn no_active_transfer_returns_none() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(view.active_usdc_rebalance(), None);
+        assert_eq!(view.active_mint(&symbol), None);
+        assert_eq!(view.active_redemption(&symbol), None);
+        drop(view);
     }
 }

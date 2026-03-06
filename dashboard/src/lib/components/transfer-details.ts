@@ -96,6 +96,7 @@ export const completedStages = (transfer: TransferOperation): StageEntry[] =>
 
 
 
+
 const usdcBridgeLinks = (status: UsdcBridgeStatus, direction: UsdcDirection): TxLink[] => {
   const burnExplorer = direction === 'alpaca_to_base' ? ETH_EXPLORER : BASE_EXPLORER
   const mintExplorer = direction === 'alpaca_to_base' ? BASE_EXPLORER : ETH_EXPLORER

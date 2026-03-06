@@ -11,6 +11,9 @@ use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symb
 use st0x_finance::Usdc;
 
 use super::venue_balance::{InventoryError, VenueBalance};
+use crate::equity_redemption::RedemptionAggregateId;
+use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
 /// Error type for inventory view operations.
@@ -496,6 +499,15 @@ pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
     last_updated: DateTime<Utc>,
+    /// Which USDC rebalance aggregate is currently in flight, if any.
+    #[serde(skip)]
+    active_usdc_rebalance: Option<UsdcRebalanceId>,
+    /// Which mint aggregate is in flight for each symbol, if any.
+    #[serde(skip)]
+    active_mints: HashMap<Symbol, IssuerRequestId>,
+    /// Which redemption aggregate is in flight for each symbol, if any.
+    #[serde(skip)]
+    active_redemptions: HashMap<Symbol, RedemptionAggregateId>,
 }
 
 impl InventoryView {
@@ -591,6 +603,9 @@ impl Default for InventoryView {
             usdc: Inventory::default(),
             equities: HashMap::new(),
             last_updated: Utc::now(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         }
     }
 }
@@ -666,6 +681,9 @@ impl InventoryView {
             equities,
             last_updated: now,
             usdc: self.usdc,
+            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_mints: self.active_mints,
+            active_redemptions: self.active_redemptions,
         })
     }
 
@@ -680,7 +698,65 @@ impl InventoryView {
             usdc: updated,
             last_updated: now,
             equities: self.equities,
+            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_mints: self.active_mints,
+            active_redemptions: self.active_redemptions,
         })
+    }
+}
+
+impl InventoryView {
+    pub(crate) fn set_active_usdc_rebalance(self, id: UsdcRebalanceId) -> Self {
+        Self {
+            active_usdc_rebalance: Some(id),
+            ..self
+        }
+    }
+
+    pub(crate) fn clear_active_usdc_rebalance(self) -> Self {
+        Self {
+            active_usdc_rebalance: None,
+            ..self
+        }
+    }
+
+    pub(crate) fn set_active_mint(mut self, symbol: Symbol, id: IssuerRequestId) -> Self {
+        self.active_mints.insert(symbol, id);
+        self
+    }
+
+    pub(crate) fn clear_active_mint(mut self, symbol: &Symbol) -> Self {
+        self.active_mints.remove(symbol);
+        self
+    }
+
+    pub(crate) fn set_active_redemption(
+        mut self,
+        symbol: Symbol,
+        id: RedemptionAggregateId,
+    ) -> Self {
+        self.active_redemptions.insert(symbol, id);
+        self
+    }
+
+    pub(crate) fn clear_active_redemption(mut self, symbol: &Symbol) -> Self {
+        self.active_redemptions.remove(symbol);
+        self
+    }
+}
+
+#[cfg(test)]
+impl InventoryView {
+    pub(crate) fn active_usdc_rebalance(&self) -> Option<&UsdcRebalanceId> {
+        self.active_usdc_rebalance.as_ref()
+    }
+
+    pub(crate) fn active_mint(&self, symbol: &Symbol) -> Option<&IssuerRequestId> {
+        self.active_mints.get(symbol)
+    }
+
+    pub(crate) fn active_redemption(&self, symbol: &Symbol) -> Option<&RedemptionAggregateId> {
+        self.active_redemptions.get(symbol)
     }
 }
 
@@ -691,10 +767,14 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+    use uuid::Uuid;
 
     use st0x_finance::Usdc;
 
     use super::*;
+    use crate::equity_redemption::RedemptionAggregateId;
+    use crate::tokenized_equity_mint::IssuerRequestId;
+    use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::wrapper::RATIO_ONE;
 
     fn shares(amount: i64) -> FractionalShares {
@@ -930,6 +1010,9 @@ mod tests {
             usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: equities.into_iter().collect(),
             last_updated: Utc::now(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         }
     }
 
@@ -948,6 +1031,9 @@ mod tests {
             ),
             equities: HashMap::new(),
             last_updated: Utc::now(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         }
     }
 
@@ -1216,6 +1302,9 @@ mod tests {
             equities: std::iter::once((tsla, make_inventory(80, 20, 40, 10))).collect(),
             usdc: usdc_make_inventory(5000, 1000, 3000, 500),
             last_updated: Utc::now(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         };
 
         let dto = view.to_dto();
@@ -1247,6 +1336,9 @@ mod tests {
             .collect(),
             usdc: Inventory::default(),
             last_updated: Utc::now(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         };
 
         let dto = view.to_dto();
@@ -1258,5 +1350,116 @@ mod tests {
 
         assert_eq!(dto.usdc.onchain_available, Usdc::ZERO);
         assert_eq!(dto.usdc.offchain_available, Usdc::ZERO);
+    }
+
+    #[test]
+    fn default_view_has_no_active_transfers() {
+        let view = InventoryView::default();
+
+        assert!(view.active_usdc_rebalance().is_none());
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        assert!(view.active_mint(&aapl).is_none());
+        assert!(view.active_redemption(&aapl).is_none());
+    }
+
+    #[test]
+    fn set_and_read_active_usdc_rebalance() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let view = InventoryView::default().set_active_usdc_rebalance(id.clone());
+
+        assert_eq!(view.active_usdc_rebalance(), Some(&id));
+    }
+
+    #[test]
+    fn clear_active_usdc_rebalance() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let view = InventoryView::default()
+            .set_active_usdc_rebalance(id)
+            .clear_active_usdc_rebalance();
+
+        assert!(view.active_usdc_rebalance().is_none());
+    }
+
+    #[test]
+    fn set_and_read_active_mint() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let id = IssuerRequestId::new("ISS001");
+        let view = InventoryView::default().set_active_mint(aapl.clone(), id.clone());
+
+        assert_eq!(view.active_mint(&aapl), Some(&id));
+    }
+
+    #[test]
+    fn clear_active_mint() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let id = IssuerRequestId::new("ISS001");
+        let view = InventoryView::default()
+            .set_active_mint(aapl.clone(), id)
+            .clear_active_mint(&aapl);
+
+        assert!(view.active_mint(&aapl).is_none());
+    }
+
+    #[test]
+    fn set_and_read_active_redemption() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let id = RedemptionAggregateId::new("REDEEM-001");
+        let view = InventoryView::default().set_active_redemption(aapl.clone(), id.clone());
+
+        assert_eq!(view.active_redemption(&aapl), Some(&id));
+    }
+
+    #[test]
+    fn clear_active_redemption() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let id = RedemptionAggregateId::new("REDEEM-001");
+        let view = InventoryView::default()
+            .set_active_redemption(aapl.clone(), id)
+            .clear_active_redemption(&aapl);
+
+        assert!(view.active_redemption(&aapl).is_none());
+    }
+
+    #[test]
+    fn active_ids_preserved_across_update_equity() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("ISS001");
+        let usdc_id = UsdcRebalanceId(Uuid::new_v4());
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(50), shares(50))
+            .set_active_mint(aapl.clone(), mint_id.clone())
+            .set_active_usdc_rebalance(usdc_id.clone());
+
+        let updated = view
+            .update_equity(
+                &aapl,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(updated.active_mint(&aapl), Some(&mint_id));
+        assert_eq!(updated.active_usdc_rebalance(), Some(&usdc_id));
+    }
+
+    #[test]
+    fn active_ids_preserved_across_update_usdc() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("REDEEM-001");
+
+        let view = InventoryView::default()
+            .with_usdc(Usdc::new(dec!(1000)), Usdc::new(dec!(1000)))
+            .set_active_redemption(aapl.clone(), redemption_id.clone());
+
+        let updated = view
+            .update_usdc(
+                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc::new(dec!(100))),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(updated.active_redemption(&aapl), Some(&redemption_id));
     }
 }

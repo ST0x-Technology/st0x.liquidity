@@ -40,7 +40,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -94,7 +94,7 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -206,7 +206,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -288,14 +288,14 @@ async fn backfilling() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(pre_trade_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
     // With 3 rapid backfilled trades, the number of offchain fill events
     // is non-deterministic (depends on position checker batching). Poll
     // for the position reaching net=0 instead of counting fill events.
-    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await?;
 
     // Verify all historical events were picked up via backfill
     let pool = connect_db(&infra.db_path).await?;
@@ -350,7 +350,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -393,7 +393,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 
@@ -490,7 +490,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         .broker(&ref_infra.broker_service)
         .db_path(&ref_infra.db_path)
         .deployment_block(ref_block)
-        .assets(ref_infra.assets_config())
+        .assets(ref_infra.assets_config()?)
         .call()?;
     let mut ref_bot = spawn_bot(ref_ctx);
 
@@ -570,7 +570,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         .broker(&crash_infra.broker_service)
         .db_path(&crash_infra.db_path)
         .deployment_block(crash_block)
-        .assets(crash_infra.assets_config())
+        .assets(crash_infra.assets_config()?)
         .call()?;
     let mut bot1 = spawn_bot(ctx1);
 
@@ -611,7 +611,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         .broker(&crash_infra.broker_service)
         .db_path(&crash_infra.db_path)
         .deployment_block(crash_block)
-        .assets(crash_infra.assets_config())
+        .assets(crash_infra.assets_config()?)
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 
@@ -689,7 +689,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -817,7 +817,7 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .execution_threshold_override(ExecutionThreshold::Shares(high_threshold))
         .call()?;
 
@@ -891,7 +891,7 @@ async fn broker_placement_fails() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -980,7 +980,7 @@ async fn broker_order_rejected() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1080,7 +1080,7 @@ async fn delayed_fill() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1188,7 +1188,7 @@ async fn small_fractional_amounts() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1269,7 +1269,7 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1355,7 +1355,7 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1394,7 +1394,7 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(infra.assets_config())
+        .assets(infra.assets_config()?)
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 

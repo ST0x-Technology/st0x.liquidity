@@ -36,7 +36,7 @@ impl<P> TestInfra<P> {
     /// Builds an `AssetsConfig` with trading enabled for all deployed
     /// equities. Use this when constructing `Ctx::for_test()` in hedging
     /// tests so the conductor treats the symbols as active.
-    pub fn assets_config(&self) -> AssetsConfig {
+    pub fn assets_config(&self) -> anyhow::Result<AssetsConfig> {
         let symbols = self
             .equity_addresses
             .iter()
@@ -49,17 +49,17 @@ impl<P> TestInfra<P> {
                     rebalancing: OperationMode::Disabled,
                     operational_limit: None,
                 };
-                (Symbol::new(symbol.clone()).unwrap(), config)
+                Ok((Symbol::new(symbol.clone())?, config))
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
 
-        AssetsConfig {
+        Ok(AssetsConfig {
             equities: EquitiesConfig {
                 symbols,
                 operational_limit: None,
             },
             cash: None,
-        }
+        })
     }
 }
 

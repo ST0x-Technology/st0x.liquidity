@@ -14,7 +14,7 @@ use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Ex
 
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
-use super::{Rebalancer, RebalancingCtx, TriggeredOperation, UsdcRebalancing};
+use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::config::EquityAssetConfig;
 use crate::equity_redemption::EquityRedemption;
@@ -36,8 +36,6 @@ pub(crate) enum SpawnRebalancerError {
     Cctp(#[from] Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
-    #[error("USDC rebalancing is enabled but no vault ID is configured")]
-    MissingUsdcVaultId,
 }
 
 pub(crate) struct RebalancingCqrsFrameworks {
@@ -117,19 +115,11 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// processors.
     pub(crate) fn spawn(
         self,
-        ctx: &RebalancingCtx,
         market_maker_wallet: Address,
+        usdc_vault_id: RaindexVaultId,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
-    ) -> Result<JoinHandle<()>, SpawnRebalancerError> {
-        let usdc_vault_id = match ctx.usdc {
-            UsdcRebalancing::Enabled { .. } => ctx
-                .usdc_vault_id
-                .map(RaindexVaultId)
-                .ok_or(SpawnRebalancerError::MissingUsdcVaultId)?,
-            UsdcRebalancing::Disabled => RaindexVaultId(alloy::primitives::B256::ZERO),
-        };
-
+    ) -> JoinHandle<()> {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -158,9 +148,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         );
 
         info!("Rebalancing infrastructure initialized");
-        Ok(tokio::spawn(async move {
+        tokio::spawn(async move {
             rebalancer.run().await;
-        }))
+        })
     }
 }
 
@@ -189,6 +179,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
