@@ -6,6 +6,8 @@
 
 use alloy::primitives::U256;
 
+use st0x_execution::SharesBlockchain;
+
 use crate::shares::{FractionalShares, SharesConversionError};
 
 /// One unit in ratio representation (10^18).
