@@ -282,25 +282,7 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
-<<<<<<< ours
-<<<<<<< ours
         let usdc_limit = Some(Usdc::new(dec!(100)));
-||||||| ancestor
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-        };
-=======
-        let usdc_limit = Some(Usdc(dec!(100)));
->>>>>>> theirs
-||||||| ancestor
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-        };
-=======
-        let usdc_limit = Some(Usdc(dec!(100)));
->>>>>>> theirs
 
         let result = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
 
@@ -316,25 +298,7 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
-<<<<<<< ours
-<<<<<<< ours
         let usdc_limit = Some(Usdc::new(dec!(100)));
-||||||| ancestor
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-        };
-=======
-        let usdc_limit = Some(Usdc(dec!(100)));
->>>>>>> theirs
-||||||| ancestor
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-        };
-=======
-        let usdc_limit = Some(Usdc(dec!(100)));
->>>>>>> theirs
 
         // 100 onchain / 500 offchain -> 83% offchain, excess = 200
         let inventory = Arc::new(RwLock::new(

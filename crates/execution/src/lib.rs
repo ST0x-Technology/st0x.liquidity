@@ -30,27 +30,11 @@ pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from_url};
 
-<<<<<<< ours
-<<<<<<< ours
 pub use st0x_finance::{
     ArithmeticError, EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol,
     ToWholeSharesError,
 };
 
-||||||| ancestor
-=======
-pub use st0x_finance::{
-    ArithmeticError, EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol,
-};
-
->>>>>>> theirs
-||||||| ancestor
-=======
-pub use st0x_finance::{
-    ArithmeticError, EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol,
-};
-
->>>>>>> theirs
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -106,138 +90,16 @@ pub trait Executor: Send + Sync + 'static {
 pub enum InvalidSharesError {
     #[error("Shares cannot be zero")]
     Zero,
-<<<<<<< ours
-<<<<<<< ours
     #[error(transparent)]
     NotPositive(#[from] NotPositive<FractionalShares>),
     #[error(transparent)]
     WholeShares(#[from] ToWholeSharesError),
-||||||| ancestor
-    #[error("Value must be positive, got {0}")]
-    NonPositive(Decimal),
-||||||| ancestor
-    #[error("Value must be positive, got {0}")]
-    NonPositive(Decimal),
-=======
-    #[error("Value must be positive, got {value:?}")]
-    NotPositive { value: Decimal },
->>>>>>> theirs
-    #[error("Cannot convert fractional shares {0} to whole shares")]
-    Fractional(Decimal),
-    #[error("Shares value {0} exceeds u64 range")]
-    Overflow(Decimal),
-=======
-    #[error("Value must be positive, got {value:?}")]
-    NotPositive { value: Decimal },
-    #[error("Cannot convert fractional shares {0} to whole shares")]
-    Fractional(Decimal),
-    #[error("Shares value {0} exceeds u64 range")]
-    Overflow(Decimal),
->>>>>>> theirs
     #[error(transparent)]
     TryFromInt(#[from] std::num::TryFromIntError),
     #[error(transparent)]
     DecimalConversion(#[from] rust_decimal::Error),
 }
 
-<<<<<<< ours
-<<<<<<< ours
-||||||| ancestor
-/// Wrapper that guarantees the inner value is positive (greater than zero).
-///
-/// Use this when an API requires strictly positive values, such as order quantities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(transparent)]
-pub struct Positive<T>(T);
-
-impl<T> Positive<T>
-where
-    T: PartialOrd + HasZero + Copy,
-{
-    pub fn new(value: T) -> Result<Self, InvalidSharesError>
-    where
-        T: Into<Decimal>,
-    {
-        if value <= T::ZERO {
-            return Err(InvalidSharesError::NonPositive(value.into()));
-||||||| ancestor
-/// Wrapper that guarantees the inner value is positive (greater than zero).
-///
-/// Use this when an API requires strictly positive values, such as order quantities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(transparent)]
-pub struct Positive<T>(T);
-
-impl<T> Positive<T>
-where
-    T: PartialOrd + HasZero + Copy,
-{
-    pub fn new(value: T) -> Result<Self, InvalidSharesError>
-    where
-        T: Into<Decimal>,
-    {
-        if value <= T::ZERO {
-            return Err(InvalidSharesError::NonPositive(value.into()));
-=======
-impl From<NotPositive<FractionalShares>> for InvalidSharesError {
-    fn from(error: NotPositive<FractionalShares>) -> Self {
-        Self::NotPositive {
-            value: error.value.inner(),
->>>>>>> theirs
-        }
-    }
-}
-
-=======
-impl From<NotPositive<FractionalShares>> for InvalidSharesError {
-    fn from(error: NotPositive<FractionalShares>) -> Self {
-        Self::NotPositive {
-            value: error.value.inner(),
-        }
-        Ok(Self(value))
-    }
-
-    pub fn inner(self) -> T {
-        self.0
-    }
-}
-
-impl<'de, T> Deserialize<'de> for Positive<T>
-where
-    T: Deserialize<'de> + PartialOrd + HasZero + Copy + Into<Decimal>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = T::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl<T: Display> Display for Positive<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Trait for types that have a zero value and can be compared to it.
-pub trait HasZero: PartialOrd + Sized {
-    const ZERO: Self;
-
-    fn is_zero(&self) -> bool
-    where
-        Self: PartialEq,
-    {
-        self == &Self::ZERO
-    }
-
-    fn is_negative(&self) -> bool {
-        self < &Self::ZERO
-    }
-}
-
->>>>>>> theirs
 /// Share quantity newtype wrapper with validation
 ///
 /// Represents whole share quantities with bounds checking.
@@ -339,33 +201,6 @@ impl SharesBlockchain for FractionalShares {
             .checked_div(TOKENIZED_EQUITY_SCALE)
             .map(Self::new)
             .ok_or(SharesConversionError::Overflow)
-    }
-}
-
-impl Positive<FractionalShares> {
-    pub const ONE: Self = unsafe { Self::new_unchecked(FractionalShares::ONE) };
-
-    /// # Safety
-    ///
-    /// The caller must ensure the value is positive (greater than zero).
-    const unsafe fn new_unchecked(value: FractionalShares) -> Self {
-        // Positive is repr(transparent) over T, so this transmute is safe
-        // when the value is known to be positive at compile time.
-        std::mem::transmute(value)
-    }
-
-    /// Converts to whole shares count, returning error if value has a fractional part
-    /// or exceeds u64 range. Use this when the target API does not support fractional shares.
-    pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {
-        let inner = self.inner();
-        if !inner.is_whole() {
-            return Err(InvalidSharesError::Fractional(inner.inner()));
-        }
-
-        inner
-            .inner()
-            .to_u64()
-            .ok_or(InvalidSharesError::Overflow(inner.inner()))
     }
 }
 
@@ -818,19 +653,7 @@ mod tests {
         ) {
             let decimal = Decimal::new(mantissa, scale);
             let result = Positive::new(FractionalShares::new(decimal));
-<<<<<<< ours
-<<<<<<< ours
-            prop_assert!(matches!(result, Err(NotPositive { .. })));
-||||||| ancestor
-            prop_assert!(matches!(result, Err(InvalidSharesError::NonPositive(_))));
-=======
             prop_assert!(result.is_err());
->>>>>>> theirs
-||||||| ancestor
-            prop_assert!(matches!(result, Err(InvalidSharesError::NonPositive(_))));
-=======
-            prop_assert!(result.is_err());
->>>>>>> theirs
         }
 
         #[test]

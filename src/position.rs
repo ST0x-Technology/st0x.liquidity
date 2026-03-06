@@ -598,18 +598,6 @@ mod tests {
     use st0x_finance::Usdc;
 
     use super::*;
-<<<<<<< ours
-<<<<<<< ours
-||||||| ancestor
-    use crate::config::OperationalLimits;
-||||||| ancestor
-    use crate::config::OperationalLimits;
-=======
->>>>>>> theirs
-    use crate::threshold::Usdc;
-=======
-    use crate::threshold::Usdc;
->>>>>>> theirs
 
     fn one_share_threshold() -> ExecutionThreshold {
         ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)

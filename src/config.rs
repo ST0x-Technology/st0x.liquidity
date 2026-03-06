@@ -28,7 +28,7 @@ use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
 };
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
-use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
+use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -40,7 +40,6 @@ pub struct Env {
     pub secrets: PathBuf,
 }
 
-<<<<<<< ours
 /// Whether a per-asset operation (trading or rebalancing) is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,7 +48,6 @@ pub(crate) enum OperationMode {
     Disabled,
 }
 
-<<<<<<< ours
 /// Per-equity asset configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,163 +131,6 @@ where
         .map(Some)
         .map_err(serde::de::Error::custom)
 }
-
-||||||| ancestor
-=======
-/// Per-equity asset configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EquityAssetConfig {
-    /// Tokenized equity always one-to-one backed and redeemable with
-    /// real shares hels in the issuer account
-    pub(crate) tokenized_equity: Address,
-    /// Wrapped version of tokenized shares to handle corporate actions in a
-    /// manner compatible with other DeFi protocols
-    pub(crate) tokenized_equity_derivative: Address,
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
-    #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) trading: OperationMode,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
-}
-
-/// Cash asset (USDC) configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CashAssetConfig {
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
-    #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<Usdc>>,
-}
-
-/// Equity assets configuration with an optional global operational limit.
-///
-/// Required in config -- operators must explicitly choose
-/// between conservative limits or uncapped mode.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub(crate) enum OperationalLimits {
-    Enabled {
-        max_amount: Positive<Usdc>,
-        max_shares: Positive<FractionalShares>,
-    },
-||||||| ancestor
-/// Configurable caps on operation sizes for safe deployment.
-///
-/// Required in config -- operators must explicitly choose
-/// between conservative limits or uncapped mode.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub(crate) enum OperationalLimits {
-    Enabled {
-        max_amount: Positive<Usdc>,
-        max_shares: Positive<FractionalShares>,
-    },
-=======
-/// Whether a per-asset operation (trading or rebalancing) is active.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum OperationMode {
-    Enabled,
->>>>>>> theirs
-    Disabled,
-}
-
-<<<<<<< ours
->>>>>>> theirs
-||||||| ancestor
-=======
-/// Per-equity asset configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EquityAssetConfig {
-    /// Tokenized equity always one-to-one backed and redeemable with
-    /// real shares hels in the issuer account
-    pub(crate) tokenized_equity: Address,
-    /// Wrapped version of tokenized shares to handle corporate actions in a
-    /// manner compatible with other DeFi protocols
-    pub(crate) tokenized_equity_derivative: Address,
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
-    #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) trading: OperationMode,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
-}
-
-/// Cash asset (USDC) configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CashAssetConfig {
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
-    #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<Usdc>>,
-}
-
-/// Equity assets configuration with an optional global operational limit.
-///
-/// Uses `#[serde(flatten)]` so that per-symbol tables live alongside the
-/// `operational_limit` key under `[assets.equities]` in the TOML.
-/// `deny_unknown_fields` is intentionally absent because it is
-/// incompatible with `flatten`.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct EquitiesConfig {
-    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
-    #[serde(flatten)]
-    pub(crate) symbols: HashMap<Symbol, EquityAssetConfig>,
-}
-
-/// Top-level assets configuration containing equities and cash.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AssetsConfig {
-    #[serde(default)]
-    pub(crate) equities: EquitiesConfig,
-    pub(crate) cash: Option<CashAssetConfig>,
-}
-
-/// Deserializes a hex string (possibly short, e.g. `"0xfab"`) into a
-/// left-padded `B256`. Missing values deserialize as `None`.
-fn deserialize_padded_b256<'de, D>(deserializer: D) -> Result<Option<B256>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let Some(hex_str) = Option::<String>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-
-    let stripped = hex_str
-        .strip_prefix("0x")
-        .or_else(|| hex_str.strip_prefix("0X"))
-        .unwrap_or(&hex_str);
-
-    if stripped.len() > 64 {
-        return Err(serde::de::Error::custom(format!(
-            "hex string too long for B256: {stripped}"
-        )));
-    }
-
-    if stripped.is_empty() {
-        return Err(serde::de::Error::custom("empty hex string for B256"));
-    }
-
-    let padded = format!("{stripped:0>64}");
-    padded
-        .parse::<B256>()
-        .map(Some)
-        .map_err(serde::de::Error::custom)
-}
-
->>>>>>> theirs
 /// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -920,31 +761,7 @@ pub(crate) mod tests {
             br#"
             database_url = ":memory:"
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -995,31 +812,7 @@ pub(crate) mod tests {
             br#"
             database_url = ":memory:"
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -1201,31 +994,7 @@ pub(crate) mod tests {
             position_check_interval = 120
             inventory_poll_interval = 90
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -1271,39 +1040,9 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
 
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-||||||| ancestor
-            [equities]
-=======
-            [assets]
->>>>>>> theirs
-
-<<<<<<< ours
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-
-            [evm]
-||||||| ancestor
-            [operational_limits]
-            mode = "disabled"
-
-            [evm]
-=======
             [raindex]
->>>>>>> theirs
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
@@ -1429,31 +1168,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -1492,39 +1207,9 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
 
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-||||||| ancestor
-            [equities]
-=======
-            [assets]
->>>>>>> theirs
-
-<<<<<<< ours
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-
-            [evm]
-||||||| ancestor
-            [operational_limits]
-            mode = "disabled"
-
-            [evm]
-=======
             [raindex]
->>>>>>> theirs
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
@@ -1581,39 +1266,9 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
 
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-||||||| ancestor
-            [equities]
-=======
-            [assets]
->>>>>>> theirs
-
-<<<<<<< ours
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-
-            [evm]
-||||||| ancestor
-            [operational_limits]
-            mode = "disabled"
-
-            [evm]
-=======
             [raindex]
->>>>>>> theirs
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
@@ -1764,25 +1419,7 @@ pub(crate) mod tests {
             r#"
             database_url = ":memory:"
 
-<<<<<<< ours
-<<<<<<< ours
             [assets.equities]
-||||||| ancestor
-            [equities]
-=======
-            [assets]
->>>>>>> theirs
-
-            [operational_limits]
-            mode = "disabled"
-||||||| ancestor
-            [equities]
-
-            [operational_limits]
-            mode = "disabled"
-=======
-            [assets]
->>>>>>> theirs
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -1948,8 +1585,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-<<<<<<< ours
-<<<<<<< ours
     async fn unknown_assets_fields_rejected() {
         let config = toml_file(
             r#"
@@ -2035,178 +1670,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-||||||| ancestor
-=======
-    async fn unknown_assets_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets]
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown assets field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_equity_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            trading = "enabled"
-            rebalancing = "disabled"
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown equity field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_cash_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.cash]
-            rebalancing = "disabled"
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown cash field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
->>>>>>> theirs
-||||||| ancestor
-=======
-    async fn unknown_assets_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets]
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown assets field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_equity_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            trading = "enabled"
-            rebalancing = "disabled"
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown equity field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_cash_fields_rejected() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.cash]
-            rebalancing = "disabled"
-            bogus_field = "should fail"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            deployment_block = 1
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, CtxError::ConfigToml { .. }),
-            "Expected config parse error for unknown cash field, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
->>>>>>> theirs
     async fn unknown_secrets_fields_rejected() {
         let config = minimal_config_toml();
         let secrets = toml_file(

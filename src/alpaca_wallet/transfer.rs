@@ -357,54 +357,14 @@ mod tests {
 
     #[test]
     fn test_initiate_withdrawal_zero_amount() {
-<<<<<<< ours
-<<<<<<< ours
         let error = Positive::new(Usdc::new(Decimal::ZERO)).unwrap_err();
         assert_eq!(error.value, Usdc::new(Decimal::ZERO));
-||||||| ancestor
-        assert!(matches!(
-            Positive::new(Usdc(Decimal::ZERO)).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::ZERO
-        ));
-=======
-        let error = Positive::new(Usdc(Decimal::ZERO)).unwrap_err();
-        assert_eq!(error.value, Usdc(Decimal::ZERO));
->>>>>>> theirs
-||||||| ancestor
-        assert!(matches!(
-            Positive::new(Usdc(Decimal::ZERO)).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::ZERO
-        ));
-=======
-        let error = Positive::new(Usdc(Decimal::ZERO)).unwrap_err();
-        assert_eq!(error.value, Usdc(Decimal::ZERO));
->>>>>>> theirs
     }
 
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
-<<<<<<< ours
-<<<<<<< ours
         let error = Positive::new(Usdc::new(Decimal::new(-100, 0))).unwrap_err();
         assert_eq!(error.value, Usdc::new(Decimal::new(-100, 0)));
-||||||| ancestor
-        assert!(matches!(
-            Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::new(-100, 0)
-        ));
-=======
-        let error = Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err();
-        assert_eq!(error.value, Usdc(Decimal::new(-100, 0)));
->>>>>>> theirs
-||||||| ancestor
-        assert!(matches!(
-            Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::new(-100, 0)
-        ));
-=======
-        let error = Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err();
-        assert_eq!(error.value, Usdc(Decimal::new(-100, 0)));
->>>>>>> theirs
     }
 
     #[tokio::test]

@@ -8,12 +8,35 @@ use std::str::FromStr;
 /// Phantom-tagged identifier. Type-safe in Rust, serializes as plain string.
 ///
 /// Tag types are defined by consumers (DTO crate, domain crate), not here.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Id<Tag: ?Sized> {
     value: String,
     #[serde(skip)]
     _tag: PhantomData<fn() -> Tag>,
+}
+
+impl<Tag: ?Sized> Clone for Id<Tag> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            _tag: PhantomData,
+        }
+    }
+}
+
+impl<Tag: ?Sized> PartialEq for Id<Tag> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<Tag: ?Sized> Eq for Id<Tag> {}
+
+impl<Tag: ?Sized> std::hash::Hash for Id<Tag> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
 }
 
 impl<Tag: ?Sized> Id<Tag> {

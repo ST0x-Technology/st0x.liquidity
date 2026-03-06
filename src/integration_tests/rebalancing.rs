@@ -1091,8 +1091,6 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         InventoryView::default().with_usdc(Usdc::new(dec!(50)), Usdc::new(dec!(950))),
     ));
 
-<<<<<<< ours
-<<<<<<< ours
     let assets = AssetsConfig {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
@@ -1100,32 +1098,6 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
         }),
-||||||| ancestor
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-=======
-    let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
-        cash: Some(CashAssetConfig {
-            vault_id: None,
-            rebalancing: OperationMode::Enabled,
-            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
-        }),
->>>>>>> theirs
-||||||| ancestor
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-=======
-    let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
-        cash: Some(CashAssetConfig {
-            vault_id: None,
-            rebalancing: OperationMode::Enabled,
-            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
-        }),
->>>>>>> theirs
     };
 
     let config = RebalancingTriggerConfig {
@@ -1247,8 +1219,6 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(900))),
     ));
 
-<<<<<<< ours
-<<<<<<< ours
     let assets = AssetsConfig {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
@@ -1256,32 +1226,6 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
         }),
-||||||| ancestor
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-=======
-    let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
-        cash: Some(CashAssetConfig {
-            vault_id: None,
-            rebalancing: OperationMode::Enabled,
-            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
-        }),
->>>>>>> theirs
-||||||| ancestor
-    let limits = OperationalLimits::Enabled {
-        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
-        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
-=======
-    let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
-        cash: Some(CashAssetConfig {
-            vault_id: None,
-            rebalancing: OperationMode::Enabled,
-            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
-        }),
->>>>>>> theirs
     };
     let config = RebalancingTriggerConfig {
         equity: ImbalanceThreshold {
