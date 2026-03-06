@@ -59,6 +59,49 @@ impl Display for Usdc {
     }
 }
 
+#[cfg(feature = "alloy")]
+mod alloy_support {
+    use alloy_primitives::U256;
+    use rust_decimal::Decimal;
+
+    use super::Usdc;
+
+    /// 10^6 scale factor for USDC (6 decimals).
+    const USDC_DECIMAL_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum UsdcConversionError {
+        #[error("USDC amount cannot be negative: {0}")]
+        NegativeValue(Decimal),
+        #[error("overflow when scaling USDC to 6 decimals")]
+        Overflow,
+        #[error("failed to parse U256: {0}")]
+        ParseError(#[from] alloy_primitives::ruint::ParseError),
+    }
+
+    impl Usdc {
+        /// Converts to U256 with 6 decimal places (USDC standard).
+        ///
+        /// Returns an error for negative values or overflow during scaling.
+        pub fn to_u256_6_decimals(self) -> Result<U256, UsdcConversionError> {
+            let inner = self.inner();
+
+            if inner.is_sign_negative() {
+                return Err(UsdcConversionError::NegativeValue(inner));
+            }
+
+            let scaled = inner
+                .checked_mul(USDC_DECIMAL_SCALE)
+                .ok_or(UsdcConversionError::Overflow)?;
+
+            Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
+        }
+    }
+}
+
+#[cfg(feature = "alloy")]
+pub use alloy_support::UsdcConversionError;
+
 impl std::ops::Mul<Decimal> for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 

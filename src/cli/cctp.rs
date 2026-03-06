@@ -13,7 +13,6 @@ use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::threshold::UsdcBlockchain;
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).

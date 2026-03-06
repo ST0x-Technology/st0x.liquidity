@@ -13,6 +13,8 @@ pub use id::Id;
 pub use shares::FractionalShares;
 pub use symbol::{EmptySymbolError, Symbol};
 pub use usdc::Usdc;
+#[cfg(feature = "alloy")]
+pub use usdc::UsdcConversionError;
 
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};

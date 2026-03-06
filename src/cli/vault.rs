@@ -12,7 +12,6 @@ use st0x_finance::Usdc;
 
 use crate::config::Ctx;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::threshold::UsdcBlockchain;
 use crate::vault_registry::VaultRegistry;
 
 pub(super) struct Deposit {
