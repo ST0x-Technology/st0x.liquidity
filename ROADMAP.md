@@ -48,7 +48,11 @@ same crate.
 
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
 
+<br>
+
 ---
+
+<br>
 
 ## Not epic
 
