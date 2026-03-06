@@ -6655,8 +6655,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< ours
-<<<<<<< ours
 name = "st0x-finance"
 version = "0.1.0"
 dependencies = [
@@ -6671,38 +6669,6 @@ dependencies = [
 ]
 
 [[package]]
-||||||| ancestor
-=======
-name = "st0x-finance"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "num-traits",
- "proptest",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
-]
-
-[[package]]
->>>>>>> theirs
-||||||| ancestor
-=======
-name = "st0x-finance"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
-]
-
-[[package]]
->>>>>>> theirs
 name = "st0x-hedge"
 version = "0.1.0"
 dependencies = [
