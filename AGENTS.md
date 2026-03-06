@@ -65,6 +65,59 @@ The project uses a strict document hierarchy:
 **Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
 plan the implementation.
 
+### Goal-Oriented Planning
+
+Plans and roadmap sections are organized around the **goal**, not around
+implementation streams. Start from the desired end state ("we need live
+inventory visibility and a reliable wallet provider") and work backwards to
+determine what must be built. Implementation details (which crate, which branch)
+are downstream from the goal -- they serve it, not the other way around.
+
+### Epic Decomposition for Parallel Execution
+
+When an epic contains multiple pieces of work, decompose it to maximize
+independent parallel execution:
+
+1. **Identify coupling boundaries.** Map which crates, modules, and files each
+   piece of work touches. Work that touches disjoint code areas can proceed in
+   parallel without conflicts.
+
+2. **Sequence only where necessary.** A branch depends on another only when it
+   needs types, traits, or behavior introduced by that branch. If two branches
+   read from the same code but write to different areas, they are independent.
+
+3. **Every branch must be independently valid.** Each PR must pass CI, compile,
+   and make sense on its own. Never leave the codebase in a broken intermediate
+   state that "will be fixed by a later PR." If a feature requires multiple PRs,
+   each one must be a coherent, self-contained increment.
+
+4. **Defer integration work.** When parallel branches must eventually connect
+   (e.g., a backend and frontend that share types), push the integration PR to
+   the end, stacked on both. This lets the parallel work proceed without
+   blocking on each other.
+
+5. **Shared dependencies go first.** If multiple branches need the same new
+   type, trait, or schema change, extract that into its own PR at the base of
+   the dependency tree. This unblocks all downstream branches simultaneously.
+
+6. **Conflict-prone work goes last.** If a piece of work touches files that
+   other parallel branches also modify, schedule it after those branches merge
+   to avoid conflict resolution overhead.
+
+### Managing Epics in the Roadmap
+
+An epic is a roadmap subsection grouping related issues toward a single goal.
+
+- **Lead with motivation**: One or two sentences explaining why this work
+  matters and what the end state looks like.
+- **Show the dependency structure**: Use an ASCII tree or ordered list to make
+  the execution order and parallelism obvious at a glance.
+- **Reference issues, not solutions**: Each item links to a GitHub issue. The
+  issue describes the desired outcome; the PR (added later) describes the
+  solution.
+- **Mark progress inline**: `[x]` with PR link as branches merge. When all items
+  complete, move the section to "Completed."
+
 ## Plan & Review
 
 ### While implementing
