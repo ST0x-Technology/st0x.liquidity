@@ -29,18 +29,18 @@ All branches stack on #355 (per-asset operations config).
                 +-- #379 dashboard integration (stacked on backend + frontend)
 ```
 
-**Turnkey wallet** (evm crate, independent):
+#### Turnkey wallet (evm crate, independent)
 
 - [ ] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
 
-**Dashboard inventory & transfer monitoring:**
+#### Dashboard inventory & transfer monitoring
 
 - [ ] [#376 Review and update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/issues/376)
 - [ ] [#377 Dashboard backend: serve inventory history and transfer status via WebSocket](https://github.com/ST0x-Technology/st0x.liquidity/issues/377)
 - [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
 - [ ] [#379 Dashboard integration: verify nix build, deployment, and end-to-end data flow](https://github.com/ST0x-Technology/st0x.liquidity/issues/379)
 
-**Wallet provider config** (main crate, depends on Turnkey wallet):
+#### Wallet provider config (main crate, depends on Turnkey wallet)
 
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
 
