@@ -693,7 +693,7 @@ where
                 &offchain_order,
                 &execution_threshold,
                 &ctx.assets,
-                |symbol| ctx.is_trading_enabled(symbol),
+                |symbol| ctx.is_asset_enabled(symbol),
             )
             .await
             {
@@ -998,7 +998,7 @@ async fn process_next_queued_event<E: Executor>(
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
 
-    let trading_enabled = ctx.is_trading_enabled(trade.symbol.base());
+    let trading_enabled = ctx.is_asset_enabled(trade.symbol.base());
 
     process_queued_trade(
         queue_context.executor,

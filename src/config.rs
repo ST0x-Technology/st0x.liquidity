@@ -145,7 +145,7 @@ struct Config {
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
-    equities: HashMap<Symbol, EquityTokenAddresses>,
+    assets: AssetsConfig,
 }
 
 /// Secret credentials deserialized from the encrypted secrets TOML.
@@ -526,7 +526,9 @@ impl Ctx {
     /// Fail-closed: assets not present in the config are treated as
     /// trading-disabled.
     pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
-        self.equities
+        self.assets
+            .equities
+            .symbols
             .get(symbol)
             .is_some_and(|config| config.trading == OperationMode::Enabled)
     }
@@ -1834,7 +1836,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn is_trading_enabled_returns_configured_value() {
+    fn is_asset_enabled_returns_configured_value() {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new("RKLB").unwrap(),
@@ -1862,20 +1864,20 @@ pub(crate) mod tests {
         };
 
         assert!(
-            !ctx.is_trading_enabled(&Symbol::new("RKLB").unwrap()),
+            !ctx.is_asset_enabled(&Symbol::new("RKLB").unwrap()),
             "RKLB trading should be disabled"
         );
     }
 
     #[test]
-    fn is_trading_enabled_defaults_to_true_for_unknown() {
+    fn is_asset_enabled_defaults_to_false_for_unknown() {
         let ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
 
         assert!(
-            ctx.is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
-            "Unknown assets should default to trading enabled"
+            !ctx.is_asset_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to trading disabled (fail-closed)"
         );
     }
 
@@ -1928,7 +1930,7 @@ pub(crate) mod tests {
     #[test]
     fn base_symbol_config_keys_fix_lookup_bug() {
         // Config keys use base symbols (SPYM not tSPYM).
-        // is_trading_enabled uses Symbol directly, which matches
+        // is_asset_enabled uses Symbol directly, which matches
         // base symbol keys. This verifies the bug fix.
         let mut symbols = HashMap::new();
         symbols.insert(
@@ -1958,7 +1960,7 @@ pub(crate) mod tests {
 
         // The lookup uses base symbol "SPYM" which matches the config key
         assert!(
-            !ctx.is_trading_enabled(&Symbol::new("SPYM").unwrap()),
+            !ctx.is_asset_enabled(&Symbol::new("SPYM").unwrap()),
             "SPYM trading should be disabled per config"
         );
     }
