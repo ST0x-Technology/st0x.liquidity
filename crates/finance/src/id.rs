@@ -132,7 +132,7 @@ mod tests {
         assert_ne!(id1, id3);
 
         let mut set = HashSet::new();
-        set.insert(id1.clone());
+        set.insert(id1);
         assert!(set.contains(&id2));
         assert!(!set.contains(&id3));
     }

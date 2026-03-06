@@ -3268,7 +3268,9 @@ mod tests {
     fn deserialize_missing_fireblocks_fields_fails() {
         let toml_str = r#"
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://eth.example.com"
+            ethereum_chain_id = 1
         "#;
 
         let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
