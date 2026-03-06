@@ -492,6 +492,57 @@ but status
 but discard a1
 ```
 
+## Example 12: Propagating Fixes Through Stacked Branches
+
+**Scenario:** You have a stack of branches (A -> B -> C) where A has CI
+failures. After fixing A, the fix needs to propagate to B and C. GitButler's
+`but pull` only tracks the base branch (origin/master), so it can't rebase
+stacked branches onto each other. Use teardown -> rebase -> setup.
+
+**Stack:** `master <- feat/config (A) <- chore/roadmap (B) <- feat/wallet (C)`
+
+```bash
+# 1. Fix CI on branch A using GitButler as normal
+but status
+# (make fixes, commit, push)
+but commit feat/config -m "fix compilation errors" --changes <ids> --status-after
+but push feat/config
+
+# 2. Teardown GitButler to get normal git access
+but teardown
+# Checks out first active branch (e.g., feat/config)
+
+# 3. Rebase B onto updated A
+git checkout chore/roadmap
+git rebase origin/feat/config
+# Skips already-applied commits, applies B's unique commits on top
+git push --force-with-lease origin chore/roadmap
+
+# 4. Rebase C onto updated B
+git checkout feat/wallet
+git rebase origin/chore/roadmap
+# Same pattern: skips duplicates, applies C's commits
+git push --force-with-lease origin feat/wallet
+
+# 5. Return to master and re-enter GitButler
+git checkout master
+but setup
+```
+
+**Key points:**
+
+- `but pull` only syncs with the target branch (origin/master), not stacked
+  branch bases. It cannot propagate fixes between branches in a stack.
+- During rebase, git automatically skips commits already in the base (shows
+  "skipped previously applied commit" warnings). This is normal.
+- Corrupted commits (from prior `but rub` across branches) may conflict. Resolve
+  with `git checkout --ours` (the upstream/base branch during rebase, opposite
+  of its meaning in a merge) for files already in the base, or
+  `git rebase --skip` for fully duplicate commits.
+- Always use `--force-with-lease` (not `--force`) to avoid overwriting
+  unexpected remote changes.
+- After `but setup`, apply only the branches you need to work on.
+
 ## Tips and Tricks
 
 ### Quick Status Check
