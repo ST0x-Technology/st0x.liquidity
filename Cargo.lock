@@ -6493,6 +6493,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "st0x-finance",
  "ts-rs",
 ]
 
