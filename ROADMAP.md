@@ -29,7 +29,7 @@ crate, so fully independent from dashboard work.
 
 - [x] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
   - PR:
-    [#385 add TurnkeyWallet to st0x-evm crate](https://github.com/ST0x-Technology/st0x.liquidity/pull/385)
+    [#387 st0x-evm turnkey integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/387)
 
 ### Dashboard inventory & transfer monitoring
 
