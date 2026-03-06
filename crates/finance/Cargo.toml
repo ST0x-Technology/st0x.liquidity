@@ -1,0 +1,20 @@
+[package]
+name = "st0x-finance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+rust_decimal = { workspace = true, features = ["serde"] }
+rust_decimal_macros = "1.40.0"
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rust_decimal_macros = "1.40.0"
+serde_json.workspace = true
+
+[lints]
+workspace = true

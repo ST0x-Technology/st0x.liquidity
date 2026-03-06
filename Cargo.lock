@@ -6560,12 +6560,25 @@ dependencies = [
  "serial_test",
  "sqlite-es",
  "sqlx",
+ "st0x-finance",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
  "url",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "st0x-finance"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
