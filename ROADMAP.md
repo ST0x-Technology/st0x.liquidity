@@ -56,6 +56,8 @@ same crate.
 
 ## Not epic
 
+Everything below has not been organized into epics yet.
+
 ### Fireblocks Contract Calls
 
 - [x] [#325 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/issues/325)
