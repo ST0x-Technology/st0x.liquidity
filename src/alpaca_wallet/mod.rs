@@ -33,7 +33,7 @@ use st0x_execution::Positive;
 
 use st0x_execution::AlpacaAccountId;
 
-use crate::threshold::Usdc;
+use st0x_finance::Usdc;
 
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;
@@ -239,7 +239,7 @@ mod tests {
 
         let asset = TokenSymbol::new("USDC");
         let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
 
         assert!(matches!(
             service
@@ -274,7 +274,7 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
 
         assert!(matches!(
             service
@@ -331,7 +331,7 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
 
         let result = service
             .initiate_withdrawal(amount, &asset, &to_address)

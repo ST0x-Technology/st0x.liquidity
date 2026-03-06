@@ -16,7 +16,7 @@ use thiserror::Error;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::threshold::Usdc;
+use st0x_finance::Usdc;
 
 /// Typed identifier for InventorySnapshot aggregates, keyed
 /// by orderbook and owner address pair.
