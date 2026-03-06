@@ -104,20 +104,14 @@ independent parallel execution:
    other parallel branches also modify, schedule it after those branches merge
    to avoid conflict resolution overhead.
 
-7. **Converge to a single terminal node.** The dependency graph for an epic
-   should have one final PR that depends on all parallel streams. This is where
-   integration happens and it ensures the epic is complete when that node
-   merges. It also prevents conflicting branches from being active
-   simultaneously in a single worktree.
-
 ### Managing Epics in the Roadmap
 
 An epic is a roadmap subsection grouping related issues toward a single goal.
 
 - **Lead with motivation**: One or two sentences explaining why this work
   matters and what the end state looks like.
-- **Show the dependency structure**: Use a Mermaid diagram (GitHub renders them
-  natively) to make the execution order and parallelism obvious at a glance.
+- **Show the dependency structure**: Use an ASCII tree or ordered list to make
+  the execution order and parallelism obvious at a glance.
 - **Reference issues, not solutions**: Each item links to a GitHub issue. The
   issue describes the desired outcome; the PR (added later) describes the
   solution.
