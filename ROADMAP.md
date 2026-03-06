@@ -28,6 +28,10 @@ Turnkey uses AWS Nitro enclaves for 50-100ms signing. Touches only the evm
 crate, so fully independent from dashboard work.
 
 - [ ] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
+  - Draft reference:
+    [#356 replace Fireblocks with Turnkey for onchain signing](https://github.com/ST0x-Technology/st0x.liquidity/pull/356)
+    (WIP with intentional design decisions -- use as inspiration for #354 and
+    #380)
 
 ### Dashboard inventory & transfer monitoring
 
