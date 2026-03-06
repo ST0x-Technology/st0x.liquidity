@@ -4,6 +4,7 @@ members = [
   "crates/dto",
   "crates/event-sorcery",
   "crates/execution",
+  "crates/finance",
   "crates/bridge",
   "crates/evm",
 ]
@@ -82,6 +83,7 @@ tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
 rust_decimal = { version = "1.38.0", features = ["serde"] }
 st0x-evm = { path = "crates/evm" }
+st0x-finance = { path = "crates/finance" }
 num-decimal = { version = "0.2.5", default-features = false, features = [
   "num-v04",
 ] }
