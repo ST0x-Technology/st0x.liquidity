@@ -18,15 +18,16 @@ dashboard work in the same crate.
 
 All branches stack on #355 (per-asset operations config).
 
-```
-#355 per-asset-operations-config
- +-- roadmap update
-      +-- #354 Turnkey wallet (evm crate)
-      |    +-- #380 wallet provider config (main crate, last)
-      +-- #376 DTO schema update
-           +-- #377 dashboard backend
-           +-- #378 dashboard frontend
-                +-- #379 dashboard integration (stacked on backend + frontend)
+```mermaid
+graph TD
+    A["#355 per-asset-operations-config"] --> B["roadmap update"]
+    B --> C["#354 Turnkey wallet<br/>(evm crate)"]
+    B --> D["#376 DTO schema update"]
+    C --> E["#380 wallet provider config<br/>(main crate, last)"]
+    D --> F["#377 dashboard backend"]
+    D --> G["#378 dashboard frontend"]
+    F --> H["#379 dashboard integration"]
+    G --> H
 ```
 
 #### Turnkey wallet (evm crate, independent)
