@@ -6660,6 +6660,7 @@ dependencies = [
 name = "st0x-finance"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "num-traits",
  "proptest",
  "rust_decimal",
