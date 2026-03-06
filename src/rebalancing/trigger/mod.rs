@@ -691,20 +691,7 @@ impl RebalancingTrigger {
         let tokenized_shares = self.wrapper.lookup_underlying(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
-        let shares_limit = self
-            .config
-            .assets
-            .equities
-            .symbols
-            .get(symbol)
-            .and_then(|config| config.operational_limit.map(Positive::inner))
-            .or_else(|| {
-                self.config
-                    .assets
-                    .equities
-                    .operational_limit
-                    .map(Positive::inner)
-            });
+        let shares_limit = self.config.assets.equities.shares_limit_for(symbol);
 
         let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
