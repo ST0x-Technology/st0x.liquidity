@@ -1,3 +1,5 @@
+//! Unified executor trait and implementations for brokerage integration.
+
 use alloy::primitives::U256;
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
@@ -28,6 +30,10 @@ pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from_url};
+
+pub use st0x_finance::{
+    ArithmeticError, EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol,
+};
 
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
@@ -80,57 +86,12 @@ pub trait Executor: Send + Sync + 'static {
     async fn get_inventory(&self) -> Result<InventoryResult, Self::Error>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("Symbol cannot be empty")]
-pub struct EmptySymbolError;
-
-/// Stock symbol newtype wrapper with validation
-///
-/// Ensures symbols are non-empty and provides type safety to prevent
-/// mixing symbols with other string types.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-pub struct Symbol(String);
-
-impl Symbol {
-    pub fn new(symbol: impl Into<String>) -> Result<Self, EmptySymbolError> {
-        let symbol = symbol.into();
-        if symbol.is_empty() {
-            return Err(EmptySymbolError);
-        }
-        Ok(Self(symbol))
-    }
-}
-
-impl<'de> Deserialize<'de> for Symbol {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Self::new(s).map_err(serde::de::Error::custom)
-    }
-}
-
-impl Display for Symbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::str::FromStr for Symbol {
-    type Err = EmptySymbolError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::new(s)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InvalidSharesError {
     #[error("Shares cannot be zero")]
     Zero,
-    #[error("Value must be positive, got {0}")]
-    NonPositive(Decimal),
+    #[error("Value must be positive, got {value:?}")]
+    NotPositive { value: Decimal },
     #[error("Cannot convert fractional shares {0} to whole shares")]
     Fractional(Decimal),
     #[error("Shares value {0} exceeds u64 range")]
@@ -141,64 +102,11 @@ pub enum InvalidSharesError {
     DecimalConversion(#[from] rust_decimal::Error),
 }
 
-/// Wrapper that guarantees the inner value is positive (greater than zero).
-///
-/// Use this when an API requires strictly positive values, such as order quantities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(transparent)]
-pub struct Positive<T>(T);
-
-impl<T> Positive<T>
-where
-    T: PartialOrd + HasZero + Copy,
-{
-    pub fn new(value: T) -> Result<Self, InvalidSharesError>
-    where
-        T: Into<Decimal>,
-    {
-        if value <= T::ZERO {
-            return Err(InvalidSharesError::NonPositive(value.into()));
+impl From<NotPositive<FractionalShares>> for InvalidSharesError {
+    fn from(error: NotPositive<FractionalShares>) -> Self {
+        Self::NotPositive {
+            value: error.value.inner(),
         }
-        Ok(Self(value))
-    }
-
-    pub fn inner(self) -> T {
-        self.0
-    }
-}
-
-impl<'de, T> Deserialize<'de> for Positive<T>
-where
-    T: Deserialize<'de> + PartialOrd + HasZero + Copy + Into<Decimal>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = T::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl<T: Display> Display for Positive<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Trait for types that have a zero value and can be compared to it.
-pub trait HasZero: PartialOrd + Sized {
-    const ZERO: Self;
-
-    fn is_zero(&self) -> bool
-    where
-        Self: PartialEq,
-    {
-        self == &Self::ZERO
-    }
-
-    fn is_negative(&self) -> bool {
-        self < &Self::ZERO
     }
 }
 
@@ -238,25 +146,6 @@ impl Display for Shares {
     }
 }
 
-/// Fractional share quantity newtype wrapper.
-///
-/// Represents share quantities that can include fractional amounts (e.g., 1.212 shares).
-/// Can be negative (for position tracking). Use `Positive<FractionalShares>` when
-/// strictly positive values are required (e.g., order quantities).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(transparent)]
-pub struct FractionalShares(Decimal);
-
-impl HasZero for FractionalShares {
-    const ZERO: Self = Self(Decimal::ZERO);
-}
-
-impl From<FractionalShares> for Decimal {
-    fn from(value: FractionalShares) -> Self {
-        value.0
-    }
-}
-
 /// 10^18 scale factor for tokenized equity decimal conversion.
 ///
 /// Tokenized equities use 18 decimals (unlike USDC which uses 6).
@@ -264,73 +153,55 @@ impl From<FractionalShares> for Decimal {
 const TOKENIZED_EQUITY_SCALE: Decimal =
     Decimal::from_parts(2_808_348_672, 232_830_643, 0, false, 0);
 
-impl FractionalShares {
-    pub const ZERO: Self = Self(Decimal::ZERO);
-    pub const ONE: Self = Self(Decimal::ONE);
-
-    pub const fn new(value: Decimal) -> Self {
-        Self(value)
-    }
-
-    pub fn inner(self) -> Decimal {
-        self.0
-    }
-
-    #[must_use]
-    pub fn abs(self) -> Self {
-        Self(self.0.abs())
-    }
-
-    pub fn is_zero(self) -> bool {
-        self.0.is_zero()
-    }
-
-    pub fn is_negative(self) -> bool {
-        self.0.is_sign_negative()
-    }
-
-    /// Returns true if this represents a whole number of shares (no fractional part).
-    pub fn is_whole(self) -> bool {
-        self.0.fract().is_zero()
-    }
-
+/// Extension trait for U256 conversions on `FractionalShares`.
+///
+/// These depend on alloy types and therefore live in st0x-execution
+/// rather than the leaf st0x-finance crate.
+pub trait SharesBlockchain {
     /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
     ///
     /// Returns an error for negative values, underflow (values < 1e-18),
     /// or overflow during scaling.
-    pub fn to_u256_18_decimals(self) -> Result<U256, SharesConversionError> {
-        if self.0.is_sign_negative() {
-            return Err(SharesConversionError::NegativeValue(self.0));
+    fn to_u256_18_decimals(self) -> Result<U256, SharesConversionError>;
+
+    /// Creates `FractionalShares` from a U256 value with 18 decimal places.
+    ///
+    /// Divides by 10^18 to convert from raw token units to decimal shares.
+    fn from_u256_18_decimals(value: U256) -> Result<FractionalShares, SharesConversionError>;
+}
+
+impl SharesBlockchain for FractionalShares {
+    fn to_u256_18_decimals(self) -> Result<U256, SharesConversionError> {
+        let inner = self.inner();
+
+        if inner.is_sign_negative() {
+            return Err(SharesConversionError::NegativeValue(inner));
         }
 
-        if self.0.is_zero() {
+        if inner.is_zero() {
             return Ok(U256::ZERO);
         }
 
-        let scaled = self
-            .0
+        let scaled = inner
             .checked_mul(TOKENIZED_EQUITY_SCALE)
             .ok_or(SharesConversionError::Overflow)?;
 
         let truncated = scaled.trunc();
 
         if truncated.is_zero() {
-            return Err(SharesConversionError::Underflow(self.0));
+            return Err(SharesConversionError::Underflow(inner));
         }
 
         if scaled != truncated {
-            return Err(SharesConversionError::PrecisionLoss(self.0));
+            return Err(SharesConversionError::PrecisionLoss(inner));
         }
 
         Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
     }
 
-    /// Creates FractionalShares from a U256 value with 18 decimal places.
-    ///
-    /// Divides by 10^18 to convert from raw token units to decimal shares.
-    pub fn from_u256_18_decimals(value: U256) -> Result<Self, SharesConversionError> {
+    fn from_u256_18_decimals(value: U256) -> Result<FractionalShares, SharesConversionError> {
         if value.is_zero() {
-            return Ok(Self::ZERO);
+            return Ok(FractionalShares::ZERO);
         }
 
         let raw_str = value.to_string();
@@ -338,8 +209,35 @@ impl FractionalShares {
 
         raw_decimal
             .checked_div(TOKENIZED_EQUITY_SCALE)
-            .map(Self)
+            .map(FractionalShares::new)
             .ok_or(SharesConversionError::Overflow)
+    }
+}
+
+impl Positive<FractionalShares> {
+    pub const ONE: Self = unsafe { Self::new_unchecked(FractionalShares::ONE) };
+
+    /// # Safety
+    ///
+    /// The caller must ensure the value is positive (greater than zero).
+    const unsafe fn new_unchecked(value: FractionalShares) -> Self {
+        // Positive is repr(transparent) over T, so this transmute is safe
+        // when the value is known to be positive at compile time.
+        std::mem::transmute(value)
+    }
+
+    /// Converts to whole shares count, returning error if value has a fractional part
+    /// or exceeds u64 range. Use this when the target API does not support fractional shares.
+    pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {
+        let inner = self.inner();
+        if !inner.is_whole() {
+            return Err(InvalidSharesError::Fractional(inner.inner()));
+        }
+
+        inner
+            .inner()
+            .to_u64()
+            .ok_or(InvalidSharesError::Overflow(inner.inner()))
     }
 }
 
@@ -357,101 +255,6 @@ pub enum SharesConversionError {
     PrecisionLoss(Decimal),
     #[error("failed to parse U256: {0}")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
-pub struct ArithmeticError<T> {
-    pub operation: String,
-    pub lhs: T,
-    pub rhs: T,
-}
-
-impl std::ops::Add for FractionalShares {
-    type Output = Result<Self, ArithmeticError<Self>>;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        self.0
-            .checked_add(rhs.0)
-            .map(Self)
-            .ok_or_else(|| ArithmeticError {
-                operation: "+".to_string(),
-                lhs: self,
-                rhs,
-            })
-    }
-}
-
-impl std::ops::Sub for FractionalShares {
-    type Output = Result<Self, ArithmeticError<Self>>;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        self.0
-            .checked_sub(rhs.0)
-            .map(Self)
-            .ok_or_else(|| ArithmeticError {
-                operation: "-".to_string(),
-                lhs: self,
-                rhs,
-            })
-    }
-}
-
-impl std::ops::Mul<Decimal> for FractionalShares {
-    type Output = Result<Self, ArithmeticError<Self>>;
-
-    fn mul(self, rhs: Decimal) -> Self::Output {
-        self.0
-            .checked_mul(rhs)
-            .map(Self)
-            .ok_or_else(|| ArithmeticError {
-                operation: "*".to_string(),
-                lhs: self,
-                rhs: Self(rhs),
-            })
-    }
-}
-
-impl FromStr for FractionalShares {
-    type Err = rust_decimal::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Decimal::from_str(s).map(Self)
-    }
-}
-
-impl Display for FractionalShares {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Positive<FractionalShares> {
-    pub const ONE: Self = Self(FractionalShares::ONE);
-
-    /// Converts to whole shares count, returning error if value has a fractional part
-    /// or exceeds u64 range. Use this when the target API does not support fractional shares.
-    pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {
-        let inner = self.inner();
-        if !inner.is_whole() {
-            return Err(InvalidSharesError::Fractional(inner.0));
-        }
-
-        inner
-            .0
-            .to_u64()
-            .ok_or(InvalidSharesError::Overflow(inner.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for FractionalShares {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = <Decimal as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self::new(value))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -887,7 +690,7 @@ mod tests {
         ) {
             let decimal = Decimal::new(mantissa, scale);
             let result = Positive::new(FractionalShares::new(decimal));
-            prop_assert!(matches!(result, Err(InvalidSharesError::NonPositive(_))));
+            prop_assert!(result.is_err());
         }
 
         #[test]
@@ -946,27 +749,30 @@ mod tests {
 
     #[test]
     fn from_u256_18_decimals_zero_returns_zero() {
-        let result = FractionalShares::from_u256_18_decimals(U256::ZERO).unwrap();
+        let result =
+            <FractionalShares as SharesBlockchain>::from_u256_18_decimals(U256::ZERO).unwrap();
         assert_eq!(result, FractionalShares::ZERO);
     }
 
     #[test]
     fn from_u256_18_decimals_one_whole_share() {
         let one_share = U256::from_str("1000000000000000000").unwrap();
-        let result = FractionalShares::from_u256_18_decimals(one_share).unwrap();
+        let result =
+            <FractionalShares as SharesBlockchain>::from_u256_18_decimals(one_share).unwrap();
         assert_eq!(result.inner(), Decimal::ONE);
     }
 
     #[test]
     fn from_u256_18_decimals_fractional_amount() {
         let one_and_a_half = U256::from_str("1500000000000000000").unwrap();
-        let result = FractionalShares::from_u256_18_decimals(one_and_a_half).unwrap();
+        let result =
+            <FractionalShares as SharesBlockchain>::from_u256_18_decimals(one_and_a_half).unwrap();
         assert_eq!(result.inner(), dec!(1.5));
     }
 
     #[test]
     fn from_u256_18_decimals_overflow_returns_error() {
-        let result = FractionalShares::from_u256_18_decimals(U256::MAX);
+        let result = <FractionalShares as SharesBlockchain>::from_u256_18_decimals(U256::MAX);
         let error = result.unwrap_err();
         assert!(
             matches!(error, SharesConversionError::DecimalConversion(_)),
