@@ -16,10 +16,10 @@ use thiserror::Error;
 use st0x_bridge::cctp::CctpError;
 use st0x_event_sorcery::SendError;
 use st0x_execution::{AlpacaBrokerApiError, InvalidSharesError, NotPositive};
+use st0x_finance::Usdc;
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::onchain::raindex::RaindexError;
-use crate::threshold::Usdc;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcTransferError {

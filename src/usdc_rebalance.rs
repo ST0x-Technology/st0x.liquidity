@@ -67,9 +67,9 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_finance::Usdc;
 
 use crate::alpaca_wallet::AlpacaTransferId;
-use crate::threshold::Usdc;
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -996,7 +996,8 @@ impl UsdcRebalance {
                 state: format!(
                     "ConversionComplete with amount \
                      mismatch: expected {}, got {}",
-                    conv_filled_amount.0, amount.0
+                    conv_filled_amount.inner(),
+                    amount.inner()
                 ),
             });
         }
@@ -1276,7 +1277,7 @@ mod tests {
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal: TransferRef::AlpacaId(transfer_id),
             })
             .await
@@ -1295,7 +1296,7 @@ mod tests {
         };
 
         assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*amount, Usdc::new(dec!(1000.00)));
         assert_eq!(*withdrawal_ref, TransferRef::AlpacaId(transfer_id));
     }
 
@@ -1308,7 +1309,7 @@ mod tests {
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
-                amount: Usdc(dec!(500.50)),
+                amount: Usdc::new(dec!(500.50)),
                 withdrawal: TransferRef::OnchainTx(tx_hash),
             })
             .await
@@ -1327,7 +1328,7 @@ mod tests {
         };
 
         assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
-        assert_eq!(*amount, Usdc(dec!(500.50)));
+        assert_eq!(*amount, Usdc::new(dec!(500.50)));
         assert_eq!(*withdrawal_ref, TransferRef::OnchainTx(tx_hash));
     }
 
@@ -1338,13 +1339,13 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
-                amount: Usdc(dec!(500.00)),
+                amount: Usdc::new(dec!(500.00)),
                 withdrawal: TransferRef::AlpacaId(transfer_id),
             })
             .await
@@ -1371,13 +1372,13 @@ mod tests {
         let error = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                 initiated_at: Utc::now(),
             },
             UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::BaseToAlpaca,
-                amount: Usdc(dec!(500.00)),
+                amount: Usdc::new(dec!(500.00)),
                 withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
                     "0x0000000000000000000000000000000000000000000000000000000000000001"
                 )),
@@ -1396,7 +1397,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                 initiated_at: Utc::now(),
             }])
@@ -1433,7 +1434,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1458,7 +1459,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                 initiated_at: Utc::now(),
             }])
@@ -1499,7 +1500,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1527,7 +1528,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1558,7 +1559,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1612,7 +1613,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                 initiated_at: Utc::now(),
             }])
@@ -1638,7 +1639,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1669,7 +1670,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1704,7 +1705,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1759,7 +1760,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                 initiated_at: Utc::now(),
             }])
@@ -1784,7 +1785,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1813,7 +1814,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1845,7 +1846,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1887,7 +1888,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1906,8 +1907,8 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx: mint_tx_hash,
-                amount_received: Usdc(dec!(99.99)),
-                fee_collected: Usdc(dec!(0.01)),
+                amount_received: Usdc::new(dec!(99.99)),
+                fee_collected: Usdc::new(dec!(0.01)),
             })
             .await
             .events();
@@ -1936,7 +1937,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -1950,8 +1951,8 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx: mint_tx_hash,
-                amount_received: Usdc(dec!(99.99)),
-                fee_collected: Usdc(dec!(0.01)),
+                amount_received: Usdc::new(dec!(99.99)),
+                fee_collected: Usdc::new(dec!(0.01)),
             })
             .await
             .then_expect_error();
@@ -1972,7 +1973,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2017,7 +2018,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2066,7 +2067,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2116,7 +2117,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2134,8 +2135,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
             ])
@@ -2143,8 +2144,8 @@ mod tests {
                 mint_tx: fixed_bytes!(
                     "0x2222222222222222222222222222222222222222222222222222222222222222"
                 ),
-                amount_received: Usdc(dec!(99.99)),
-                fee_collected: Usdc(dec!(0.01)),
+                amount_received: Usdc::new(dec!(99.99)),
+                fee_collected: Usdc::new(dec!(0.01)),
             })
             .await
             .then_expect_error();
@@ -2167,7 +2168,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2185,8 +2186,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
             ])
@@ -2212,7 +2213,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2257,7 +2258,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2275,8 +2276,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
             ])
@@ -2314,7 +2315,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(500.00)),
+                    amount: Usdc::new(dec!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2332,8 +2333,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
             ])
@@ -2366,7 +2367,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2410,7 +2411,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2428,8 +2429,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -2461,7 +2462,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2479,8 +2480,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
             ])
@@ -2509,7 +2510,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(500.00)),
+                    amount: Usdc::new(dec!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2527,8 +2528,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -2572,7 +2573,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2590,8 +2591,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -2631,7 +2632,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(10000.00)),
+                    amount: Usdc::new(dec!(10000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                     initiated_at: Utc::now(),
                 },
@@ -2649,8 +2650,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -2683,7 +2684,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(5000.00)),
+                    amount: Usdc::new(dec!(5000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(withdrawal_tx),
                     initiated_at: Utc::now(),
                 },
@@ -2701,8 +2702,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -2727,7 +2728,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100.00)),
+                    amount: Usdc::new(dec!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -2755,7 +2756,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100.00)),
+                    amount: Usdc::new(dec!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -2783,7 +2784,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100.00)),
+                    amount: Usdc::new(dec!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -2825,7 +2826,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100.00)),
+                    amount: Usdc::new(dec!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -2845,8 +2846,8 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
-                amount_received: Usdc(dec!(99.99)),
-                fee_collected: Usdc(dec!(0.01)),
+                amount_received: Usdc::new(dec!(99.99)),
+                fee_collected: Usdc::new(dec!(0.01)),
             })
             .await
             .then_expect_error();
@@ -2868,7 +2869,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100.00)),
+                    amount: Usdc::new(dec!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -2886,8 +2887,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash: mint_tx,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -2921,7 +2922,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100.00)),
+                    amount: Usdc::new(dec!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -2939,8 +2940,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash: mint_tx,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -2954,7 +2955,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(100.00)),
+                amount: Usdc::new(dec!(100.00)),
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
             })
             .await
@@ -2977,7 +2978,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100.00)),
+                    amount: Usdc::new(dec!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -2995,8 +2996,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash: mint_tx,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -3026,7 +3027,7 @@ mod tests {
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiateConversion {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 order_id,
             })
             .await
@@ -3044,7 +3045,7 @@ mod tests {
         };
 
         assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*amount, Usdc::new(dec!(1000.00)));
         assert_eq!(*event_order_id, order_id);
     }
 
@@ -3055,13 +3056,13 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 order_id,
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::InitiateConversion {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(500.00)),
+                amount: Usdc::new(dec!(500.00)),
                 order_id: Uuid::new_v4(),
             })
             .await
@@ -3076,12 +3077,12 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_conversion_from_converting_state() {
         let order_id = Uuid::new_v4();
-        let filled_amount = Usdc(dec!(998));
+        let filled_amount = Usdc::new(dec!(998));
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 order_id,
                 initiated_at: Utc::now(),
             }])
@@ -3101,7 +3102,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::ConfirmConversion {
-                filled_amount: Usdc(dec!(998)),
+                filled_amount: Usdc::new(dec!(998)),
             })
             .await
             .then_expect_error();
@@ -3120,18 +3121,18 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     order_id,
                     initiated_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
-                    filled_amount: Usdc(dec!(998)),
+                    filled_amount: Usdc::new(dec!(998)),
                     converted_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ConfirmConversion {
-                filled_amount: Usdc(dec!(998)),
+                filled_amount: Usdc::new(dec!(998)),
             })
             .await
             .then_expect_error();
@@ -3149,7 +3150,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 order_id,
                 initiated_at: Utc::now(),
             }])
@@ -3190,13 +3191,13 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     order_id,
                     initiated_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
-                    filled_amount: Usdc(dec!(998)),
+                    filled_amount: Usdc::new(dec!(998)),
                     converted_at: Utc::now(),
                 },
             ])
@@ -3216,13 +3217,13 @@ mod tests {
     async fn test_initiate_withdrawal_after_conversion_complete() {
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let filled_amount = Usdc(dec!(998));
+        let filled_amount = Usdc::new(dec!(998));
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     order_id,
                     initiated_at: Utc::now(),
                 },
@@ -3248,13 +3249,13 @@ mod tests {
     async fn test_initiate_with_mismatched_amount_from_conversion_complete_fails() {
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let filled_amount = Usdc(dec!(998));
+        let filled_amount = Usdc::new(dec!(998));
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     order_id,
                     initiated_at: Utc::now(),
                 },
@@ -3266,7 +3267,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(999.00)),
+                amount: Usdc::new(dec!(999.00)),
                 withdrawal: TransferRef::AlpacaId(transfer_id),
             })
             .await
@@ -3294,7 +3295,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
                     initiated_at: Utc::now(),
                 },
@@ -3312,8 +3313,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash: mint_tx,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -3327,7 +3328,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
             })
             .await
             .events();
@@ -3344,7 +3345,7 @@ mod tests {
         };
 
         assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
-        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*amount, Usdc::new(dec!(1000.00)));
         assert_eq!(*event_order_id, order_id);
     }
 
@@ -3359,7 +3360,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                     initiated_at: Utc::now(),
                 },
@@ -3377,8 +3378,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash: mint_tx,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -3392,7 +3393,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: Uuid::new_v4(),
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
             })
             .await
             .then_expect_error();
@@ -3409,7 +3410,7 @@ mod tests {
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: Uuid::new_v4(),
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
             })
             .await
             .then_expect_error();
@@ -3431,7 +3432,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
                     initiated_at: Utc::now(),
                 },
@@ -3449,8 +3450,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash: mint_tx,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -3464,7 +3465,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: Uuid::new_v4(),
-                amount: Usdc(dec!(500.00)),
+                amount: Usdc::new(dec!(500.00)),
             })
             .await
             .then_expect_error();
@@ -3473,7 +3474,7 @@ mod tests {
             matches!(
                 &error,
                 LifecycleError::Apply(UsdcRebalanceError::ConversionAmountMismatch { expected, provided })
-                    if *expected == Usdc(dec!(1000.00)) && *provided == Usdc(dec!(500.00))
+                    if *expected == Usdc::new(dec!(1000.00)) && *provided == Usdc::new(dec!(500.00))
             ),
             "Expected ConversionAmountMismatch with expected=1000 and provided=500, got: {error:?}"
         );
@@ -3491,7 +3492,7 @@ mod tests {
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
                     initiated_at: Utc::now(),
                 },
@@ -3509,8 +3510,8 @@ mod tests {
                 },
                 UsdcRebalanceEvent::Bridged {
                     mint_tx_hash: mint_tx,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                     minted_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::DepositInitiated {
@@ -3523,13 +3524,13 @@ mod tests {
                 },
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: Usdc::new(dec!(1000.00)),
                     order_id,
                     initiated_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ConfirmConversion {
-                filled_amount: Usdc(dec!(998)),
+                filled_amount: Usdc::new(dec!(998)),
             })
             .await
             .events();
@@ -3545,7 +3546,7 @@ mod tests {
     fn conversion_confirmed_on_uninitialized_produces_failed_state() {
         let error = replay::<UsdcRebalance>(vec![UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::BaseToAlpaca,
-            filled_amount: Usdc(dec!(998)),
+            filled_amount: Usdc::new(dec!(998)),
             converted_at: Utc::now(),
         }])
         .unwrap_err();
@@ -3558,13 +3559,13 @@ mod tests {
         let error = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                 initiated_at: Utc::now(),
             },
             UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: Usdc(dec!(1000.00)),
+                amount: Usdc::new(dec!(1000.00)),
                 order_id: Uuid::new_v4(),
                 initiated_at: Utc::now(),
             },
