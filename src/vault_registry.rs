@@ -731,4 +731,87 @@ mod tests {
             "Reactor should only see events emitted after construction, not historical ones"
         );
     }
+
+    #[test]
+    fn equity_vault_seeded_from_config_sets_discovered_in_to_zero() {
+        let seeded_at = Utc::now();
+
+        let registry =
+            replay::<VaultRegistry>(vec![VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token: TEST_TOKEN,
+                vault_id: TEST_VAULT_ID,
+                seeded_at,
+                symbol: test_symbol(),
+            }])
+            .unwrap()
+            .unwrap();
+
+        let vault = registry.equity_vaults.get(&TEST_TOKEN).unwrap();
+        assert_eq!(vault.discovered_in, TxHash::ZERO);
+        assert_eq!(vault.discovered_at, seeded_at);
+        assert_eq!(vault.vault_id, TEST_VAULT_ID);
+        assert_eq!(vault.symbol, test_symbol());
+    }
+
+    #[test]
+    fn usdc_vault_seeded_from_config_sets_discovered_in_to_zero() {
+        let seeded_at = Utc::now();
+
+        let registry =
+            replay::<VaultRegistry>(vec![VaultRegistryEvent::UsdcVaultSeededFromConfig {
+                vault_id: TEST_VAULT_ID,
+                seeded_at,
+            }])
+            .unwrap()
+            .unwrap();
+
+        let usdc_vault = registry.usdc_vault.unwrap();
+        assert_eq!(usdc_vault.discovered_in, TxHash::ZERO);
+        assert_eq!(usdc_vault.discovered_at, seeded_at);
+        assert_eq!(usdc_vault.vault_id, TEST_VAULT_ID);
+    }
+
+    #[tokio::test]
+    async fn seed_equity_vault_from_config_command_produces_correct_event() {
+        let events = TestHarness::<VaultRegistry>::with(())
+            .given_no_previous_events()
+            .when(VaultRegistryCommand::SeedEquityVaultFromConfig {
+                token: TEST_TOKEN,
+                vault_id: TEST_VAULT_ID,
+                symbol: test_symbol(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token,
+                vault_id,
+                symbol,
+                ..
+            } if *token == TEST_TOKEN
+                && *vault_id == TEST_VAULT_ID
+                && *symbol == test_symbol()
+        ));
+    }
+
+    #[tokio::test]
+    async fn seed_usdc_vault_from_config_command_produces_correct_event() {
+        let events = TestHarness::<VaultRegistry>::with(())
+            .given_no_previous_events()
+            .when(VaultRegistryCommand::SeedUsdcVaultFromConfig {
+                vault_id: TEST_VAULT_ID,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            VaultRegistryEvent::UsdcVaultSeededFromConfig { vault_id, .. }
+            if *vault_id == TEST_VAULT_ID
+        ));
+    }
 }
