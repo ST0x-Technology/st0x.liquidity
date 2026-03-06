@@ -1,8 +1,9 @@
 # Roadmap
 
-## Current Development Focus
+Each `##` section is an epic -- a goal-oriented group of related issues. Epics
+are ordered by priority (highest first).
 
-### Operational visibility and reliable wallet signing
+## Operational visibility and reliable wallet signing
 
 Stop relying on logs for rebalancing visibility, and add a reliable alternative
 to Fireblocks for onchain signing. All branches stack on #355.
@@ -19,7 +20,7 @@ graph TD
     G --> H
 ```
 
-#### Turnkey wallet (evm crate, independent)
+### Turnkey wallet (evm crate, independent)
 
 Fireblocks has been unreliable for production signing (30s+ latency, outages).
 Turnkey uses AWS Nitro enclaves for 50-100ms signing. Touches only the evm
@@ -27,7 +28,7 @@ crate, so fully independent from dashboard work.
 
 - [ ] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
 
-#### Dashboard inventory & transfer monitoring
+### Dashboard inventory & transfer monitoring
 
 We are actively testing cross-venue inventory transfers and need dashboard
 panels showing inventory snapshots, change history, and transfer lifecycle
@@ -39,7 +40,7 @@ Turnkey work above, so both proceed in parallel.
 - [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
 - [ ] [#379 Dashboard integration: verify nix build, deployment, and end-to-end data flow](https://github.com/ST0x-Technology/st0x.liquidity/issues/379)
 
-#### Wallet provider config (main crate, depends on Turnkey wallet)
+### Wallet provider config (main crate, depends on Turnkey wallet)
 
 Wires Turnkey into the main crate config so operators can choose between Turnkey
 and Fireblocks. Deferred to last to avoid conflicts with dashboard work in the
@@ -48,6 +49,8 @@ same crate.
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
 
 ---
+
+## Not epic
 
 ### Fireblocks Contract Calls
 
@@ -128,9 +131,7 @@ All auto-rebalancing logic uses ES/CQRS. Time to disable legacy:
 - [x] [#144 Drop old CRUD tables](https://github.com/ST0x-Technology/st0x.liquidity/issues/144)
   - Superseded: legacy tables removed in #273
 
----
-
-## Backlog: Admin Dashboard
+### Backlog: Admin Dashboard
 
 Unified web dashboard for monitoring and controlling the liquidity bot.
 Eliminates jumping between Grafana, HyperDX, and CLI for Schwab OAuth. Supports
@@ -145,34 +146,32 @@ both Schwab and Alpaca bot instances.
 - [ ] [#181 Dashboard: Trade History Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/181)
 - [ ] [#182 Dashboard: Rebalancing Panel (Alpaca Only)](https://github.com/ST0x-Technology/st0x.liquidity/issues/182)
 
-### Controls
+#### Controls
 
 - [ ] [#183 Dashboard: Circuit Breaker](https://github.com/ST0x-Technology/st0x.liquidity/issues/183)
 - [ ] [#184 Dashboard: Schwab OAuth Integration](https://github.com/ST0x-Technology/st0x.liquidity/issues/184)
 
-### Integrations
+#### Integrations
 
 - [ ] [#185 Dashboard: Grafana Embedding](https://github.com/ST0x-Technology/st0x.liquidity/issues/185)
 - [ ] [#186 Dashboard: HyperDX Health Status](https://github.com/ST0x-Technology/st0x.liquidity/issues/186)
 
-### Infrastructure
+#### Infrastructure
 
 - [ ] [#187 Dashboard: Deployment Configuration](https://github.com/ST0x-Technology/st0x.liquidity/issues/187)
 
----
-
-## Backlog: Multi-Crate Architecture
+### Backlog: Multi-Crate Architecture
 
 Split monolith into focused crates for faster builds, stricter abstraction
 boundaries, and reduced coupling. Sequenced around CQRS/ES migration.
 
-### Prerequisites
+#### Prerequisites
 
 - [x] [#267 Use cqrs-es Services to make OffchainOrder aggregate self-contained](https://github.com/ST0x-Technology/st0x.liquidity/issues/267)
   - PR:
     [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
 
-### Phase 2: Integration Layer Extraction
+#### Phase 2: Integration Layer Extraction
 
 Extract external API wrappers (no CQRS/ES dependencies):
 
@@ -180,41 +179,35 @@ Extract external API wrappers (no CQRS/ES dependencies):
 - [ ] [#269 Extract st0x-tokenization crate with Tokenizer trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/269)
 - [ ] [#270 Extract st0x-vault crate with Vault trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/270)
 
-### Phase 3: Rebalancing Domain Extraction
+#### Phase 3: Rebalancing Domain Extraction
 
 Extract rebalancing logic (already clean CQRS):
 
 - [ ] [#271 Extract st0x-rebalance crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/271)
 
-### Phase 4: Hedging Extraction & Application Layer
+#### Phase 4: Hedging Extraction & Application Layer
 
 After CQRS migration Phase 3. Extract hedging logic and create application
 binary:
 
 - [ ] [#272 Convert st0x-hedge to library crate and create st0x-server binary](https://github.com/ST0x-Technology/st0x.liquidity/issues/272)
 
----
-
-## Backlog: Quant Research Data
+### Backlog: Quant Research Data
 
 Ensure the event store captures all data needed for quantitative research —
 execution timing, market conditions, and operational metrics.
 
 - [ ] [#303 Audit external integrations: record start/end timestamps for all calls in event store](https://github.com/ST0x-Technology/st0x.liquidity/issues/303)
 
----
-
-## Backlog: Testing
+### Backlog: Testing
 
 - [ ] [#292 Work Plan: E2E Test Infrastructure while liquidity bot stabilizes](https://github.com/ST0x-Technology/st0x.liquidity/issues/292)
 - [ ] [#285 Integration test plan](https://github.com/ST0x-Technology/st0x.liquidity/issues/285)
 - [ ] [#264 Set up end-to-end testing infrastructure](https://github.com/ST0x-Technology/st0x.liquidity/issues/264)
 
----
+### Backlog: Infrastructure & Production Enhancements
 
-## Backlog: Infrastructure & Production Enhancements
-
-### Infrastructure
+#### Infrastructure
 
 - [ ] [#296 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/issues/296)
 - [ ] [#293 Granular SSH access control: limit root access and per-user deploy keys](https://github.com/ST0x-Technology/st0x.liquidity/issues/293)
@@ -226,7 +219,7 @@ execution timing, market conditions, and operational metrics.
       Event streaming infrastructure
 - [ ] [#78 Integrate Kafka in bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/78)
 
-### Production Enhancements
+#### Production Enhancements
 
 - [x] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
   - PR:
@@ -234,19 +227,19 @@ execution timing, market conditions, and operational metrics.
 - [ ] [#36 Set up Git Hooks for formatting](https://github.com/ST0x-Technology/st0x.liquidity/issues/36) -
       Automated formatting and linting checks
 
-### Build Performance
+#### Build Performance
 
 - [ ] [#57 Set up docker build caching in the deployment GitHub Action](https://github.com/ST0x-Technology/st0x.liquidity/issues/57) -
       Optimize deployment pipeline performance
 - [ ] [#56 Optimize the Dockerfile to cache nix deps at build stage](https://github.com/ST0x-Technology/st0x.liquidity/issues/56) -
       Cache nix dependencies for faster builds
 
-### Reliability
+#### Reliability
 
 - [ ] [#33 Ensure all components have retries/restarts](https://github.com/ST0x-Technology/st0x.liquidity/issues/33) -
       Component restart strategies
 
-### Code Quality
+#### Code Quality
 
 - [ ] [#54 Create BrokerAuthProvider trait to abstract authentication across codebase](https://github.com/ST0x-Technology/st0x.liquidity/issues/54) -
       Authentication abstraction
@@ -254,29 +247,25 @@ execution timing, market conditions, and operational metrics.
   - PR:
     [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
 
-### Data Quality
+#### Data Quality
 
 - [ ] [#73 Stop storing onchain events unrelated to the arbitrageur](https://github.com/ST0x-Technology/st0x.liquidity/issues/73) -
       Filter unnecessary event storage
 - [ ] [#240 Conversion slippage not tracked, causing inventory drift](https://github.com/ST0x-Technology/st0x.liquidity/issues/240)
 - [ ] [#254 Track transfers with unique IDs for accurate inventory reconciliation](https://github.com/ST0x-Technology/st0x.liquidity/issues/254)
 
-### Edge Cases
+#### Edge Cases
 
 - [ ] [#16 Handle reorgs](https://github.com/ST0x-Technology/st0x.liquidity/issues/16) -
       Handle blockchain reorganizations safely
 
----
-
-## Completed: CI/CD Improvements
+### Completed: CI/CD Improvements
 
 - [x] [#256 Implement CI/CD improvements from infra deployment spec](https://github.com/ST0x-Technology/st0x.liquidity/issues/256)
   - PR:
     [#259 Terraform infra provisioning and Nix-powered secret management and service deployments](https://github.com/ST0x-Technology/st0x.liquidity/pull/259)
 
----
-
-## Completed: Production Fixes (Jan 2026)
+### Completed: Production Fixes (Jan 2026)
 
 - [x] [#251 Manual operations on trading venues not detected by inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/issues/251)
   - PR:
@@ -287,9 +276,7 @@ execution timing, market conditions, and operational metrics.
 - PR:
   [#266 Fix cqrs inventory management](https://github.com/ST0x-Technology/st0x.liquidity/pull/266)
 
----
-
-## Completed: Alpaca Production Go-Live
+### Completed: Alpaca Production Go-Live
 
 - [x] [#223 Auto-rebalancing flow missing USDC/USD conversion step](https://github.com/ST0x-Technology/st0x.liquidity/issues/223)
   - PR:
@@ -307,9 +294,7 @@ execution timing, market conditions, and operational metrics.
   - PR:
     [#225 refactor Alpaca services with Broker API client support](https://github.com/ST0x-Technology/st0x.liquidity/pull/225)
 
----
-
-## Completed: Admin Dashboard Foundation
+### Completed: Admin Dashboard Foundation
 
 - [x] [#188 spec out the dashboard](https://github.com/ST0x-Technology/st0x.liquidity/issues/188)
   - PR:
@@ -324,15 +309,13 @@ execution timing, market conditions, and operational metrics.
   - PR:
     [#206 Add dashboard skeleton and live event tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/206)
 
----
-
-## Completed: CQRS/ES Migration with Automated Rebalancing
+### Completed: CQRS/ES Migration with Automated Rebalancing
 
 Migrated to event-sourced architecture through 3 phases. Automated rebalancing
 implemented as first major feature on new architecture (Alpaca-only, Schwab
 remains manual).
 
-### Phase 1: Dual-Write Foundation (Shadow Mode)
+#### Phase 1: Dual-Write Foundation (Shadow Mode)
 
 - [x] [#124 Add CQRS/ES migration specification to SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/issues/124)
   - PR:
@@ -359,7 +342,7 @@ remains manual).
   - PR:
     [#168 Lifecycle wrapper for event-sourced aggregates](https://github.com/ST0x-Technology/st0x.liquidity/pull/168)
 
-### Phase 2: Automated Rebalancing (Alpaca-Only)
+#### Phase 2: Automated Rebalancing (Alpaca-Only)
 
 - [x] [#132 Implement Alpaca crypto wallet service](https://github.com/ST0x-Technology/st0x.liquidity/issues/132)
   - PR:
@@ -395,9 +378,7 @@ remains manual).
   - PR:
     [#190 manual rebalancing CLI](https://github.com/ST0x-Technology/st0x.liquidity/pull/190)
 
----
-
-## Completed: Multi-Crate Architecture Phase 1
+### Completed: Multi-Crate Architecture Phase 1
 
 - [x] [#199 Proposal: multi-crate architecture for faster builds and stricter boundaries](https://github.com/ST0x-Technology/st0x.liquidity/issues/199)
   - PR:
@@ -406,9 +387,7 @@ remains manual).
   - PR:
     [#222 decouple VaultService from Evm, remove signer type parameter](https://github.com/ST0x-Technology/st0x.liquidity/pull/222)
 
----
-
-## Completed: Bug Fixes
+### Completed: Bug Fixes
 
 - [x] [#261 Fix inventory tracking post-upgrade bugs](https://github.com/ST0x-Technology/st0x.liquidity/issues/261)
   - PR:
@@ -456,9 +435,7 @@ remains manual).
   - PR:
     [#118 Fix: Clean up stale PENDING executions to prevent infinite retry loops](https://github.com/ST0x-Technology/st0x.liquidity/pull/118)
 
----
-
-## Completed: Multi-Broker Support
+### Completed: Multi-Broker Support
 
 - [x] [#60 Create a complete abstraction for Broker](https://github.com/ST0x-Technology/st0x.liquidity/issues/60)
   - PR:
@@ -470,9 +447,7 @@ remains manual).
   - PR:
     [#191 Trading via Alpaca Broker API](https://github.com/ST0x-Technology/st0x.liquidity/pull/191)
 
----
-
-## Completed: Performance Monitoring & Profitability Analysis
+### Completed: Performance Monitoring & Profitability Analysis
 
 - [x] [#91 Track onchain Pyth prices](https://github.com/ST0x-Technology/st0x.liquidity/issues/91)
   - PR:
@@ -499,9 +474,7 @@ remains manual).
   - PR:
     [#98 Fix/tokencryption](https://github.com/ST0x-Technology/st0x.liquidity/pull/98)
 
----
-
-## Completed: Deployment & Infrastructure
+### Completed: Deployment & Infrastructure
 
 - [x] [#11 Set up automated deployment](https://github.com/ST0x-Technology/st0x.liquidity/issues/11)
   - PR: [#39 CD](https://github.com/ST0x-Technology/st0x.liquidity/pull/39)
@@ -515,9 +488,7 @@ remains manual).
   - PR:
     [#111 fix logging and db env vars](https://github.com/ST0x-Technology/st0x.liquidity/pull/111)
 
----
-
-## Completed: Code Quality & Documentation
+### Completed: Code Quality & Documentation
 
 - [x] [#50 Centralize suffix handling logic](https://github.com/ST0x-Technology/st0x.liquidity/issues/50)
 - [x] [#68 Refactor visibility levels to improve dead code identification](https://github.com/ST0x-Technology/st0x.liquidity/issues/68)
@@ -533,9 +504,7 @@ remains manual).
   - PR:
     [#103 broker crate docs and AGENTS.md downsize to fix Claude Code warning](https://github.com/ST0x-Technology/st0x.liquidity/pull/103)
 
----
-
-## Completed: MVP Core Functionality
+### Completed: MVP Core Functionality
 
 The core arbitrage bot functionality is now live and operational:
 
@@ -562,8 +531,6 @@ The core arbitrage bot functionality is now live and operational:
   - PR:
     [#53 Only run the bot during market open hours](https://github.com/ST0x-Technology/st0x.liquidity/pull/53)
 
----
-
-## [SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/blob/master/SPEC.md)
+### [SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/blob/master/SPEC.md)
 
 See the specification for detailed system behavior documentation.
