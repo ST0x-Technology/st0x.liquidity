@@ -2,30 +2,6 @@
 
 ## Current Development Focus
 
-### Fireblocks Contract Calls
-
-- [x] [#325 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/issues/325)
-  - PR:
-    [#326 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/pull/326)
-- [x] [#323 Fireblocks integration uses OneTimeAddress instead of whitelisted contract wallets](https://github.com/ST0x-Technology/st0x.liquidity/issues/323)
-  - PR:
-    [#324 resolve fireblocks contract wallet via API per call](https://github.com/ST0x-Technology/st0x.liquidity/pull/324)
-- [x] [#297 Harden wallet management with Fireblocks contract calls](https://github.com/ST0x-Technology/st0x.liquidity/issues/297)
-  - PR:
-    [#300 add fireblocks integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/300)
-
-### Live testing of auto-rebalancing on the Alpaca instance
-
-- PR:
-  [#315 go live prod configuration](https://github.com/ST0x-Technology/st0x.liquidity/pull/315)
-
-- [ ] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
-  - PR (draft):
-    [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
-- [ ] [#353 Per-asset operations config: independent trading/rebalancing toggles, vault IDs, operational limits](https://github.com/ST0x-Technology/st0x.liquidity/issues/353)
-  - PR:
-    [#355 per-asset operations config: independent trading/rebalancing toggles](https://github.com/ST0x-Technology/st0x.liquidity/pull/355)
-
 ### Operational visibility and reliable wallet signing
 
 We are actively testing auto-rebalancing with cross-venue inventory transfers
@@ -67,6 +43,30 @@ All branches stack on #355 (per-asset operations config).
 **Wallet provider config** (main crate, depends on Turnkey wallet):
 
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
+
+### Fireblocks Contract Calls
+
+- [x] [#325 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/issues/325)
+  - PR:
+    [#326 upgrade Rain Orderbook bindings from V5 to V6](https://github.com/ST0x-Technology/st0x.liquidity/pull/326)
+- [x] [#323 Fireblocks integration uses OneTimeAddress instead of whitelisted contract wallets](https://github.com/ST0x-Technology/st0x.liquidity/issues/323)
+  - PR:
+    [#324 resolve fireblocks contract wallet via API per call](https://github.com/ST0x-Technology/st0x.liquidity/pull/324)
+- [x] [#297 Harden wallet management with Fireblocks contract calls](https://github.com/ST0x-Technology/st0x.liquidity/issues/297)
+  - PR:
+    [#300 add fireblocks integration](https://github.com/ST0x-Technology/st0x.liquidity/pull/300)
+
+### Live testing of auto-rebalancing on the Alpaca instance
+
+- PR:
+  [#315 go live prod configuration](https://github.com/ST0x-Technology/st0x.liquidity/pull/315)
+
+- [ ] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
+  - PR (draft):
+    [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
+- [ ] [#353 Per-asset operations config: independent trading/rebalancing toggles, vault IDs, operational limits](https://github.com/ST0x-Technology/st0x.liquidity/issues/353)
+  - PR:
+    [#355 per-asset operations config: independent trading/rebalancing toggles](https://github.com/ST0x-Technology/st0x.liquidity/pull/355)
 
 #### Wrapped Token Handling
 
