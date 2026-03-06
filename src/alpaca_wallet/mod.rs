@@ -29,10 +29,7 @@ mod whitelist;
 use alloy::primitives::{Address, TxHash};
 use std::sync::Arc;
 
-use st0x_execution::Positive;
-
-use st0x_execution::AlpacaAccountId;
-
+use st0x_execution::{AlpacaAccountId, Positive};
 use st0x_finance::Usdc;
 
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};

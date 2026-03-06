@@ -932,7 +932,9 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,
@@ -1032,7 +1034,9 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,
@@ -1411,7 +1415,9 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,

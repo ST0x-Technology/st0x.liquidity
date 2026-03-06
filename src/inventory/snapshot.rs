@@ -15,7 +15,6 @@ use thiserror::Error;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Nil};
 use st0x_execution::{FractionalShares, Symbol};
-
 use st0x_finance::Usdc;
 
 /// Typed identifier for InventorySnapshot aggregates, keyed

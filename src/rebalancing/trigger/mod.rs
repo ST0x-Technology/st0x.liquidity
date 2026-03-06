@@ -27,6 +27,7 @@ use st0x_evm::fireblocks::{
     FireblocksVaultAccountId, FireblocksWallet,
 };
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
+use st0x_finance::Usdc;
 
 use crate::config::{AssetsConfig, OperationMode};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
@@ -34,8 +35,6 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
     ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, Operator, TransferOp, Venue,
 };
-use st0x_finance::Usdc;
-
 use crate::offchain_order::Dollars;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::position::{Position, PositionEvent};
@@ -81,6 +80,11 @@ pub enum RebalancingCtxError {
     },
     #[error("missing Fireblocks asset ID for chain ID {chain_id}")]
     MissingChainAssetId { chain_id: u64 },
+    #[error(
+        "chain ID mismatch: expected {expected} but RPC returned {actual} \
+         (check that base_rpc_url and ethereum_rpc_url are not swapped)"
+    )]
+    ChainIdMismatch { expected: u64, actual: u64 },
     #[error("RPC error during wallet setup: {0}")]
     Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
     #[error(transparent)]
@@ -91,7 +95,9 @@ pub enum RebalancingCtxError {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
     pub(crate) base_rpc_url: Url,
+    pub(crate) base_chain_id: u64,
     pub(crate) ethereum_rpc_url: Url,
+    pub(crate) ethereum_chain_id: u64,
     pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
     pub(crate) fireblocks_secret_path: PathBuf,
 }
@@ -164,12 +170,14 @@ impl RebalancingCtx {
                 &secrets.fireblocks_api_user_id,
                 &fireblocks_secret,
                 secrets.base_rpc_url,
+                secrets.base_chain_id,
             ),
             Self::build_wallet(
                 &config,
                 &secrets.fireblocks_api_user_id,
                 &fireblocks_secret,
                 secrets.ethereum_rpc_url,
+                secrets.ethereum_chain_id,
             ),
         )?;
 
@@ -199,9 +207,18 @@ impl RebalancingCtx {
         api_user_id: &FireblocksApiUserId,
         api_secret: &[u8],
         rpc_url: Url,
+        expected_chain_id: u64,
     ) -> Result<FireblocksWallet<RootProvider>, RebalancingCtxError> {
         let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
         let chain_id = provider.get_chain_id().await?;
+
+        if chain_id != expected_chain_id {
+            return Err(RebalancingCtxError::ChainIdMismatch {
+                expected: expected_chain_id,
+                actual: chain_id,
+            });
+        }
+
         let asset_id = config
             .fireblocks_chain_asset_ids
             .get(chain_id)
@@ -671,7 +688,7 @@ impl RebalancingTrigger {
             .await?
             .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
 
-        let unwrapped_token = self.wrapper.lookup_tokenized_equity(symbol)?;
+        let unwrapped_token = self.wrapper.lookup_underlying(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
         let shares_limit = self
@@ -733,16 +750,14 @@ impl RebalancingTrigger {
 
     /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
     fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
-        let cash_rebalancing_disabled = self
-            .config
-            .assets
-            .cash
-            .as_ref()
-            .is_some_and(|cash| matches!(cash.rebalancing, OperationMode::Disabled));
-
-        if cash_rebalancing_disabled {
-            debug!("USDC rebalancing disabled via assets.cash config");
-            return None;
+        if let Some(cash) = &self.config.assets.cash {
+            match cash.rebalancing {
+                OperationMode::Disabled => {
+                    debug!("USDC rebalancing disabled via assets.cash config");
+                    return None;
+                }
+                OperationMode::Enabled => {}
+            }
         }
 
         let usdc_limit = self
@@ -1023,14 +1038,15 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
-    use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
-    use st0x_execution::{Direction, ExecutorOrderId, Positive};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
+
+    use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
+    use st0x_execution::{Direction, ExecutorOrderId, Positive};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -3176,7 +3192,9 @@ mod tests {
     fn valid_rebalancing_secrets_toml() -> &'static str {
         r#"
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://eth.example.com"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#

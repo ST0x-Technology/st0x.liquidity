@@ -68,7 +68,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .await
     }
 
-    fn lookup_tokenized_equity(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_underlying(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
         let asset = self
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
@@ -76,7 +76,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         Ok(asset.tokenized_equity)
     }
 
-    fn lookup_tokenized_equity_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
         let asset = self
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
@@ -252,37 +252,37 @@ mod tests {
     }
 
     #[test]
-    fn lookup_tokenized_equity_derivative_returns_vault_address() {
+    fn lookup_derivative_returns_vault_address() {
         let config = test_asset_config();
         let expected = config.tokenized_equity_derivative;
         let service = service_with_symbol("tAAPL", config);
 
         let result = service
-            .lookup_tokenized_equity_derivative(&"tAAPL".parse().unwrap())
+            .lookup_derivative(&"tAAPL".parse().unwrap())
             .unwrap();
 
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn lookup_tokenized_equity_returns_underlying_address() {
+    fn lookup_underlying_returns_underlying_address() {
         let config = test_asset_config();
         let expected = config.tokenized_equity;
         let service = service_with_symbol("tAAPL", config);
 
         let result = service
-            .lookup_tokenized_equity(&"tAAPL".parse().unwrap())
+            .lookup_underlying(&"tAAPL".parse().unwrap())
             .unwrap();
 
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn lookup_tokenized_equity_derivative_errors_on_unconfigured_symbol() {
+    fn lookup_derivative_errors_on_unconfigured_symbol() {
         let service = service_with_symbol("tAAPL", test_asset_config());
 
         let error = service
-            .lookup_tokenized_equity_derivative(&"tMSFT".parse().unwrap())
+            .lookup_derivative(&"tMSFT".parse().unwrap())
             .unwrap_err();
 
         assert!(
