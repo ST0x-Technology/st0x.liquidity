@@ -4,19 +4,8 @@
 
 ### Operational visibility and reliable wallet signing
 
-We are actively testing auto-rebalancing with cross-venue inventory transfers
-and currently rely on logs to understand system state. We need dashboard panels
-showing inventory snapshots and transfer lifecycle so operators can see what is
-happening without tailing logs. Separately, Fireblocks has been unreliable for
-onchain signing (high latency, outages), so we are adding Turnkey as an
-alternative wallet provider.
-
-These two goals touch disjoint code areas (Turnkey: evm crate only; dashboard:
-dto + main crate + dashboard frontend), so they proceed in parallel. Wiring
-Turnkey into the main crate config is deferred to last to avoid conflicts with
-dashboard work in the same crate.
-
-All branches stack on #355 (per-asset operations config).
+Stop relying on logs for rebalancing visibility, and add a reliable alternative
+to Fireblocks for onchain signing. All branches stack on #355.
 
 ```mermaid
 graph TD
@@ -32,9 +21,18 @@ graph TD
 
 #### Turnkey wallet (evm crate, independent)
 
+Fireblocks has been unreliable for production signing (30s+ latency, outages).
+Turnkey uses AWS Nitro enclaves for 50-100ms signing. Touches only the evm
+crate, so fully independent from dashboard work.
+
 - [ ] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
 
 #### Dashboard inventory & transfer monitoring
+
+We are actively testing cross-venue inventory transfers and need dashboard
+panels showing inventory snapshots, change history, and transfer lifecycle
+status. Touches dto + main crate + dashboard frontend -- disjoint from the
+Turnkey work above, so both proceed in parallel.
 
 - [ ] [#376 Review and update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/issues/376)
 - [ ] [#377 Dashboard backend: serve inventory history and transfer status via WebSocket](https://github.com/ST0x-Technology/st0x.liquidity/issues/377)
@@ -43,7 +41,13 @@ graph TD
 
 #### Wallet provider config (main crate, depends on Turnkey wallet)
 
+Wires Turnkey into the main crate config so operators can choose between Turnkey
+and Fireblocks. Deferred to last to avoid conflicts with dashboard work in the
+same crate.
+
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
+
+---
 
 ### Fireblocks Contract Calls
 
