@@ -357,18 +357,14 @@ mod tests {
 
     #[test]
     fn test_initiate_withdrawal_zero_amount() {
-        assert!(matches!(
-            Positive::new(Usdc(Decimal::ZERO)).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::ZERO
-        ));
+        let error = Positive::new(Usdc(Decimal::ZERO)).unwrap_err();
+        assert_eq!(error.value, Usdc(Decimal::ZERO));
     }
 
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
-        assert!(matches!(
-            Positive::new(Usdc(dec!(-100))).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == dec!(-100)
-        ));
+        let error = Positive::new(Usdc(Decimal::new(-100, 0))).unwrap_err();
+        assert_eq!(error.value, Usdc(Decimal::new(-100, 0)));
     }
 
     #[tokio::test]
