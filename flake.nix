@@ -77,6 +77,7 @@
             name = "butt";
             runtimeInputs = [ gitbutler-cli pkgs.gh pkgs.git pkgs.jq ];
             text = ''
+              set -x
               branch=""
               while [[ $# -gt 0 ]]; do
                 case $1 in
@@ -97,17 +98,17 @@
                 exit 1
               fi
 
-              echo "Propagating changes from $branch through the stack..."
+              if ! git diff --quiet || ! git diff --cached --quiet; then
+                echo "ERROR: working tree is dirty -- commit or stash changes first" >&2
+                exit 1
+              fi
 
               default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
                 | sed 's|refs/remotes/origin/||' || echo master)
 
               git fetch origin
-
-              echo "Tearing down GitButler..."
               but teardown || true
 
-              echo "Finding stacked branches..."
               chain=()
               current="$branch"
               while true; do
@@ -118,35 +119,22 @@
                 current="$child"
               done
 
-              if [[ ''${#chain[@]} -eq 0 ]]; then
-                echo "No stacked branches found on top of $branch."
-              else
-                echo "Stack: $branch -> ''${chain[*]}"
-              fi
-
               parent="origin/$branch"
               for child in "''${chain[@]}"; do
-                echo "Rebasing $child onto $parent..."
                 git checkout "$child"
                 if ! git rebase "$parent"; then
-                  echo ""
-                  echo "Rebase conflict in $child!"
-                  echo "Resolve conflicts, then run:"
+                  echo "Rebase conflict in $child. Resolve, then run:"
                   echo "  git rebase --continue"
                   echo "  git push --force-with-lease origin $child"
                   echo "  git checkout $default_branch && but setup"
                   exit 1
                 fi
-                echo "Pushing $child..."
                 git push --force-with-lease origin "$child"
                 parent="$child"
               done
 
-              echo "Setting up GitButler..."
               git checkout "$default_branch"
               but setup
-
-              echo "Done! All branches propagated."
             '';
           };
 
