@@ -6,9 +6,7 @@
 
 use alloy::primitives::U256;
 
-use st0x_execution::SharesBlockchain;
-
-use crate::shares::{FractionalShares, SharesConversionError};
+use crate::shares::{FractionalShares, SharesBlockchain, SharesConversionError};
 
 /// One unit in ratio representation (10^18).
 pub(crate) const RATIO_ONE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
