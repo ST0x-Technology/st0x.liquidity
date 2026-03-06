@@ -10,9 +10,10 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{Evm, OpenChainErrorRegistry, ReadOnlyEvm};
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
-    TimeInForce,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares,
+    SharesBlockchain, Symbol, TimeInForce,
 };
+use st0x_finance::Usdc;
 
 use super::TransferDirection;
 use crate::alpaca_wallet::AlpacaWalletService;
@@ -24,7 +25,6 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::CrossVenueCashTransfer;
-use crate::threshold::Usdc;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
@@ -548,6 +548,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use st0x_finance::Usdc;
 
     use super::*;
     use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
@@ -649,7 +650,7 @@ mod tests {
     async fn test_transfer_usdc_requires_alpaca_broker() {
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -672,7 +673,7 @@ mod tests {
     async fn test_transfer_usdc_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -695,7 +696,7 @@ mod tests {
     async fn test_transfer_usdc_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         transfer_usdc_command(

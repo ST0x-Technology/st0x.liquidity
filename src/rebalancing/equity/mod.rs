@@ -19,7 +19,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
-use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
+use st0x_execution::{FractionalShares, SharesBlockchain, SharesConversionError, Symbol};
 
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::equity_redemption::{

@@ -1600,8 +1600,10 @@ mod tests {
     use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
+    use st0x_finance::Usdc;
+
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
-    use crate::threshold::{ExecutionThreshold, Usdc};
+    use crate::threshold::ExecutionThreshold;
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
@@ -3376,7 +3378,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 symbol,
                 Inventory::available(
@@ -3510,7 +3512,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3598,7 +3600,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(Decimal::ZERO), Usdc(Decimal::ZERO))
+            .with_usdc(Usdc::new(Decimal::ZERO), Usdc::new(Decimal::ZERO))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3620,12 +3622,12 @@ mod tests {
             )
             .unwrap()
             .update_usdc(
-                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc(dec!(50))),
+                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc::new(dec!(50))),
                 chrono::Utc::now(),
             )
             .unwrap()
             .update_usdc(
-                Inventory::available(Venue::Hedging, Operator::Add, Usdc(dec!(50))),
+                Inventory::available(Venue::Hedging, Operator::Add, Usdc::new(dec!(50))),
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -3735,7 +3737,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(

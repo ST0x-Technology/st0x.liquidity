@@ -24,6 +24,7 @@ use st0x_event_sorcery::{Store, StoreBuilder, test_store};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
+use st0x_finance::Usdc;
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
@@ -41,7 +42,7 @@ use crate::rebalancing::{
     Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation,
 };
 use crate::test_utils::setup_test_db;
-use crate::threshold::{ExecutionThreshold, Usdc};
+use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::tests::{
     TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
@@ -161,7 +162,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000))),
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000))),
     ));
     let (sender, receiver) = mpsc::channel(10);
 
@@ -808,8 +809,8 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,
-        onchain: Usdc(dec!(100)),
-        offchain: Usdc(dec!(900)),
+        onchain: Usdc::new(dec!(100)),
+        offchain: Usdc::new(dec!(900)),
     })
     .await;
 
@@ -859,7 +860,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         .expect("Expected a captured call");
     assert_eq!(
         call.amount,
-        Usdc(dec!(400)),
+        Usdc::new(dec!(400)),
         "Expected excess of $400 (target $500 - actual $100)"
     );
 
@@ -883,8 +884,8 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,
-        onchain: Usdc(dec!(900)),
-        offchain: Usdc(dec!(100)),
+        onchain: Usdc::new(dec!(900)),
+        offchain: Usdc::new(dec!(100)),
     })
     .await;
 
@@ -932,7 +933,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         .expect("Expected a captured call");
     assert_eq!(
         call.amount,
-        Usdc(dec!(400)),
+        Usdc::new(dec!(400)),
         "Expected excess of $400 (actual $900 - target $500)"
     );
 
@@ -1087,9 +1088,23 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     // 50 onchain, 950 offchain = 5% ratio -> TooMuchOffchain
     // Excess to reach 50% target = 500 - 50 = 450 USDC
     let inventory = Arc::new(RwLock::new(
-        InventoryView::default().with_usdc(Usdc(dec!(50)), Usdc(dec!(950))),
+        InventoryView::default().with_usdc(Usdc::new(dec!(50)), Usdc::new(dec!(950))),
     ));
 
+<<<<<<< ours
+<<<<<<< ours
+    let assets = AssetsConfig {
+        equities: EquitiesConfig::default(),
+        cash: Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+        }),
+||||||| ancestor
+    let limits = OperationalLimits::Enabled {
+        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+=======
     let assets = AssetsConfig {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
@@ -1097,6 +1112,20 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
         }),
+>>>>>>> theirs
+||||||| ancestor
+    let limits = OperationalLimits::Enabled {
+        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+=======
+    let assets = AssetsConfig {
+        equities: EquitiesConfig::default(),
+        cash: Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
+        }),
+>>>>>>> theirs
     };
 
     let config = RebalancingTriggerConfig {
@@ -1131,7 +1160,11 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let op1 = receiver.try_recv().expect("First trigger should fire");
     match op1 {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(amount, Usdc(dec!(100)), "First transfer capped to $100");
+            assert_eq!(
+                amount,
+                Usdc::new(dec!(100)),
+                "First transfer capped to $100"
+            );
         }
         _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
     }
@@ -1142,7 +1175,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc(dec!(150)), Usdc(dec!(850)));
+        *guard = taken.with_usdc(Usdc::new(dec!(150)), Usdc::new(dec!(850)));
     }
 
     // Cycle 2: excess = 350, capped to 100
@@ -1150,7 +1183,11 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let op2 = receiver.try_recv().expect("Second trigger should fire");
     match op2 {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(amount, Usdc(dec!(100)), "Second transfer capped to $100");
+            assert_eq!(
+                amount,
+                Usdc::new(dec!(100)),
+                "Second transfer capped to $100"
+            );
         }
         _ => panic!("Expected UsdcAlpacaToBase, got {op2:?}"),
     }
@@ -1161,7 +1198,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc(dec!(250)), Usdc(dec!(750)));
+        *guard = taken.with_usdc(Usdc::new(dec!(250)), Usdc::new(dec!(750)));
     }
 
     // Cycle 3: excess = 250, capped to 100
@@ -1169,7 +1206,11 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let op3 = receiver.try_recv().expect("Third trigger should fire");
     match op3 {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(amount, Usdc(dec!(100)), "Third transfer capped to $100");
+            assert_eq!(
+                amount,
+                Usdc::new(dec!(100)),
+                "Third transfer capped to $100"
+            );
         }
         _ => panic!("Expected UsdcAlpacaToBase, got {op3:?}"),
     }
@@ -1180,7 +1221,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc(dec!(350)), Usdc(dec!(650)));
+        *guard = taken.with_usdc(Usdc::new(dec!(350)), Usdc::new(dec!(650)));
     }
 
     trigger.check_and_trigger_usdc().await;
@@ -1203,9 +1244,23 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
 
     // Large imbalance: 100 onchain, 900 offchain
     let inventory = Arc::new(RwLock::new(
-        InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(900))),
+        InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(900))),
     ));
 
+<<<<<<< ours
+<<<<<<< ours
+    let assets = AssetsConfig {
+        equities: EquitiesConfig::default(),
+        cash: Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+        }),
+||||||| ancestor
+    let limits = OperationalLimits::Enabled {
+        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+=======
     let assets = AssetsConfig {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
@@ -1213,6 +1268,20 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
         }),
+>>>>>>> theirs
+||||||| ancestor
+    let limits = OperationalLimits::Enabled {
+        max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+        max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+=======
+    let assets = AssetsConfig {
+        equities: EquitiesConfig::default(),
+        cash: Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
+        }),
+>>>>>>> theirs
     };
     let config = RebalancingTriggerConfig {
         equity: ImbalanceThreshold {
@@ -1248,7 +1317,11 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         .expect("First trigger should produce an operation");
     match op1 {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(amount, Usdc(dec!(100)), "First transfer capped to $100");
+            assert_eq!(
+                amount,
+                Usdc::new(dec!(100)),
+                "First transfer capped to $100"
+            );
         }
         _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
     }
@@ -1275,7 +1348,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
             assert_eq!(
                 amount,
-                Usdc(dec!(100)),
+                Usdc::new(dec!(100)),
                 "Retry transfer also capped to $100"
             );
         }
@@ -1301,8 +1374,8 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
         build_imbalanced_inventory(Imbalance::Usdc {
             inventory: &inventory,
-            onchain: Usdc(dec!(350)),
-            offchain: Usdc(dec!(650)),
+            onchain: Usdc::new(dec!(350)),
+            offchain: Usdc::new(dec!(650)),
         })
         .await;
 
@@ -1352,8 +1425,8 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
         build_imbalanced_inventory(Imbalance::Usdc {
             inventory: &inventory,
-            onchain: Usdc(dec!(350)),
-            offchain: Usdc(dec!(650)),
+            onchain: Usdc::new(dec!(350)),
+            offchain: Usdc::new(dec!(650)),
         })
         .await;
 
@@ -1397,7 +1470,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TriggeredOperation::UsdcAlpacaToBase { amount } => {
                 assert_eq!(
                     amount,
-                    Usdc(dec!(150)),
+                    Usdc::new(dec!(150)),
                     "Excess should be $150 (target $500 - actual $350)"
                 );
             }

@@ -8,10 +8,11 @@ use thiserror::Error;
 
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::OpenChainErrorRegistry;
+use st0x_finance::Usdc;
 
 use crate::config::Ctx;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::threshold::Usdc;
+use crate::threshold::UsdcBlockchain;
 use crate::vault_registry::VaultRegistry;
 
 pub(super) struct Deposit {
@@ -155,6 +156,8 @@ mod tests {
     use std::str::FromStr;
     use url::Url;
 
+    use st0x_finance::Usdc;
+
     use super::*;
     use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
@@ -221,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = vault_withdraw_command(
@@ -269,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("250.25").unwrap());
+        let amount = Usdc::new(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
         vault_withdraw_command(

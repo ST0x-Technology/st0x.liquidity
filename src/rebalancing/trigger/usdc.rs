@@ -7,14 +7,16 @@ use rust_decimal::Decimal;
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
+use st0x_finance::Usdc;
+
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
-use crate::threshold::Usdc;
 
 /// Minimum USDC amount for Alpaca withdrawals.
 /// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~17bps observed in live tests),
 /// we use $51 to ensure we always meet the minimum after conversion slippage.
-pub(crate) const ALPACA_MINIMUM_WITHDRAWAL: Usdc = Usdc(Decimal::from_parts(51, 0, 0, false, 0));
+pub(crate) const ALPACA_MINIMUM_WITHDRAWAL: Usdc =
+    Usdc::new(Decimal::from_parts(51, 0, 0, false, 0));
 
 /// Why a USDC trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,8 +90,8 @@ pub(super) async fn check_imbalance_and_build_operation(
     match imbalance {
         Imbalance::TooMuchOffchain { excess } if excess < ALPACA_MINIMUM_WITHDRAWAL => {
             debug!(
-                excess = %excess.0,
-                minimum = %ALPACA_MINIMUM_WITHDRAWAL.0,
+                excess = %excess.inner(),
+                minimum = %ALPACA_MINIMUM_WITHDRAWAL.inner(),
                 "USDC imbalance below Alpaca minimum withdrawal, skipping"
             );
             Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess })
@@ -110,8 +112,8 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
 
     if amount > cap {
         warn!(
-            computed = %amount.0,
-            limit = %cap.0,
+            computed = %amount.inner(),
+            limit = %cap.inner(),
             "USDC rebalancing amount capped by operational limit"
         );
         cap
@@ -179,7 +181,7 @@ mod tests {
     fn alpaca_minimum_withdrawal_is_51_usdc() {
         assert_eq!(
             ALPACA_MINIMUM_WITHDRAWAL,
-            Usdc(dec!(51)),
+            Usdc::new(dec!(51)),
             "Alpaca minimum withdrawal should be $51 to account for ~17bps USDC/USD spread"
         );
     }
@@ -188,7 +190,8 @@ mod tests {
     async fn test_excess_below_minimum_returns_below_minimum_withdrawal() {
         // 90 offchain, 10 onchain = 90% offchain
         // Excess to reach 50% target = 90 - 50 = 40 USDC (below $51 minimum)
-        let inventory = InventoryView::default().with_usdc(Usdc(dec!(10)), Usdc(dec!(90)));
+        let inventory =
+            InventoryView::default().with_usdc(Usdc::new(dec!(10)), Usdc::new(dec!(90)));
 
         let inventory = Arc::new(RwLock::new(inventory));
         let threshold = ImbalanceThreshold {
@@ -199,7 +202,7 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
 
         assert!(
-            matches!(result, Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess }) if excess.0 < dec!(51)),
+            matches!(result, Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess }) if excess.inner() < dec!(51)),
             "Expected BelowMinimumWithdrawal, got {result:?}"
         );
     }
@@ -208,7 +211,8 @@ mod tests {
     async fn test_excess_above_minimum_triggers_alpaca_to_base() {
         // 500 offchain, 100 onchain = 83% offchain
         // To reach 50% target: need 300 each, so excess = 500 - 300 = 200 USDC
-        let inventory = InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(500)));
+        let inventory =
+            InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500)));
 
         let inventory = Arc::new(RwLock::new(inventory));
         let threshold = ImbalanceThreshold {
@@ -219,7 +223,7 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount.0 >= dec!(51)),
+            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount.inner() >= dec!(51)),
             "Expected UsdcAlpacaToBase with amount >= 51, got {result:?}"
         );
     }
@@ -229,7 +233,8 @@ mod tests {
         // Edge case: excess is exactly $51
         // Total = 102, target = 51 each
         // If offchain = 102, onchain = 0, excess = 102 - 51 = 51
-        let inventory = InventoryView::default().with_usdc(Usdc(dec!(0)), Usdc(dec!(102)));
+        let inventory =
+            InventoryView::default().with_usdc(Usdc::new(dec!(0)), Usdc::new(dec!(102)));
 
         let inventory = Arc::new(RwLock::new(inventory));
         let threshold = ImbalanceThreshold {
@@ -240,7 +245,7 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc(dec!(51))),
+            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(dec!(51))),
             "Expected UsdcAlpacaToBase with amount = 51, got {result:?}"
         );
     }
@@ -251,7 +256,8 @@ mod tests {
         // Deposits have no minimum restriction (verified in production at 0.01 USDC).
         // 10 offchain, 90 onchain = 10% offchain (below 30% lower bound)
         // Excess = 90 - 50 = 40 USDC (would be below withdrawal minimum, but deposits are fine)
-        let inventory = InventoryView::default().with_usdc(Usdc(dec!(90)), Usdc(dec!(10)));
+        let inventory =
+            InventoryView::default().with_usdc(Usdc::new(dec!(90)), Usdc::new(dec!(10)));
 
         let inventory = Arc::new(RwLock::new(inventory));
         let threshold = ImbalanceThreshold {
@@ -262,25 +268,44 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc(dec!(40))),
+            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc::new(dec!(40))),
             "Expected UsdcBaseToAlpaca with amount = 40 (no minimum for deposits), got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn operational_limits_cap_usdc_amount() {
-        let inventory = InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(500)));
+        let inventory =
+            InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500)));
         let inventory = Arc::new(RwLock::new(inventory));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+<<<<<<< ours
+<<<<<<< ours
+        let usdc_limit = Some(Usdc::new(dec!(100)));
+||||||| ancestor
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+        };
+=======
         let usdc_limit = Some(Usdc(dec!(100)));
+>>>>>>> theirs
+||||||| ancestor
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+        };
+=======
+        let usdc_limit = Some(Usdc(dec!(100)));
+>>>>>>> theirs
 
         let result = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc(dec!(100))),
+            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(dec!(100))),
             "Operational limit should cap USDC transfer to 100, got {result:?}"
         );
     }
@@ -291,23 +316,41 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+<<<<<<< ours
+<<<<<<< ours
+        let usdc_limit = Some(Usdc::new(dec!(100)));
+||||||| ancestor
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+        };
+=======
         let usdc_limit = Some(Usdc(dec!(100)));
+>>>>>>> theirs
+||||||| ancestor
+        let limits = OperationalLimits::Enabled {
+            max_shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            max_amount: Positive::new(Usdc(dec!(100))).unwrap(),
+        };
+=======
+        let usdc_limit = Some(Usdc(dec!(100)));
+>>>>>>> theirs
 
         // 100 onchain / 500 offchain -> 83% offchain, excess = 200
         let inventory = Arc::new(RwLock::new(
-            InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(500))),
+            InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500))),
         ));
 
         let first = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
         assert!(
-            matches!(first, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc(dec!(100))),
+            matches!(first, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(dec!(100))),
             "First transfer capped to 100, got {first:?}"
         );
 
         // After transferring 100: 200 onchain / 400 offchain -> 67% offchain
         // Still above 70% threshold? No — 400/600 = 66.7%, within 30%-70%. No trigger.
         let after_first = Arc::new(RwLock::new(
-            InventoryView::default().with_usdc(Usdc(dec!(200)), Usdc(dec!(400))),
+            InventoryView::default().with_usdc(Usdc::new(dec!(200)), Usdc::new(dec!(400))),
         ));
 
         let second =
@@ -321,13 +364,13 @@ mod tests {
         // But if only 50 was transferred: 150 onchain / 450 offchain -> 75% offchain
         // Still above 70%, so triggers again
         let partially_resolved = Arc::new(RwLock::new(
-            InventoryView::default().with_usdc(Usdc(dec!(150)), Usdc(dec!(450))),
+            InventoryView::default().with_usdc(Usdc::new(dec!(150)), Usdc::new(dec!(450))),
         ));
 
         let third =
             check_imbalance_and_build_operation(&threshold, &partially_resolved, usdc_limit).await;
         assert!(
-            matches!(third, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc(dec!(100))),
+            matches!(third, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(dec!(100))),
             "Remaining imbalance triggers another capped transfer, got {third:?}"
         );
     }
