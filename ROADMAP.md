@@ -10,7 +10,7 @@ to Fireblocks for onchain signing. All branches stack on #355.
 
 ```mermaid
 graph TD
-    A["#355 per-asset-operations-config"] --> B["#381 roadmap update"]
+    A["#355 per-asset-operations-config"] --> B["#386 roadmap update"]
     B --> C["#354 Turnkey wallet<br/>(evm crate)"]
     B --> D["#376 DTO schema update"]
     D --> F["#377 dashboard backend"]
