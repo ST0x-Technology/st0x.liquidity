@@ -27,11 +27,9 @@ Fireblocks has been unreliable for production signing (30s+ latency, outages).
 Turnkey uses AWS Nitro enclaves for 50-100ms signing. Touches only the evm
 crate, so fully independent from dashboard work.
 
-- [ ] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
-  - Draft reference:
-    [#356 replace Fireblocks with Turnkey for onchain signing](https://github.com/ST0x-Technology/st0x.liquidity/pull/356)
-    (WIP with intentional design decisions -- use as inspiration for #354 and
-    #380)
+- [x] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
+  - PR:
+    [#385 add TurnkeyWallet to st0x-evm crate](https://github.com/ST0x-Technology/st0x.liquidity/pull/385)
 
 ### Dashboard inventory & transfer monitoring
 
@@ -83,9 +81,6 @@ Everything below has not been organized into epics yet.
 - [ ] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
   - PR (draft):
     [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
-- [ ] [#353 Per-asset operations config: independent trading/rebalancing toggles, vault IDs, operational limits](https://github.com/ST0x-Technology/st0x.liquidity/issues/353)
-  - PR:
-    [#355 per-asset operations config: independent trading/rebalancing toggles](https://github.com/ST0x-Technology/st0x.liquidity/pull/355)
 
 #### Wrapped Token Handling
 
