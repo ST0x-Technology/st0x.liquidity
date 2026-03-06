@@ -73,8 +73,85 @@
             inherit (pkgs) sqlx-cli;
             sol-build-inputs = rainix.sol-build-inputs.${system};
           };
+          butt = pkgs.writeShellApplication {
+            name = "butt";
+            runtimeInputs = [ gitbutler-cli pkgs.gh pkgs.git pkgs.jq ];
+            text = ''
+              branch=""
+              while [[ $# -gt 0 ]]; do
+                case $1 in
+                  -b|--branch) branch="$2"; shift 2 ;;
+                  -p|--pr)
+                    branch=$(gh pr view "$2" --json headRefName -q .headRefName)
+                    shift 2
+                    ;;
+                  *)
+                    echo "Usage: butt (-b BRANCH | -p PR_NUMBER)" >&2
+                    exit 1
+                    ;;
+                esac
+              done
+
+              if [[ -z "$branch" ]]; then
+                echo "Usage: butt (-b BRANCH | -p PR_NUMBER)" >&2
+                exit 1
+              fi
+
+              echo "Propagating changes from $branch through the stack..."
+
+              default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+                | sed 's|refs/remotes/origin/||' || echo master)
+
+              git fetch origin
+
+              echo "Tearing down GitButler..."
+              but teardown || true
+
+              echo "Finding stacked branches..."
+              chain=()
+              current="$branch"
+              while true; do
+                child=$(gh pr list --base "$current" --state open \
+                  --json headRefName -q '.[0].headRefName // empty')
+                if [[ -z "$child" ]]; then break; fi
+                chain+=("$child")
+                current="$child"
+              done
+
+              if [[ ''${#chain[@]} -eq 0 ]]; then
+                echo "No stacked branches found on top of $branch."
+              else
+                echo "Stack: $branch -> ''${chain[*]}"
+              fi
+
+              parent="origin/$branch"
+              for child in "''${chain[@]}"; do
+                echo "Rebasing $child onto $parent..."
+                git checkout "$child"
+                if ! git rebase "$parent"; then
+                  echo ""
+                  echo "Rebase conflict in $child!"
+                  echo "Resolve conflicts, then run:"
+                  echo "  git rebase --continue"
+                  echo "  git push --force-with-lease origin $child"
+                  echo "  git checkout $default_branch && but setup"
+                  exit 1
+                fi
+                echo "Pushing $child..."
+                git push --force-with-lease origin "$child"
+                parent="$child"
+              done
+
+              echo "Setting up GitButler..."
+              git checkout "$default_branch"
+              but setup
+
+              echo "Done! All branches propagated."
+            '';
+          };
+
         in rainixPkgs // deployPkgs // {
-          inherit gitbutler-cli;
+          inherit gitbutler-cli butt;
           inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
           st0x-dto = st0xRust.dto;
@@ -215,6 +292,7 @@
               packages.ci
               packages.prepSolArtifacts
               packages.remote
+              packages.butt
               packages.deployNixos
               packages.deployService
               packages.deployAll
