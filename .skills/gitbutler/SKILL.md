@@ -158,6 +158,11 @@ For chained PRs, include the caution block at the top of the PR body:
   hooks) by default. When you do use amend, run `prek run --all-files` (prek is
   the project's pre-commit/format runner, installed by git-hooks.nix) and amend
   any formatting fixes before pushing.
+- **Forge authentication required for PRs.** `but pr new` requires GitHub
+  authentication via `but config forge auth`, which opens a browser popup.
+  Before the first `but pr new` in a session, warn the user that a browser auth
+  popup will appear so they aren't surprised. If auth fails, the user must run
+  `but config forge auth` manually.
 - For deeper command syntax and flags, use `references/reference.md`.
 - For workspace model and dependency behavior, use `references/concepts.md`.
 - For end-to-end workflow patterns, use `references/examples.md`.
