@@ -148,10 +148,10 @@ This project uses a Cargo workspace with:
 ### Building & Running
 
 **CRITICAL: NEVER use `cargo build` for verification.** It's slower than
-`cargo check` and less useful than `cargo test` or `cargo clippy`. Use:
+`cargo check` and less useful than `cargo nextest run` or `cargo clippy`. Use:
 
 - `cargo check` for fast compilation verification
-- `cargo test` for verification with test coverage
+- `cargo nextest run` for verification with test coverage
 - `cargo clippy` for verification with linting
 
 Only use `cargo build` when you actually need the build artifacts (e.g., final
@@ -167,11 +167,12 @@ binary).
 
 ### Testing
 
-- `cargo test --workspace -q` - Run all tests (both main and execution crates)
-- `cargo test -q --lib` - Run library tests only
-- `cargo test -p st0x-execution -q` - Run execution crate tests only
-- `cargo test -p st0x-hedge -q` - Run main crate tests only
-- `cargo test -q <test_name>` - Run specific test
+- `cargo nextest run --workspace` - Run all tests (both main and execution
+  crates)
+- `cargo nextest run --lib` - Run library tests only
+- `cargo nextest run -p st0x-execution` - Run execution crate tests only
+- `cargo nextest run -p st0x-hedge` - Run main crate tests only
+- `cargo nextest run <test_name>` - Run specific test
 
 ### Database Management
 
@@ -577,7 +578,7 @@ assignments is useless; test actual behavior like
   only documentation/markdown files were changed). Run them in this order to
   fail fast:
   1. `cargo check` - fastest, catches compilation errors first
-  2. `cargo test --workspace -q` - only run after check passes
+  2. `cargo nextest run --workspace` - only run after check passes
   3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
@@ -585,8 +586,8 @@ assignments is useless; test actual behavior like
 - **CRITICAL: Do NOT run clippy until ALL substantive work is done.** Clippy is
   a polish step. Running it while tasks remain open is wasted effort -
   subsequent code changes will introduce new lint issues. Complete every task on
-  the list first (`cargo check` + `cargo test` passing), then run clippy as a
-  final pass before handing over.
+  the list first (`cargo check` + `cargo nextest run` passing), then run clippy
+  as a final pass before handing over.
 
 #### CRITICAL: Quality Control Policy
 

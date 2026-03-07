@@ -118,7 +118,7 @@ enum BrokerSecrets {
 /// `Standalone`: order_owner comes from config, no rebalancing.
 /// `Rebalancing`: order_owner resolved from Fireblocks at runtime.
 #[derive(Clone, Debug)]
-pub(crate) enum TradingMode {
+pub enum TradingMode {
     Standalone { order_owner: Address },
     Rebalancing(Box<RebalancingCtx>),
 }
@@ -485,6 +485,53 @@ impl Ctx {
         self.equities
             .get(symbol)
             .is_none_or(|equity| equity.enabled)
+    }
+}
+
+/// Test-only constructor for `Ctx` that internalizes fields e2e tests
+/// don't need to control (log level, operational limits, EVM wrapping,
+/// polling intervals). This keeps `Ctx` fields `pub(crate)` while
+/// providing a stable construction API for the e2e test crate.
+#[cfg(any(test, feature = "test-support"))]
+#[bon::bon]
+impl Ctx {
+    #[builder]
+    pub fn for_test(
+        database_url: String,
+        ws_rpc_url: Url,
+        orderbook: Address,
+        deployment_block: u64,
+        broker: BrokerCtx,
+        trading_mode: TradingMode,
+        #[builder(default)] equities: HashMap<Symbol, EquityTokenAddresses>,
+        #[builder(default = 2)] inventory_poll_interval: u64,
+        execution_threshold_override: Option<ExecutionThreshold>,
+    ) -> Result<Self, CtxError> {
+        let execution_threshold = match execution_threshold_override {
+            Some(threshold) => threshold,
+            None => broker.execution_threshold()?,
+        };
+
+        Ok(Self {
+            database_url,
+            log_level: LogLevel::Debug,
+            server_port: 0,
+            operational_limits: OperationalLimits::Disabled,
+            evm: EvmCtx {
+                ws_rpc_url,
+                orderbook,
+                deployment_block,
+            },
+            order_polling_interval: 1,
+            order_polling_max_jitter: 0,
+            position_check_interval: 2,
+            inventory_poll_interval,
+            broker,
+            telemetry: None,
+            trading_mode,
+            execution_threshold,
+            equities,
+        })
     }
 }
 

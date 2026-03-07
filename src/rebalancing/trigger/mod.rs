@@ -82,7 +82,7 @@ pub enum RebalancingCtxError {
 /// USDC rebalancing configuration with explicit enable/disable.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
-pub(crate) enum UsdcRebalancing {
+pub enum UsdcRebalancing {
     Enabled { target: Decimal, deviation: Decimal },
     Disabled,
 }
@@ -121,7 +121,7 @@ pub(crate) struct RebalancingConfig {
 /// Read-only provider access for either chain is available via
 /// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
-pub(crate) struct RebalancingCtx {
+pub struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     /// Issuer's wallet for tokenized equity redemptions.
@@ -233,12 +233,16 @@ impl RebalancingCtx {
     pub(crate) fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.ethereum_wallet
     }
+}
 
+#[cfg(test)]
+#[bon::bon]
+impl RebalancingCtx {
     /// Test constructor that creates a `RebalancingCtx` with stub wallets.
     ///
     /// The wallets panic on `send` -- use only in tests that don't submit
     /// transactions through the rebalancing wallet.
-    #[cfg(test)]
+    #[builder]
     pub(crate) fn stub(
         equity: ImbalanceThreshold,
         usdc: UsdcRebalancing,
@@ -263,6 +267,57 @@ impl RebalancingCtx {
             #[cfg(feature = "test-support")]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[bon::bon]
+impl RebalancingCtx {
+    /// Test constructor that accepts pre-built wallets for e2e tests
+    /// that need real onchain interaction (e.g. with Anvil forks).
+    #[builder]
+    pub fn with_wallets(
+        equity: ImbalanceThreshold,
+        usdc: UsdcRebalancing,
+        redemption_wallet: Address,
+        usdc_vault_id: B256,
+        alpaca_broker_auth: AlpacaBrokerApiCtx,
+        base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        Self {
+            equity,
+            usdc,
+            redemption_wallet,
+            usdc_vault_id,
+            alpaca_broker_auth,
+            base_wallet,
+            ethereum_wallet,
+            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+        }
+    }
+
+    /// Sets the Circle API base URL override (for e2e tests with local
+    /// CCTP contracts and a mock attestation server).
+    #[must_use]
+    pub fn with_circle_api_base(mut self, base_url: String) -> Self {
+        self.circle_api_base = base_url;
+        self
+    }
+
+    /// Sets the CCTP contract address overrides (for e2e tests with
+    /// locally deployed CCTP contracts).
+    #[must_use]
+    pub fn with_cctp_addresses(
+        mut self,
+        token_messenger: Address,
+        message_transmitter: Address,
+    ) -> Self {
+        self.token_messenger = token_messenger;
+        self.message_transmitter = message_transmitter;
+        self
     }
 }
 

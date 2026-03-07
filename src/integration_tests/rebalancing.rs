@@ -484,7 +484,6 @@ async fn equity_offchain_imbalance_triggers_mint() {
     mint_mock.assert();
     poll_mock.assert();
 
-    // Extract the mint aggregate_id (UUID assigned by the rebalancer at runtime).
     let events = fetch_events(&pool).await;
     let mint_agg_id = events
         .iter()
@@ -556,7 +555,6 @@ async fn equity_offchain_imbalance_triggers_mint() {
     )
     .await;
 
-    // Verify event payloads capture the correct data from the API interaction
     let mint_requested = &events[6].payload["MintRequested"];
     assert_eq!(
         mint_requested["symbol"].as_str().unwrap(),
@@ -837,13 +835,11 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         receiver,
     );
 
-    // Trigger detects the USDC imbalance and sends a UsdcAlpacaToBase operation.
     trigger.check_and_trigger_usdc().await;
 
     // Close the channel so the rebalancer exits after processing.
     drop(trigger);
 
-    // Rebalancer receives the operation and dispatches to MockUsdcRebalance.
     rebalancer.run().await;
 
     assert_eq!(
@@ -912,7 +908,6 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         receiver,
     );
 
-    // Trigger detects the USDC onchain imbalance and sends a UsdcBaseToAlpaca operation.
     trigger.check_and_trigger_usdc().await;
 
     drop(trigger);
@@ -977,7 +972,6 @@ async fn mint_api_failure_produces_rejected_event() {
     let equity_transfer =
         build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, MockWrapper::new());
 
-    // Mock returns HTTP 500 for the mint request
     let mint_mock = server.mock(|when, then| {
         when.method(POST).path(tokenization_mint_path());
         then.status(500).body("Internal Server Error");
@@ -1063,7 +1057,6 @@ async fn mint_api_failure_produces_rejected_event() {
     )
     .await;
 
-    // Verify no mint events were emitted (the aggregate returned an error)
     let events = fetch_events(&pool).await;
     assert!(
         !events
