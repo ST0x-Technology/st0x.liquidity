@@ -692,10 +692,13 @@ Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 ### Code style
 
-#### ASCII only in code
+#### ASCII in code, unicode in user-facing output
 
-Use ASCII characters only in code and comments. For arrows, use `->` not `->`.
+Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
 Unicode breaks vim navigation and grep workflows.
+
+In user-facing output (GUI templates, CLI display, rendered text), prefer
+unicode characters (`←`, `→`, `·`, etc.) for readability and polish.
 
 #### No single-letter variables or arguments
 
