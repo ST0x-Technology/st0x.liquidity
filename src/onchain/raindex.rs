@@ -453,11 +453,12 @@ mod tests {
             let base_provider = ProviderBuilder::new().connect_http(endpoint.parse()?);
             let wallet = RawPrivateKeyWallet::new(&private_key, base_provider, 1)?;
 
-            Self::deploy_tofu_decimals(wallet.provider()).await?;
+            Self::deploy_tofu_decimals(wallet.signing_provider()).await?;
 
-            let orderbook_address = Self::deploy_orderbook(wallet.provider()).await?;
+            let orderbook_address = Self::deploy_orderbook(wallet.signing_provider()).await?;
 
-            let token_address = Self::deploy_token(wallet.provider(), wallet.address()).await?;
+            let token_address =
+                Self::deploy_token(wallet.signing_provider(), wallet.address()).await?;
 
             Ok(Self {
                 anvil,
@@ -512,7 +513,7 @@ mod tests {
             spender: Address,
             amount: U256,
         ) -> Result<(), LocalEvmError> {
-            let token_contract = TestERC20::new(token, self.wallet.provider());
+            let token_contract = TestERC20::new(token, self.wallet.signing_provider());
 
             token_contract
                 .approve(spender, amount)

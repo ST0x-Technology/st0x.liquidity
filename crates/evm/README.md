@@ -14,38 +14,35 @@ from "how to sign and submit" (key management, owned by this crate).
 
 ## Implementations
 
-### `FireblocksWallet`
-
-Wraps the Fireblocks SDK client. Builds a `CONTRACT_CALL` transaction request,
-submits it to the Fireblocks API, polls for completion, and fetches the receipt
-from a read-only RPC provider. Uses MPC-based key management -- the private key
-never exists in a single location.
-
 ### `TurnkeyWallet`
 
-Wraps `alloy-signer-turnkey` to sign transactions via the Turnkey API. Key
-material is managed by Turnkey's secure infrastructure. Enabled behind the
-`turnkey` feature flag.
+Wraps `alloy-signer-turnkey` to sign transactions via Turnkey's AWS Nitro secure
+enclaves. Low-latency signing (50-100ms). Enabled behind the `turnkey` feature
+flag.
 
 ### `RawPrivateKeyWallet`
 
-Wraps an alloy provider with an embedded `EthereumWallet` for anvil-based
-testing.
+Signs locally with a raw private key. Wraps an alloy provider with an embedded
+`EthereumWallet`. Enabled behind the `local-signer` feature flag.
 
 ## Configuration
 
-Fireblocks credentials live in the encrypted secrets file. The main crate's
-`RebalancingConfig` / `RebalancingSecrets` are responsible for parsing TOML and
-assembling a `FireblocksCtx`, which is this crate's public construction
-interface (per `docs/domain.md`).
+The wallet backend is selected at compile time via cargo features on the main
+crate (`wallet-turnkey` or `wallet-private-key`). Wallet credentials live in the
+main crate's `RebalancingConfig` / `RebalancingSecrets` TOML sections under
+`[rebalancing.wallet]`.
 
-| Field                         | Location | Description                                    |
-| ----------------------------- | -------- | ---------------------------------------------- |
-| `fireblocks_api_user_id`      | config   | Fireblocks API user identifier                 |
-| `fireblocks_secret_path`      | secrets  | Path to RSA private key for API authentication |
-| `fireblocks_vault_account_id` | config   | Vault account containing the signing key       |
-| `fireblocks_chain_asset_ids`  | config   | Mapping of chain IDs to Fireblocks asset IDs   |
-| `fireblocks_environment`      | config   | `production` or `sandbox`                      |
+### Turnkey (`wallet-turnkey`)
 
-The market maker wallet address is derived from the Fireblocks vault account at
-startup via the Fireblocks API.
+| Field             | Location | Description                       |
+| ----------------- | -------- | --------------------------------- |
+| `address`         | config   | Wallet address on both chains     |
+| `organization_id` | config   | Turnkey organization identifier   |
+| `api_private_key` | secrets  | Hex-encoded P-256 API private key |
+
+### Raw private key (`wallet-private-key`)
+
+| Field         | Location | Description                       |
+| ------------- | -------- | --------------------------------- |
+| `address`     | config   | Wallet address on both chains     |
+| `private_key` | secrets  | Raw EVM private key (hex-encoded) |

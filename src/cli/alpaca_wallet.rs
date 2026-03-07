@@ -77,7 +77,7 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
         anyhow::bail!("Insufficient USDC balance: have {balance}, need {amount_u256}");
     }
 
-    writeln!(stdout, "   Sending USDC transfer via Fireblocks...")?;
+    writeln!(stdout, "   Sending USDC transfer...")?;
     let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
     let tx_receipt = ethereum_wallet
         .submit::<Registry, _>(
