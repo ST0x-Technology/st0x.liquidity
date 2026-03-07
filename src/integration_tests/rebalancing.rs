@@ -18,7 +18,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{broadcast, mpsc};
 
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
 use st0x_execution::{
@@ -30,7 +30,7 @@ use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
 use crate::config::{AssetsConfig, CashAssetConfig, EquitiesConfig, OperationMode};
 use crate::equity_redemption::EquityRedemption;
-use crate::inventory::{ImbalanceThreshold, InventoryView};
+use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView};
 use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::onchain::mock::MockRaindex;
 use crate::onchain::raindex::Raindex;
@@ -155,7 +155,8 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
     let symbol = Symbol::new("AAPL").unwrap();
     let aggregate_id = symbol.to_string();
 
-    let inventory = Arc::new(RwLock::new(
+    let (inventory_sender, _) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default()
             .with_equity(
                 symbol.clone(),
@@ -163,6 +164,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
                 FractionalShares::ZERO,
             )
             .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000))),
+        inventory_sender,
     ));
     let (sender, receiver) = mpsc::channel(10);
 
@@ -277,7 +279,7 @@ enum Imbalance<'a> {
         offchain: Decimal,
     },
     Usdc {
-        inventory: &'a Arc<RwLock<InventoryView>>,
+        inventory: &'a Arc<BroadcastingInventory>,
         onchain: Usdc,
         offchain: Usdc,
     },
@@ -805,7 +807,11 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
 
     // 100 onchain, 900 offchain = 10% onchain ratio -> below 30% -> TooMuchOffchain
     // Excess = target_onchain - onchain = 500 - 100 = 400 USDC (above $51 minimum)
-    let inventory = Arc::new(RwLock::new(InventoryView::default()));
+    let (inventory_sender, _) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
+        InventoryView::default(),
+        inventory_sender,
+    ));
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,
@@ -880,7 +886,11 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
 
     // 900 onchain, 100 offchain = 90% onchain ratio -> above 70% -> TooMuchOnchain
     // Excess = onchain - target_onchain = 900 - 500 = 400 USDC
-    let inventory = Arc::new(RwLock::new(InventoryView::default()));
+    let (inventory_sender, _) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
+        InventoryView::default(),
+        inventory_sender,
+    ));
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,
@@ -1087,8 +1097,10 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // 50 onchain, 950 offchain = 5% ratio -> TooMuchOffchain
     // Excess to reach 50% target = 500 - 50 = 450 USDC
-    let inventory = Arc::new(RwLock::new(
+    let (inventory_sender, _) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default().with_usdc(Usdc::new(dec!(50)), Usdc::new(dec!(950))),
+        inventory_sender,
     ));
 
     let assets = AssetsConfig {
@@ -1215,8 +1227,10 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     let pool = setup_test_db().await;
 
     // Large imbalance: 100 onchain, 900 offchain
-    let inventory = Arc::new(RwLock::new(
+    let (inventory_sender, _) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(900))),
+        inventory_sender,
     ));
 
     let assets = AssetsConfig {
@@ -1314,7 +1328,11 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
     // Scenario 1: Wide threshold - no trigger
     {
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
 
         build_imbalanced_inventory(Imbalance::Usdc {
             inventory: &inventory,
@@ -1365,7 +1383,11 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
     // Scenario 2: Tight threshold - triggers
     {
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
 
         build_imbalanced_inventory(Imbalance::Usdc {
             inventory: &inventory,
