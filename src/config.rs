@@ -508,27 +508,6 @@ impl Ctx {
             });
         }
 
-        let usdc = match &trading_mode {
-            TradingMode::Rebalancing(ctx) => Some(&ctx.usdc),
-            TradingMode::Standalone { .. } => None,
-        };
-        let usdc_rebalancing_enabled = match usdc {
-            Some(UsdcRebalancing::Enabled { .. }) => true,
-            Some(UsdcRebalancing::Disabled) | None => false,
-        };
-
-        if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits
-            && usdc_rebalancing_enabled
-        {
-            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
-            if max_amount.inner() < minimum {
-                return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
-                    configured: max_amount.inner(),
-                    minimum,
-                });
-            }
-        }
-
         Ok(Self {
             database_url: config.database_url,
             log_level,
