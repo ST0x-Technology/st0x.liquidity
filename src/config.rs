@@ -84,20 +84,6 @@ pub struct EquitiesConfig {
     pub symbols: HashMap<Symbol, EquityAssetConfig>,
 }
 
-impl EquitiesConfig {
-    /// Resolves the operational shares limit for a symbol.
-    ///
-    /// Symbol-specific limit takes precedence over the global limit.
-    /// Returns `None` when neither is configured (unlimited).
-    #[cfg(test)]
-    fn shares_limit_for(&self, symbol: &Symbol) -> Option<Positive<FractionalShares>> {
-        self.symbols
-            .get(symbol)
-            .and_then(|config| config.operational_limit)
-            .or(self.operational_limit)
-    }
-}
-
 /// Top-level assets configuration containing equities and cash.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2433,96 +2419,5 @@ pub(crate) mod tests {
                  as unknown variant (kebab-case required), but got: {error}"
             );
         }
-    }
-
-    #[test]
-    fn shares_limit_prefers_symbol_specific_over_global() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let symbol_limit = Positive::new(FractionalShares::new(dec!(5))).unwrap();
-        let global_limit = Positive::new(FractionalShares::new(dec!(100))).unwrap();
-
-        let config = EquitiesConfig {
-            operational_limit: Some(global_limit),
-            symbols: HashMap::from([(
-                symbol.clone(),
-                EquityAssetConfig {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_id: None,
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: Some(symbol_limit),
-                },
-            )]),
-        };
-
-        assert_eq!(
-            config.shares_limit_for(&symbol),
-            Some(Positive::new(FractionalShares::new(dec!(5))).unwrap()),
-        );
-    }
-
-    #[test]
-    fn shares_limit_falls_back_to_global_when_symbol_has_no_limit() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let global_limit = Positive::new(FractionalShares::new(dec!(100))).unwrap();
-
-        let config = EquitiesConfig {
-            operational_limit: Some(global_limit),
-            symbols: HashMap::from([(
-                symbol.clone(),
-                EquityAssetConfig {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_id: None,
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
-                },
-            )]),
-        };
-
-        assert_eq!(
-            config.shares_limit_for(&symbol),
-            Some(Positive::new(FractionalShares::new(dec!(100))).unwrap()),
-        );
-    }
-
-    #[test]
-    fn shares_limit_falls_back_to_global_for_unknown_symbol() {
-        let symbol = Symbol::new("UNKNOWN").unwrap();
-        let global_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
-
-        let config = EquitiesConfig {
-            operational_limit: Some(global_limit),
-            symbols: HashMap::new(),
-        };
-
-        assert_eq!(
-            config.shares_limit_for(&symbol),
-            Some(Positive::new(FractionalShares::new(dec!(50))).unwrap()),
-        );
-    }
-
-    #[test]
-    fn shares_limit_returns_none_when_no_limits_configured() {
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        let config = EquitiesConfig {
-            operational_limit: None,
-            symbols: HashMap::from([(
-                symbol.clone(),
-                EquityAssetConfig {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_id: None,
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
-                },
-            )]),
-        };
-
-        assert_eq!(config.shares_limit_for(&symbol), None);
     }
 }
