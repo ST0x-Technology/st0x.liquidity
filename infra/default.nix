@@ -12,10 +12,19 @@ let
     set -eo pipefail
 
     if [ "''${1:-}" = "-i" ]; then
+      if [ -z "''${2:-}" ]; then
+        echo "ERROR: identity is empty -- pass -i <path> or set a default" >&2
+        exit 1
+      fi
       identity="$2"
       shift 2
     else
       echo "ERROR: -i <identity_file> is required" >&2
+      exit 1
+    fi
+
+    if [ -z "$identity" ]; then
+      echo "ERROR: identity is empty -- pass -i <path> or set a default" >&2
       exit 1
     fi
   '';

@@ -337,7 +337,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let base_symbol = onchain_trade.symbol.base();
 
     // CLI test command uses MockExecutor (market always open)
-    let trading_enabled = ctx.is_asset_enabled(base_symbol);
+    let trading_enabled = ctx.is_trading_enabled(base_symbol);
     let executor = MockExecutor::new();
     let Some(params) = check_execution_readiness(
         &executor,

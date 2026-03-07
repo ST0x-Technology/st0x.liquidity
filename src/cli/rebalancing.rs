@@ -10,9 +10,10 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{Evm, OpenChainErrorRegistry, ReadOnlyEvm};
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
-    TimeInForce,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares,
+    SharesBlockchain, Symbol, TimeInForce,
 };
+use st0x_finance::Usdc;
 
 use super::TransferDirection;
 use crate::alpaca_wallet::AlpacaWalletService;
@@ -24,7 +25,6 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::CrossVenueCashTransfer;
-use crate::threshold::Usdc;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
@@ -160,9 +160,6 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let owner = rebalancing_ctx.base_wallet().address();
-
     let usdc_vault_id = ctx
         .assets
         .cash
@@ -171,6 +168,9 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
 
     writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
+
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let owner = rebalancing_ctx.base_wallet().address();
 
     let broker_mode = if alpaca_auth.is_sandbox() {
         AlpacaBrokerApiMode::Sandbox
@@ -541,16 +541,19 @@ fn format_tokenization_request<Writer: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
+    use alloy::primitives::{Address, address, b256};
     use rust_decimal::Decimal;
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
 
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use st0x_finance::Usdc;
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
+    use crate::config::{
+        AssetsConfig, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode, TradingMode,
+    };
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -649,7 +652,7 @@ mod tests {
     async fn test_transfer_usdc_requires_alpaca_broker() {
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -670,9 +673,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_rebalancing_ctx() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        ctx.assets.cash = Some(CashAssetConfig {
+            vault_id: Some(b256!(
+                "0x00000000000000000000000000000000000000000000000000000000000000ab"
+            )),
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        });
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_usdc_command(
@@ -695,7 +705,7 @@ mod tests {
     async fn test_transfer_usdc_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         transfer_usdc_command(
@@ -760,6 +770,88 @@ mod tests {
             broker_mode,
             AlpacaBrokerApiMode::Production,
             "Production auth should yield Production broker mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transfer_usdc_requires_vault_id_when_cash_is_none() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        let pool = setup_test_db().await;
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+
+        let mut stdout = Vec::new();
+        let result = transfer_usdc_command(
+            &mut stdout,
+            TransferDirection::ToRaindex,
+            amount,
+            &ctx,
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("assets.cash.vault_id is required"),
+            "Expected vault_id error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transfer_usdc_requires_vault_id_when_vault_id_is_none() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        ctx.assets.cash = Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        });
+        let pool = setup_test_db().await;
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+
+        let mut stdout = Vec::new();
+        let result = transfer_usdc_command(
+            &mut stdout,
+            TransferDirection::ToRaindex,
+            amount,
+            &ctx,
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("assets.cash.vault_id is required"),
+            "Expected vault_id error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transfer_usdc_writes_vault_id_to_stdout() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let vault_id = b256!("0x00000000000000000000000000000000000000000000000000000000000000ab");
+        ctx.assets.cash = Some(CashAssetConfig {
+            vault_id: Some(vault_id),
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        });
+        let pool = setup_test_db().await;
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
+
+        let mut stdout = Vec::new();
+        // Will fail at rebalancing_ctx, but vault_id check passes first
+        transfer_usdc_command(
+            &mut stdout,
+            TransferDirection::ToRaindex,
+            amount,
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Vault ID:"),
+            "Expected vault ID in output, got: {output}"
         );
     }
 }

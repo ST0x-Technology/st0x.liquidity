@@ -14,8 +14,8 @@ use url::Url;
 
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::{
-    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
-    InvalidSharesError, PersistenceError, SharesConversionError,
+    EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
+    InvalidExecutorError, InvalidSharesError, NotPositive, PersistenceError, SharesConversionError,
 };
 
 use st0x_event_sorcery::ProjectionError;
@@ -118,6 +118,8 @@ pub(crate) enum OnChainError {
     Position(#[from] PositionError),
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] SharesConversionError),
+    #[error(transparent)]
+    NotPositive(#[from] NotPositive<FractionalShares>),
     #[error("Decimal parse error: {0}")]
     DecimalParse(#[from] rust_decimal::Error),
     #[error("JSON serialization error: {0}")]

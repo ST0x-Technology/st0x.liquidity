@@ -27,6 +27,7 @@ use st0x_evm::fireblocks::{
     FireblocksVaultAccountId, FireblocksWallet,
 };
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
+use st0x_finance::Usdc;
 
 use crate::config::{AssetsConfig, OperationMode};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
@@ -37,7 +38,6 @@ use crate::inventory::{
 use crate::offchain_order::Dollars;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::position::{Position, PositionEvent};
-use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintEvent,
 };
@@ -80,6 +80,11 @@ pub enum RebalancingCtxError {
     },
     #[error("missing Fireblocks asset ID for chain ID {chain_id}")]
     MissingChainAssetId { chain_id: u64 },
+    #[error(
+        "chain ID mismatch: expected {expected} but RPC returned {actual} \
+         (check that base_rpc_url and ethereum_rpc_url are not swapped)"
+    )]
+    ChainIdMismatch { expected: u64, actual: u64 },
     #[error("RPC error during wallet setup: {0}")]
     Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
     #[error(transparent)]
@@ -90,7 +95,9 @@ pub enum RebalancingCtxError {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
     pub(crate) base_rpc_url: Url,
+    pub(crate) base_chain_id: u64,
     pub(crate) ethereum_rpc_url: Url,
+    pub(crate) ethereum_chain_id: u64,
     pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
     pub(crate) fireblocks_secret_path: PathBuf,
 }
@@ -163,12 +170,14 @@ impl RebalancingCtx {
                 &secrets.fireblocks_api_user_id,
                 &fireblocks_secret,
                 secrets.base_rpc_url,
+                secrets.base_chain_id,
             ),
             Self::build_wallet(
                 &config,
                 &secrets.fireblocks_api_user_id,
                 &fireblocks_secret,
                 secrets.ethereum_rpc_url,
+                secrets.ethereum_chain_id,
             ),
         )?;
 
@@ -198,9 +207,18 @@ impl RebalancingCtx {
         api_user_id: &FireblocksApiUserId,
         api_secret: &[u8],
         rpc_url: Url,
+        expected_chain_id: u64,
     ) -> Result<FireblocksWallet<RootProvider>, RebalancingCtxError> {
         let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
         let chain_id = provider.get_chain_id().await?;
+
+        if chain_id != expected_chain_id {
+            return Err(RebalancingCtxError::ChainIdMismatch {
+                expected: expected_chain_id,
+                actual: chain_id,
+            });
+        }
+
         let asset_id = config
             .fireblocks_chain_asset_ids
             .get(chain_id)
@@ -294,7 +312,7 @@ pub(crate) enum TriggeredOperation {
         /// Wrapped (ERC-4626) token address for vault withdrawal.
         wrapped_token: Address,
         /// Unwrapped (underlying) token address for sending to Alpaca.
-        unwrapped_token: Address,
+        tokenized_shares: Address,
     },
     /// Move USDC from Alpaca to Base (too much offchain).
     UsdcAlpacaToBase { amount: Usdc },
@@ -564,7 +582,7 @@ impl Reactor for RebalancingTrigger {
                             Inventory::available(
                                 Venue::MarketMaking,
                                 equity_op.inverse(),
-                                Usdc(usdc_value),
+                                Usdc::new(usdc_value),
                             ),
                         )
                     }
@@ -590,7 +608,7 @@ impl Reactor for RebalancingTrigger {
                             Inventory::available(
                                 Venue::Hedging,
                                 equity_op.inverse(),
-                                Usdc(usdc_value),
+                                Usdc::new(usdc_value),
                             ),
                         )
                     }
@@ -670,30 +688,17 @@ impl RebalancingTrigger {
             .await?
             .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
 
-        let unwrapped_token = self.wrapper.lookup_tokenized_equity(symbol)?;
+        let tokenized_shares = self.wrapper.lookup_underlying(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
 
-        let shares_limit = self
-            .config
-            .assets
-            .equities
-            .symbols
-            .get(symbol)
-            .and_then(|config| config.operational_limit.map(Positive::inner))
-            .or_else(|| {
-                self.config
-                    .assets
-                    .equities
-                    .operational_limit
-                    .map(Positive::inner)
-            });
+        let shares_limit = self.config.assets.equities.shares_limit_for(symbol);
 
         let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
             &self.inventory,
             wrapped_token,
-            unwrapped_token,
+            tokenized_shares,
             &vault_ratio,
             shares_limit,
         )
@@ -732,16 +737,14 @@ impl RebalancingTrigger {
 
     /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
     fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
-        let cash_rebalancing_disabled = self
-            .config
-            .assets
-            .cash
-            .as_ref()
-            .is_some_and(|cash| matches!(cash.rebalancing, OperationMode::Disabled));
-
-        if cash_rebalancing_disabled {
-            debug!("USDC rebalancing disabled via assets.cash config");
-            return None;
+        if let Some(cash) = &self.config.assets.cash {
+            match cash.rebalancing {
+                OperationMode::Disabled => {
+                    debug!("USDC rebalancing disabled via assets.cash config");
+                    return None;
+                }
+                OperationMode::Enabled => {}
+            }
         }
 
         let usdc_limit = self
@@ -1022,14 +1025,15 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
-    use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
-    use st0x_execution::{Direction, ExecutorOrderId, Positive};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
+
+    use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
+    use st0x_execution::{Direction, ExecutorOrderId, Positive};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -1040,7 +1044,7 @@ mod tests {
     use crate::inventory::{TransferOp, Venue};
     use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::{PositionEvent, TradeId};
-    use crate::threshold::{ExecutionThreshold, Usdc};
+    use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
     use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
     use crate::vault_registry::VaultRegistryCommand;
@@ -1411,7 +1415,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(
-            InventoryView::default().with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000))),
+            InventoryView::default().with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000))),
         ));
         let pool = crate::test_utils::setup_test_db().await;
 
@@ -1472,7 +1476,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)));
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)));
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -1511,7 +1515,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(50)),
@@ -1552,7 +1556,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
@@ -2353,7 +2357,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
+            .with_usdc(Usdc::new(dec!(10000)), Usdc::new(dec!(10000)));
 
         let (trigger, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -2374,7 +2378,7 @@ mod tests {
             .usdc_available(Venue::MarketMaking)
             .unwrap();
 
-        assert_eq!(onchain_usdc, Usdc(dec!(8500)));
+        assert_eq!(onchain_usdc, Usdc::new(dec!(8500)));
     }
 
     #[tokio::test]
@@ -2382,7 +2386,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
+            .with_usdc(Usdc::new(dec!(10000)), Usdc::new(dec!(10000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
@@ -2409,7 +2413,7 @@ mod tests {
             .usdc_available(Venue::MarketMaking)
             .unwrap();
 
-        assert_eq!(onchain_usdc, Usdc(dec!(11500)));
+        assert_eq!(onchain_usdc, Usdc::new(dec!(11500)));
     }
 
     #[tokio::test]
@@ -2417,7 +2421,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)));
+            .with_usdc(Usdc::new(dec!(10000)), Usdc::new(dec!(10000)));
 
         let (trigger, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -2438,7 +2442,7 @@ mod tests {
             .usdc_available(Venue::Hedging)
             .unwrap();
 
-        assert_eq!(offchain_usdc, Usdc(dec!(8500)));
+        assert_eq!(offchain_usdc, Usdc::new(dec!(8500)));
     }
 
     #[tokio::test]
@@ -2446,7 +2450,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(Usdc(dec!(10000)), Usdc(dec!(10000)))
+            .with_usdc(Usdc::new(dec!(10000)), Usdc::new(dec!(10000)))
             .update_equity(
                 &symbol,
                 Inventory::available(Venue::Hedging, Operator::Add, shares(100)),
@@ -2473,7 +2477,7 @@ mod tests {
             .usdc_available(Venue::Hedging)
             .unwrap();
 
-        assert_eq!(offchain_usdc, Usdc(dec!(11500)));
+        assert_eq!(offchain_usdc, Usdc::new(dec!(11500)));
     }
 
     #[tokio::test]
@@ -2986,7 +2990,7 @@ mod tests {
     }
 
     fn usdc(n: i64) -> Usdc {
-        Usdc(Decimal::from(n))
+        Usdc::new(Decimal::from(n))
     }
 
     fn make_usdc_initiated(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
@@ -3021,8 +3025,8 @@ mod tests {
     fn make_usdc_bridged() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Bridged {
             mint_tx_hash: TxHash::random(),
-            amount_received: Usdc(dec!(99.99)),
-            fee_collected: Usdc(dec!(0.01)),
+            amount_received: Usdc::new(dec!(99.99)),
+            fee_collected: Usdc::new(dec!(0.01)),
             minted_at: Utc::now(),
         }
     }
@@ -3175,7 +3179,9 @@ mod tests {
     fn valid_rebalancing_secrets_toml() -> &'static str {
         r#"
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://eth.example.com"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#
@@ -3262,7 +3268,9 @@ mod tests {
     fn deserialize_missing_fireblocks_fields_fails() {
         let toml_str = r#"
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://eth.example.com"
+            ethereum_chain_id = 1
         "#;
 
         let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
@@ -3428,7 +3436,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(500)),
+                    amount: Usdc::new(dec!(500)),
                     withdrawal: TransferRef::OnchainTx(tx_hash),
                 },
             )
@@ -3464,8 +3472,8 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                 },
             )
             .await
@@ -3514,7 +3522,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000)),
+                    amount: Usdc::new(dec!(1000)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
                 },
             )
@@ -3550,8 +3558,8 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                 },
             )
             .await
@@ -3596,7 +3604,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100)),
+                    amount: Usdc::new(dec!(100)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
                 },
             )
@@ -3639,7 +3647,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100)),
+                    amount: Usdc::new(dec!(100)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
                 },
             )
@@ -3692,7 +3700,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(100)),
+                    amount: Usdc::new(dec!(100)),
                     order_id: uuid::Uuid::new_v4(),
                 },
             )
@@ -3725,7 +3733,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(10);
         let pool = crate::test_utils::setup_test_db().await;
         let inventory = Arc::new(tokio::sync::RwLock::new(
-            InventoryView::default().with_usdc(Usdc(dec!(5000)), Usdc(dec!(5000))),
+            InventoryView::default().with_usdc(Usdc::new(dec!(5000)), Usdc::new(dec!(5000))),
         ));
 
         let trigger = Arc::new(RebalancingTrigger::new(
@@ -3755,7 +3763,7 @@ mod tests {
                 id.clone(),
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000)),
+                    amount: Usdc::new(dec!(1000)),
                     withdrawal_ref: TransferRef::OnchainTx(tx_hash),
                     initiated_at: chrono::Utc::now(),
                 },
@@ -3795,7 +3803,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc(dec!(500)),
+                    amount: Usdc::new(dec!(500)),
                     withdrawal: TransferRef::OnchainTx(tx_hash),
                 },
             )
@@ -3831,8 +3839,8 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: tx_hash,
-                    amount_received: Usdc(dec!(99.99)),
-                    fee_collected: Usdc(dec!(0.01)),
+                    amount_received: Usdc::new(dec!(99.99)),
+                    fee_collected: Usdc::new(dec!(0.01)),
                 },
             )
             .await
@@ -3859,7 +3867,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: uuid::Uuid::new_v4(),
-                    amount: Usdc(dec!(500)),
+                    amount: Usdc::new(dec!(500)),
                 },
             )
             .await
@@ -3884,7 +3892,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::ConfirmConversion {
-                    filled_amount: Usdc(dec!(499)), // ~0.2% slippage
+                    filled_amount: Usdc::new(dec!(499)), // ~0.2% slippage
                 },
             )
             .await

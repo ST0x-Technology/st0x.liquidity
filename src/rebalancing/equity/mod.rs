@@ -19,7 +19,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
-use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
+use st0x_execution::{FractionalShares, SharesBlockchain, SharesConversionError, Symbol};
 
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::equity_redemption::{
@@ -352,7 +352,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
 
-        let wrapped_token = self.wrapper.lookup_tokenized_equity_derivative(&symbol)?;
+        let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
         let (wrap_tx_hash, wrapped_shares) = self
             .wrapper
             .to_wrapped(wrapped_token, shares_minted, self.wallet)

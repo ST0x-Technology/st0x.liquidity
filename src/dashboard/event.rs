@@ -128,7 +128,9 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "mint-123");
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            ServerMessage::Initial(_)
+            | ServerMessage::InventoryUpdate(_)
+            | ServerMessage::TransferUpdate(_) => panic!("expected Event message"),
         }
     }
 
@@ -160,7 +162,9 @@ mod tests {
             ServerMessage::Event(entry) => {
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            ServerMessage::Initial(_)
+            | ServerMessage::InventoryUpdate(_)
+            | ServerMessage::TransferUpdate(_) => panic!("expected Event message"),
         }
     }
 
@@ -184,7 +188,9 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "redemption-123");
                 assert_eq!(entry.event_type, "EquityRedemptionEvent::Completed");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            ServerMessage::Initial(_)
+            | ServerMessage::InventoryUpdate(_)
+            | ServerMessage::TransferUpdate(_) => panic!("expected Event message"),
         }
     }
 
@@ -208,7 +214,9 @@ mod tests {
                 assert_eq!(entry.aggregate_id, id.to_string());
                 assert_eq!(entry.event_type, "UsdcRebalanceEvent::WithdrawalConfirmed");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            ServerMessage::Initial(_)
+            | ServerMessage::InventoryUpdate(_)
+            | ServerMessage::TransferUpdate(_) => panic!("expected Event message"),
         }
     }
 
@@ -246,7 +254,11 @@ mod tests {
                         i + 1
                     );
                 }
-                ServerMessage::Initial(_) => panic!("receiver {} expected Event message", i + 1),
+                ServerMessage::Initial(_)
+                | ServerMessage::InventoryUpdate(_)
+                | ServerMessage::TransferUpdate(_) => {
+                    panic!("receiver {} expected Event message", i + 1)
+                }
             }
         }
     }

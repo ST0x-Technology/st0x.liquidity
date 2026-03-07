@@ -20,6 +20,7 @@ use st0x_execution::{
     AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
     TimeInForce,
 };
+use st0x_finance::Usdc;
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
@@ -27,7 +28,7 @@ use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
 };
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
-use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
+use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -91,6 +92,19 @@ pub(crate) struct EquitiesConfig {
     pub(crate) symbols: HashMap<Symbol, EquityAssetConfig>,
 }
 
+impl EquitiesConfig {
+    /// Resolves the operational shares limit for a symbol.
+    ///
+    /// Symbol-specific limit takes precedence over the global limit.
+    /// Returns `None` when neither is configured (unlimited).
+    pub(crate) fn shares_limit_for(&self, symbol: &Symbol) -> Option<FractionalShares> {
+        self.symbols
+            .get(symbol)
+            .and_then(|config| config.operational_limit.map(Positive::inner))
+            .or_else(|| self.operational_limit.map(Positive::inner))
+    }
+}
+
 /// Top-level assets configuration containing equities and cash.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,7 +144,6 @@ where
         .map(Some)
         .map_err(serde::de::Error::custom)
 }
-
 /// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,7 +255,7 @@ impl BrokerCtx {
                 Positive::<FractionalShares>::ONE,
             )),
             Self::AlpacaTradingApi(_) | Self::AlpacaBrokerApi(_) => {
-                Ok(ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))?)
+                Ok(ExecutionThreshold::dollar_value(Usdc::new(Decimal::TWO))?)
             }
         }
     }
@@ -495,6 +508,27 @@ impl Ctx {
             });
         }
 
+        let usdc = match &trading_mode {
+            TradingMode::Rebalancing(ctx) => Some(&ctx.usdc),
+            TradingMode::Standalone { .. } => None,
+        };
+        let usdc_rebalancing_enabled = match usdc {
+            Some(UsdcRebalancing::Enabled { .. }) => true,
+            Some(UsdcRebalancing::Disabled) | None => false,
+        };
+
+        if let OperationalLimits::Enabled { max_amount, .. } = &config.operational_limits
+            && usdc_rebalancing_enabled
+        {
+            let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+            if max_amount.inner() < minimum {
+                return Err(CtxError::OperationalLimitBelowMinimumWithdrawal {
+                    configured: max_amount.inner(),
+                    minimum,
+                });
+            }
+        }
+
         Ok(Self {
             database_url: config.database_url,
             log_level,
@@ -542,11 +576,11 @@ impl Ctx {
         }
     }
 
-    /// Returns whether the given asset is enabled for trading and rebalancing.
+    /// Returns whether trading is enabled for the given equity.
     ///
     /// Fail-closed: assets not present in the config are treated as
     /// trading-disabled.
-    pub(crate) fn is_asset_enabled(&self, symbol: &Symbol) -> bool {
+    pub(crate) fn is_trading_enabled(&self, symbol: &Symbol) -> bool {
         self.assets
             .equities
             .symbols
@@ -685,6 +719,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
+    use rust_decimal_macros::dec;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -911,7 +946,9 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,
@@ -1011,7 +1048,9 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,
@@ -1336,7 +1375,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc::new(Decimal::TWO)).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 
@@ -1359,7 +1398,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc::new(Decimal::TWO)).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 
@@ -1390,7 +1429,9 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
+            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
+            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,
@@ -1885,7 +1926,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn is_asset_enabled_returns_configured_value() {
+    fn is_trading_enabled_returns_configured_value() {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new("RKLB").unwrap(),
@@ -1913,19 +1954,19 @@ pub(crate) mod tests {
         };
 
         assert!(
-            !ctx.is_asset_enabled(&Symbol::new("RKLB").unwrap()),
+            !ctx.is_trading_enabled(&Symbol::new("RKLB").unwrap()),
             "RKLB trading should be disabled"
         );
     }
 
     #[test]
-    fn is_asset_enabled_defaults_to_false_for_unknown() {
+    fn is_trading_disabled_for_unknown_assets() {
         let ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
 
         assert!(
-            !ctx.is_asset_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            !ctx.is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
             "Unknown assets should default to trading disabled (fail-closed)"
         );
     }
@@ -1979,7 +2020,7 @@ pub(crate) mod tests {
     #[test]
     fn base_symbol_config_keys_fix_lookup_bug() {
         // Config keys use base symbols (SPYM not tSPYM).
-        // is_asset_enabled uses Symbol directly, which matches
+        // is_trading_enabled uses Symbol directly, which matches
         // base symbol keys. This verifies the bug fix.
         let mut symbols = HashMap::new();
         symbols.insert(
@@ -2009,7 +2050,7 @@ pub(crate) mod tests {
 
         // The lookup uses base symbol "SPYM" which matches the config key
         assert!(
-            !ctx.is_asset_enabled(&Symbol::new("SPYM").unwrap()),
+            !ctx.is_trading_enabled(&Symbol::new("SPYM").unwrap()),
             "SPYM trading should be disabled per config"
         );
     }
@@ -2375,5 +2416,96 @@ pub(crate) mod tests {
                  as unknown variant (kebab-case required), but got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn shares_limit_prefers_symbol_specific_over_global() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let symbol_limit = Positive::new(FractionalShares::new(dec!(5))).unwrap();
+        let global_limit = Positive::new(FractionalShares::new(dec!(100))).unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: Some(global_limit),
+            symbols: HashMap::from([(
+                symbol.clone(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: Some(symbol_limit),
+                },
+            )]),
+        };
+
+        assert_eq!(
+            config.shares_limit_for(&symbol),
+            Some(FractionalShares::new(dec!(5))),
+        );
+    }
+
+    #[test]
+    fn shares_limit_falls_back_to_global_when_symbol_has_no_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let global_limit = Positive::new(FractionalShares::new(dec!(100))).unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: Some(global_limit),
+            symbols: HashMap::from([(
+                symbol.clone(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: None,
+                },
+            )]),
+        };
+
+        assert_eq!(
+            config.shares_limit_for(&symbol),
+            Some(FractionalShares::new(dec!(100))),
+        );
+    }
+
+    #[test]
+    fn shares_limit_falls_back_to_global_for_unknown_symbol() {
+        let symbol = Symbol::new("UNKNOWN").unwrap();
+        let global_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: Some(global_limit),
+            symbols: HashMap::new(),
+        };
+
+        assert_eq!(
+            config.shares_limit_for(&symbol),
+            Some(FractionalShares::new(dec!(50))),
+        );
+    }
+
+    #[test]
+    fn shares_limit_returns_none_when_no_limits_configured() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                symbol.clone(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: None,
+                },
+            )]),
+        };
+
+        assert_eq!(config.shares_limit_for(&symbol), None);
     }
 }

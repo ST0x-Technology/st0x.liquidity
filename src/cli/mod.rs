@@ -19,11 +19,11 @@ use tracing::info;
 
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
+use st0x_finance::Usdc;
 
 use crate::config::{Ctx, Env};
 use crate::offchain_order::OrderPlacer;
 use crate::symbol::cache::SymbolCache;
-use crate::threshold::Usdc;
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]

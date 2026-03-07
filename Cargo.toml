@@ -4,6 +4,7 @@ members = [
   "crates/dto",
   "crates/event-sorcery",
   "crates/execution",
+  "crates/finance",
   "crates/bridge",
   "crates/evm",
 ]
@@ -81,7 +82,10 @@ opentelemetry-otlp = "0.30.0"
 tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
 rust_decimal = { version = "1.38.0", features = ["serde"] }
+rust_decimal_macros = "1.40.0"
+alloy-primitives = "1.4"
 st0x-evm = { path = "crates/evm" }
+st0x-finance = { path = "crates/finance" }
 num-decimal = { version = "0.2.5", default-features = false, features = [
   "num-v04",
 ] }
@@ -141,9 +145,10 @@ ts-rs = { version = "11.1.0", features = [
 ] }
 rocket_ws = "0.1.1"
 toml = "0.9.11"
-rust_decimal_macros = "1.38.0"
+rust_decimal_macros.workspace = true
 st0x-evm = { workspace = true, features = ["fireblocks"] }
 bon = "3.9.0"
+st0x-finance = { workspace = true, features = ["alloy"] }
 
 [dev-dependencies]
 httpmock.workspace = true

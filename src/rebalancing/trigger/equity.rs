@@ -98,7 +98,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
     wrapped_token: Address,
-    unwrapped_token: Address,
+    tokenized_shares: Address,
     vault_ratio: &UnderlyingPerWrapped,
     shares_limit: Option<FractionalShares>,
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
@@ -126,7 +126,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 symbol: symbol.clone(),
                 quantity,
                 wrapped_token,
-                unwrapped_token,
+                tokenized_shares,
             }
         }
     }))
@@ -337,14 +337,14 @@ mod tests {
 
         let Ok(Some(TriggeredOperation::Redemption {
             wrapped_token,
-            unwrapped_token,
+            tokenized_shares,
             ..
         })) = result
         else {
             panic!("Expected Redemption, got {result:?}");
         };
         assert_eq!(wrapped_token, wrapped_addr);
-        assert_eq!(unwrapped_token, unwrapped_addr);
+        assert_eq!(tokenized_shares, unwrapped_addr);
     }
 
     #[tokio::test]

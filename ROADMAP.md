@@ -13,12 +13,11 @@ graph TD
     A["#355 per-asset-operations-config"] --> B["#381 roadmap update"]
     B --> C["#354 Turnkey wallet<br/>(evm crate)"]
     B --> D["#376 DTO schema update"]
+    C --> E["#380 wallet provider config<br/>(main crate, last)"]
     D --> F["#377 dashboard backend"]
     D --> G["#378 dashboard frontend"]
     F --> H["#379 dashboard integration"]
     G --> H
-    C --> E["#380 wallet provider config<br/>(main crate, last)"]
-    H --> E
 ```
 
 ### Turnkey wallet (evm crate, independent)
@@ -36,16 +35,18 @@ panels showing inventory snapshots, change history, and transfer lifecycle
 status. Touches dto + main crate + dashboard frontend -- disjoint from the
 Turnkey work above, so both proceed in parallel.
 
-- [ ] [#376 Review and update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/issues/376)
+- [x] [#376 Review and update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/issues/376)
+  - PR:
+    [#382 update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/pull/382)
 - [ ] [#377 Dashboard backend: serve inventory history and transfer status via WebSocket](https://github.com/ST0x-Technology/st0x.liquidity/issues/377)
 - [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
 - [ ] [#379 Dashboard integration: verify nix build, deployment, and end-to-end data flow](https://github.com/ST0x-Technology/st0x.liquidity/issues/379)
 
-### Wallet provider config (main crate, depends on everything above)
+### Wallet provider config (main crate, depends on Turnkey wallet)
 
 Wires Turnkey into the main crate config so operators can choose between Turnkey
-and Fireblocks. Final convergence point -- stacked on both the Turnkey and
-dashboard integration branches to avoid conflicts in the main crate.
+and Fireblocks. Deferred to last to avoid conflicts with dashboard work in the
+same crate.
 
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
 
@@ -76,12 +77,12 @@ Everything below has not been organized into epics yet.
 - PR:
   [#315 go live prod configuration](https://github.com/ST0x-Technology/st0x.liquidity/pull/315)
 
-- [ ] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
-  - PR (draft):
-    [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
 - [ ] [#353 Per-asset operations config: independent trading/rebalancing toggles, vault IDs, operational limits](https://github.com/ST0x-Technology/st0x.liquidity/issues/353)
   - PR:
     [#355 per-asset operations config: independent trading/rebalancing toggles](https://github.com/ST0x-Technology/st0x.liquidity/pull/355)
+- [x] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
+  - PR:
+    [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
 
 #### Wrapped Token Handling
 
@@ -148,8 +149,10 @@ both Schwab and Alpaca bot instances.
 
 - [ ] [#233 Make the dashboard display not only live events happening but also get historical data so that it's clear what's been happening in the system](https://github.com/ST0x-Technology/st0x.liquidity/issues/233)
 - [ ] [#178 Dashboard: Performance Metrics Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/178)
+- [ ] [#179 Dashboard: Inventory Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/179)
 - [ ] [#180 Dashboard: Spreads Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/180)
 - [ ] [#181 Dashboard: Trade History Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/181)
+- [ ] [#182 Dashboard: Rebalancing Panel (Alpaca Only)](https://github.com/ST0x-Technology/st0x.liquidity/issues/182)
 
 #### Controls
 

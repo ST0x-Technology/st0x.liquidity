@@ -104,12 +104,6 @@ independent parallel execution:
    other parallel branches also modify, schedule it after those branches merge
    to avoid conflict resolution overhead.
 
-7. **Converge to a single terminal node.** The dependency graph for an epic
-   should have one final PR that depends on all parallel streams. This is where
-   integration happens and it ensures the epic is complete when that node
-   merges. It also prevents conflicting branches from being active
-   simultaneously in a single worktree.
-
 ### Managing Epics in the Roadmap
 
 An epic is a roadmap subsection grouping related issues toward a single goal.
@@ -286,6 +280,10 @@ resolution and feature selection.
 See `.skills/gitbutler/` for version control workflow and
 `.github/PULL_REQUEST_TEMPLATE.md` for PR format requirements.
 
+**Default behavior:** After completing work, stage, commit, and push all changes
+unless the user explicitly says not to push (or there is a clear, stated reason
+to avoid pushing). Do not stop to ask for confirmation by default—proceed.
+
 ## Development Workflow Notes
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
@@ -420,36 +418,16 @@ is the source of truth for terminology and naming conventions.
   `.with_required_confirmations(self.required_confirmations).get_receipt()` on
   all pending transactions. Never use bare `.get_receipt().await` in production
   code paths.
-- **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
-  cqrs-es framework for event sourcing. **NEVER write directly to the `events`
-  table**. This is strictly forbidden and violates the CQRS architecture:
-  - **FORBIDDEN**: Direct INSERT statements into the `events` table
-  - **FORBIDDEN**: Manual sequence number management for events
-  - **FORBIDDEN**: Bypassing the CqrsFramework to write events
-  - **REQUIRED**: Always use `CqrsFramework::execute()` or
-    `CqrsFramework::execute_with_metadata()` to emit events
-  - **REQUIRED**: Events must be emitted through aggregate commands that
-    generate domain events
-  - The cqrs-es framework handles event persistence, sequence numbers, aggregate
-    loading, and consistency guarantees
-  - Direct table writes break aggregate consistency, event ordering, and the
-    event sourcing pattern
-  - If you see existing code writing directly to `events` table, that code is
-    incorrect and should be refactored to use CqrsFramework
-- **CRITICAL: Single CQRS Framework Instance Per Aggregate**: In the main bot
-  flow, each aggregate type must have exactly ONE `SqliteCqrs<A>` instance,
-  constructed once during startup in `Conductor::start`, then passed to all
-  consumers. This prevents silent production bugs where missing query processors
-  cause events to persist without triggering required side effects.
-  - **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` anywhere in
-    the server binary's code path outside `Conductor::start`
-  - **FORBIDDEN**: Creating multiple `SqliteCqrs<A>` instances for the same
-    aggregate type in the bot flow
-  - **REQUIRED**: When adding a new query processor, add it to the framework
-    construction in `Conductor::start`
-  - **ALLOWED**: Direct construction in test code, CLI code, and migration code
-    (different execution contexts with intentionally different query processor
-    needs)
+- **CRITICAL: CQRS/Event Sourcing Architecture**: **NEVER write directly to the
+  `events` table** — no direct INSERTs, no manual sequence numbers, no bypassing
+  `CqrsFramework`. Always use `CqrsFramework::execute()` or
+  `execute_with_metadata()` to emit events through aggregate commands. The
+  framework handles persistence, sequence numbers, and consistency
+- **CRITICAL: Single CQRS Framework Instance Per Aggregate**: Each aggregate
+  must have exactly ONE `SqliteCqrs<A>` in the server binary, constructed in
+  `Conductor::start`. Never call `sqlite_cqrs()` or `CqrsFramework::new()`
+  elsewhere in the server path. Direct construction is fine in
+  test/CLI/migration code
 - **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
   `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
@@ -514,28 +492,12 @@ is the source of truth for terminology and naming conventions.
   (`#[cfg(test)]` modules) where panicking on unexpected state is the desired
   behavior
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
-  String values that throw away type information**. This is strictly forbidden
-  and violates our error handling principles:
-  - **FORBIDDEN**: `SomeError(String)` - throws away all type information
-  - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
-  - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
-    interpolation
-  - **FORBIDDEN**: Using `format!()` to convert typed values into String fields
-    in error variants (e.g., `format!("{side:?}")`) - store the actual typed
-    value instead
-  - **FORBIDDEN**: Unpacking newtypes into their inner type to store in error
-    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`, not
-    `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
-    representation. Never discard type safety by extracting inner values.
-  - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
-    preserve all type information
-  - **REQUIRED**: Each error variant must preserve the complete error chain with
-    `#[source]`
-  - **REQUIRED**: Discover error variants as needed during implementation, not
-    preemptively
-  - **FORBIDDEN: `.map_err` for error conversion**: Use `#[from]` + `?` instead.
-    To log before converting, chain
-    `.inspect_err(|error| error!(?error, "context"))` before `?`
+  String values.** No `SomeError(String)`, no `.to_string()` or `format!()`
+  conversions, no unpacking newtypes (store `Symbol` not `String`). Use
+  `#[from]` + `?` for error conversion (never `.map_err`), preserve error chains
+  with `#[source]`, discover variants during implementation not preemptively. To
+  log before converting: `.inspect_err(|error| error!(?error, "ctx"))` before
+  `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
@@ -713,13 +675,8 @@ that cannot be expressed through code structure alone.
 - Describing function signatures (use doc comments instead)
 - Adding obvious test setup descriptions
 - Marking code sections that are clear from structure
-- **Referencing internal task tracking or ephemeral context**: NEVER leave
-  comments like `// Task 7: ...`, `// TODO from ticket XYZ`,
-  `// Part of sprint 5 work`, or any reference to task numbers, issue trackers,
-  todo lists, or session context that won't exist for future readers. These
-  comments are meaningless to PR reviewers, future maintainers, and anyone
-  without access to your internal state. If the code needs explanation, explain
-  WHAT it does and WHY - not which task number led to writing it.
+- **NEVER reference task numbers, issue trackers, or session context** in
+  comments — explain WHAT and WHY, not which task led to writing it
 
 #### Examples
 

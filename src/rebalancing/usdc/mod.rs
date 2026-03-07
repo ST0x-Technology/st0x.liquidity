@@ -15,11 +15,11 @@ use thiserror::Error;
 
 use st0x_bridge::cctp::CctpError;
 use st0x_event_sorcery::SendError;
-use st0x_execution::{AlpacaBrokerApiError, InvalidSharesError};
+use st0x_execution::{AlpacaBrokerApiError, InvalidSharesError, NotPositive};
+use st0x_finance::Usdc;
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::onchain::raindex::RaindexError;
-use crate::threshold::Usdc;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcTransferError {
@@ -47,6 +47,8 @@ pub(crate) enum UsdcTransferError {
     U256ToU128(#[from] FromUintError<u128>),
     #[error("Invalid shares: {0}")]
     InvalidShares(#[from] InvalidSharesError),
+    #[error(transparent)]
+    NotPositive(#[from] NotPositive<Usdc>),
     #[error(
         "Conversion order {order_id} filled but \
          filled_quantity is missing"

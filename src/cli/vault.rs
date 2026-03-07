@@ -8,10 +8,10 @@ use thiserror::Error;
 
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::OpenChainErrorRegistry;
+use st0x_finance::Usdc;
 
 use crate::config::Ctx;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistry;
 
 pub(super) struct Deposit {
@@ -31,12 +31,6 @@ pub(crate) enum VaultCliError {
 
     #[error("failed to parse scaled amount as U256")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
-
-    #[error(
-        "assets.cash.vault_id is required for USDC withdrawal \
-         but not configured"
-    )]
-    MissingCashVaultId,
 }
 
 fn decimal_to_u256(amount: Decimal, decimals: u8) -> Result<U256, VaultCliError> {
@@ -124,7 +118,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         .cash
         .as_ref()
         .and_then(|cash| cash.vault_id)
-        .ok_or(VaultCliError::MissingCashVaultId)?;
+        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
 
     writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
 
@@ -160,6 +154,8 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::str::FromStr;
     use url::Url;
+
+    use st0x_finance::Usdc;
 
     use super::*;
     use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
@@ -227,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = vault_withdraw_command(
@@ -275,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("250.25").unwrap());
+        let amount = Usdc::new(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
         vault_withdraw_command(
