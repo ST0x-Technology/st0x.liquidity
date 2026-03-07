@@ -3,7 +3,9 @@ import { createWebSocket } from './websocket.svelte'
 import type { QueryClient } from '@tanstack/svelte-query'
 import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
 import type { InitialState } from '$lib/api/InitialState'
+import type { Inventory } from '$lib/api/Inventory'
 import type { ServerMessage } from '$lib/api/ServerMessage'
+import type { TransferOperation } from '$lib/api/TransferOperation'
 
 class MockWebSocket {
   static instances: MockWebSocket[] = []
@@ -96,9 +98,16 @@ const createTimeframeMetrics = () => ({
   uptimePercent: '100'
 })
 
+const createUsdcInventory = () => ({
+  onchainAvailable: '0',
+  onchainInflight: '0',
+  offchainAvailable: '0',
+  offchainInflight: '0'
+})
+
 const createInitialState = (): InitialState => ({
   recentTrades: [],
-  inventory: { perSymbol: [], usdc: { onchain: '0', offchain: '0' } },
+  inventory: { perSymbol: [], usdc: createUsdcInventory(), snapshotAt: null },
   metrics: {
     '1h': createTimeframeMetrics(),
     '1d': createTimeframeMetrics(),
@@ -107,8 +116,8 @@ const createInitialState = (): InitialState => ({
     all: createTimeframeMetrics()
   },
   spreads: [],
-  activeRebalances: [],
-  recentRebalances: [],
+  activeTransfers: [],
+  recentTransfers: [],
   authStatus: { status: 'not_configured' },
   circuitBreaker: { status: 'active' }
 })
@@ -555,5 +564,182 @@ describe('createWebSocket', () => {
       }
     })
     consoleSpy.mockRestore()
+  })
+
+  it('handles inventory_update by replacing inventory cache', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    const inventory: Inventory = {
+      perSymbol: [
+        {
+          symbol: 'tAAPL',
+          onchainAvailable: '100.5',
+          onchainInflight: '0',
+          offchainAvailable: '50',
+          offchainInflight: '10'
+        }
+      ],
+      usdc: createUsdcInventory(),
+      snapshotAt: '2024-01-01T00:00:00Z'
+    }
+
+    const message: ServerMessage = { type: 'inventory_update', data: inventory }
+    MockWebSocket.getInstance(0).simulateMessage(message)
+
+    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['inventory'], inventory)
+  })
+
+  it('handles transfer_update by adding new active transfer', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    const transfer: TransferOperation = {
+      kind: 'equity_mint',
+      id: 'mint-1',
+      symbol: 'tAAPL',
+      quantity: '100',
+      status: { status: 'minting' },
+      startedAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z'
+    }
+
+    const message: ServerMessage = { type: 'transfer_update', data: transfer }
+    MockWebSocket.getInstance(0).simulateMessage(message)
+
+    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
+    const transfersCall = setQueryDataCalls.find(
+      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","active"]'
+    )
+
+    expect(transfersCall).toBeDefined()
+    if (transfersCall === undefined) throw new Error('transfersCall should be defined')
+
+    const updater = transfersCall[1] as (
+      old: TransferOperation[] | undefined
+    ) => TransferOperation[]
+    const result = updater([])
+
+    expect(result).toEqual([transfer])
+  })
+
+  it('handles transfer_update by moving completed transfer to recent', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    const activeTransfer: TransferOperation = {
+      kind: 'equity_mint',
+      id: 'mint-1',
+      symbol: 'tAAPL',
+      quantity: '100',
+      status: { status: 'minting' },
+      startedAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z'
+    }
+
+    const completedTransfer: TransferOperation = {
+      kind: 'equity_mint',
+      id: 'mint-1',
+      symbol: 'tAAPL',
+      quantity: '100',
+      status: { status: 'completed', completed_at: '2024-01-01T00:01:00Z' },
+      startedAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:01:00Z'
+    }
+
+    const message: ServerMessage = { type: 'transfer_update', data: completedTransfer }
+    MockWebSocket.getInstance(0).simulateMessage(message)
+
+    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
+    const activeCall = setQueryDataCalls.find(
+      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","active"]'
+    )
+
+    expect(activeCall).toBeDefined()
+    if (activeCall === undefined) throw new Error('activeCall should be defined')
+
+    const activeUpdater = activeCall[1] as (
+      old: TransferOperation[] | undefined
+    ) => TransferOperation[]
+    const activeResult = activeUpdater([activeTransfer])
+
+    expect(activeResult).toEqual([])
+
+    const recentCall = setQueryDataCalls.find(
+      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","recent"]'
+    )
+
+    expect(recentCall).toBeDefined()
+    if (recentCall === undefined) throw new Error('recentCall should be defined')
+
+    const recentUpdater = recentCall[1] as (
+      old: TransferOperation[] | undefined
+    ) => TransferOperation[]
+    const recentResult = recentUpdater([])
+
+    expect(recentResult).toEqual([completedTransfer])
+  })
+
+  it('validates inventory_update message structure', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({ type: 'inventory_update', data: { invalid: true } })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
+      type: 'inventory_update',
+      data: { invalid: true }
+    })
+    consoleSpy.mockRestore()
+  })
+
+  it('validates transfer_update message structure', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({ type: 'transfer_update', data: { noKind: true } })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
+      type: 'transfer_update',
+      data: { noKind: true }
+    })
+    consoleSpy.mockRestore()
+  })
+
+  it('populates transfer cache keys from initial state', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    const initialState = createInitialState()
+    MockWebSocket.getInstance(0).simulateMessage({ type: 'initial', data: initialState })
+
+    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['transfers', 'active'], [])
+    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['transfers', 'recent'], [])
   })
 })

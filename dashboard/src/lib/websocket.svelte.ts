@@ -1,7 +1,9 @@
 import { FiniteStateMachine } from 'runed'
 import type { QueryClient } from '@tanstack/svelte-query'
 import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
+import type { Inventory } from '$lib/api/Inventory'
 import type { ServerMessage } from '$lib/api/ServerMessage'
+import type { TransferOperation } from '$lib/api/TransferOperation'
 import { matcher } from '$lib/fp'
 import { reactive } from '$lib/frp.svelte'
 
@@ -33,11 +35,21 @@ const isInitialState = (v: unknown): boolean => {
     isObject(v['inventory']) &&
     isObject(v['metrics']) &&
     Array.isArray(v['spreads']) &&
-    Array.isArray(v['activeRebalances']) &&
-    Array.isArray(v['recentRebalances']) &&
+    Array.isArray(v['activeTransfers']) &&
+    Array.isArray(v['recentTransfers']) &&
     isObject(v['authStatus']) &&
     isObject(v['circuitBreaker'])
   )
+}
+
+const isInventory = (v: unknown): boolean => {
+  if (!isObject(v)) return false
+  return Array.isArray(v['perSymbol']) && isObject(v['usdc'])
+}
+
+const isTransferOperation = (v: unknown): boolean => {
+  if (!isObject(v)) return false
+  return typeof v['kind'] === 'string' && typeof v['id'] === 'string'
 }
 
 const isServerMessage = (value: unknown): value is ServerMessage => {
@@ -48,6 +60,8 @@ const isServerMessage = (value: unknown): value is ServerMessage => {
 
   if (type === 'initial') return isInitialState(data)
   if (type === 'event') return isEventStoreEntry(data)
+  if (type === 'inventory_update') return isInventory(data)
+  if (type === 'transfer_update') return isTransferOperation(data)
 
   return false
 }
@@ -76,8 +90,8 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         queryClient.setQueryData(['inventory'], data.inventory)
         queryClient.setQueryData(['metrics'], data.metrics)
         queryClient.setQueryData(['spreads'], data.spreads)
-        queryClient.setQueryData(['rebalances', 'active'], data.activeRebalances)
-        queryClient.setQueryData(['rebalances', 'recent'], data.recentRebalances)
+        queryClient.setQueryData(['transfers', 'active'], data.activeTransfers)
+        queryClient.setQueryData(['transfers', 'recent'], data.recentTransfers)
         queryClient.setQueryData(['auth'], data.authStatus)
         queryClient.setQueryData(['circuitBreaker'], data.circuitBreaker)
       },
@@ -86,6 +100,31 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         queryClient.setQueryData<EventStoreEntry[]>(['events'], (old) =>
           [data, ...(old ?? [])].slice(0, MAX_EVENTS)
         )
+      },
+
+      inventory_update: ({ data }) => {
+        queryClient.setQueryData<Inventory>(['inventory'], data)
+      },
+
+      transfer_update: ({ data }) => {
+        queryClient.setQueryData<TransferOperation[]>(['transfers', 'active'], (old) => {
+          const existing = old ?? []
+          const index = existing.findIndex((transfer) => transfer.id === data.id)
+
+          if (data.status.status === 'completed' || data.status.status === 'failed') {
+            const filtered = index >= 0 ? existing.filter((_, idx) => idx !== index) : existing
+            queryClient.setQueryData<TransferOperation[]>(
+              ['transfers', 'recent'],
+              (recent) => [data, ...(recent ?? [])].slice(0, MAX_EVENTS)
+            )
+            return filtered
+          }
+
+          if (index >= 0) {
+            return existing.map((transfer, idx) => (idx === index ? data : transfer))
+          }
+          return [data, ...existing]
+        })
       }
     })
   }
