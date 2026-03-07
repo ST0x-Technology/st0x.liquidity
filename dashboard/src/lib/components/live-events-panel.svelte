@@ -21,7 +21,7 @@
 
   const parseEventType = (eventType: string): { type: string; event: string } => {
     const idx = eventType.indexOf('::')
-    if (idx === -1) return { type: stripEventSuffix(eventType), event: '' }
+    if (idx === -1) return { type: '', event: stripEventSuffix(eventType) }
     return { type: stripEventSuffix(eventType.slice(0, idx)), event: eventType.slice(idx + 2) }
   }
 
