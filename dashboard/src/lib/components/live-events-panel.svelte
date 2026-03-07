@@ -16,10 +16,13 @@
 
   const events = $derived(eventsQuery.data ?? [])
 
+  const stripEventSuffix = (name: string): string =>
+    name.endsWith('Event') ? name.slice(0, -5) : name
+
   const parseEventType = (eventType: string): { type: string; event: string } => {
     const idx = eventType.indexOf('::')
-    if (idx === -1) return { type: eventType, event: '' }
-    return { type: eventType.slice(0, idx), event: eventType.slice(idx + 2) }
+    if (idx === -1) return { type: stripEventSuffix(eventType), event: '' }
+    return { type: stripEventSuffix(eventType.slice(0, idx)), event: eventType.slice(idx + 2) }
   }
 
   type SortDir = 'asc' | 'desc'
