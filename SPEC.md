@@ -2425,7 +2425,7 @@ type ServerMessage =
   | { type: "inventory:updated"; data: Inventory }
   | { type: "metrics:updated"; data: PerformanceMetrics }
   | { type: "spread:updated"; data: SpreadUpdate }
-  | { type: "rebalance:updated"; data: RebalanceOperation }
+  | { type: "transfer_update"; data: TransferOperation }
   | { type: "circuit_breaker:changed"; data: CircuitBreakerStatus }
   | { type: "auth:status"; data: AuthStatus };
 
@@ -2434,8 +2434,8 @@ type InitialState = {
   inventory: Inventory;
   metrics: PerformanceMetrics;
   spreads: SpreadSummary[];
-  activeRebalances: RebalanceOperation[];
-  recentRebalances: RebalanceOperation[];
+  activeTransfers: TransferOperation[];
+  recentTransfers: TransferOperation[];
   authStatus: AuthStatus;
   circuitBreaker: CircuitBreakerStatus;
 };
@@ -2487,22 +2487,33 @@ type Inventory = {
   usdc: { onchain: number; offchain: number };
 };
 
-type RebalanceOperation =
-  | { type: "mint"; id: string; symbol: string; amount: number }
-    & RebalanceStatus
-  | { type: "redeem"; id: string; symbol: string; amount: number }
-    & RebalanceStatus
+type TransferOperation =
+  | { kind: "equity_mint"; id: string; symbol: string; quantity: string }
+    & { status: TransferStatus; startedAt: string; updatedAt: string }
+  | { kind: "equity_redemption"; id: string; symbol: string; quantity: string }
+    & { status: TransferStatus; startedAt: string; updatedAt: string }
   | {
-    type: "usdc";
+    kind: "usdc_bridge";
     id: string;
     direction: "alpaca_to_base" | "base_to_alpaca";
-    amount: number;
-  } & RebalanceStatus;
+    amount: string;
+  } & { status: TransferStatus; startedAt: string; updatedAt: string };
 
-type RebalanceStatus =
-  | { status: "in_progress"; startedAt: Date }
-  | { status: "completed"; startedAt: Date; completedAt: Date }
-  | { status: "failed"; startedAt: Date; failedAt: Date; reason: string };
+type TransferStatus =
+  | {
+    status:
+      | "minting"
+      | "wrapping"
+      | "depositing"
+      | "withdrawing"
+      | "unwrapping"
+      | "sending"
+      | "pending_confirmation"
+      | "converting"
+      | "bridging";
+  }
+  | { status: "completed"; completedAt: string }
+  | { status: "failed"; failedAt: string };
 ```
 
 ##### TanStack Query Integration
@@ -2518,8 +2529,8 @@ socket.onmessage = (event) => {
       queryClient.setQueryData(["events"], []); // starts empty, fills with live events
       queryClient.setQueryData(["trades"], data.recentTrades);
       queryClient.setQueryData(["inventory"], data.inventory);
-      queryClient.setQueryData(["rebalances", "active"], data.activeRebalances);
-      queryClient.setQueryData(["rebalances", "recent"], data.recentRebalances);
+      queryClient.setQueryData(["transfers", "active"], data.activeTransfers);
+      queryClient.setQueryData(["transfers", "recent"], data.recentTransfers);
       queryClient.setQueryData(["auth"], data.authStatus);
       queryClient.setQueryData(["circuitBreaker"], data.circuitBreaker);
     },
@@ -2532,7 +2543,7 @@ socket.onmessage = (event) => {
     "inventory:updated": (inventory) => {
       queryClient.setQueryData(["inventory"], inventory);
     },
-    "rebalance:updated": (op) => {
+    "transfer_update": (op) => {
       // Update active or move to recent based on status
     },
     // ... other event handlers

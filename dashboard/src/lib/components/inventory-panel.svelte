@@ -7,6 +7,7 @@
   import type { Inventory } from '$lib/api/Inventory'
   import type { TransferOperation } from '$lib/api/TransferOperation'
   import { matcher } from '$lib/fp'
+  import { decimalAdd, decimalCompare, decimalIsZero, decimalToNumber } from '$lib/decimal'
 
   const inventoryQuery = createQuery<Inventory>(() => ({
     queryKey: ['inventory'],
@@ -42,7 +43,11 @@
 
   const activeTransfers = $derived(activeQuery.data ?? [])
   const recentTransfers = $derived(recentQuery.data ?? [])
-  const allTransfers = $derived([...activeTransfers, ...recentTransfers])
+  const allTransfers = $derived.by(() => {
+    const byId = new Map(recentTransfers.map((transfer) => [transfer.id, transfer]))
+    for (const transfer of activeTransfers) byId.set(transfer.id, transfer)
+    return [...byId.values()]
+  })
 
   const decimalPlaces = (value: string): number => {
     const dotIdx = value.indexOf('.')
@@ -51,38 +56,32 @@
   }
 
   const fmt = (value: string): string => {
-    const num = parseFloat(value)
-    if (num === 0) return '-'
+    if (decimalIsZero(value)) return '-'
     const dp = decimalPlaces(value)
-    return num.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
+    return decimalToNumber(value).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
   }
 
   const fmtNum = (value: string): string => {
-    const num = parseFloat(value)
     const dp = decimalPlaces(value)
-    return num.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
+    return decimalToNumber(value).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
   }
 
   type CashRow = { label: string; value: string; decimals: number }
 
   const cashRows = $derived.by((): CashRow[] => {
     if (!usdc) return []
-    const usdcVal = parseFloat(usdc.onchainAvailable)
-    const usdVal = parseFloat(usdc.offchainAvailable)
-    const totalVal = usdcVal + usdVal
     return [
-      { label: 'Total', value: String(totalVal), decimals: 6 },
-      { label: 'USDC', value: String(usdcVal), decimals: 6 },
-      { label: 'USD', value: String(usdVal), decimals: 2 }
+      { label: 'Total', value: decimalAdd(usdc.onchainAvailable, usdc.offchainAvailable), decimals: 6 },
+      { label: 'USDC', value: usdc.onchainAvailable, decimals: 6 },
+      { label: 'USD', value: usdc.offchainAvailable, decimals: 2 }
     ]
   })
 
   const maxDecimals = 6
 
   const fmtCashAligned = (value: string, decimals: number): string => {
-    const num = parseFloat(value)
-    if (num === 0) return '-'
-    const formatted = num.toLocaleString('en-US', {
+    if (decimalIsZero(value)) return '-'
+    const formatted = decimalToNumber(value).toLocaleString('en-US', {
       minimumFractionDigits: decimals,
       maximumFractionDigits: decimals
     })
@@ -107,6 +106,13 @@
       equity_mint: (op) => stripPrefix(op.symbol),
       equity_redemption: (op) => stripPrefix(op.symbol),
       usdc_bridge: () => 'USD'
+    })
+
+  const transferAmountRaw = (transfer: TransferOperation): string =>
+    matchKind(transfer, {
+      equity_mint: (op) => op.quantity,
+      equity_redemption: (op) => op.quantity,
+      usdc_bridge: (op) => op.amount
     })
 
   const transferAmount = (transfer: TransferOperation): string =>
@@ -166,9 +172,9 @@
     sorted.sort((left, right) => {
       let cmp = 0
       if (column === 'underlying') cmp = stripPrefix(left.symbol).localeCompare(stripPrefix(right.symbol))
-      else if (column === 'raindex') cmp = parseFloat(left.onchainAvailable) - parseFloat(right.onchainAvailable)
-      else if (column === 'alpaca') cmp = parseFloat(left.offchainAvailable) - parseFloat(right.offchainAvailable)
-      else cmp = (parseFloat(left.onchainAvailable) + parseFloat(left.offchainAvailable)) - (parseFloat(right.onchainAvailable) + parseFloat(right.offchainAvailable))
+      else if (column === 'raindex') cmp = decimalCompare(left.onchainAvailable, right.onchainAvailable)
+      else if (column === 'alpaca') cmp = decimalCompare(left.offchainAvailable, right.offchainAvailable)
+      else cmp = decimalCompare(decimalAdd(left.onchainAvailable, left.offchainAvailable), decimalAdd(right.onchainAvailable, right.offchainAvailable))
       return dir === 'desc' ? -cmp : cmp
     })
     return sorted
@@ -185,7 +191,7 @@
       let cmp = 0
       if (column === 'time') cmp = left.startedAt.localeCompare(right.startedAt)
       else if (column === 'purpose') cmp = transferPurpose(left).localeCompare(transferPurpose(right))
-      else if (column === 'amount') cmp = parseFloat(transferAmount(left).replace(/,/g, '')) - parseFloat(transferAmount(right).replace(/,/g, ''))
+      else if (column === 'amount') cmp = decimalCompare(transferAmountRaw(left), transferAmountRaw(right))
       else if (column === 'underlying') cmp = transferUnderlying(left).localeCompare(transferUnderlying(right))
       else cmp = left.status.status.localeCompare(right.status.status)
       return dir === 'desc' ? -cmp : cmp
@@ -228,7 +234,7 @@
                     {fmt(item.offchainAvailable)}
                   </Table.Cell>
                   <Table.Cell class="text-right font-mono font-semibold">
-                    {fmtNum(String(parseFloat(item.onchainAvailable) + parseFloat(item.offchainAvailable)))}
+                    {fmtNum(decimalAdd(item.onchainAvailable, item.offchainAvailable))}
                   </Table.Cell>
                 </Table.Row>
               {/each}
