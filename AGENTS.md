@@ -227,6 +227,10 @@ resolution and feature selection.
 See `.skills/gitbutler/` for version control workflow and
 `.github/PULL_REQUEST_TEMPLATE.md` for PR format requirements.
 
+**Default behavior:** After completing work, stage, commit, and push all changes
+unless the user explicitly says not to push (or there is a clear, stated reason
+to avoid pushing). Do not stop to ask for confirmation by default—proceed.
+
 ## Development Workflow Notes
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
@@ -399,6 +403,10 @@ is the source of truth for terminology and naming conventions.
   system. Use ADTs and enums to encode business rules and state transitions
   directly in types rather than runtime validation. See "Type modeling" in Code
   Style for details
+- **SDK Boundary Conversion**: Functions that call external SDKs must accept
+  domain types and convert to SDK types internally. Never strip domain types to
+  primitives (`&str`, `u64`, etc.) at the call site — the conversion belongs
+  inside the function that needs the primitive for the SDK call
 - **Schema Design**: Avoid database columns that can contradict each other. Use
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where

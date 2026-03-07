@@ -516,11 +516,10 @@ pub(super) async fn alpaca_journal_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, address};
+    use alloy::primitives::{Address, address};
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use std::collections::HashMap;
     use url::Url;
     use uuid::uuid;
 
@@ -529,11 +528,10 @@ mod tests {
 
     use super::*;
     use crate::cli::ConvertDirection;
-    use crate::config::{LogLevel, OperationalLimits, TradingMode};
+    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
-    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -541,7 +539,6 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -557,7 +554,10 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
         }
     }
 
@@ -595,7 +595,6 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -614,14 +613,20 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
                 ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                UsdcRebalancing::Disabled,
+                ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.3),
+                },
                 Address::ZERO,
-                B256::ZERO,
                 AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
@@ -632,7 +637,6 @@ mod tests {
                 },
             ))),
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
         }
     }
 

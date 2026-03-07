@@ -30,7 +30,7 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
-use crate::config::{Ctx, CtxError, OperationalLimits};
+use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
@@ -41,7 +41,7 @@ use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::raindex::RaindexService;
+use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
@@ -72,7 +72,7 @@ pub(crate) struct TradeProcessingCqrs {
     pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) execution_threshold: ExecutionThreshold,
-    pub(crate) operational_limits: OperationalLimits,
+    pub(crate) assets: AssetsConfig,
 }
 
 pub(crate) struct Conductor {
@@ -176,6 +176,8 @@ impl Conductor {
                 StoreBuilder::<VaultRegistry>::new(pool.clone())
                     .build(())
                     .await?;
+
+            seed_vault_registry_from_config(&vault_registry, &ctx).await?;
 
             let rebalancing = match ctx.rebalancing_ctx() {
                 Ok(ctx) => Some(ctx.clone()),
@@ -321,6 +323,66 @@ struct RebalancingDeps {
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
 }
 
+/// Pre-seeds the vault registry with vault IDs from config.
+///
+/// Assets with a `vault_id` in config get their vaults registered
+/// immediately at startup, so rebalancing can work even before any
+/// onchain trades have been observed.
+async fn seed_vault_registry_from_config(
+    vault_registry: &Store<VaultRegistry>,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let vault_registry_id = VaultRegistryId {
+        orderbook: ctx.evm.orderbook,
+        owner: ctx.order_owner(),
+    };
+
+    for (symbol, equity_config) in &ctx.assets.equities.symbols {
+        let Some(vault_id) = equity_config.vault_id else {
+            if ctx.is_rebalancing_enabled(symbol) {
+                return Err(CtxError::MissingEquityVaultId {
+                    symbol: symbol.clone(),
+                }
+                .into());
+            }
+            continue;
+        };
+
+        info!(
+            %symbol,
+            %vault_id,
+            token = %equity_config.tokenized_equity_derivative,
+            "Seeding equity vault from config"
+        );
+
+        vault_registry
+            .send(
+                &vault_registry_id,
+                VaultRegistryCommand::SeedEquityVaultFromConfig {
+                    token: equity_config.tokenized_equity_derivative,
+                    vault_id,
+                    symbol: symbol.clone(),
+                },
+            )
+            .await?;
+    }
+
+    if let Some(cash) = &ctx.assets.cash
+        && let Some(vault_id) = cash.vault_id
+    {
+        info!(%vault_id, "Seeding USDC vault from config");
+
+        vault_registry
+            .send(
+                &vault_registry_id,
+                VaultRegistryCommand::SeedUsdcVaultFromConfig { vault_id },
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     ethereum_wallet: Chain,
@@ -357,7 +419,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let wrapper = Arc::new(WrapperService::new(
             base_wallet.clone(),
-            deps.ctx.equities.clone(),
+            deps.ctx.assets.equities.symbols.clone(),
         ));
 
         let equity_transfer_services = EquityTransferServices {
@@ -368,17 +430,19 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let disabled_assets = deps
             .ctx
+            .assets
             .equities
-            .iter()
-            .filter(|(_, config)| !config.enabled)
-            .map(|(symbol, _)| symbol.clone())
+            .symbols
+            .keys()
+            .filter(|symbol| !deps.ctx.is_rebalancing_enabled(symbol))
+            .cloned()
             .collect();
 
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: rebalancing_ctx.equity,
-                usdc: rebalancing_ctx.usdc.clone(),
-                limits: deps.ctx.operational_limits.clone(),
+                usdc: rebalancing_ctx.usdc,
+                assets: deps.ctx.assets.clone(),
                 disabled_assets,
             },
             deps.vault_registry,
@@ -404,7 +468,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let services = RebalancerServices::new(
             rebalancing_ctx.clone(),
-            deps.ctx.equities.clone(),
+            deps.ctx.assets.equities.symbols.clone(),
             ethereum_wallet,
             base_wallet,
             raindex_service,
@@ -412,9 +476,17 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
+        let usdc_vault_id = deps
+            .ctx
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.vault_id)
+            .ok_or(CtxError::MissingCashVaultId)?;
+
         let handle = services.spawn(
-            &rebalancing_ctx,
             market_maker_wallet,
+            RaindexVaultId(usdc_vault_id),
             operation_receiver,
             frameworks,
         );
@@ -600,7 +672,6 @@ fn spawn_periodic_accumulated_position_check<E>(
     offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
     check_interval: Duration,
-    operational_limits: OperationalLimits,
     ctx: Ctx,
 ) -> JoinHandle<()>
 where
@@ -622,7 +693,7 @@ where
                 &position_projection,
                 &offchain_order,
                 &execution_threshold,
-                &operational_limits,
+                &ctx.assets,
                 |symbol| ctx.is_asset_enabled(symbol),
             )
             .await
@@ -927,7 +998,7 @@ async fn process_next_queued_event<E: Executor>(
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
 
-    let asset_enabled = ctx.is_asset_enabled(trade.symbol.base());
+    let trading_enabled = ctx.is_asset_enabled(trade.symbol.base());
 
     process_queued_trade(
         queue_context.executor,
@@ -936,7 +1007,7 @@ async fn process_next_queued_event<E: Executor>(
         event_id,
         trade,
         cqrs,
-        asset_enabled,
+        trading_enabled,
     )
     .await
 }
@@ -1167,7 +1238,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
         &cqrs.position_projection,
         base_symbol,
         executor_type,
-        &cqrs.operational_limits,
+        &cqrs.assets,
         asset_enabled,
     )
     .await?
@@ -1327,8 +1398,8 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     position_projection: &Projection<Position>,
     offchain_order: &Arc<Store<OffchainOrder>>,
     threshold: &ExecutionThreshold,
-    limits: &OperationalLimits,
-    is_asset_enabled: impl Fn(&Symbol) -> bool,
+    assets: &AssetsConfig,
+    is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
@@ -1339,8 +1410,8 @@ where
         executor,
         position_projection,
         executor_type,
-        limits,
-        is_asset_enabled,
+        assets,
+        is_trading_enabled,
     )
     .await?;
 
@@ -1524,11 +1595,11 @@ mod tests {
     };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
+    use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
     use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
-    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::{ExecutionThreshold, Usdc};
@@ -1539,6 +1610,29 @@ mod tests {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
+    fn test_assets_config() -> AssetsConfig {
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: Address::random(),
+                vault_id: None,
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols,
+            },
+            cash: None,
+        }
+    }
+
     fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
             onchain_trade: frameworks.onchain_trade.clone(),
@@ -1546,7 +1640,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
-            operational_limits: OperationalLimits::Disabled,
+            assets: test_assets_config(),
         }
     }
 
@@ -2821,7 +2915,7 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
-            operational_limits: OperationalLimits::Disabled,
+            assets: test_assets_config(),
         }
     }
 
@@ -3165,7 +3259,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
-            &cqrs.operational_limits,
+            &cqrs.assets,
             |_| true,
         )
         .await
@@ -3363,11 +3457,11 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancing::Enabled {
+                usdc: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                limits: OperationalLimits::Disabled,
+                assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3451,11 +3545,8 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: threshold,
-                usdc: UsdcRebalancing::Enabled {
-                    target: threshold.target,
-                    deviation: threshold.deviation,
-                },
-                limits: OperationalLimits::Disabled,
+                usdc: threshold,
+                assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3562,11 +3653,11 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancing::Enabled {
+                usdc: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                limits: OperationalLimits::Disabled,
+                assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3686,11 +3777,11 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: UsdcRebalancing::Enabled {
+                usdc: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                limits: OperationalLimits::Disabled,
+                assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3963,7 +4054,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
-            &cqrs.operational_limits,
+            &cqrs.assets,
             |_| true,
         )
         .await
@@ -4047,7 +4138,7 @@ mod tests {
             &cqrs.position_projection,
             &cqrs.offchain_order,
             &cqrs.execution_threshold,
-            &cqrs.operational_limits,
+            &cqrs.assets,
             |_| true,
         )
         .await
