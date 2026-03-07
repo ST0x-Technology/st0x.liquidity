@@ -803,7 +803,7 @@ mod tests {
         contracts_mock.assert();
         create_mock.assert();
         assert!(
-            poll_mock.hits() >= 1,
+            poll_mock.calls() >= 1,
             "poll endpoint should be hit at least once"
         );
         assert!(
@@ -860,7 +860,7 @@ mod tests {
         contracts_mock.assert();
         create_mock.assert();
         assert!(
-            poll_mock.hits() >= 1,
+            poll_mock.calls() >= 1,
             "poll endpoint should be hit at least once"
         );
         assert!(
@@ -932,7 +932,7 @@ mod tests {
         contracts_mock.assert();
         create_mock.assert();
         assert!(
-            poll_mock.hits() >= 1,
+            poll_mock.calls() >= 1,
             "poll endpoint should be hit at least once"
         );
         assert_eq!(result.transaction_hash, tx_hash);
@@ -1293,10 +1293,10 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            poll_mock.hits() >= 2,
+            poll_mock.calls() >= 2,
             "should have polled multiple times before timing out, \
              but only polled {} time(s)",
-            poll_mock.hits()
+            poll_mock.calls()
         );
         assert!(
             matches!(
