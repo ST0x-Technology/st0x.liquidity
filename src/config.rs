@@ -939,7 +939,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
-            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
         "#,
         );
@@ -1036,7 +1035,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
-            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
         "#,
         );
@@ -1404,7 +1402,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
-            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
         "#,
         );
