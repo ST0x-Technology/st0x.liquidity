@@ -4,6 +4,7 @@ import type { QueryClient } from '@tanstack/svelte-query'
 import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
 import type { InitialState } from '$lib/api/InitialState'
 import type { Inventory } from '$lib/api/Inventory'
+import type { InventorySnapshot } from '$lib/api/InventorySnapshot'
 import type { ServerMessage } from '$lib/api/ServerMessage'
 import type { TransferOperation } from '$lib/api/TransferOperation'
 
@@ -633,6 +634,53 @@ describe('createWebSocket', () => {
     expect(result).toEqual([transfer])
   })
 
+  it('handles transfer_update by replacing existing active transfer with same id', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    const existingTransfer: TransferOperation = {
+      kind: 'equity_mint',
+      id: 'mint-1',
+      symbol: 'tAAPL',
+      quantity: '100',
+      status: { status: 'minting' },
+      startedAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z'
+    }
+
+    const updatedTransfer: TransferOperation = {
+      kind: 'equity_mint',
+      id: 'mint-1',
+      symbol: 'tAAPL',
+      quantity: '100',
+      status: { status: 'wrapping' },
+      startedAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:30Z'
+    }
+
+    const message: ServerMessage = { type: 'transfer_update', data: updatedTransfer }
+    MockWebSocket.getInstance(0).simulateMessage(message)
+
+    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
+    const transfersCall = setQueryDataCalls.find(
+      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","active"]'
+    )
+
+    expect(transfersCall).toBeDefined()
+    if (transfersCall === undefined) throw new Error('transfersCall should be defined')
+
+    const updater = transfersCall[1] as (
+      old: TransferOperation[] | undefined
+    ) => TransferOperation[]
+    const result = updater([existingTransfer])
+
+    expect(result).toHaveLength(1)
+    expect(result[0]).toEqual(updatedTransfer)
+  })
+
   it('handles transfer_update by moving completed transfer to recent', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
@@ -655,7 +703,7 @@ describe('createWebSocket', () => {
       id: 'mint-1',
       symbol: 'tAAPL',
       quantity: '100',
-      status: { status: 'completed', completed_at: '2024-01-01T00:01:00Z' },
+      status: { status: 'completed', completedAt: '2024-01-01T00:01:00Z' },
       startedAt: '2024-01-01T00:00:00Z',
       updatedAt: '2024-01-01T00:01:00Z'
     }
@@ -730,6 +778,52 @@ describe('createWebSocket', () => {
       type: 'transfer_update',
       data: { noKind: true }
     })
+    consoleSpy.mockRestore()
+  })
+
+  it('rejects transfer_update with missing nested status field', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({
+        type: 'transfer_update',
+        data: { kind: 'equity_mint', id: 'mint-1', symbol: 'tAAPL', quantity: '100' }
+      })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith(
+      'Invalid ServerMessage structure:',
+      expect.objectContaining({ type: 'transfer_update' })
+    )
+    consoleSpy.mockRestore()
+  })
+
+  it('rejects inventory_update with missing nested usdc fields', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({
+        type: 'inventory_update',
+        data: { perSymbol: [], usdc: {} }
+      })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith(
+      'Invalid ServerMessage structure:',
+      expect.objectContaining({ type: 'inventory_update' })
+    )
     consoleSpy.mockRestore()
   })
 

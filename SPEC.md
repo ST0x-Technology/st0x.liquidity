@@ -2419,23 +2419,16 @@ All read data flows through a single WebSocket connection:
 type ServerMessage =
   | { type: "initial"; data: InitialState }
   | { type: "event"; data: EventStoreEntry }
-  | { type: "trade:onchain"; data: OnchainTrade }
-  | { type: "trade:offchain"; data: OffchainTrade }
-  | { type: "position:updated"; data: Position }
-  | { type: "inventory:updated"; data: Inventory }
-  | { type: "metrics:updated"; data: PerformanceMetrics }
-  | { type: "spread:updated"; data: SpreadUpdate }
-  | { type: "rebalance:updated"; data: RebalanceOperation }
-  | { type: "circuit_breaker:changed"; data: CircuitBreakerStatus }
-  | { type: "auth:status"; data: AuthStatus };
+  | { type: "inventory_update"; data: InventorySnapshot }
+  | { type: "transfer_update"; data: TransferOperation };
 
 type InitialState = {
   recentTrades: Trade[];
   inventory: Inventory;
   metrics: PerformanceMetrics;
   spreads: SpreadSummary[];
-  activeRebalances: RebalanceOperation[];
-  recentRebalances: RebalanceOperation[];
+  activeTransfers: TransferOperation[];
+  recentTransfers: TransferOperation[];
   authStatus: AuthStatus;
   circuitBreaker: CircuitBreakerStatus;
 };
@@ -2487,22 +2480,33 @@ type Inventory = {
   usdc: { onchain: number; offchain: number };
 };
 
-type RebalanceOperation =
-  | { type: "mint"; id: string; symbol: string; amount: number }
-    & RebalanceStatus
-  | { type: "redeem"; id: string; symbol: string; amount: number }
-    & RebalanceStatus
+type TransferOperation =
+  | { kind: "equity_mint"; id: string; symbol: string; quantity: string }
+    & { status: TransferStatus; startedAt: string; updatedAt: string }
+  | { kind: "equity_redemption"; id: string; symbol: string; quantity: string }
+    & { status: TransferStatus; startedAt: string; updatedAt: string }
   | {
-    type: "usdc";
+    kind: "usdc_bridge";
     id: string;
     direction: "alpaca_to_base" | "base_to_alpaca";
-    amount: number;
-  } & RebalanceStatus;
+    amount: string;
+  } & { status: TransferStatus; startedAt: string; updatedAt: string };
 
-type RebalanceStatus =
-  | { status: "in_progress"; startedAt: Date }
-  | { status: "completed"; startedAt: Date; completedAt: Date }
-  | { status: "failed"; startedAt: Date; failedAt: Date; reason: string };
+type TransferStatus =
+  | {
+    status:
+      | "minting"
+      | "wrapping"
+      | "depositing"
+      | "withdrawing"
+      | "unwrapping"
+      | "sending"
+      | "pending_confirmation"
+      | "converting"
+      | "bridging";
+  }
+  | { status: "completed"; completedAt: string }
+  | { status: "failed"; failedAt: string };
 ```
 
 ##### TanStack Query Integration
@@ -2518,8 +2522,8 @@ socket.onmessage = (event) => {
       queryClient.setQueryData(["events"], []); // starts empty, fills with live events
       queryClient.setQueryData(["trades"], data.recentTrades);
       queryClient.setQueryData(["inventory"], data.inventory);
-      queryClient.setQueryData(["rebalances", "active"], data.activeRebalances);
-      queryClient.setQueryData(["rebalances", "recent"], data.recentRebalances);
+      queryClient.setQueryData(["transfers", "active"], data.activeTransfers);
+      queryClient.setQueryData(["transfers", "recent"], data.recentTransfers);
       queryClient.setQueryData(["auth"], data.authStatus);
       queryClient.setQueryData(["circuitBreaker"], data.circuitBreaker);
     },
@@ -2532,7 +2536,7 @@ socket.onmessage = (event) => {
     "inventory:updated": (inventory) => {
       queryClient.setQueryData(["inventory"], inventory);
     },
-    "rebalance:updated": (op) => {
+    "transfer_update": (op) => {
       // Update active or move to recent based on status
     },
     // ... other event handlers
@@ -2684,11 +2688,12 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
    - Hedge lag (average time between onchain trade and offchain hedge execution)
    - Uptime (% of market hours the bot was operational)
 
-2. **Inventory** (2/3 width): Two sections separated by a divider. Top section
-   shows current holdings: Asset, Raindex, Inflight (`← 10.50 ←` or
-   `→ 25.75 →`), Alpaca. USDC row separated by border. Bottom section shows
-   rebalancing transfers: Asset, Transfer (`Alpaca — 10.50 → Raindex`), Status
-   (badge). Active transfers first, then recent.
+2. **Inventory** (2/3 width): Two side-by-side tables. Left table shows equity
+   holdings: Equity, Raindex, Alpaca, Total. Right table shows cash balances:
+   Total (USDC + USD), USDC (onchain), USD (offchain). Below a separator,
+   "Inventory Transfers" lists active transfers first, then recent: Time,
+   Purpose, Amount, Underlying, Status (dot indicator). All columns are
+   sortable.
 
 3. **Spreads**: Live spread visualization using TradingView Lightweight Charts:
    - Overview table showing last realized spreads per asset (buy price, sell
@@ -2701,8 +2706,8 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
    onchain/offchain/both (default: both). Shows symbol, direction, amount,
    price, timestamp, venue.
 
-5. **Rebalancing** (Alpaca only): Merged into the Inventory panel as a
-   sub-section below the current holdings (see panel 2 above).
+5. **Rebalancing**: Merged into the Inventory panel as the "Inventory Transfers"
+   sub-section (see panel 2 above).
 
 6. **Live Events**: Real-time stream of domain events as they occur
    (aggregate_type, aggregate_id, sequence, event_type, timestamp). Payloads

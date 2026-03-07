@@ -676,11 +676,13 @@ Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 #### ASCII in code, unicode in user-facing output
 
-Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
-Unicode breaks vim navigation and grep workflows.
+Use ASCII characters only in identifiers, comments, log messages, and config
+keys. For arrows in comments, use `->` not `→`. Unicode breaks vim navigation
+and grep workflows.
 
-In user-facing output (GUI templates, CLI display, rendered text), prefer
-unicode characters (`←`, `→`, `·`, etc.) for readability and polish.
+In user-facing string literals (GUI templates, CLI display, rendered text),
+prefer unicode characters (`←`, `→`, `·`, `▲`, `▼`, etc.) for readability and
+polish.
 
 #### No single-letter variables or arguments
 

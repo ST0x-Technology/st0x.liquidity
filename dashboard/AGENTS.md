@@ -8,7 +8,7 @@ This file provides guidance to AI agents working with the dashboard.
 
 ### Package Manager
 
-Use `bun` for all operations. Run from repo root with `--cwd dashboard`.
+Use `bun` for all operations. `cd dashboard` before running commands.
 
 **CRITICAL: After any change to `bun.lock`**, regenerate `bun.nix` and format
 it:
@@ -66,6 +66,42 @@ matchState(state, {
 - Direct `$state` mutations → use `reactive()` for explicit updates
 - Nested if/else on union types → use `matcher()` for exhaustive matching
 - Try/catch blocks → use `tryCatch()` / `Result` type
+
+### Code Formatting
+
+Prettier and formatters don't enforce vertical breathing room. These rules are
+manual discipline:
+
+- **Multi-property objects on separate lines.** Never cram multi-property object
+  literals onto a single line. Break them across lines so each property is
+  scannable.
+- **Blank lines between conditional branches.** When sequential `if` blocks
+  return objects, separate them with a blank line.
+
+```typescript
+// BAD
+if (status === "completed") {
+  return { text: "text-muted-foreground", dot: "bg-muted-foreground" };
+}
+if (status === "failed") {
+  return { text: "text-destructive", dot: "bg-destructive" };
+}
+
+// GOOD
+if (status === "completed") {
+  return {
+    text: "text-muted-foreground",
+    dot: "bg-muted-foreground",
+  };
+}
+
+if (status === "failed") {
+  return {
+    text: "text-destructive",
+    dot: "bg-destructive",
+  };
+}
+```
 
 ### Testing
 
