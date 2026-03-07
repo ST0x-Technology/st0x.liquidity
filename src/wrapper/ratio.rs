@@ -77,9 +77,13 @@ impl UnderlyingPerWrapped {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
+    use st0x_exact_decimal::ExactDecimal;
 
     use super::*;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     #[test]
     fn one_to_one_ratio_converts_identity() {
@@ -142,11 +146,11 @@ mod tests {
     #[test]
     fn fractional_one_to_one_converts_identity() {
         let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-        let wrapped = FractionalShares::new(dec!(100));
+        let wrapped = FractionalShares::new(ed("100"));
 
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert_eq!(underlying.inner(), dec!(100));
+        assert_eq!(underlying.inner(), ed("100"));
     }
 
     #[test]
@@ -156,10 +160,10 @@ mod tests {
         let ratio = UnderlyingPerWrapped::new(assets_per_share).unwrap();
 
         // 100 wrapped should give 105 underlying
-        let wrapped = FractionalShares::new(dec!(100));
+        let wrapped = FractionalShares::new(ed("100"));
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert_eq!(underlying.inner(), dec!(105));
+        assert_eq!(underlying.inner(), ed("105"));
     }
 
     #[test]
@@ -169,10 +173,10 @@ mod tests {
         let ratio = UnderlyingPerWrapped::new(assets_per_share).unwrap();
 
         // 50 wrapped should give 100 underlying
-        let wrapped = FractionalShares::new(dec!(50));
+        let wrapped = FractionalShares::new(ed("50"));
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert_eq!(underlying.inner(), dec!(100));
+        assert_eq!(underlying.inner(), ed("100"));
     }
 
     #[test]
@@ -189,10 +193,10 @@ mod tests {
     #[test]
     fn fractional_conversion_handles_small_values() {
         let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-        let wrapped = FractionalShares::new(dec!(0.000001));
+        let wrapped = FractionalShares::new(ed("0.000001"));
 
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert_eq!(underlying.inner(), dec!(0.000001));
+        assert_eq!(underlying.inner(), ed("0.000001"));
     }
 }

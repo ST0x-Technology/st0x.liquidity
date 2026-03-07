@@ -4,8 +4,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
+use rain_math_float::FloatError;
 use tokio::sync::RwLock;
 use tracing::{trace, warn};
+
+use st0x_exact_decimal::ExactDecimal;
 
 use st0x_execution::{FractionalShares, Symbol};
 
@@ -15,7 +18,7 @@ use crate::inventory::{EquityImbalanceError, Imbalance, ImbalanceThreshold, Inve
 use crate::wrapper::{UnderlyingPerWrapped, WrapperError};
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
-const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u32 = 9;
+const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
 
 /// Why an equity trigger failed.
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +31,8 @@ pub(crate) enum EquityTriggerError {
     TokenAddress(#[from] TokenAddressError),
     #[error(transparent)]
     Wrapper(#[from] WrapperError),
+    #[error("Float arithmetic error during truncation: {0}")]
+    Float(#[from] FloatError),
 }
 
 /// RAII guard that holds an equity in-progress claim.
@@ -115,14 +120,14 @@ pub(super) async fn check_imbalance_and_build_operation(
 
     Ok(Some(match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), limits);
+            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess)?, limits);
             TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
             }
         }
         Imbalance::TooMuchOnchain { excess } => {
-            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess), limits);
+            let quantity = cap_shares(symbol, truncate_for_alpaca(symbol, excess)?, limits);
             TriggeredOperation::Redemption {
                 symbol: symbol.clone(),
                 quantity,
@@ -158,11 +163,18 @@ fn cap_shares(
 
 /// Truncates to the Alpaca API decimal limit, logging a warning when
 /// sub-nanoshare digits are dropped.
-fn truncate_for_alpaca(symbol: &Symbol, quantity: FractionalShares) -> FractionalShares {
-    let truncated_decimal = quantity
+fn truncate_for_alpaca(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+) -> Result<FractionalShares, FloatError> {
+    // Truncate by converting to fixed-point with the target scale,
+    // then back. This drops any digits beyond the scale limit.
+    let (fixed, _lossless) = quantity
         .inner()
-        .trunc_with_scale(ALPACA_QUANTITY_MAX_DECIMAL_PLACES);
-    let truncated = FractionalShares::new(truncated_decimal);
+        .to_fixed_decimal_lossy(ALPACA_QUANTITY_MAX_DECIMAL_PLACES)?;
+    let truncated_value =
+        ExactDecimal::from_fixed_decimal(fixed, ALPACA_QUANTITY_MAX_DECIMAL_PLACES)?;
+    let truncated = FractionalShares::new(truncated_value);
 
     if truncated != quantity {
         warn!(
@@ -174,16 +186,14 @@ fn truncate_for_alpaca(symbol: &Symbol, quantity: FractionalShares) -> Fractiona
         );
     }
 
-    truncated
+    Ok(truncated)
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{U256, address};
     use chrono::Utc;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
-    use std::str::FromStr;
+    use st0x_exact_decimal::ExactDecimal;
 
     use st0x_execution::{FractionalShares, Positive};
 
@@ -194,12 +204,16 @@ mod tests {
     use crate::threshold::Usdc;
     use crate::wrapper::RATIO_ONE;
 
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
+
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
     fn shares(quantity: i64) -> FractionalShares {
-        FractionalShares::new(Decimal::from(quantity))
+        FractionalShares::new(ed(&quantity.to_string()))
     }
 
     fn make_imbalanced_view(
@@ -273,8 +287,8 @@ mod tests {
         let view = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
         let inventory = Arc::new(RwLock::new(view));
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: ed("0.5"),
+            deviation: ed("0.2"),
         };
         let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
@@ -297,8 +311,8 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = make_imbalanced_view(&symbol, 20, 80);
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: ed("0.5"),
+            deviation: ed("0.2"),
         };
         let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
@@ -323,8 +337,8 @@ mod tests {
         let unwrapped_addr = address!("0xabcdef0123456789abcdef0123456789abcdef01");
         let inventory = make_imbalanced_view(&symbol, 80, 20);
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: ed("0.5"),
+            deviation: ed("0.2"),
         };
         let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
@@ -362,8 +376,8 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = make_imbalanced_view(&symbol, 65, 35);
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: ed("0.5"),
+            deviation: ed("0.2"),
         };
 
         // At 1:1 ratio, this is balanced
@@ -400,7 +414,7 @@ mod tests {
     }
 
     fn precise_shares(s: &str) -> FractionalShares {
-        FractionalShares::new(Decimal::from_str(s).unwrap())
+        FractionalShares::new(ed(s))
     }
 
     fn make_precise_imbalanced_view(
@@ -448,8 +462,8 @@ mod tests {
 
         let inventory = make_precise_imbalanced_view(&symbol, onchain, offchain);
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.1),
+            target: ed("0.5"),
+            deviation: ed("0.1"),
         };
 
         // Trigger rebalancing - should return Mint with truncated quantity
@@ -550,8 +564,8 @@ mod tests {
         // Target 50%, deviation 10% -> triggers when outside 40%-60%
         // Current ratio = 10.12... / 100 = ~10.12%, well below 40%
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.1),
+            target: ed("0.5"),
+            deviation: ed("0.1"),
         };
         let vault_ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
@@ -573,11 +587,19 @@ mod tests {
             panic!("Expected Mint");
         };
 
-        // Verify it's truncated (exactly 9 decimal places)
+        // Verify it's truncated to at most 9 decimal places.
+        // A lossless roundtrip through to_fixed_decimal(9) confirms no excess precision.
+        let (fixed, lossless) = qty1.inner().to_fixed_decimal_lossy(9).unwrap();
+        assert!(
+            lossless,
+            "First mint quantity should have at most 9 decimal places after truncation, \
+             but to_fixed_decimal(9) was lossy for {qty1}"
+        );
+        let roundtripped = ExactDecimal::from_fixed_decimal(fixed, 9).unwrap();
         assert_eq!(
-            qty1.inner().scale(),
-            9,
-            "First mint quantity should have exactly 9 decimal places after truncation"
+            qty1.inner(),
+            roundtripped,
+            "First mint quantity should survive 9-dp roundtrip"
         );
 
         // Simulate mint completing
@@ -642,11 +664,12 @@ mod tests {
         // plus the new imbalance. We can't easily calculate the exact expected value,
         // but we verify the system continues to work and produce truncated quantities.
         assert!(
-            qty2.inner() > Decimal::ZERO,
+            qty2.inner() > ExactDecimal::zero(),
             "Second mint should have positive quantity"
         );
+        let (_fixed2, lossless2) = qty2.inner().to_fixed_decimal_lossy(9).unwrap();
         assert!(
-            qty2.inner().scale() <= 9,
+            lossless2,
             "Second mint quantity should be truncated to at most 9 decimal places"
         );
     }
@@ -655,16 +678,16 @@ mod tests {
     fn truncate_for_alpaca_truncates_excess_precision() {
         let symbol = Symbol::new("TEST").unwrap();
         let original = precise_shares("1.12345678901234567890");
-        let truncated = truncate_for_alpaca(&symbol, original);
+        let truncated = truncate_for_alpaca(&symbol, original).unwrap();
 
-        assert_eq!(truncated.inner(), dec!(1.123456789));
+        assert_eq!(truncated.inner(), ed("1.123456789"));
     }
 
     #[test]
     fn truncate_for_alpaca_preserves_value_within_limit() {
         let symbol = Symbol::new("TEST").unwrap();
         let original = precise_shares("1.123");
-        let result = truncate_for_alpaca(&symbol, original);
+        let result = truncate_for_alpaca(&symbol, original).unwrap();
 
         assert_eq!(result, original);
     }
@@ -674,13 +697,13 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = make_imbalanced_view(&symbol, 80, 20);
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: ed("0.5"),
+            deviation: ed("0.2"),
         };
         let ratio = one_to_one_ratio();
         let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(10))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+            max_shares: Positive::new(FractionalShares::new(ed("10"))).unwrap(),
+            max_amount: Positive::new(Usdc(ed("1000"))).unwrap(),
         };
 
         let result = check_imbalance_and_build_operation(
@@ -699,7 +722,7 @@ mod tests {
         };
         assert_eq!(
             quantity,
-            FractionalShares::new(dec!(10)),
+            FractionalShares::new(ed("10")),
             "Operational limit should cap redemption to 10 shares, got {quantity}"
         );
     }
@@ -708,13 +731,13 @@ mod tests {
     async fn capped_equity_rebalancing_leaves_remaining_imbalance_triggerable() {
         let symbol = Symbol::new("AAPL").unwrap();
         let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: ed("0.5"),
+            deviation: ed("0.2"),
         };
         let ratio = one_to_one_ratio();
         let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(10))).unwrap(),
-            max_amount: Positive::new(Usdc(dec!(1000))).unwrap(),
+            max_shares: Positive::new(FractionalShares::new(ed("10"))).unwrap(),
+            max_amount: Positive::new(Usdc(ed("1000"))).unwrap(),
         };
 
         // 80 onchain / 20 offchain -> 80% onchain, above 70% -> excess ~30
@@ -738,7 +761,7 @@ mod tests {
         else {
             panic!("Expected first Redemption, got {first:?}");
         };
-        assert_eq!(first_qty, FractionalShares::new(dec!(10)));
+        assert_eq!(first_qty, FractionalShares::new(ed("10")));
 
         // After redeeming 10: 70 onchain / 30 offchain -> 70% onchain, still at boundary
         let inventory_after = make_imbalanced_view(&symbol, 70, 30);
@@ -781,7 +804,7 @@ mod tests {
         };
         assert_eq!(
             third_qty,
-            FractionalShares::new(dec!(10)),
+            FractionalShares::new(ed("10")),
             "Remaining imbalance triggers another capped operation"
         );
     }

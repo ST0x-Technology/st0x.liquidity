@@ -1,3 +1,4 @@
+use rain_math_float::FloatError;
 use thiserror::Error;
 
 mod auth;
@@ -30,10 +31,18 @@ pub enum AlpacaTradingApiError {
     EmptySymbol(#[from] crate::EmptySymbolError),
     #[error("Invalid shares: {0}")]
     InvalidShares(#[from] crate::InvalidSharesError),
-    #[error("Decimal parse error: {0}")]
-    DecimalParse(#[from] rust_decimal::Error),
     #[error("Num parse error: {0}")]
     NumParse(#[from] num_decimal::ParseNumError),
+    #[error(
+        "Cannot convert ExactDecimal formatted string \
+         '{formatted}' to Num: {source}"
+    )]
+    NumConversion {
+        formatted: String,
+        source: num_decimal::ParseNumError,
+    },
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
     #[error("Notional orders not supported")]
     NotionalOrdersNotSupported,
     #[error("Filled order {order_id} is missing required field: {field}")]

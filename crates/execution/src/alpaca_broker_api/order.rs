@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
+
+use st0x_exact_decimal::ExactDecimal;
 
 use super::client::AlpacaBrokerApiClient;
 use super::{AlpacaBrokerApiError, TimeInForce};
@@ -93,20 +94,12 @@ pub(super) struct OrderResponse {
         deserialize_with = "deserialize_positive_shares_from_string"
     )]
     pub quantity: Positive<FractionalShares>,
-    #[serde(
-        rename = "filled_qty",
-        default,
-        deserialize_with = "deserialize_optional_decimal"
-    )]
-    pub filled_quantity: Option<Decimal>,
+    #[serde(rename = "filled_qty", default)]
+    pub filled_quantity: Option<ExactDecimal>,
     pub side: OrderSide,
     pub status: BrokerOrderStatus,
-    #[serde(
-        rename = "filled_avg_price",
-        default,
-        deserialize_with = "deserialize_optional_decimal"
-    )]
-    pub filled_average_price: Option<Decimal>,
+    #[serde(rename = "filled_avg_price", default)]
+    pub filled_average_price: Option<ExactDecimal>,
 }
 
 /// Order request for crypto trading (e.g., USDC/USD conversion).
@@ -117,7 +110,7 @@ pub(crate) struct CryptoOrderRequest {
     pub symbol: String,
     /// Quantity of the base asset (e.g., USDC amount)
     #[serde(rename = "qty")]
-    pub quantity: Decimal,
+    pub quantity: ExactDecimal,
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
@@ -129,21 +122,13 @@ pub(crate) struct CryptoOrderRequest {
 pub struct CryptoOrderResponse {
     pub id: Uuid,
     pub symbol: String,
-    #[serde(rename = "qty", deserialize_with = "deserialize_decimal_from_string")]
-    pub quantity: Decimal,
+    #[serde(rename = "qty")]
+    pub quantity: ExactDecimal,
     status: BrokerOrderStatus,
-    #[serde(
-        rename = "filled_avg_price",
-        default,
-        deserialize_with = "deserialize_optional_decimal"
-    )]
-    pub filled_average_price: Option<Decimal>,
-    #[serde(
-        rename = "filled_qty",
-        default,
-        deserialize_with = "deserialize_optional_decimal"
-    )]
-    pub filled_quantity: Option<Decimal>,
+    #[serde(rename = "filled_avg_price", default)]
+    pub filled_average_price: Option<ExactDecimal>,
+    #[serde(rename = "filled_qty", default)]
+    pub filled_quantity: Option<ExactDecimal>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -164,33 +149,15 @@ impl CryptoOrderResponse {
     }
 }
 
-fn deserialize_decimal_from_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    s.parse::<Decimal>().map_err(serde::de::Error::custom)
-}
-
 fn deserialize_positive_shares_from_string<'de, D>(
     deserializer: D,
 ) -> Result<Positive<FractionalShares>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    let value: Decimal = s.parse().map_err(serde::de::Error::custom)?;
-    Positive::new(FractionalShares::new(value)).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let maybe_string: Option<String> = Option::deserialize(deserializer)?;
-    maybe_string
-        .map(|string| string.parse().map_err(serde::de::Error::custom))
-        .transpose()
+    let string = String::deserialize(deserializer)?;
+    let exact = ExactDecimal::parse(&string).map_err(serde::de::Error::custom)?;
+    Positive::new(FractionalShares::new(exact)).map_err(serde::de::Error::custom)
 }
 
 pub(super) async fn place_market_order(
@@ -303,7 +270,7 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
 /// - To convert USD buying power to USDC: buy USDC/USD
 pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
-    amount: Decimal,
+    amount: ExactDecimal,
     direction: ConversionDirection,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
     let side = match direction {
@@ -375,14 +342,16 @@ pub(crate) async fn poll_crypto_order_until_filled(
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
-    use std::str::FromStr;
 
     use super::*;
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -429,7 +398,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ed("100"))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -440,7 +409,7 @@ mod tests {
         mock.assert();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
-        assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
+        assert_eq!(placement.shares.inner(), FractionalShares::new(ed("100")));
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -475,7 +444,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
+            shares: Positive::new(FractionalShares::new(ed("50"))).unwrap(),
             direction: Direction::Sell,
         };
 
@@ -486,7 +455,7 @@ mod tests {
         mock.assert();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
-        assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
+        assert_eq!(placement.shares.inner(), FractionalShares::new(ed("50")));
         assert_eq!(placement.direction, Direction::Sell);
     }
 
@@ -518,7 +487,10 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
+        assert_eq!(
+            order_update.shares.inner(),
+            FractionalShares::new(ed("100"))
+        );
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price, None);
@@ -552,10 +524,13 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
-        assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
+        assert_eq!(order_update.shares.inner(), FractionalShares::new(ed("50")));
         assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
-        assert_eq!(order_update.price, Some(dec!(245.67)));
+        assert_eq!(
+            order_update.price,
+            Some(ExactDecimal::parse("245.67").unwrap())
+        );
     }
 
     #[tokio::test]
@@ -622,7 +597,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "USDCUSD",
-                    "qty": "1000.50",
+                    "qty": "1000.5",
                     "side": "sell",
                     "type": "market",
                     "time_in_force": "gtc"
@@ -632,17 +607,17 @@ mod tests {
                 .json_body(json!({
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": "USDCUSD",
-                    "qty": "1000.50",
+                    "qty": "1000.5",
                     "side": "sell",
                     "status": "filled",
                     "filled_avg_price": "1.0001",
-                    "filled_qty": "1000.50",
+                    "filled_qty": "1000.5",
                     "created_at": "2025-01-06T12:00:00Z"
                 }));
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let amount = Decimal::from_str("1000.50").unwrap();
+        let amount = ed("1000.5");
 
         let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd)
             .await
@@ -651,7 +626,7 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(order.symbol, "USDCUSD");
-        assert_eq!(order.quantity, Decimal::from_str("1000.50").unwrap());
+        assert_eq!(order.quantity, ed("1000.5"));
         assert_eq!(order.status_display(), "filled");
     }
 
@@ -685,7 +660,7 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let amount = Decimal::from_str("500").unwrap();
+        let amount = ed("500");
 
         let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc)
             .await
@@ -694,7 +669,7 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
-        assert_eq!(order.quantity, dec!(500));
+        assert_eq!(order.quantity, ed("500"));
         assert_eq!(order.status_display(), "filled");
     }
 
@@ -703,7 +678,7 @@ mod tests {
         let make_order = |status: BrokerOrderStatus| CryptoOrderResponse {
             id: Uuid::new_v4(),
             symbol: "USDCUSD".to_string(),
-            quantity: Decimal::from(100),
+            quantity: ed("100"),
             status,
             filled_average_price: None,
             filled_quantity: None,

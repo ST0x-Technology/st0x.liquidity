@@ -1,9 +1,9 @@
 //! Position fetching for Alpaca Broker API.
 
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use tracing::{debug, error};
+
+use st0x_exact_decimal::ExactDecimal;
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
@@ -14,14 +14,14 @@ use crate::{EquityPosition, FractionalShares, Inventory, Symbol};
 struct PositionResponse {
     symbol: String,
     #[serde(rename = "qty")]
-    quantity: Decimal,
-    market_value: Option<Decimal>,
+    quantity: ExactDecimal,
+    market_value: Option<ExactDecimal>,
 }
 
 /// Account details response from Alpaca Broker API.
 #[derive(Debug, Deserialize)]
 struct AccountDetailsResponse {
-    cash: Decimal,
+    cash: ExactDecimal,
 }
 
 pub(super) async fn fetch_inventory(
@@ -41,27 +41,38 @@ pub(super) async fn fetch_inventory(
                 );
             })?;
 
+            let quantity = FractionalShares::new(position.quantity);
+
             Ok(EquityPosition {
                 symbol,
-                quantity: FractionalShares::new(position.quantity),
+                quantity,
                 market_value: position.market_value,
             })
         })
         .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
 
-    let cents_decimal = account
-        .cash
-        .checked_mul(Decimal::from(100))
-        .ok_or(AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
+    let hundred = ExactDecimal::parse("100").map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let cents = (account.cash * hundred).map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let frac = cents
+        .frac()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
 
-    if !cents_decimal.fract().is_zero() {
+    if !frac
+        .is_zero()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?
+    {
         return Err(AlpacaBrokerApiError::FractionalCents(account.cash));
     }
 
-    let cash_balance_cents = cents_decimal
-        .trunc()
-        .to_i64()
-        .ok_or(AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
+    let integer_cents = cents
+        .integer()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let formatted = integer_cents
+        .format_decimal()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let cash_balance_cents: i64 = formatted
+        .parse()
+        .map_err(|_| AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
 
     Ok(Inventory {
         positions: broker_positions,
@@ -100,7 +111,6 @@ async fn get_account_details(
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
@@ -108,6 +118,14 @@ mod tests {
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
+
+    fn shares(value: &str) -> FractionalShares {
+        FractionalShares::new(ed(value))
+    }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -171,8 +189,11 @@ mod tests {
             .iter()
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
-        assert_eq!(aapl.quantity, FractionalShares::new(dec!(10.5)));
-        assert_eq!(aapl.market_value, Some(dec!(1575.00)));
+        assert_eq!(aapl.quantity, shares("10.5"));
+        assert_eq!(
+            aapl.market_value,
+            Some(ExactDecimal::parse("1575.00").unwrap())
+        );
     }
 
     #[tokio::test]
@@ -288,8 +309,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             aapl.market_value,
-            Some(dec!(1575.005)),
-            "Sub-cent market value 1575.005 should be preserved as Decimal"
+            Some(ExactDecimal::parse("1575.005").unwrap()),
+            "Sub-cent market value 1575.005 should be preserved as ExactDecimal"
         );
     }
 
@@ -366,6 +387,9 @@ mod tests {
             .iter()
             .find(|position| position.symbol.to_string() == "RKLB")
             .unwrap();
-        assert_eq!(rklb.market_value, Some(dec!(511.6476)));
+        assert_eq!(
+            rklb.market_value,
+            Some(ExactDecimal::parse("511.6476").unwrap())
+        );
     }
 }

@@ -11,8 +11,8 @@ use alloy::hex::FromHexError;
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use st0x_exact_decimal::ExactDecimal;
 use thiserror::Error;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -61,9 +61,9 @@ impl FromStr for OnChainTradeId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OnChainTrade {
     pub(crate) symbol: Symbol,
-    pub(crate) amount: Decimal,
+    pub(crate) amount: ExactDecimal,
     pub(crate) direction: Direction,
-    pub(crate) price_usdc: Decimal,
+    pub(crate) price_usdc: ExactDecimal,
     pub(crate) block_number: Option<u64>,
     pub(crate) block_timestamp: DateTime<Utc>,
     pub(crate) filled_at: DateTime<Utc>,
@@ -205,9 +205,9 @@ pub(crate) enum OnChainTradeError {
 pub(crate) enum OnChainTradeCommand {
     Witness {
         symbol: Symbol,
-        amount: Decimal,
+        amount: ExactDecimal,
         direction: Direction,
-        price_usdc: Decimal,
+        price_usdc: ExactDecimal,
         block_number: u64,
         block_timestamp: DateTime<Utc>,
     },
@@ -221,9 +221,9 @@ pub(crate) enum OnChainTradeCommand {
 pub(crate) enum OnChainTradeEvent {
     Filled {
         symbol: Symbol,
-        amount: Decimal,
+        amount: ExactDecimal,
         direction: Direction,
-        price_usdc: Decimal,
+        price_usdc: ExactDecimal,
         block_number: u64,
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
@@ -265,11 +265,13 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use st0x_event_sorcery::{LifecycleError, TestHarness, replay};
 
     use super::*;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     #[tokio::test]
     async fn witness_command_creates_filled_event() {
@@ -280,9 +282,9 @@ mod tests {
             .given_no_previous_events()
             .when(OnChainTradeCommand::Witness {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: ed("10.5"),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: ed("150.25"),
                 block_number: 12345,
                 block_timestamp: now,
             })
@@ -308,9 +310,9 @@ mod tests {
         let events = TestHarness::<OnChainTrade>::with(())
             .given(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: ed("10.5"),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: ed("150.25"),
                 block_number: 12345,
                 block_timestamp: now,
                 filled_at: now,
@@ -342,9 +344,9 @@ mod tests {
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol: symbol.clone(),
-                    amount: dec!(10.5),
+                    amount: ed("10.5"),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.25),
+                    price_usdc: ed("150.25"),
                     block_number: 12345,
                     block_timestamp: now,
                     filled_at: now,
@@ -402,18 +404,18 @@ mod tests {
         let error = TestHarness::<OnChainTrade>::with(())
             .given(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: ed("10.5"),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: ed("150.25"),
                 block_number: 12345,
                 block_timestamp: now,
                 filled_at: now,
             }])
             .when(OnChainTradeCommand::Witness {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: ed("10.5"),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: ed("150.25"),
                 block_number: 12345,
                 block_timestamp: now,
             })
@@ -442,9 +444,9 @@ mod tests {
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol: symbol.clone(),
-                    amount: dec!(10.5),
+                    amount: ed("10.5"),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.25),
+                    price_usdc: ed("150.25"),
                     block_number: 12345,
                     block_timestamp: now,
                     filled_at: now,
@@ -457,9 +459,9 @@ mod tests {
             ])
             .when(OnChainTradeCommand::Witness {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: ed("10.5"),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: ed("150.25"),
                 block_number: 12345,
                 block_timestamp: now,
             })
@@ -479,9 +481,9 @@ mod tests {
 
         let trade = replay::<OnChainTrade>(vec![OnChainTradeEvent::Filled {
             symbol,
-            amount: dec!(10.5),
+            amount: ed("10.5"),
             direction: Direction::Buy,
-            price_usdc: dec!(150.25),
+            price_usdc: ed("150.25"),
             block_number: 12345,
             block_timestamp: now,
             filled_at: now,
@@ -490,7 +492,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(trade.amount, dec!(10.5));
+        assert_eq!(trade.amount, ed("10.5"));
         assert_eq!(trade.direction, Direction::Buy);
         assert!(!trade.is_enriched());
     }
@@ -509,9 +511,9 @@ mod tests {
         let trade = replay::<OnChainTrade>(vec![
             OnChainTradeEvent::Filled {
                 symbol: Symbol::new("AAPL").unwrap(),
-                amount: dec!(10.5),
+                amount: ed("10.5"),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: ed("150.25"),
                 block_number: 12345,
                 block_timestamp: now,
                 filled_at: now,

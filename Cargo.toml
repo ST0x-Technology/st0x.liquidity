@@ -4,6 +4,7 @@ members = [
   "crates/dto",
   "crates/e2e-tests",
   "crates/event-sorcery",
+  "crates/exact-decimal",
   "crates/execution",
   "crates/bridge",
   "crates/evm",
@@ -82,7 +83,7 @@ opentelemetry-otlp = "0.30.0"
 tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
 rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
-rust_decimal = { version = "1.38.0", features = ["serde"] }
+st0x-exact-decimal = { path = "crates/exact-decimal" }
 st0x-evm = { path = "crates/evm" }
 num-decimal = { version = "0.2.5", default-features = false, features = [
   "num-v04",
@@ -130,7 +131,6 @@ rand.workspace = true
 rocket = { version = "0.5.1", features = ["json"] }
 chrono-tz.workspace = true
 aes-gcm = "0.10.3"
-rust_decimal.workspace = true
 num-traits.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -144,9 +144,9 @@ ts-rs = { version = "11.1.0", features = [
 ] }
 rocket_ws = "0.1.1"
 toml = "0.9.11"
-rust_decimal_macros = "1.38.0"
 st0x-evm = { workspace = true, features = ["fireblocks"] }
 bon = "3.9.0"
+st0x-exact-decimal.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true

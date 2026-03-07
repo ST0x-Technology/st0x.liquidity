@@ -313,11 +313,16 @@ pub(crate) struct Instrument {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use st0x_exact_decimal::ExactDecimal;
+
+    use super::*;
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     #[test]
     fn test_new_buy() {
@@ -862,8 +867,8 @@ mod tests {
 
         assert_eq!(order_status.order_id, Some("1004055538123".to_string()));
         assert!(order_status.is_filled());
-        assert_eq!(order_status.filled_quantity.unwrap(), dec!(100.0));
-        assert_eq!(order_status.price(), Some(dec!(150.25)));
+        assert_eq!(order_status.filled_quantity.unwrap(), ed("100"));
+        assert_eq!(order_status.price().unwrap(), Some(ed("150.25")));
     }
 
     #[tokio::test]
@@ -911,8 +916,8 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538456".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert_eq!(order_status.filled_quantity, Some(dec!(0.0)));
-        assert_eq!(order_status.price(), None);
+        assert_eq!(order_status.filled_quantity, Some(ed("0")));
+        assert_eq!(order_status.price().unwrap(), None);
     }
 
     #[tokio::test]
@@ -976,10 +981,12 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538789".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert_eq!(order_status.filled_quantity.unwrap(), dec!(75.0));
-        // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75 = 100.33333
-        let expected_price = (dec!(50) * dec!(100.00) + dec!(25) * dec!(101.00)) / dec!(75);
-        assert_eq!(order_status.price(), Some(expected_price));
+        assert_eq!(order_status.filled_quantity.unwrap(), ed("75"));
+        // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75 = 100.333...
+        let expected_price =
+            ((ed("50") * ed("100")).unwrap() + (ed("25") * ed("101")).unwrap()).unwrap();
+        let expected_price = (expected_price / ed("75")).unwrap();
+        assert_eq!(order_status.price().unwrap(), Some(expected_price));
     }
 
     #[tokio::test]

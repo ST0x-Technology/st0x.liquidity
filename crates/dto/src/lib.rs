@@ -5,10 +5,11 @@
 //! for the full workspace.
 
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::Serialize;
 use std::path::Path;
 use ts_rs::TS;
+
+use st0x_exact_decimal::ExactDecimal;
 
 /// Messages sent from the server to WebSocket clients.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -71,7 +72,7 @@ pub struct Trade {
 pub struct Position {
     pub symbol: String,
     #[ts(type = "string")]
-    pub net: Decimal,
+    pub net: ExactDecimal,
 }
 
 /// Per-symbol onchain/offchain/net balances.
@@ -80,11 +81,11 @@ pub struct Position {
 pub struct SymbolInventory {
     pub symbol: String,
     #[ts(type = "string")]
-    pub onchain: Decimal,
+    pub onchain: ExactDecimal,
     #[ts(type = "string")]
-    pub offchain: Decimal,
+    pub offchain: ExactDecimal,
     #[ts(type = "string")]
-    pub net: Decimal,
+    pub net: ExactDecimal,
 }
 
 /// Onchain and offchain USDC balances.
@@ -92,9 +93,9 @@ pub struct SymbolInventory {
 #[serde(rename_all = "camelCase")]
 pub struct UsdcInventory {
     #[ts(type = "string")]
-    pub onchain: Decimal,
+    pub onchain: ExactDecimal,
     #[ts(type = "string")]
-    pub offchain: Decimal,
+    pub offchain: ExactDecimal,
 }
 
 /// Full inventory snapshot across all symbols and USDC.
@@ -110,8 +111,8 @@ impl Inventory {
         Self {
             per_symbol: Vec::new(),
             usdc: UsdcInventory {
-                onchain: Decimal::ZERO,
-                offchain: Decimal::ZERO,
+                onchain: ExactDecimal::zero(),
+                offchain: ExactDecimal::zero(),
             },
         }
     }
@@ -121,9 +122,9 @@ impl Inventory {
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 pub struct PnL {
     #[ts(type = "string")]
-    pub absolute: Decimal,
+    pub absolute: ExactDecimal,
     #[ts(type = "string")]
-    pub percent: Decimal,
+    pub percent: ExactDecimal,
 }
 
 /// Performance metrics for a single time window.
@@ -131,38 +132,38 @@ pub struct PnL {
 #[serde(rename_all = "camelCase")]
 pub struct TimeframeMetrics {
     #[ts(type = "string")]
-    pub aum: Decimal,
+    pub aum: ExactDecimal,
     pub pnl: PnL,
     #[ts(type = "string")]
-    pub volume: Decimal,
+    pub volume: ExactDecimal,
     #[ts(type = "number")]
     pub trade_count: u64,
     #[ts(type = "string | null")]
-    pub sharpe_ratio: Option<Decimal>,
+    pub sharpe_ratio: Option<ExactDecimal>,
     #[ts(type = "string | null")]
-    pub sortino_ratio: Option<Decimal>,
+    pub sortino_ratio: Option<ExactDecimal>,
     #[ts(type = "string")]
-    pub max_drawdown: Decimal,
+    pub max_drawdown: ExactDecimal,
     #[ts(type = "number | null")]
     pub hedge_lag_ms: Option<u64>,
     #[ts(optional, type = "string")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub uptime_percent: Option<Decimal>,
+    pub uptime_percent: Option<ExactDecimal>,
 }
 
 impl TimeframeMetrics {
     pub fn zero() -> Self {
         Self {
-            aum: Decimal::ZERO,
+            aum: ExactDecimal::zero(),
             pnl: PnL {
-                absolute: Decimal::ZERO,
-                percent: Decimal::ZERO,
+                absolute: ExactDecimal::zero(),
+                percent: ExactDecimal::zero(),
             },
-            volume: Decimal::ZERO,
+            volume: ExactDecimal::zero(),
             trade_count: 0,
             sharpe_ratio: None,
             sortino_ratio: None,
-            max_drawdown: Decimal::ZERO,
+            max_drawdown: ExactDecimal::zero(),
             hedge_lag_ms: None,
             uptime_percent: None,
         }
@@ -202,13 +203,13 @@ impl PerformanceMetrics {
 pub struct SpreadSummary {
     pub symbol: String,
     #[ts(type = "string")]
-    pub last_buy_price: Decimal,
+    pub last_buy_price: ExactDecimal,
     #[ts(type = "string")]
-    pub last_sell_price: Decimal,
+    pub last_sell_price: ExactDecimal,
     #[ts(type = "string")]
-    pub pyth_price: Decimal,
+    pub pyth_price: ExactDecimal,
     #[ts(type = "string")]
-    pub spread_bps: Decimal,
+    pub spread_bps: ExactDecimal,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -220,12 +221,12 @@ pub struct SpreadUpdate {
     pub timestamp: DateTime<Utc>,
     #[ts(optional, type = "string")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub buy_price: Option<Decimal>,
+    pub buy_price: Option<ExactDecimal>,
     #[ts(optional, type = "string")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sell_price: Option<Decimal>,
+    pub sell_price: Option<ExactDecimal>,
     #[ts(type = "string")]
-    pub pyth_price: Decimal,
+    pub pyth_price: ExactDecimal,
 }
 
 /// Active or completed rebalance operation.

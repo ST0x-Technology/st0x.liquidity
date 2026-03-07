@@ -1,5 +1,6 @@
-use rust_decimal::Decimal;
+use rain_math_float::FloatError;
 use serde::Deserialize;
+use st0x_exact_decimal::ExactDecimal;
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
@@ -132,11 +133,14 @@ pub enum AlpacaBrokerApiError {
     AssetNotTradable { symbol: Symbol },
 
     #[error("Cash balance {0} cannot be converted to cents")]
-    CashBalanceConversion(Decimal),
+    CashBalanceConversion(ExactDecimal),
 
     #[error("Cash balance {0} has fractional cents after conversion")]
-    FractionalCents(Decimal),
+    FractionalCents(ExactDecimal),
 
     #[error("Invalid symbol in position: {0}")]
     InvalidSymbol(#[from] crate::EmptySymbolError),
+
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
 }

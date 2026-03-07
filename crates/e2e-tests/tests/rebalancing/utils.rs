@@ -4,6 +4,10 @@
 //! assertion helpers (`assert_equity_rebalancing_flow`,
 //! `assert_usdc_rebalancing_flow`) used by the rebalancing e2e tests.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+pub(crate) use std::time::Duration;
+
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
 pub(crate) use alloy::primitives::{U256, utils::parse_units};
@@ -17,15 +21,10 @@ use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use rain_math_float::Float;
-pub(crate) use rust_decimal::Decimal;
-pub(crate) use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
-pub(crate) use std::str::FromStr;
-use std::sync::Arc;
-pub(crate) use std::time::Duration;
 
 use st0x_evm::{Evm, EvmError, Wallet};
+pub(crate) use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Symbol, TimeInForce,
 };
@@ -49,6 +48,13 @@ use e2e_tests::services::base_chain::{self, TakeOrderResult};
 use e2e_tests::services::cctp::CctpOverrides;
 use e2e_tests::services::cctp::attestation::CctpAttestationMock;
 pub(crate) use e2e_tests::services::cctp::{CctpInfra, USDC_ETHEREUM};
+
+pub(crate) fn ed(value: &str) -> ExactDecimal {
+    match ExactDecimal::parse(value) {
+        Ok(val) => val,
+        Err(error) => panic!("ed({value:?}) failed: {error}"),
+    }
+}
 
 /// Local signing wallet for rebalancing e2e tests that exposes
 /// `Provider = RootProvider`.
@@ -173,7 +179,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     )?);
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(dec!(0.5), dec!(0.1))?)
+        .equity(ImbalanceThreshold::new(ed("0.5"), ed("0.1"))?)
         .usdc(usdc_rebalancing)
         .redemption_wallet(redemption_wallet)
         .usdc_vault_id(B256::random())
@@ -242,10 +248,10 @@ where
     );
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(dec!(0.5), Decimal::from(100))?)
+        .equity(ImbalanceThreshold::new(ed("0.5"), ed("100"))?)
         .usdc(UsdcRebalancing::Enabled {
-            target: dec!(0.5),
-            deviation: dec!(0.1),
+            target: ed("0.5"),
+            deviation: ed("0.1"),
         })
         .redemption_wallet(Address::random())
         .usdc_vault_id(usdc_vault_id)
@@ -348,7 +354,7 @@ async fn assert_inventory_snapshots(
             .unwrap_or_else(|| {
                 panic!("OnchainEquity missing symbol {symbol}, got: {onchain_balances}")
             });
-        let _parsed_balance: Decimal = balance_str
+        let _parsed_balance: ExactDecimal = balance_str
             .parse()
             .unwrap_or_else(|err| panic!("Failed to parse onchain balance for {symbol}: {err}"));
     }
@@ -371,7 +377,7 @@ async fn assert_inventory_snapshots(
             .unwrap_or_else(|| {
                 panic!("OffchainEquity missing symbol {symbol}, got: {offchain_positions}")
             });
-        let _position: Decimal = position_str
+        let _position: ExactDecimal = position_str
             .parse()
             .unwrap_or_else(|err| panic!("Failed to parse offchain position for {symbol}: {err}"));
     }
@@ -388,7 +394,7 @@ async fn assert_inventory_snapshots(
             .and_then(|val| val.get("usdc_balance"))
             .and_then(|val| val.as_str())
             .ok_or_else(|| anyhow::anyhow!("OnchainCash payload missing usdc_balance"))?;
-        let _usdc_balance: Decimal = usdc_balance_str
+        let _usdc_balance: ExactDecimal = usdc_balance_str
             .parse()
             .unwrap_or_else(|err| panic!("Failed to parse onchain USDC balance: {err}"));
     }
@@ -901,7 +907,7 @@ fn assert_usdc_rebalancing_broker_state(
         matched_order.side, expectations.expected_broker_side,
         "Unexpected USDCUSD order side"
     );
-    let _parsed_order_qty: Decimal = matched_order.qty.parse().unwrap_or_else(|err| {
+    let _parsed_order_qty: ExactDecimal = matched_order.qty.parse().unwrap_or_else(|err| {
         panic!(
             "Failed to parse USDCUSD order qty '{}': {err}",
             matched_order.qty
@@ -966,8 +972,16 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
 
     let pre_balance_float = Float::from_raw(usdc_vault_balance_before_rebalance);
     let post_balance_float = Float::from_raw(vault_balance);
-    let pre_usdc_units = pre_balance_float.to_fixed_decimal(6)?;
-    let post_usdc_units = post_balance_float.to_fixed_decimal(6)?;
+    let (pre_usdc_units, pre_lossless) = pre_balance_float.to_fixed_decimal_lossy(6)?;
+    assert!(
+        pre_lossless,
+        "Pre-rebalance USDC balance should convert losslessly to 6 decimals"
+    );
+    let (post_usdc_units, post_lossless) = post_balance_float.to_fixed_decimal_lossy(6)?;
+    assert!(
+        post_lossless,
+        "Post-rebalance USDC balance should convert losslessly to 6 decimals"
+    );
 
     let expected_post_units = match rebalance_type {
         UsdcRebalanceType::AlpacaToBase => pre_usdc_units

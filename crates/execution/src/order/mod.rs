@@ -1,7 +1,8 @@
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+
+use st0x_exact_decimal::ExactDecimal;
 
 use crate::{Direction, FractionalShares, Positive, Symbol};
 
@@ -28,7 +29,7 @@ pub struct OrderUpdate<OrderId> {
     pub direction: Direction,
     pub status: OrderStatus,
     pub updated_at: DateTime<Utc>,
-    pub price: Option<Decimal>,
+    pub price: Option<ExactDecimal>,
 }
 
 #[derive(Debug, Clone)]

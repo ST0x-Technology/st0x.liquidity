@@ -161,17 +161,17 @@ mod tests {
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use httpmock::Method::GET;
     use httpmock::MockServer;
-    use rust_decimal_macros::dec;
     use serde_json::json;
-    use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
-        TimeInForce,
-    };
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_exact_decimal::ExactDecimal;
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
+        TimeInForce,
+    };
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
@@ -185,6 +185,10 @@ mod tests {
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::VaultRegistry;
     use crate::wrapper::mock::MockWrapper;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     type BaseProvider = FillProvider<
         JoinFill<
@@ -200,12 +204,12 @@ mod tests {
     fn make_ctx() -> RebalancingCtx {
         RebalancingCtx::stub()
             .equity(ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
+                target: ed("0.5"),
+                deviation: ed("0.2"),
             })
             .usdc(UsdcRebalancing::Enabled {
-                target: dec!(0.6),
-                deviation: dec!(0.15),
+                target: ed("0.6"),
+                deviation: ed("0.15"),
             })
             .redemption_wallet(address!("0x1234567890123456789012345678901234567890"))
             .usdc_vault_id(b256!(
@@ -247,8 +251,8 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        assert_eq!(trigger_config.equity.target, dec!(0.5));
-        assert_eq!(trigger_config.equity.deviation, dec!(0.2));
+        assert_eq!(trigger_config.equity.target, ed("0.5"));
+        assert_eq!(trigger_config.equity.deviation, ed("0.2"));
     }
 
     #[test]
@@ -265,8 +269,8 @@ mod tests {
         let UsdcRebalancing::Enabled { target, deviation } = trigger_config.usdc else {
             panic!("expected enabled");
         };
-        assert_eq!(target, dec!(0.6));
-        assert_eq!(deviation, dec!(0.15));
+        assert_eq!(target, ed("0.6"));
+        assert_eq!(deviation, ed("0.15"));
     }
 
     async fn make_services_with_mock_wallet(
@@ -433,7 +437,7 @@ mod tests {
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(10)),
+            quantity: FractionalShares::new(ed("10")),
         })
         .await
         .unwrap();

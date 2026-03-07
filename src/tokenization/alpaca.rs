@@ -29,8 +29,8 @@ use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use st0x_exact_decimal::ExactDecimal;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -280,7 +280,7 @@ pub(crate) struct TokenizationRequest {
     pub(crate) issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub(crate) tx_hash: Option<TxHash>,
-    fees: Option<Decimal>,
+    fees: Option<ExactDecimal>,
     pub(crate) created_at: DateTime<Utc>,
     updated_at: Option<DateTime<Utc>>,
 }
@@ -801,16 +801,20 @@ pub(crate) mod tests {
     use alloy::providers::ProviderBuilder;
     use httpmock::MockServer;
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
     use std::time::Duration;
     use uuid::uuid;
 
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::{Evm, OpenChainErrorRegistry};
+    use st0x_exact_decimal::ExactDecimal;
 
     use super::*;
     use crate::bindings::TestERC20;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
         address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
@@ -883,7 +887,7 @@ pub(crate) mod tests {
     fn create_mint_request() -> MintRequest {
         MintRequest {
             underlying_symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(100.5)),
+            quantity: FractionalShares::new(ed("100.5")),
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
@@ -938,7 +942,7 @@ pub(crate) mod tests {
             result.token_symbol.as_ref().map(ToString::to_string),
             Some("tAAPL".to_string())
         );
-        assert_eq!(result.quantity, FractionalShares::new(dec!(100.5)));
+        assert_eq!(result.quantity, FractionalShares::new(ed("100.5")));
         assert_eq!(result.issuer, Issuer::new("st0x"));
         assert_eq!(result.network, Network::new("base"));
         assert_eq!(
@@ -1496,7 +1500,7 @@ pub(crate) mod tests {
         });
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(dec!(100.0));
+        let quantity = FractionalShares::new(ed("100.0"));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let mint_result = service
@@ -1625,7 +1629,7 @@ pub(crate) mod tests {
         });
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(dec!(100.5));
+        let quantity = FractionalShares::new(ed("100.5"));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = service

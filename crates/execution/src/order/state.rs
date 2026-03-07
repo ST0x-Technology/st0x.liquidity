@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+
+use st0x_exact_decimal::ExactDecimal;
 
 use super::OrderStatus;
 
@@ -13,7 +14,7 @@ pub enum OrderState {
     Filled {
         executed_at: DateTime<Utc>,
         order_id: String,
-        price: Decimal,
+        price: ExactDecimal,
     },
     Failed {
         failed_at: DateTime<Utc>,
@@ -34,8 +35,6 @@ impl OrderState {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use super::*;
 
     #[test]
@@ -52,7 +51,7 @@ mod tests {
             OrderState::Filled {
                 executed_at: Utc::now(),
                 order_id: "ORDER123".to_string(),
-                price: dec!(150.00),
+                price: ExactDecimal::parse("150.00").unwrap(),
             }
             .status(),
             OrderStatus::Filled

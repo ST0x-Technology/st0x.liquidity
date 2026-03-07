@@ -202,13 +202,17 @@ impl AlpacaWalletService {
 mod tests {
     use alloy::primitives::address;
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_exact_decimal::ExactDecimal;
     use st0x_execution::AlpacaAccountId;
     use std::time::Duration;
     use uuid::uuid;
 
     use super::*;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -239,7 +243,7 @@ mod tests {
 
         let asset = TokenSymbol::new("USDC");
         let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc(ed("100"))).unwrap();
 
         assert!(matches!(
             service
@@ -274,7 +278,7 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc(ed("100"))).unwrap();
 
         assert!(matches!(
             service
@@ -331,7 +335,7 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc(ed("100"))).unwrap();
 
         let result = service
             .initiate_withdrawal(amount, &asset, &to_address)

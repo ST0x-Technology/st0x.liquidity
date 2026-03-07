@@ -10,7 +10,6 @@ mod vault;
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
-use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use thiserror::Error;
 use tracing::info;
 
 use st0x_evm::OpenChainErrorRegistry;
+use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 
 use crate::config::{Ctx, Env};
@@ -205,7 +205,7 @@ pub enum Commands {
     VaultDeposit {
         /// Amount of tokens to deposit (human-readable, e.g., 100 for 100 tokens)
         #[arg(short = 'a', long = "amount")]
-        amount: Decimal,
+        amount: ExactDecimal,
 
         /// Token contract address
         #[arg(short = 't', long = "token")]
@@ -468,7 +468,7 @@ enum ProviderCommand {
         amount: Usdc,
     },
     VaultDeposit {
-        amount: Decimal,
+        amount: ExactDecimal,
         token: Address,
         vault_id: B256,
         decimals: u8,
@@ -797,9 +797,8 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use rain_math_float::Float;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_exact_decimal::ExactDecimal;
     use std::collections::HashMap;
     use std::str::FromStr;
     use url::Url;
@@ -2002,7 +2001,7 @@ mod tests {
         let (order_id, order) = &executions[0];
         assert_eq!(
             order.shares(),
-            Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
+            Positive::new(FractionalShares::new(ExactDecimal::parse("9").unwrap())).unwrap()
         );
         assert_eq!(order.direction(), Direction::Buy);
         assert!(
@@ -2102,7 +2101,7 @@ mod tests {
         let order = &executions[0].1;
         assert_eq!(
             order.shares(),
-            Positive::new(FractionalShares::new(dec!(5))).unwrap()
+            Positive::new(FractionalShares::new(ExactDecimal::parse("5").unwrap())).unwrap()
         );
 
         let stdout_str1 = String::from_utf8(stdout1).unwrap();

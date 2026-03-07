@@ -1,8 +1,9 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
 use alloy::primitives::{Address, B256, U256};
-use rust_decimal::Decimal;
+use rain_math_float::FloatError;
 use sqlx::SqlitePool;
+use st0x_exact_decimal::ExactDecimal;
 use std::io::Write;
 use thiserror::Error;
 
@@ -15,7 +16,7 @@ use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistry;
 
 pub(super) struct Deposit {
-    pub(super) amount: Decimal,
+    pub(super) amount: ExactDecimal,
     pub(super) token: Address,
     pub(super) vault_id: B256,
     pub(super) decimals: u8,
@@ -24,26 +25,21 @@ pub(super) struct Deposit {
 #[derive(Debug, Error)]
 pub(crate) enum VaultCliError {
     #[error("negative amount: {0}")]
-    NegativeAmount(Decimal),
+    NegativeAmount(ExactDecimal),
 
-    #[error("amount overflow when scaling to {decimals} decimals")]
-    AmountOverflow { decimals: u8 },
+    #[error("float operation failed: {0}")]
+    Float(#[from] FloatError),
 
     #[error("failed to parse scaled amount as U256")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
 
-fn decimal_to_u256(amount: Decimal, decimals: u8) -> Result<U256, VaultCliError> {
-    if amount.is_sign_negative() {
+fn exact_decimal_to_u256(amount: ExactDecimal, decimals: u8) -> Result<U256, VaultCliError> {
+    if amount.is_negative()? {
         return Err(VaultCliError::NegativeAmount(amount));
     }
 
-    let scale = Decimal::from(10u64.pow(u32::from(decimals)));
-    let scaled = amount
-        .checked_mul(scale)
-        .ok_or(VaultCliError::AmountOverflow { decimals })?;
-
-    Ok(U256::from_str_radix(&scaled.trunc().to_string(), 10)?)
+    Ok(amount.to_fixed_decimal(decimals)?)
 }
 
 pub(super) async fn vault_deposit_command<Writer: Write>(
@@ -70,7 +66,7 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let amount_u256 = decimal_to_u256(amount, decimals)?;
+    let amount_u256 = exact_decimal_to_u256(amount, decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
     let (_vault_store, vault_registry_projection) =
@@ -144,15 +140,17 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
-    use rust_decimal_macros::dec;
     use std::collections::HashMap;
-    use std::str::FromStr;
     use url::Url;
 
     use super::*;
     use crate::config::{BrokerCtx, LogLevel, OperationalLimits, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
+
+    fn ed(value: &str) -> ExactDecimal {
+        ExactDecimal::parse(value).unwrap()
+    }
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -186,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_deposit_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Decimal::from_str("100").unwrap();
+        let amount = ed("100");
 
         let mut stdout = Vec::new();
         let deposit = Deposit {
@@ -213,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(ed("100"));
 
         let mut stdout = Vec::new();
         let result = vault_withdraw_command(
@@ -237,7 +235,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let deposit = Deposit {
-            amount: dec!(500.50),
+            amount: ed("500.5"),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
             decimals: 6,
@@ -253,7 +251,7 @@ mod tests {
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
-            output.contains("500.50"),
+            output.contains("500.5"),
             "Expected amount in output, got: {output}"
         );
     }
@@ -261,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("250.25").unwrap());
+        let amount = Usdc(ed("250.25"));
 
         let mut stdout = Vec::new();
         vault_withdraw_command(
@@ -281,30 +279,33 @@ mod tests {
     }
 
     #[test]
-    fn test_decimal_to_u256_valid_6_decimals() {
-        let amount = Decimal::from_str("100.5").unwrap();
-        let result = decimal_to_u256(amount, 6).unwrap();
+    fn test_exact_decimal_to_u256_valid_6_decimals() {
+        let amount = ed("100.5");
+        let result = exact_decimal_to_u256(amount, 6).unwrap();
         assert_eq!(result, U256::from(100_500_000u64));
     }
 
     #[test]
-    fn test_decimal_to_u256_valid_18_decimals() {
-        let amount = Decimal::from_str("3").unwrap();
-        let result = decimal_to_u256(amount, 18).unwrap();
-        assert_eq!(result, U256::from_str("3000000000000000000").unwrap());
+    fn test_exact_decimal_to_u256_valid_18_decimals() {
+        let amount = ed("3");
+        let result = exact_decimal_to_u256(amount, 18).unwrap();
+        assert_eq!(
+            result,
+            U256::from_str_radix("3000000000000000000", 10).unwrap()
+        );
     }
 
     #[test]
-    fn test_decimal_to_u256_negative_amount_fails() {
-        let amount = Decimal::from_str("-100").unwrap();
-        let result = decimal_to_u256(amount, 6);
+    fn test_exact_decimal_to_u256_negative_amount_fails() {
+        let amount = ed("-100");
+        let result = exact_decimal_to_u256(amount, 6);
         assert!(matches!(result, Err(VaultCliError::NegativeAmount(_))));
     }
 
     #[test]
-    fn test_decimal_to_u256_zero() {
-        let amount = Decimal::ZERO;
-        let result = decimal_to_u256(amount, 6).unwrap();
+    fn test_exact_decimal_to_u256_zero() {
+        let amount = ExactDecimal::zero();
+        let result = exact_decimal_to_u256(amount, 6).unwrap();
         assert_eq!(result, U256::ZERO);
     }
 }
