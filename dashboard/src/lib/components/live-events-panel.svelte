@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { browser } from '$app/environment'
   import { createQuery } from '@tanstack/svelte-query'
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
@@ -15,18 +14,49 @@
     staleTime: Infinity
   }))
 
-  const formatTimestamp = (timestamp: string): string => {
-    const date = new Date(timestamp)
-    const locale = browser ? navigator.language : 'en-US'
-    return date.toLocaleTimeString(locale, {
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    })
+  const events = $derived(eventsQuery.data ?? [])
+
+  const stripEventSuffix = (name: string): string =>
+    name.endsWith('Event') ? name.slice(0, -5) : name
+
+  const parseEventType = (eventType: string): { type: string; event: string } => {
+    const idx = eventType.indexOf('::')
+    if (idx === -1) return { type: stripEventSuffix(eventType), event: '' }
+    return { type: stripEventSuffix(eventType.slice(0, idx)), event: eventType.slice(idx + 2) }
   }
 
-  const events = $derived(eventsQuery.data ?? [])
+  type SortDir = 'asc' | 'desc'
+  type EventCol = 'aggregate' | 'type' | 'sequence' | 'event'
+  type SortState = { column: EventCol; dir: SortDir } | null
+
+  let eventSort = $state<SortState>(null)
+
+  const toggleSort = (current: SortState, column: EventCol): SortState => {
+    if (current?.column === column) {
+      return current.dir === 'asc' ? { column, dir: 'desc' } : null
+    }
+    return { column, dir: 'asc' }
+  }
+
+  const sortIndicator = (state: SortState, column: EventCol): string => {
+    if (state?.column !== column) return ''
+    return state.dir === 'asc' ? ' \u25B2' : ' \u25BC'
+  }
+
+  const sortedEvents = $derived.by(() => {
+    if (!eventSort) return events
+    const sorted = [...events]
+    const { column, dir } = eventSort
+    sorted.sort((left, right) => {
+      let cmp = 0
+      if (column === 'aggregate') cmp = left.aggregate_id.localeCompare(right.aggregate_id)
+      else if (column === 'type') cmp = parseEventType(left.event_type).type.localeCompare(parseEventType(right.event_type).type)
+      else if (column === 'sequence') cmp = left.sequence - right.sequence
+      else cmp = parseEventType(left.event_type).event.localeCompare(parseEventType(right.event_type).event)
+      return dir === 'desc' ? -cmp : cmp
+    })
+    return sorted
+  })
 </script>
 
 <Card.Root class="flex h-full min-h-56 flex-col overflow-hidden">
@@ -47,26 +77,27 @@
       <Table.Root>
         <Table.Header>
           <Table.Row>
-            <Table.Head class="w-20">Time</Table.Head>
-            <Table.Head>Event</Table.Head>
-            <Table.Head>ID</Table.Head>
-            <Table.Head class="w-12 text-right">#</Table.Head>
+            <Table.Head class="cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'aggregate')}>Aggregate{sortIndicator(eventSort, 'aggregate')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'type')}>Type{sortIndicator(eventSort, 'type')}</Table.Head>
+            <Table.Head class="w-12 cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'sequence')}>No.{sortIndicator(eventSort, 'sequence')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'event')}>Event{sortIndicator(eventSort, 'event')}</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
-          {#each events as event (event.aggregate_id + '-' + String(event.sequence))}
+          {#each sortedEvents as event (event.aggregate_id + '-' + String(event.sequence))}
+            {@const parsed = parseEventType(event.event_type)}
             <Table.Row>
-              <Table.Cell class="font-mono text-xs text-muted-foreground">
-                {formatTimestamp(event.timestamp)}
-              </Table.Cell>
-              <Table.Cell class="font-mono text-xs">
-                {event.event_type}
-              </Table.Cell>
               <Table.Cell class="font-mono text-xs" title={event.aggregate_id}>
                 {truncateId(event.aggregate_id)}
               </Table.Cell>
-              <Table.Cell class="text-right font-mono text-xs">
+              <Table.Cell class="font-mono text-xs opacity-90">
+                {parsed.type}
+              </Table.Cell>
+              <Table.Cell class="font-mono text-xs opacity-90">
                 {event.sequence}
+              </Table.Cell>
+              <Table.Cell class="font-mono text-xs">
+                {parsed.event}
               </Table.Cell>
             </Table.Row>
           {/each}

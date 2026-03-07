@@ -2684,9 +2684,11 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
    - Hedge lag (average time between onchain trade and offchain hedge execution)
    - Uptime (% of market hours the bot was operational)
 
-2. **Inventory**: Current holdings across both venues (onchain tokens vs
-   offchain shares per symbol, USDC balances). Shows imbalance ratios and
-   proximity to rebalancing thresholds.
+2. **Inventory** (2/3 width): Two sections separated by a divider. Top section
+   shows current holdings: Asset, Raindex, Inflight (`← 10.50 ←` or
+   `→ 25.75 →`), Alpaca. USDC row separated by border. Bottom section shows
+   rebalancing transfers: Asset, Transfer (`Alpaca — 10.50 → Raindex`), Status
+   (badge). Active transfers first, then recent.
 
 3. **Spreads**: Live spread visualization using TradingView Lightweight Charts:
    - Overview table showing last realized spreads per asset (buy price, sell
@@ -2699,9 +2701,8 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
    onchain/offchain/both (default: both). Shows symbol, direction, amount,
    price, timestamp, venue.
 
-5. **Rebalancing** (Alpaca only): Active rebalancing operations with live status
-   updates (CrossVenueEquityTransfer, CrossVenueCashTransfer). Below that,
-   recent completed/failed rebalances.
+5. **Rebalancing** (Alpaca only): Merged into the Inventory panel as a
+   sub-section below the current holdings (see panel 2 above).
 
 6. **Live Events**: Real-time stream of domain events as they occur
    (aggregate_type, aggregate_id, sequence, event_type, timestamp). Payloads
