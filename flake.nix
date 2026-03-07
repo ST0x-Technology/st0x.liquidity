@@ -118,6 +118,14 @@
             '';
           };
 
+          genE2eBunNix = rainix.mkTask.${system} {
+            name = "gen-e2e-bun-nix";
+            additionalBuildInputs = [ bun2nix.packages.${system}.default ];
+            body = ''
+              exec bun2nix -o e2e/bun.nix --lock-file e2e/bun.lock
+            '';
+          };
+
           bootstrap = rainix.mkTask.${system} {
             name = "bootstrap-nixos";
             additionalBuildInputs = infraPkgs.buildInputs
@@ -196,6 +204,18 @@
             '';
           };
 
+          runE2e = pkgs.writeShellApplication {
+            name = "run-e2e";
+            runtimeInputs = [ pkgs.bun pkgs.git ];
+            text = ''
+              export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
+              export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+              cd "$(git rev-parse --show-toplevel)/e2e"
+              bun install
+              exec bunx playwright test "$@"
+            '';
+          };
+
         };
 
         formatter = pkgs.nixfmt-classic;
@@ -215,6 +235,7 @@
               packages.ci
               packages.prepSolArtifacts
               packages.remote
+              packages.runE2e
               packages.deployNixos
               packages.deployService
               packages.deployAll
