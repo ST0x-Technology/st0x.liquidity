@@ -1043,6 +1043,12 @@ mod tests {
             usdc_base: USDC_ADDRESS,
             ethereum_wallet: wallet.clone(),
             base_wallet: wallet.clone(),
+            #[cfg(feature = "test-support")]
+            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            #[cfg(feature = "test-support")]
+            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+            #[cfg(feature = "test-support")]
+            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         })
         .unwrap();
 

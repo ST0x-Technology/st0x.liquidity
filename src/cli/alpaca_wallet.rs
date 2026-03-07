@@ -549,6 +549,8 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone {
@@ -601,6 +603,8 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
             broker: BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
@@ -610,7 +614,6 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             }),
             telemetry: None,
-            equities: HashMap::new(),
             trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
                 ImbalanceThreshold {
                     target: dec!(0.5),
@@ -629,6 +632,7 @@ mod tests {
                 },
             ))),
             execution_threshold: ExecutionThreshold::whole_share(),
+            equities: HashMap::new(),
         }
     }
 

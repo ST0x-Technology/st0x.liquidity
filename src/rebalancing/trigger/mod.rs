@@ -132,6 +132,15 @@ pub(crate) struct RebalancingCtx {
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     /// Pre-built wallet for Ethereum mainnet.
     ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    /// Circle attestation/fee API base URL (test-only override).
+    #[cfg(feature = "test-support")]
+    pub circle_api_base: String,
+    /// `TokenMessengerV2` contract address (test-only override).
+    #[cfg(feature = "test-support")]
+    pub token_messenger: Address,
+    /// `MessageTransmitterV2` contract address (test-only override).
+    #[cfg(feature = "test-support")]
+    pub message_transmitter: Address,
 }
 
 impl RebalancingCtx {
@@ -177,6 +186,12 @@ impl RebalancingCtx {
             alpaca_broker_auth: broker_auth,
             base_wallet: Arc::new(base_wallet),
             ethereum_wallet: Arc::new(ethereum_wallet),
+            #[cfg(feature = "test-support")]
+            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            #[cfg(feature = "test-support")]
+            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+            #[cfg(feature = "test-support")]
+            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         })
     }
 
@@ -241,6 +256,12 @@ impl RebalancingCtx {
             alpaca_broker_auth,
             base_wallet: wallet.clone(),
             ethereum_wallet: wallet,
+            #[cfg(feature = "test-support")]
+            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            #[cfg(feature = "test-support")]
+            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+            #[cfg(feature = "test-support")]
+            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         }
     }
 }
