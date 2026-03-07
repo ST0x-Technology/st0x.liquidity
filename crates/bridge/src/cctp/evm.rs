@@ -181,6 +181,27 @@ impl<W: Wallet> CctpEndpoint<W> {
         IERC20::new(self.usdc_address, self.wallet.provider())
     }
 
+    /// Pre-approve USDC spending via the wallet's signing path.
+    ///
+    /// Unlike `usdc().approve().send()` which uses the read-only provider,
+    /// this submits through `Wallet::submit()` which has signing capability.
+    #[cfg(test)]
+    pub(super) async fn approve_usdc<Registry: IntoErrorRegistry>(
+        &self,
+        spender: Address,
+        amount: U256,
+    ) -> Result<(), CctpError> {
+        self.wallet
+            .submit::<Registry, _>(
+                self.usdc_address,
+                IERC20::approveCall { spender, amount },
+                "test pre-approve USDC",
+            )
+            .await?;
+
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
         self.wallet.address()

@@ -807,8 +807,8 @@ pub(crate) mod tests {
     use std::time::Duration;
     use uuid::uuid;
 
+    use st0x_evm::OpenChainErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{Evm, OpenChainErrorRegistry};
 
     use super::*;
     use crate::bindings::TestERC20;
@@ -1177,7 +1177,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
@@ -1228,7 +1228,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
@@ -1657,7 +1657,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
 
         // Mint tokens to the signer (creates a Transfer event from 0x0 -> signer)
@@ -1711,7 +1711,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
@@ -1764,7 +1764,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
@@ -1896,7 +1896,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
@@ -1950,7 +1950,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
@@ -1991,7 +1991,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let provider = wallet.provider().clone();
+        let provider = wallet.signing_provider().clone();
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
