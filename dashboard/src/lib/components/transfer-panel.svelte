@@ -5,6 +5,7 @@
   import { Badge, type BadgeVariant } from '$lib/components/ui/badge'
   import type { TransferOperation } from '$lib/api/TransferOperation'
   import { matcher } from '$lib/fp'
+  import { formatDecimal } from '$lib/decimal'
 
   const activeQuery = createQuery<TransferOperation[]>(() => ({
     queryKey: ['transfers', 'active'],
@@ -18,30 +19,33 @@
 
   const activeTransfers = $derived(activeQuery.data ?? [])
   const recentTransfers = $derived(recentQuery.data ?? [])
-  const allTransfers = $derived([...activeTransfers, ...recentTransfers])
+  const allTransfers = $derived.by(() => {
+    const byId = new Map(activeTransfers.map((transfer) => [transfer.id, transfer]))
+    for (const transfer of recentTransfers) {
+      if (!byId.has(transfer.id)) byId.set(transfer.id, transfer)
+    }
+    return [...byId.values()]
+  })
 
   const matchKind = matcher<TransferOperation>()('kind')
 
-  const fmtNum = (value: string): string => {
-    const num = parseFloat(value)
-    return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  }
+  const fmtNum = (value: string): string => formatDecimal(value, 2)
 
   const transferAsset = (transfer: TransferOperation): string =>
     matchKind(transfer, {
-      equity_mint: (op) => op.symbol,
-      equity_redemption: (op) => op.symbol,
+      equity_mint: ({ symbol }) => symbol,
+      equity_redemption: ({ symbol }) => symbol,
       usdc_bridge: () => 'USDC'
     })
 
   const transferDescription = (transfer: TransferOperation): string =>
     matchKind(transfer, {
-      equity_mint: (op) => `Alpaca — ${fmtNum(op.quantity)} → Raindex`,
-      equity_redemption: (op) => `Raindex — ${fmtNum(op.quantity)} → Alpaca`,
-      usdc_bridge: (op) =>
-        op.direction === 'alpaca_to_base'
-          ? `Alpaca — ${fmtNum(op.amount)} → Raindex`
-          : `Raindex — ${fmtNum(op.amount)} → Alpaca`
+      equity_mint: ({ quantity }) => `Alpaca — ${fmtNum(quantity)} → Raindex`,
+      equity_redemption: ({ quantity }) => `Raindex — ${fmtNum(quantity)} → Alpaca`,
+      usdc_bridge: ({ direction, amount }) =>
+        direction === 'alpaca_to_base'
+          ? `Alpaca — ${fmtNum(amount)} → Raindex`
+          : `Raindex — ${fmtNum(amount)} → Alpaca`
     })
 
   const statusVariant = (status: string): BadgeVariant => {

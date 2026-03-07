@@ -48,6 +48,7 @@
   },
   "dependencies": {
     "@tanstack/svelte-query": "^6.0.10",
+    "decimal.js": "^10.6.0",
     "runed": "^0.37.1"
   }
 }
