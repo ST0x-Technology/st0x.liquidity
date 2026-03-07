@@ -5,6 +5,7 @@
   import { Badge, type BadgeVariant } from '$lib/components/ui/badge'
   import type { TransferOperation } from '$lib/api/TransferOperation'
   import { matcher } from '$lib/fp'
+  import { decimalToNumber } from '$lib/decimal'
 
   const activeQuery = createQuery<TransferOperation[]>(() => ({
     queryKey: ['transfers', 'active'],
@@ -20,14 +21,16 @@
 
   const activeTransfers = $derived(activeQuery.data ?? [])
   const recentTransfers = $derived(recentQuery.data ?? [])
-  const allTransfers = $derived([...activeTransfers, ...recentTransfers])
+  const allTransfers = $derived.by(() => {
+    const byId = new Map(recentTransfers.map((transfer) => [transfer.id, transfer]))
+    for (const transfer of activeTransfers) byId.set(transfer.id, transfer)
+    return [...byId.values()]
+  })
 
   const matchKind = matcher<TransferOperation>()('kind')
 
-  const fmtNum = (value: string): string => {
-    const num = parseFloat(value)
-    return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  }
+  const fmtNum = (value: string): string =>
+    decimalToNumber(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
   const transferAsset = (transfer: TransferOperation): string =>
     matchKind(transfer, {
