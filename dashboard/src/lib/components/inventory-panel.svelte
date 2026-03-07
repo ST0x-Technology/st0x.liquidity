@@ -55,20 +55,32 @@
     return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
 
-  const fmtCash = (value: string): string => {
+  type CashRow = { label: string; value: string; decimals: number }
+
+  const cashRows = $derived.by((): CashRow[] => {
+    if (!usdc) return []
+    const usdcVal = parseFloat(usdc.onchainAvailable)
+    const usdVal = parseFloat(usdc.offchainAvailable)
+    const totalVal = usdcVal + usdVal
+    return [
+      { label: 'USDC', value: String(usdcVal), decimals: 6 },
+      { label: 'USD', value: String(usdVal), decimals: 2 },
+      { label: 'Total', value: String(totalVal), decimals: 6 }
+    ]
+  })
+
+  const maxDecimals = 6
+
+  const fmtCashAligned = (value: string, decimals: number): string => {
     const num = parseFloat(value)
     if (num === 0) return '-'
-    return num.toLocaleString('en-US', { minimumFractionDigits: 6, maximumFractionDigits: 6 })
+    const formatted = num.toLocaleString('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals
+    })
+    const trailingPad = maxDecimals - decimals
+    return formatted + '\u00A0'.repeat(trailingPad)
   }
-
-  const cashTotal = $derived(
-    usdc
-      ? (parseFloat(usdc.onchainAvailable) + parseFloat(usdc.offchainAvailable)).toLocaleString(
-          'en-US',
-          { minimumFractionDigits: 6, maximumFractionDigits: 6 }
-        )
-      : '-'
-  )
 
   const stripPrefix = (symbol: string): string =>
     symbol.startsWith('t') ? symbol.slice(1) : symbol
@@ -219,13 +231,13 @@
                   <Table.Cell class="font-mono font-medium">
                     {stripPrefix(item.symbol)}
                   </Table.Cell>
-                  <Table.Cell class="text-right font-mono">
+                  <Table.Cell class="text-right font-mono opacity-90">
                     {fmt(item.onchainAvailable)}
                   </Table.Cell>
-                  <Table.Cell class="text-right font-mono">
+                  <Table.Cell class="text-right font-mono opacity-90">
                     {fmt(item.offchainAvailable)}
                   </Table.Cell>
-                  <Table.Cell class="text-right font-mono">
+                  <Table.Cell class="text-right font-mono font-semibold">
                     {fmtNum(String(parseFloat(item.onchainAvailable) + parseFloat(item.offchainAvailable)))}
                   </Table.Cell>
                 </Table.Row>
@@ -244,24 +256,14 @@
                 </Table.Row>
               </Table.Header>
               <Table.Body>
-                <Table.Row>
-                  <Table.Cell class="font-mono font-medium">USDC</Table.Cell>
-                  <Table.Cell class="text-right font-mono">
-                    {fmtCash(usdc.onchainAvailable)}
-                  </Table.Cell>
-                </Table.Row>
-                <Table.Row>
-                  <Table.Cell class="font-mono font-medium">USD</Table.Cell>
-                  <Table.Cell class="text-right font-mono">
-                    {fmtCash(usdc.offchainAvailable)}
-                  </Table.Cell>
-                </Table.Row>
-                <Table.Row>
-                  <Table.Cell class="font-mono font-medium">Total</Table.Cell>
-                  <Table.Cell class="text-right font-mono font-medium">
-                    {cashTotal}
-                  </Table.Cell>
-                </Table.Row>
+                {#each cashRows as row (row.label)}
+                  <Table.Row>
+                    <Table.Cell class="font-mono {row.label === 'Total' ? 'font-semibold' : 'font-medium'}">{row.label}</Table.Cell>
+                    <Table.Cell class="text-right font-mono whitespace-pre {row.label === 'Total' ? 'font-semibold' : ''}">
+                      {fmtCashAligned(row.value, row.decimals)}
+                    </Table.Cell>
+                  </Table.Row>
+                {/each}
               </Table.Body>
             </Table.Root>
           </div>
@@ -269,7 +271,9 @@
       </div>
 
       {#if allTransfers.length > 0}
-        <Separator.Root class="my-4" />
+        <Separator.Root class="my-6" />
+
+        <div class="pb-3 text-lg font-semibold leading-none tracking-tight">Cross-Venue Transfers</div>
 
         <Table.Root>
           <Table.Header>
@@ -277,7 +281,7 @@
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'time')}>Time{sortIndicator(transferSort, 'time')}</Table.Head>
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'from')}>From{sortIndicator(transferSort, 'from')}</Table.Head>
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'to')}>To{sortIndicator(transferSort, 'to')}</Table.Head>
-              <Table.Head class="cursor-pointer select-none text-right" onclick={() => transferSort = toggleSort(transferSort, 'amount')}>Amount{sortIndicator(transferSort, 'amount')}</Table.Head>
+              <Table.Head class="cursor-pointer select-none text-right pr-6" onclick={() => transferSort = toggleSort(transferSort, 'amount')}>Amount{sortIndicator(transferSort, 'amount')}</Table.Head>
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'underlying')}>Underlying{sortIndicator(transferSort, 'underlying')}</Table.Head>
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'status')}>Status{sortIndicator(transferSort, 'status')}</Table.Head>
             </Table.Row>
@@ -295,7 +299,7 @@
                 <Table.Cell>
                   {transferTo(transfer)}
                 </Table.Cell>
-                <Table.Cell class="text-right font-mono">
+                <Table.Cell class="text-right font-mono pr-6">
                   {transferAmount(transfer)}
                 </Table.Cell>
                 <Table.Cell class="font-mono font-medium">

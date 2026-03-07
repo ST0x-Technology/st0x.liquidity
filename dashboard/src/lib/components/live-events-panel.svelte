@@ -16,8 +16,14 @@
 
   const events = $derived(eventsQuery.data ?? [])
 
+  const parseEventType = (eventType: string): { type: string; event: string } => {
+    const idx = eventType.indexOf('::')
+    if (idx === -1) return { type: eventType, event: '' }
+    return { type: eventType.slice(0, idx), event: eventType.slice(idx + 2) }
+  }
+
   type SortDir = 'asc' | 'desc'
-  type EventCol = 'sequence' | 'event' | 'id'
+  type EventCol = 'aggregate' | 'type' | 'sequence' | 'event'
   type SortState = { column: EventCol; dir: SortDir } | null
 
   let eventSort = $state<SortState>(null)
@@ -40,9 +46,10 @@
     const { column, dir } = eventSort
     sorted.sort((left, right) => {
       let cmp = 0
-      if (column === 'sequence') cmp = left.sequence - right.sequence
-      else if (column === 'event') cmp = left.event_type.localeCompare(right.event_type)
-      else cmp = left.aggregate_id.localeCompare(right.aggregate_id)
+      if (column === 'aggregate') cmp = left.aggregate_id.localeCompare(right.aggregate_id)
+      else if (column === 'type') cmp = parseEventType(left.event_type).type.localeCompare(parseEventType(right.event_type).type)
+      else if (column === 'sequence') cmp = left.sequence - right.sequence
+      else cmp = parseEventType(left.event_type).event.localeCompare(parseEventType(right.event_type).event)
       return dir === 'desc' ? -cmp : cmp
     })
     return sorted
@@ -67,22 +74,27 @@
       <Table.Root>
         <Table.Header>
           <Table.Row>
-            <Table.Head class="w-12 cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'sequence')}>#{sortIndicator(eventSort, 'sequence')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'aggregate')}>Aggregate{sortIndicator(eventSort, 'aggregate')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'type')}>Type{sortIndicator(eventSort, 'type')}</Table.Head>
+            <Table.Head class="w-12 cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'sequence')}>No.{sortIndicator(eventSort, 'sequence')}</Table.Head>
             <Table.Head class="cursor-pointer select-none" onclick={() => eventSort = toggleSort(eventSort, 'event')}>Event{sortIndicator(eventSort, 'event')}</Table.Head>
-            <Table.Head class="cursor-pointer select-none text-right" onclick={() => eventSort = toggleSort(eventSort, 'id')}>ID{sortIndicator(eventSort, 'id')}</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
           {#each sortedEvents as event (event.aggregate_id + '-' + String(event.sequence))}
+            {@const parsed = parseEventType(event.event_type)}
             <Table.Row>
-              <Table.Cell class="font-mono text-xs text-muted-foreground">
+              <Table.Cell class="font-mono text-xs" title={event.aggregate_id}>
+                {truncateId(event.aggregate_id)}
+              </Table.Cell>
+              <Table.Cell class="font-mono text-xs opacity-90">
+                {parsed.type}
+              </Table.Cell>
+              <Table.Cell class="font-mono text-xs opacity-90">
                 {event.sequence}
               </Table.Cell>
               <Table.Cell class="font-mono text-xs">
-                {event.event_type}
-              </Table.Cell>
-              <Table.Cell class="text-right font-mono text-xs" title={event.aggregate_id}>
-                {truncateId(event.aggregate_id)}
+                {parsed.event}
               </Table.Cell>
             </Table.Row>
           {/each}
