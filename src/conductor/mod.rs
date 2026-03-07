@@ -14,7 +14,6 @@ use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -32,7 +31,7 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
+use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -117,13 +116,21 @@ pub(crate) async fn run_market_hours_loop<E>(
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
     event_sender: broadcast::Sender<ServerMessage>,
+    inventory: Arc<BroadcastingInventory>,
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    let mut conductor =
-        Conductor::start(ctx, pool, executor, executor_maintenance, event_sender).await?;
+    let mut conductor = Conductor::start(
+        ctx,
+        pool,
+        executor,
+        executor_maintenance,
+        event_sender,
+        inventory,
+    )
+    .await?;
 
     info!("Conductor running");
     let result = conductor.wait_for_completion().await;
@@ -145,6 +152,7 @@ impl Conductor {
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
+        inventory: Arc<BroadcastingInventory>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Self>> + Send>>
     where
         E: Executor + Clone + Send + 'static,
@@ -169,8 +177,6 @@ impl Conductor {
             let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
                 .build(())
                 .await?;
-
-            let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
             let (vault_registry, vault_registry_projection) =
                 StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -317,7 +323,7 @@ struct RebalancingInfrastructure {
 struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
-    inventory: Arc<RwLock<InventoryView>>,
+    inventory: Arc<BroadcastingInventory>,
     event_sender: broadcast::Sender<ServerMessage>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
@@ -447,7 +453,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(deps.event_sender));
+        let event_broadcaster =
+            Arc::new(EventBroadcaster::new(deps.event_sender, deps.pool.clone()));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let built = manifest
@@ -1592,7 +1599,7 @@ mod tests {
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::view::Operator;
-    use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
+    use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
@@ -3423,7 +3430,11 @@ mod tests {
             .await
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(imbalanced_inventory(&symbol)));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            imbalanced_inventory(&symbol),
+            inventory_sender,
+        ));
         let (operation_sender, mut operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3517,7 +3528,11 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            initial_inventory,
+            inventory_sender,
+        ));
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3625,7 +3640,11 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            initial_inventory,
+            inventory_sender,
+        ));
         let (operation_sender, mut receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3751,7 +3770,11 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            initial_inventory,
+            inventory_sender,
+        ));
         let (operation_sender, receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));

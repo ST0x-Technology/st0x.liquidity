@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
+use st0x_dto::{SymbolInventory, UsdcInventory};
 use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::Usdc;
 
@@ -535,6 +536,53 @@ impl InventoryView {
     ) -> Option<Imbalance<Usdc>> {
         self.usdc.detect_imbalance(threshold)
     }
+
+    /// Converts the in-memory inventory view to a DTO for dashboard serialization.
+    pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
+        let per_symbol = self
+            .equities
+            .iter()
+            .map(|(symbol, inventory)| {
+                let (onchain_available, onchain_inflight) = venue_balances(inventory.onchain);
+
+                let (offchain_available, offchain_inflight) = venue_balances(inventory.offchain);
+
+                SymbolInventory {
+                    symbol: symbol.clone(),
+                    onchain_available,
+                    onchain_inflight,
+                    offchain_available,
+                    offchain_inflight,
+                }
+            })
+            .collect();
+
+        let (usdc_onchain_available, usdc_onchain_inflight) = venue_balances(self.usdc.onchain);
+
+        let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
+
+        st0x_dto::Inventory {
+            per_symbol,
+            usdc: UsdcInventory {
+                onchain_available: usdc_onchain_available,
+                onchain_inflight: usdc_onchain_inflight,
+                offchain_available: usdc_offchain_available,
+                offchain_inflight: usdc_offchain_inflight,
+            },
+        }
+    }
+}
+
+fn venue_balances<T>(venue: Option<VenueBalance<T>>) -> (T, T)
+where
+    T: Add<Output = Result<T, ArithmeticError<T>>>
+        + Sub<Output = Result<T, ArithmeticError<T>>>
+        + Copy
+        + HasZero,
+{
+    venue.map_or((T::ZERO, T::ZERO), |balance| {
+        (balance.available(), balance.inflight())
+    })
 }
 
 impl Default for InventoryView {
@@ -1132,5 +1180,83 @@ mod tests {
             view.check_usdc_imbalance(&threshold("0.5", "0.3"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn to_dto_converts_equities_and_usdc() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(100), shares(50))
+            .with_usdc(
+                Usdc::new(Decimal::from(10000)),
+                Usdc::new(Decimal::from(5000)),
+            );
+
+        let dto = view.to_dto();
+
+        assert_eq!(dto.per_symbol.len(), 1);
+
+        let aapl_dto = &dto.per_symbol[0];
+        assert_eq!(aapl_dto.symbol, aapl);
+        assert_eq!(aapl_dto.onchain_available.inner(), Decimal::from(100));
+        assert_eq!(aapl_dto.onchain_inflight, FractionalShares::ZERO);
+        assert_eq!(aapl_dto.offchain_available.inner(), Decimal::from(50));
+        assert_eq!(aapl_dto.offchain_inflight, FractionalShares::ZERO);
+
+        assert_eq!(dto.usdc.onchain_available.inner(), Decimal::from(10000));
+        assert_eq!(dto.usdc.onchain_inflight, Usdc::ZERO);
+        assert_eq!(dto.usdc.offchain_available.inner(), Decimal::from(5000));
+        assert_eq!(dto.usdc.offchain_inflight, Usdc::ZERO);
+    }
+
+    #[test]
+    fn to_dto_includes_inflight_amounts() {
+        let tsla = Symbol::new("TSLA").unwrap();
+        let view = InventoryView {
+            equities: std::iter::once((tsla, make_inventory(80, 20, 40, 10))).collect(),
+            usdc: usdc_make_inventory(5000, 1000, 3000, 500),
+            last_updated: Utc::now(),
+        };
+
+        let dto = view.to_dto();
+
+        let tsla_dto = &dto.per_symbol[0];
+        assert_eq!(tsla_dto.onchain_available.inner(), Decimal::from(80));
+        assert_eq!(tsla_dto.onchain_inflight.inner(), Decimal::from(20));
+        assert_eq!(tsla_dto.offchain_available.inner(), Decimal::from(40));
+        assert_eq!(tsla_dto.offchain_inflight.inner(), Decimal::from(10));
+
+        assert_eq!(dto.usdc.onchain_available.inner(), Decimal::from(5000));
+        assert_eq!(dto.usdc.onchain_inflight.inner(), Decimal::from(1000));
+        assert_eq!(dto.usdc.offchain_available.inner(), Decimal::from(3000));
+        assert_eq!(dto.usdc.offchain_inflight.inner(), Decimal::from(500));
+    }
+
+    #[test]
+    fn to_dto_handles_uninitialized_venues() {
+        let spy = Symbol::new("SPY").unwrap();
+        let view = InventoryView {
+            equities: std::iter::once((
+                spy,
+                Inventory {
+                    onchain: Some(venue(75, 0)),
+                    offchain: None,
+                    last_rebalancing: None,
+                },
+            ))
+            .collect(),
+            usdc: Inventory::default(),
+            last_updated: Utc::now(),
+        };
+
+        let dto = view.to_dto();
+
+        let spy_dto = &dto.per_symbol[0];
+        assert_eq!(spy_dto.onchain_available.inner(), Decimal::from(75));
+        assert_eq!(spy_dto.offchain_available, FractionalShares::ZERO);
+        assert_eq!(spy_dto.offchain_inflight, FractionalShares::ZERO);
+
+        assert_eq!(dto.usdc.onchain_available, Usdc::ZERO);
+        assert_eq!(dto.usdc.offchain_available, Usdc::ZERO);
     }
 }
