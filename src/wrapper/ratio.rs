@@ -77,7 +77,6 @@ impl UnderlyingPerWrapped {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -190,10 +189,10 @@ mod tests {
     #[test]
     fn fractional_conversion_handles_small_values() {
         let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-        let wrapped = FractionalShares::new(Decimal::new(1, 6)); // 0.000001
+        let wrapped = FractionalShares::new(dec!(0.000001));
 
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert_eq!(underlying.inner(), Decimal::new(1, 6));
+        assert_eq!(underlying.inner(), dec!(0.000001));
     }
 }

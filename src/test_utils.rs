@@ -8,6 +8,7 @@ use alloy::rpc::types::{Log, TransactionReceipt};
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -174,7 +175,7 @@ impl OnchainTradeBuilder {
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 amount: FractionalShares::new(Decimal::ONE),
                 direction: Direction::Buy,
-                price: Usdc::new(Decimal::new(150, 0)).unwrap(),
+                price: Usdc::new(dec!(150)).unwrap(),
                 block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: None,

@@ -187,6 +187,7 @@ impl TryIntoExecutor for MockExecutorCtx {
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{Direction, FractionalShares, Positive, Symbol};
@@ -287,7 +288,7 @@ mod tests {
             positions: vec![crate::EquityPosition {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(Decimal::from(100)),
-                market_value: Some(Decimal::new(1_500_000, 2)),
+                market_value: Some(dec!(15000)),
             }],
             cash_balance_cents: 5_000_000,
         };

@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn usdc_mul_decimal_succeeds() {
         let usdc = Usdc(Decimal::from(100));
-        let ratio = Decimal::new(5, 1); // 0.5
+        let ratio = dec!(0.5);
 
         let result = (usdc * ratio).unwrap();
 
@@ -309,13 +309,13 @@ mod tests {
     #[test]
     fn from_cents_converts_positive_cents_to_dollars() {
         let usdc = Usdc::from_cents(12345).unwrap();
-        assert_eq!(usdc.0, Decimal::new(12345, 2)); // 123.45
+        assert_eq!(usdc.0, dec!(123.45));
     }
 
     #[test]
     fn from_cents_converts_negative_cents_to_dollars() {
         let usdc = Usdc::from_cents(-500).unwrap();
-        assert_eq!(usdc.0, Decimal::new(-5, 0)); // -5.00
+        assert_eq!(usdc.0, dec!(-5));
     }
 
     #[test]
