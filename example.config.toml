@@ -9,12 +9,17 @@ deployment_block = 1
 
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-fireblocks_vault_account_id = 0
-fireblocks_environment = "sandbox"
-
-fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { target = 0.5, deviation = 0.3 }
+
+# Wallet configuration — the wallet provider is selected at compile
+# time via cargo features (wallet-turnkey or wallet-private-key).
+# Include all fields; only those matching the compiled feature are
+# read, the rest are silently ignored.
+[rebalancing.wallet]
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# Required for wallet-turnkey:
+organization_id = "org-example-turnkey-org-id"
 
 [assets.equities.EXAMPLE]
 trading = "enabled"

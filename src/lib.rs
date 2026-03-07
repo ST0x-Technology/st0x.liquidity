@@ -4,6 +4,24 @@
 //! directional exposure by executing offsetting trades on
 //! traditional brokerages.
 
+#[cfg(all(feature = "wallet-turnkey", feature = "wallet-private-key"))]
+compile_error!(
+    "Features `wallet-turnkey` and `wallet-private-key` are mutually \
+     exclusive. Enable exactly one."
+);
+
+// In test builds, wallet features aren't required -- tests construct
+// wallets directly via RawPrivateKeyWallet or stub wallets.
+#[cfg(all(
+    not(any(feature = "wallet-turnkey", feature = "wallet-private-key")),
+    not(test),
+    not(doc),
+))]
+compile_error!(
+    "No wallet feature enabled. Enable exactly one of \
+     `wallet-turnkey` or `wallet-private-key`."
+);
+
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;

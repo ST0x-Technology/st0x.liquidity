@@ -6,29 +6,16 @@ edition = "2024"
 [features]
 default = []
 local-signer = []
-fireblocks = [
-  "dep:fireblocks-sdk",
-  "dep:backon",
-  "dep:chrono",
-  "dep:uuid",
-  "dep:serde",
-  "dep:url",
-]
 turnkey = ["dep:alloy-signer-turnkey", "dep:serde"]
 
 [dependencies]
 alloy.workspace = true
 alloy-signer-turnkey = { version = "=1.0.41", optional = true }
 async-trait.workspace = true
-backon = { workspace = true, optional = true }
-chrono = { workspace = true, optional = true }
-fireblocks-sdk = { version = "2025.10.17", optional = true }
 rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
 serde = { workspace = true, features = ["derive"], optional = true }
 thiserror.workspace = true
 tracing.workspace = true
-url = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true, features = ["v4"] }
 
 [dev-dependencies]
 httpmock.workspace = true

@@ -91,10 +91,7 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         sender_address,
     );
 
-    writeln!(
-        stdout,
-        "   Depositing to vault (approve + deposit via Fireblocks)..."
-    )?;
+    writeln!(stdout, "   Depositing to vault (approve + deposit)...")?;
     let deposit_tx = raindex_service
         .deposit::<OpenChainErrorRegistry>(token, RaindexVaultId(vault_id), amount_u256, decimals)
         .await?;
