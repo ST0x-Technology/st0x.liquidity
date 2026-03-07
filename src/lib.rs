@@ -6,6 +6,7 @@
 
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
@@ -76,9 +77,13 @@ pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     sqlx::migrate!().run(&pool).await?;
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+    let inventory = Arc::new(inventory::BroadcastingInventory::new(
+        inventory::InventoryView::default(),
+        event_sender.clone(),
+    ));
 
-    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone());
-    let bot_task = spawn_bot_task(ctx, pool, event_sender);
+    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
+    let bot_task = spawn_bot_task(ctx, pool, event_sender, inventory);
 
     await_shutdown(server_task, bot_task).await;
 
@@ -90,6 +95,7 @@ fn spawn_server_task(
     ctx: &Ctx,
     pool: &SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
+    inventory: Arc<inventory::BroadcastingInventory>,
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
         .merge(("port", ctx.server_port))
@@ -102,6 +108,10 @@ fn spawn_server_task(
         .manage(ctx.clone())
         .manage(dashboard::Broadcast {
             sender: event_sender,
+        })
+        .manage(dashboard::DashboardState {
+            inventory,
+            pool: pool.clone(),
         });
 
     tokio::spawn(rocket.launch())
@@ -111,9 +121,10 @@ fn spawn_bot_task(
     ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
+    inventory: Arc<inventory::BroadcastingInventory>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(error) = run(ctx, pool, event_sender).await {
+        if let Err(error) = run(ctx, pool, event_sender, inventory).await {
             error!("Bot failed: {error}");
         }
     })
@@ -172,11 +183,18 @@ async fn run(
     ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
+    inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
 
     loop {
-        let result = run_bot_session(ctx.clone(), pool.clone(), event_sender.clone()).await;
+        let result = run_bot_session(
+            ctx.clone(),
+            pool.clone(),
+            event_sender.clone(),
+            inventory.clone(),
+        )
+        .await;
 
         match result {
             Ok(()) => {
@@ -207,6 +225,7 @@ async fn run_bot_session(
     ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
+    inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     match ctx.broker.clone() {
         BrokerCtx::DryRun => {
@@ -214,7 +233,15 @@ async fn run_bot_session(
             let executor = MockExecutorCtx.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
+            conductor::run_market_hours_loop(
+                executor,
+                ctx,
+                pool,
+                maintenance,
+                event_sender,
+                inventory,
+            )
+            .await
         }
         BrokerCtx::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
@@ -222,21 +249,45 @@ async fn run_bot_session(
             let executor = schwab_ctx.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
+            conductor::run_market_hours_loop(
+                executor,
+                ctx,
+                pool,
+                maintenance,
+                event_sender,
+                inventory,
+            )
+            .await
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             info!("Initializing Alpaca Trading API executor");
             let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
+            conductor::run_market_hours_loop(
+                executor,
+                ctx,
+                pool,
+                maintenance,
+                event_sender,
+                inventory,
+            )
+            .await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             info!("Initializing Alpaca Broker API executor");
             let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(executor, ctx, pool, maintenance, event_sender).await
+            conductor::run_market_hours_loop(
+                executor,
+                ctx,
+                pool,
+                maintenance,
+                event_sender,
+                inventory,
+            )
+            .await
         }
     }
 }
@@ -259,6 +310,14 @@ mod tests {
         sender
     }
 
+    fn create_test_inventory() -> Arc<inventory::BroadcastingInventory> {
+        let (sender, _) = broadcast::channel(16);
+        Arc::new(inventory::BroadcastingInventory::new(
+            inventory::InventoryView::default(),
+            sender,
+        ))
+    }
+
     #[tokio::test]
     async fn test_run_function_websocket_connection_error() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
@@ -266,9 +325,14 @@ mod tests {
         ));
         let pool = create_test_pool().await;
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
-        Box::pin(run(ctx, pool, create_test_event_sender()))
-            .await
-            .unwrap_err();
+        Box::pin(run(
+            ctx,
+            pool,
+            create_test_event_sender(),
+            create_test_inventory(),
+        ))
+        .await
+        .unwrap_err();
     }
 
     #[tokio::test]
@@ -279,9 +343,14 @@ mod tests {
         let pool = create_test_pool().await;
         ctx.evm.orderbook = Address::ZERO;
         ctx.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
-        Box::pin(run(ctx, pool, create_test_event_sender()))
-            .await
-            .unwrap_err();
+        Box::pin(run(
+            ctx,
+            pool,
+            create_test_event_sender(),
+            create_test_inventory(),
+        ))
+        .await
+        .unwrap_err();
     }
 
     #[tokio::test]
@@ -291,8 +360,13 @@ mod tests {
         ));
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
-        Box::pin(run(ctx, pool, create_test_event_sender()))
-            .await
-            .unwrap_err();
+        Box::pin(run(
+            ctx,
+            pool,
+            create_test_event_sender(),
+            create_test_inventory(),
+        ))
+        .await
+        .unwrap_err();
     }
 }
