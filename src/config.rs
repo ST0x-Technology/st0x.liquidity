@@ -820,10 +820,6 @@ pub(crate) mod tests {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.config.toml"))
     }
 
-    fn example_secrets_toml() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.secrets.toml"))
-    }
-
     #[test]
     fn test_log_level_from_conversion() {
         let level: Level = LogLevel::Trace.into();
@@ -925,9 +921,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
-            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
-            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,
@@ -1027,9 +1021,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
-            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
-            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,
@@ -1102,7 +1094,28 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn rebalancing_with_missing_secret_file_fails() {
-        let error = Ctx::load_files(example_config_toml(), example_secrets_toml())
+        let secrets = toml_file(
+            r#"
+            hyperdx.api_key = "test-key"
+
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [rebalancing]
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+            fireblocks_api_user_id = "test-user"
+            fireblocks_secret_path = "/tmp/nonexistent.key"
+        "#,
+        );
+        let error = Ctx::load_files(example_config_toml(), secrets.path())
             .await
             .unwrap_err();
         assert!(
@@ -1152,7 +1165,28 @@ pub(crate) mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), example_secrets_toml())
+        let secrets = toml_file(
+            r#"
+            hyperdx.api_key = "test-key"
+
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [rebalancing]
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+            fireblocks_api_user_id = "test-user"
+            fireblocks_secret_path = "/tmp/test.key"
+        "#,
+        );
+        let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
         assert!(
@@ -1408,9 +1442,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             base_rpc_url = "https://base.example.com"
-            base_chain_id = 8453
             ethereum_rpc_url = "https://mainnet.infura.io"
-            ethereum_chain_id = 1
             fireblocks_api_user_id = "test-user"
             fireblocks_secret_path = "/tmp/test.key"
         "#,

@@ -5,7 +5,7 @@ hyperdx.service_name = "st0x-hedge"
 
 [raindex]
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
-deployment_block = 41715047
+deployment_block = 42954321
 
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
