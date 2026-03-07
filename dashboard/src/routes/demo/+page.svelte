@@ -1,5 +1,6 @@
 <script lang="ts">
   import { useQueryClient } from '@tanstack/svelte-query'
+  import HeaderBar from '$lib/components/header-bar.svelte'
   import InventoryPanel from '$lib/components/inventory-panel.svelte'
   import LiveEventsPanel from '$lib/components/live-events-panel.svelte'
   import type { Inventory } from '$lib/api/Inventory'
@@ -12,7 +13,7 @@
     perSymbol: [
       {
         symbol: 'tAAPL',
-        onchainAvailable: '150.25',
+        onchainAvailable: '150.253847',
         onchainInflight: '0',
         offchainAvailable: '200.00',
         offchainInflight: '10.50'
@@ -42,7 +43,7 @@
         symbol: 'tAMZN',
         onchainAvailable: '45.00',
         onchainInflight: '0',
-        offchainAvailable: '90.75',
+        offchainAvailable: '90.753218',
         offchainInflight: '0'
       },
       {
