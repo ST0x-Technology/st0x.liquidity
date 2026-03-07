@@ -169,8 +169,12 @@ pub fn decode_pyth_price(output: &Bytes) -> Result<Price, PythError> {
     Ok(price)
 }
 
-impl Price {
-    pub(crate) fn to_exact_decimal(&self) -> Result<ExactDecimal, PythError> {
+pub(crate) trait PriceExt {
+    fn to_exact_decimal(&self) -> Result<ExactDecimal, PythError>;
+}
+
+impl PriceExt for Price {
+    fn to_exact_decimal(&self) -> Result<ExactDecimal, PythError> {
         scale_with_exponent_signed(self.price, self.expo)
     }
 }

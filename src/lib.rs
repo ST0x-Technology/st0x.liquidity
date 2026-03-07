@@ -34,7 +34,6 @@ mod onchain_trade;
 mod position;
 mod queue;
 mod rebalancing;
-mod shares;
 mod symbol;
 mod telemetry;
 mod threshold;
@@ -57,9 +56,9 @@ pub use position::Position;
 #[cfg(any(test, feature = "test-support"))]
 pub use rebalancing::{RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
 #[cfg(any(test, feature = "test-support"))]
-pub use threshold::ExecutionThreshold;
+pub use st0x_shared::EquityTokenAddresses;
 #[cfg(any(test, feature = "test-support"))]
-pub use wrapper::EquityTokenAddresses;
+pub use threshold::ExecutionThreshold;
 
 #[cfg(test)]
 mod integration_tests;

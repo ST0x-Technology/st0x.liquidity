@@ -6,12 +6,14 @@
 //! trade direction (buy/sell), and validates amounts before
 //! further processing.
 
-use std::fmt;
-use std::marker::PhantomData;
-use std::str::FromStr;
-
 use st0x_exact_decimal::ExactDecimal;
 use st0x_execution::{Direction, FractionalShares, Symbol};
+
+#[cfg(test)]
+pub(crate) use st0x_shared::tokenized_symbol::TokenizedSymbolError;
+pub(crate) use st0x_shared::tokenized_symbol::{
+    OneToOneTokenizedShares, TokenizedSymbol, WrappedTokenizedShares,
+};
 
 use super::OnChainError;
 use crate::onchain::trade::TradeValidationError;
@@ -22,7 +24,7 @@ use crate::onchain::trade::TradeValidationError;
 #[macro_export]
 macro_rules! tokenized_symbol {
     ($form:ty, $symbol:expr) => {
-        $crate::onchain::io::TokenizedSymbol::<$form>::parse($symbol).unwrap()
+        st0x_shared::tokenized_symbol::TokenizedSymbol::<$form>::parse($symbol).unwrap()
     };
 }
 
@@ -49,79 +51,6 @@ impl Usdc {
 
     pub(crate) fn value(self) -> ExactDecimal {
         self.0
-    }
-}
-
-/// Distinguishes how an equity was tokenized onchain.
-/// Each form defines the symbol prefix used in Raindex orders.
-pub(crate) trait TokenizationForm: fmt::Debug + Clone + PartialEq + Eq {
-    fn prefix() -> &'static str;
-}
-
-/// 1:1 minted tokenized shares (tTICKER, e.g. tAAPL, tSPYM).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OneToOneTokenizedShares;
-
-impl TokenizationForm for OneToOneTokenizedShares {
-    fn prefix() -> &'static str {
-        "t"
-    }
-}
-
-/// ERC-4626 vault shares wrapping tokenized equity
-/// (wtTICKER, e.g. wtCOIN, wtAAPL).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WrappedTokenizedShares;
-
-impl TokenizationForm for WrappedTokenizedShares {
-    fn prefix() -> &'static str {
-        "wt"
-    }
-}
-
-/// A tokenized equity symbol consisting of a tokenization-form
-/// prefix and a base ticker. Parameterized by the form to
-/// distinguish minted (t) from wrapped (wt) symbols at the
-/// type level.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TokenizedSymbol<Form: TokenizationForm> {
-    _form: PhantomData<Form>,
-    symbol: Symbol,
-}
-
-impl<Form: TokenizationForm> TokenizedSymbol<Form> {
-    pub(crate) fn parse(input: &str) -> Result<Self, OnChainError> {
-        let Some(stripped) = input.strip_prefix(Form::prefix()) else {
-            return Err(OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity {
-                    symbol_provided: input.to_string(),
-                },
-            ));
-        };
-
-        let symbol = Symbol::new(stripped)?;
-        Ok(Self {
-            _form: PhantomData,
-            symbol,
-        })
-    }
-
-    pub(crate) fn base(&self) -> &Symbol {
-        &self.symbol
-    }
-}
-
-impl<Form: TokenizationForm> fmt::Display for TokenizedSymbol<Form> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}", Form::prefix(), self.symbol)
-    }
-}
-
-impl<Form: TokenizationForm> FromStr for TokenizedSymbol<Form> {
-    type Err = OnChainError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s)
     }
 }
 
@@ -248,9 +177,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                OnChainError::Validation(
-                    TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-                ) if symbol_provided == "USDC"
+                TokenizedSymbolError::NotTokenizedEquity {
+                    ref symbol_provided, ..
+                } if symbol_provided == "USDC"
             ),
             "Expected NotTokenizedEquity for USDC, got: {err:?}"
         );
@@ -259,9 +188,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                OnChainError::Validation(
-                    TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-                ) if symbol_provided == "AAPL"
+                TokenizedSymbolError::NotTokenizedEquity {
+                    ref symbol_provided, ..
+                } if symbol_provided == "AAPL"
             ),
             "Expected NotTokenizedEquity for AAPL, got: {err:?}"
         );
@@ -270,9 +199,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                OnChainError::Validation(
-                    TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-                ) if symbol_provided.is_empty()
+                TokenizedSymbolError::NotTokenizedEquity {
+                    ref symbol_provided, ..
+                } if symbol_provided.is_empty()
             ),
             "Expected NotTokenizedEquity for empty, got: {err:?}"
         );
@@ -294,7 +223,7 @@ mod tests {
 
         // Prefix-only "t" -> empty base -> Symbol validation fails
         let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("t").unwrap_err();
-        assert!(matches!(error, OnChainError::EmptySymbol(_)));
+        assert!(matches!(error, TokenizedSymbolError::EmptySymbol(_)));
     }
 
     #[test]
@@ -317,42 +246,42 @@ mod tests {
         let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("").unwrap_err();
         assert!(matches!(
             error,
-            OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-            ) if symbol_provided.is_empty()
+            TokenizedSymbolError::NotTokenizedEquity {
+                ref symbol_provided, ..
+            } if symbol_provided.is_empty()
         ));
 
         let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("USDC").unwrap_err();
         assert!(matches!(
             error,
-            OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-            ) if symbol_provided == "USDC"
+            TokenizedSymbolError::NotTokenizedEquity {
+                ref symbol_provided, ..
+            } if symbol_provided == "USDC"
         ));
 
         let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("AAPL").unwrap_err();
         assert!(matches!(
             error,
-            OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-            ) if symbol_provided == "AAPL"
+            TokenizedSymbolError::NotTokenizedEquity {
+                ref symbol_provided, ..
+            } if symbol_provided == "AAPL"
         ));
 
         // Legacy formats are no longer accepted
         let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("AAPL0x").unwrap_err();
         assert!(matches!(
             error,
-            OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-            ) if symbol_provided == "AAPL0x"
+            TokenizedSymbolError::NotTokenizedEquity {
+                ref symbol_provided, ..
+            } if symbol_provided == "AAPL0x"
         ));
 
         let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("NVDAs1").unwrap_err();
         assert!(matches!(
             error,
-            OnChainError::Validation(
-                TradeValidationError::NotTokenizedEquity { ref symbol_provided }
-            ) if symbol_provided == "NVDAs1"
+            TokenizedSymbolError::NotTokenizedEquity {
+                ref symbol_provided, ..
+            } if symbol_provided == "NVDAs1"
         ));
     }
 
@@ -552,8 +481,6 @@ mod tests {
 
     #[test]
     fn test_real_transaction_nvda_amount_extraction() {
-        // Real transaction: 0.374 wtNVDA sold for 64.169234 USDC
-        // Verifies equity vs USDC amounts are not swapped
         let details =
             TradeDetails::try_from_io("USDC", ed("64.169234"), "wtNVDA", ed("0.374")).unwrap();
 
@@ -629,17 +556,17 @@ mod tests {
         let err = TokenizedSymbol::<WrappedTokenizedShares>::parse("tCOIN").unwrap_err();
         assert!(matches!(
             err,
-            OnChainError::Validation(TradeValidationError::NotTokenizedEquity { .. })
+            TokenizedSymbolError::NotTokenizedEquity { .. }
         ));
 
         let err = TokenizedSymbol::<WrappedTokenizedShares>::parse("USDC").unwrap_err();
         assert!(matches!(
             err,
-            OnChainError::Validation(TradeValidationError::NotTokenizedEquity { .. })
+            TokenizedSymbolError::NotTokenizedEquity { .. }
         ));
 
         let err = TokenizedSymbol::<WrappedTokenizedShares>::parse("wt").unwrap_err();
-        assert!(matches!(err, OnChainError::EmptySymbol(_)));
+        assert!(matches!(err, TokenizedSymbolError::EmptySymbol(_)));
     }
 
     #[test]
