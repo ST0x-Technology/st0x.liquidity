@@ -343,3 +343,56 @@ impl<T> DomainError for T where
     T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
 }
+
+/// Load a single entity by replaying events from the store.
+///
+/// Creates a lightweight, temporary event store — no CQRS framework, no
+/// query processors. Suitable for read-only access from contexts that
+/// don't own a [`Store`] (e.g., dashboard transfer loading).
+pub async fn load_entity<Entity: EventSourced>(
+    pool: &SqlitePool,
+    id: &Entity::Id,
+) -> Result<Option<Entity>, SendError<Entity>> {
+    let repo = SqliteEventRepository::new(pool.clone());
+    let event_store =
+        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_event_store(repo);
+
+    let context = event_store.load_aggregate(&id.to_string()).await?;
+
+    Ok(context.aggregate.into_result()?)
+}
+
+/// Load all aggregate IDs for a given entity type.
+///
+/// Queries the events table for distinct aggregate IDs. Used
+/// by dashboard transfer loading to enumerate all transfer
+/// aggregates without requiring access to a [`Store`].
+pub async fn load_all_ids<Entity: EventSourced>(
+    pool: &SqlitePool,
+) -> Result<Vec<Entity::Id>, sqlx::Error>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT aggregate_id FROM events \
+         WHERE aggregate_type = ?1 \
+         ORDER BY aggregate_id ASC",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id_str,)| {
+            id_str.parse::<Entity::Id>().ok().or_else(|| {
+                tracing::warn!(
+                    aggregate_id = id_str,
+                    aggregate_type = Entity::AGGREGATE_TYPE,
+                    "Failed to parse aggregate ID"
+                );
+                None
+            })
+        })
+        .collect())
+}

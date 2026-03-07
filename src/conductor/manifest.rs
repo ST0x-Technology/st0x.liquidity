@@ -117,14 +117,14 @@ mod tests {
     use alloy::primitives::Address;
     use rust_decimal_macros::dec;
     use std::collections::HashSet;
-    use tokio::sync::{RwLock, broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc};
 
     use st0x_event_sorcery::test_store;
     use st0x_execution::Symbol;
 
     use super::*;
     use crate::config::{AssetsConfig, EquitiesConfig};
-    use crate::inventory::{ImbalanceThreshold, InventoryView};
+    use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::{LiquidityVenueRatio, RebalancingTriggerConfig};
     use crate::test_utils::setup_test_db;
@@ -164,12 +164,15 @@ mod tests {
             vault_registry,
             Address::ZERO,
             Address::ZERO,
-            Arc::new(RwLock::new(InventoryView::default())),
+            {
+                let (sender, _) = broadcast::channel(16);
+                Arc::new(BroadcastingInventory::new(InventoryView::default(), sender))
+            },
             operation_sender,
             Arc::new(MockWrapper::new()),
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender));
+        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender, pool.clone()));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let services = EquityTransferServices {
