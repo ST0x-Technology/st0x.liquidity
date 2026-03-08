@@ -53,8 +53,11 @@ pub(crate) enum Imbalance<T> {
 #[serde(try_from = "RawImbalanceThreshold", deny_unknown_fields)]
 pub struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
+    #[serde(rename = "onchain_ratio", alias = "target")]
     pub(crate) target: Decimal,
-    /// Deviation from target that triggers rebalancing.
+    /// How far the actual onchain ratio can deviate from target before
+    /// rebalancing triggers (e.g., 0.15 means ±15 percentage points).
+    #[serde(rename = "trigger_threshold", alias = "deviation")]
     pub(crate) deviation: Decimal,
 }
 
