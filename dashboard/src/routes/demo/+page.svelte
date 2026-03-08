@@ -467,10 +467,18 @@
     }
   ]
 
+  const mockRebalancing = {
+    equityOnchainRatio: '0.5',
+    equityTriggerThreshold: '0.15',
+    cashOnchainRatio: '0.6',
+    cashTriggerThreshold: '0.1'
+  }
+
   queryClient.setQueryData(['inventory'], mockInventory)
   queryClient.setQueryData(['transfers', 'active'], mockActiveTransfers)
   queryClient.setQueryData(['transfers', 'recent'], mockRecentTransfers)
   queryClient.setQueryData(['events'], mockEvents)
+  queryClient.setQueryData(['rebalancing'], mockRebalancing)
 </script>
 
 <div class="flex h-screen flex-col bg-background">
@@ -478,8 +486,8 @@
     connectionStatus="disconnected"
   />
 
-  <main class="flex-1 overflow-auto p-2 md:overflow-hidden md:p-4">
-    <div class="grid h-full grid-cols-1 gap-2 md:grid-cols-[3fr_2fr] md:gap-4">
+  <main class="flex-1 overflow-auto p-2 md:p-4">
+    <div class="grid grid-cols-1 gap-2 lg:grid-cols-[3fr_2fr] lg:gap-4">
       <InventoryPanel />
       <LiveEventsPanel />
     </div>

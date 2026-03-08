@@ -39,8 +39,8 @@
     </div>
   {/if}
 
-  <main class="flex-1 overflow-auto p-2 md:overflow-hidden md:p-4">
-    <div class="grid h-full grid-cols-1 gap-2 md:grid-cols-[3fr_2fr] md:gap-4">
+  <main class="flex-1 overflow-auto p-2 md:p-4">
+    <div class="grid grid-cols-1 gap-2 lg:grid-cols-[3fr_2fr] lg:gap-4">
       <InventoryPanel />
       <LiveEventsPanel />
     </div>
