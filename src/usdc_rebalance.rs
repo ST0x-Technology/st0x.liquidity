@@ -66,7 +66,7 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use uuid::Uuid;
 
-use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
+use st0x_dto::{CompletedStage, TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_finance::{Id, Usdc};
 
@@ -479,6 +479,14 @@ pub(crate) enum UsdcRebalance {
     },
 }
 
+fn stage(name: &str, tx_hash: Option<TxHash>, completed_at: DateTime<Utc>) -> CompletedStage {
+    CompletedStage {
+        name: name.to_string(),
+        tx_hash,
+        completed_at,
+    }
+}
+
 fn direction_to_dto(direction: &RebalanceDirection) -> st0x_dto::UsdcBridgeDirection {
     match direction {
         RebalanceDirection::AlpacaToBase => st0x_dto::UsdcBridgeDirection::AlpacaToBase,
@@ -489,7 +497,7 @@ fn direction_to_dto(direction: &RebalanceDirection) -> st0x_dto::UsdcBridgeDirec
 impl UsdcRebalance {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn to_dto(&self, id: &UsdcRebalanceId) -> TransferOperation {
-        let (direction, amount, status, started_at, updated_at) = match self {
+        let (direction, amount, status, stages, started_at, updated_at) = match self {
             Self::Converting {
                 direction,
                 amount,
@@ -499,6 +507,7 @@ impl UsdcRebalance {
                 direction,
                 *amount,
                 UsdcBridgeStatus::Converting,
+                vec![stage("initiated", None, *initiated_at)],
                 *initiated_at,
                 *initiated_at,
             ),
@@ -513,6 +522,10 @@ impl UsdcRebalance {
                 direction,
                 *amount,
                 UsdcBridgeStatus::Converting,
+                vec![
+                    stage("initiated", None, *initiated_at),
+                    stage("converted", None, *converted_at),
+                ],
                 *initiated_at,
                 *converted_at,
             ),
@@ -541,6 +554,7 @@ impl UsdcRebalance {
                     burn: None,
                     mint: None,
                 },
+                vec![stage("initiated", None, *initiated_at)],
                 *initiated_at,
                 *failed_at,
             ),
@@ -562,6 +576,7 @@ impl UsdcRebalance {
                     burn: *burn_tx_hash,
                     mint: None,
                 },
+                vec![stage("initiated", None, *initiated_at)],
                 *initiated_at,
                 *failed_at,
             ),
@@ -584,6 +599,7 @@ impl UsdcRebalance {
                     burn: Some(*burn_tx_hash),
                     mint: Some(*mint_tx_hash),
                 },
+                vec![stage("initiated", None, *initiated_at)],
                 *initiated_at,
                 *failed_at,
             ),
@@ -597,6 +613,7 @@ impl UsdcRebalance {
                 direction,
                 *amount,
                 UsdcBridgeStatus::Withdrawing,
+                vec![stage("initiated", None, *initiated_at)],
                 *initiated_at,
                 *initiated_at,
             ),
@@ -611,6 +628,10 @@ impl UsdcRebalance {
                 direction,
                 *amount,
                 UsdcBridgeStatus::Withdrawing,
+                vec![
+                    stage("initiated", None, *initiated_at),
+                    stage("confirmed", None, *confirmed_at),
+                ],
                 *initiated_at,
                 *confirmed_at,
             ),
@@ -628,6 +649,10 @@ impl UsdcRebalance {
                 UsdcBridgeStatus::Bridging {
                     burn: *burn_tx_hash,
                 },
+                vec![
+                    stage("initiated", None, *initiated_at),
+                    stage("burned", Some(*burn_tx_hash), *burned_at),
+                ],
                 *initiated_at,
                 *burned_at,
             ),
@@ -645,6 +670,10 @@ impl UsdcRebalance {
                 UsdcBridgeStatus::Bridging {
                     burn: *burn_tx_hash,
                 },
+                vec![
+                    stage("initiated", None, *initiated_at),
+                    stage("attested", None, *attested_at),
+                ],
                 *initiated_at,
                 *attested_at,
             ),
@@ -653,6 +682,7 @@ impl UsdcRebalance {
                 direction,
                 amount,
                 burn_tx_hash,
+                mint_tx_hash,
                 initiated_at,
                 minted_at,
                 ..
@@ -662,6 +692,10 @@ impl UsdcRebalance {
                 UsdcBridgeStatus::Bridging {
                     burn: *burn_tx_hash,
                 },
+                vec![
+                    stage("initiated", None, *initiated_at),
+                    stage("minted", Some(*mint_tx_hash), *minted_at),
+                ],
                 *initiated_at,
                 *minted_at,
             ),
@@ -681,6 +715,10 @@ impl UsdcRebalance {
                     burn: *burn_tx_hash,
                     mint: *mint_tx_hash,
                 },
+                vec![
+                    stage("initiated", None, *initiated_at),
+                    stage("deposit_initiated", None, *deposit_initiated_at),
+                ],
                 *initiated_at,
                 *deposit_initiated_at,
             ),
@@ -700,6 +738,10 @@ impl UsdcRebalance {
                     burn: *burn_tx_hash,
                     mint: *mint_tx_hash,
                 },
+                vec![
+                    stage("initiated", None, *initiated_at),
+                    stage("deposit_confirmed", None, *deposit_confirmed_at),
+                ],
                 *initiated_at,
                 *deposit_confirmed_at,
             ),
@@ -710,6 +752,7 @@ impl UsdcRebalance {
             direction: direction_to_dto(direction),
             amount,
             status,
+            completed_stages: stages,
             started_at,
             updated_at,
         })
@@ -3952,5 +3995,42 @@ mod tests {
         assert_eq!(mint, Some(mint_tx));
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, failed_at);
+    }
+
+    #[test]
+    fn to_dto_populates_completed_stages() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let burned_at = initiated_at + chrono::Duration::seconds(30);
+        let burn_tx = TxHash::random();
+
+        let state = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(dec!(2000)),
+            burn_tx_hash: burn_tx,
+            initiated_at,
+            burned_at,
+        };
+
+        let TransferOperation::UsdcBridge(bridge) = state.to_dto(&id) else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert_eq!(
+            bridge.completed_stages.len(),
+            2,
+            "Bridging should have 2 completed stages, got: {:?}",
+            bridge
+                .completed_stages
+                .iter()
+                .map(|stage| &stage.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(bridge.completed_stages[0].name, "initiated");
+        assert!(bridge.completed_stages[0].tx_hash.is_none());
+        assert_eq!(bridge.completed_stages[0].completed_at, initiated_at);
+        assert_eq!(bridge.completed_stages[1].name, "burned");
+        assert_eq!(bridge.completed_stages[1].tx_hash, Some(burn_tx));
+        assert_eq!(bridge.completed_stages[1].completed_at, burned_at);
     }
 }

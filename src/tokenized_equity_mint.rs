@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::warn;
 
-use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
+use st0x_dto::{CompletedStage, EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
@@ -367,6 +367,14 @@ pub(crate) enum TokenizedEquityMint {
     },
 }
 
+fn stage(name: &str, tx_hash: Option<TxHash>, completed_at: DateTime<Utc>) -> CompletedStage {
+    CompletedStage {
+        name: name.to_string(),
+        tx_hash,
+        completed_at,
+    }
+}
+
 impl TokenizedEquityMint {
     pub(crate) fn to_dto(&self, id: &IssuerRequestId) -> TransferOperation {
         match self {
@@ -375,14 +383,19 @@ impl TokenizedEquityMint {
                 quantity,
                 requested_at,
                 ..
-            } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Minting,
-                started_at: *requested_at,
-                updated_at: *requested_at,
-            }),
+            } => {
+                let stages = vec![stage("requested", None, *requested_at)];
+
+                TransferOperation::EquityMint(EquityMintOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityMintStatus::Minting,
+                    completed_stages: stages,
+                    started_at: *requested_at,
+                    updated_at: *requested_at,
+                })
+            }
 
             Self::MintAccepted {
                 symbol,
@@ -390,30 +403,48 @@ impl TokenizedEquityMint {
                 requested_at,
                 accepted_at,
                 ..
-            } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Minting,
-                started_at: *requested_at,
-                updated_at: *accepted_at,
-            }),
+            } => {
+                let stages = vec![
+                    stage("requested", None, *requested_at),
+                    stage("accepted", None, *accepted_at),
+                ];
+
+                TransferOperation::EquityMint(EquityMintOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityMintStatus::Minting,
+                    completed_stages: stages,
+                    started_at: *requested_at,
+                    updated_at: *accepted_at,
+                })
+            }
 
             Self::TokensReceived {
                 symbol,
                 quantity,
                 tx_hash,
                 requested_at,
+                accepted_at,
                 received_at,
                 ..
-            } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Wrapping { token: *tx_hash },
-                started_at: *requested_at,
-                updated_at: *received_at,
-            }),
+            } => {
+                let stages = vec![
+                    stage("requested", None, *requested_at),
+                    stage("accepted", None, *accepted_at),
+                    stage("received", Some(*tx_hash), *received_at),
+                ];
+
+                TransferOperation::EquityMint(EquityMintOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityMintStatus::Wrapping { token: *tx_hash },
+                    completed_stages: stages,
+                    started_at: *requested_at,
+                    updated_at: *received_at,
+                })
+            }
 
             Self::TokensWrapped {
                 symbol,
@@ -421,19 +452,31 @@ impl TokenizedEquityMint {
                 tx_hash,
                 wrap_tx_hash,
                 requested_at,
+                accepted_at,
+                received_at,
                 wrapped_at,
                 ..
-            } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Depositing {
-                    token: *tx_hash,
-                    wrap: *wrap_tx_hash,
-                },
-                started_at: *requested_at,
-                updated_at: *wrapped_at,
-            }),
+            } => {
+                let stages = vec![
+                    stage("requested", None, *requested_at),
+                    stage("accepted", None, *accepted_at),
+                    stage("received", Some(*tx_hash), *received_at),
+                    stage("wrapped", Some(*wrap_tx_hash), *wrapped_at),
+                ];
+
+                TransferOperation::EquityMint(EquityMintOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityMintStatus::Depositing {
+                        token: *tx_hash,
+                        wrap: *wrap_tx_hash,
+                    },
+                    completed_stages: stages,
+                    started_at: *requested_at,
+                    updated_at: *wrapped_at,
+                })
+            }
 
             Self::DepositedIntoRaindex {
                 symbol,
@@ -443,19 +486,28 @@ impl TokenizedEquityMint {
                 vault_deposit_tx_hash,
                 deposited_at,
                 ..
-            } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Completed {
-                    completed_at: *deposited_at,
-                    token: *token_tx_hash,
-                    wrap: *wrap_tx_hash,
-                    vault_deposit: *vault_deposit_tx_hash,
-                },
-                started_at: *deposited_at,
-                updated_at: *deposited_at,
-            }),
+            } => {
+                let stages = vec![stage(
+                    "deposited",
+                    Some(*vault_deposit_tx_hash),
+                    *deposited_at,
+                )];
+
+                TransferOperation::EquityMint(EquityMintOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityMintStatus::Completed {
+                        completed_at: *deposited_at,
+                        token: *token_tx_hash,
+                        wrap: *wrap_tx_hash,
+                        vault_deposit: *vault_deposit_tx_hash,
+                    },
+                    completed_stages: stages,
+                    started_at: *deposited_at,
+                    updated_at: *deposited_at,
+                })
+            }
 
             Self::Failed {
                 symbol,
@@ -463,17 +515,22 @@ impl TokenizedEquityMint {
                 reason,
                 requested_at,
                 failed_at,
-            } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Failed {
-                    failed_at: *failed_at,
-                    reason: reason.clone(),
-                },
-                started_at: *requested_at,
-                updated_at: *failed_at,
-            }),
+            } => {
+                let stages = vec![stage("requested", None, *requested_at)];
+
+                TransferOperation::EquityMint(EquityMintOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityMintStatus::Failed {
+                        failed_at: *failed_at,
+                        reason: reason.clone(),
+                    },
+                    completed_stages: stages,
+                    started_at: *requested_at,
+                    updated_at: *failed_at,
+                })
+            }
         }
     }
 }
@@ -1663,6 +1720,56 @@ mod tests {
         assert_eq!(reason, "Something went wrong");
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
+    }
+
+    #[test]
+    fn to_dto_populates_completed_stages() {
+        let id = IssuerRequestId::new("MINT-001");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(30);
+        let even_later = now + chrono::Duration::seconds(60);
+        let token_tx = TxHash::random();
+        let wrap_tx = TxHash::random();
+
+        let wrapped = TokenizedEquityMint::TokensWrapped {
+            symbol,
+            quantity: dec!(10),
+            wallet: Address::ZERO,
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tx_hash: token_tx,
+            receipt_id: ReceiptId(U256::from(1)),
+            shares_minted: U256::from(10_000_000_000_000_000_000_u128),
+            wrap_tx_hash: wrap_tx,
+            wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+            requested_at: now,
+            accepted_at: later,
+            received_at: later,
+            wrapped_at: even_later,
+        };
+
+        let TransferOperation::EquityMint(op) = wrapped.to_dto(&id) else {
+            panic!("Expected EquityMint");
+        };
+
+        assert_eq!(
+            op.completed_stages.len(),
+            4,
+            "TokensWrapped should have 4 completed stages, got: {:?}",
+            op.completed_stages
+                .iter()
+                .map(|stage| &stage.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(op.completed_stages[0].name, "requested");
+        assert!(op.completed_stages[0].tx_hash.is_none());
+        assert_eq!(op.completed_stages[1].name, "accepted");
+        assert_eq!(op.completed_stages[2].name, "received");
+        assert_eq!(op.completed_stages[2].tx_hash, Some(token_tx));
+        assert_eq!(op.completed_stages[3].name, "wrapped");
+        assert_eq!(op.completed_stages[3].tx_hash, Some(wrap_tx));
+        assert_eq!(op.completed_stages[3].completed_at, even_later);
     }
 
     #[tokio::test]

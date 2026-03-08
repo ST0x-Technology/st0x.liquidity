@@ -170,6 +170,16 @@ pub struct InventorySnapshot {
     pub fetched_at: DateTime<Utc>,
 }
 
+/// A completed stage in a transfer pipeline with its timestamp.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedStage {
+    pub name: String,
+    #[ts(type = "string | null")]
+    pub tx_hash: Option<TxHash>,
+    pub completed_at: DateTime<Utc>,
+}
+
 /// Tag type for equity mint operation IDs.
 pub enum EquityMintTag {}
 
@@ -199,6 +209,7 @@ pub struct EquityMintOperation {
     #[ts(type = "string")]
     pub quantity: FractionalShares,
     pub status: EquityMintStatus,
+    pub completed_stages: Vec<CompletedStage>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -248,6 +259,7 @@ pub struct EquityRedemptionOperation {
     #[ts(type = "string")]
     pub quantity: FractionalShares,
     pub status: EquityRedemptionStatus,
+    pub completed_stages: Vec<CompletedStage>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -310,6 +322,7 @@ pub struct UsdcBridgeOperation {
     #[ts(type = "string")]
     pub amount: Usdc,
     pub status: UsdcBridgeStatus,
+    pub completed_stages: Vec<CompletedStage>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -527,6 +540,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     InventorySnapshot::export_all_to(out_dir)?;
     UsdcInventory::export_all_to(out_dir)?;
     TransferOperation::export_all_to(out_dir)?;
+    CompletedStage::export_all_to(out_dir)?;
     EquityMintOperation::export_all_to(out_dir)?;
     EquityMintStatus::export_all_to(out_dir)?;
     EquityRedemptionOperation::export_all_to(out_dir)?;
@@ -627,6 +641,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(Decimal::new(10, 0)),
             status: EquityMintStatus::Minting,
+            completed_stages: vec![],
             started_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -648,6 +663,7 @@ mod tests {
                 burn: TxHash::random(),
                 mint: TxHash::random(),
             },
+            completed_stages: vec![],
             started_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -755,6 +771,51 @@ mod tests {
         assert!(
             json.contains("\"mint\""),
             "should include mint hash, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_stages_serializes_correctly() {
+        let now = Utc::now();
+        let tx = TxHash::random();
+
+        let operation = TransferOperation::EquityMint(EquityMintOperation {
+            id: Id::new("mint-cs"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(Decimal::new(10, 0)),
+            status: EquityMintStatus::Wrapping { token: tx },
+            completed_stages: vec![
+                CompletedStage {
+                    name: "requested".to_string(),
+                    tx_hash: None,
+                    completed_at: now,
+                },
+                CompletedStage {
+                    name: "received".to_string(),
+                    tx_hash: Some(tx),
+                    completed_at: now,
+                },
+            ],
+            started_at: now,
+            updated_at: now,
+        });
+
+        let json = serde_json::to_string(&operation).unwrap();
+        assert!(
+            json.contains("\"completedStages\""),
+            "should contain completedStages key, got: {json}"
+        );
+        assert!(
+            json.contains("\"requested\""),
+            "should contain requested stage, got: {json}"
+        );
+        assert!(
+            json.contains("\"received\""),
+            "should contain received stage, got: {json}"
+        );
+        assert!(
+            json.contains(&format!("\"0x{tx:x}\"")),
+            "should contain tx hash, got: {json}"
         );
     }
 

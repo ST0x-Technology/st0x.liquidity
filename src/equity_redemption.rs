@@ -63,7 +63,9 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::{info, warn};
 
-use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
+use st0x_dto::{
+    CompletedStage, EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation,
+};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
@@ -363,6 +365,14 @@ pub(crate) enum EquityRedemption {
     },
 }
 
+fn stage(name: &str, tx_hash: Option<TxHash>, completed_at: DateTime<Utc>) -> CompletedStage {
+    CompletedStage {
+        name: name.to_string(),
+        tx_hash,
+        completed_at,
+    }
+}
+
 impl EquityRedemption {
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         match self {
@@ -372,16 +382,25 @@ impl EquityRedemption {
                 raindex_withdraw_tx,
                 withdrawn_at,
                 ..
-            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Withdrawing {
-                    raindex_withdraw: *raindex_withdraw_tx,
-                },
-                started_at: *withdrawn_at,
-                updated_at: *withdrawn_at,
-            }),
+            } => {
+                let stages = vec![stage(
+                    "withdrawn",
+                    Some(*raindex_withdraw_tx),
+                    *withdrawn_at,
+                )];
+
+                TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityRedemptionStatus::Withdrawing {
+                        raindex_withdraw: *raindex_withdraw_tx,
+                    },
+                    completed_stages: stages,
+                    started_at: *withdrawn_at,
+                    updated_at: *withdrawn_at,
+                })
+            }
 
             Self::TokensUnwrapped {
                 symbol,
@@ -391,34 +410,48 @@ impl EquityRedemption {
                 withdrawn_at,
                 unwrapped_at,
                 ..
-            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Unwrapping {
-                    raindex_withdraw: *raindex_withdraw_tx,
-                    unwrap: *unwrap_tx_hash,
-                },
-                started_at: *withdrawn_at,
-                updated_at: *unwrapped_at,
-            }),
+            } => {
+                let stages = vec![
+                    stage("withdrawn", Some(*raindex_withdraw_tx), *withdrawn_at),
+                    stage("unwrapped", Some(*unwrap_tx_hash), *unwrapped_at),
+                ];
+
+                TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityRedemptionStatus::Unwrapping {
+                        raindex_withdraw: *raindex_withdraw_tx,
+                        unwrap: *unwrap_tx_hash,
+                    },
+                    completed_stages: stages,
+                    started_at: *withdrawn_at,
+                    updated_at: *unwrapped_at,
+                })
+            }
 
             Self::TokensSent {
                 symbol,
                 quantity,
                 raindex_withdraw_tx,
+                redemption_tx,
                 sent_at,
                 ..
-            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Sending {
-                    raindex_withdraw: *raindex_withdraw_tx,
-                },
-                started_at: *sent_at,
-                updated_at: *sent_at,
-            }),
+            } => {
+                let stages = vec![stage("sent", Some(*redemption_tx), *sent_at)];
+
+                TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityRedemptionStatus::Sending {
+                        raindex_withdraw: *raindex_withdraw_tx,
+                    },
+                    completed_stages: stages,
+                    started_at: *sent_at,
+                    updated_at: *sent_at,
+                })
+            }
 
             Self::Pending {
                 symbol,
@@ -427,16 +460,24 @@ impl EquityRedemption {
                 sent_at,
                 detected_at,
                 ..
-            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::PendingConfirmation {
-                    redemption: *redemption_tx,
-                },
-                started_at: *sent_at,
-                updated_at: *detected_at,
-            }),
+            } => {
+                let stages = vec![
+                    stage("sent", Some(*redemption_tx), *sent_at),
+                    stage("detected", None, *detected_at),
+                ];
+
+                TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityRedemptionStatus::PendingConfirmation {
+                        redemption: *redemption_tx,
+                    },
+                    completed_stages: stages,
+                    started_at: *sent_at,
+                    updated_at: *detected_at,
+                })
+            }
 
             Self::Completed {
                 symbol,
@@ -444,17 +485,22 @@ impl EquityRedemption {
                 redemption_tx,
                 completed_at,
                 ..
-            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Completed {
-                    completed_at: *completed_at,
-                    redemption: *redemption_tx,
-                },
-                started_at: *completed_at,
-                updated_at: *completed_at,
-            }),
+            } => {
+                let stages = vec![stage("completed", Some(*redemption_tx), *completed_at)];
+
+                TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                    id: Id::new(id.0.clone()),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(*quantity),
+                    status: EquityRedemptionStatus::Completed {
+                        completed_at: *completed_at,
+                        redemption: *redemption_tx,
+                    },
+                    completed_stages: stages,
+                    started_at: *completed_at,
+                    updated_at: *completed_at,
+                })
+            }
 
             Self::Failed {
                 symbol,
@@ -472,6 +518,7 @@ impl EquityRedemption {
                     raindex_withdraw: *raindex_withdraw_tx,
                     redemption: *redemption_tx,
                 },
+                completed_stages: vec![],
                 started_at: *failed_at,
                 updated_at: *failed_at,
             }),
@@ -1730,5 +1777,47 @@ mod tests {
         assert_eq!(redemption, redeem_tx);
         assert_eq!(op.started_at, later);
         assert_eq!(op.updated_at, later);
+    }
+
+    #[test]
+    fn to_dto_populates_completed_stages() {
+        let id = RedemptionAggregateId::new("REDEEM-001");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(30);
+
+        let withdraw_tx = TxHash::random();
+        let unwrap_tx = TxHash::random();
+        let unwrapped = EquityRedemption::TokensUnwrapped {
+            symbol,
+            quantity: dec!(50.25),
+            token: Address::random(),
+            underlying_token: Address::random(),
+            raindex_withdraw_tx: withdraw_tx,
+            unwrap_tx_hash: unwrap_tx,
+            unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            withdrawn_at: now,
+            unwrapped_at: later,
+        };
+
+        let TransferOperation::EquityRedemption(op) = unwrapped.to_dto(&id) else {
+            panic!("Expected EquityRedemption");
+        };
+
+        assert_eq!(
+            op.completed_stages.len(),
+            2,
+            "TokensUnwrapped should have 2 completed stages, got: {:?}",
+            op.completed_stages
+                .iter()
+                .map(|stage| &stage.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(op.completed_stages[0].name, "withdrawn");
+        assert_eq!(op.completed_stages[0].tx_hash, Some(withdraw_tx));
+        assert_eq!(op.completed_stages[0].completed_at, now);
+        assert_eq!(op.completed_stages[1].name, "unwrapped");
+        assert_eq!(op.completed_stages[1].tx_hash, Some(unwrap_tx));
+        assert_eq!(op.completed_stages[1].completed_at, later);
     }
 }
