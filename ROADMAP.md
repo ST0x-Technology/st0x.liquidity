@@ -39,8 +39,15 @@ Turnkey work above, so both proceed in parallel.
   - PR:
     [#382 update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/pull/382)
 - [ ] [#377 Dashboard backend: serve inventory history and transfer status via WebSocket](https://github.com/ST0x-Technology/st0x.liquidity/issues/377)
+  - PR:
+    [#396 add ratio/target columns, fix live events, improve styling](https://github.com/ST0x-Technology/st0x.liquidity/pull/396)
 - [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
+  - PR:
+    [#396 add ratio/target columns, fix live events, improve styling](https://github.com/ST0x-Technology/st0x.liquidity/pull/396)
 - [ ] [#379 Dashboard integration: verify nix build, deployment, and end-to-end data flow](https://github.com/ST0x-Technology/st0x.liquidity/issues/379)
+- [ ] [#398 Editable service config without redeploy](https://github.com/ST0x-Technology/st0x.liquidity/issues/398)
+  - PR:
+    [#397 copy config to /mnt/data for editing without redeploy](https://github.com/ST0x-Technology/st0x.liquidity/pull/397)
 
 ### Wallet provider config (main crate, depends on Turnkey wallet)
 
@@ -148,6 +155,8 @@ both Schwab and Alpaca bot instances.
 **Panels:**
 
 - [ ] [#233 Make the dashboard display not only live events happening but also get historical data so that it's clear what's been happening in the system](https://github.com/ST0x-Technology/st0x.liquidity/issues/233)
+  - PR:
+    [#396 add ratio/target columns, fix live events, improve styling](https://github.com/ST0x-Technology/st0x.liquidity/pull/396)
 - [ ] [#178 Dashboard: Performance Metrics Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/178)
 - [ ] [#179 Dashboard: Inventory Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/179)
 - [ ] [#180 Dashboard: Spreads Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/180)

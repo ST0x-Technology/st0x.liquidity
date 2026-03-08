@@ -44,10 +44,16 @@ let
       serviceConfig = {
         DynamicUser = true;
         SupplementaryGroups = [ "st0x" ];
+        ExecStartPre = pkgs.writeShellScript "copy-config-${name}" ''
+          if [ ! -f /mnt/data/${name}.toml ]; then
+            cp ${configFile} /mnt/data/${name}.toml
+            chmod 0644 /mnt/data/${name}.toml
+          fi
+        '';
         ExecStart = builtins.concatStringsSep " " [
           path
           "--config"
-          "${configFile}"
+          "/mnt/data/${name}.toml"
           "--secrets"
           cfg.decryptedSecretPath
         ];
