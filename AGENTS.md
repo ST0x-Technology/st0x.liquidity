@@ -473,12 +473,10 @@ is the source of truth for terminology and naming conventions.
   behavior
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
   String values.** No `SomeError(String)`, no `.to_string()` or `format!()`
-  conversions, no unpacking newtypes (store `Symbol` not `String`). Prefer
-  `#[from]` + `?` for error conversion; preserve error chains with `#[source]`;
-  discover variants during implementation not preemptively. `.map_err` is
-  permitted when adding call-site context or adapting a source error type that
-  cannot implement `From`/`#[from]` - do not reach for it as the default when
-  `#[from]` + `?` suffices. To log before converting:
+  conversions, no unpacking newtypes (store `Symbol` not `String`). Use
+  `#[from]` + `?` for error conversion (prefer over `.map_err`), preserve error
+  chains with `#[source]`, discover variants during implementation not
+  preemptively. To log before converting:
   `.inspect_err(|error| error!(?error, "ctx"))` before `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
