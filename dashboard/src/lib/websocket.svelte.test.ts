@@ -614,6 +614,7 @@ describe('createWebSocket', () => {
       symbol: 'tAAPL',
       quantity: '100',
       status: { status: 'minting' },
+      completedStages: [],
       startedAt: '2024-01-01T00:00:00Z',
       updatedAt: '2024-01-01T00:00:00Z'
     }
@@ -650,6 +651,7 @@ describe('createWebSocket', () => {
       symbol: 'tAAPL',
       quantity: '100',
       status: { status: 'minting' },
+      completedStages: [],
       startedAt: '2024-01-01T00:00:00Z',
       updatedAt: '2024-01-01T00:00:00Z'
     }
@@ -666,6 +668,7 @@ describe('createWebSocket', () => {
         wrap: '0xaaaa000000000000000000000000000000000000000000000000000000000002',
         vault_deposit: '0xaaaa000000000000000000000000000000000000000000000000000000000003'
       },
+      completedStages: [],
       startedAt: '2024-01-01T00:00:00Z',
       updatedAt: '2024-01-01T00:01:00Z'
     }
