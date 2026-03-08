@@ -592,4 +592,141 @@ mod tests {
         assert!(json.contains("offchainAvailable"));
         assert!(json.contains("offchainInflight"));
     }
+
+    #[test]
+    fn failed_equity_mint_includes_reason() {
+        let status = EquityMintStatus::Failed {
+            failed_at: Utc::now(),
+            reason: "insufficient balance".to_string(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""reason":"insufficient balance""#),
+            "Failed mint should include reason, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_equity_mint_includes_all_tx_hashes() {
+        let status = EquityMintStatus::Completed {
+            completed_at: Utc::now(),
+            token: TxHash::random(),
+            wrap: TxHash::random(),
+            vault_deposit: TxHash::random(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"token\""),
+            "should include token, got: {json}"
+        );
+        assert!(
+            json.contains("\"wrap\""),
+            "should include wrap, got: {json}"
+        );
+        assert!(
+            json.contains("\"vaultDeposit\""),
+            "should include vaultDeposit, got: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_usdc_bridge_includes_reason_and_optional_tx_hashes() {
+        let status = UsdcBridgeStatus::Failed {
+            failed_at: Utc::now(),
+            reason: "bridge timeout".to_string(),
+            burn: Some(TxHash::random()),
+            mint: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""reason":"bridge timeout""#),
+            "should include reason, got: {json}"
+        );
+        assert!(
+            json.contains("\"burn\""),
+            "should include burn hash, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_usdc_bridge_includes_both_tx_hashes() {
+        let status = UsdcBridgeStatus::Completed {
+            completed_at: Utc::now(),
+            burn: TxHash::random(),
+            mint: TxHash::random(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"burn\""),
+            "should include burn hash, got: {json}"
+        );
+        assert!(
+            json.contains("\"mint\""),
+            "should include mint hash, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_stages_serializes_correctly() {
+        let now = Utc::now();
+        let tx = TxHash::random();
+
+        let operation = TransferOperation::EquityMint(EquityMintOperation {
+            id: Id::new("mint-cs"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(Decimal::new(10, 0)),
+            status: EquityMintStatus::Wrapping { token: tx },
+            completed_stages: vec![
+                CompletedStage {
+                    name: "requested".to_string(),
+                    tx_hash: None,
+                    completed_at: now,
+                },
+                CompletedStage {
+                    name: "received".to_string(),
+                    tx_hash: Some(tx),
+                    completed_at: now,
+                },
+            ],
+            started_at: now,
+            updated_at: now,
+        });
+
+        let json = serde_json::to_string(&operation).unwrap();
+        assert!(
+            json.contains("\"completedStages\""),
+            "should contain completedStages key, got: {json}"
+        );
+        assert!(
+            json.contains("\"requested\""),
+            "should contain requested stage, got: {json}"
+        );
+        assert!(
+            json.contains("\"received\""),
+            "should contain received stage, got: {json}"
+        );
+        assert!(
+            json.contains(&format!("\"0x{tx:x}\"")),
+            "should contain tx hash, got: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_equity_redemption_includes_optional_tx_hashes() {
+        let withdraw_tx = TxHash::random();
+        let status = EquityRedemptionStatus::Failed {
+            failed_at: Utc::now(),
+            raindex_withdraw: Some(withdraw_tx),
+            redemption: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"raindexWithdraw\""),
+            "should include raindexWithdraw, got: {json}"
+        );
+        assert!(
+            json.contains(&format!("\"0x{withdraw_tx:x}\"")),
+            "should include actual tx hash value, got: {json}"
+        );
+    }
 }
