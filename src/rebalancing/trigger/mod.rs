@@ -1759,6 +1759,7 @@ mod tests {
         TokenizedEquityMintEvent::WrappingFailed {
             symbol: symbol.clone(),
             quantity,
+            reason: "test wrapping failure".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -3370,7 +3371,13 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
-            Arc::new(RwLock::new(InventoryView::default())),
+            {
+                let (inventory_sender, _) = tokio::sync::broadcast::channel(16);
+                Arc::new(BroadcastingInventory::new(
+                    InventoryView::default(),
+                    inventory_sender,
+                ))
+            },
             sender,
             wrapper,
         );

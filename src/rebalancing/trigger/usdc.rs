@@ -129,7 +129,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
-    use crate::inventory::InventoryView;
+    use crate::inventory::{BroadcastingInventory, InventoryView};
 
     #[test]
     fn test_guard_releases_on_drop() {
@@ -358,8 +358,10 @@ mod tests {
     #[tokio::test]
     async fn capped_amount_below_minimum_skips_withdrawal() {
         // excess = $200 (above $51 minimum), but limit = $30 caps it below minimum
-        let inventory = Arc::new(RwLock::new(
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500))),
+            sender,
         ));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
