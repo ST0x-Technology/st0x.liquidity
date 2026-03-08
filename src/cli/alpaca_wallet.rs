@@ -77,7 +77,7 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
         anyhow::bail!("Insufficient USDC balance: have {balance}, need {amount_u256}");
     }
 
-    writeln!(stdout, "   Sending USDC transfer via Fireblocks...")?;
+    writeln!(stdout, "   Sending USDC transfer via wallet...")?;
     let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
     let tx_receipt = ethereum_wallet
         .submit::<Registry, _>(
@@ -531,7 +531,7 @@ mod tests {
     use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
-    use crate::rebalancing::RebalancingCtx;
+    use crate::rebalancing::{LiquidityVenueRatio, RebalancingCtx};
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -618,13 +618,15 @@ mod tests {
                 cash: None,
             },
             trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
-                ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.1),
-                },
-                ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.3),
+                LiquidityVenueRatio {
+                    equities: ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.1),
+                    },
+                    cash: Some(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.3),
+                    }),
                 },
                 Address::ZERO,
                 AlpacaBrokerApiCtx {

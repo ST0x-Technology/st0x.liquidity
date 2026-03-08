@@ -126,20 +126,22 @@ mod tests {
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::RebalancingTriggerConfig;
+    use crate::rebalancing::{LiquidityVenueRatio, RebalancingTriggerConfig};
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
 
     fn test_trigger_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
-            equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
-            },
-            usdc: ImbalanceThreshold {
-                target: dec!(0.6),
-                deviation: dec!(0.15),
+            liquidity_venue_ratio: LiquidityVenueRatio {
+                equities: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                cash: Some(ImbalanceThreshold {
+                    target: dec!(0.6),
+                    deviation: dec!(0.15),
+                }),
             },
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),

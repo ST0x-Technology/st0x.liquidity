@@ -5,7 +5,7 @@ mod usdc;
 
 pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::fs;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -23,12 +22,14 @@ use url::Url;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
 use st0x_evm::Wallet;
 use st0x_evm::fireblocks::{
-    ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment,
+    ChainAssetIds, FireblocksApiUserId, FireblocksCtx, FireblocksEnvironment, FireblocksError,
     FireblocksVaultAccountId, FireblocksWallet,
 };
+use st0x_evm::local::RawPrivateKeyWallet;
+use st0x_evm::turnkey::{TurnkeyApiPrivateKey, TurnkeyCtx, TurnkeyOrganizationId, TurnkeyWallet};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
 
-use crate::config::{AssetsConfig, OperationMode};
+use crate::config::AssetsConfig;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
@@ -70,20 +71,67 @@ pub(crate) enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
+    #[error("RPC error during wallet setup: {0}")]
+    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
     #[error(transparent)]
-    Fireblocks(#[from] st0x_evm::fireblocks::FireblocksError),
-    #[error("failed to read Fireblocks secret file at {path:?}")]
+    Evm(#[from] st0x_evm::EvmError),
+    #[error(transparent)]
+    Fireblocks(#[from] FireblocksError),
+    #[error("failed to read Fireblocks secret from {path}")]
     FireblocksSecretRead {
         path: PathBuf,
         #[source]
         error: std::io::Error,
     },
-    #[error("missing Fireblocks asset ID for chain ID {chain_id}")]
+    #[error("no Fireblocks chain asset ID configured for chain {chain_id}")]
     MissingChainAssetId { chain_id: u64 },
-    #[error("RPC error during wallet setup: {0}")]
-    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
-    #[error(transparent)]
-    Evm(#[from] st0x_evm::EvmError),
+    #[error(
+        "wallet config and secrets must use the same type \
+         (e.g. both 'turnkey' or both 'fireblocks')"
+    )]
+    WalletConfigSecretsMismatch,
+}
+
+/// Wallet backend selection (plaintext config).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum WalletConfig {
+    Turnkey {
+        organization_id: TurnkeyOrganizationId,
+        address: Address,
+    },
+    Fireblocks {
+        vault_account_id: FireblocksVaultAccountId,
+        environment: FireblocksEnvironment,
+        chain_asset_ids: ChainAssetIds,
+    },
+    RawPrivateKey,
+}
+
+/// Wallet backend secrets (encrypted config).
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum WalletSecrets {
+    Turnkey {
+        api_private_key: TurnkeyApiPrivateKey,
+    },
+    Fireblocks {
+        api_user_id: FireblocksApiUserId,
+        secret_path: PathBuf,
+    },
+    RawPrivateKey {
+        private_key: B256,
+    },
+}
+
+impl std::fmt::Debug for WalletSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Turnkey { .. } => write!(f, "Turnkey {{ redacted }}"),
+            Self::Fireblocks { .. } => write!(f, "Fireblocks {{ redacted }}"),
+            Self::RawPrivateKey { .. } => write!(f, "RawPrivateKey {{ redacted }}"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,34 +139,39 @@ pub enum RebalancingCtxError {
 pub(crate) struct RebalancingSecrets {
     pub(crate) base_rpc_url: Url,
     pub(crate) ethereum_rpc_url: Url,
-    pub(crate) fireblocks_api_user_id: FireblocksApiUserId,
-    pub(crate) fireblocks_secret_path: PathBuf,
+}
+
+/// The proportion of each asset type's total inventory (regular + tokenized)
+/// allocated to the market-making liquidity venue (Raindex).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiquidityVenueRatio {
+    /// Target ratio and deviation for tokenized equities.
+    pub(crate) equities: ImbalanceThreshold,
+    /// Target ratio and deviation for USDC. When absent, USDC rebalancing
+    /// is disabled.
+    pub(crate) cash: Option<ImbalanceThreshold>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
     pub(crate) redemption_wallet: Address,
-    pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
-    pub(crate) fireblocks_environment: FireblocksEnvironment,
-    pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
+    pub(crate) liquidity_venue_ratio: LiquidityVenueRatio,
 }
 
 /// Runtime configuration for rebalancing operations.
 ///
 /// Constructed asynchronously from `RebalancingConfig`,
-/// `RebalancingSecrets`, and broker auth. During construction, Fireblocks
-/// wallets are pre-built for both chains. After construction, all
-/// fields are immutable.
+/// `RebalancingSecrets`, wallet config/secrets, and broker auth.
+/// During construction, wallets are pre-built for both chains. After
+/// construction, all fields are immutable.
 ///
 /// Read-only provider access for either chain is available via
 /// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) liquidity_venue_ratio: LiquidityVenueRatio,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
@@ -138,52 +191,43 @@ pub(crate) struct RebalancingCtx {
 }
 
 impl RebalancingCtx {
-    /// Construct from config, secrets, and broker auth.
+    /// Construct from config, secrets, wallet config/secrets, and
+    /// broker auth.
     ///
-    /// Builds Fireblocks wallets for both chains and stores them
-    /// immutably. Read-only provider access for either chain is
-    /// available via `base_wallet().provider()` and
-    /// `ethereum_wallet().provider()`.
+    /// Builds wallets for both chains and stores them immutably.
+    /// Read-only provider access for either chain is available via
+    /// `base_wallet().provider()` and `ethereum_wallet().provider()`.
     pub(crate) async fn new(
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
+        wallet_config: WalletConfig,
+        wallet_secrets: WalletSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
-        let fireblocks_secret =
-            fs::read(&secrets.fireblocks_secret_path)
-                .await
-                .map_err(|error| RebalancingCtxError::FireblocksSecretRead {
-                    path: secrets.fireblocks_secret_path.clone(),
-                    error,
-                })?;
-
         let (base_wallet, ethereum_wallet) = tokio::try_join!(
             Self::build_wallet(
-                &config,
-                &secrets.fireblocks_api_user_id,
-                &fireblocks_secret,
-                secrets.base_rpc_url,
+                &wallet_config,
+                &wallet_secrets,
+                secrets.base_rpc_url.clone()
             ),
             Self::build_wallet(
-                &config,
-                &secrets.fireblocks_api_user_id,
-                &fireblocks_secret,
-                secrets.ethereum_rpc_url,
+                &wallet_config,
+                &wallet_secrets,
+                secrets.ethereum_rpc_url.clone()
             ),
         )?;
 
         info!(
             wallet = %base_wallet.address(),
-            "Initialized Fireblocks wallet"
+            "Initialized wallet"
         );
 
         Ok(Self {
-            equity: config.equity,
-            usdc: config.usdc,
+            liquidity_venue_ratio: config.liquidity_venue_ratio,
             redemption_wallet: config.redemption_wallet,
             alpaca_broker_auth: broker_auth,
-            base_wallet: Arc::new(base_wallet),
-            ethereum_wallet: Arc::new(ethereum_wallet),
+            base_wallet,
+            ethereum_wallet,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -194,30 +238,80 @@ impl RebalancingCtx {
     }
 
     async fn build_wallet(
-        config: &RebalancingConfig,
-        api_user_id: &FireblocksApiUserId,
-        api_secret: &[u8],
+        config: &WalletConfig,
+        secrets: &WalletSecrets,
         rpc_url: Url,
-    ) -> Result<FireblocksWallet<RootProvider>, RebalancingCtxError> {
-        let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url));
-        let chain_id = provider.get_chain_id().await?;
-        let asset_id = config
-            .fireblocks_chain_asset_ids
-            .get(chain_id)
-            .cloned()
-            .ok_or(RebalancingCtxError::MissingChainAssetId { chain_id })?;
+    ) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, RebalancingCtxError> {
+        let provider = RootProvider::new(crate::onchain::http_client_with_retry(rpc_url.clone()));
 
-        Ok(FireblocksWallet::new(FireblocksCtx {
-            api_user_id: api_user_id.clone(),
-            secret: api_secret.to_vec(),
-            vault_account_id: config.fireblocks_vault_account_id,
-            environment: config.fireblocks_environment,
-            asset_id,
-            base_url: None,
-            provider,
-            required_confirmations: REQUIRED_CONFIRMATIONS,
-        })
-        .await?)
+        match (config, secrets) {
+            (
+                WalletConfig::Turnkey {
+                    organization_id,
+                    address,
+                },
+                WalletSecrets::Turnkey { api_private_key },
+            ) => {
+                let wallet = TurnkeyWallet::new(TurnkeyCtx {
+                    api_private_key: api_private_key.clone(),
+                    organization_id: organization_id.clone(),
+                    address: *address,
+                    provider,
+                    required_confirmations: REQUIRED_CONFIRMATIONS,
+                })
+                .await?;
+
+                Ok(Arc::new(wallet))
+            }
+
+            (
+                WalletConfig::Fireblocks {
+                    vault_account_id,
+                    environment,
+                    chain_asset_ids,
+                },
+                WalletSecrets::Fireblocks {
+                    api_user_id,
+                    secret_path,
+                },
+            ) => {
+                let secret = tokio::fs::read(secret_path).await.map_err(|error| {
+                    RebalancingCtxError::FireblocksSecretRead {
+                        path: secret_path.clone(),
+                        error,
+                    }
+                })?;
+
+                let chain_id = provider.get_chain_id().await?;
+                let asset_id = chain_asset_ids
+                    .get(chain_id)
+                    .ok_or(RebalancingCtxError::MissingChainAssetId { chain_id })?
+                    .clone();
+
+                let wallet = FireblocksWallet::new(FireblocksCtx {
+                    api_user_id: api_user_id.clone(),
+                    secret,
+                    vault_account_id: *vault_account_id,
+                    environment: *environment,
+                    asset_id,
+                    provider,
+                    required_confirmations: REQUIRED_CONFIRMATIONS,
+                    base_url: None,
+                })
+                .await?;
+
+                Ok(Arc::new(wallet))
+            }
+
+            (WalletConfig::RawPrivateKey, WalletSecrets::RawPrivateKey { private_key }) => {
+                let wallet =
+                    RawPrivateKeyWallet::new(private_key, provider, REQUIRED_CONFIRMATIONS)?;
+
+                Ok(Arc::new(wallet))
+            }
+
+            _ => Err(RebalancingCtxError::WalletConfigSecretsMismatch),
+        }
     }
 
     pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
@@ -234,16 +328,14 @@ impl RebalancingCtx {
     /// transactions through the rebalancing wallet.
     #[cfg(test)]
     pub(crate) fn stub(
-        equity: ImbalanceThreshold,
-        usdc: ImbalanceThreshold,
+        liquidity_venue_ratio: LiquidityVenueRatio,
         redemption_wallet: Address,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
         let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
 
         Self {
-            equity,
-            usdc,
+            liquidity_venue_ratio,
             redemption_wallet,
             alpaca_broker_auth,
             base_wallet: wallet.clone(),
@@ -261,8 +353,7 @@ impl RebalancingCtx {
 impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingCtx")
-            .field("equity", &self.equity)
-            .field("usdc", &self.usdc)
+            .field("liquidity_venue_ratio", &self.liquidity_venue_ratio)
             .field("redemption_wallet", &self.redemption_wallet)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("wallet", &self.base_wallet.address())
@@ -273,8 +364,7 @@ impl std::fmt::Debug for RebalancingCtx {
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) liquidity_venue_ratio: LiquidityVenueRatio,
     pub(crate) assets: AssetsConfig,
     pub(crate) disabled_assets: HashSet<Symbol>,
 }
@@ -683,7 +773,7 @@ impl RebalancingTrigger {
 
         let Some(operation) = equity::check_imbalance_and_build_operation(
             symbol,
-            &self.config.equity,
+            &self.config.liquidity_venue_ratio.equities,
             &self.inventory,
             wrapped_token,
             unwrapped_token,
@@ -723,21 +813,23 @@ impl RebalancingTrigger {
         Ok(registry.token_by_symbol(symbol))
     }
 
-    /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
+    /// Returns USDC rebalancing parameters if rebalancing is enabled.
+    ///
+    /// USDC rebalancing is enabled when `liquidity_venue_ratio.cash` is
+    /// `Some` in the rebalancing config.
     fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
-        let Some(cash) = self.config.assets.cash.as_ref() else {
-            debug!("No assets.cash configured, USDC rebalancing disabled");
-            return None;
-        };
+        let threshold = self.config.liquidity_venue_ratio.cash?;
 
-        if matches!(cash.rebalancing, OperationMode::Disabled) {
-            debug!("USDC rebalancing disabled via assets.cash config");
-            return None;
-        }
+        debug!("USDC rebalancing enabled");
 
-        let usdc_limit = cash.operational_limit.map(Positive::inner);
+        let usdc_limit = self
+            .config
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.operational_limit.map(Positive::inner));
 
-        Some((self.config.usdc, usdc_limit))
+        Some((threshold, usdc_limit))
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
@@ -1003,7 +1095,7 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -1034,19 +1126,20 @@ mod tests {
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
-            equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
-            },
-            usdc: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
+            liquidity_venue_ratio: LiquidityVenueRatio {
+                equities: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                cash: Some(ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                }),
             },
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
                     vault_id: None,
-                    rebalancing: OperationMode::Enabled,
                     operational_limit: None,
                 }),
             },
@@ -1111,7 +1204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_usdc_disabled_via_cash_config_does_not_send() {
+    async fn test_usdc_disabled_via_no_cash_ratio_does_not_send() {
         let (sender, mut receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let pool = crate::test_utils::setup_test_db().await;
@@ -1119,15 +1212,13 @@ mod tests {
 
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity: test_config().equity,
-                usdc: test_config().usdc,
+                liquidity_venue_ratio: LiquidityVenueRatio {
+                    equities: test_config().liquidity_venue_ratio.equities,
+                    cash: None,
+                },
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
-                    cash: Some(CashAssetConfig {
-                        vault_id: Some(B256::ZERO),
-                        rebalancing: OperationMode::Disabled,
-                        operational_limit: None,
-                    }),
+                    cash: None,
                 },
                 disabled_assets: HashSet::new(),
             },
@@ -1160,8 +1251,7 @@ mod tests {
 
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity: test_config().equity,
-                usdc: test_config().usdc,
+                liquidity_venue_ratio: test_config().liquidity_venue_ratio,
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -3145,20 +3235,10 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
 
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            target = "0.5"
-            deviation = "0.3"
+            [liquidity_venue_ratio]
+            equities = { target = "0.5", deviation = "0.2" }
+            cash = { target = "0.5", deviation = "0.3" }
         "#
     }
 
@@ -3166,8 +3246,6 @@ mod tests {
         r#"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://eth.example.com"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
         "#
     }
 
@@ -3175,11 +3253,12 @@ mod tests {
     fn deserialize_config_succeeds() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        assert_eq!(config.equity.target, dec!(0.5));
-        assert_eq!(config.equity.deviation, dec!(0.2));
+        assert_eq!(config.liquidity_venue_ratio.equities.target, dec!(0.5));
+        assert_eq!(config.liquidity_venue_ratio.equities.deviation, dec!(0.2));
 
-        assert_eq!(config.usdc.target, dec!(0.5));
-        assert_eq!(config.usdc.deviation, dec!(0.3));
+        let cash = config.liquidity_venue_ratio.cash.unwrap();
+        assert_eq!(cash.target, dec!(0.5));
+        assert_eq!(cash.deviation, dec!(0.3));
         assert_eq!(
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -3197,48 +3276,28 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
 
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.6"
-            deviation = "0.1"
-
-            [usdc]
-            target = "0.4"
-            deviation = "0.15"
+            [liquidity_venue_ratio]
+            equities = { target = "0.6", deviation = "0.1" }
+            cash = { target = "0.4", deviation = "0.15" }
         "#,
         )
         .unwrap();
 
-        assert_eq!(config.equity.target, dec!(0.6));
-        assert_eq!(config.equity.deviation, dec!(0.1));
+        assert_eq!(config.liquidity_venue_ratio.equities.target, dec!(0.6));
+        assert_eq!(config.liquidity_venue_ratio.equities.deviation, dec!(0.1));
 
-        assert_eq!(config.usdc.target, dec!(0.4));
-        assert_eq!(config.usdc.deviation, dec!(0.15));
+        let cash = config.liquidity_venue_ratio.cash.unwrap();
+        assert_eq!(cash.target, dec!(0.4));
+        assert_eq!(cash.deviation, dec!(0.15));
     }
 
     #[test]
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
-
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            target = "0.5"
-            deviation = "0.3"
+            [liquidity_venue_ratio]
+            equities = { target = "0.5", deviation = "0.2" }
+            cash = { target = "0.5", deviation = "0.3" }
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -3249,119 +3308,66 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_fireblocks_fields_fails() {
-        let toml_str = r#"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://eth.example.com"
-        "#;
-
-        let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("fireblocks_api_user_id"),
-            "Expected missing fireblocks_api_user_id error, got: {error}"
-        );
-    }
-
-    #[test]
-    fn deserialize_string_vault_account_id_fails() {
-        // Reproduces production error: Fireblocks API returns 400 with
-        // "vaultAccountId: should match format \"numeric\"" when a
-        // non-numeric value is used. The vault account ID must be a bare
-        // integer in TOML, not a quoted string.
+    fn deserialize_missing_liquidity_venue_ratio_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = "1"
-            fireblocks_environment = "sandbox"
-
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            target = "0.5"
-            deviation = "0.3"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
         assert!(
-            error.message().contains("invalid type: string")
-                && error.message().contains("expected u64"),
-            "Expected string-to-u64 type mismatch for \
-             fireblocks_vault_account_id, got: {error}"
+            error.message().contains("liquidity_venue_ratio"),
+            "Expected missing liquidity_venue_ratio error, got: {error}"
         );
     }
 
     #[test]
-    fn deserialize_integer_vault_account_id_succeeds() {
+    fn deserialize_config_without_cash_succeeds() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 1
-            fireblocks_environment = "sandbox"
 
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            target = "0.5"
-            deviation = "0.3"
+            [liquidity_venue_ratio]
+            equities = { target = "0.5", deviation = "0.2" }
         "#;
 
         let config = toml::from_str::<RebalancingConfig>(toml_str).unwrap();
-        assert_eq!(config.fireblocks_vault_account_id.to_string(), "1");
+        assert!(config.liquidity_venue_ratio.cash.is_none());
     }
 
-    #[test]
-    fn deserialize_missing_equity_fails() {
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
+    #[tokio::test]
+    async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
+        // Regression: when liquidity_venue_ratio.cash is None, startup must
+        // not require assets.cash.vault_id. The trigger returns no USDC
+        // rebalancing params, so no USDC vault lookup occurs.
+        let (sender, _receiver) = mpsc::channel(10);
+        let pool = crate::test_utils::setup_test_db().await;
+        let wrapper = Arc::new(MockWrapper::new());
 
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [usdc]
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("equity"),
-            "Expected missing equity error, got: {error}"
+        let trigger = RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                liquidity_venue_ratio: LiquidityVenueRatio {
+                    equities: ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.2),
+                    },
+                    cash: None,
+                },
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
+                disabled_assets: HashSet::new(),
+            },
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            Arc::new(RwLock::new(InventoryView::default())),
+            sender,
+            wrapper,
         );
-    }
 
-    #[test]
-    fn deserialize_missing_usdc_fails() {
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
-
-            [fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
         assert!(
-            error.message().contains("usdc"),
-            "Expected missing usdc error, got: {error}"
+            trigger.usdc_rebalancing_params().is_none(),
+            "Expected usdc_rebalancing_params to be None when cash ratio is absent"
         );
     }
 

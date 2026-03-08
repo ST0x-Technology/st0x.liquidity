@@ -217,7 +217,7 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
         return Ok(());
     }
 
-    writeln!(stdout, "   Sending approval tx via Fireblocks...")?;
+    writeln!(stdout, "   Sending approval tx via wallet...")?;
     let receipt = caller
         .submit::<Registry, _>(
             usdc_address,

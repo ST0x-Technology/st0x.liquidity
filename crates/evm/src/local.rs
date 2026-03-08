@@ -38,20 +38,28 @@ type SignerProvider<P> = FillProvider<
 /// wraps the provider with signing capabilities internally.
 ///
 /// `P` is the **base** provider type (e.g., from
-/// `ProviderBuilder::new().connect_http(url)`). The wallet-equipped provider
-/// is derived internally and exposed via [`Evm::provider()`].
+/// `ProviderBuilder::new().connect_http(url)`). Stores both the base
+/// provider (exposed via [`Evm::provider()`] for read-only access) and
+/// a signing provider (used internally by [`Wallet::send()`]).
 #[derive(Clone)]
 pub struct RawPrivateKeyWallet<P: Provider> {
-    provider: SignerProvider<P>,
+    /// Base provider for read-only chain access (view calls, balance
+    /// checks, block subscriptions).
+    provider: P,
+    /// Provider wrapped with gas/nonce/chain-id/wallet fillers for
+    /// transaction signing and submission.
+    signing_provider: SignerProvider<P>,
     required_confirmations: u64,
 }
 
 impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
-    /// Creates a new `RawPrivateKeyWallet` from a private key and base provider.
+    /// Creates a new `RawPrivateKeyWallet` from a private key and base
+    /// provider.
     ///
-    /// The base provider is wrapped with gas, nonce, chain ID, and wallet
-    /// fillers. Use [`Evm::provider()`] to access the signing provider for
-    /// contract deployments in tests.
+    /// The base provider is cloned and stored separately for read-only
+    /// access. Use [`signing_provider()`](Self::signing_provider) to
+    /// access the wallet-equipped provider for contract deployments in
+    /// tests.
     pub fn new(
         private_key: &B256,
         provider: P,
@@ -60,14 +68,22 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
         let eth_wallet = EthereumWallet::from(signer);
 
+        let base_provider = provider.clone();
+
         let signing_provider = ProviderBuilder::new()
             .wallet(eth_wallet)
             .connect_provider(provider);
 
         Ok(Self {
-            provider: signing_provider,
+            provider: base_provider,
+            signing_provider,
             required_confirmations,
         })
+    }
+
+    /// Returns the signing provider for contract deployments in tests.
+    pub fn signing_provider(&self) -> &SignerProvider<P> {
+        &self.signing_provider
     }
 }
 
@@ -76,9 +92,9 @@ impl<P> Evm for RawPrivateKeyWallet<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
-    type Provider = SignerProvider<P>;
+    type Provider = P;
 
-    fn provider(&self) -> &SignerProvider<P> {
+    fn provider(&self) -> &P {
         &self.provider
     }
 }
@@ -89,7 +105,7 @@ where
     P: Provider + Clone + Send + Sync + 'static,
 {
     fn address(&self) -> Address {
-        self.provider.default_signer_address()
+        self.signing_provider.default_signer_address()
     }
 
     async fn send(
@@ -104,7 +120,7 @@ where
             .to(contract)
             .input(calldata.into());
 
-        let pending = self.provider.send_transaction(tx).await?;
+        let pending = self.signing_provider.send_transaction(tx).await?;
 
         info!(tx_hash = %pending.tx_hash(), note, "Transaction submitted");
 
@@ -151,7 +167,7 @@ mod tests {
         let wallet = RawPrivateKeyWallet::new(&private_key, base_provider, 1).unwrap();
         let signer_address = wallet.address();
 
-        let token = TestERC20::deploy(wallet.provider()).await.unwrap();
+        let token = TestERC20::deploy(wallet.signing_provider()).await.unwrap();
         let token_address = *token.address();
 
         let mint_amount = U256::from(1_000_000) * U256::from(10).pow(U256::from(18));
