@@ -487,6 +487,7 @@ fn direction_to_dto(direction: &RebalanceDirection) -> st0x_dto::UsdcBridgeDirec
 }
 
 impl UsdcRebalance {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn to_dto(&self, id: &UsdcRebalanceId) -> TransferOperation {
         let (direction, amount, status, started_at, updated_at) = match self {
             Self::Converting {
@@ -519,6 +520,7 @@ impl UsdcRebalance {
             Self::ConversionFailed {
                 direction,
                 amount,
+                reason,
                 initiated_at,
                 failed_at,
                 ..
@@ -526,20 +528,7 @@ impl UsdcRebalance {
             | Self::WithdrawalFailed {
                 direction,
                 amount,
-                initiated_at,
-                failed_at,
-                ..
-            }
-            | Self::BridgingFailed {
-                direction,
-                amount,
-                initiated_at,
-                failed_at,
-                ..
-            }
-            | Self::DepositFailed {
-                direction,
-                amount,
+                reason,
                 initiated_at,
                 failed_at,
                 ..
@@ -548,6 +537,52 @@ impl UsdcRebalance {
                 *amount,
                 UsdcBridgeStatus::Failed {
                     failed_at: *failed_at,
+                    reason: reason.clone(),
+                    burn: None,
+                    mint: None,
+                },
+                *initiated_at,
+                *failed_at,
+            ),
+
+            Self::BridgingFailed {
+                direction,
+                amount,
+                burn_tx_hash,
+                reason,
+                initiated_at,
+                failed_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Failed {
+                    failed_at: *failed_at,
+                    reason: reason.clone(),
+                    burn: *burn_tx_hash,
+                    mint: None,
+                },
+                *initiated_at,
+                *failed_at,
+            ),
+
+            Self::DepositFailed {
+                direction,
+                amount,
+                burn_tx_hash,
+                mint_tx_hash,
+                reason,
+                initiated_at,
+                failed_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Failed {
+                    failed_at: *failed_at,
+                    reason: reason.clone(),
+                    burn: Some(*burn_tx_hash),
+                    mint: Some(*mint_tx_hash),
                 },
                 *initiated_at,
                 *failed_at,
@@ -583,13 +618,16 @@ impl UsdcRebalance {
             Self::Bridging {
                 direction,
                 amount,
+                burn_tx_hash,
                 initiated_at,
                 burned_at,
                 ..
             } => (
                 direction,
                 *amount,
-                UsdcBridgeStatus::Bridging,
+                UsdcBridgeStatus::Bridging {
+                    burn: *burn_tx_hash,
+                },
                 *initiated_at,
                 *burned_at,
             ),
@@ -597,13 +635,16 @@ impl UsdcRebalance {
             Self::Attested {
                 direction,
                 amount,
+                burn_tx_hash,
                 initiated_at,
                 attested_at,
                 ..
             } => (
                 direction,
                 *amount,
-                UsdcBridgeStatus::Bridging,
+                UsdcBridgeStatus::Bridging {
+                    burn: *burn_tx_hash,
+                },
                 *initiated_at,
                 *attested_at,
             ),
@@ -611,13 +652,16 @@ impl UsdcRebalance {
             Self::Bridged {
                 direction,
                 amount,
+                burn_tx_hash,
                 initiated_at,
                 minted_at,
                 ..
             } => (
                 direction,
                 *amount,
-                UsdcBridgeStatus::Bridging,
+                UsdcBridgeStatus::Bridging {
+                    burn: *burn_tx_hash,
+                },
                 *initiated_at,
                 *minted_at,
             ),
@@ -625,13 +669,18 @@ impl UsdcRebalance {
             Self::DepositInitiated {
                 direction,
                 amount,
+                burn_tx_hash,
+                mint_tx_hash,
                 initiated_at,
                 deposit_initiated_at,
                 ..
             } => (
                 direction,
                 *amount,
-                UsdcBridgeStatus::Depositing,
+                UsdcBridgeStatus::Depositing {
+                    burn: *burn_tx_hash,
+                    mint: *mint_tx_hash,
+                },
                 *initiated_at,
                 *deposit_initiated_at,
             ),
@@ -639,14 +688,17 @@ impl UsdcRebalance {
             Self::DepositConfirmed {
                 direction,
                 amount,
+                burn_tx_hash,
+                mint_tx_hash,
                 initiated_at,
                 deposit_confirmed_at,
-                ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Completed {
                     completed_at: *deposit_confirmed_at,
+                    burn: *burn_tx_hash,
+                    mint: *mint_tx_hash,
                 },
                 *initiated_at,
                 *deposit_confirmed_at,
@@ -3813,7 +3865,11 @@ mod tests {
             st0x_dto::UsdcBridgeDirection::BaseToAlpaca
         ));
         assert_eq!(bridge.amount, Usdc::new(dec!(2000)));
-        assert!(matches!(bridge.status, UsdcBridgeStatus::Bridging));
+        assert!(
+            matches!(bridge.status, UsdcBridgeStatus::Bridging { burn } if burn == burn_tx),
+            "Expected Bridging with burn hash, got: {:?}",
+            bridge.status
+        );
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, burned_at);
     }
@@ -3841,10 +3897,17 @@ mod tests {
             panic!("expected UsdcBridge variant");
         };
 
-        assert!(matches!(
-            bridge.status,
-            UsdcBridgeStatus::Completed { completed_at } if completed_at == confirmed_at
-        ));
+        let UsdcBridgeStatus::Completed {
+            completed_at,
+            burn,
+            mint,
+        } = bridge.status
+        else {
+            panic!("Expected Completed, got: {:?}", bridge.status);
+        };
+        assert_eq!(completed_at, confirmed_at);
+        assert_eq!(burn, burn_tx);
+        assert_eq!(mint, mint_tx);
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, confirmed_at);
     }
@@ -3874,10 +3937,19 @@ mod tests {
             panic!("expected UsdcBridge variant");
         };
 
-        assert!(matches!(
-            bridge.status,
-            UsdcBridgeStatus::Failed { failed_at: fa } if fa == failed_at
-        ));
+        let UsdcBridgeStatus::Failed {
+            failed_at: fa,
+            reason,
+            burn,
+            mint,
+        } = bridge.status
+        else {
+            panic!("Expected Failed, got: {:?}", bridge.status);
+        };
+        assert_eq!(fa, failed_at);
+        assert_eq!(reason, "deposit timeout");
+        assert_eq!(burn, Some(burn_tx));
+        assert_eq!(mint, Some(mint_tx));
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, failed_at);
     }

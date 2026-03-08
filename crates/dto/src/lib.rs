@@ -5,6 +5,7 @@
 //! for the full workspace. Domain types from `st0x-finance` are used for type
 //! safety, with `#[ts(type = "string")]` overrides for TypeScript compatibility.
 
+use alloy_primitives::TxHash;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -209,10 +210,29 @@ pub struct EquityMintOperation {
 )]
 pub enum EquityMintStatus {
     Minting,
-    Wrapping,
-    Depositing,
-    Completed { completed_at: DateTime<Utc> },
-    Failed { failed_at: DateTime<Utc> },
+    Wrapping {
+        #[ts(type = "string")]
+        token: TxHash,
+    },
+    Depositing {
+        #[ts(type = "string")]
+        token: TxHash,
+        #[ts(type = "string")]
+        wrap: TxHash,
+    },
+    Completed {
+        completed_at: DateTime<Utc>,
+        #[ts(type = "string")]
+        token: TxHash,
+        #[ts(type = "string")]
+        wrap: TxHash,
+        #[ts(type = "string")]
+        vault_deposit: TxHash,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+        reason: String,
+    },
 }
 
 /// Redeeming tokenized equity back to real shares.
@@ -238,12 +258,36 @@ pub struct EquityRedemptionOperation {
     rename_all_fields = "camelCase"
 )]
 pub enum EquityRedemptionStatus {
-    Withdrawing,
-    Unwrapping,
-    Sending,
-    PendingConfirmation,
-    Completed { completed_at: DateTime<Utc> },
-    Failed { failed_at: DateTime<Utc> },
+    Withdrawing {
+        #[ts(type = "string")]
+        raindex_withdraw: TxHash,
+    },
+    Unwrapping {
+        #[ts(type = "string")]
+        raindex_withdraw: TxHash,
+        #[ts(type = "string")]
+        unwrap: TxHash,
+    },
+    Sending {
+        #[ts(type = "string")]
+        raindex_withdraw: TxHash,
+    },
+    PendingConfirmation {
+        #[ts(type = "string")]
+        redemption: TxHash,
+    },
+    Completed {
+        completed_at: DateTime<Utc>,
+        #[ts(type = "string")]
+        redemption: TxHash,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+        #[ts(type = "string | null")]
+        raindex_withdraw: Option<TxHash>,
+        #[ts(type = "string | null")]
+        redemption: Option<TxHash>,
+    },
 }
 
 /// Direction for USDC bridge transfers.
@@ -278,10 +322,31 @@ pub struct UsdcBridgeOperation {
 pub enum UsdcBridgeStatus {
     Converting,
     Withdrawing,
-    Bridging,
-    Depositing,
-    Completed { completed_at: DateTime<Utc> },
-    Failed { failed_at: DateTime<Utc> },
+    Bridging {
+        #[ts(type = "string")]
+        burn: TxHash,
+    },
+    Depositing {
+        #[ts(type = "string")]
+        burn: TxHash,
+        #[ts(type = "string")]
+        mint: TxHash,
+    },
+    Completed {
+        completed_at: DateTime<Utc>,
+        #[ts(type = "string")]
+        burn: TxHash,
+        #[ts(type = "string")]
+        mint: TxHash,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+        reason: String,
+        #[ts(type = "string | null")]
+        burn: Option<TxHash>,
+        #[ts(type = "string | null")]
+        mint: Option<TxHash>,
+    },
 }
 
 impl TransferOperation {
@@ -578,6 +643,8 @@ mod tests {
             amount: Usdc::new(Decimal::new(1000, 0)),
             status: UsdcBridgeStatus::Completed {
                 completed_at: Utc::now(),
+                burn: TxHash::random(),
+                mint: TxHash::random(),
             },
             started_at: Utc::now(),
             updated_at: Utc::now(),
@@ -612,5 +679,97 @@ mod tests {
         assert!(json.contains("onchainInflight"));
         assert!(json.contains("offchainAvailable"));
         assert!(json.contains("offchainInflight"));
+    }
+
+    #[test]
+    fn failed_equity_mint_includes_reason() {
+        let status = EquityMintStatus::Failed {
+            failed_at: Utc::now(),
+            reason: "insufficient balance".to_string(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""reason":"insufficient balance""#),
+            "Failed mint should include reason, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_equity_mint_includes_all_tx_hashes() {
+        let status = EquityMintStatus::Completed {
+            completed_at: Utc::now(),
+            token: TxHash::random(),
+            wrap: TxHash::random(),
+            vault_deposit: TxHash::random(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"token\""),
+            "should include token, got: {json}"
+        );
+        assert!(
+            json.contains("\"wrap\""),
+            "should include wrap, got: {json}"
+        );
+        assert!(
+            json.contains("\"vault_deposit\""),
+            "should include vault_deposit, got: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_usdc_bridge_includes_reason_and_optional_tx_hashes() {
+        let status = UsdcBridgeStatus::Failed {
+            failed_at: Utc::now(),
+            reason: "bridge timeout".to_string(),
+            burn: Some(TxHash::random()),
+            mint: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""reason":"bridge timeout""#),
+            "should include reason, got: {json}"
+        );
+        assert!(
+            json.contains("\"burn\""),
+            "should include burn hash, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_usdc_bridge_includes_both_tx_hashes() {
+        let status = UsdcBridgeStatus::Completed {
+            completed_at: Utc::now(),
+            burn: TxHash::random(),
+            mint: TxHash::random(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"burn\""),
+            "should include burn hash, got: {json}"
+        );
+        assert!(
+            json.contains("\"mint\""),
+            "should include mint hash, got: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_equity_redemption_includes_optional_tx_hashes() {
+        let withdraw_tx = TxHash::random();
+        let status = EquityRedemptionStatus::Failed {
+            failed_at: Utc::now(),
+            raindex_withdraw: Some(withdraw_tx),
+            redemption: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"raindex_withdraw\""),
+            "should include raindex_withdraw, got: {json}"
+        );
+        assert!(
+            json.contains(&format!("\"0x{withdraw_tx:x}\"")),
+            "should include actual tx hash value, got: {json}"
+        );
     }
 }
