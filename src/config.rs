@@ -1194,8 +1194,6 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
         "#,
         );
         let error = Ctx::load_files(config.path(), secrets.path())
