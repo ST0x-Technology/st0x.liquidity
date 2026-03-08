@@ -37,6 +37,9 @@ jobs:
       - name: Test
         run: nix develop -c cargo nextest run --workspace --all-features
 
+      - name: Verify .sqlx/ cache is fresh
+        run: nix build --impure .#st0x-sqlx-check
+
       - name: Clippy
         run: |
           nix develop -c cargo clippy \

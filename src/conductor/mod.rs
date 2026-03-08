@@ -493,8 +493,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .ok_or(CtxError::MissingCashVaultId)?;
 
         let handle = services.spawn(
-            RaindexVaultId(usdc_vault_id),
             market_maker_wallet,
+            RaindexVaultId(usdc_vault_id),
             operation_receiver,
             frameworks,
         );
