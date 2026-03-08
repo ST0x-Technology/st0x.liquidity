@@ -631,7 +631,6 @@ mod tests {
                     }),
                 },
                 Address::ZERO,
-                None,
                 AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),

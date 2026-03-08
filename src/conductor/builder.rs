@@ -1,39 +1,34 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
-use alloy::providers::Provider;
-use alloy::rpc::types::Log;
-use alloy::sol_types;
-use futures_util::Stream;
-use sqlx::SqlitePool;
 use std::sync::Arc;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+use alloy::providers::Provider;
+use apalis::prelude::{Monitor, WorkerBuilder};
+use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{error, info};
 
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
+use super::job::handle_job;
+use super::order_fill_monitor::{OrderFillJobQueue, OrderFillMonitor};
+use super::order_fill_processor::OrderFillCtx;
 use super::{
-    Conductor, EventProcessingError, TradingTasks, spawn_event_processor, spawn_inventory_poller,
-    spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
-    spawn_queue_processor,
+    Conductor, OrderFillError, spawn_inventory_poller, spawn_order_poller,
+    spawn_periodic_accumulated_position_check,
 };
-use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot};
 use crate::offchain_order::OffchainOrder;
+use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
-use crate::onchain::trade::TradeEvent;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::vault_registry::VaultRegistry;
-
-type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
-type TakeStream =
-    Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
@@ -50,7 +45,6 @@ pub(crate) struct CqrsFrameworks {
 /// [`Conductor`].
 pub(crate) struct ConductorCtx<P, E> {
     pub(crate) ctx: Ctx,
-    pub(crate) pool: SqlitePool,
     pub(crate) cache: SymbolCache,
     pub(crate) provider: P,
     pub(crate) executor: E,
@@ -63,28 +57,22 @@ pub(crate) struct Initial;
 
 pub(crate) struct WithExecutorMaintenance {
     executor_maintenance: Option<JoinHandle<()>>,
-}
-
-pub(crate) struct WithDexStreams {
-    executor_maintenance: Option<JoinHandle<()>>,
-    clear_stream: ClearStream,
-    take_stream: TakeStream,
-    event_sender: UnboundedSender<(TradeEvent, Log)>,
-    event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
     common: ConductorCtx<P, E>,
+    job_queue: OrderFillJobQueue,
     state: State,
 }
 
 impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     ConductorBuilder<P, E, Initial>
 {
-    pub(crate) fn new(common: ConductorCtx<P, E>) -> Self {
+    pub(crate) fn new(common: ConductorCtx<P, E>, job_queue: OrderFillJobQueue) -> Self {
         Self {
             common,
+            job_queue,
             state: Initial,
         }
     }
@@ -95,49 +83,20 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     ) -> ConductorBuilder<P, E, WithExecutorMaintenance> {
         ConductorBuilder {
             common: self.common,
+            job_queue: self.job_queue,
             state: WithExecutorMaintenance {
                 executor_maintenance,
-            },
-        }
-    }
-}
-
-impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
-    ConductorBuilder<P, E, WithExecutorMaintenance>
-{
-    pub(crate) fn with_dex_event_streams(
-        self,
-        clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>>
-        + Unpin
-        + Send
-        + 'static,
-        take_stream: impl Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
-        + Unpin
-        + Send
-        + 'static,
-    ) -> ConductorBuilder<P, E, WithDexStreams> {
-        let (event_sender, event_receiver) =
-            tokio::sync::mpsc::unbounded_channel::<(TradeEvent, Log)>();
-
-        ConductorBuilder {
-            common: self.common,
-            state: WithDexStreams {
-                executor_maintenance: self.state.executor_maintenance,
-                clear_stream: Box::new(clear_stream),
-                take_stream: Box::new(take_stream),
-                event_sender,
-                event_receiver,
                 rebalancer: None,
             },
         }
     }
 }
 
-impl<P, E> ConductorBuilder<P, E, WithDexStreams>
+impl<P, E> ConductorBuilder<P, E, WithExecutorMaintenance>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
+    E: Executor + Clone + Send + Sync + 'static,
+    OrderFillError: From<E::Error>,
 {
     pub(crate) fn with_rebalancer(mut self, rebalancer: JoinHandle<()>) -> Self {
         self.state.rebalancer = Some(rebalancer);
@@ -185,13 +144,7 @@ where
             self.common.frameworks.offchain_order.clone(),
             self.common.frameworks.position.clone(),
         );
-        let dex_event_receiver = spawn_onchain_event_receiver(
-            self.state.event_sender,
-            self.state.clear_stream,
-            self.state.take_stream,
-        );
-        let event_processor =
-            spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
+
         let position_checker = spawn_periodic_accumulated_position_check()
             .executor(self.common.executor.clone())
             .position(self.common.frameworks.position.clone())
@@ -203,6 +156,7 @@ where
             ))
             .ctx(self.common.ctx.clone())
             .call();
+
         let trade_cqrs = super::TradeProcessingCqrs {
             onchain_trade: self.common.frameworks.onchain_trade,
             position: self.common.frameworks.position,
@@ -211,27 +165,55 @@ where
             execution_threshold: self.common.execution_threshold,
             assets: self.common.ctx.assets.clone(),
         };
-        let queue_processor = spawn_queue_processor(
-            self.common.executor,
-            &self.common.ctx,
-            &self.common.pool,
-            &self.common.cache,
-            self.common.provider,
-            trade_cqrs,
-            self.common.frameworks.vault_registry,
+
+        let order_fill_ctx = Arc::new(OrderFillCtx {
+            ctx: self.common.ctx.clone(),
+            cache: self.common.cache,
+            feed_id_cache: FeedIdCache::default(),
+            evm: ReadOnlyEvm::new(self.common.provider),
+            cqrs: trade_cqrs,
+            vault_registry: self.common.frameworks.vault_registry,
+            executor: self.common.executor,
+        });
+
+        let order_fill_monitor = OrderFillMonitor::new(
+            self.common.ctx.evm.ws_rpc_url.clone(),
+            self.common.ctx.evm.orderbook,
+            self.job_queue.clone(),
         );
 
+        let supervisor = SupervisorBuilder::default()
+            .with_task("order-fill-monitor", order_fill_monitor)
+            .build()
+            .run();
+
+        let job_queue = self.job_queue;
+        let monitor = tokio::spawn(async move {
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, attempt| {
+                    info!(attempt, "Restarting order fill worker");
+                    true
+                })
+                .register(move |index| {
+                    WorkerBuilder::new(format!("order-fill-worker-{index}"))
+                        .backend(job_queue.clone())
+                        .data(order_fill_ctx.clone())
+                        .build(handle_job::<_, OrderFillCtx<P, E>>)
+                });
+
+            if let Err(monitor_error) = monitor.run().await {
+                error!(%monitor_error, "Apalis monitor exited with error");
+            }
+        });
+
         Conductor {
+            supervisor,
+            monitor,
+            order_poller,
+            position_checker,
             executor_maintenance,
             rebalancer,
             inventory_poller,
-            trading_tasks: Some(TradingTasks {
-                order_poller,
-                dex_event_receiver,
-                event_processor,
-                position_checker,
-                queue_processor,
-            }),
         }
     }
 }

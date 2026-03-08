@@ -74,15 +74,14 @@ pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
 fn rebalancing_targets(ctx: &Ctx) -> RebalancingTargets {
     match &ctx.trading_mode {
         TradingMode::Rebalancing(rebalancing_ctx) => {
-            let (cash_onchain_ratio, cash_trigger_threshold) = match rebalancing_ctx.usdc {
-                rebalancing::UsdcRebalancing::Enabled { target, deviation } => {
-                    (Some(target), Some(deviation))
-                }
-                rebalancing::UsdcRebalancing::Disabled => (None, None),
-            };
+            let ratio = &rebalancing_ctx.liquidity_venue_ratio;
+            let (cash_onchain_ratio, cash_trigger_threshold) =
+                ratio.cash.as_ref().map_or((None, None), |cash| {
+                    (Some(cash.target), Some(cash.deviation))
+                });
             RebalancingTargets {
-                equity_onchain_ratio: rebalancing_ctx.equity.target,
-                equity_trigger_threshold: rebalancing_ctx.equity.deviation,
+                equity_onchain_ratio: ratio.equities.target,
+                equity_trigger_threshold: ratio.equities.deviation,
                 cash_onchain_ratio,
                 cash_trigger_threshold,
             }

@@ -780,7 +780,7 @@ mod tests {
         .await;
 
         let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
+            &transfer.transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(dec!(100.0)),

@@ -14,8 +14,7 @@ pub(crate) use rebalancer::Rebalancer;
 pub(crate) use spawn::{RebalancerServices, RebalancingCqrsFrameworks};
 pub(crate) use trigger::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, RebalancingTrigger,
-    RebalancingTriggerConfig, RebalancingTriggerCtx, TriggeredOperation, UsdcRebalancing,
-    WalletConfig, WalletSecrets,
+    RebalancingTriggerConfig, TriggeredOperation, WalletConfig, WalletSecrets,
 };
 
 #[cfg(test)]

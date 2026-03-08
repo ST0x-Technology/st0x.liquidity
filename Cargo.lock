@@ -980,6 +980,83 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "apalis"
+version = "1.0.0-rc.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "715f15d294758af4ef93447224a9b23f9f16ccd230061d30783c3b29870d9c11"
+dependencies = [
+ "apalis-core",
+ "futures-util",
+ "pin-project",
+ "thiserror 2.0.17",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "apalis-codec"
+version = "0.1.0-rc.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7044b64a1cf157936c016768aeb5be6b5fd3b551ce113c39f8a3bbf2611f661b"
+dependencies = [
+ "apalis-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "apalis-core"
+version = "1.0.0-rc.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0f76544e368008495c859a2dcab9ae98456b492154e17dbb06c05e2a3ec47b9"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-sink",
+ "futures-timer",
+ "futures-util",
+ "pin-project",
+ "serde",
+ "thiserror 2.0.17",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "apalis-sql"
+version = "1.0.0-rc.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9466baa9eb65d1daa7eb2f98e2718aa6044a0ea95429457e1298d436722cbe48"
+dependencies = [
+ "apalis-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "apalis-sqlite"
+version = "1.0.0-rc.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a16a88f8105f05035a83ea2ae15901978e55dadcaa7c0589b219ed4accbe961"
+dependencies = [
+ "apalis-codec",
+ "apalis-core",
+ "apalis-sql",
+ "futures",
+ "log",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.17",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "apca"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6641,6 +6718,9 @@ dependencies = [
  "aes-gcm",
  "alloy",
  "anyhow",
+ "apalis",
+ "apalis-codec",
+ "apalis-sqlite",
  "async-trait",
  "backon",
  "base64 0.22.1",
@@ -6677,6 +6757,7 @@ dependencies = [
  "st0x-evm",
  "st0x-execution",
  "st0x-finance",
+ "task-supervisor",
  "temp-env",
  "tempfile",
  "thiserror 2.0.17",
@@ -6889,6 +6970,17 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "task-supervisor"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50d6419e6b5fe8a93fd8df36e34c9e923eae05a6008a72f0311f16ac2a9a46c3"
+dependencies = [
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "temp-env"
@@ -7283,8 +7375,10 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper 1.0.2",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -7612,6 +7706,17 @@ dependencies = [
  "crunchy",
  "hex",
  "static_assertions",
+]
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.2",
+ "serde",
+ "web-time",
 ]
 
 [[package]]
