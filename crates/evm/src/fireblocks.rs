@@ -416,6 +416,7 @@ where
 
         let receipt = PendingTransactionBuilder::new(self.provider.root().clone(), tx_hash)
             .with_required_confirmations(self.required_confirmations)
+            .with_timeout(Some(Duration::from_secs(300)))
             .get_receipt()
             .await?;
 

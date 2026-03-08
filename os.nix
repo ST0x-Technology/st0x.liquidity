@@ -137,7 +137,7 @@ in {
           };
         in {
           "/".tryFiles = "$uri $uri/ /index.html";
-          "/api/alpaca/ws" = wsProxy 8081;
+          "/api/ws" = wsProxy 8001;
         };
       };
     };
