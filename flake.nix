@@ -205,7 +205,10 @@
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           inherit (rainix.devShells.${system}.default) shellHook;
+
+          SQLX_OFFLINE = true;
           DATABASE_URL = "sqlite:liquidity.db";
+
           buildInputs = with pkgs;
             [
               bun
