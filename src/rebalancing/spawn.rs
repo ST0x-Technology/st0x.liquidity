@@ -115,8 +115,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// processors.
     pub(crate) fn spawn(
         self,
-        usdc_vault_id: RaindexVaultId,
         market_maker_wallet: Address,
+        usdc_vault_id: RaindexVaultId,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
     ) -> JoinHandle<()> {
@@ -434,8 +434,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
         let handle = services.spawn(
-            RaindexVaultId(B256::ZERO),
             Address::random(),
+            RaindexVaultId(B256::ZERO),
             rx,
             frameworks,
         );
