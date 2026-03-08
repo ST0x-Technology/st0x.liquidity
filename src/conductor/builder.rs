@@ -21,7 +21,7 @@ use super::{
 };
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::InventorySnapshot;
+use crate::inventory::{InventoryPollingService, InventorySnapshot};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
@@ -46,14 +46,17 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) snapshot: Arc<Store<InventorySnapshot>>,
 }
 
-struct CommonFields<P, E> {
-    ctx: Ctx,
-    pool: SqlitePool,
-    cache: SymbolCache,
-    provider: P,
-    executor: E,
-    execution_threshold: ExecutionThreshold,
-    frameworks: CqrsFrameworks,
+/// Everything the [`ConductorBuilder`] needs to construct a running
+/// [`Conductor`].
+pub(crate) struct ConductorCtx<P, E> {
+    pub(crate) ctx: Ctx,
+    pub(crate) pool: SqlitePool,
+    pub(crate) cache: SymbolCache,
+    pub(crate) provider: P,
+    pub(crate) executor: E,
+    pub(crate) execution_threshold: ExecutionThreshold,
+    pub(crate) frameworks: CqrsFrameworks,
+    pub(crate) poll_notify: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) struct Initial;
@@ -72,32 +75,16 @@ pub(crate) struct WithDexStreams {
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
-    common: CommonFields<P, E>,
+    common: ConductorCtx<P, E>,
     state: State,
 }
 
 impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     ConductorBuilder<P, E, Initial>
 {
-    pub(crate) fn new(
-        ctx: Ctx,
-        pool: SqlitePool,
-        cache: SymbolCache,
-        provider: P,
-        executor: E,
-        execution_threshold: ExecutionThreshold,
-        frameworks: CqrsFrameworks,
-    ) -> Self {
+    pub(crate) fn new(common: ConductorCtx<P, E>) -> Self {
         Self {
-            common: CommonFields {
-                ctx,
-                pool,
-                cache,
-                provider,
-                executor,
-                execution_threshold,
-                frameworks,
-            },
+            common,
             state: Initial,
         }
     }
@@ -175,14 +162,19 @@ where
             order_owner,
         ));
 
-        let inventory_poller = Some(spawn_inventory_poller(
+        let polling_service = InventoryPollingService::new(
             raindex_service,
             self.common.executor.clone(),
             self.common.frameworks.vault_registry.clone(),
             self.common.ctx.evm.orderbook,
             order_owner,
             self.common.frameworks.snapshot,
+        );
+
+        let inventory_poller = Some(spawn_inventory_poller(
+            polling_service,
             std::time::Duration::from_secs(self.common.ctx.inventory_poll_interval),
+            self.common.poll_notify.clone(),
         ));
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 

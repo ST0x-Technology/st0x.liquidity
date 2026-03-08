@@ -1,6 +1,6 @@
 //! Spawns the rebalancing infrastructure.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -127,7 +127,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
                 .usdc_vault_id
                 .map(RaindexVaultId)
                 .ok_or(SpawnRebalancerError::MissingUsdcVaultId)?,
-            UsdcRebalancing::Disabled => RaindexVaultId(alloy::primitives::B256::ZERO),
+            UsdcRebalancing::Disabled => RaindexVaultId(B256::ZERO),
         };
 
         let equity = Arc::new(CrossVenueEquityTransfer::new(
@@ -168,7 +168,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
 mod tests {
     use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, address, b256};
+    use alloy::primitives::{address, b256};
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
@@ -421,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_dispatches_mint_operation() {
         let server = MockServer::start();
-        let (services, _ctx) = make_services_with_mock_wallet(&server).await;
+        let (services, ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
         let mock_services = EquityTransferServices {
@@ -442,12 +442,9 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let handle = services.spawn(
-            Address::random(),
-            RaindexVaultId(B256::ZERO),
-            rx,
-            frameworks,
-        );
+        let handle = services
+            .spawn(&ctx, Address::random(), rx, frameworks)
+            .unwrap();
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
