@@ -1801,6 +1801,7 @@ mod tests {
         TokenizedEquityMintEvent::WrappingFailed {
             symbol: symbol.clone(),
             quantity,
+            reason: "test wrapping failure".to_string(),
             failed_at: Utc::now(),
         }
     }

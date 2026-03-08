@@ -353,10 +353,31 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
         info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
 
         let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
-        let (wrap_tx_hash, wrapped_shares) = self
+        let (wrap_tx_hash, wrapped_shares) = match self
             .wrapper
             .to_wrapped(wrapped_token, shares_minted, self.wallet)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(wrap_error) => {
+                warn!(%wrap_error, "Wrapping failed, recording failure in aggregate");
+                let fail_result = self
+                    .mint_store
+                    .send(
+                        &issuer_request_id,
+                        TokenizedEquityMintCommand::FailWrap {
+                            reason: wrap_error.to_string(),
+                        },
+                    )
+                    .await;
+
+                if let Err(fail_send_error) = fail_result {
+                    warn!(%fail_send_error, "Failed to record FailWrap command");
+                }
+
+                return Err(wrap_error.into());
+            }
+        };
 
         self.mint_store
             .send(
@@ -370,8 +391,29 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         info!(%wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
 
-        let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
-        let vault_deposit_tx_hash = self
+        let vault_id = match self.raindex.lookup_vault_id(wrapped_token).await {
+            Ok(vault_id) => vault_id,
+            Err(raindex_error) => {
+                warn!(%raindex_error, "Vault lookup failed, recording failure in aggregate");
+                let fail_result = self
+                    .mint_store
+                    .send(
+                        &issuer_request_id,
+                        TokenizedEquityMintCommand::FailRaindexDeposit {
+                            reason: raindex_error.to_string(),
+                        },
+                    )
+                    .await;
+
+                if let Err(fail_send_error) = fail_result {
+                    warn!(%fail_send_error, "Failed to record FailRaindexDeposit command");
+                }
+
+                return Err(raindex_error.into());
+            }
+        };
+
+        let vault_deposit_tx_hash = match self
             .raindex
             .deposit(
                 wrapped_token,
@@ -379,7 +421,28 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
                 wrapped_shares,
                 TOKENIZED_EQUITY_DECIMALS,
             )
-            .await?;
+            .await
+        {
+            Ok(tx_hash) => tx_hash,
+            Err(deposit_error) => {
+                warn!(%deposit_error, "Raindex deposit failed, recording failure in aggregate");
+                let fail_result = self
+                    .mint_store
+                    .send(
+                        &issuer_request_id,
+                        TokenizedEquityMintCommand::FailRaindexDeposit {
+                            reason: deposit_error.to_string(),
+                        },
+                    )
+                    .await;
+
+                if let Err(fail_send_error) = fail_result {
+                    warn!(%fail_send_error, "Failed to record FailRaindexDeposit command");
+                }
+
+                return Err(deposit_error.into());
+            }
+        };
 
         self.mint_store
             .send(
@@ -437,7 +500,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{load_all_ids, test_store};
     use st0x_execution::{FractionalShares, Symbol};
 
     use super::*;
@@ -453,31 +516,43 @@ mod tests {
         }
     }
 
+    struct TestEquityTransfer {
+        transfer: CrossVenueEquityTransfer,
+        mint_store: Arc<Store<TokenizedEquityMint>>,
+        pool: SqlitePool,
+    }
+
     async fn create_equity_transfer(
         tokenizer: Arc<dyn Tokenizer>,
         raindex: Arc<dyn Raindex>,
         wrapper: Arc<dyn Wrapper>,
-    ) -> CrossVenueEquityTransfer {
+    ) -> TestEquityTransfer {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         let services = mock_services();
 
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool, services));
+        let redemption_store = Arc::new(test_store(pool.clone(), services));
 
-        CrossVenueEquityTransfer::new(
+        let transfer = CrossVenueEquityTransfer::new(
             raindex,
             tokenizer,
             wrapper,
             Address::random(),
-            mint_store,
+            Arc::clone(&mint_store),
             redemption_store,
-        )
+        );
+
+        TestEquityTransfer {
+            transfer,
+            mint_store,
+            pool,
+        }
     }
 
     #[tokio::test]
     async fn mint_transfer_sends_mint_and_deposit_commands() {
-        let transfer = create_equity_transfer(
+        let test = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
             Arc::new(MockRaindex::new()),
             Arc::new(MockWrapper::new()),
@@ -485,7 +560,7 @@ mod tests {
         .await;
 
         CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
+            &test.transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(dec!(100.0)),
@@ -504,13 +579,12 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer =
-            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
+        let test = create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-                &transfer,
+                &test.transfer,
                 Equity {
                     symbol: Symbol::new("TEST").unwrap(),
                     quantity: FractionalShares::new(dec!(50)),
@@ -528,11 +602,10 @@ mod tests {
             Arc::new(MockTokenizer::new().with_detection_outcome(MockDetectionOutcome::Timeout));
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer =
-            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
+        let test = create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
+            &test.transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
                 quantity: FractionalShares::new(dec!(50)),
@@ -553,11 +626,10 @@ mod tests {
             Arc::new(MockTokenizer::new().with_detection_outcome(MockDetectionOutcome::ApiError));
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer =
-            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
+        let test = create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
+            &test.transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
                 quantity: FractionalShares::new(dec!(50)),
@@ -581,11 +653,10 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer =
-            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
+        let test = create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
+            &test.transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
                 quantity: FractionalShares::new(dec!(50)),
@@ -609,11 +680,10 @@ mod tests {
         );
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
 
-        let transfer =
-            create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
+        let test = create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
         let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
+            &test.transfer,
             Equity {
                 symbol: Symbol::new("TEST").unwrap(),
                 quantity: FractionalShares::new(dec!(50)),
@@ -629,8 +699,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_transfer_fails_when_wrapper_fails() {
-        let transfer = create_equity_transfer(
+    async fn wrapping_failure_emits_wrapping_failed_event() {
+        let test = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
             Arc::new(MockRaindex::new()),
             Arc::new(MockWrapper::failing()),
@@ -638,7 +708,7 @@ mod tests {
         .await;
 
         let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
+            &test.transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(dec!(100.0)),
@@ -651,11 +721,22 @@ mod tests {
             matches!(error, MintError::Wrapper(_)),
             "Expected Wrapper error, got: {error:?}"
         );
+
+        // The aggregate should be in Failed state via WrappingFailed event
+        let ids = load_all_ids::<TokenizedEquityMint>(&test.pool)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "Expected exactly one mint aggregate");
+        let entity = test.mint_store.load(&ids[0]).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state after wrapping failure, got: {entity:?}"
+        );
     }
 
     #[tokio::test]
-    async fn mint_transfer_fails_when_raindex_deposit_fails() {
-        let transfer = create_equity_transfer(
+    async fn deposit_failure_emits_raindex_deposit_failed_event() {
+        let test = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
             Arc::new(MockRaindex::failing_deposit()),
             Arc::new(MockWrapper::new()),
@@ -663,7 +744,7 @@ mod tests {
         .await;
 
         let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
+            &test.transfer,
             Equity {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(dec!(100.0)),
@@ -675,6 +756,17 @@ mod tests {
         assert!(
             matches!(error, MintError::Raindex(_)),
             "Expected Raindex error, got: {error:?}"
+        );
+
+        // The aggregate should be in Failed state via RaindexDepositFailed event
+        let ids = load_all_ids::<TokenizedEquityMint>(&test.pool)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "Expected exactly one mint aggregate");
+        let entity = test.mint_store.load(&ids[0]).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state after deposit failure, got: {entity:?}"
         );
     }
 }

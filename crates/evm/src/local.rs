@@ -14,6 +14,7 @@ use alloy::providers::{Identity, Provider, ProviderBuilder, WalletProvider};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use std::time::Duration;
 use tracing::info;
 
 use crate::{Evm, EvmError, Wallet};
@@ -110,6 +111,7 @@ where
 
         let receipt = pending
             .with_required_confirmations(self.required_confirmations)
+            .with_timeout(Some(Duration::from_secs(300)))
             .get_receipt()
             .await?;
 

@@ -97,7 +97,7 @@ async fn check_market_open<E: Executor>(
 /// against its configured threshold. Skips disabled assets.
 /// Returns execution parameters for positions that are ready.
 #[tracing::instrument(
-    skip(executor, position_projection, is_trading_enabled),
+    skip(executor, position_projection, assets, is_trading_enabled),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]

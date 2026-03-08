@@ -4,7 +4,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
 
 use st0x_evm::{IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
@@ -128,8 +128,16 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                 .await?;
         }
 
+        let balance_before: U256 = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(
+                wrapped_token,
+                IERC20::balanceOfCall { account: receiver },
+            )
+            .await?;
+
         info!("Sending ERC4626 deposit to {wrapped_token}");
-        let receipt = self
+        match self
             .wallet
             .submit::<OpenChainErrorRegistry, _>(
                 wrapped_token,
@@ -139,22 +147,60 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                 },
                 "ERC4626 deposit",
             )
-            .await?;
-        let tx_hash = receipt.transaction_hash;
+            .await
+        {
+            Ok(receipt) => {
+                let tx_hash = receipt.transaction_hash;
 
-        let actual_shares = receipt
-            .inner
-            .logs()
-            .iter()
-            .filter(|log| log.address() == wrapped_token)
-            .find_map(|log| {
-                IERC4626::Deposit::decode_log(log.as_ref())
-                    .ok()
-                    .map(|event| event.data.shares)
-            })
-            .ok_or(WrapperError::MissingDepositEvent)?;
+                let actual_shares = receipt
+                    .inner
+                    .logs()
+                    .iter()
+                    .filter(|log| log.address() == wrapped_token)
+                    .find_map(|log| {
+                        IERC4626::Deposit::decode_log(log.as_ref())
+                            .ok()
+                            .map(|event| event.data.shares)
+                    })
+                    .ok_or(WrapperError::MissingDepositEvent)?;
 
-        Ok((tx_hash, actual_shares))
+                Ok((tx_hash, actual_shares))
+            }
+
+            Err(submit_error) => {
+                warn!(
+                    %submit_error,
+                    "ERC4626 deposit receipt failed, \
+                     falling back to balance diff"
+                );
+
+                let balance_after: U256 = self
+                    .wallet
+                    .call::<OpenChainErrorRegistry, _>(
+                        wrapped_token,
+                        IERC20::balanceOfCall { account: receiver },
+                    )
+                    .await?;
+
+                let actual_shares = balance_after.saturating_sub(balance_before);
+
+                if actual_shares.is_zero() {
+                    warn!("Balance unchanged after deposit timeout");
+                    return Err(submit_error.into());
+                }
+
+                info!(
+                    %actual_shares,
+                    %balance_before,
+                    %balance_after,
+                    "Recovered deposit amount from balance diff"
+                );
+
+                // No tx_hash available since the receipt failed,
+                // use a zero hash as sentinel
+                Ok((TxHash::ZERO, actual_shares))
+            }
+        }
     }
 
     async fn to_underlying(
@@ -164,8 +210,21 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         receiver: Address,
         owner: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
+        let underlying_token: Address = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {})
+            .await?;
+
+        let balance_before: U256 = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(
+                underlying_token,
+                IERC20::balanceOfCall { account: receiver },
+            )
+            .await?;
+
         info!("Sending ERC4626 redeem to {wrapped_token}");
-        let receipt = self
+        match self
             .wallet
             .submit::<OpenChainErrorRegistry, _>(
                 wrapped_token,
@@ -176,22 +235,58 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                 },
                 "ERC4626 redeem",
             )
-            .await?;
-        let tx_hash = receipt.transaction_hash;
+            .await
+        {
+            Ok(receipt) => {
+                let tx_hash = receipt.transaction_hash;
 
-        let actual_assets = receipt
-            .inner
-            .logs()
-            .iter()
-            .filter(|log| log.address() == wrapped_token)
-            .find_map(|log| {
-                IERC4626::Withdraw::decode_log(log.as_ref())
-                    .ok()
-                    .map(|event| event.data.assets)
-            })
-            .ok_or(WrapperError::MissingWithdrawEvent)?;
+                let actual_assets = receipt
+                    .inner
+                    .logs()
+                    .iter()
+                    .filter(|log| log.address() == wrapped_token)
+                    .find_map(|log| {
+                        IERC4626::Withdraw::decode_log(log.as_ref())
+                            .ok()
+                            .map(|event| event.data.assets)
+                    })
+                    .ok_or(WrapperError::MissingWithdrawEvent)?;
 
-        Ok((tx_hash, actual_assets))
+                Ok((tx_hash, actual_assets))
+            }
+
+            Err(submit_error) => {
+                warn!(
+                    %submit_error,
+                    "ERC4626 redeem receipt failed, \
+                     falling back to balance diff"
+                );
+
+                let balance_after: U256 = self
+                    .wallet
+                    .call::<OpenChainErrorRegistry, _>(
+                        underlying_token,
+                        IERC20::balanceOfCall { account: receiver },
+                    )
+                    .await?;
+
+                let actual_assets = balance_after.saturating_sub(balance_before);
+
+                if actual_assets.is_zero() {
+                    warn!("Balance unchanged after redeem timeout");
+                    return Err(submit_error.into());
+                }
+
+                info!(
+                    %actual_assets,
+                    %balance_before,
+                    %balance_after,
+                    "Recovered redeem amount from balance diff"
+                );
+
+                Ok((TxHash::ZERO, actual_assets))
+            }
+        }
     }
 
     fn owner(&self) -> Address {
