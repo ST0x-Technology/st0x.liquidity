@@ -728,8 +728,8 @@ mod tests {
             "should include wrap, got: {json}"
         );
         assert!(
-            json.contains("\"vault_deposit\""),
-            "should include vault_deposit, got: {json}"
+            json.contains("\"vaultDeposit\""),
+            "should include vaultDeposit, got: {json}"
         );
     }
 
@@ -825,8 +825,8 @@ mod tests {
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(
-            json.contains("\"raindex_withdraw\""),
-            "should include raindex_withdraw, got: {json}"
+            json.contains("\"raindexWithdraw\""),
+            "should include raindexWithdraw, got: {json}"
         );
         assert!(
             json.contains(&format!("\"0x{withdraw_tx:x}\"")),

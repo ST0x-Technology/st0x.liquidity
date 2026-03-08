@@ -27,6 +27,8 @@ the limit:
 
 - [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
   `::random()`, mocks, encoding, compile-time macros
+- [docs/conductor.md](docs/conductor.md) - Conductor orchestration layer:
+  task-supervisor, apalis workers, DexEventMonitor, ConductorBuilder, lifecycle
 - [docs/cqrs.md](docs/cqrs.md) - Event sourcing with st0x-event-sorcery
   (EventSourced trait, Store, Projection, testing, cqrs-es internals)
 

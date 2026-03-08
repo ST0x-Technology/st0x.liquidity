@@ -16,6 +16,6 @@ pub(crate) use spawn::{RebalancerServices, RebalancingCqrsFrameworks};
 pub use trigger::UsdcRebalancing;
 pub(crate) use trigger::{
     RebalancingConfig, RebalancingSecrets, RebalancingTrigger, RebalancingTriggerConfig,
-    RebalancingTriggerCtx, TriggeredOperation, WalletConfig, WalletSecrets,
+    TriggeredOperation,
 };
 pub use trigger::{RebalancingCtx, RebalancingCtxError};

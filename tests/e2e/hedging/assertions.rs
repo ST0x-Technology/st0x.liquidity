@@ -73,7 +73,7 @@ pub(crate) async fn poll_for_hedged_position(
     let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
     let deadline = tokio::time::Instant::now() + timeout;
     let context = format!("hedged position for {symbol}");
-    let target_symbol = Symbol::new(symbol.to_owned()).unwrap();
+    let target_symbol = Symbol::new(symbol).unwrap();
 
     loop {
         sleep_or_crash(bot, &context).await;
