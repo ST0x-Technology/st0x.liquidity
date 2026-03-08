@@ -369,13 +369,16 @@ impl EquityRedemption {
             Self::WithdrawnFromRaindex {
                 symbol,
                 quantity,
+                raindex_withdraw_tx,
                 withdrawn_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
                 id: Id::new(id.0.clone()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Withdrawing,
+                status: EquityRedemptionStatus::Withdrawing {
+                    raindex_withdraw: *raindex_withdraw_tx,
+                },
                 started_at: *withdrawn_at,
                 updated_at: *withdrawn_at,
             }),
@@ -383,6 +386,8 @@ impl EquityRedemption {
             Self::TokensUnwrapped {
                 symbol,
                 quantity,
+                raindex_withdraw_tx,
+                unwrap_tx_hash,
                 withdrawn_at,
                 unwrapped_at,
                 ..
@@ -390,7 +395,10 @@ impl EquityRedemption {
                 id: Id::new(id.0.clone()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Unwrapping,
+                status: EquityRedemptionStatus::Unwrapping {
+                    raindex_withdraw: *raindex_withdraw_tx,
+                    unwrap: *unwrap_tx_hash,
+                },
                 started_at: *withdrawn_at,
                 updated_at: *unwrapped_at,
             }),
@@ -398,13 +406,16 @@ impl EquityRedemption {
             Self::TokensSent {
                 symbol,
                 quantity,
+                raindex_withdraw_tx,
                 sent_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
                 id: Id::new(id.0.clone()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Sending,
+                status: EquityRedemptionStatus::Sending {
+                    raindex_withdraw: *raindex_withdraw_tx,
+                },
                 started_at: *sent_at,
                 updated_at: *sent_at,
             }),
@@ -412,6 +423,7 @@ impl EquityRedemption {
             Self::Pending {
                 symbol,
                 quantity,
+                redemption_tx,
                 sent_at,
                 detected_at,
                 ..
@@ -419,7 +431,9 @@ impl EquityRedemption {
                 id: Id::new(id.0.clone()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::PendingConfirmation,
+                status: EquityRedemptionStatus::PendingConfirmation {
+                    redemption: *redemption_tx,
+                },
                 started_at: *sent_at,
                 updated_at: *detected_at,
             }),
@@ -427,6 +441,7 @@ impl EquityRedemption {
             Self::Completed {
                 symbol,
                 quantity,
+                redemption_tx,
                 completed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
@@ -435,6 +450,7 @@ impl EquityRedemption {
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Completed {
                     completed_at: *completed_at,
+                    redemption: *redemption_tx,
                 },
                 started_at: *completed_at,
                 updated_at: *completed_at,
@@ -443,6 +459,8 @@ impl EquityRedemption {
             Self::Failed {
                 symbol,
                 quantity,
+                raindex_withdraw_tx,
+                redemption_tx,
                 failed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
@@ -451,6 +469,8 @@ impl EquityRedemption {
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Failed {
                     failed_at: *failed_at,
+                    raindex_withdraw: *raindex_withdraw_tx,
+                    redemption: *redemption_tx,
                 },
                 started_at: *failed_at,
                 updated_at: *failed_at,
@@ -1566,12 +1586,13 @@ mod tests {
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
 
+        let withdraw_tx = TxHash::random();
         let withdrawn = EquityRedemption::WithdrawnFromRaindex {
             symbol: symbol.clone(),
             quantity: dec!(50.25),
             token: Address::random(),
             wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
-            raindex_withdraw_tx: TxHash::random(),
+            raindex_withdraw_tx: withdraw_tx,
             withdrawn_at: now,
         };
         let TransferOperation::EquityRedemption(op) = withdrawn.to_dto(&id) else {
@@ -1584,20 +1605,22 @@ mod tests {
         assert_eq!(op.symbol, symbol);
         assert_eq!(op.quantity, FractionalShares::new(dec!(50.25)));
         assert!(
-            matches!(op.status, EquityRedemptionStatus::Withdrawing),
-            "Expected Withdrawing, got: {:?}",
+            matches!(op.status, EquityRedemptionStatus::Withdrawing { raindex_withdraw } if raindex_withdraw == withdraw_tx),
+            "Expected Withdrawing with tx hash, got: {:?}",
             op.status
         );
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, now);
 
+        let withdraw_tx = TxHash::random();
+        let unwrap_tx = TxHash::random();
         let unwrapped = EquityRedemption::TokensUnwrapped {
             symbol: symbol.clone(),
             quantity: dec!(50.25),
             token: Address::random(),
             underlying_token: Address::random(),
-            raindex_withdraw_tx: TxHash::random(),
-            unwrap_tx_hash: TxHash::random(),
+            raindex_withdraw_tx: withdraw_tx,
+            unwrap_tx_hash: unwrap_tx,
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             withdrawn_at: now,
             unwrapped_at: later,
@@ -1606,18 +1629,19 @@ mod tests {
             panic!("Expected EquityRedemption");
         };
         assert!(
-            matches!(op.status, EquityRedemptionStatus::Unwrapping),
-            "Expected Unwrapping, got: {:?}",
+            matches!(op.status, EquityRedemptionStatus::Unwrapping { raindex_withdraw, unwrap } if raindex_withdraw == withdraw_tx && unwrap == unwrap_tx),
+            "Expected Unwrapping with tx hashes, got: {:?}",
             op.status
         );
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
 
+        let withdraw_tx = TxHash::random();
         let sent = EquityRedemption::TokensSent {
             symbol: symbol.clone(),
             quantity: dec!(50.25),
             token: Address::random(),
-            raindex_withdraw_tx: TxHash::random(),
+            raindex_withdraw_tx: withdraw_tx,
             unwrap_tx_hash: Some(TxHash::random()),
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
@@ -1627,17 +1651,18 @@ mod tests {
             panic!("Expected EquityRedemption");
         };
         assert!(
-            matches!(op.status, EquityRedemptionStatus::Sending),
-            "Expected Sending, got: {:?}",
+            matches!(op.status, EquityRedemptionStatus::Sending { raindex_withdraw } if raindex_withdraw == withdraw_tx),
+            "Expected Sending with tx hash, got: {:?}",
             op.status
         );
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, now);
 
+        let redemption_tx = TxHash::random();
         let pending = EquityRedemption::Pending {
             symbol,
             quantity: dec!(50.25),
-            redemption_tx: TxHash::random(),
+            redemption_tx,
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             sent_at: now,
             detected_at: later,
@@ -1646,8 +1671,8 @@ mod tests {
             panic!("Expected EquityRedemption");
         };
         assert!(
-            matches!(op.status, EquityRedemptionStatus::PendingConfirmation),
-            "Expected PendingConfirmation, got: {:?}",
+            matches!(op.status, EquityRedemptionStatus::PendingConfirmation { redemption } if redemption == redemption_tx),
+            "Expected PendingConfirmation with tx hash, got: {:?}",
             op.status
         );
         assert_eq!(op.started_at, now);
@@ -1662,40 +1687,47 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let later = Utc::now() + chrono::Duration::seconds(60);
 
+        let redemption_tx = TxHash::random();
         let completed = EquityRedemption::Completed {
             symbol: symbol.clone(),
             quantity: dec!(50.25),
-            redemption_tx: TxHash::random(),
+            redemption_tx,
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             completed_at: later,
         };
         let TransferOperation::EquityRedemption(op) = completed.to_dto(&id) else {
             panic!("Expected EquityRedemption");
         };
-        assert!(
-            matches!(op.status, EquityRedemptionStatus::Completed { .. }),
-            "Expected Completed, got: {:?}",
-            op.status
-        );
+        let EquityRedemptionStatus::Completed { redemption, .. } = op.status else {
+            panic!("Expected Completed, got: {:?}", op.status);
+        };
+        assert_eq!(redemption, redemption_tx);
         assert_eq!(op.started_at, later);
         assert_eq!(op.updated_at, later);
 
+        let withdraw_tx = Some(TxHash::random());
+        let redeem_tx = Some(TxHash::random());
         let failed = EquityRedemption::Failed {
             symbol,
             quantity: dec!(50.25),
-            raindex_withdraw_tx: Some(TxHash::random()),
-            redemption_tx: Some(TxHash::random()),
+            raindex_withdraw_tx: withdraw_tx,
+            redemption_tx: redeem_tx,
             tokenization_request_id: Some(TokenizationRequestId("TOK001".to_string())),
             failed_at: later,
         };
         let TransferOperation::EquityRedemption(op) = failed.to_dto(&id) else {
             panic!("Expected EquityRedemption");
         };
-        assert!(
-            matches!(op.status, EquityRedemptionStatus::Failed { .. }),
-            "Expected Failed, got: {:?}",
-            op.status
-        );
+        let EquityRedemptionStatus::Failed {
+            raindex_withdraw,
+            redemption,
+            ..
+        } = op.status
+        else {
+            panic!("Expected Failed, got: {:?}", op.status);
+        };
+        assert_eq!(raindex_withdraw, withdraw_tx);
+        assert_eq!(redemption, redeem_tx);
         assert_eq!(op.started_at, later);
         assert_eq!(op.updated_at, later);
     }

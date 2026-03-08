@@ -136,6 +136,7 @@ fn classify(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::TxHash;
     use chrono::Utc;
     use rust_decimal::Decimal;
 
@@ -195,6 +196,9 @@ mod tests {
         classify(
             mint_transfer(EquityMintStatus::Completed {
                 completed_at: Utc::now(),
+                token: TxHash::random(),
+                wrap: TxHash::random(),
+                vault_deposit: TxHash::random(),
             }),
             &cutoff,
             &mut active,
@@ -213,6 +217,8 @@ mod tests {
 
         let mut transfer = usdc_transfer(UsdcBridgeStatus::Completed {
             completed_at: Utc::now() - chrono::Duration::hours(48),
+            burn: TxHash::random(),
+            mint: TxHash::random(),
         });
 
         if let TransferOperation::UsdcBridge(ref mut op) = transfer {

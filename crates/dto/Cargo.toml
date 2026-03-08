@@ -6,6 +6,7 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+alloy-primitives = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 rust_decimal = { workspace = true, features = ["serde"] }
