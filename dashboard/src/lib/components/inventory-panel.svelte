@@ -15,6 +15,7 @@
     computeTotal, computeRatio, isWithinThreshold,
     stripPrefix
   } from './inventory-panel'
+  import { failureReason, txLinks } from './transfer-details'
 
   const inventoryQuery = createQuery<Inventory>(() => ({
     queryKey: ['inventory'],
@@ -121,6 +122,9 @@
     if (status === 'failed') return { text: 'text-destructive', dot: 'bg-destructive' }
     return { text: '', dot: 'bg-green-500' }
   }
+
+  const fmtHash = (hash: string): string =>
+    `${hash.slice(0, 6)}\u2026${hash.slice(-4)}`
 
   type SortDir = 'asc' | 'desc'
   type SortState<Col extends string> = { column: Col; dir: SortDir } | null
@@ -310,6 +314,8 @@
           <Table.Body>
             {#each sortedTransfers as transfer (transfer.id)}
               {@const style = statusStyle(transfer.status.status)}
+              {@const reason = failureReason(transfer)}
+              {@const links = txLinks(transfer)}
               <Table.Row>
                 <Table.Cell class="font-mono text-muted-foreground">
                   {formatTime(transfer.startedAt)}
@@ -324,10 +330,28 @@
                   {transferUnderlying(transfer)}
                 </Table.Cell>
                 <Table.Cell class={style.text}>
-                  <span class="inline-flex items-center gap-1.5">
-                    <span class="inline-block h-1.5 w-1.5 rounded-full {style.dot}"></span>
-                    {transfer.status.status}
-                  </span>
+                  <div class="flex flex-col gap-0.5">
+                    <span class="inline-flex items-center gap-1.5">
+                      <span class="inline-block h-1.5 w-1.5 rounded-full {style.dot}"></span>
+                      {transfer.status.status}
+                    </span>
+                    {#if reason}
+                      <span class="text-[10px] leading-tight text-destructive">{reason}</span>
+                    {/if}
+                    {#if links.length > 0}
+                      <span class="flex flex-wrap gap-1">
+                        {#each links as link (link.label)}
+                          <a
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            class="text-[10px] text-muted-foreground underline decoration-dotted hover:text-foreground"
+                            title={link.hash}
+                          >{link.label}: {fmtHash(link.hash)}</a>
+                        {/each}
+                      </span>
+                    {/if}
+                  </div>
                 </Table.Cell>
               </Table.Row>
             {/each}

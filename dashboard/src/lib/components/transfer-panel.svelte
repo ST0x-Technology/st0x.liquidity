@@ -6,6 +6,7 @@
   import type { TransferOperation } from '$lib/api/TransferOperation'
   import { matcher } from '$lib/fp'
   import { decimalToNumber } from '$lib/decimal'
+  import { failureReason, txLinks } from './transfer-details'
 
   const activeQuery = createQuery<TransferOperation[]>(() => ({
     queryKey: ['transfers', 'active'],
@@ -41,12 +42,12 @@
 
   const transferDescription = (transfer: TransferOperation): string =>
     matchKind(transfer, {
-      equity_mint: (op) => `Alpaca — ${fmtNum(op.quantity)} → Raindex`,
-      equity_redemption: (op) => `Raindex — ${fmtNum(op.quantity)} → Alpaca`,
+      equity_mint: (op) => `Alpaca \u2014 ${fmtNum(op.quantity)} \u2192 Raindex`,
+      equity_redemption: (op) => `Raindex \u2014 ${fmtNum(op.quantity)} \u2192 Alpaca`,
       usdc_bridge: (op) =>
         op.direction === 'alpaca_to_base'
-          ? `Alpaca — ${fmtNum(op.amount)} → Raindex`
-          : `Raindex — ${fmtNum(op.amount)} → Alpaca`
+          ? `Alpaca \u2014 ${fmtNum(op.amount)} \u2192 Raindex`
+          : `Raindex \u2014 ${fmtNum(op.amount)} \u2192 Alpaca`
     })
 
   const statusVariant = (status: string): BadgeVariant => {
@@ -54,6 +55,9 @@
     if (status === 'failed') return 'destructive'
     return 'secondary'
   }
+
+  const fmtHash = (hash: string): string =>
+    `${hash.slice(0, 6)}\u2026${hash.slice(-4)}`
 </script>
 
 <Card.Root class="flex h-full min-h-56 flex-col overflow-hidden">
@@ -81,6 +85,8 @@
         </Table.Header>
         <Table.Body>
           {#each allTransfers as transfer (transfer.id)}
+            {@const reason = failureReason(transfer)}
+            {@const links = txLinks(transfer)}
             <Table.Row>
               <Table.Cell class="font-mono text-xs font-medium">
                 {transferAsset(transfer)}
@@ -89,9 +95,27 @@
                 {transferDescription(transfer)}
               </Table.Cell>
               <Table.Cell>
-                <Badge variant={statusVariant(transfer.status.status)}>
-                  {transfer.status.status}
-                </Badge>
+                <div class="flex flex-col gap-0.5">
+                  <Badge variant={statusVariant(transfer.status.status)}>
+                    {transfer.status.status}
+                  </Badge>
+                  {#if reason}
+                    <span class="text-[10px] leading-tight text-destructive">{reason}</span>
+                  {/if}
+                  {#if links.length > 0}
+                    <span class="flex flex-wrap gap-1">
+                      {#each links as link (link.label)}
+                        <a
+                          href={link.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          class="text-[10px] text-muted-foreground underline decoration-dotted hover:text-foreground"
+                          title={link.hash}
+                        >{link.label}: {fmtHash(link.hash)}</a>
+                      {/each}
+                    </span>
+                  {/if}
+                </div>
               </Table.Cell>
             </Table.Row>
           {/each}
