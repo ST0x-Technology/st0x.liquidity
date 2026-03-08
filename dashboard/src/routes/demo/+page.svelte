@@ -126,6 +126,7 @@
       symbol: 'tAAPL',
       quantity: '10.50',
       status: { status: 'wrapping', token: '0xa1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 120000).toISOString(),
       updatedAt: new Date(Date.now() - 30000).toISOString()
     },
@@ -135,6 +136,7 @@
       direction: 'alpaca_to_base',
       amount: '5000.00',
       status: { status: 'bridging', burn: '0xb2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 300000).toISOString(),
       updatedAt: new Date(Date.now() - 60000).toISOString()
     },
@@ -144,6 +146,7 @@
       symbol: 'tNVDA',
       quantity: '15.00',
       status: { status: 'sending', raindex_withdraw: '0xc3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 90000).toISOString(),
       updatedAt: new Date(Date.now() - 15000).toISOString()
     },
@@ -153,6 +156,7 @@
       symbol: 'tMETA',
       quantity: '22.375',
       status: { status: 'minting' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 45000).toISOString(),
       updatedAt: new Date(Date.now() - 10000).toISOString()
     },
@@ -162,6 +166,7 @@
       symbol: 'tDIS',
       quantity: '8.00',
       status: { status: 'unwrapping', raindex_withdraw: '0xd4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5', unwrap: '0xe5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 200000).toISOString(),
       updatedAt: new Date(Date.now() - 50000).toISOString()
     }
@@ -174,6 +179,7 @@
       symbol: 'tSPYM',
       quantity: '100.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 400000).toISOString(), token: '0x1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b', wrap: '0x2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c', vault_deposit: '0x3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 700000).toISOString(),
       updatedAt: new Date(Date.now() - 400000).toISOString()
     },
@@ -183,6 +189,7 @@
       symbol: 'tAAPL',
       quantity: '50.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 600000).toISOString(), redemption: '0x4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 900000).toISOString(),
       updatedAt: new Date(Date.now() - 600000).toISOString()
     },
@@ -192,6 +199,7 @@
       symbol: 'tMSFT',
       quantity: '25.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 800000).toISOString(), token: '0x5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f', wrap: '0x6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a', vault_deposit: '0x7a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 1000000).toISOString(),
       updatedAt: new Date(Date.now() - 800000).toISOString()
     },
@@ -201,6 +209,7 @@
       direction: 'alpaca_to_base',
       amount: '25000.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 1100000).toISOString(), burn: '0x8b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c', mint: '0x9c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 1300000).toISOString(),
       updatedAt: new Date(Date.now() - 1100000).toISOString()
     },
@@ -210,6 +219,7 @@
       direction: 'base_to_alpaca',
       amount: '10000.00',
       status: { status: 'failed', failed_at: new Date(Date.now() - 1200000).toISOString(), reason: 'bridge timeout', burn: '0xad4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e', mint: null },
+      completedStages: [],
       startedAt: new Date(Date.now() - 1500000).toISOString(),
       updatedAt: new Date(Date.now() - 1200000).toISOString()
     },
@@ -219,6 +229,7 @@
       symbol: 'tTSLA',
       quantity: '30.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 1800000).toISOString(), redemption: '0xbe5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 2100000).toISOString(),
       updatedAt: new Date(Date.now() - 1800000).toISOString()
     },
@@ -228,6 +239,7 @@
       symbol: 'tGOOG',
       quantity: '40.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 2400000).toISOString(), token: '0xcf6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a', wrap: '0xd01b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b', vault_deposit: '0xe12c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 2800000).toISOString(),
       updatedAt: new Date(Date.now() - 2400000).toISOString()
     },
@@ -237,6 +249,7 @@
       symbol: 'tAMZN',
       quantity: '12.50',
       status: { status: 'failed', failed_at: new Date(Date.now() - 2600000).toISOString(), raindex_withdraw: '0xf23d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d', redemption: null },
+      completedStages: [],
       startedAt: new Date(Date.now() - 3000000).toISOString(),
       updatedAt: new Date(Date.now() - 2600000).toISOString()
     },
@@ -246,6 +259,7 @@
       direction: 'base_to_alpaca',
       amount: '50000.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 3200000).toISOString(), burn: '0x034e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e', mint: '0x145f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 3600000).toISOString(),
       updatedAt: new Date(Date.now() - 3200000).toISOString()
     },
@@ -255,6 +269,7 @@
       symbol: 'tV',
       quantity: '67.50',
       status: { status: 'completed', completed_at: new Date(Date.now() - 3800000).toISOString(), token: '0x256a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a', wrap: '0x367b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b', vault_deposit: '0x478c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 4200000).toISOString(),
       updatedAt: new Date(Date.now() - 3800000).toISOString()
     },
@@ -264,6 +279,7 @@
       symbol: 'tNFLX',
       quantity: '14.128573',
       status: { status: 'completed', completed_at: new Date(Date.now() - 4500000).toISOString(), token: '0x589d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d', wrap: '0x69ae5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e', vault_deposit: '0x7abf6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 5000000).toISOString(),
       updatedAt: new Date(Date.now() - 4500000).toISOString()
     },
@@ -273,6 +289,7 @@
       symbol: 'tJPM',
       quantity: '20.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 5200000).toISOString(), redemption: '0x8bc01a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 5800000).toISOString(),
       updatedAt: new Date(Date.now() - 5200000).toISOString()
     },
@@ -282,6 +299,7 @@
       direction: 'alpaca_to_base',
       amount: '15000.00',
       status: { status: 'failed', failed_at: new Date(Date.now() - 5500000).toISOString(), reason: 'insufficient balance', burn: null, mint: null },
+      completedStages: [],
       startedAt: new Date(Date.now() - 6000000).toISOString(),
       updatedAt: new Date(Date.now() - 5500000).toISOString()
     },
@@ -291,6 +309,7 @@
       symbol: 'tBAC',
       quantity: '500.00',
       status: { status: 'completed', completed_at: new Date(Date.now() - 6200000).toISOString(), token: '0x9cd12a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f', wrap: '0xade23b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a', vault_deposit: '0xbef34c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b' },
+      completedStages: [],
       startedAt: new Date(Date.now() - 6800000).toISOString(),
       updatedAt: new Date(Date.now() - 6200000).toISOString()
     }

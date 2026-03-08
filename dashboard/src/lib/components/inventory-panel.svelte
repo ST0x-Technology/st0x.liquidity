@@ -15,7 +15,7 @@
     computeTotal, computeRatio, isWithinThreshold,
     stripPrefix
   } from './inventory-panel'
-  import { failureReason, txLinks } from './transfer-details'
+  import { completedStages, failureReason, txLinks } from './transfer-details'
 
   const inventoryQuery = createQuery<Inventory>(() => ({
     queryKey: ['inventory'],
@@ -316,6 +316,7 @@
               {@const style = statusStyle(transfer.status.status)}
               {@const reason = failureReason(transfer)}
               {@const links = txLinks(transfer)}
+              {@const stages = completedStages(transfer)}
               <Table.Row>
                 <Table.Cell class="font-mono text-muted-foreground">
                   {formatTime(transfer.startedAt)}
@@ -348,6 +349,16 @@
                             class="text-[10px] text-muted-foreground underline decoration-dotted hover:text-foreground"
                             title={link.hash}
                           >{link.label}: {fmtHash(link.hash)}</a>
+                        {/each}
+                      </span>
+                    {/if}
+                    {#if stages.length > 0}
+                      <span class="flex flex-wrap gap-1 pt-0.5">
+                        {#each stages as entry (entry.name)}
+                          <span
+                            class="text-[10px] text-muted-foreground"
+                            title={entry.txHash ? `${entry.name}: ${entry.txHash}` : entry.name}
+                          >{entry.name} {formatTime(entry.completedAt)}</span>
                         {/each}
                       </span>
                     {/if}

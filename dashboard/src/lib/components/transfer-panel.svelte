@@ -6,7 +6,7 @@
   import type { TransferOperation } from '$lib/api/TransferOperation'
   import { matcher } from '$lib/fp'
   import { decimalToNumber } from '$lib/decimal'
-  import { failureReason, txLinks } from './transfer-details'
+  import { completedStages, failureReason, txLinks } from './transfer-details'
 
   const activeQuery = createQuery<TransferOperation[]>(() => ({
     queryKey: ['transfers', 'active'],
@@ -58,6 +58,14 @@
 
   const fmtHash = (hash: string): string =>
     `${hash.slice(0, 6)}\u2026${hash.slice(-4)}`
+
+  const fmtTime = (timestamp: string): string =>
+    new Date(timestamp).toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    })
 </script>
 
 <Card.Root class="flex h-full min-h-56 flex-col overflow-hidden">
@@ -87,6 +95,7 @@
           {#each allTransfers as transfer (transfer.id)}
             {@const reason = failureReason(transfer)}
             {@const links = txLinks(transfer)}
+            {@const stages = completedStages(transfer)}
             <Table.Row>
               <Table.Cell class="font-mono text-xs font-medium">
                 {transferAsset(transfer)}
@@ -112,6 +121,16 @@
                           class="text-[10px] text-muted-foreground underline decoration-dotted hover:text-foreground"
                           title={link.hash}
                         >{link.label}: {fmtHash(link.hash)}</a>
+                      {/each}
+                    </span>
+                  {/if}
+                  {#if stages.length > 0}
+                    <span class="flex flex-wrap gap-1 pt-0.5">
+                      {#each stages as entry (entry.name)}
+                        <span
+                          class="text-[10px] text-muted-foreground"
+                          title={entry.txHash ? `${entry.name}: ${entry.txHash}` : entry.name}
+                        >{entry.name} {fmtTime(entry.completedAt)}</span>
                       {/each}
                     </span>
                   {/if}
