@@ -592,4 +592,106 @@ mod tests {
         assert!(json.contains("offchainAvailable"));
         assert!(json.contains("offchainInflight"));
     }
+
+    #[test]
+    fn failed_equity_mint_serializes_with_failed_at() {
+        let status = EquityMintStatus::Failed {
+            failed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""status":"failed""#),
+            "should include failed status tag, got: {json}"
+        );
+        assert!(
+            json.contains("\"failedAt\""),
+            "should include failedAt, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_equity_mint_serializes_with_completed_at() {
+        let status = EquityMintStatus::Completed {
+            completed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""status":"completed""#),
+            "should include completed status tag, got: {json}"
+        );
+        assert!(
+            json.contains("\"completedAt\""),
+            "should include completedAt, got: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_usdc_bridge_serializes_with_failed_at() {
+        let status = UsdcBridgeStatus::Failed {
+            failed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""status":"failed""#),
+            "should include failed status tag, got: {json}"
+        );
+        assert!(
+            json.contains("\"failedAt\""),
+            "should include failedAt, got: {json}"
+        );
+    }
+
+    #[test]
+    fn completed_usdc_bridge_serializes_with_completed_at() {
+        let status = UsdcBridgeStatus::Completed {
+            completed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""status":"completed""#),
+            "should include completed status tag, got: {json}"
+        );
+        assert!(
+            json.contains("\"completedAt\""),
+            "should include completedAt, got: {json}"
+        );
+    }
+
+    #[test]
+    fn equity_mint_wrapping_status_serializes() {
+        let operation = TransferOperation::EquityMint(EquityMintOperation {
+            id: Id::new("mint-cs"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(Decimal::new(10, 0)),
+            status: EquityMintStatus::Wrapping,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+
+        let json = serde_json::to_string(&operation).unwrap();
+        assert!(
+            json.contains(r#""status":"wrapping""#),
+            "should contain wrapping status, got: {json}"
+        );
+        assert!(
+            json.contains(r#""kind":"equity_mint""#),
+            "should contain equity_mint kind, got: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_equity_redemption_serializes_with_failed_at() {
+        let status = EquityRedemptionStatus::Failed {
+            failed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(r#""status":"failed""#),
+            "should include failed status tag, got: {json}"
+        );
+        assert!(
+            json.contains("\"failedAt\""),
+            "should include failedAt, got: {json}"
+        );
+    }
 }
