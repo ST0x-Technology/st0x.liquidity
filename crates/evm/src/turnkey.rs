@@ -51,8 +51,7 @@ pub enum TurnkeyError {
 ///
 /// Contains everything needed to build a wallet: Turnkey API
 /// credentials, the wallet address, and a base provider. Callers
-/// construct this directly via its public fields and pass it to
-/// [`TurnkeyWallet::new`].
+/// construct this directly via struct literal syntax.
 pub struct TurnkeyCtx<P> {
     pub api_private_key: TurnkeyApiPrivateKey,
     pub organization_id: TurnkeyOrganizationId,

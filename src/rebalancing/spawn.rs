@@ -182,8 +182,8 @@ mod tests {
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::{LiquidityVenueRatio, RebalancingTriggerConfig};
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::VaultRegistry;
@@ -202,13 +202,15 @@ mod tests {
 
     fn make_ctx() -> RebalancingCtx {
         RebalancingCtx::stub(
-            ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
-            },
-            ImbalanceThreshold {
-                target: dec!(0.6),
-                deviation: dec!(0.15),
+            LiquidityVenueRatio {
+                equities: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                cash: Some(ImbalanceThreshold {
+                    target: dec!(0.6),
+                    deviation: dec!(0.15),
+                }),
             },
             address!("0x1234567890123456789012345678901234567890"),
             AlpacaBrokerApiCtx {
@@ -241,8 +243,7 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity: ctx.equity,
-            usdc: ctx.usdc,
+            liquidity_venue_ratio: ctx.liquidity_venue_ratio,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
@@ -250,8 +251,14 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        assert_eq!(trigger_config.equity.target, dec!(0.5));
-        assert_eq!(trigger_config.equity.deviation, dec!(0.2));
+        assert_eq!(
+            trigger_config.liquidity_venue_ratio.equities.target,
+            dec!(0.5)
+        );
+        assert_eq!(
+            trigger_config.liquidity_venue_ratio.equities.deviation,
+            dec!(0.2)
+        );
     }
 
     #[test]
@@ -259,8 +266,7 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity: ctx.equity,
-            usdc: ctx.usdc,
+            liquidity_venue_ratio: ctx.liquidity_venue_ratio,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
@@ -268,8 +274,9 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        assert_eq!(trigger_config.usdc.target, dec!(0.6));
-        assert_eq!(trigger_config.usdc.deviation, dec!(0.15));
+        let cash = trigger_config.liquidity_venue_ratio.cash.unwrap();
+        assert_eq!(cash.target, dec!(0.6));
+        assert_eq!(cash.deviation, dec!(0.15));
     }
 
     async fn make_services_with_mock_wallet(

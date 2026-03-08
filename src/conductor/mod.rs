@@ -440,8 +440,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity: rebalancing_ctx.equity,
-                usdc: rebalancing_ctx.usdc,
+                liquidity_venue_ratio: rebalancing_ctx.liquidity_venue_ratio.clone(),
                 assets: deps.ctx.assets.clone(),
                 disabled_assets,
             },
@@ -476,17 +475,23 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
-        let usdc_vault_id = deps
-            .ctx
-            .assets
-            .cash
-            .as_ref()
-            .and_then(|cash| cash.vault_id)
-            .ok_or(CtxError::MissingCashVaultId)?;
+        let usdc_vault_id = if rebalancing_ctx.liquidity_venue_ratio.cash.is_some() {
+            let vault_id = deps
+                .ctx
+                .assets
+                .cash
+                .as_ref()
+                .and_then(|cash| cash.vault_id)
+                .ok_or(CtxError::MissingCashVaultId)?;
+
+            RaindexVaultId(vault_id)
+        } else {
+            RaindexVaultId(alloy::primitives::B256::ZERO)
+        };
 
         let handle = services.spawn(
             market_maker_wallet,
-            RaindexVaultId(usdc_vault_id),
+            usdc_vault_id,
             operation_receiver,
             frameworks,
         );
@@ -1600,7 +1605,7 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
     use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
-    use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
+    use crate::rebalancing::{LiquidityVenueRatio, RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::{ExecutionThreshold, Usdc};
     use crate::wrapper::mock::MockWrapper;
@@ -3450,13 +3455,15 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
-                },
-                usdc: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                liquidity_venue_ratio: LiquidityVenueRatio {
+                    equities: ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.2),
+                    },
+                    cash: Some(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.2),
+                    }),
                 },
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
@@ -3541,8 +3548,10 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity: threshold,
-                usdc: threshold,
+                liquidity_venue_ratio: LiquidityVenueRatio {
+                    equities: threshold,
+                    cash: Some(threshold),
+                },
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
@@ -3646,13 +3655,15 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
-                },
-                usdc: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                liquidity_venue_ratio: LiquidityVenueRatio {
+                    equities: ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.2),
+                    },
+                    cash: Some(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.2),
+                    }),
                 },
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
@@ -3770,13 +3781,15 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
-                },
-                usdc: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
+                liquidity_venue_ratio: LiquidityVenueRatio {
+                    equities: ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.2),
+                    },
+                    cash: Some(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.2),
+                    }),
                 },
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),

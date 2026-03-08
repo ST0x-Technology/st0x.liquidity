@@ -7,14 +7,17 @@ hyperdx.service_name = "st0x-hedge"
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 
+[wallet]
+type = "turnkey"
+organization_id = "org-..."
+address = "0x0000000000000000000000000000000000000000"
+
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-fireblocks_vault_account_id = 0
-fireblocks_environment = "sandbox"
 
-fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
-equity = { target = 0.5, deviation = 0.2 }
-usdc = { target = 0.5, deviation = 0.3 }
+[rebalancing.liquidity_venue_ratio]
+equities = { target = 0.5, deviation = 0.2 }
+cash = { target = 0.5, deviation = 0.3 }
 
 [assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -25,6 +28,5 @@ rebalancing = "disabled"
 # operational_limit = 100.0
 
 [assets.cash]
-rebalancing = "enabled"
 # vault_id = "0xcd34"
 # operational_limit = 10000.0

@@ -181,6 +181,27 @@ impl<W: Wallet> CctpEndpoint<W> {
         IERC20::new(self.usdc_address, self.wallet.provider())
     }
 
+    /// Approves USDC spending via the wallet's signing path.
+    ///
+    /// Unlike `usdc().approve().send()`, this goes through `Wallet::submit`
+    /// which handles signing regardless of whether `Evm::Provider` is a
+    /// signing or read-only provider.
+    #[cfg(test)]
+    pub(super) async fn test_approve_usdc(
+        &self,
+        spender: Address,
+        amount: U256,
+    ) -> Result<(), CctpError> {
+        self.wallet
+            .submit::<st0x_evm::OpenChainErrorRegistry, _>(
+                self.usdc_address,
+                IERC20::approveCall { spender, amount },
+                "test USDC approve",
+            )
+            .await?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
         self.wallet.address()

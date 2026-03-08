@@ -40,7 +40,8 @@ use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
-    Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation,
+    LiquidityVenueRatio, Rebalancer, RebalancingTrigger, RebalancingTriggerConfig,
+    TriggeredOperation,
 };
 use crate::test_utils::setup_test_db;
 use crate::threshold::{ExecutionThreshold, Usdc};
@@ -108,13 +109,15 @@ async fn discover_deterministic_tx_hash(
 
 fn test_trigger_config() -> RebalancingTriggerConfig {
     RebalancingTriggerConfig {
-        equity: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
-        },
-        usdc: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+        liquidity_venue_ratio: LiquidityVenueRatio {
+            equities: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            cash: Some(ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            }),
         },
         assets: AssetsConfig {
             equities: EquitiesConfig {
@@ -132,7 +135,6 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             },
             cash: Some(CashAssetConfig {
                 vault_id: None,
-                rebalancing: OperationMode::Enabled,
                 operational_limit: None,
             }),
         },
@@ -1112,19 +1114,20 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
             vault_id: None,
-            rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
         }),
     };
 
     let config = RebalancingTriggerConfig {
-        equity: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
-        },
-        usdc: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+        liquidity_venue_ratio: LiquidityVenueRatio {
+            equities: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            cash: Some(ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            }),
         },
         assets,
         disabled_assets: HashSet::new(),
@@ -1228,18 +1231,19 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
             vault_id: None,
-            rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc(dec!(100))).unwrap()),
         }),
     };
     let config = RebalancingTriggerConfig {
-        equity: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
-        },
-        usdc: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+        liquidity_venue_ratio: LiquidityVenueRatio {
+            equities: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            cash: Some(ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            }),
         },
         assets,
         disabled_assets: HashSet::new(),
@@ -1326,19 +1330,20 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
         let (sender, mut receiver) = mpsc::channel(10);
         let wide_config = RebalancingTriggerConfig {
-            equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.4),
-            },
-            usdc: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.4),
+            liquidity_venue_ratio: LiquidityVenueRatio {
+                equities: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.4),
+                },
+                cash: Some(ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.4),
+                }),
             },
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
                     vault_id: None,
-                    rebalancing: OperationMode::Enabled,
                     operational_limit: None,
                 }),
             },
@@ -1381,19 +1386,20 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
         let (sender, mut receiver) = mpsc::channel(10);
         let tight_config = RebalancingTriggerConfig {
-            equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.1),
-            },
-            usdc: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.1),
+            liquidity_venue_ratio: LiquidityVenueRatio {
+                equities: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.1),
+                },
+                cash: Some(ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.1),
+                }),
             },
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
                     vault_id: None,
-                    rebalancing: OperationMode::Enabled,
                     operational_limit: None,
                 }),
             },
