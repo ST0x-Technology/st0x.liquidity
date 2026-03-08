@@ -1,7 +1,9 @@
+import type { CompletedStage } from '$lib/api/CompletedStage'
 import type { TransferOperation } from '$lib/api/TransferOperation'
 import { matcher } from '$lib/fp'
 
 export type TxLink = { label: string; hash: string; url: string }
+export type StageEntry = CompletedStage
 
 const BASE_EXPLORER = 'https://basescan.org/tx'
 const ETH_EXPLORER = 'https://etherscan.io/tx'
@@ -84,6 +86,13 @@ const equityRedemptionLinks = (status: EquityRedemptionStatus): TxLink[] => {
     }
   }
 }
+
+export const completedStages = (transfer: TransferOperation): StageEntry[] =>
+  matchKind(transfer, {
+    equity_mint: (op) => op.completedStages,
+    equity_redemption: (op) => op.completedStages,
+    usdc_bridge: (op) => op.completedStages
+  })
 
 const usdcBridgeLinks = (status: UsdcBridgeStatus, direction: UsdcDirection): TxLink[] => {
   const burnExplorer = direction === 'alpaca_to_base' ? ETH_EXPLORER : BASE_EXPLORER

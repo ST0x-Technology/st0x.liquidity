@@ -154,6 +154,7 @@ mod tests {
             symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
             quantity: st0x_execution::FractionalShares::new(Decimal::from(10)),
             status,
+            completed_stages: vec![],
             started_at: Utc::now(),
             updated_at: Utc::now(),
         })
@@ -165,6 +166,7 @@ mod tests {
             direction: UsdcBridgeDirection::AlpacaToBase,
             amount: Usdc::new(Decimal::from(1000)),
             status,
+            completed_stages: vec![],
             started_at: Utc::now(),
             updated_at: Utc::now(),
         })
