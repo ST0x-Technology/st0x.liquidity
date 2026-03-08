@@ -107,6 +107,7 @@ const createUsdcInventory = () => ({
 
 const createInitialState = (): InitialState => ({
   recentTrades: [],
+  recentEvents: [],
   inventory: { perSymbol: [], usdc: createUsdcInventory(), snapshotAt: null },
   metrics: {
     '1h': createTimeframeMetrics(),
@@ -119,7 +120,13 @@ const createInitialState = (): InitialState => ({
   activeTransfers: [],
   recentTransfers: [],
   authStatus: { status: 'not_configured' },
-  circuitBreaker: { status: 'active' }
+  circuitBreaker: { status: 'active' },
+  rebalancing: {
+    equityOnchainRatio: '0.5',
+    equityTriggerThreshold: '0.2',
+    cashOnchainRatio: '0.5',
+    cashTriggerThreshold: '0.2'
+  }
 })
 
 describe('createWebSocket', () => {
@@ -172,6 +179,7 @@ describe('createWebSocket', () => {
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['inventory'], initialState.inventory)
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['auth'], { status: 'not_configured' })
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['circuitBreaker'], { status: 'active' })
+    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['rebalancing'], initialState.rebalancing)
   })
 
   it('prepends events and caps at 100', () => {

@@ -4,9 +4,16 @@
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
   import * as Separator from '$lib/components/ui/separator'
+  import * as Tooltip from '$lib/components/ui/tooltip'
   import type { Inventory } from '$lib/api/Inventory'
+  import type { RebalancingTargets } from '$lib/api/RebalancingTargets'
   import type { TransferOperation } from '$lib/api/TransferOperation'
   import { matcher } from '$lib/fp'
+  import {
+    fmt, fmtNum, fmtPct, fmtDeviation,
+    computeTotal, computeRatio, isWithinThreshold,
+    stripPrefix
+  } from './inventory-panel'
 
   const inventoryQuery = createQuery<Inventory>(() => ({
     queryKey: ['inventory'],
@@ -20,6 +27,18 @@
           offchainInflight: '0'
         },
         snapshotAt: null
+      }),
+    staleTime: Infinity
+  }))
+
+  const rebalancingQuery = createQuery<RebalancingTargets>(() => ({
+    queryKey: ['rebalancing'],
+    queryFn: () =>
+      Promise.resolve({
+        equityOnchainRatio: '0',
+        equityTriggerThreshold: '0',
+        cashOnchainRatio: null,
+        cashTriggerThreshold: null
       }),
     staleTime: Infinity
   }))
@@ -39,59 +58,15 @@
   const inventory = $derived(inventoryQuery.data)
   const symbols = $derived(inventory?.perSymbol ?? [])
   const usdc = $derived(inventory?.usdc)
+  const rebalancing = $derived(rebalancingQuery.data)
 
   const activeTransfers = $derived(activeQuery.data ?? [])
   const recentTransfers = $derived(recentQuery.data ?? [])
   const allTransfers = $derived([...activeTransfers, ...recentTransfers])
 
-  const decimalPlaces = (value: string): number => {
-    const dotIdx = value.indexOf('.')
-    if (dotIdx === -1) return 0
-    return Math.max(2, value.length - dotIdx - 1)
-  }
-
-  const fmt = (value: string): string => {
-    const num = parseFloat(value)
-    if (num === 0) return '-'
-    const dp = decimalPlaces(value)
-    return num.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
-  }
-
-  const fmtNum = (value: string): string => {
-    const num = parseFloat(value)
-    const dp = decimalPlaces(value)
-    return num.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
-  }
-
-  type CashRow = { label: string; value: string; decimals: number }
-
-  const cashRows = $derived.by((): CashRow[] => {
-    if (!usdc) return []
-    const usdcVal = parseFloat(usdc.onchainAvailable)
-    const usdVal = parseFloat(usdc.offchainAvailable)
-    const totalVal = usdcVal + usdVal
-    return [
-      { label: 'Total', value: String(totalVal), decimals: 6 },
-      { label: 'USDC', value: String(usdcVal), decimals: 6 },
-      { label: 'USD', value: String(usdVal), decimals: 2 }
-    ]
-  })
-
-  const maxDecimals = 6
-
-  const fmtCashAligned = (value: string, decimals: number): string => {
-    const num = parseFloat(value)
-    if (num === 0) return '-'
-    const formatted = num.toLocaleString('en-US', {
-      minimumFractionDigits: decimals,
-      maximumFractionDigits: decimals
-    })
-    const trailingPad = maxDecimals - decimals
-    return formatted + '\u00A0'.repeat(trailingPad)
-  }
-
-  const stripPrefix = (symbol: string): string =>
-    symbol.startsWith('t') ? symbol.slice(1) : symbol
+  const cashRatio = $derived(
+    usdc ? computeRatio(usdc.onchainAvailable, usdc.offchainAvailable) : null
+  )
 
   const matchKind = matcher<TransferOperation>()('kind')
 
@@ -156,7 +131,7 @@
     return state.dir === 'asc' ? ' \u25B2' : ' \u25BC'
   }
 
-  type EquityCol = 'underlying' | 'raindex' | 'alpaca' | 'total'
+  type EquityCol = 'underlying' | 'offchain' | 'onchain' | 'total' | 'ratio'
   let equitySort = $state<SortState<EquityCol>>(null)
 
   const sortedSymbols = $derived.by(() => {
@@ -166,8 +141,9 @@
     sorted.sort((left, right) => {
       let cmp = 0
       if (column === 'underlying') cmp = stripPrefix(left.symbol).localeCompare(stripPrefix(right.symbol))
-      else if (column === 'raindex') cmp = parseFloat(left.onchainAvailable) - parseFloat(right.onchainAvailable)
-      else if (column === 'alpaca') cmp = parseFloat(left.offchainAvailable) - parseFloat(right.offchainAvailable)
+      else if (column === 'offchain') cmp = parseFloat(left.offchainAvailable) - parseFloat(right.offchainAvailable)
+      else if (column === 'onchain') cmp = parseFloat(left.onchainAvailable) - parseFloat(right.onchainAvailable)
+      else if (column === 'ratio') cmp = (computeRatio(left.onchainAvailable, left.offchainAvailable) ?? 0) - (computeRatio(right.onchainAvailable, right.offchainAvailable) ?? 0)
       else cmp = (parseFloat(left.onchainAvailable) + parseFloat(left.offchainAvailable)) - (parseFloat(right.onchainAvailable) + parseFloat(right.offchainAvailable))
       return dir === 'desc' ? -cmp : cmp
     })
@@ -194,71 +170,110 @@
   })
 </script>
 
-<Card.Root class="flex h-full min-h-56 flex-col overflow-hidden">
-  <Card.Header class="shrink-0 pb-3">
-    <Card.Title>Available Inventory</Card.Title>
+<Card.Root>
+  <Card.Header class="pb-3">
+    <Card.Title>Inventory Available</Card.Title>
   </Card.Header>
-  <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-0">
+  <Card.Content class="px-6 pt-0">
     {#if symbols.length === 0 && !usdc}
       <div class="flex h-full items-center justify-center text-muted-foreground">
         No inventory data
       </div>
     {:else}
-      <div class="flex gap-0">
-        <div class="flex-[2] pr-6">
-          <Table.Root>
-            <Table.Header>
-              <Table.Row>
-                <Table.Head class="cursor-pointer select-none" onclick={() => equitySort = toggleSort(equitySort, 'underlying')}>Equity{sortIndicator(equitySort, 'underlying')}</Table.Head>
-                <Table.Head class="cursor-pointer select-none text-right" onclick={() => equitySort = toggleSort(equitySort, 'raindex')}>Raindex{sortIndicator(equitySort, 'raindex')}</Table.Head>
-                <Table.Head class="cursor-pointer select-none text-right" onclick={() => equitySort = toggleSort(equitySort, 'alpaca')}>Alpaca{sortIndicator(equitySort, 'alpaca')}</Table.Head>
-                <Table.Head class="cursor-pointer select-none text-right" onclick={() => equitySort = toggleSort(equitySort, 'total')}>Total{sortIndicator(equitySort, 'total')}</Table.Head>
-              </Table.Row>
-            </Table.Header>
-            <Table.Body>
-              {#each sortedSymbols as item (item.symbol)}
-                <Table.Row>
-                  <Table.Cell class="font-mono font-medium">
-                    {stripPrefix(item.symbol)}
-                  </Table.Cell>
-                  <Table.Cell class="text-right font-mono opacity-90">
-                    {fmt(item.onchainAvailable)}
-                  </Table.Cell>
-                  <Table.Cell class="text-right font-mono opacity-90">
-                    {fmt(item.offchainAvailable)}
-                  </Table.Cell>
-                  <Table.Cell class="text-right font-mono font-semibold">
-                    {fmtNum(String(parseFloat(item.onchainAvailable) + parseFloat(item.offchainAvailable)))}
-                  </Table.Cell>
-                </Table.Row>
-              {/each}
-            </Table.Body>
-          </Table.Root>
-        </div>
+      <Table.Root>
+        <Table.Body>
+          {#if usdc}
+            {@const cashTarget = parseFloat(rebalancing?.cashOnchainRatio ?? '0')}
+            {@const cashThreshold = parseFloat(rebalancing?.cashTriggerThreshold ?? '0')}
+            {@const within = isWithinThreshold(cashRatio, cashTarget, cashThreshold)}
+            <Table.Row class="border-b">
+              <Table.Head>Cash</Table.Head>
+              <Table.Head class="text-right">USD</Table.Head>
+              <Table.Head class="text-right">USDC</Table.Head>
+              <Table.Head class="text-right">Total</Table.Head>
+              <Table.Head class="text-right">
+                <Tooltip.Root>
+                  <Tooltip.Trigger class="cursor-help underline decoration-dotted underline-offset-4">Ratio</Tooltip.Trigger>
+                  <Tooltip.Content>Onchain value as a percentage of total (onchain + offchain)</Tooltip.Content>
+                </Tooltip.Root>
+              </Table.Head>
+              <Table.Head class="text-right">
+                <Tooltip.Root>
+                  <Tooltip.Trigger class="cursor-help underline decoration-dotted underline-offset-4">Dev.</Tooltip.Trigger>
+                  <Tooltip.Content>Deviation from the configured onchain ratio target, in percentage points</Tooltip.Content>
+                </Tooltip.Root>
+              </Table.Head>
+            </Table.Row>
+            <Table.Row>
+              <Table.Cell class="font-mono font-semibold"></Table.Cell>
+              <Table.Cell class="text-right font-mono opacity-90">
+                {fmt(usdc.offchainAvailable)}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono opacity-90">
+                {fmt(usdc.onchainAvailable)}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono font-semibold">
+                {fmtNum(computeTotal(usdc.onchainAvailable, usdc.offchainAvailable))}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono {within ? 'text-muted-foreground' : 'text-destructive'}">
+                {cashRatio !== null ? fmtPct(cashRatio) : '-'}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono {within ? 'text-muted-foreground' : 'text-destructive'}">
+                {fmtDeviation(cashRatio, cashTarget)}
+              </Table.Cell>
+            </Table.Row>
 
-        {#if usdc}
-          <div class="flex-1 border-l pl-6">
-            <Table.Root>
-              <Table.Header>
-                <Table.Row>
-                  <Table.Head>Currency</Table.Head>
-                  <Table.Head>Balance</Table.Head>
-                </Table.Row>
-              </Table.Header>
-              <Table.Body>
-                {#each cashRows as row (row.label)}
-                  <Table.Row>
-                    <Table.Cell class="font-mono {row.label === 'Total' ? 'font-semibold' : 'font-medium'}">{row.label}</Table.Cell>
-                    <Table.Cell class="font-mono whitespace-pre {row.label === 'Total' ? 'font-semibold' : ''}">
-                      {fmtCashAligned(row.value, row.decimals)}
-                    </Table.Cell>
-                  </Table.Row>
-                {/each}
-              </Table.Body>
-            </Table.Root>
-          </div>
-        {/if}
-      </div>
+            <Table.Row>
+              <Table.Cell colspan={6} class="h-4"></Table.Cell>
+            </Table.Row>
+          {/if}
+
+          <Table.Row class="border-b">
+            <Table.Head class="cursor-pointer select-none" onclick={() => equitySort = toggleSort(equitySort, 'underlying')}>Equity{sortIndicator(equitySort, 'underlying')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none text-right" onclick={() => equitySort = toggleSort(equitySort, 'offchain')}>Alpaca{sortIndicator(equitySort, 'offchain')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none text-right" onclick={() => equitySort = toggleSort(equitySort, 'onchain')}>Raindex{sortIndicator(equitySort, 'onchain')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none text-right" onclick={() => equitySort = toggleSort(equitySort, 'total')}>Total{sortIndicator(equitySort, 'total')}</Table.Head>
+            <Table.Head class="cursor-pointer select-none text-right" onclick={() => equitySort = toggleSort(equitySort, 'ratio')}>
+              <Tooltip.Root>
+                <Tooltip.Trigger class="cursor-help underline decoration-dotted underline-offset-4">Ratio{sortIndicator(equitySort, 'ratio')}</Tooltip.Trigger>
+                <Tooltip.Content>Onchain value as a percentage of total (onchain + offchain)</Tooltip.Content>
+              </Tooltip.Root>
+            </Table.Head>
+            <Table.Head class="text-right">
+              <Tooltip.Root>
+                <Tooltip.Trigger class="cursor-help underline decoration-dotted underline-offset-4">Dev.</Tooltip.Trigger>
+                <Tooltip.Content>Deviation from the configured onchain ratio target, in percentage points</Tooltip.Content>
+              </Tooltip.Root>
+            </Table.Head>
+          </Table.Row>
+          {#each sortedSymbols as item (item.symbol)}
+            {@const ratio = computeRatio(item.onchainAvailable, item.offchainAvailable)}
+            {@const equityTarget = parseFloat(rebalancing?.equityOnchainRatio ?? '0')}
+            {@const equityThreshold = parseFloat(rebalancing?.equityTriggerThreshold ?? '0')}
+            {@const within = isWithinThreshold(ratio, equityTarget, equityThreshold)}
+            <Table.Row>
+              <Table.Cell class="font-mono font-medium">
+                {stripPrefix(item.symbol)}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono opacity-90">
+                {fmt(item.offchainAvailable)}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono opacity-90">
+                {fmt(item.onchainAvailable)}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono font-semibold">
+                {fmtNum(computeTotal(item.onchainAvailable, item.offchainAvailable))}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono {within ? 'text-muted-foreground' : 'text-destructive'}">
+                {ratio !== null ? fmtPct(ratio) : '-'}
+              </Table.Cell>
+              <Table.Cell class="text-right font-mono {within ? 'text-muted-foreground' : 'text-destructive'}">
+                {fmtDeviation(ratio, equityTarget)}
+              </Table.Cell>
+            </Table.Row>
+          {/each}
+        </Table.Body>
+      </Table.Root>
 
       {#if allTransfers.length > 0}
         <Separator.Root class="my-6" />
@@ -269,7 +284,12 @@
           <Table.Header>
             <Table.Row>
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'time')}>Time{sortIndicator(transferSort, 'time')}</Table.Head>
-              <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'purpose')}>Purpose{sortIndicator(transferSort, 'purpose')}</Table.Head>
+              <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'purpose')}>
+                <Tooltip.Root>
+                  <Tooltip.Trigger class="cursor-help underline decoration-dotted underline-offset-4">Purpose{sortIndicator(transferSort, 'purpose')}</Tooltip.Trigger>
+                  <Tooltip.Content class="max-w-xs">Providing Liquidity: onchain ratio fell below threshold, transferring from hedging venue. Hedging Risk: onchain ratio exceeded threshold, transferring to hedging venue.</Tooltip.Content>
+                </Tooltip.Root>
+              </Table.Head>
               <Table.Head class="cursor-pointer select-none text-right pr-6" onclick={() => transferSort = toggleSort(transferSort, 'amount')}>Amount{sortIndicator(transferSort, 'amount')}</Table.Head>
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'underlying')}>Underlying{sortIndicator(transferSort, 'underlying')}</Table.Head>
               <Table.Head class="cursor-pointer select-none" onclick={() => transferSort = toggleSort(transferSort, 'status')}>Status{sortIndicator(transferSort, 'status')}</Table.Head>
@@ -303,9 +323,6 @@
         </Table.Root>
       {/if}
 
-      <div
-        class="pointer-events-none sticky bottom-0 h-8 bg-gradient-to-t from-card to-transparent"
-      ></div>
     {/if}
   </Card.Content>
 </Card.Root>

@@ -11,10 +11,10 @@ use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
 
-use st0x_dto::ServerMessage;
+use st0x_dto::{RebalancingTargets, ServerMessage};
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
 
-use crate::config::{BrokerCtx, Ctx};
+use crate::config::{BrokerCtx, Ctx, TradingMode};
 
 mod alpaca_wallet;
 pub mod api;
@@ -71,6 +71,26 @@ pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn rebalancing_targets(ctx: &Ctx) -> RebalancingTargets {
+    match &ctx.trading_mode {
+        TradingMode::Rebalancing(rebalancing_ctx) => {
+            let usdc_configured = rebalancing_ctx.usdc.target != rust_decimal::Decimal::ZERO;
+            RebalancingTargets {
+                equity_onchain_ratio: rebalancing_ctx.equity.target,
+                equity_trigger_threshold: rebalancing_ctx.equity.deviation,
+                cash_onchain_ratio: usdc_configured.then_some(rebalancing_ctx.usdc.target),
+                cash_trigger_threshold: usdc_configured.then_some(rebalancing_ctx.usdc.deviation),
+            }
+        }
+        TradingMode::Standalone { .. } => RebalancingTargets {
+            equity_onchain_ratio: rust_decimal::Decimal::ZERO,
+            equity_trigger_threshold: rust_decimal::Decimal::ZERO,
+            cash_onchain_ratio: None,
+            cash_trigger_threshold: None,
+        },
+    }
+}
+
 fn spawn_server_task(
     ctx: &Ctx,
     pool: &SqlitePool,
@@ -92,6 +112,7 @@ fn spawn_server_task(
         .manage(dashboard::DashboardState {
             inventory,
             pool: pool.clone(),
+            rebalancing: rebalancing_targets(ctx),
         });
 
     tokio::spawn(rocket.launch())

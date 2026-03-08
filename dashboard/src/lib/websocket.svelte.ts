@@ -32,13 +32,15 @@ const isInitialState = (v: unknown): boolean => {
   if (!isObject(v)) return false
   return (
     Array.isArray(v['recentTrades']) &&
+    Array.isArray(v['recentEvents']) &&
     isObject(v['inventory']) &&
     isObject(v['metrics']) &&
     Array.isArray(v['spreads']) &&
     Array.isArray(v['activeTransfers']) &&
     Array.isArray(v['recentTransfers']) &&
     isObject(v['authStatus']) &&
-    isObject(v['circuitBreaker'])
+    isObject(v['circuitBreaker']) &&
+    isObject(v['rebalancing'])
   )
 }
 
@@ -85,7 +87,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
   const handleMessage = (msg: ServerMessage) => {
     matchMessage(msg, {
       initial: ({ data }) => {
-        queryClient.setQueryData<EventStoreEntry[]>(['events'], [])
+        queryClient.setQueryData<EventStoreEntry[]>(['events'], data.recentEvents ?? [])
         queryClient.setQueryData(['trades'], data.recentTrades)
         queryClient.setQueryData(['inventory'], data.inventory)
         queryClient.setQueryData(['metrics'], data.metrics)
@@ -94,6 +96,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         queryClient.setQueryData(['transfers', 'recent'], data.recentTransfers)
         queryClient.setQueryData(['auth'], data.authStatus)
         queryClient.setQueryData(['circuitBreaker'], data.circuitBreaker)
+        queryClient.setQueryData(['rebalancing'], data.rebalancing)
       },
 
       event: ({ data }) => {

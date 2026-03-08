@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use st0x_dto::{InitialState, ServerMessage};
+use st0x_dto::{EventStoreEntry, InitialState, RebalancingTargets, ServerMessage};
 
 use crate::inventory::BroadcastingInventory;
 
@@ -24,6 +24,7 @@ pub(crate) struct Broadcast {
 pub(crate) struct DashboardState {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) pool: SqlitePool,
+    pub(crate) rebalancing: RebalancingTargets,
 }
 
 #[get("/ws")]
@@ -36,15 +37,20 @@ fn ws_endpoint<'r>(
     let inventory = Arc::clone(&dashboard.inventory);
     let pool = dashboard.pool.clone();
 
+    let rebalancing = dashboard.rebalancing.clone();
+
     ws.channel(move |mut stream| {
         Box::pin(async move {
             let inventory_dto = inventory.read().await.to_dto();
             let transfers = transfer_loader::load_transfers(&pool).await;
+            let recent_events = load_recent_events(&pool).await;
 
             let initial_state = InitialState {
                 inventory: inventory_dto,
                 active_transfers: transfers.active,
                 recent_transfers: transfers.recent,
+                recent_events,
+                rebalancing,
                 ..InitialState::stub()
             };
 
@@ -92,6 +98,34 @@ fn ws_endpoint<'r>(
     })
 }
 
+async fn load_recent_events(pool: &SqlitePool) -> Vec<EventStoreEntry> {
+    let rows = sqlx::query_as::<_, (String, String, i64, String)>(
+        "SELECT aggregate_type, aggregate_id, sequence, event_type \
+         FROM events ORDER BY rowid DESC LIMIT 100",
+    )
+    .fetch_all(pool)
+    .await;
+
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(
+                |(aggregate_type, aggregate_id, sequence, event_type)| EventStoreEntry {
+                    aggregate_type,
+                    aggregate_id,
+                    sequence: u64::try_from(sequence).unwrap_or(0),
+                    event_type,
+                    timestamp: chrono::Utc::now(),
+                },
+            )
+            .collect(),
+        Err(error) => {
+            warn!("Failed to load recent events: {error}");
+            Vec::new()
+        }
+    }
+}
+
 pub(crate) fn routes() -> Vec<Route> {
     routes![ws_endpoint]
 }
@@ -102,6 +136,7 @@ mod tests {
     use futures_util::future::join_all;
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
+    use rust_decimal::Decimal;
     use st0x_dto::EventStoreEntry;
     use std::sync::Mutex;
     use tokio::sync::oneshot;
@@ -124,6 +159,12 @@ mod tests {
                 sender,
             )),
             pool,
+            rebalancing: RebalancingTargets {
+                equity_onchain_ratio: Decimal::ZERO,
+                equity_trigger_threshold: Decimal::ZERO,
+                cash_onchain_ratio: None,
+                cash_trigger_threshold: None,
+            },
         }
     }
 
@@ -132,10 +173,12 @@ mod tests {
         let initial = InitialState::stub();
         let json = serde_json::to_string(&initial).expect("serialization should succeed");
         assert!(json.contains("recentTrades"));
+        assert!(json.contains("recentEvents"));
         assert!(json.contains("inventory"));
         assert!(json.contains("metrics"));
         assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
+        assert!(json.contains("rebalancing"));
     }
 
     #[tokio::test]
@@ -241,7 +284,9 @@ mod tests {
 
         assert_eq!(parsed["type"], "initial");
         assert!(parsed["data"]["recentTrades"].is_array());
+        assert!(parsed["data"]["recentEvents"].is_array());
         assert!(parsed["data"]["inventory"].is_object());
+        assert!(parsed["data"]["rebalancing"].is_object());
 
         shutdown_handle.notify();
     }

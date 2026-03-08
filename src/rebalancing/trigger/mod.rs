@@ -119,7 +119,9 @@ pub(crate) enum RebalancingSecrets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    /// Omit when cash rebalancing is disabled (`[assets.cash] rebalancing = "disabled"`).
+    #[serde(default)]
+    pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) redemption_wallet: Address,
     pub(crate) fireblocks_vault_account_id: Option<FireblocksVaultAccountId>,
     pub(crate) fireblocks_environment: Option<FireblocksEnvironment>,
@@ -263,7 +265,10 @@ impl RebalancingCtx {
 
         Ok(Self {
             equity: config.equity,
-            usdc: config.usdc,
+            usdc: config.usdc.unwrap_or(ImbalanceThreshold {
+                target: Decimal::ZERO,
+                deviation: Decimal::ZERO,
+            }),
             redemption_wallet: config.redemption_wallet,
             alpaca_broker_auth: broker_auth,
             base_wallet,
@@ -3321,8 +3326,9 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.5));
         assert_eq!(config.equity.deviation, dec!(0.2));
 
-        assert_eq!(config.usdc.target, dec!(0.5));
-        assert_eq!(config.usdc.deviation, dec!(0.3));
+        let usdc = config.usdc.unwrap();
+        assert_eq!(usdc.target, dec!(0.5));
+        assert_eq!(usdc.deviation, dec!(0.3));
         assert_eq!(
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -3361,8 +3367,9 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.6));
         assert_eq!(config.equity.deviation, dec!(0.1));
 
-        assert_eq!(config.usdc.target, dec!(0.4));
-        assert_eq!(config.usdc.deviation, dec!(0.15));
+        let usdc = config.usdc.unwrap();
+        assert_eq!(usdc.target, dec!(0.4));
+        assert_eq!(usdc.deviation, dec!(0.15));
     }
 
     #[test]
@@ -3501,7 +3508,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_usdc_fails() {
+    fn deserialize_missing_usdc_defaults_to_none() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             fireblocks_vault_account_id = 0
@@ -3516,11 +3523,8 @@ mod tests {
             deviation = "0.2"
         "#;
 
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("usdc"),
-            "Expected missing usdc error, got: {error}"
-        );
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.usdc.is_none());
     }
 
     /// Spy reactor that records all dispatched events for verification.
