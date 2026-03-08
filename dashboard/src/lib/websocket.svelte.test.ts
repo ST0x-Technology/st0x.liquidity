@@ -659,7 +659,13 @@ describe('createWebSocket', () => {
       id: 'mint-1',
       symbol: 'tAAPL',
       quantity: '100',
-      status: { status: 'completed', completed_at: '2024-01-01T00:01:00Z' },
+      status: {
+        status: 'completed',
+        completed_at: '2024-01-01T00:01:00Z',
+        token: '0xaaaa000000000000000000000000000000000000000000000000000000000001',
+        wrap: '0xaaaa000000000000000000000000000000000000000000000000000000000002',
+        vault_deposit: '0xaaaa000000000000000000000000000000000000000000000000000000000003'
+      },
       startedAt: '2024-01-01T00:00:00Z',
       updatedAt: '2024-01-01T00:01:00Z'
     }

@@ -402,6 +402,7 @@ impl TokenizedEquityMint {
             Self::TokensReceived {
                 symbol,
                 quantity,
+                tx_hash,
                 requested_at,
                 received_at,
                 ..
@@ -409,7 +410,7 @@ impl TokenizedEquityMint {
                 id: Id::new(id.0.clone()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Wrapping,
+                status: EquityMintStatus::Wrapping { token: *tx_hash },
                 started_at: *requested_at,
                 updated_at: *received_at,
             }),
@@ -417,6 +418,8 @@ impl TokenizedEquityMint {
             Self::TokensWrapped {
                 symbol,
                 quantity,
+                tx_hash,
+                wrap_tx_hash,
                 requested_at,
                 wrapped_at,
                 ..
@@ -424,7 +427,10 @@ impl TokenizedEquityMint {
                 id: Id::new(id.0.clone()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: EquityMintStatus::Depositing,
+                status: EquityMintStatus::Depositing {
+                    token: *tx_hash,
+                    wrap: *wrap_tx_hash,
+                },
                 started_at: *requested_at,
                 updated_at: *wrapped_at,
             }),
@@ -432,6 +438,9 @@ impl TokenizedEquityMint {
             Self::DepositedIntoRaindex {
                 symbol,
                 quantity,
+                token_tx_hash,
+                wrap_tx_hash,
+                vault_deposit_tx_hash,
                 deposited_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
@@ -440,6 +449,9 @@ impl TokenizedEquityMint {
                 quantity: FractionalShares::new(*quantity),
                 status: EquityMintStatus::Completed {
                     completed_at: *deposited_at,
+                    token: *token_tx_hash,
+                    wrap: *wrap_tx_hash,
+                    vault_deposit: *vault_deposit_tx_hash,
                 },
                 started_at: *deposited_at,
                 updated_at: *deposited_at,
@@ -448,15 +460,16 @@ impl TokenizedEquityMint {
             Self::Failed {
                 symbol,
                 quantity,
+                reason,
                 requested_at,
                 failed_at,
-                ..
             } => TransferOperation::EquityMint(EquityMintOperation {
                 id: Id::new(id.0.clone()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityMintStatus::Failed {
                     failed_at: *failed_at,
+                    reason: reason.clone(),
                 },
                 started_at: *requested_at,
                 updated_at: *failed_at,
@@ -1541,13 +1554,14 @@ mod tests {
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
 
+        let token_tx = TxHash::random();
         let received = TokenizedEquityMint::TokensReceived {
             symbol: symbol.clone(),
             quantity: dec!(10),
             wallet: Address::ZERO,
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
-            tx_hash: TxHash::random(),
+            tx_hash: token_tx,
             receipt_id: ReceiptId(U256::from(1)),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             requested_at: now,
@@ -1558,23 +1572,25 @@ mod tests {
             panic!("Expected EquityMint");
         };
         assert!(
-            matches!(op.status, EquityMintStatus::Wrapping),
-            "Expected Wrapping, got: {:?}",
+            matches!(op.status, EquityMintStatus::Wrapping { token } if token == token_tx),
+            "Expected Wrapping with token tx hash, got: {:?}",
             op.status
         );
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
 
+        let token_tx = TxHash::random();
+        let wrap_tx = TxHash::random();
         let wrapped = TokenizedEquityMint::TokensWrapped {
             symbol,
             quantity: dec!(10),
             wallet: Address::ZERO,
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
-            tx_hash: TxHash::random(),
+            tx_hash: token_tx,
             receipt_id: ReceiptId(U256::from(1)),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
-            wrap_tx_hash: TxHash::random(),
+            wrap_tx_hash: wrap_tx,
             wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
             requested_at: now,
             accepted_at: now,
@@ -1585,8 +1601,8 @@ mod tests {
             panic!("Expected EquityMint");
         };
         assert!(
-            matches!(op.status, EquityMintStatus::Depositing),
-            "Expected Depositing, got: {:?}",
+            matches!(op.status, EquityMintStatus::Depositing { token, wrap } if token == token_tx && wrap == wrap_tx),
+            "Expected Depositing with tx hashes, got: {:?}",
             op.status
         );
         assert_eq!(op.started_at, now);
@@ -1600,24 +1616,34 @@ mod tests {
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
 
+        let token_tx = TxHash::random();
+        let wrap_tx = TxHash::random();
+        let deposit_tx = TxHash::random();
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: symbol.clone(),
             quantity: dec!(10),
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
-            token_tx_hash: TxHash::random(),
-            wrap_tx_hash: TxHash::random(),
-            vault_deposit_tx_hash: TxHash::random(),
+            token_tx_hash: token_tx,
+            wrap_tx_hash: wrap_tx,
+            vault_deposit_tx_hash: deposit_tx,
             deposited_at: later,
         };
         let TransferOperation::EquityMint(op) = deposited.to_dto(&id) else {
             panic!("Expected EquityMint");
         };
-        assert!(
-            matches!(op.status, EquityMintStatus::Completed { .. }),
-            "Expected Completed, got: {:?}",
-            op.status
-        );
+        let EquityMintStatus::Completed {
+            token,
+            wrap,
+            vault_deposit,
+            ..
+        } = op.status
+        else {
+            panic!("Expected Completed, got: {:?}", op.status);
+        };
+        assert_eq!(token, token_tx);
+        assert_eq!(wrap, wrap_tx);
+        assert_eq!(vault_deposit, deposit_tx);
         assert_eq!(op.started_at, later);
         assert_eq!(op.updated_at, later);
 
@@ -1631,11 +1657,10 @@ mod tests {
         let TransferOperation::EquityMint(op) = failed.to_dto(&id) else {
             panic!("Expected EquityMint");
         };
-        assert!(
-            matches!(op.status, EquityMintStatus::Failed { .. }),
-            "Expected Failed, got: {:?}",
-            op.status
-        );
+        let EquityMintStatus::Failed { reason, .. } = &op.status else {
+            panic!("Expected Failed, got: {:?}", op.status);
+        };
+        assert_eq!(reason, "Something went wrong");
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
     }
