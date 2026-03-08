@@ -28,6 +28,7 @@ pub enum ServerMessage {
 #[serde(rename_all = "camelCase")]
 pub struct InitialState {
     pub recent_trades: Vec<Trade>,
+    pub recent_events: Vec<EventStoreEntry>,
     pub inventory: Inventory,
     pub metrics: PerformanceMetrics,
     pub spreads: Vec<SpreadSummary>,
@@ -35,12 +36,32 @@ pub struct InitialState {
     pub recent_transfers: Vec<TransferOperation>,
     pub auth_status: AuthStatus,
     pub circuit_breaker: CircuitBreakerStatus,
+    pub rebalancing: RebalancingTargets,
+}
+
+/// Configured rebalancing target ratios and trigger thresholds.
+///
+/// `onchain_ratio` is the target proportion of total value held onchain.
+/// `trigger_threshold` is how far the actual ratio can deviate before
+/// rebalancing fires (e.g., 0.15 = ±15 percentage points).
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RebalancingTargets {
+    #[ts(type = "string")]
+    pub equity_onchain_ratio: Decimal,
+    #[ts(type = "string")]
+    pub equity_trigger_threshold: Decimal,
+    #[ts(type = "string | null")]
+    pub cash_onchain_ratio: Option<Decimal>,
+    #[ts(type = "string | null")]
+    pub cash_trigger_threshold: Option<Decimal>,
 }
 
 impl InitialState {
     pub fn stub() -> Self {
         Self {
             recent_trades: Vec::new(),
+            recent_events: Vec::new(),
             inventory: Inventory::empty(),
             metrics: PerformanceMetrics::zero(),
             spreads: Vec::new(),
@@ -48,6 +69,12 @@ impl InitialState {
             recent_transfers: Vec::new(),
             auth_status: AuthStatus::NotConfigured,
             circuit_breaker: CircuitBreakerStatus::Active,
+            rebalancing: RebalancingTargets {
+                equity_onchain_ratio: Decimal::ZERO,
+                equity_trigger_threshold: Decimal::ZERO,
+                cash_onchain_ratio: None,
+                cash_trigger_threshold: None,
+            },
         }
     }
 }
@@ -449,6 +476,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     SpreadUpdate::export_all_to(out_dir)?;
     CircuitBreakerStatus::export_all_to(out_dir)?;
     AuthStatus::export_all_to(out_dir)?;
+    RebalancingTargets::export_all_to(out_dir)?;
 
     Ok(())
 }
@@ -468,12 +496,14 @@ mod tests {
         let initial = InitialState::stub();
         let json = serde_json::to_string(&initial).expect("serialization should succeed");
         assert!(json.contains("recentTrades"));
+        assert!(json.contains("recentEvents"));
         assert!(json.contains("inventory"));
         assert!(json.contains("metrics"));
         assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
         assert!(json.contains("activeTransfers"));
         assert!(json.contains("recentTransfers"));
+        assert!(json.contains("rebalancing"));
     }
 
     #[derive(TS)]
