@@ -479,10 +479,10 @@ is the source of truth for terminology and naming conventions.
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
   String values.** No `SomeError(String)`, no `.to_string()` or `format!()`
   conversions, no unpacking newtypes (store `Symbol` not `String`). Use
-  `#[from]` + `?` for error conversion (never `.map_err`), preserve error chains
-  with `#[source]`, discover variants during implementation not preemptively. To
-  log before converting: `.inspect_err(|error| error!(?error, "ctx"))` before
-  `?`
+  `#[from]` + `?` for error conversion (prefer over `.map_err`), preserve error
+  chains with `#[source]`, discover variants during implementation not
+  preemptively. To log before converting:
+  `.inspect_err(|error| error!(?error, "ctx"))` before `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly

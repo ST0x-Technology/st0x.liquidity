@@ -862,10 +862,6 @@ pub(crate) mod tests {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.secrets.toml"))
     }
 
-    fn example_config_toml() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.config.toml"))
-    }
-
     #[test]
     fn test_log_level_from_conversion() {
         let level: Level = LogLevel::Trace.into();
@@ -1210,8 +1206,6 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
         "#,
         );
         let error = Ctx::load_files(config.path(), secrets.path())

@@ -475,8 +475,6 @@
 
 <div class="flex h-screen flex-col bg-background">
   <HeaderBar
-    broker="alpaca"
-    onBrokerChange={() => {}}
     connectionStatus="disconnected"
   />
 

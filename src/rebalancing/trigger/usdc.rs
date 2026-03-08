@@ -129,7 +129,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
-    use crate::inventory::InventoryView;
+    use crate::inventory::{BroadcastingInventory, InventoryView};
 
     #[test]
     fn test_guard_releases_on_drop() {
