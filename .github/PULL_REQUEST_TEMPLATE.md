@@ -24,4 +24,3 @@ By submitting this for review, I'm confirming I've done the following:
 - [ ] added comprehensive test coverage for any changes in logic
 - [ ] made this PR as small as possible
 - [ ] linked any relevant issues or PRs
-- [ ] included screenshots (if this involves a change to the dashboard)

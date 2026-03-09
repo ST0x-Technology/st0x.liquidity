@@ -1,0 +1,21 @@
+database_url = ":memory:"
+log_level = "info"
+server_port = 8001
+
+[equities.tEXAMPLE]
+enabled = true
+unwrapped = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+wrapped = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[operational_limits]
+mode = "enabled"
+max_amount = "100"
+max_shares = "2"
+
+[evm]
+orderbook = "0x1111111111111111111111111111111111111111"
+order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
+deployment_block = 1
+
+[hyperdx]
+service_name = "st0x-hedge-e2e"
