@@ -337,15 +337,24 @@ pub(super) async fn process_found_trade<W: Write>(
     let base_symbol = onchain_trade.symbol.base();
 
     // CLI test command uses MockExecutor (market always open)
-    let asset_enabled = ctx.is_asset_enabled(base_symbol);
+    let trading_enabled = ctx.is_trading_enabled(base_symbol);
+
+    if !trading_enabled {
+        writeln!(
+            stdout,
+            "Trading disabled by configuration for {base_symbol}"
+        )?;
+        return Ok(());
+    }
+
     let executor = MockExecutor::new();
     let Some(params) = check_execution_readiness(
         &executor,
         &position_projection,
         base_symbol,
         executor_type,
-        &ctx.operational_limits,
-        asset_enabled,
+        &ctx.assets,
+        trading_enabled,
     )
     .await?
     else {
@@ -504,11 +513,10 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
-    use std::collections::HashMap;
     use url::Url;
 
     use super::*;
-    use crate::config::{LogLevel, OperationalLimits, SchwabAuth, TradingMode};
+    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
@@ -520,7 +528,6 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            operational_limits: OperationalLimits::Disabled,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -543,7 +550,10 @@ mod tests {
                 order_owner: Address::ZERO,
             },
             execution_threshold: ExecutionThreshold::whole_share(),
-            equities: HashMap::new(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
         }
     }
 

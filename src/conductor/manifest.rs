@@ -123,11 +123,10 @@ mod tests {
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::config::OperationalLimits;
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
-    use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
@@ -138,11 +137,14 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: UsdcRebalancing::Enabled {
+            usdc: ImbalanceThreshold {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
-            limits: OperationalLimits::Disabled,
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             disabled_assets: HashSet::new(),
         }
     }

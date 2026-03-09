@@ -3,7 +3,7 @@ use tracing::{debug, info, warn};
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
 
-use crate::config::OperationalLimits;
+use crate::config::AssetsConfig;
 use crate::onchain::OnChainError;
 use crate::position::Position;
 
@@ -27,7 +27,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     position_projection: &Projection<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
-    limits: &OperationalLimits,
+    assets: &AssetsConfig,
     asset_enabled: bool,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
     if !check_asset_enabled(asset_enabled, symbol) {
@@ -39,7 +39,14 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
         return Ok(None);
     };
 
-    let Some((direction, shares)) = position.is_ready_for_execution(executor_type, limits)? else {
+    let shares_limit = assets
+        .equities
+        .symbols
+        .get(symbol)
+        .and_then(|config| config.operational_limit);
+
+    let Some((direction, shares)) = position.is_ready_for_execution(executor_type, shares_limit)?
+    else {
         debug!(%symbol, net = %position.net, "Position not ready for execution");
         return Ok(None);
     };
@@ -89,7 +96,7 @@ async fn check_market_open<E: Executor>(
 /// against its configured threshold. Skips disabled assets.
 /// Returns execution parameters for positions that are ready.
 #[tracing::instrument(
-    skip(executor, position_projection, is_asset_enabled),
+    skip(executor, position_projection, is_trading_enabled),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
@@ -97,20 +104,28 @@ pub(crate) async fn check_all_positions<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
     executor_type: SupportedExecutor,
-    limits: &OperationalLimits,
-    is_asset_enabled: impl Fn(&Symbol) -> bool,
+    assets: &AssetsConfig,
+    is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<ExecutionCtx>, OnChainError> {
     let all_positions = position_projection.load_all().await?;
 
     let mut ready = Vec::new();
 
     for (symbol, position) in &all_positions {
-        if !is_asset_enabled(symbol) {
+        if !is_trading_enabled(symbol) {
             debug!(symbol = %symbol, "Asset disabled, skipping periodic check");
             continue;
         }
 
-        if let Some((direction, shares)) = position.is_ready_for_execution(executor_type, limits)? {
+        let shares_limit = assets
+            .equities
+            .symbols
+            .get(symbol)
+            .and_then(|config| config.operational_limit);
+
+        if let Some((direction, shares)) =
+            position.is_ready_for_execution(executor_type, shares_limit)?
+        {
             if !check_market_open(executor, symbol).await? {
                 continue;
             }
@@ -144,8 +159,9 @@ pub(crate) async fn check_all_positions<E: Executor>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::TxHash;
+    use alloy::primitives::{Address, TxHash};
     use rust_decimal_macros::dec;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
@@ -156,7 +172,7 @@ mod tests {
     use st0x_execution::MockExecutor;
 
     use super::*;
-    use crate::config::OperationalLimits;
+    use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -207,7 +223,10 @@ mod tests {
             &query,
             &Symbol::new("AAPL").unwrap(),
             SupportedExecutor::Schwab,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -236,7 +255,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::Schwab,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -265,7 +287,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -316,7 +341,10 @@ mod tests {
             &executor,
             &query,
             SupportedExecutor::Schwab,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             |_| true,
         )
         .await
@@ -357,7 +385,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -391,7 +422,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -428,7 +462,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -460,7 +497,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -478,7 +518,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             true,
         )
         .await
@@ -508,9 +551,23 @@ mod tests {
         )
         .await;
 
-        let limits = OperationalLimits::Enabled {
-            max_shares: Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
-            max_amount: Positive::new(crate::threshold::Usdc(dec!(1000))).unwrap(),
+        let assets = AssetsConfig {
+            equities: EquitiesConfig {
+                symbols: HashMap::from([(
+                    symbol.clone(),
+                    EquityAssetConfig {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_id: None,
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        operational_limit: Some(
+                            Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
+                        ),
+                    },
+                )]),
+            },
+            cash: None,
         };
 
         let params = check_execution_readiness(
@@ -518,7 +575,7 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &limits,
+            &assets,
             true,
         )
         .await
@@ -553,7 +610,10 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             false,
         )
         .await
@@ -595,7 +655,10 @@ mod tests {
             &executor,
             &query,
             SupportedExecutor::DryRun,
-            &OperationalLimits::Disabled,
+            &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
             |symbol| symbol != &aapl,
         )
         .await

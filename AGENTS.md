@@ -395,6 +395,10 @@ is the source of truth for terminology and naming conventions.
   system. Use ADTs and enums to encode business rules and state transitions
   directly in types rather than runtime validation. See "Type modeling" in Code
   Style for details
+- **SDK Boundary Conversion**: Functions that call external SDKs must accept
+  domain types and convert to SDK types internally. Never strip domain types to
+  primitives (`&str`, `u64`, etc.) at the call site — the conversion belongs
+  inside the function that needs the primitive for the SDK call
 - **Schema Design**: Avoid database columns that can contradict each other. Use
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where

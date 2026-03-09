@@ -11,10 +11,12 @@ let
   parseIdentity = ''
     set -eo pipefail
 
-    identity=~/.ssh/id_ed25519
     if [ "''${1:-}" = "-i" ]; then
       identity="$2"
       shift 2
+    else
+      echo "ERROR: -i <identity_file> is required" >&2
+      exit 1
     fi
   '';
 
