@@ -27,6 +27,14 @@ mod client;
 mod executor;
 mod journal;
 mod market_hours;
+#[cfg(feature = "mock")]
+mod mock_api;
+#[cfg(feature = "mock")]
+pub use mock_api::{
+    AlpacaBrokerMock, MockMode, MockOrderSnapshot, MockPosition, MockPositionSnapshot,
+    MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID, TEST_API_KEY,
+    TEST_API_SECRET, TransferDirection, TransferStatus, WhitelistStatus,
+};
 mod order;
 mod positions;
 

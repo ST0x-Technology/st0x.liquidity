@@ -10,21 +10,16 @@ use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol;
 use rust_decimal_macros::dec;
 use tokio::task::JoinHandle;
 
+use st0x_bridge::cctp::{
+    TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
+};
 use st0x_execution::Symbol;
 
-sol!(
-    #![sol(all_derives = true, rpc)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    TestMintBurnToken, "src/services/cctp/TestMintBurnToken.json"
-);
-
-use super::contracts;
-use crate::services::TestInfra;
-use crate::services::base_chain::USDC_BASE;
+use crate::base_chain::USDC_BASE;
+use crate::test_infra::TestInfra;
 
 /// USDC on Ethereum mainnet.
 pub const USDC_ETHEREUM: Address =
@@ -81,7 +76,7 @@ impl CctpInfra {
         let attester_key = B256::random();
         let attester_address = PrivateKeySigner::from_bytes(&attester_key)?.address();
 
-        let mut ethereum_cctp = contracts::deploy_cctp_on_chain(
+        let mut ethereum_cctp = deploy_cctp_on_chain(
             &ethereum_endpoint,
             &cctp_deployer_key,
             0, // Ethereum domain
@@ -89,7 +84,7 @@ impl CctpInfra {
         )
         .await?;
 
-        let mut base_cctp = contracts::deploy_cctp_on_chain(
+        let mut base_cctp = deploy_cctp_on_chain(
             &infra.base_chain.endpoint(),
             &cctp_deployer_key,
             6, // Base domain
@@ -109,7 +104,7 @@ impl CctpInfra {
             .anvil_set_code(USDC_ETHEREUM, TestMintBurnToken::DEPLOYED_BYTECODE.clone())
             .await?;
 
-        contracts::set_max_burn_amount(
+        set_max_burn_amount(
             &ethereum_endpoint,
             &cctp_deployer_key,
             ethereum_cctp.token_minter,
@@ -130,7 +125,7 @@ impl CctpInfra {
             .anvil_set_code(USDC_BASE, TestMintBurnToken::DEPLOYED_BYTECODE.clone())
             .await?;
 
-        contracts::set_max_burn_amount(
+        set_max_burn_amount(
             &infra.base_chain.endpoint(),
             &cctp_deployer_key,
             base_cctp.token_minter,
@@ -141,7 +136,7 @@ impl CctpInfra {
 
         base_cctp.usdc = USDC_BASE;
 
-        contracts::link_chains(
+        link_chains(
             &ethereum_endpoint,
             &infra.base_chain.endpoint(),
             &cctp_deployer_key,
@@ -153,7 +148,7 @@ impl CctpInfra {
         // MockMintBurnToken.mint() has no access control, so any key works.
         let mint_amount = U256::from(1_000_000_000_000u64); // 1M USDC
 
-        contracts::mint_usdc(
+        mint_usdc(
             &infra.base_chain.endpoint(),
             &cctp_deployer_key,
             USDC_BASE,
@@ -162,7 +157,7 @@ impl CctpInfra {
         )
         .await?;
 
-        contracts::mint_usdc(
+        mint_usdc(
             &ethereum_endpoint,
             &cctp_deployer_key,
             USDC_ETHEREUM,
@@ -186,11 +181,10 @@ impl CctpInfra {
         let base_watcher_provider = alloy::providers::ProviderBuilder::new()
             .connect(&infra.base_chain.endpoint())
             .await?;
-        let attestation_watcher = infra.attestation_service.start_watcher(
-            eth_watcher_provider,
-            base_watcher_provider,
-            attester_key,
-        );
+        let attestation_watcher = infra
+            .attestation_service
+            .start_watcher(eth_watcher_provider, base_watcher_provider, attester_key)
+            .await?;
 
         Ok(Self {
             ethereum_endpoint,

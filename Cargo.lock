@@ -975,9 +975,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.100"
+version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "apca"
@@ -2300,37 +2300,6 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
-
-[[package]]
-name = "e2e-tests"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "async-trait",
- "bon",
- "chrono",
- "httpmock",
- "rain-math-float",
- "rand 0.8.5",
- "reqwest 0.12.24",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "sqlx",
- "st0x-event-sorcery",
- "st0x-evm",
- "st0x-execution",
- "st0x-hedge",
- "tempfile",
- "test-log",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.20",
- "url",
- "uuid",
-]
 
 [[package]]
 name = "ecdsa"
@@ -6577,6 +6546,7 @@ name = "st0x-bridge"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "anyhow",
  "async-trait",
  "backon",
  "httpmock",
@@ -6627,6 +6597,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "alloy-signer-turnkey",
+ "anyhow",
  "async-trait",
  "backon",
  "chrono",
@@ -6650,10 +6621,12 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "alloy",
+ "anyhow",
  "apca",
  "async-trait",
  "backon",
  "base64 0.22.1",
+ "bon",
  "chrono",
  "chrono-tz",
  "cqrs-es",

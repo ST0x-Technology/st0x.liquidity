@@ -206,11 +206,41 @@ execution timing, market conditions, and operational metrics.
 
 - [ ] [#303 Audit external integrations: record start/end timestamps for all calls in event store](https://github.com/ST0x-Technology/st0x.liquidity/issues/303)
 
+---
+
+## Backlog: Black-Box E2E Testing Architecture
+
+E2e tests should exercise the system from the perspective of external services
+(blockchain, broker API, attestation service) rather than inspecting internal
+state. Nobody cares about the internals of a trading bot -- they care that the
+bot reacts to new fills, moves inventory when it should, and maintains correct
+positions. This epic covers reducing exposed internals, adding chaos/fault
+injection, and invariant monitoring under randomized workloads.
+
+```mermaid
+graph LR
+    A[#416 Reduce exposed internals] --> C[#418 Invariant monitoring]
+    A --> B[#417 Chaos/fault injection]
+    B --> D[#419 Adversarial simulation]
+    C --> D
+```
+
+- [ ] [#416 E2e tests expose crate internals that should not be public](https://github.com/ST0x-Technology/st0x.liquidity/issues/416)
+- [ ] [#417 No chaos/fault injection testing for failure recovery](https://github.com/ST0x-Technology/st0x.liquidity/issues/417)
+- [ ] [#418 No invariant monitoring under randomized workloads](https://github.com/ST0x-Technology/st0x.liquidity/issues/418)
+- [ ] [#419 No adversarial environment simulation in e2e tests](https://github.com/ST0x-Technology/st0x.liquidity/issues/419)
+
+---
+
 ### Backlog: Testing
 
-- [ ] [#292 Work Plan: E2E Test Infrastructure while liquidity bot stabilizes](https://github.com/ST0x-Technology/st0x.liquidity/issues/292)
-- [ ] [#285 Integration test plan](https://github.com/ST0x-Technology/st0x.liquidity/issues/285)
+- [x] [#292 Work Plan: E2E Test Infrastructure while liquidity bot stabilizes](https://github.com/ST0x-Technology/st0x.liquidity/issues/292)
+- [x] [#285 Integration test plan](https://github.com/ST0x-Technology/st0x.liquidity/issues/285)
 - [ ] [#264 Set up end-to-end testing infrastructure](https://github.com/ST0x-Technology/st0x.liquidity/issues/264)
+  - PR (open):
+    [#346 full e2e test suite](https://github.com/ST0x-Technology/st0x.liquidity/pull/346)
+  - PR (draft):
+    [#420 refactor e2e tests](https://github.com/ST0x-Technology/st0x.liquidity/pull/420)
 
 ### Backlog: Infrastructure & Production Enhancements
 

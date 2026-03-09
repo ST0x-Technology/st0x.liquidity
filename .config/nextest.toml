@@ -1,5 +1,9 @@
+[test-groups.e2e]
+max-threads = 2
+
 [[profile.default.overrides]]
-filter = "package(e2e-tests)"
+filter = "binary(=e2e)"
+test-group = "e2e"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.default.overrides]]

@@ -2218,121 +2218,56 @@ foundation for future enhancements.
 
 ### Testing Strategy
 
-Tests are organized into four layers, each with a distinct purpose and assertion
-boundary. Higher layers are slower but provide stronger correctness guarantees.
+#### Aggregate Testing
 
-#### Layer 1: Unit Tests (per-module, in-process)
+Use `TestHarness` for BDD-style command testing and `replay` for reconstructing
+state from events. Both operate at the `EventSourced` level, hiding
+`Lifecycle`/`Aggregate` internals:
 
-Standard Rust `#[test]` and `#[tokio::test]` in `#[cfg(test)]` modules. Test
-individual functions, aggregates, and domain logic in isolation.
+```rust
+#[tokio::test]
+async fn test_position_accumulates_fills() {
+    let events = TestHarness::<Position>::with(())
+        .given(vec![
+            PositionEvent::Initialized { /* ... */ },
+            PositionEvent::OnChainOrderFilled { /* ... */ },
+        ])
+        .when(PositionCommand::AcknowledgeOnChainFill { /* ... */ })
+        .await
+        .then_expect_events(&[
+            PositionEvent::OnChainOrderFilled { /* ... */ },
+        ]);
+}
+```
 
-**Aggregate tests** use `TestHarness` for BDD-style command testing and `replay`
-for reconstructing state from events. Both operate at the `EventSourced` level,
-hiding `Lifecycle`/`Aggregate` internals.
+#### State Reconstruction Testing
 
-**Property-based tests** (`proptest`) verify invariants that should hold for all
-inputs: parsing/serialization roundtrips, boundary conditions, numeric edge
-cases, newtype construction constraints, domain type arithmetic. Use liberally
-wherever clear invariants exist — these are cheap to run and catch entire
-classes of bugs that example-based tests miss.
+Use `replay` to reconstruct entity state from a sequence of events:
 
-#### Layer 2: Integration Tests (multi-component, in-process)
+```rust
+#[test]
+fn test_replay_builds_position_state() {
+    let position = replay::<Position>(vec![
+        PositionEvent::Initialized { /* ... */ },
+        PositionEvent::OnChainOrderFilled { /* ... */ },
+    ])
+    .unwrap()
+    .expect("should produce a live position");
 
-Wire multiple components together with mock implementations behind traits
-(Executor, Bridge, Tokenizer, Vault). Test interaction patterns, CQRS event flow
-across aggregates, and side-effect sequencing.
+    assert_eq!(position.net, FractionalShares::new(dec!(1.5)));
+}
+```
 
-These run fast (no network I/O) and are suitable for high-iteration randomized
-testing. Good for:
+#### Integration Testing
 
-- Verifying internal protocol correctness (event sequencing, state machine
-  transitions)
-- Testing that trait boundaries enforce correct interaction contracts
-- Randomized ordering and concurrency testing
-- Single active rebalancing per asset (scheduling constraints)
-- Trigger monotonicity (ratio moves toward target after rebalancing)
-
-#### Layer 3: E2E Scenario Tests (black box, real infrastructure)
-
-Start the actual bot binary against real Anvil chains, stateful mock
-broker/tokenization/attestation services, and a real SQLite database. Assert
-outcomes exclusively from external perspectives:
-
-- **Broker mock state**: orders filled, positions held, transfers completed —
-  what the trading venue actually saw
-- **Onchain state**: vault balances, token balances, contract state — what the
-  blockchain actually shows
-
-**Forbidden in e2e tests**: direct database queries, CQRS event inspection,
-projection loading, or any assertion that depends on bot internals. The bot is
-an opaque process. If an invariant can only be verified by reading internal
-state, it belongs in layer 2.
-
-E2e tests cover specific scenarios: happy path hedging, backfill, crash
-recovery, market hours transitions, error handling paths, etc.
-
-#### Layer 4: Randomized System Invariant Tests (black box, property-based)
-
-Property-based tests at the e2e level. Use the same infrastructure as layer 3
-(Anvil, stateful mocks) but with randomized inputs and fault injection. Assert
-system-wide invariants that must hold regardless of trade sequence, timing, or
-failure patterns.
-
-**Conservation invariants** (assuming zero fees and zero spread):
-
-- Share conservation: total shares per equity across onchain vaults + broker
-  positions is constant across any trade/rebalancing sequence
-- Dollar conservation: total USDC across onchain vaults + broker cash +
-  in-flight bridges is constant
-- Rebalancing is zero-sum: mint/redeem/bridge operations move assets between
-  venues without creating or destroying value
-
-**Hedging completeness invariants:**
-
-- 1:1 filled correspondence: with threshold = 1 share and single-share trades,
-  filled offchain orders == onchain trades
-- Zero net at rest: after all operations settle, net position per symbol is zero
-- No phantom hedges: every filled offchain order traces to exactly one onchain
-  event
-
-**Convergence invariants:**
-
-- Restart convergence: same seed, happy path vs random restarts at arbitrary
-  points -> same equilibrium
-- Error recovery convergence: same seed, perfect broker vs random transient
-  failures -> same equilibrium
-- Idempotent event processing: duplicate onchain event delivery -> same final
-  state as single delivery
-
-**Ordering invariants:**
-
-- Cross-symbol commutativity: trades on different symbols in any order -> same
-  per-symbol final state
-- Same-symbol eventual consistency: trades on same symbol in any order -> same
-  final accumulated state
-
-**Safety invariants:**
-
-- Operational limits never exceeded under any random trade sequence
-- No negative vault balances or broker positions
-- Sub-threshold trades produce zero offchain orders
-
-**Rebalancing invariants:**
-
-- Trigger monotonicity: completing a rebalancing operation moves venue ratio
-  closer to target
-- Single active rebalancing per asset at any time
-- Bridge conservation: USDC entering CCTP on one chain arrives on the other or
-  fails visibly
-
-**Fault injection dimensions** (the "nemesis"):
-
-- Random bot restarts mid-operation
-- Random broker HTTP errors (500s, timeouts, rejections)
-- Random RPC disconnects/reconnects
-- Random order fill delays
-- Clock skew on broker mock timestamps
-- Market hours transitions mid-trade
+```rust
+#[tokio::test]
+async fn test_full_flow_blockchain_to_broker() {
+    // Setup test pool and CQRS instances
+    // Execute commands across aggregates
+    // Verify events persisted and views updated
+}
+```
 
 ### Code Organization
 

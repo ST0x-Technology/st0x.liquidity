@@ -268,8 +268,9 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        assert_eq!(trigger_config.usdc.target, dec!(0.6));
-        assert_eq!(trigger_config.usdc.deviation, dec!(0.15));
+        let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
+        assert_eq!(usdc_threshold.target, dec!(0.6));
+        assert_eq!(usdc_threshold.deviation, dec!(0.15));
     }
 
     async fn make_services_with_mock_wallet(

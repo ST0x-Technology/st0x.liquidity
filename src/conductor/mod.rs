@@ -3454,10 +3454,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: ImbalanceThreshold {
+                usdc: Some(ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
-                },
+                }),
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
@@ -3542,7 +3542,7 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: threshold,
-                usdc: threshold,
+                usdc: Some(threshold),
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
@@ -3650,10 +3650,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: ImbalanceThreshold {
+                usdc: Some(ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
-                },
+                }),
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },
@@ -3774,10 +3774,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc: ImbalanceThreshold {
+                usdc: Some(ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
-                },
+                }),
                 assets: test_assets_config(),
                 disabled_assets: HashSet::new(),
             },

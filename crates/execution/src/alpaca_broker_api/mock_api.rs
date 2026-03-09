@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use st0x_execution::Symbol;
+use crate::Symbol;
 
 sol! {
     #[sol(all_derives = true)]
@@ -49,7 +49,7 @@ pub enum MockMode {
 
 pub struct MockPosition {
     pub symbol: Symbol,
-    pub qty: Decimal,
+    pub quantity: Decimal,
     pub market_value: Decimal,
 }
 
@@ -59,17 +59,51 @@ struct MockAccount {
     positions: HashMap<Symbol, MockPosition>,
 }
 
+/// Side of a broker order (buy or sell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+impl std::fmt::Display for OrderSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Buy => write!(formatter, "buy"),
+            Self::Sell => write!(formatter, "sell"),
+        }
+    }
+}
+
+/// Status of a broker order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStatus {
+    New,
+    Filled,
+    Rejected,
+}
+
+impl std::fmt::Display for OrderStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::New => write!(formatter, "new"),
+            Self::Filled => write!(formatter, "filled"),
+            Self::Rejected => write!(formatter, "rejected"),
+        }
+    }
+}
+
 struct MockOrder {
     symbol: String,
-    qty: String,
-    side: String,
-    status: String,
+    quantity: Decimal,
+    side: OrderSide,
+    status: OrderStatus,
     poll_count: usize,
-    filled_price: Option<String>,
+    filled_price: Option<Decimal>,
 }
 
 /// A single calendar entry controlling market open/close times.
-pub(crate) struct CalendarEntry {
+struct CalendarEntry {
     pub date: String,
     pub open: String,
     pub close: String,
@@ -78,12 +112,12 @@ pub(crate) struct CalendarEntry {
 /// A mock wallet transfer tracked in shared state.
 struct MockWalletTransfer {
     transfer_id: String,
-    direction: String,
-    amount: String,
+    direction: TransferDirection,
+    amount: Decimal,
     asset: String,
-    from_address: String,
-    to_address: String,
-    status: String,
+    from_address: Address,
+    to_address: Address,
+    status: TransferStatus,
     tx_hash: String,
     poll_count: usize,
     /// Number of polls before transitioning from "pending" to "complete".
@@ -108,41 +142,91 @@ struct MockState {
     whitelisted_addresses: Vec<WhitelistEntry>,
 }
 
+/// Status of a whitelisted address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhitelistStatus {
+    Approved,
+    Pending,
+}
+
+impl std::fmt::Display for WhitelistStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Approved => write!(formatter, "APPROVED"),
+            Self::Pending => write!(formatter, "PENDING"),
+        }
+    }
+}
+
 /// A whitelisted address entry in the mock state.
 struct WhitelistEntry {
     id: String,
-    address: String,
+    address: Address,
     asset: String,
     chain: String,
-    status: String,
+    status: WhitelistStatus,
 }
 
 /// Snapshot of a placed order, returned by [`AlpacaBrokerMock::orders`].
 pub struct MockOrderSnapshot {
     pub order_id: String,
     pub symbol: String,
-    pub qty: String,
-    pub side: String,
-    pub status: String,
+    pub quantity: Decimal,
+    pub side: OrderSide,
+    pub status: OrderStatus,
     pub poll_count: usize,
-    pub filled_price: Option<String>,
+    pub filled_price: Option<Decimal>,
 }
 
 /// Snapshot of a position, returned by [`AlpacaBrokerMock::positions`].
 pub struct MockPositionSnapshot {
     pub symbol: String,
-    pub qty: String,
-    pub market_value: String,
+    pub quantity: Decimal,
+    pub market_value: Decimal,
+}
+
+/// Direction of a wallet transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Incoming,
+    Outgoing,
+}
+
+impl std::fmt::Display for TransferDirection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Incoming => write!(formatter, "INCOMING"),
+            Self::Outgoing => write!(formatter, "OUTGOING"),
+        }
+    }
+}
+
+/// Status of a wallet transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferStatus {
+    Pending,
+    Processing,
+    Complete,
+}
+
+impl std::fmt::Display for TransferStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(formatter, "PENDING"),
+            Self::Processing => write!(formatter, "PROCESSING"),
+            Self::Complete => write!(formatter, "COMPLETE"),
+        }
+    }
 }
 
 /// Snapshot of a wallet transfer, returned by
 /// [`AlpacaBrokerMock::wallet_transfers`].
 pub struct MockWalletTransferSnapshot {
     pub transfer_id: String,
-    pub direction: String,
-    pub amount: String,
+    pub direction: TransferDirection,
+    pub amount: Decimal,
     pub asset: String,
-    pub status: String,
+    pub status: TransferStatus,
 }
 
 /// Owns the `MockServer` and shared state. All endpoints respond dynamically
@@ -261,11 +345,11 @@ impl AlpacaBrokerMock {
             .map(|(order_id, order)| MockOrderSnapshot {
                 order_id: order_id.clone(),
                 symbol: order.symbol.clone(),
-                qty: order.qty.clone(),
-                side: order.side.clone(),
-                status: order.status.clone(),
+                quantity: order.quantity,
+                side: order.side,
+                status: order.status,
                 poll_count: order.poll_count,
-                filled_price: order.filled_price.clone(),
+                filled_price: order.filled_price,
             })
             .collect()
     }
@@ -277,17 +361,15 @@ impl AlpacaBrokerMock {
     /// `owner_address` is the market maker's Ethereum address, pre-approved
     /// in the whitelist for USDC withdrawals.
     pub fn register_wallet_endpoints(&self, owner_address: Address) {
-        let owner_hex = format!("{owner_address:#x}");
-
         {
             let mut state = lock(&self.state);
             state.alpaca_deposit_address = format!("{:#x}", Address::random());
             state.whitelisted_addresses.push(WhitelistEntry {
                 id: Uuid::new_v4().to_string(),
-                address: owner_hex,
+                address: owner_address,
                 asset: "USDC".to_string(),
                 chain: "ETH".to_string(),
-                status: "APPROVED".to_string(),
+                status: WhitelistStatus::Approved,
             });
         }
 
@@ -306,10 +388,10 @@ impl AlpacaBrokerMock {
             .iter()
             .map(|transfer| MockWalletTransferSnapshot {
                 transfer_id: transfer.transfer_id.clone(),
-                direction: transfer.direction.clone(),
-                amount: transfer.amount.clone(),
+                direction: transfer.direction,
+                amount: transfer.amount,
                 asset: transfer.asset.clone(),
-                status: transfer.status.clone(),
+                status: transfer.status,
             })
             .collect()
     }
@@ -323,8 +405,8 @@ impl AlpacaBrokerMock {
             .values()
             .map(|pos| MockPositionSnapshot {
                 symbol: pos.symbol.to_string(),
-                qty: pos.qty.to_string(),
-                market_value: pos.market_value.to_string(),
+                quantity: pos.quantity,
+                market_value: pos.market_value,
             })
             .collect()
     }
@@ -338,19 +420,20 @@ impl AlpacaBrokerMock {
     /// bot's Ethereum wallet). The bot then polls Alpaca for a deposit
     /// matching the mint tx hash. This watcher simulates Alpaca detecting
     /// the on-chain mint and creating the corresponding transfer record.
-    pub fn start_deposit_watcher<P>(
+    pub async fn start_deposit_watcher<P>(
         &self,
         provider: P,
         usdc_address: Address,
         mint_recipient: Address,
-    ) -> JoinHandle<()>
+    ) -> anyhow::Result<JoinHandle<()>>
     where
         P: Provider + Clone + Send + Sync + 'static,
     {
         let state = Arc::clone(&self.state);
+        let start_block = provider.get_block_number().await?;
 
-        tokio::spawn(async move {
-            let mut last_block = provider.get_block_number().await.unwrap_or(0);
+        Ok(tokio::spawn(async move {
+            let mut last_block = start_block;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -363,64 +446,111 @@ impl AlpacaBrokerMock {
                     continue;
                 }
 
-                for block_num in (last_block + 1)..=current {
-                    let Ok(Some(block)) =
-                        provider.get_block_by_number(block_num.into()).full().await
-                    else {
-                        continue;
-                    };
+                let range_ok = scan_deposit_range(
+                    &provider,
+                    &state,
+                    last_block + 1,
+                    current,
+                    usdc_address,
+                    mint_recipient,
+                )
+                .await;
 
-                    for tx_hash in block.transactions.hashes() {
-                        let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await
-                        else {
-                            continue;
-                        };
-
-                        for log in receipt.inner.logs() {
-                            let Ok(event) = Transfer::decode_log(log.as_ref()) else {
-                                continue;
-                            };
-
-                            // Only care about USDC transfers to the bot's wallet
-                            // (the CCTP mint recipient)
-                            if log.address() != usdc_address || event.to != mint_recipient {
-                                continue;
-                            }
-
-                            let tx_hash_hex = format!("{tx_hash:#x}");
-
-                            let already_exists = lock(&state)
-                                .wallet_transfers
-                                .iter()
-                                .any(|transfer| transfer.tx_hash == tx_hash_hex);
-
-                            if already_exists {
-                                continue;
-                            }
-
-                            // USDC has 6 decimals on Ethereum
-                            let amount_usdc = format_u256_as_usdc(event.value);
-
-                            lock(&state).wallet_transfers.push(MockWalletTransfer {
-                                transfer_id: Uuid::new_v4().to_string(),
-                                direction: "INCOMING".to_string(),
-                                amount: amount_usdc.to_string(),
-                                asset: "USDC".to_string(),
-                                from_address: format!("{:#x}", event.from),
-                                to_address: format!("{mint_recipient:#x}"),
-                                status: "COMPLETE".to_string(),
-                                tx_hash: tx_hash_hex,
-                                poll_count: 0,
-                                polls_until_complete: 0,
-                            });
-                        }
-                    }
+                if range_ok {
+                    last_block = current;
                 }
-
-                last_block = current;
             }
-        })
+        }))
     }
+}
+
+/// Scans a single block for USDC Transfer events to `mint_recipient`
+/// and records them as incoming wallet transfers in mock state.
+/// Returns `true` if the block was fully processed, `false` on RPC error.
+///
+/// Only records transfers where `from == Address::ZERO` (a mint event),
+/// filtering out regular transfers that happen to target `mint_recipient`.
+async fn scan_block_for_deposits<P: Provider>(
+    provider: &P,
+    state: &Mutex<MockState>,
+    block_num: u64,
+    usdc_address: Address,
+    mint_recipient: Address,
+) -> bool {
+    let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).full().await else {
+        return false;
+    };
+
+    for tx_hash in block.transactions.hashes() {
+        let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await else {
+            return false;
+        };
+
+        for log in receipt.inner.logs() {
+            let Ok(event) = Transfer::decode_log(log.as_ref()) else {
+                continue;
+            };
+
+            if log.address() != usdc_address
+                || event.to != mint_recipient
+                || event.from != Address::ZERO
+            {
+                continue;
+            }
+
+            let tx_hash_hex = format!("{tx_hash:#x}");
+
+            let already_exists = lock(state)
+                .wallet_transfers
+                .iter()
+                .any(|transfer| transfer.tx_hash == tx_hash_hex);
+
+            if already_exists {
+                continue;
+            }
+
+            let amount_usdc = format_u256_as_usdc(event.value);
+
+            let Ok(amount) = Decimal::from_str(&amount_usdc) else {
+                continue;
+            };
+
+            lock(state).wallet_transfers.push(MockWalletTransfer {
+                transfer_id: Uuid::new_v4().to_string(),
+                direction: TransferDirection::Incoming,
+                amount,
+                asset: "USDC".to_string(),
+                from_address: event.from,
+                to_address: mint_recipient,
+                status: TransferStatus::Complete,
+                tx_hash: tx_hash_hex,
+                poll_count: 0,
+                polls_until_complete: 0,
+            });
+        }
+    }
+
+    true
+}
+
+/// Scans a range of blocks for deposits, returning true only if
+/// every block in the range was fully processed.
+async fn scan_deposit_range<P: Provider>(
+    provider: &P,
+    state: &Mutex<MockState>,
+    from: u64,
+    to: u64,
+    usdc_address: Address,
+    mint_recipient: Address,
+) -> bool {
+    for block_num in from..=to {
+        if !scan_block_for_deposits(provider, state, block_num, usdc_address, mint_recipient).await
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Locks the mutex, recovering from poisoning (a previous holder panicked).
@@ -493,11 +623,16 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                     .positions
                     .values()
                     .map(|pos| {
+                        let side = if pos.quantity.is_sign_negative() {
+                            "short"
+                        } else {
+                            "long"
+                        };
                         json!({
                             "symbol": pos.symbol,
-                            "qty": pos.qty.to_string(),
+                            "qty": pos.quantity.abs().to_string(),
                             "market_value": pos.market_value.to_string(),
-                            "side": "long",
+                            "side": side,
                             "avg_entry_price": "0",
                         })
                     })
@@ -560,8 +695,19 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
             };
 
             let symbol = symbol.to_string();
-            let qty = qty.to_string();
-            let side = side.to_string();
+            let Ok(quantity) = Decimal::from_str(qty) else {
+                return json_response(400, &json!({"message": format!("invalid qty: {qty}")}));
+            };
+            let side = match side {
+                "buy" => OrderSide::Buy,
+                "sell" => OrderSide::Sell,
+                other => {
+                    return json_response(
+                        400,
+                        &json!({"message": format!("invalid side: {other}")}),
+                    );
+                }
+            };
             let order_id = Uuid::new_v4().to_string();
 
             let mut state = lock(&state);
@@ -571,16 +717,16 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
             }
 
             if symbol == "USDCUSD" {
-                return handle_crypto_order(&mut state, &order_id, &symbol, &qty, &side);
+                return handle_crypto_order(&mut state, &order_id, &symbol, quantity, side);
             }
 
             state.orders.insert(
                 order_id.clone(),
                 MockOrder {
                     symbol: symbol.clone(),
-                    qty: qty.clone(),
-                    side: side.clone(),
-                    status: "new".to_string(),
+                    quantity,
+                    side,
+                    status: OrderStatus::New,
                     poll_count: 0,
                     filled_price: None,
                 },
@@ -592,8 +738,8 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 &json!({
                     "id": order_id,
                     "symbol": symbol,
-                    "qty": qty,
-                    "side": side,
+                    "qty": quantity.to_string(),
+                    "side": side.to_string(),
                     "status": "new",
                     "filled_avg_price": null,
                 }),
@@ -607,28 +753,25 @@ fn handle_crypto_order(
     state: &mut MockState,
     order_id: &str,
     symbol: &str,
-    qty: &str,
-    side: &str,
+    quantity: Decimal,
+    side: OrderSide,
 ) -> HttpMockResponse {
-    let Ok(qty_dec) = Decimal::from_str(qty) else {
-        return json_response(400, &json!({"message": format!("invalid qty: {qty}")}));
-    };
-
-    if side == "buy" {
-        state.account.cash -= qty_dec;
-    } else {
-        state.account.cash += qty_dec;
+    match side {
+        OrderSide::Buy => state.account.cash -= quantity,
+        OrderSide::Sell => state.account.cash += quantity,
     }
+
+    let fill_price = Decimal::ONE;
 
     state.orders.insert(
         order_id.to_string(),
         MockOrder {
             symbol: symbol.to_string(),
-            qty: qty.to_string(),
-            side: side.to_string(),
-            status: "filled".to_string(),
+            quantity,
+            side,
+            status: OrderStatus::Filled,
             poll_count: 0,
-            filled_price: Some("1.00".to_string()),
+            filled_price: Some(fill_price),
         },
     );
 
@@ -637,11 +780,11 @@ fn handle_crypto_order(
         &json!({
             "id": order_id,
             "symbol": symbol,
-            "qty": qty,
-            "side": side,
+            "qty": quantity.to_string(),
+            "side": side.to_string(),
             "status": "filled",
-            "filled_avg_price": "1.00",
-            "filled_qty": qty,
+            "filled_avg_price": fill_price.to_string(),
+            "filled_qty": quantity.to_string(),
             "created_at": "2025-01-06T12:00:00Z"
         }),
     )
@@ -698,7 +841,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                     }
                     MockMode::OrderRejected => {
                         if let Some(order) = state.orders.get_mut(&order_id) {
-                            order.status = "rejected".to_string();
+                            order.status = OrderStatus::Rejected;
                         }
                     }
                     MockMode::DelayedFill { polls_before_fill } => {
@@ -730,19 +873,21 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                 }
 
                 let order = &state.orders[&order_id];
-                let filled_qty = if order.status == "filled" {
-                    Some(order.qty.clone())
+                let filled_quantity = if order.status == OrderStatus::Filled {
+                    Some(order.quantity.to_string())
                 } else {
                     None
                 };
+                let filled_price: Option<String> =
+                    order.filled_price.map(|price| price.to_string());
                 let body = json!({
                     "id": order_id,
                     "symbol": order.symbol,
-                    "qty": order.qty,
-                    "side": order.side,
-                    "status": order.status,
-                    "filled_avg_price": order.filled_price,
-                    "filled_qty": filled_qty,
+                    "qty": order.quantity.to_string(),
+                    "side": order.side.to_string(),
+                    "status": order.status.to_string(),
+                    "filled_avg_price": filled_price,
+                    "filled_qty": filled_quantity,
                     "created_at": "2025-01-01T00:00:00Z",
                 });
                 drop(state);
@@ -759,51 +904,39 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price: Deci
     let should_fill = state
         .orders
         .get(order_id)
-        .is_some_and(|o| o.status == "new");
+        .is_some_and(|order| order.status == OrderStatus::New);
     if !should_fill {
         return;
     }
 
     let symbol = state.orders[order_id].symbol.clone();
-    let qty_str = state.orders[order_id].qty.clone();
-    let side = state.orders[order_id].side.clone();
-
-    let qty = Decimal::from_str(&qty_str)
-        .unwrap_or_else(|_| panic!("order {order_id} has invalid qty '{qty_str}' in mock state"));
+    let quantity = state.orders[order_id].quantity;
+    let side = state.orders[order_id].side;
     let symbol_key = Symbol::force_new(symbol);
 
     if let Some(order) = state.orders.get_mut(order_id) {
-        order.status = "filled".to_string();
-        order.filled_price = Some(fill_price.to_string());
+        order.status = OrderStatus::Filled;
+        order.filled_price = Some(fill_price);
     }
 
-    if side == "buy" {
-        state.account.cash -= qty * fill_price;
-        let position = state
-            .account
-            .positions
-            .entry(symbol_key.clone())
-            .or_insert_with(|| MockPosition {
-                symbol: symbol_key,
-                qty: Decimal::ZERO,
-                market_value: Decimal::ZERO,
-            });
-        position.qty += qty;
-        position.market_value += qty * fill_price;
-    } else {
-        state.account.cash += qty * fill_price;
-        let position = state
-            .account
-            .positions
-            .entry(symbol_key.clone())
-            .or_insert_with(|| MockPosition {
-                symbol: symbol_key,
-                qty: Decimal::ZERO,
-                market_value: Decimal::ZERO,
-            });
-        position.qty -= qty;
-        position.market_value -= qty * fill_price;
-    }
+    let trade_value = quantity * fill_price;
+    let (cash_delta, quantity_delta, mv_delta) = match side {
+        OrderSide::Buy => (-trade_value, quantity, trade_value),
+        OrderSide::Sell => (trade_value, -quantity, -trade_value),
+    };
+
+    state.account.cash += cash_delta;
+    let position = state
+        .account
+        .positions
+        .entry(symbol_key.clone())
+        .or_insert_with(|| MockPosition {
+            symbol: symbol_key,
+            quantity: Decimal::ZERO,
+            market_value: Decimal::ZERO,
+        });
+    position.quantity += quantity_delta;
+    position.market_value += mv_delta;
 }
 
 fn register_whitelist_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -824,7 +957,7 @@ fn register_whitelist_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockSt
                             "address": entry.address,
                             "asset": entry.asset,
                             "chain": entry.chain,
-                            "status": entry.status,
+                            "status": entry.status.to_string(),
                             "created_at": "2025-01-01T00:00:00Z"
                         })
                     })
@@ -853,7 +986,7 @@ fn register_whitelist_post_endpoint(server: &MockServer, state: &Arc<Mutex<MockS
                 }
             };
 
-            let Some(address) = body["address"].as_str() else {
+            let Some(address_str) = body["address"].as_str() else {
                 return json_response(
                     400,
                     &json!({"message": "missing or non-string field: address"}),
@@ -865,7 +998,12 @@ fn register_whitelist_post_endpoint(server: &MockServer, state: &Arc<Mutex<MockS
                     &json!({"message": "missing or non-string field: asset"}),
                 );
             };
-            let address = address.to_string();
+            let Ok(address) = address_str.parse::<Address>() else {
+                return json_response(
+                    400,
+                    &json!({"message": format!("invalid address: {address_str}")}),
+                );
+            };
             let asset = asset.to_string();
             let entry_id = Uuid::new_v4().to_string();
 
@@ -873,10 +1011,10 @@ fn register_whitelist_post_endpoint(server: &MockServer, state: &Arc<Mutex<MockS
                 let mut state = lock(&state);
                 state.whitelisted_addresses.push(WhitelistEntry {
                     id: entry_id.clone(),
-                    address: address.clone(),
+                    address,
                     asset: asset.clone(),
                     chain: "ETH".to_string(),
-                    status: "APPROVED".to_string(),
+                    status: WhitelistStatus::Approved,
                 });
             }
 
@@ -933,7 +1071,7 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
                 }
             };
 
-            let Some(amount) = body["amount"].as_str() else {
+            let Some(amount_str) = body["amount"].as_str() else {
                 return json_response(
                     400,
                     &json!({"message": "missing or non-string field: amount"}),
@@ -945,29 +1083,49 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
                     &json!({"message": "missing or non-string field: asset"}),
                 );
             };
-            let Some(to_address) = body["address"].as_str() else {
+            let Some(to_address_str) = body["address"].as_str() else {
                 return json_response(
                     400,
                     &json!({"message": "missing or non-string field: address"}),
                 );
             };
-            let amount = amount.to_string();
+            let Ok(amount) = Decimal::from_str(amount_str) else {
+                return json_response(
+                    400,
+                    &json!({"message": format!("invalid amount: {amount_str}")}),
+                );
+            };
+            let Ok(to_address) = to_address_str.parse::<Address>() else {
+                return json_response(
+                    400,
+                    &json!({"message": format!("invalid address: {to_address_str}")}),
+                );
+            };
             let asset = asset.to_string();
-            let to_address = to_address.to_string();
             let transfer_id = Uuid::new_v4().to_string();
 
             let from_address = {
                 let mut state = lock(&state);
                 let from_address = state.alpaca_deposit_address.clone();
 
+                let Ok(parsed_from) = from_address.parse::<Address>() else {
+                    return json_response(
+                        500,
+                        &json!({"message": format!(
+                            "mock misconfigured: invalid alpaca_deposit_address: \
+                             {from_address}"
+                        )}),
+                    );
+                };
+
                 state.wallet_transfers.push(MockWalletTransfer {
                     transfer_id: transfer_id.clone(),
-                    direction: "OUTGOING".to_string(),
-                    amount: amount.clone(),
+                    direction: TransferDirection::Outgoing,
+                    amount,
                     asset: asset.clone(),
-                    from_address: from_address.clone(),
-                    to_address: to_address.clone(),
-                    status: "PENDING".to_string(),
+                    from_address: parsed_from,
+                    to_address,
+                    status: TransferStatus::Pending,
                     tx_hash: String::new(),
                     poll_count: 0,
                     polls_until_complete: 2,
@@ -981,12 +1139,12 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
                 &json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
-                    "amount": amount,
-                    "usd_value": amount,
+                    "amount": amount.to_string(),
+                    "usd_value": amount.to_string(),
                     "asset": asset,
                     "chain": "ETH",
                     "from_address": from_address,
-                    "to_address": to_address,
+                    "to_address": format!("{to_address:#x}"),
                     "status": "PENDING",
                     "tx_hash": null,
                     "created_at": Utc::now().to_rfc3339(),
@@ -1009,16 +1167,20 @@ fn register_wallet_transfers_get_endpoint(server: &MockServer, state: &Arc<Mutex
                 let mut state = lock(&state);
 
                 for transfer in &mut state.wallet_transfers {
-                    if transfer.status == "PENDING" || transfer.status == "PROCESSING" {
+                    let is_pending = matches!(
+                        transfer.status,
+                        TransferStatus::Pending | TransferStatus::Processing
+                    );
+                    if is_pending {
                         transfer.poll_count += 1;
 
                         if transfer.poll_count >= transfer.polls_until_complete {
-                            transfer.status = "COMPLETE".to_string();
+                            transfer.status = TransferStatus::Complete;
                             if transfer.tx_hash.is_empty() {
                                 transfer.tx_hash = format!("0x{}", "cd".repeat(32));
                             }
                         } else {
-                            transfer.status = "PROCESSING".to_string();
+                            transfer.status = TransferStatus::Processing;
                         }
                     }
                 }
@@ -1035,14 +1197,14 @@ fn register_wallet_transfers_get_endpoint(server: &MockServer, state: &Arc<Mutex
 
                         json!({
                             "id": transfer.transfer_id,
-                            "direction": transfer.direction,
-                            "amount": transfer.amount,
-                            "usd_value": transfer.amount,
+                            "direction": transfer.direction.to_string(),
+                            "amount": transfer.amount.to_string(),
+                            "usd_value": transfer.amount.to_string(),
                             "asset": transfer.asset,
                             "chain": "ETH",
                             "from_address": transfer.from_address,
                             "to_address": transfer.to_address,
-                            "status": transfer.status,
+                            "status": transfer.status.to_string(),
                             "tx_hash": tx_hash,
                             "created_at": "2025-01-01T00:00:00Z",
                             "network_fee": "0",

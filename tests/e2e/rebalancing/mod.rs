@@ -24,9 +24,13 @@
 //! test verifies the first stage of the pipeline (inventory polling +
 //! snapshot events).
 
-mod utils;
+mod assertions;
 
-use self::utils::*;
+use std::collections::HashMap;
+
+use st0x_hedge::OperationMode;
+
+use self::assertions::*;
 
 /// Control test: direct high-precision sell-side Raindex prices should not
 /// break equity rebalancing. This avoids buy-side reciprocal math and verifies
@@ -55,23 +59,29 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
     }
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
-    let ctx = build_rebalancing_ctx(
-        &infra.base_chain,
-        &infra.broker_service,
-        &infra.db_path,
-        current_block,
-        &infra.equity_addresses,
-        UsdcRebalancing::Disabled,
-        REDEMPTION_WALLET,
-    )?;
+    let cash_vault_id = prepared_orders[0].input_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared_orders[0].output_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
     let mut bot = spawn_bot(ctx);
 
     tokio::time::sleep(Duration::from_secs(8)).await;
 
+    // Take all orders without delay so the inventory poller sees the
+    // full imbalance in one pass and triggers a single mint cycle.
     let mut take_results = Vec::new();
     for prepared in &prepared_orders {
         take_results.push(infra.base_chain.take_prepared_order(prepared).await?);
-        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
     poll_for_events_with_timeout(
@@ -98,7 +108,7 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
         .expected_positions(&expected_positions)
         .take_results(&take_results)
         .provider(&infra.base_chain.provider)
-        .orderbook_addr(infra.base_chain.orderbook_addr)
+        .orderbook(infra.base_chain.orderbook)
         .owner(infra.base_chain.owner)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
@@ -156,25 +166,30 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     // Capture block AFTER setup so the bot sees the orders
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
-    let ctx = build_rebalancing_ctx(
-        &infra.base_chain,
-        &infra.broker_service,
-        &infra.db_path,
-        current_block,
-        &infra.equity_addresses,
-        UsdcRebalancing::Disabled,
-        REDEMPTION_WALLET,
-    )?;
+    let cash_vault_id = prepared_orders[0].input_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared_orders[0].output_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
     let mut bot = spawn_bot(ctx);
 
     // Let bot finish coordination before submitting takes.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Take orders from taker account (separate nonces).
+    // Take all orders without delay so the inventory poller sees the
+    // full imbalance in one pass and triggers a single mint cycle.
     let mut take_results = Vec::new();
     for prepared in &prepared_orders {
         take_results.push(infra.base_chain.take_prepared_order(prepared).await?);
-        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
     poll_for_events_with_timeout(
@@ -201,7 +216,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .expected_positions(&expected_positions)
         .take_results(&take_results)
         .provider(&infra.base_chain.provider)
-        .orderbook_addr(infra.base_chain.orderbook_addr)
+        .orderbook(infra.base_chain.orderbook)
         .owner(infra.base_chain.owner)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
@@ -250,16 +265,19 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    // Extra equity tips the onchain ratio above 0.6 threshold -> Redemption.
+    // Extra equity keeps the onchain/offchain ratio balanced (0.5) before the
+    // take so the trigger doesn't fire at startup. After the BuyEquity fill
+    // adds 12.5 shares onchain and the hedge sell removes 12.5 offchain, the
+    // ratio jumps to ~0.81 > 0.6 threshold -> Redemption.
     let vault_addr = infra.equity_addresses[0].1;
     let underlying_addr = infra.equity_addresses[0].2;
     let redemption_wallet_balance_before =
-        e2e_tests::services::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
     let equity_vault_id = prepared.input_vault_id;
-    let extra_equity: U256 = parse_units("100", 18)?.into();
+    let extra_equity: U256 = parse_units("20", 18)?.into();
     infra
         .base_chain
         .deposit_into_raindex_vault(vault_addr, equity_vault_id, extra_equity, 18)
@@ -268,15 +286,21 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
     // Capture block AFTER all owner setup so the bot sees everything
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
-    let ctx = build_rebalancing_ctx(
-        &infra.base_chain,
-        &infra.broker_service,
-        &infra.db_path,
-        current_block,
-        &infra.equity_addresses,
-        UsdcRebalancing::Disabled,
-        REDEMPTION_WALLET,
-    )?;
+    let cash_vault_id = prepared.output_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.input_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
     let mut bot = spawn_bot(ctx);
 
     // Wait for bot's coordination phase before submitting takes.
@@ -307,7 +331,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .build()];
 
     let redemption_wallet_balance_after =
-        e2e_tests::services::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
@@ -316,7 +340,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .expected_positions(&expected_positions)
         .take_results(&[take_result])
         .provider(&infra.base_chain.provider)
-        .orderbook_addr(infra.base_chain.orderbook_addr)
+        .orderbook(infra.base_chain.orderbook)
         .owner(infra.base_chain.owner)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
@@ -342,7 +366,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 /// redemption completes successfully.
 ///
 /// Run explicitly when validating the decimal-normalization fix:
-/// `cargo test -p e2e-tests --test rebalancing -- --ignored --nocapture \
+/// `cargo test --test e2e -- --ignored --nocapture \
 ///   equity_redemption_buy_inv_repeating_reciprocal_regression`
 #[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
 #[test_log::test(tokio::test)]
@@ -367,7 +391,7 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
     let vault_addr = infra.equity_addresses[0].1;
     let underlying_addr = infra.equity_addresses[0].2;
     let redemption_wallet_balance_before =
-        e2e_tests::services::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
@@ -380,15 +404,20 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
-    let ctx = build_rebalancing_ctx(
-        &infra.base_chain,
-        &infra.broker_service,
-        &infra.db_path,
-        current_block,
-        &infra.equity_addresses,
-        UsdcRebalancing::Disabled,
-        REDEMPTION_WALLET,
-    )?;
+    let cash_vault_id = prepared.output_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.input_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
     let mut bot = spawn_bot(ctx);
 
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -417,7 +446,7 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .build()];
 
     let redemption_wallet_balance_after =
-        e2e_tests::services::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
@@ -426,7 +455,7 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .expected_positions(&expected_positions)
         .take_results(&[take_result])
         .provider(&infra.base_chain.provider)
-        .orderbook_addr(infra.base_chain.orderbook_addr)
+        .orderbook(infra.base_chain.orderbook)
         .owner(infra.base_chain.owner)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
@@ -478,7 +507,7 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
     let vault_addr = infra.equity_addresses[0].1;
     let underlying_addr = infra.equity_addresses[0].2;
     let redemption_wallet_balance_before =
-        e2e_tests::services::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
@@ -491,15 +520,20 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
-    let ctx = build_rebalancing_ctx(
-        &infra.base_chain,
-        &infra.broker_service,
-        &infra.db_path,
-        current_block,
-        &infra.equity_addresses,
-        UsdcRebalancing::Disabled,
-        REDEMPTION_WALLET,
-    )?;
+    let cash_vault_id = prepared.output_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.input_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
     let mut bot = spawn_bot(ctx);
 
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -528,7 +562,7 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .build()];
 
     let redemption_wallet_balance_after =
-        e2e_tests::services::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
@@ -537,7 +571,7 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .expected_positions(&expected_positions)
         .take_results(&[take_result])
         .provider(&infra.base_chain.provider)
-        .orderbook_addr(infra.base_chain.orderbook_addr)
+        .orderbook(infra.base_chain.orderbook)
         .owner(infra.base_chain.owner)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
@@ -582,8 +616,10 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         .connect(&cctp.ethereum_endpoint)
         .await?;
 
-    // Small USDC vault — deposit destination for bridged USDC
-    let usdc_amount: U256 = parse_units("10000", 6)?.into();
+    // USDC vault sized so the onchain/offchain ratio stays above 0.4
+    // before takes (70k / 170k = 0.41) but drops below after BuyEquity
+    // drains ~3.6k USDC (66.4k / 170k = 0.39 < 0.4 threshold).
+    let usdc_amount: U256 = parse_units("70000", 6)?.into();
     let usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
 
     // Set up BuyEquity orders BEFORE bot starts
@@ -601,27 +637,6 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
                 .await?,
         );
     }
-
-    // Snapshot balances BEFORE bot starts. The rebalancing can trigger on the
-    // first inventory poll, so any snapshot taken after bot start may race
-    // with the vault withdrawal/deposit.
-    let usdc_vault_balance_before_rebalance =
-        st0x_hedge::bindings::IOrderBookV6::IOrderBookV6Instance::new(
-            infra.base_chain.orderbook_addr,
-            &infra.base_chain.provider,
-        )
-        .vaultBalance2(
-            infra.base_chain.owner,
-            e2e_tests::services::base_chain::USDC_BASE,
-            usdc_vault_id,
-        )
-        .call()
-        .await?;
-    let ethereum_usdc_balance_before_rebalance =
-        e2e_tests::services::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_usdc_rebalancing_ctx()
@@ -647,6 +662,29 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         }
     }
 
+    // The BuyEquity orders use their own USDC output vaults (not the
+    // pre-funded usdc_vault_id), so takes don't modify the pre-funded
+    // vault. The chain query is safe here: the AlpacaToBase deposit
+    // flow is long enough (CCTP bridge + attestation) that the vault
+    // balance won't change before we snapshot.
+    let usdc_vault_balance_before_rebalance =
+        st0x_hedge::bindings::IOrderBookV6::IOrderBookV6Instance::new(
+            infra.base_chain.orderbook,
+            &infra.base_chain.provider,
+        )
+        .vaultBalance2(
+            infra.base_chain.owner,
+            crate::base_chain::USDC_BASE,
+            usdc_vault_id,
+        )
+        .call()
+        .await?;
+    let ethereum_usdc_balance_before_rebalance =
+        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+
     poll_for_events_with_timeout(
         &mut bot,
         &infra.db_path,
@@ -656,7 +694,7 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
     )
     .await;
     let ethereum_usdc_balance_after_rebalance =
-        e2e_tests::services::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
             .balanceOf(infra.base_chain.owner)
             .call()
             .await?;
@@ -676,7 +714,7 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         .expected_positions(&expected_positions)
         .take_results(&take_results)
         .provider(&infra.base_chain.provider)
-        .orderbook_addr(infra.base_chain.orderbook_addr)
+        .orderbook(infra.base_chain.orderbook)
         .owner(infra.base_chain.owner)
         .broker(&infra.broker_service)
         .attestation(&infra.attestation_service)
@@ -716,13 +754,10 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
     let cctp = CctpInfra::start(&infra).await?;
 
-    // Pre-fund the USDC vault with enough to create a TooMuchOnchain
-    // imbalance. The broker mock starts with $100k offchain cash.
-    // After hedging 3 SellEquity trades (7.5 * $150 = $1,125 each),
-    // offchain drops to ~$96.6k. Onchain needs to exceed
-    // target+deviation (60%) of total to trigger BaseToAlpaca.
-    // $200k onchain / ($200k + $96.6k) = ~0.67 > 0.6 threshold.
-    let usdc_amount: U256 = parse_units("200000", 6)?.into();
+    // Pre-fund the USDC vault so the ratio stays below 0.6 before
+    // takes (145k / 245k = 0.59) but exceeds after SellEquity fills
+    // add ~3.6k USDC (148.6k / 245k = 0.61 > 0.6 threshold).
+    let usdc_amount: U256 = parse_units("145000", 6)?.into();
     let usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
 
     // Set up SellEquity orders BEFORE bot starts.
@@ -756,32 +791,10 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
     let eth_balance_provider = alloy::providers::ProviderBuilder::new()
         .connect(&cctp.ethereum_endpoint)
         .await?;
-    let _deposit_watcher = infra.broker_service.start_deposit_watcher(
-        eth_deposit_provider,
-        USDC_ETHEREUM,
-        infra.base_chain.owner,
-    );
-
-    // Snapshot balances BEFORE bot starts. The $200k pre-funded vault
-    // already exceeds the 60% threshold (200k / (200k + 100k offchain) = 67%),
-    // so rebalancing triggers on the first inventory poll.
-    let usdc_vault_balance_before_rebalance =
-        st0x_hedge::bindings::IOrderBookV6::IOrderBookV6Instance::new(
-            infra.base_chain.orderbook_addr,
-            &infra.base_chain.provider,
-        )
-        .vaultBalance2(
-            infra.base_chain.owner,
-            e2e_tests::services::base_chain::USDC_BASE,
-            usdc_vault_id,
-        )
-        .call()
+    let _deposit_watcher = infra
+        .broker_service
+        .start_deposit_watcher(eth_deposit_provider, USDC_ETHEREUM, infra.base_chain.owner)
         .await?;
-    let ethereum_usdc_balance_before_rebalance =
-        e2e_tests::services::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_usdc_rebalancing_ctx()
@@ -807,6 +820,25 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         }
     }
 
+    // Compute the pre-trade USDC vault balance from take event data.
+    // The live chain query (`vaultBalance2`) is racey because the
+    // inventory poller may detect the USDC surplus and trigger a
+    // vault withdrawal before the test re-queries the chain.
+    let usdc_vault_balance_before_rebalance = take_results
+        .iter()
+        .find(|result| {
+            result.input_token == crate::base_chain::USDC_BASE
+                && result.input_vault_id == usdc_vault_id
+        })
+        .expect("at least one take should touch the USDC input vault")
+        .input_vault_balance_before_take;
+
+    let ethereum_usdc_balance_before_rebalance =
+        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+
     poll_for_events_with_timeout(
         &mut bot,
         &infra.db_path,
@@ -816,7 +848,7 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
     )
     .await;
     let ethereum_usdc_balance_after_rebalance =
-        e2e_tests::services::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
             .balanceOf(infra.base_chain.owner)
             .call()
             .await?;
@@ -836,7 +868,7 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .expected_positions(&expected_positions)
         .take_results(&take_results)
         .provider(&infra.base_chain.provider)
-        .orderbook_addr(infra.base_chain.orderbook_addr)
+        .orderbook(infra.base_chain.orderbook)
         .owner(infra.base_chain.owner)
         .broker(&infra.broker_service)
         .attestation(&infra.attestation_service)

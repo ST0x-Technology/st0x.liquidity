@@ -17,13 +17,17 @@ cctp = [
   "dep:tokio",
   "dep:tracing",
 ]
+mock = ["cctp", "dep:anyhow", "dep:httpmock", "dep:rand"]
 
 [dependencies]
 alloy.workspace = true
+anyhow = { version = "1.0.98", optional = true }
 async-trait.workspace = true
 
 # Optional deps gated behind cctp feature
 backon = { workspace = true, optional = true }
+httpmock = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rust_decimal = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

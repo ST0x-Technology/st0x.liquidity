@@ -56,6 +56,17 @@
 //! **Cost**: 1 basis point (0.01%) of transfer amount
 
 mod evm;
+#[cfg(feature = "mock")]
+mod mock_attestation;
+#[cfg(feature = "mock")]
+pub use mock_attestation::CctpAttestationMock;
+#[cfg(feature = "mock")]
+mod test_contracts;
+#[cfg(feature = "mock")]
+pub use test_contracts::{
+    DeployedCctpChain, TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc,
+    set_max_burn_amount,
+};
 
 use std::mem::size_of;
 use std::time::Duration;
