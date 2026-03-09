@@ -222,13 +222,9 @@ resolution and feature selection.
 - `nix run .#prepSolArtifacts` - Build Solidity artifacts for orderbook
   interface
 
-## Version Control
-
-See `.skills/gitbutler/` for version control workflow and
-`.github/PULL_REQUEST_TEMPLATE.md` for PR format requirements.
-
 ## Development Workflow Notes
 
+- See `.github/PULL_REQUEST_TEMPLATE.md` for PR format requirements
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
   the interactive view, e.g. `git --no-pager diff`
 - **CRITICAL: NEVER run `cargo run` unless explicitly asked by the user.** If
