@@ -14,7 +14,7 @@ fireblocks_environment = "production"
 
 fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
 equity = { target = 0.5, deviation = 0.15 }
-usdc = { target = 0.5, deviation = 0.3 }
+usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
 [assets.cash]
 vault_id = "0xfab"

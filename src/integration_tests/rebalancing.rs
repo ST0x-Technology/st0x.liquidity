@@ -112,10 +112,10 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: ImbalanceThreshold {
+        usdc: Some(ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
-        },
+        }),
         assets: AssetsConfig {
             equities: EquitiesConfig {
                 symbols: HashMap::from([(
@@ -504,7 +504,6 @@ async fn equity_offchain_imbalance_triggers_mint() {
     mint_mock.assert();
     poll_mock.assert();
 
-    // Extract the mint aggregate_id (UUID assigned by the rebalancer at runtime).
     let events = fetch_events(&pool).await;
     let mint_agg_id = events
         .iter()
@@ -576,7 +575,6 @@ async fn equity_offchain_imbalance_triggers_mint() {
     )
     .await;
 
-    // Verify event payloads capture the correct data from the API interaction
     let mint_requested = &events[6].payload["MintRequested"];
     assert_eq!(
         mint_requested["symbol"].as_str().unwrap(),
@@ -857,13 +855,11 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         receiver,
     );
 
-    // Trigger detects the USDC imbalance and sends a UsdcAlpacaToBase operation.
     trigger.check_and_trigger_usdc().await;
 
     // Close the channel so the rebalancer exits after processing.
     drop(trigger);
 
-    // Rebalancer receives the operation and dispatches to MockUsdcRebalance.
     rebalancer.run().await;
 
     assert_eq!(
@@ -932,7 +928,6 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         receiver,
     );
 
-    // Trigger detects the USDC onchain imbalance and sends a UsdcBaseToAlpaca operation.
     trigger.check_and_trigger_usdc().await;
 
     drop(trigger);
@@ -958,6 +953,50 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         usdc.alpaca_to_base_calls(),
         0,
         "alpaca_to_base should not have been called"
+    );
+}
+
+/// Verifies that setting `usdc: None` in RebalancingTriggerConfig
+/// disables USDC rebalancing entirely: even with a severe imbalance,
+/// `check_and_trigger_usdc` dispatches no operations.
+#[tokio::test]
+async fn usdc_none_disables_usdc_rebalancing() {
+    let pool = setup_test_db().await;
+
+    let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+    build_imbalanced_inventory(Imbalance::Usdc {
+        inventory: &inventory,
+        onchain: Usdc(dec!(100)),
+        offchain: Usdc(dec!(900)),
+    })
+    .await;
+
+    let (sender, mut receiver) = mpsc::channel(10);
+
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
+
+    let trigger = RebalancingTrigger::new(
+        RebalancingTriggerConfig {
+            usdc: None,
+            ..test_trigger_config()
+        },
+        vault_registry,
+        TEST_ORDERBOOK,
+        TEST_ORDER_OWNER,
+        Arc::clone(&inventory),
+        sender,
+        wrapper,
+    );
+
+    trigger.check_and_trigger_usdc().await;
+
+    drop(trigger);
+
+    assert!(
+        receiver.try_recv().is_err(),
+        "No USDC operation should be dispatched when usdc threshold is None"
     );
 }
 
@@ -997,7 +1036,6 @@ async fn mint_api_failure_produces_rejected_event() {
     let equity_transfer =
         build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, MockWrapper::new());
 
-    // Mock returns HTTP 500 for the mint request
     let mint_mock = server.mock(|when, then| {
         when.method(POST).path(tokenization_mint_path());
         then.status(500).body("Internal Server Error");
@@ -1083,7 +1121,6 @@ async fn mint_api_failure_produces_rejected_event() {
     )
     .await;
 
-    // Verify no mint events were emitted (the aggregate returned an error)
     let events = fetch_events(&pool).await;
     assert!(
         !events
@@ -1122,10 +1159,10 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: ImbalanceThreshold {
+        usdc: Some(ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
-        },
+        }),
         assets,
         disabled_assets: HashSet::new(),
     };
@@ -1237,10 +1274,10 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             target: dec!(0.5),
             deviation: dec!(0.2),
         },
-        usdc: ImbalanceThreshold {
+        usdc: Some(ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
-        },
+        }),
         assets,
         disabled_assets: HashSet::new(),
     };
@@ -1330,10 +1367,10 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
             },
-            usdc: ImbalanceThreshold {
+            usdc: Some(ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.4),
-            },
+            }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
@@ -1385,10 +1422,10 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
             },
-            usdc: ImbalanceThreshold {
+            usdc: Some(ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.1),
-            },
+            }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {

@@ -28,7 +28,7 @@ use st0x_evm::fireblocks::{
 };
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
 
-use crate::config::{AssetsConfig, OperationMode};
+use crate::config::AssetsConfig;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
@@ -86,6 +86,14 @@ pub enum RebalancingCtxError {
     Evm(#[from] st0x_evm::EvmError),
 }
 
+/// USDC rebalancing configuration with explicit enable/disable.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum UsdcRebalancing {
+    Enabled { target: Decimal, deviation: Decimal },
+    Disabled,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
@@ -99,11 +107,14 @@ pub(crate) struct RebalancingSecrets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
-    pub(crate) fireblocks_environment: FireblocksEnvironment,
     pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
+    pub(crate) fireblocks_environment: FireblocksEnvironment,
+    /// Override the Fireblocks API base URL. When absent, determined
+    /// by `fireblocks_environment`.
+    pub(crate) fireblocks_base_url: Option<Url>,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -116,9 +127,9 @@ pub(crate) struct RebalancingConfig {
 /// Read-only provider access for either chain is available via
 /// `base_wallet().provider()` and `ethereum_wallet().provider()`.
 #[derive(Clone)]
-pub(crate) struct RebalancingCtx {
+pub struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) usdc: Option<ImbalanceThreshold>,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
@@ -177,9 +188,16 @@ impl RebalancingCtx {
             "Initialized Fireblocks wallet"
         );
 
+        let usdc = match config.usdc {
+            UsdcRebalancing::Enabled { target, deviation } => {
+                Some(ImbalanceThreshold { target, deviation })
+            }
+            UsdcRebalancing::Disabled => None,
+        };
+
         Ok(Self {
             equity: config.equity,
-            usdc: config.usdc,
+            usdc,
             redemption_wallet: config.redemption_wallet,
             alpaca_broker_auth: broker_auth,
             base_wallet: Arc::new(base_wallet),
@@ -213,7 +231,7 @@ impl RebalancingCtx {
             vault_account_id: config.fireblocks_vault_account_id,
             environment: config.fireblocks_environment,
             asset_id,
-            base_url: None,
+            base_url: config.fireblocks_base_url.clone(),
             provider,
             required_confirmations: REQUIRED_CONFIRMATIONS,
         })
@@ -227,15 +245,19 @@ impl RebalancingCtx {
     pub(crate) fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.ethereum_wallet
     }
+}
 
+#[cfg(test)]
+#[bon::bon]
+impl RebalancingCtx {
     /// Test constructor that creates a `RebalancingCtx` with stub wallets.
     ///
     /// The wallets panic on `send` -- use only in tests that don't submit
     /// transactions through the rebalancing wallet.
-    #[cfg(test)]
+    #[builder]
     pub(crate) fn stub(
         equity: ImbalanceThreshold,
-        usdc: ImbalanceThreshold,
+        usdc: Option<ImbalanceThreshold>,
         redemption_wallet: Address,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
@@ -258,6 +280,62 @@ impl RebalancingCtx {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[bon::bon]
+impl RebalancingCtx {
+    /// Test constructor that accepts pre-built wallets for e2e tests
+    /// that need real onchain interaction (e.g. with Anvil forks).
+    #[builder]
+    pub fn with_wallets(
+        equity: ImbalanceThreshold,
+        usdc: UsdcRebalancing,
+        redemption_wallet: Address,
+        alpaca_broker_auth: AlpacaBrokerApiCtx,
+        base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        let usdc = match usdc {
+            UsdcRebalancing::Enabled { target, deviation } => {
+                Some(ImbalanceThreshold { target, deviation })
+            }
+            UsdcRebalancing::Disabled => None,
+        };
+
+        Self {
+            equity,
+            usdc,
+            redemption_wallet,
+            alpaca_broker_auth,
+            base_wallet,
+            ethereum_wallet,
+            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+        }
+    }
+
+    /// Sets the Circle API base URL override (for e2e tests with local
+    /// CCTP contracts and a mock attestation server).
+    #[must_use]
+    pub fn with_circle_api_base(mut self, base_url: String) -> Self {
+        self.circle_api_base = base_url;
+        self
+    }
+
+    /// Sets the CCTP contract address overrides (for e2e tests with
+    /// locally deployed CCTP contracts).
+    #[must_use]
+    pub fn with_cctp_addresses(
+        mut self,
+        token_messenger: Address,
+        message_transmitter: Address,
+    ) -> Self {
+        self.token_messenger = token_messenger;
+        self.message_transmitter = message_transmitter;
+        self
+    }
+}
+
 impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingCtx")
@@ -274,7 +352,7 @@ impl std::fmt::Debug for RebalancingCtx {
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) assets: AssetsConfig,
     pub(crate) disabled_assets: HashSet<Symbol>,
 }
@@ -725,19 +803,17 @@ impl RebalancingTrigger {
 
     /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
     fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
-        let Some(cash) = self.config.assets.cash.as_ref() else {
-            debug!("No assets.cash configured, USDC rebalancing disabled");
-            return None;
-        };
+        let threshold = self.config.usdc.as_ref()?;
 
-        if matches!(cash.rebalancing, OperationMode::Disabled) {
-            debug!("USDC rebalancing disabled via assets.cash config");
-            return None;
-        }
+        let usdc_limit = self
+            .config
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.operational_limit)
+            .map(Positive::inner);
 
-        let usdc_limit = cash.operational_limit.map(Positive::inner);
-
-        Some((self.config.usdc, usdc_limit))
+        Some((*threshold, usdc_limit))
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
@@ -1003,7 +1079,7 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -1019,7 +1095,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::config::{CashAssetConfig, EquitiesConfig};
+    use crate::config::{CashAssetConfig, EquitiesConfig, OperationMode};
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
@@ -1038,10 +1114,10 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: ImbalanceThreshold {
+            usdc: Some(ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
-            },
+            }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
@@ -1120,14 +1196,10 @@ mod tests {
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: test_config().equity,
-                usdc: test_config().usdc,
+                usdc: None,
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
-                    cash: Some(CashAssetConfig {
-                        vault_id: Some(B256::ZERO),
-                        rebalancing: OperationMode::Disabled,
-                        operational_limit: None,
-                    }),
+                    cash: None,
                 },
                 disabled_assets: HashSet::new(),
             },
@@ -3157,6 +3229,7 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#
@@ -3178,8 +3251,11 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.5));
         assert_eq!(config.equity.deviation, dec!(0.2));
 
-        assert_eq!(config.usdc.target, dec!(0.5));
-        assert_eq!(config.usdc.deviation, dec!(0.3));
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
+            panic!("expected UsdcRebalancing::Enabled");
+        };
+        assert_eq!(target, dec!(0.5));
+        assert_eq!(deviation, dec!(0.3));
         assert_eq!(
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -3209,6 +3285,7 @@ mod tests {
             deviation = "0.1"
 
             [usdc]
+            mode = "enabled"
             target = "0.4"
             deviation = "0.15"
         "#,
@@ -3218,8 +3295,11 @@ mod tests {
         assert_eq!(config.equity.target, dec!(0.6));
         assert_eq!(config.equity.deviation, dec!(0.1));
 
-        assert_eq!(config.usdc.target, dec!(0.4));
-        assert_eq!(config.usdc.deviation, dec!(0.15));
+        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
+            panic!("expected UsdcRebalancing::Enabled");
+        };
+        assert_eq!(target, dec!(0.4));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
@@ -3237,6 +3317,7 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -3282,6 +3363,7 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -3311,6 +3393,7 @@ mod tests {
             deviation = "0.2"
 
             [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -3331,6 +3414,7 @@ mod tests {
             8453 = "BASECHAIN_ETH"
 
             [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#;

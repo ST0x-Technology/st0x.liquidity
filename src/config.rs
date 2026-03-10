@@ -42,7 +42,7 @@ pub struct Env {
 /// Whether a per-asset operation (trading or rebalancing) is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum OperationMode {
+pub enum OperationMode {
     Enabled,
     Disabled,
 }
@@ -50,32 +50,24 @@ pub(crate) enum OperationMode {
 /// Per-equity asset configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EquityAssetConfig {
-    /// Tokenized equity always one-to-one backed and redeemable with
-    /// real shares held in the issuer account
-    pub(crate) tokenized_equity: Address,
-    /// Wrapped version of tokenized shares to handle corporate actions in a
-    /// manner compatible with other DeFi protocols
-    pub(crate) tokenized_equity_derivative: Address,
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
+pub struct EquityAssetConfig {
+    pub tokenized_equity: Address,
+    pub tokenized_equity_derivative: Address,
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) trading: OperationMode,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
+    pub vault_id: Option<B256>,
+    pub trading: OperationMode,
+    pub rebalancing: OperationMode,
+    pub operational_limit: Option<Positive<FractionalShares>>,
 }
 
 /// Cash asset (USDC) configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CashAssetConfig {
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
+pub struct CashAssetConfig {
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<Usdc>>,
+    pub vault_id: Option<B256>,
+    pub rebalancing: OperationMode,
+    pub operational_limit: Option<Positive<Usdc>>,
 }
 
 /// Equity assets configuration keyed by symbol.
@@ -85,17 +77,17 @@ pub(crate) struct CashAssetConfig {
 /// `deny_unknown_fields` is intentionally absent because it is
 /// incompatible with `flatten`.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct EquitiesConfig {
+pub struct EquitiesConfig {
     #[serde(flatten)]
-    pub(crate) symbols: HashMap<Symbol, EquityAssetConfig>,
+    pub symbols: HashMap<Symbol, EquityAssetConfig>,
 }
 
 /// Top-level assets configuration containing equities and cash.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AssetsConfig {
-    pub(crate) equities: EquitiesConfig,
-    pub(crate) cash: Option<CashAssetConfig>,
+pub struct AssetsConfig {
+    pub equities: EquitiesConfig,
+    pub cash: Option<CashAssetConfig>,
 }
 
 /// Deserializes a hex string (possibly short, e.g. `"0xfab"`) into a
@@ -192,7 +184,7 @@ enum BrokerSecrets {
 /// `Standalone`: order_owner comes from config, no rebalancing.
 /// `Rebalancing`: order_owner resolved from Fireblocks at runtime.
 #[derive(Clone, Debug)]
-pub(crate) enum TradingMode {
+pub enum TradingMode {
     Standalone { order_owner: Address },
     Rebalancing(Box<RebalancingCtx>),
 }
@@ -211,8 +203,8 @@ pub struct Ctx {
     pub(crate) inventory_poll_interval: u64,
     pub(crate) broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    pub(crate) trading_mode: TradingMode,
-    pub(crate) execution_threshold: ExecutionThreshold,
+    pub trading_mode: TradingMode,
+    pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
 }
 
@@ -563,6 +555,52 @@ impl Ctx {
             .symbols
             .get(symbol)
             .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
+    }
+}
+
+/// Test-only constructor for `Ctx` that internalizes fields e2e tests
+/// don't need to control (log level, operational limits, EVM wrapping,
+/// polling intervals). This keeps `Ctx` fields `pub(crate)` while
+/// providing a stable construction API for the e2e test crate.
+#[cfg(any(test, feature = "test-support"))]
+#[bon::bon]
+impl Ctx {
+    #[builder]
+    pub fn for_test(
+        database_url: String,
+        ws_rpc_url: Url,
+        orderbook: Address,
+        deployment_block: u64,
+        broker: BrokerCtx,
+        trading_mode: TradingMode,
+        assets: AssetsConfig,
+        #[builder(default = 2)] inventory_poll_interval: u64,
+        execution_threshold_override: Option<ExecutionThreshold>,
+    ) -> Result<Self, CtxError> {
+        let execution_threshold = match execution_threshold_override {
+            Some(threshold) => threshold,
+            None => broker.execution_threshold()?,
+        };
+
+        Ok(Self {
+            database_url,
+            log_level: LogLevel::Debug,
+            server_port: 0,
+            evm: EvmCtx {
+                ws_rpc_url,
+                orderbook,
+                deployment_block,
+            },
+            order_polling_interval: 1,
+            order_polling_max_jitter: 0,
+            position_check_interval: 2,
+            inventory_poll_interval,
+            broker,
+            telemetry: None,
+            trading_mode,
+            execution_threshold,
+            assets,
+        })
     }
 }
 
@@ -944,6 +982,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1040,6 +1079,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1128,6 +1168,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1266,6 +1307,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -1419,6 +1461,7 @@ pub(crate) mod tests {
             deviation = "0.2"
 
             [rebalancing.usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#,

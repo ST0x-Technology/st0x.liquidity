@@ -201,25 +201,25 @@ mod tests {
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_ctx() -> RebalancingCtx {
-        RebalancingCtx::stub(
-            ImbalanceThreshold {
+        RebalancingCtx::stub()
+            .equity(ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
-            },
-            ImbalanceThreshold {
+            })
+            .usdc(ImbalanceThreshold {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
-            },
-            address!("0x1234567890123456789012345678901234567890"),
-            AlpacaBrokerApiCtx {
+            })
+            .redemption_wallet(address!("0x1234567890123456789012345678901234567890"))
+            .alpaca_broker_auth(AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
                 account_id: AlpacaAccountId::new(Uuid::nil()),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
-            },
-        )
+            })
+            .call()
     }
 
     #[test]
@@ -268,8 +268,9 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        assert_eq!(trigger_config.usdc.target, dec!(0.6));
-        assert_eq!(trigger_config.usdc.deviation, dec!(0.15));
+        let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
+        assert_eq!(usdc_threshold.target, dec!(0.6));
+        assert_eq!(usdc_threshold.deviation, dec!(0.15));
     }
 
     async fn make_services_with_mock_wallet(

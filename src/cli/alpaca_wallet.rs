@@ -617,25 +617,27 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
-            trading_mode: TradingMode::Rebalancing(Box::new(RebalancingCtx::stub(
-                ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.1),
-                },
-                ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.3),
-                },
-                Address::ZERO,
-                AlpacaBrokerApiCtx {
-                    api_key: "test-key".to_string(),
-                    api_secret: "test-secret".to_string(),
-                    account_id: alpaca_account_id,
-                    mode: Some(AlpacaBrokerApiMode::Sandbox),
-                    asset_cache_ttl: std::time::Duration::from_secs(3600),
-                    time_in_force: TimeInForce::default(),
-                },
-            ))),
+            trading_mode: TradingMode::Rebalancing(Box::new(
+                RebalancingCtx::stub()
+                    .equity(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.1),
+                    })
+                    .usdc(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.3),
+                    })
+                    .redemption_wallet(Address::ZERO)
+                    .alpaca_broker_auth(AlpacaBrokerApiCtx {
+                        api_key: "test-key".to_string(),
+                        api_secret: "test-secret".to_string(),
+                        account_id: alpaca_account_id,
+                        mode: Some(AlpacaBrokerApiMode::Sandbox),
+                        asset_cache_ttl: std::time::Duration::from_secs(3600),
+                        time_in_force: TimeInForce::default(),
+                    })
+                    .call(),
+            )),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }

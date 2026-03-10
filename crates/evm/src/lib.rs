@@ -41,6 +41,9 @@ pub mod local;
 #[cfg(feature = "turnkey")]
 pub mod turnkey;
 
+#[cfg(feature = "mock")]
+pub mod test_chain;
+
 /// Errors that can occur during EVM operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EvmError {

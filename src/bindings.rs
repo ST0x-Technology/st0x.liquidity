@@ -28,14 +28,14 @@ sol!(
     TestERC20, "lib/rain.orderbook/out/ArbTest.sol/Token.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
     OrderBook, "lib/rain.orderbook/out/OrderBookV6.sol/OrderBookV6.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -44,32 +44,32 @@ sol!(
 
 // ERC20 with configurable name, symbol, and decimals via constructor args.
 // Distinct from `TestERC20` (ArbTest Token) which has a no-arg constructor.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
     DeployableERC20, "lib/rain.orderbook/lib/rain.interpreter/out/TestERC20.sol/TestERC20.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Interpreter, "lib/rain.orderbook/out/Rainterpreter.sol/Rainterpreter.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Store, "lib/rain.orderbook/out/RainterpreterStore.sol/RainterpreterStore.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Parser, "lib/rain.orderbook/out/RainterpreterParser.sol/RainterpreterParser.json"
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     Deployer, "lib/rain.orderbook/out/RainterpreterExpressionDeployer.sol/RainterpreterExpressionDeployer.json"
