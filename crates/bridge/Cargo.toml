@@ -41,7 +41,7 @@ tracing = { workspace = true, optional = true }
 httpmock.workspace = true
 proptest.workspace = true
 itertools = "0.14.0"
-rust_decimal_macros = "1.38.0"
+rust_decimal_macros.workspace = true
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 rand.workspace = true

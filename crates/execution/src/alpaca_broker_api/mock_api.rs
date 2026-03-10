@@ -94,7 +94,7 @@ impl std::fmt::Display for OrderStatus {
 }
 
 struct MockOrder {
-    symbol: String,
+    symbol: Symbol,
     quantity: Decimal,
     side: OrderSide,
     status: OrderStatus,
@@ -344,7 +344,7 @@ impl AlpacaBrokerMock {
             .iter()
             .map(|(order_id, order)| MockOrderSnapshot {
                 order_id: order_id.clone(),
-                symbol: order.symbol.clone(),
+                symbol: order.symbol.to_string(),
                 quantity: order.quantity,
                 side: order.side,
                 status: order.status,
@@ -694,7 +694,9 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 );
             };
 
-            let symbol = symbol.to_string();
+            let Ok(symbol) = Symbol::new(symbol) else {
+                return json_response(400, &json!({"message": "symbol cannot be empty"}));
+            };
             let Ok(quantity) = Decimal::from_str(qty) else {
                 return json_response(400, &json!({"message": format!("invalid qty: {qty}")}));
             };
@@ -716,7 +718,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 return json_response(422, &json!({"message": "order rejected"}));
             }
 
-            if symbol == "USDCUSD" {
+            if symbol.to_string() == "USDCUSD" {
                 return handle_crypto_order(&mut state, &order_id, &symbol, quantity, side);
             }
 
@@ -752,7 +754,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
 fn handle_crypto_order(
     state: &mut MockState,
     order_id: &str,
-    symbol: &str,
+    symbol: &Symbol,
     quantity: Decimal,
     side: OrderSide,
 ) -> HttpMockResponse {
@@ -766,7 +768,7 @@ fn handle_crypto_order(
     state.orders.insert(
         order_id.to_string(),
         MockOrder {
-            symbol: symbol.to_string(),
+            symbol: symbol.clone(),
             quantity,
             side,
             status: OrderStatus::Filled,
@@ -816,8 +818,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
 
                 match mode {
                     MockMode::HappyPath => {
-                        let symbol = state.orders[&order_id].symbol.clone();
-                        let symbol_key = Symbol::force_new(symbol);
+                        let symbol_key = state.orders[&order_id].symbol.clone();
 
                         let delay = state
                             .symbol_fill_delays
@@ -851,11 +852,9 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                             .is_some_and(|o| o.poll_count >= polls_before_fill);
 
                         if ready {
-                            let symbol = state.orders[&order_id].symbol.clone();
-                            let Some(fill_price) = state
-                                .symbol_fill_prices
-                                .get(&Symbol::force_new(symbol))
-                                .copied()
+                            let symbol_key = state.orders[&order_id].symbol.clone();
+                            let Some(fill_price) =
+                                state.symbol_fill_prices.get(&symbol_key).copied()
                             else {
                                 return json_response(
                                     500,
@@ -909,10 +908,9 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price: Deci
         return;
     }
 
-    let symbol = state.orders[order_id].symbol.clone();
+    let symbol_key = state.orders[order_id].symbol.clone();
     let quantity = state.orders[order_id].quantity;
     let side = state.orders[order_id].side;
-    let symbol_key = Symbol::force_new(symbol);
 
     if let Some(order) = state.orders.get_mut(order_id) {
         order.status = OrderStatus::Filled;

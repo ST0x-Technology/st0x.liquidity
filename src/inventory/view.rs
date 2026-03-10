@@ -3,12 +3,13 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
+use st0x_finance::Usdc;
+
 use super::venue_balance::{InventoryError, VenueBalance};
-use crate::threshold::Usdc;
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
 /// Error type for inventory view operations.
@@ -583,8 +584,14 @@ impl InventoryView {
     pub(crate) fn with_usdc(self, onchain_available: Usdc, offchain_available: Usdc) -> Self {
         Self {
             usdc: Inventory {
-                onchain: Some(VenueBalance::new(onchain_available, Usdc(Decimal::ZERO))),
-                offchain: Some(VenueBalance::new(offchain_available, Usdc(Decimal::ZERO))),
+                onchain: Some(VenueBalance::new(
+                    onchain_available,
+                    Usdc::new(Decimal::ZERO),
+                )),
+                offchain: Some(VenueBalance::new(
+                    offchain_available,
+                    Usdc::new(Decimal::ZERO),
+                )),
                 last_rebalancing: None,
             },
             ..self
@@ -637,8 +644,9 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
+    use st0x_finance::Usdc;
+
     use super::*;
-    use crate::threshold::Usdc;
     use crate::wrapper::RATIO_ONE;
 
     fn shares(amount: i64) -> FractionalShares {
@@ -851,8 +859,8 @@ mod tests {
 
     fn usdc_venue(available: i64, inflight: i64) -> VenueBalance<Usdc> {
         VenueBalance::new(
-            Usdc(Decimal::from(available)),
-            Usdc(Decimal::from(inflight)),
+            Usdc::new(Decimal::from(available)),
+            Usdc::new(Decimal::from(inflight)),
         )
     }
 
