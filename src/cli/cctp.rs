@@ -7,12 +7,12 @@ use std::io::Write;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
 use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
+use st0x_finance::Usdc;
 
 use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::threshold::Usdc;
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).
@@ -246,6 +246,7 @@ mod tests {
     use url::Url;
 
     use st0x_evm::OpenChainErrorRegistry;
+    use st0x_finance::Usdc;
 
     use super::*;
     use crate::config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel, TradingMode};
@@ -282,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn test_cctp_bridge_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
+        let amount = Some(Usdc::new(Decimal::from_str("100").unwrap()));
 
         let mut stdout = Vec::new();
         let error = cctp_bridge_command::<OpenChainErrorRegistry, _>(

@@ -36,12 +36,13 @@ cqrs-es.workspace = true
 sqlite-es.workspace = true
 rust_decimal = { workspace = true, features = ["serde-with-float"] }
 num-decimal.workspace = true
-rust_decimal_macros = "1.40.0"
+rust_decimal_macros.workspace = true
+st0x-finance.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
 proptest.workspace = true
-rust_decimal_macros = "1.40.0"
+rust_decimal_macros.workspace = true
 serde_json.workspace = true
 serial_test.workspace = true
 

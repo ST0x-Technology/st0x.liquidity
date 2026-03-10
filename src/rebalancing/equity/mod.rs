@@ -19,7 +19,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
-use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
+use st0x_execution::{FractionalShares, SharesBlockchain, SharesConversionError, Symbol};
 
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::equity_redemption::{
@@ -352,7 +352,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         info!(%shares_minted, "Tokens received, wrapping into ERC-4626 shares");
 
-        let wrapped_token = self.wrapper.lookup_tokenized_equity_derivative(&symbol)?;
+        let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
         let (wrap_tx_hash, wrapped_shares) = self
             .wrapper
             .to_wrapped(wrapped_token, shares_minted, self.wallet)
@@ -678,6 +678,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mint_transfer_fails_when_derivative_lookup_fails() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_lookup()),
+        )
+        .await;
+
+        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+            &transfer,
+            Equity {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(dec!(100.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintError::Wrapper(WrapperError::SymbolNotConfigured(_))
+            ),
+            "Expected Wrapper(SymbolNotConfigured) error, got: {error:?}"
+        );
+    }
+
     /// Verifies that mint deposits the derivative token (from
     /// `lookup_tokenized_equity_derivative`) to the Raindex vault, not the
     /// base tokenized share (from `lookup_tokenized_equity`).
@@ -689,7 +717,7 @@ mod tests {
         let raindex = Arc::new(MockRaindex::new());
         let wrapper = Arc::new(
             MockWrapper::new()
-                .with_unwrapped_token(base_share)
+                .with_tokenized_shares(base_share)
                 .with_wrapped_token(derivative),
         );
 

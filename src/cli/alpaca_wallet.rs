@@ -10,6 +10,7 @@ use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApi, ConversionDirection, Executor, FractionalShares, Positive,
     Symbol,
 };
+use st0x_finance::Usdc;
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
@@ -18,7 +19,6 @@ use crate::alpaca_wallet::{
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
 use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
-use crate::threshold::Usdc;
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
@@ -526,6 +526,8 @@ mod tests {
     use st0x_evm::NoOpErrorRegistry;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
+    use st0x_finance::Usdc;
+
     use super::*;
     use crate::cli::ConvertDirection;
     use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
@@ -645,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_deposit_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(100));
+        let amount = Usdc::new(dec!(100));
 
         let mut stdout = Vec::new();
         let err_msg = alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
@@ -661,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_deposit_writes_amount_to_stdout() {
         let ctx = create_full_alpaca_ctx();
-        let amount = Usdc(dec!(500.50));
+        let amount = Usdc::new(dec!(500.50));
 
         let mut stdout = Vec::new();
         alpaca_deposit_command::<NoOpErrorRegistry, _>(&mut stdout, amount, &ctx)
@@ -678,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_withdraw_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(100));
+        let amount = Usdc::new(dec!(100));
 
         let mut stdout = Vec::new();
         let err_msg =
@@ -710,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_convert_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(500.50));
+        let amount = Usdc::new(dec!(500.50));
 
         let mut stdout = Vec::new();
         alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &ctx)
@@ -731,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_convert_to_usdc_writes_direction_to_stdout() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let amount = Usdc(dec!(250));
+        let amount = Usdc::new(dec!(250));
 
         let mut stdout = Vec::new();
         alpaca_convert_command(&mut stdout, ConvertDirection::ToUsdc, amount, &ctx)
