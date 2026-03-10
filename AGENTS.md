@@ -91,10 +91,17 @@ Decompose epics to maximize independent parallel execution:
 
 ### Managing Epics in the Roadmap
 
-An epic groups related issues toward a single goal. Lead with motivation (why
-this matters), show dependency structure via Mermaid diagrams, reference issues
-not solutions, and mark progress inline (`[x]` with PR link). Move completed
-epics to "Completed."
+An epic is a roadmap subsection grouping related issues toward a single goal.
+
+- **Lead with motivation**: One or two sentences explaining why this work
+  matters and what the end state looks like.
+- **Show the dependency structure**: Use a Mermaid diagram (GitHub renders them
+  natively) to make the execution order and parallelism obvious at a glance.
+- **Reference issues, not solutions**: Each item links to a GitHub issue. The
+  issue describes the desired outcome; the PR (added later) describes the
+  solution.
+- **Mark progress inline**: `[x]` with PR link as branches merge. When all items
+  complete, move the section to "Completed."
 
 ## Plan & Review
 
@@ -465,28 +472,14 @@ is the source of truth for terminology and naming conventions.
   (`#[cfg(test)]` modules) where panicking on unexpected state is the desired
   behavior
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
-  String values that throw away type information**. This is strictly forbidden
-  and violates our error handling principles:
-  - **FORBIDDEN**: `SomeError(String)` - throws away all type information
-  - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
-  - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
-    interpolation
-  - **FORBIDDEN**: Using `format!()` to convert typed values into String fields
-    in error variants (e.g., `format!("{side:?}")`) - store the actual typed
-    value instead
-  - **FORBIDDEN**: Unpacking newtypes into their inner type to store in error
-    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`, not
-    `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
-    representation. Never discard type safety by extracting inner values.
-  - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
-    preserve all type information
-  - **REQUIRED**: Each error variant must preserve the complete error chain with
-    `#[source]`
-  - **REQUIRED**: Discover error variants as needed during implementation, not
-    preemptively
-  - **FORBIDDEN: `.map_err` for error conversion**: Use `#[from]` + `?` instead.
-    To log before converting, chain
-    `.inspect_err(|error| error!(?error, "context"))` before `?`
+  String values.** No `SomeError(String)`, no `.to_string()` or `format!()`
+  conversions, no unpacking newtypes (store `Symbol` not `String`). Prefer
+  `#[from]` + `?` for error conversion; preserve error chains with `#[source]`;
+  discover variants during implementation not preemptively. `.map_err` is
+  permitted when adding call-site context or adapting a source error type that
+  cannot implement `From`/`#[from]` - do not reach for it as the default when
+  `#[from]` + `?` suffices. To log before converting:
+  `.inspect_err(|error| error!(?error, "ctx"))` before `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
@@ -664,13 +657,8 @@ that cannot be expressed through code structure alone.
 - Describing function signatures (use doc comments instead)
 - Adding obvious test setup descriptions
 - Marking code sections that are clear from structure
-- **Referencing internal task tracking or ephemeral context**: NEVER leave
-  comments like `// Task 7: ...`, `// TODO from ticket XYZ`,
-  `// Part of sprint 5 work`, or any reference to task numbers, issue trackers,
-  todo lists, or session context that won't exist for future readers. These
-  comments are meaningless to PR reviewers, future maintainers, and anyone
-  without access to your internal state. If the code needs explanation, explain
-  WHAT it does and WHY - not which task number led to writing it.
+- **NEVER reference task numbers, issue trackers, or session context** in
+  comments — explain WHAT and WHY, not which task led to writing it
 
 #### Examples
 
@@ -686,10 +674,15 @@ Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 ### Code style
 
-#### ASCII only in code
+#### ASCII in code, unicode in user-facing output
 
-Use ASCII characters only in code and comments. For arrows, use `->` not `->`.
-Unicode breaks vim navigation and grep workflows.
+Use ASCII characters only in identifiers, comments, log messages, and config
+keys. For arrows in comments, use `->` not `→`. Unicode breaks vim navigation
+and grep workflows.
+
+In user-facing string literals (GUI templates, CLI display, rendered text),
+prefer unicode characters (`←`, `→`, `·`, `▲`, `▼`, etc.) for readability and
+polish.
 
 #### No single-letter variables or arguments
 

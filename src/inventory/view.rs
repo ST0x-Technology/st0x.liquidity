@@ -3,12 +3,13 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
+use st0x_finance::Usdc;
+
 use super::venue_balance::{InventoryError, VenueBalance};
-use crate::threshold::Usdc;
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
 /// Error type for inventory view operations.
@@ -168,7 +169,7 @@ pub(crate) enum TransferOp {
 /// Venues are `Option` to distinguish "not yet polled" from "polled with zero balance".
 /// Imbalance detection requires both venues to have been initialized by snapshot events.
 ///
-/// Fields are private — mutation is only possible through the closure-returning
+/// Fields are private - mutation is only possible through the closure-returning
 /// factory methods, which are designed to be passed to
 /// [`InventoryView::update_equity`] or [`InventoryView::update_usdc`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -471,7 +472,7 @@ where
     /// unconditionally and discard any tracked inflight.
     ///
     /// Takes the triggering error as a witness to prevent blind
-    /// usage — callers must have an error in hand.
+    /// usage - callers must have an error in hand.
     pub(crate) fn force_on_snapshot<E: std::fmt::Debug + Send + 'static>(
         venue: Venue,
         snapshot_balance: T,
@@ -583,8 +584,14 @@ impl InventoryView {
     pub(crate) fn with_usdc(self, onchain_available: Usdc, offchain_available: Usdc) -> Self {
         Self {
             usdc: Inventory {
-                onchain: Some(VenueBalance::new(onchain_available, Usdc(Decimal::ZERO))),
-                offchain: Some(VenueBalance::new(offchain_available, Usdc(Decimal::ZERO))),
+                onchain: Some(VenueBalance::new(
+                    onchain_available,
+                    Usdc::new(Decimal::ZERO),
+                )),
+                offchain: Some(VenueBalance::new(
+                    offchain_available,
+                    Usdc::new(Decimal::ZERO),
+                )),
                 last_rebalancing: None,
             },
             ..self
@@ -637,8 +644,9 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
+    use st0x_finance::Usdc;
+
     use super::*;
-    use crate::threshold::Usdc;
     use crate::wrapper::RATIO_ONE;
 
     fn shares(amount: i64) -> FractionalShares {
@@ -851,8 +859,8 @@ mod tests {
 
     fn usdc_venue(available: i64, inflight: i64) -> VenueBalance<Usdc> {
         VenueBalance::new(
-            Usdc(Decimal::from(available)),
-            Usdc(Decimal::from(inflight)),
+            Usdc::new(Decimal::from(available)),
+            Usdc::new(Decimal::from(inflight)),
         )
     }
 

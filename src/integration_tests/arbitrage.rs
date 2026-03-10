@@ -601,38 +601,6 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
 ///
 /// Creates a `Projection` wired to the `StoreBuilder` so it receives event
 /// dispatches, while the same projection is returned for type-safe loading.
-fn test_assets_config() -> AssetsConfig {
-    let symbols = HashMap::from([
-        (
-            Symbol::new(TEST_AAPL).unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_id: None,
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        ),
-        (
-            Symbol::new(TEST_MSFT).unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_id: None,
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        ),
-    ]);
-
-    AssetsConfig {
-        equities: EquitiesConfig { symbols },
-        cash: None,
-    }
-}
-
 async fn create_test_cqrs(
     pool: &SqlitePool,
 ) -> (
@@ -642,7 +610,17 @@ async fn create_test_cqrs(
     Arc<Store<crate::offchain_order::OffchainOrder>>,
     Arc<Projection<OffchainOrder>>,
 ) {
-    create_test_cqrs_with_assets(pool, test_assets_config()).await
+    create_test_cqrs_with_assets(
+        pool,
+        AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                ..EquitiesConfig::default()
+            },
+            cash: None,
+        },
+    )
+    .await
 }
 
 async fn create_test_cqrs_with_assets(
@@ -2125,6 +2103,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     // 3 cycles of 1-share hedges to fully close.
     let assets = AssetsConfig {
         equities: EquitiesConfig {
+            operational_limit: None,
             symbols: HashMap::from([(
                 Symbol::new(TEST_AAPL).unwrap(),
                 EquityAssetConfig {
@@ -2301,6 +2280,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     // concurrent checker cycles.
     let assets = AssetsConfig {
         equities: EquitiesConfig {
+            operational_limit: None,
             symbols: HashMap::from([(
                 Symbol::new(TEST_AAPL).unwrap(),
                 EquityAssetConfig {

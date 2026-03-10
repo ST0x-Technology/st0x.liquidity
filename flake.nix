@@ -162,8 +162,7 @@
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
               ${infraPkgs.parseIdentity}
-              ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@" || exit $?
-              exec ${rekeySecrets}
+              ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@" && exec ${rekeySecrets}
             '';
           };
 
