@@ -148,13 +148,13 @@ async fn seed_event_queue(pool: &SqlitePool, queued_event: &QueuedEvent) -> i64 
     let block_number = i64::try_from(queued_event.block_number).unwrap();
     let event_data = serde_json::to_string(&queued_event.event).unwrap();
 
-    sqlx::query_scalar!(
+    sqlx::query_scalar(
         "INSERT INTO event_queue (tx_hash, log_index, block_number, event_data) VALUES (?, ?, ?, ?) RETURNING id",
-        tx_hash_str,
-        log_index,
-        block_number,
-        event_data
     )
+    .bind(&tx_hash_str)
+    .bind(log_index)
+    .bind(block_number)
+    .bind(&event_data)
     .fetch_one(pool)
     .await
     .unwrap()

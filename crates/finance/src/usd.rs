@@ -31,10 +31,14 @@ impl Usd {
         Decimal::from(cents).checked_div(dec!(100)).map(Self)
     }
 
-    /// Converts to cents, truncating any sub-cent precision.
-    /// Returns `None` if the result overflows `i64`.
+    /// Converts to cents. Returns `None` if the value has sub-cent
+    /// precision or if the result overflows `i64`.
     pub fn to_cents(self) -> Option<i64> {
-        self.0.checked_mul(dec!(100))?.trunc().to_i64()
+        let cents = self.0.checked_mul(dec!(100))?;
+        if !cents.fract().is_zero() {
+            return None;
+        }
+        cents.to_i64()
     }
 
     pub fn is_zero(self) -> bool {
@@ -238,9 +242,9 @@ mod tests {
     }
 
     #[test]
-    fn to_cents_truncates_sub_cent_precision() {
+    fn to_cents_rejects_sub_cent_precision() {
         let usd = Usd(Decimal::new(99999, 3)); // $99.999
-        assert_eq!(usd.to_cents().unwrap(), 9_999);
+        assert_eq!(usd.to_cents(), None);
     }
 
     #[test]

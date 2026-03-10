@@ -109,24 +109,6 @@ pub(crate) async fn poll_for_hedged_position(
     }
 }
 
-/// Counts rows in the `event_queue` table.
-pub(crate) async fn count_queued_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_queue")
-        .fetch_one(pool)
-        .await?;
-
-    Ok(row.0)
-}
-
-/// Counts processed rows in the `event_queue` table.
-pub(crate) async fn count_processed_queue_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_queue WHERE processed = 1")
-        .fetch_one(pool)
-        .await?;
-
-    Ok(row.0)
-}
-
 /// Comprehensive end-to-end assertions covering broker state, onchain
 /// vaults, and CQRS events/views for one or more symbols.
 ///

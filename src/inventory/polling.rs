@@ -11,11 +11,12 @@ use alloy::providers::RootProvider;
 use futures_util::future::try_join_all;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{Executor, InventoryResult};
+use st0x_finance::Usd;
 
 use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
@@ -36,7 +37,7 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
     SnapshotAggregate(#[from] SendError<InventorySnapshot>),
     #[error(transparent)]
-    VaultRegistry(#[from] SendError<VaultRegistry>),
+    VaultRegistry(#[from] Box<SendError<VaultRegistry>>),
     #[error(transparent)]
     Evm(#[from] EvmError),
     #[error(transparent)]
@@ -46,6 +47,8 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
         expected: Vec<Address>,
         actual: Vec<Address>,
     },
+    #[error("cash reserve {reserved} overflows when converting to cents")]
+    ReserveCentsOverflow { reserved: Usd },
 }
 
 pub(crate) struct WalletPollingConfig {
@@ -65,6 +68,7 @@ where
     order_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: WalletPollingConfig,
+    reserved_cash: Usd,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -80,6 +84,7 @@ where
         order_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
         wallet_polling: WalletPollingConfig,
+        reserved_cash: Usd,
     ) -> Self {
         Self {
             raindex_service,
@@ -89,6 +94,7 @@ where
             order_owner,
             snapshot,
             wallet_polling,
+            reserved_cash,
         }
     }
 
@@ -138,7 +144,11 @@ where
             owner: self.order_owner,
         };
 
-        Ok(self.vault_registry.load(&vault_registry_id).await?)
+        Ok(self
+            .vault_registry
+            .load(&vault_registry_id)
+            .await
+            .map_err(Box::new)?)
     }
 
     async fn poll_onchain_equity(
@@ -306,16 +316,43 @@ where
             )
             .await?;
 
+        let cash_balance_cents = self.apply_cash_reserve(inventory.cash_balance_cents)?;
+
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::OffchainCash {
-                    cash_balance_cents: inventory.cash_balance_cents,
-                },
+                InventorySnapshotCommand::OffchainCash { cash_balance_cents },
             )
             .await?;
 
         Ok(())
+    }
+
+    /// Subtracts the configured cash reserve from the raw broker balance,
+    /// flooring at zero if the reserve exceeds the balance.
+    fn apply_cash_reserve(
+        &self,
+        raw_balance_cents: i64,
+    ) -> Result<i64, InventoryPollingError<Exe::Error>> {
+        if self.reserved_cash.is_zero() {
+            return Ok(raw_balance_cents);
+        }
+
+        let reserve_cents =
+            self.reserved_cash
+                .to_cents()
+                .ok_or(InventoryPollingError::ReserveCentsOverflow {
+                    reserved: self.reserved_cash,
+                })?;
+
+        let available_cents = raw_balance_cents.saturating_sub(reserve_cents).max(0);
+
+        info!(
+            raw_balance_cents,
+            reserve_cents, available_cents, "Applied cash reserve to offchain balance"
+        );
+
+        Ok(available_cents)
     }
 }
 
@@ -335,6 +372,7 @@ mod tests {
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
+    use st0x_finance::HasZero;
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
@@ -497,6 +535,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -548,6 +587,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -595,6 +635,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -632,6 +673,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         // Should succeed without error
@@ -691,6 +733,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -742,6 +785,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -787,6 +831,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -884,6 +929,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -937,6 +983,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -991,6 +1038,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1043,6 +1091,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1078,6 +1127,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1154,6 +1204,7 @@ mod tests {
                 ethereum: Some(ethereum_wallet),
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1197,6 +1248,7 @@ mod tests {
                 ethereum: None,
                 base: Some(base_wallet),
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1236,6 +1288,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1276,6 +1329,7 @@ mod tests {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1319,6 +1373,7 @@ mod tests {
                 ethereum: Some(ethereum_wallet),
                 base: None,
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1349,6 +1404,7 @@ mod tests {
                 ethereum: None,
                 base: Some(base_wallet),
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();

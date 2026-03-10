@@ -28,8 +28,8 @@ use crate::{Evm, EvmError, Wallet};
 pub struct TurnkeyOrganizationId(String);
 
 impl TurnkeyOrganizationId {
-    pub fn new(value: String) -> Self {
-        Self(value)
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
@@ -40,8 +40,8 @@ impl TurnkeyOrganizationId {
 pub struct TurnkeyApiPrivateKey(String);
 
 impl TurnkeyApiPrivateKey {
-    pub fn new(value: String) -> Self {
-        Self(value)
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 

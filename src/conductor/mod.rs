@@ -2613,7 +2613,7 @@ mod tests {
     }
 
     async fn get_vault_registry_events(pool: &SqlitePool) -> Vec<String> {
-        sqlx::query_scalar!("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
+        sqlx::query_scalar("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
             .fetch_all(pool)
             .await
             .unwrap()
@@ -2770,8 +2770,8 @@ mod tests {
         }
         .to_string();
 
-        let aggregate_ids: Vec<String> = sqlx::query_scalar!(
-            "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'"
+        let aggregate_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'",
         )
         .fetch_all(&pool)
         .await

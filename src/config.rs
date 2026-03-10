@@ -20,7 +20,7 @@ use st0x_execution::{
     AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
     TimeInForce,
 };
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
@@ -69,6 +69,9 @@ pub struct CashAssetConfig {
     pub vault_id: Option<B256>,
     pub rebalancing: OperationMode,
     pub operational_limit: Option<Positive<Usdc>>,
+    /// USD amount subtracted from offchain cash to compute available balance.
+    /// Prevents the system from rebalancing funds that should remain untouched.
+    pub reserved: Option<Positive<Usd>>,
 }
 
 /// Equity assets configuration with an optional global operational limit.
@@ -1194,8 +1197,10 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+
+            [rebalancing.wallet]
+            type = "private-key"
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
         let error = Ctx::load_files(config.path(), secrets.path())

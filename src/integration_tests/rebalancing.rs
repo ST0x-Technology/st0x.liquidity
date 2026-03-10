@@ -135,6 +135,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
                 vault_id: None,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
+                reserved: None,
             }),
         },
         disabled_assets: HashSet::new(),
@@ -1223,6 +1224,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+            reserved: None,
         }),
     };
 
@@ -1353,6 +1355,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+            reserved: None,
         }),
     };
     let config = RebalancingTriggerConfig {
@@ -1471,6 +1474,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     vault_id: None,
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),
@@ -1530,6 +1534,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     vault_id: None,
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),

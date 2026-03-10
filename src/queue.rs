@@ -507,7 +507,7 @@ mod tests {
     async fn test_get_max_processed_block_only_unprocessed() {
         let pool = setup_test_db().await;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
             VALUES
@@ -527,7 +527,7 @@ mod tests {
     async fn test_get_max_processed_block_only_processed() {
         let pool = setup_test_db().await;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
             VALUES
@@ -548,7 +548,7 @@ mod tests {
     async fn test_get_max_processed_block_mixed_states() {
         let pool = setup_test_db().await;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
             VALUES
@@ -570,7 +570,7 @@ mod tests {
     async fn test_get_max_processed_block_zero_block() {
         let pool = setup_test_db().await;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
             VALUES
@@ -592,14 +592,14 @@ mod tests {
 
         let large_block: i64 = 999_999_999;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
             VALUES
                 ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, ?1, '{}', 1)
             "#,
-            large_block
         )
+        .bind(large_block)
         .execute(&pool)
         .await
         .unwrap();

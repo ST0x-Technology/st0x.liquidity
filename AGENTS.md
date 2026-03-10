@@ -28,7 +28,9 @@ the limit:
 - [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
   `::random()`, mocks, encoding, compile-time macros
 - [docs/cqrs.md](docs/cqrs.md) - Event sourcing with st0x-event-sorcery
-  (EventSourced trait, Store, Projection, testing, cqrs-es internals)
+  (EventSourced trait, Store, Projection, cqrs-es internals)
+- [docs/sqlx.md](docs/sqlx.md) - SQLx offline mode, query cache, worktree setup,
+  and known pitfalls
 
 **Update at the end:**
 

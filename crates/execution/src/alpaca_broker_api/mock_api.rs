@@ -244,6 +244,7 @@ impl AlpacaBrokerMock {
     pub async fn start(
         symbol_fill_prices: Vec<(Symbol, Decimal)>,
         symbol_positions: Vec<MockPosition>,
+        #[builder(default = Decimal::from(100_000))] initial_cash: Decimal,
     ) -> Self {
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
@@ -261,8 +262,8 @@ impl AlpacaBrokerMock {
 
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
-                cash: Decimal::from(100_000),
-                buying_power: Decimal::from(100_000),
+                cash: initial_cash,
+                buying_power: initial_cash,
                 positions,
             },
             orders: HashMap::new(),

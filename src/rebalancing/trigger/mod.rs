@@ -1328,6 +1328,7 @@ mod tests {
                     vault_id: None,
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),

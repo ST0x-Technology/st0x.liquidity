@@ -96,9 +96,13 @@ export const completedStages = (transfer: TransferOperation): StageEntry[] =>
 
 
 
+
 const usdcBridgeLinks = (status: UsdcBridgeStatus, direction: UsdcDirection): TxLink[] => {
-  const burnExplorer = direction === 'alpaca_to_base' ? ETH_EXPLORER : BASE_EXPLORER
-  const mintExplorer = direction === 'alpaca_to_base' ? BASE_EXPLORER : ETH_EXPLORER
+  const explorers: Record<UsdcDirection, { burn: string; mint: string }> = {
+    alpaca_to_base: { burn: ETH_EXPLORER, mint: BASE_EXPLORER },
+    base_to_alpaca: { burn: BASE_EXPLORER, mint: ETH_EXPLORER },
+  }
+  const { burn: burnExplorer, mint: mintExplorer } = explorers[direction]
 
   const burnLink = (hash: string): TxLink => ({ label: 'burn', hash, url: `${burnExplorer}/${hash}` })
   const mintLink = (hash: string): TxLink => ({ label: 'mint', hash, url: `${mintExplorer}/${hash}` })

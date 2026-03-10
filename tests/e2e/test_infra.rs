@@ -49,7 +49,10 @@ impl<P> TestInfra<P> {
                     rebalancing: OperationMode::Disabled,
                     operational_limit: None,
                 };
-                (Symbol::new(symbol.clone()).unwrap(), config)
+                let Ok(symbol_key) = Symbol::new(symbol.clone()) else {
+                    panic!("Invalid test symbol: {symbol}");
+                };
+                (symbol_key, config)
             })
             .collect();
 

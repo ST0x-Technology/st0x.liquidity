@@ -13,6 +13,7 @@ use tracing::info;
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::{ReadOnlyEvm, Wallet};
 use st0x_execution::Executor;
+use st0x_finance::{HasZero, Positive, Usd};
 
 use super::{
     Conductor, EventProcessingError, TradingTasks, spawn_event_processor, spawn_inventory_poller,
@@ -196,6 +197,15 @@ where
             order_owner,
         ));
 
+        let reserved_cash = self
+            .common
+            .ctx
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.reserved)
+            .map_or(Usd::ZERO, Positive::inner);
+
         let polling_service = InventoryPollingService::new(
             raindex_service,
             self.common.executor.clone(),
@@ -204,6 +214,7 @@ where
             order_owner,
             self.common.frameworks.snapshot,
             self.state.wallet_polling,
+            reserved_cash,
         );
         let inventory_poller = Some(spawn_inventory_poller(
             polling_service,
