@@ -1448,3 +1448,161 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
     bot2.abort();
     Ok(())
 }
+
+/// Verifies crash recovery: an order that was `Submitted` before the bot
+/// crashed is picked up and polled to completion after restart.
+///
+/// The broker is configured with a high fill delay so the order stays
+/// pending during the first bot lifetime. After aborting the bot and
+/// removing the delay, a fresh bot instance picks up the order and
+/// processes the fill.
+#[test_log::test(tokio::test)]
+async fn crash_recovery_resumes_submitted_orders() -> anyhow::Result<()> {
+    let onchain_price = dec!(155.00);
+    let broker_fill_price = dec!(150.25);
+    let trade_amount = dec!(5.0);
+
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+
+    // High delay so the order stays "new" (pending) during first bot run
+    infra
+        .broker_service
+        .set_symbol_fill_delay(Symbol::new("AAPL")?, 100);
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    infra
+        .base_chain
+        .take_order()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    // Wait for order placement (Submitted), but not fill
+    poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Submitted", 1).await;
+
+    // Kill the bot before fill completes
+    bot.abort();
+    let _ = bot.await;
+
+    // Remove the delay so next poll returns filled
+    infra
+        .broker_service
+        .set_symbol_fill_delay(Symbol::new("AAPL")?, 0);
+
+    // Restart with the same database
+    let ctx2 = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .call()?;
+    let mut bot2 = spawn_bot(ctx2);
+
+    // The restarted bot should discover the Submitted order and poll it to filled
+    poll_for_events(&mut bot2, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+
+    // Verify position is fully hedged
+    poll_for_hedged_position(&mut bot2, &infra.db_path, "AAPL").await;
+
+    bot2.abort();
+    Ok(())
+}
+
+/// Verifies that two submitted orders are polled independently.
+///
+/// AAPL is configured with a high fill delay while TSLA fills
+/// immediately. With per-order job isolation, TSLA's fill should not be
+/// blocked by AAPL's pending status. This test documents the desired
+/// behavior for the apalis job-based poller.
+#[test_log::test(tokio::test)]
+async fn order_polling_independence() -> anyhow::Result<()> {
+    let onchain_price = dec!(155.00);
+    let aapl_broker = dec!(150.25);
+    let tsla_broker = dec!(245.00);
+    let trade_amount = dec!(5.0);
+
+    let infra =
+        TestInfra::start(vec![("AAPL", aapl_broker), ("TSLA", tsla_broker)], vec![]).await?;
+
+    // AAPL stays pending for many polls; TSLA fills immediately
+    infra
+        .broker_service
+        .set_symbol_fill_delay(Symbol::new("AAPL")?, 100);
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Submit both trades
+    infra
+        .base_chain
+        .take_order()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    infra
+        .base_chain
+        .take_order()
+        .symbol("TSLA")
+        .amount(trade_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    // Both should be submitted to the broker
+    poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Submitted", 2).await;
+
+    // TSLA should fill promptly even though AAPL is stuck pending.
+    // With per-order jobs this is guaranteed; with the sequential poller
+    // it still works (mock returns instantly) but would fail with a truly
+    // blocking broker call.
+    poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+
+    // Verify TSLA filled (not AAPL)
+    let pool = connect_db(&infra.db_path).await?;
+    let tsla_hedged = {
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection
+            .load(&Symbol::new("TSLA")?)
+            .await?
+            .is_some_and(|position| position.net == FractionalShares::ZERO)
+    };
+    pool.close().await;
+
+    assert!(
+        tsla_hedged,
+        "TSLA should be fully hedged while AAPL is still pending"
+    );
+
+    bot.abort();
+    Ok(())
+}

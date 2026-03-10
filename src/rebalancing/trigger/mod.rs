@@ -3454,7 +3454,7 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
-        // Regression: when liquidity_venue_ratio.cash is None, startup must
+        // Regression: when usdc threshold is None, startup must
         // not require assets.cash.vault_id. The trigger returns no USDC
         // rebalancing params, so no USDC vault lookup occurs.
         let (sender, _receiver) = mpsc::channel(10);
@@ -3464,13 +3464,11 @@ mod tests {
 
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                liquidity_venue_ratio: LiquidityVenueRatio {
-                    equities: ImbalanceThreshold {
-                        target: dec!(0.5),
-                        deviation: dec!(0.2),
-                    },
-                    cash: None,
+                equity: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
                 },
+                usdc: None,
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,

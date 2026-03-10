@@ -15,6 +15,8 @@ use st0x_event_sorcery::Store;
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
+use tokio::sync::Mutex;
+
 use super::job::{Job, Label};
 use super::order_fill_monitor::OrderFillJob;
 use super::{
@@ -22,6 +24,7 @@ use super::{
     discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::Ctx;
+use crate::offchain::order_status_ctx::PollOrderStatusQueue;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
@@ -43,6 +46,7 @@ pub(crate) struct OrderFillCtx<P, E> {
     pub(crate) cqrs: TradeProcessingCqrs,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
     pub(crate) executor: E,
+    pub(crate) poll_queue: Mutex<PollOrderStatusQueue>,
 }
 
 impl<P, E> Job<OrderFillCtx<P, E>> for OrderFillJob
@@ -115,6 +119,7 @@ where
             queued_event,
             trade,
             &ctx.cqrs,
+            &ctx.poll_queue,
             trading_enabled,
         )
         .await?;

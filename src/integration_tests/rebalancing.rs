@@ -1024,7 +1024,11 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
 async fn usdc_none_disables_usdc_rebalancing() {
     let pool = setup_test_db().await;
 
-    let inventory = Arc::new(RwLock::new(InventoryView::default()));
+    let (inventory_sender, _) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
+        InventoryView::default(),
+        inventory_sender,
+    ));
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,

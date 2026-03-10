@@ -33,12 +33,14 @@ use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, OrderBook, Parser, Store as RainStore,
     TOFUTokenDecimals,
 };
+use crate::conductor::job::Job;
 use crate::conductor::{
     OrderFillError, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
-use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
+use crate::offchain::order_status_ctx::{OrderStatusCtx, PollOrderStatusQueue};
+use crate::offchain::poll_order_status::PollOrderStatus;
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
@@ -110,6 +112,7 @@ impl AnvilTrade {
     async fn submit(
         &self,
         cqrs: &TradeProcessingCqrs,
+        poll_queue: &tokio::sync::Mutex<PollOrderStatusQueue>,
     ) -> Result<Option<OffchainOrderId>, OrderFillError> {
         let executor = MockExecutor::default();
         process_queued_trade(
@@ -117,27 +120,74 @@ impl AnvilTrade {
             &self.queued_event,
             self.trade.clone(),
             cqrs,
+            poll_queue,
             true,
         )
         .await
     }
 }
 
-/// Creates a poller with the default MockExecutor (returns Filled) and polls pending orders.
-async fn poll_and_fill(
+/// Queries the projection for submitted orders and executes each as a
+/// [`PollOrderStatus`] job using the given executor.
+async fn poll_submitted_orders(
+    pool: &SqlitePool,
+    executor: MockExecutor,
     offchain_order_projection: &Projection<OffchainOrder>,
-    offchain_order: &Arc<Store<crate::offchain_order::OffchainOrder>>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
     position: &Arc<Store<Position>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let poller = OrderStatusPoller::new(
-        OrderPollerCtx::default(),
-        MockExecutor::new(),
-        offchain_order_projection.clone(),
-        offchain_order.clone(),
-        position.clone(),
-    );
-    poller.poll_pending_orders().await?;
+    let submitted = offchain_order_projection
+        .filter(
+            st0x_event_sorcery::Column("status"),
+            &st0x_execution::OrderStatus::Submitted,
+        )
+        .await?;
+
+    crate::conductor::setup_apalis_tables(pool).await?;
+
+    let ctx = OrderStatusCtx {
+        executor,
+        offchain_order: offchain_order.clone(),
+        position: position.clone(),
+        poll_queue: tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(pool)),
+        poll_interval: std::time::Duration::from_secs(1),
+    };
+
+    for (offchain_order_id, order) in submitted {
+        let Some(executor_order_id) = order.executor_order_id() else {
+            continue;
+        };
+
+        let job = PollOrderStatus {
+            offchain_order_id,
+            executor_order_id: executor_order_id.clone(),
+            symbol: order.symbol().clone(),
+            shares: order.shares(),
+            direction: order.direction(),
+        };
+
+        job.execute(&ctx).await?;
+    }
+
     Ok(())
+}
+
+/// Polls all submitted orders and fills them using the default
+/// [`MockExecutor`] (returns `OrderState::Filled`).
+async fn poll_and_fill(
+    pool: &SqlitePool,
+    offchain_order_projection: &Projection<OffchainOrder>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
+    position: &Arc<Store<Position>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    poll_submitted_orders(
+        pool,
+        MockExecutor::new(),
+        offchain_order_projection,
+        offchain_order,
+        position,
+    )
+    .await
 }
 
 /// Holds a deployed Rain OrderBook on a local Anvil node, ready to create real take-order events.
@@ -630,6 +680,8 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let pool = setup_test_db().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Checkpoint 1: before any trades -- no Position aggregate exists
@@ -645,7 +697,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
+    let result1 = trade1.submit(&cqrs, &poll_queue).await?;
     assert!(
         result1.is_none(),
         "No execution should be created below threshold"
@@ -680,7 +732,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .await;
     let trade2_agg = trade2.aggregate_id();
     let order_id = trade2
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("Threshold crossed, should return OffchainOrderId");
     let order_id_str = order_id.to_string();
@@ -739,7 +791,13 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     assert_eq!(offchain_placed["shares"].as_str().unwrap(), "1.2");
 
     // Fulfillment: order poller detects the filled order and completes the lifecycle
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -776,6 +834,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let pool = setup_test_db().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Two trades: 0.5 + 0.7 = 1.2 shares, crosses threshold
@@ -788,7 +848,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    trade1.submit(&cqrs).await?;
+    trade1.submit(&cqrs, &poll_queue).await?;
 
     let trade2 = orderbook
         .take_order()
@@ -799,7 +859,10 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade2
+        .submit(&cqrs, &poll_queue)
+        .await?
+        .expect("Threshold crossed");
     let order_id_str = order_id.to_string();
 
     // Poller discovers the broker FAILED the order
@@ -807,14 +870,13 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected order".to_string()),
     });
-    OrderStatusPoller::new(
-        OrderPollerCtx::default(),
+    poll_submitted_orders(
+        &pool,
         failed_executor,
-        offchain_order_projection.as_ref().clone(),
-        offchain_order.clone(),
-        position.clone(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
     )
-    .poll_pending_orders()
     .await?;
 
     // After failure: pending cleared, position still has net exposure
@@ -857,6 +919,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         &position,
         &position_query,
         &offchain_order,
+        &poll_queue,
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
             equities: EquitiesConfig::default(),
@@ -866,7 +929,13 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     )
     .await?;
 
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     // Final: position fully hedged
     assert_position()
@@ -911,6 +980,8 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let pool = setup_test_db().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let aapl = Symbol::new(TEST_AAPL).unwrap();
     let msft = Symbol::new(TEST_MSFT).unwrap();
 
@@ -936,7 +1007,10 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let trade2_agg = trade2.aggregate_id();
 
     // Submit both below-threshold trades concurrently (different symbols)
-    let (aapl_result, msft_result) = tokio::join!(trade1.submit(&cqrs), trade2.submit(&cqrs));
+    let (aapl_result, msft_result) = tokio::join!(
+        trade1.submit(&cqrs, &poll_queue),
+        trade2.submit(&cqrs, &poll_queue)
+    );
     assert!(aapl_result?.is_none());
     assert!(msft_result?.is_none());
 
@@ -950,7 +1024,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let trade3_agg = trade3.aggregate_id();
     let aapl_order_id = trade3
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("AAPL 1.2 crosses threshold");
     let aapl_order_str = aapl_order_id.to_string();
@@ -1033,7 +1107,13 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(aapl_placed["shares"].as_str().unwrap(), "1.2");
 
     // Poll and fill AAPL, verify MSFT unchanged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1077,7 +1157,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let trade4_agg = trade4.aggregate_id();
     let msft_order_id = trade4
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("MSFT 1.0 hits threshold");
     let msft_order_str = msft_order_id.to_string();
@@ -1121,7 +1201,13 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(msft_placed["shares"].as_str().unwrap(), "1.0");
 
     // Poll and fill MSFT, both positions end fully hedged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1165,6 +1251,8 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let pool = setup_test_db().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.5 shares, below threshold
@@ -1177,7 +1265,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
+    let result1 = trade1.submit(&cqrs, &poll_queue).await?;
     assert!(result1.is_none(), "Below threshold");
 
     assert_position()
@@ -1201,7 +1289,10 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade2
+        .submit(&cqrs, &poll_queue)
+        .await?
+        .expect("Threshold crossed");
     let order_id_str = order_id.to_string();
 
     assert_position()
@@ -1257,7 +1348,13 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     );
 
     // Fill the hedge order
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1285,6 +1382,8 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
     let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let trade1 = orderbook
@@ -1297,7 +1396,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("Exactly 1.0 should cross whole-share threshold");
 
@@ -1355,6 +1454,8 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
     let pool = setup_test_db().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
     // Complete a full hedge cycle so position net=0
     let trade1 = orderbook
@@ -1365,8 +1466,17 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.submit(&cqrs).await?.expect("Threshold crossed");
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    trade1
+        .submit(&cqrs, &poll_queue)
+        .await?
+        .expect("Threshold crossed");
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     let events_before = fetch_events(&pool).await;
 
@@ -1376,6 +1486,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         &position,
         &position_query,
         &offchain_order,
+        &poll_queue,
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
             equities: EquitiesConfig::default(),
@@ -1403,6 +1514,8 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let pool = setup_test_db().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // First cycle: 1.0 share sell -> hedge -> fill
@@ -1416,10 +1529,16 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order1 = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("First threshold crossing");
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1443,7 +1562,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .await;
     let trade2_agg = trade2.aggregate_id();
     let order2 = trade2
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("Second threshold crossing");
     assert_ne!(order1, order2, "Second cycle should create a new order");
@@ -1459,7 +1578,13 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
 
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1512,6 +1637,8 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
     let (cqrs, _, _, _, _) = create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
     let trade1 = orderbook
         .take_order()
@@ -1521,7 +1648,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.submit(&cqrs).await?;
+    trade1.submit(&cqrs, &poll_queue).await?;
 
     // Run vault discovery using the same trade data
     let vault_registry = test_store(pool.clone(), ());
@@ -1602,6 +1729,8 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
     let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let trade1 = orderbook
@@ -1613,7 +1742,7 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result = trade1.submit(&cqrs).await?;
+    let result = trade1.submit(&cqrs, &poll_queue).await?;
     assert!(result.is_none(), "Tiny trade should not trigger execution");
 
     assert_position()
@@ -1647,6 +1776,8 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
     let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let trade1 = orderbook
@@ -1659,7 +1790,7 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("500 shares should immediately cross threshold");
 
@@ -1704,6 +1835,8 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let pool = setup_test_db().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.8 AAPL -> net=+0.8, below threshold
@@ -1716,7 +1849,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    assert!(trade1.submit(&cqrs).await?.is_none());
+    assert!(trade1.submit(&cqrs, &poll_queue).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -1739,7 +1872,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    assert!(trade2.submit(&cqrs).await?.is_none());
+    assert!(trade2.submit(&cqrs, &poll_queue).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -1762,7 +1895,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade3_agg = trade3.aggregate_id();
-    assert!(trade3.submit(&cqrs).await?.is_none());
+    assert!(trade3.submit(&cqrs, &poll_queue).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -1786,7 +1919,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .await;
     let trade4_agg = trade4.aggregate_id();
     let order_id = trade4
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("Net -1.1 crosses threshold");
     let order_id_str = order_id.to_string();
@@ -1832,7 +1965,13 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     assert_eq!(placed["shares"].as_str().unwrap(), "1.1");
 
     // Fill the hedge and verify net returns to zero
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1855,6 +1994,8 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
     let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Sell 1.5 AAPL -> crosses threshold, offchain order placed
@@ -1868,7 +2009,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("1.5 shares crosses threshold");
     let order_id_str = order_id.to_string();
@@ -1894,7 +2035,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let result2 = trade2.submit(&cqrs).await?;
+    let result2 = trade2.submit(&cqrs, &poll_queue).await?;
     assert!(
         result2.is_none(),
         "No new offchain order while one is pending"
@@ -1967,6 +2108,8 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs_with_assets(&pool, assets.clone()).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 3-share sell -> net = -3
@@ -1979,7 +2122,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         .call()
         .await;
     let order1 = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("3 shares crosses threshold");
 
@@ -2007,7 +2150,13 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     );
 
     // Fill first order -> net becomes -2
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -2026,6 +2175,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &position,
         &position_query,
         &offchain_order,
+        &poll_queue,
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2047,7 +2197,13 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     );
 
     // Fill second order -> net becomes -1
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     // Cycle 3: 1 remaining share, still capped to 1 (but matches)
     check_and_execute_accumulated_positions(
@@ -2055,6 +2211,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &position,
         &position_query,
         &offchain_order,
+        &poll_queue,
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2076,7 +2233,13 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     );
 
     // Fill third order -> fully hedged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -2096,6 +2259,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &position,
         &position_query,
         &offchain_order,
+        &poll_queue,
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2144,6 +2308,8 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
         create_test_cqrs_with_assets(&pool, assets.clone()).await;
+    let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+        tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 5-share sell -> net = -5, capped to 2 shares by max_shares
@@ -2156,7 +2322,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         .call()
         .await;
     let order1 = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &poll_queue)
         .await?
         .expect("5 shares crosses threshold");
 
@@ -2188,14 +2354,13 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected".to_string()),
     });
-    OrderStatusPoller::new(
-        OrderPollerCtx::default(),
+    poll_submitted_orders(
+        &pool,
         failed_executor,
-        offchain_order_projection.as_ref().clone(),
-        offchain_order.clone(),
-        position.clone(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
     )
-    .poll_pending_orders()
     .await?;
 
     // Pending cleared after failure, position still has -5 net
@@ -2216,6 +2381,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &position,
         &position_query,
         &offchain_order,
+        &poll_queue,
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2249,6 +2415,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &position,
         &position_query,
         &offchain_order,
+        &poll_queue,
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2262,7 +2429,13 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     );
 
     // Fill the retry -> net becomes -3
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_and_fill(
+        &pool,
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
