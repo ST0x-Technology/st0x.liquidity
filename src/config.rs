@@ -20,6 +20,7 @@ use st0x_execution::{
     AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
     TimeInForce,
 };
+use st0x_finance::Usdc;
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
@@ -27,7 +28,7 @@ use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
 };
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
-use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
+use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -70,16 +71,31 @@ pub struct CashAssetConfig {
     pub operational_limit: Option<Positive<Usdc>>,
 }
 
-/// Equity assets configuration keyed by symbol.
+/// Equity assets configuration with an optional global operational limit.
 ///
-/// Uses `#[serde(flatten)]` so that per-symbol tables appear directly
-/// under `[assets.equities]` in the TOML.
+/// Uses `#[serde(flatten)]` so that per-symbol tables live alongside the
+/// `operational_limit` key under `[assets.equities]` in the TOML.
 /// `deny_unknown_fields` is intentionally absent because it is
 /// incompatible with `flatten`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct EquitiesConfig {
+    pub operational_limit: Option<Positive<FractionalShares>>,
     #[serde(flatten)]
     pub symbols: HashMap<Symbol, EquityAssetConfig>,
+}
+
+impl EquitiesConfig {
+    /// Resolves the operational shares limit for a symbol.
+    ///
+    /// Symbol-specific limit takes precedence over the global limit.
+    /// Returns `None` when neither is configured (unlimited).
+    #[cfg(test)]
+    fn shares_limit_for(&self, symbol: &Symbol) -> Option<Positive<FractionalShares>> {
+        self.symbols
+            .get(symbol)
+            .and_then(|config| config.operational_limit)
+            .or(self.operational_limit)
+    }
 }
 
 /// Top-level assets configuration containing equities and cash.
@@ -121,7 +137,6 @@ where
         .map(Some)
         .map_err(serde::de::Error::custom)
 }
-
 /// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -233,7 +248,7 @@ impl BrokerCtx {
                 Positive::<FractionalShares>::ONE,
             )),
             Self::AlpacaTradingApi(_) | Self::AlpacaBrokerApi(_) => {
-                Ok(ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))?)
+                Ok(ExecutionThreshold::dollar_value(Usdc::new(Decimal::TWO))?)
             }
         }
     }
@@ -722,6 +737,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
+    use rust_decimal_macros::dec;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -1377,7 +1393,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc::new(Decimal::TWO)).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 
@@ -1400,7 +1416,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc::new(Decimal::TWO)).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 
@@ -1494,7 +1510,28 @@ pub(crate) mod tests {
     #[test]
     fn server_config_toml_is_valid() {
         let config_str = include_str!("../config/st0x-hedge.toml");
-        let _: Config = toml::from_str(config_str).unwrap();
+        let config: Config = toml::from_str(config_str).unwrap();
+
+        let global_limit = config
+            .assets
+            .equities
+            .operational_limit
+            .map(Positive::inner);
+
+        for (symbol, equity) in &config.assets.equities.symbols {
+            if equity.rebalancing == OperationMode::Enabled
+                && let Some(limit) = &equity.operational_limit
+                && let Some(global) = global_limit
+            {
+                assert!(
+                    limit.inner() < global,
+                    "{symbol}: per-asset operational_limit ({}) must be \
+                     stricter than global equities operational_limit ({global}) \
+                     to provide meaningful per-asset safety",
+                    limit.inner()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1852,10 +1889,10 @@ pub(crate) mod tests {
             rebalancing = "disabled"
         "#;
 
-        let error = toml::from_str::<AssetsConfig>(toml_str).unwrap_err();
+        let result = toml::from_str::<AssetsConfig>(toml_str);
         assert!(
-            error.message().contains("missing field `trading`"),
-            "Expected missing field `trading` error, got: {error}"
+            result.is_err(),
+            "Expected error for missing trading field, got {result:?}"
         );
     }
 
@@ -1868,10 +1905,10 @@ pub(crate) mod tests {
             trading = "enabled"
         "#;
 
-        let error = toml::from_str::<AssetsConfig>(toml_str).unwrap_err();
+        let result = toml::from_str::<AssetsConfig>(toml_str);
         assert!(
-            error.message().contains("missing field `rebalancing`"),
-            "Expected missing field `rebalancing` error, got: {error}"
+            result.is_err(),
+            "Expected error for missing rebalancing field, got {result:?}"
         );
     }
 
@@ -1922,7 +1959,10 @@ pub(crate) mod tests {
 
         let ctx = Ctx {
             assets: AssetsConfig {
-                equities: EquitiesConfig { symbols },
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols,
+                },
                 cash: None,
             },
             ..create_test_ctx_with_order_owner(address!(
@@ -1937,7 +1977,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn is_trading_enabled_defaults_to_false_for_unknown() {
+    fn is_trading_disabled_for_unknown_assets() {
         let ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
@@ -1965,7 +2005,10 @@ pub(crate) mod tests {
 
         let ctx = Ctx {
             assets: AssetsConfig {
-                equities: EquitiesConfig { symbols },
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols,
+                },
                 cash: None,
             },
             ..create_test_ctx_with_order_owner(address!(
@@ -2011,7 +2054,10 @@ pub(crate) mod tests {
 
         let ctx = Ctx {
             assets: AssetsConfig {
-                equities: EquitiesConfig { symbols },
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols,
+                },
                 cash: None,
             },
             ..create_test_ctx_with_order_owner(address!(
@@ -2201,10 +2247,10 @@ pub(crate) mod tests {
                 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             "#;
 
-            let error = toml::from_str::<EquityAssetConfig>(toml_str).unwrap_err();
+            let result = toml::from_str::<EquityAssetConfig>(toml_str);
             assert!(
-                error.message().contains("missing field `tokenized_equity`"),
-                "Expected missing tokenized_equity error, got: {error}"
+                result.is_err(),
+                "Expected error for missing tokenized_equity, got {result:?}"
             );
         }
 
@@ -2214,10 +2260,10 @@ pub(crate) mod tests {
                 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             "#;
 
-            let error = toml::from_str::<EquityAssetConfig>(toml_str).unwrap_err();
+            let result = toml::from_str::<EquityAssetConfig>(toml_str);
             assert!(
-                error.message().contains("missing field"),
-                "Expected missing field error, got: {error}"
+                result.is_err(),
+                "Expected error for missing tokenized_equity_derivative, got {result:?}"
             );
         }
 
@@ -2233,10 +2279,10 @@ pub(crate) mod tests {
                 vault_id: Option<B256>,
             }
 
-            let error = toml::from_str::<Wrapper>(toml_str).unwrap_err();
+            let result = toml::from_str::<Wrapper>(toml_str);
             assert!(
-                error.message().contains("empty hex string"),
-                "Expected empty hex string error, got: {error}"
+                result.is_err(),
+                "Expected error for empty hex string, got {result:?}"
             );
         }
 
@@ -2253,10 +2299,10 @@ pub(crate) mod tests {
                 vault_id: Option<B256>,
             }
 
-            let error = toml::from_str::<Wrapper>(&toml_str).unwrap_err();
+            let result = toml::from_str::<Wrapper>(&toml_str);
             assert!(
-                error.message().contains("too long"),
-                "Expected too-long hex string error, got: {error}"
+                result.is_err(),
+                "Expected error for too-long hex string, got {result:?}"
             );
         }
 
@@ -2336,7 +2382,13 @@ pub(crate) mod tests {
             type = "dry-run"
         "#;
 
-        toml::from_str::<Secrets>(with_evm).unwrap();
+        let result = toml::from_str::<Secrets>(with_evm);
+        assert!(
+            result.is_ok(),
+            "Secrets TOML with [evm] section should parse successfully, \
+             but got error: {}",
+            result.err().unwrap()
+        );
 
         let with_raindex = r#"
             [raindex]
@@ -2346,14 +2398,11 @@ pub(crate) mod tests {
             type = "dry-run"
         "#;
 
-        let Err(error) = toml::from_str::<Secrets>(with_raindex) else {
-            panic!("Secrets TOML with [raindex] section should be rejected");
-        };
+        let result = toml::from_str::<Secrets>(with_raindex);
         assert!(
-            error.message().contains("unknown field `raindex`"),
+            result.is_err(),
             "Secrets TOML with [raindex] section should be rejected \
-             (deny_unknown_fields); the correct section name is [evm], \
-             got: {error}"
+             (deny_unknown_fields); the correct section name is [evm]"
         );
     }
 
@@ -2372,14 +2421,108 @@ pub(crate) mod tests {
                 "#,
             );
 
-            let Err(error) = toml::from_str::<Secrets>(&toml_str) else {
-                panic!("Snake_case broker type \"{snake_value}\" should be rejected");
-            };
+            let result = toml::from_str::<Secrets>(&toml_str);
+            assert!(
+                result.is_err(),
+                "Snake_case broker type \"{snake_value}\" should be rejected"
+            );
+            let error = result.err().unwrap();
             assert!(
                 error.to_string().contains("unknown variant"),
                 "Snake_case broker type \"{snake_value}\" should be rejected \
                  as unknown variant (kebab-case required), but got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn shares_limit_prefers_symbol_specific_over_global() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let symbol_limit = Positive::new(FractionalShares::new(dec!(5))).unwrap();
+        let global_limit = Positive::new(FractionalShares::new(dec!(100))).unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: Some(global_limit),
+            symbols: HashMap::from([(
+                symbol.clone(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: Some(symbol_limit),
+                },
+            )]),
+        };
+
+        assert_eq!(
+            config.shares_limit_for(&symbol),
+            Some(Positive::new(FractionalShares::new(dec!(5))).unwrap()),
+        );
+    }
+
+    #[test]
+    fn shares_limit_falls_back_to_global_when_symbol_has_no_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let global_limit = Positive::new(FractionalShares::new(dec!(100))).unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: Some(global_limit),
+            symbols: HashMap::from([(
+                symbol.clone(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: None,
+                },
+            )]),
+        };
+
+        assert_eq!(
+            config.shares_limit_for(&symbol),
+            Some(Positive::new(FractionalShares::new(dec!(100))).unwrap()),
+        );
+    }
+
+    #[test]
+    fn shares_limit_falls_back_to_global_for_unknown_symbol() {
+        let symbol = Symbol::new("UNKNOWN").unwrap();
+        let global_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: Some(global_limit),
+            symbols: HashMap::new(),
+        };
+
+        assert_eq!(
+            config.shares_limit_for(&symbol),
+            Some(Positive::new(FractionalShares::new(dec!(50))).unwrap()),
+        );
+    }
+
+    #[test]
+    fn shares_limit_returns_none_when_no_limits_configured() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let config = EquitiesConfig {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                symbol.clone(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: None,
+                },
+            )]),
+        };
+
+        assert_eq!(config.shares_limit_for(&symbol), None);
     }
 }

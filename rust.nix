@@ -124,6 +124,7 @@ in {
   clippy = craneLib.cargoClippy (commonArgs // {
     inherit cargoArtifacts;
     preBuild = sqlxSetup;
-    cargoClippyExtraArgs = "--workspace --all-targets --all-features";
+    cargoClippyExtraArgs =
+      "--workspace --all-targets --all-features -- -D warnings";
   });
 }

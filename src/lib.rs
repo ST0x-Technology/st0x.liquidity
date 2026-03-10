@@ -55,7 +55,7 @@ pub use config::{AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfi
 #[cfg(any(test, feature = "test-support"))]
 pub use inventory::ImbalanceThreshold;
 #[cfg(any(test, feature = "test-support"))]
-pub use offchain_order::{Dollars, OffchainOrder, OffchainOrderId};
+pub use offchain_order::{OffchainOrder, OffchainOrderId};
 #[cfg(any(test, feature = "test-support"))]
 pub use position::Position;
 #[cfg(any(test, feature = "test-support"))]

@@ -8,10 +8,10 @@ use thiserror::Error;
 
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::OpenChainErrorRegistry;
+use st0x_finance::Usdc;
 
 use crate::config::Ctx;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistry;
 
 pub(super) struct Deposit {
@@ -31,12 +31,6 @@ pub(crate) enum VaultCliError {
 
     #[error("failed to parse scaled amount as U256")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
-
-    #[error(
-        "assets.cash.vault_id is required for USDC withdrawal \
-         but not configured"
-    )]
-    MissingCashVaultId,
 }
 
 fn decimal_to_u256(amount: Decimal, decimals: u8) -> Result<U256, VaultCliError> {
@@ -121,7 +115,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         .cash
         .as_ref()
         .and_then(|cash| cash.vault_id)
-        .ok_or(VaultCliError::MissingCashVaultId)?;
+        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
 
     writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
 
@@ -158,9 +152,17 @@ mod tests {
     use std::str::FromStr;
     use url::Url;
 
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use st0x_finance::Usdc;
+
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
+    use crate::config::{
+        AssetsConfig, BrokerCtx, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode,
+        TradingMode,
+    };
+    use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
+    use crate::rebalancing::RebalancingCtx;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_rebalancing() -> Ctx {
@@ -186,6 +188,53 @@ mod tests {
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
+            },
+        }
+    }
+
+    fn create_ctx_with_rebalancing(cash: Option<CashAssetConfig>) -> Ctx {
+        let alpaca_broker_auth = AlpacaBrokerApiCtx {
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+        };
+
+        Ctx {
+            database_url: ":memory:".to_string(),
+            log_level: LogLevel::Debug,
+            server_port: 8080,
+            evm: EvmCtx {
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                orderbook: address!("0x1234567890123456789012345678901234567890"),
+                deployment_block: 1,
+            },
+            order_polling_interval: 15,
+            order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
+            broker: BrokerCtx::DryRun,
+            telemetry: None,
+            trading_mode: TradingMode::Rebalancing(Box::new(
+                RebalancingCtx::stub()
+                    .equity(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.1),
+                    })
+                    .usdc(ImbalanceThreshold {
+                        target: dec!(0.5),
+                        deviation: dec!(0.1),
+                    })
+                    .redemption_wallet(Address::ZERO)
+                    .alpaca_broker_auth(alpaca_broker_auth)
+                    .call(),
+            )),
+            execution_threshold: ExecutionThreshold::whole_share(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash,
             },
         }
     }
@@ -224,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc::new(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
         let result = vault_withdraw_command(
@@ -272,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("250.25").unwrap());
+        let amount = Usdc::new(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
         vault_withdraw_command(
@@ -317,5 +366,82 @@ mod tests {
         let amount = Decimal::ZERO;
         let result = decimal_to_u256(amount, 6).unwrap();
         assert_eq!(result, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn withdraw_fails_when_cash_vault_id_missing() {
+        let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
+            vault_id: None,
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        }));
+        let amount = Usdc::new(dec!(100));
+
+        let mut stdout = Vec::new();
+        let err_msg = vault_withdraw_command(
+            &mut stdout,
+            amount,
+            &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err_msg.contains("assets.cash.vault_id is required but not configured"),
+            "Expected vault_id missing error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_fails_when_cash_config_missing() {
+        let ctx = create_ctx_with_rebalancing(None);
+        let amount = Usdc::new(dec!(100));
+
+        let mut stdout = Vec::new();
+        let err_msg = vault_withdraw_command(
+            &mut stdout,
+            amount,
+            &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err_msg.contains("assets.cash.vault_id is required but not configured"),
+            "Expected vault_id missing error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_passes_cash_vault_lookup_when_vault_id_configured() {
+        let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
+            vault_id: Some(TEST_VAULT_ID),
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        }));
+        let amount = Usdc::new(dec!(100));
+
+        let mut stdout = Vec::new();
+        let result = vault_withdraw_command(
+            &mut stdout,
+            amount,
+            &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
+        )
+        .await;
+
+        // The vault lookup succeeds but the raindex service call will fail
+        // because we're using stub wallets. The important thing is we got
+        // past the vault_id lookup.
+        result.unwrap_err();
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains(&TEST_VAULT_ID.to_string()),
+            "Expected vault ID in output (proving lookup succeeded), got: {output}"
+        );
     }
 }

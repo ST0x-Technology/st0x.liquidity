@@ -219,8 +219,9 @@ mod tests {
 
     use st0x_execution::FractionalShares;
 
+    use st0x_finance::Usdc;
+
     use super::*;
-    use crate::threshold::Usdc;
 
     fn equity_balance(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
         VenueBalance::new(
@@ -231,8 +232,8 @@ mod tests {
 
     fn usdc_balance(available: i64, inflight: i64) -> VenueBalance<Usdc> {
         VenueBalance::new(
-            Usdc(Decimal::from(available)),
-            Usdc(Decimal::from(inflight)),
+            Usdc::new(Decimal::from(available)),
+            Usdc::new(Decimal::from(inflight)),
         )
     }
 
@@ -364,12 +365,12 @@ mod tests {
     #[test]
     fn usdc_balance_works_same_as_equity() {
         let balance = usdc_balance(100, 0);
-        let amount = Usdc(Decimal::from(30));
+        let amount = Usdc::new(Decimal::from(30));
 
         let result = balance.move_to_inflight(amount).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(70));
-        assert_eq!(result.inflight().0, Decimal::from(30));
+        assert_eq!(result.available().inner(), Decimal::from(70));
+        assert_eq!(result.inflight().inner(), Decimal::from(30));
     }
 
     #[test]
@@ -398,12 +399,12 @@ mod tests {
     #[test]
     fn apply_snapshot_works_with_usdc_when_inflight_zero() {
         let balance = usdc_balance(1000, 0);
-        let snapshot_balance = Usdc(Decimal::from(950));
+        let snapshot_balance = Usdc::new(Decimal::from(950));
 
         let result = balance.apply_snapshot(snapshot_balance);
 
-        assert_eq!(result.available().0, Decimal::from(950));
-        assert_eq!(result.inflight().0, Decimal::ZERO);
+        assert_eq!(result.available().inner(), Decimal::from(950));
+        assert_eq!(result.inflight().inner(), Decimal::ZERO);
     }
 
     #[derive(Debug)]
@@ -442,14 +443,14 @@ mod tests {
     #[test]
     fn force_apply_snapshot_works_with_usdc() {
         let balance = usdc_balance(1000, 200);
-        let snapshot_balance = Usdc(Decimal::from(950));
+        let snapshot_balance = Usdc::new(Decimal::from(950));
         let error = TestError {
             _reason: "usdc corruption",
         };
 
         let result = balance.force_apply_snapshot(snapshot_balance, &error);
 
-        assert_eq!(result.available().0, Decimal::from(950));
-        assert_eq!(result.inflight().0, Decimal::ZERO);
+        assert_eq!(result.available().inner(), Decimal::from(950));
+        assert_eq!(result.inflight().inner(), Decimal::ZERO);
     }
 }

@@ -5,11 +5,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use st0x_finance::Usdc;
+
 use super::equity::{Equity, MintError, RedemptionError};
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use super::trigger::TriggeredOperation;
 use super::usdc::UsdcTransferError;
-use crate::threshold::Usdc;
 
 /// Type-erased equity transfer (hedging -> market-making).
 type EquityToMarketMaking =
@@ -180,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn execute_usdc_alpaca_to_base_calls_usdc_to_market_making() {
         let (equity, usdc) = execute(vec![TriggeredOperation::UsdcAlpacaToBase {
-            amount: Usdc(dec!(1000)),
+            amount: Usdc::new(dec!(1000)),
         }])
         .await;
 
@@ -193,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn execute_usdc_base_to_alpaca_calls_usdc_to_hedging() {
         let (equity, usdc) = execute(vec![TriggeredOperation::UsdcBaseToAlpaca {
-            amount: Usdc(dec!(2000)),
+            amount: Usdc::new(dec!(2000)),
         }])
         .await;
 
@@ -221,10 +222,10 @@ mod tests {
                 unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
             },
             TriggeredOperation::UsdcAlpacaToBase {
-                amount: Usdc(dec!(500)),
+                amount: Usdc::new(dec!(500)),
             },
             TriggeredOperation::UsdcBaseToAlpaca {
-                amount: Usdc(dec!(300)),
+                amount: Usdc::new(dec!(300)),
             },
         ])
         .await;

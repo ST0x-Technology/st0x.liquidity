@@ -349,12 +349,6 @@ async fn seed_vault_registry_from_config(
 
     for (symbol, equity_config) in &ctx.assets.equities.symbols {
         let Some(vault_id) = equity_config.vault_id else {
-            if ctx.is_rebalancing_enabled(symbol) {
-                return Err(CtxError::MissingEquityVaultId {
-                    symbol: symbol.clone(),
-                }
-                .into());
-            }
             continue;
         };
 
@@ -1584,6 +1578,7 @@ mod tests {
         Direction, ExecutorOrderId, MarketOrder, MockExecutor, MockExecutorCtx, Positive, Symbol,
         TryIntoExecutor,
     };
+    use st0x_finance::{Usd, Usdc};
 
     use super::*;
     use crate::bindings::IOrderBookV6::{
@@ -1591,39 +1586,18 @@ mod tests {
     };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
-    use crate::offchain_order::Dollars;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
-    use crate::threshold::{ExecutionThreshold, Usdc};
+    use crate::threshold::ExecutionThreshold;
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
-    }
-
-    fn test_assets_config() -> AssetsConfig {
-        let mut symbols = std::collections::HashMap::new();
-        symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::random(),
-                tokenized_equity_derivative: Address::random(),
-                vault_id: None,
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        AssetsConfig {
-            equities: EquitiesConfig { symbols },
-            cash: None,
-        }
     }
 
     fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
@@ -1633,7 +1607,10 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: test_assets_config(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
         }
     }
 
@@ -2908,7 +2885,10 @@ mod tests {
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
-            assets: test_assets_config(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
         }
     }
 
@@ -3223,7 +3203,7 @@ mod tests {
                     shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                     direction: Direction::Sell,
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
-                    price: Dollars(dec!(150)),
+                    price: Usd::new(dec!(150)),
                     broker_timestamp: chrono::Utc::now(),
                 },
             )
@@ -3387,7 +3367,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 symbol,
                 Inventory::available(
@@ -3427,12 +3407,11 @@ mod tests {
                     orderbook,
                     owner: order_owner,
                 },
-                VaultRegistryCommand::DiscoverEquityVault {
+                VaultRegistryCommand::SeedEquityVaultFromConfig {
                     token: test_token,
                     vault_id: fixed_bytes!(
                         "0x0000000000000000000000000000000000000000000000000000000000000001"
                     ),
-                    discovered_in: TxHash::ZERO,
                     symbol: symbol.clone(),
                 },
             )
@@ -3454,7 +3433,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 }),
-                assets: test_assets_config(),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3518,7 +3500,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3539,7 +3521,10 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: threshold,
                 usdc: Some(threshold),
-                assets: test_assets_config(),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3603,7 +3588,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(Decimal::ZERO), Usdc(Decimal::ZERO))
+            .with_usdc(Usdc::new(Decimal::ZERO), Usdc::new(Decimal::ZERO))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3625,12 +3610,12 @@ mod tests {
             )
             .unwrap()
             .update_usdc(
-                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc(dec!(50))),
+                Inventory::available(Venue::MarketMaking, Operator::Add, Usdc::new(dec!(50))),
                 chrono::Utc::now(),
             )
             .unwrap()
             .update_usdc(
-                Inventory::available(Venue::Hedging, Operator::Add, Usdc(dec!(50))),
+                Inventory::available(Venue::Hedging, Operator::Add, Usdc::new(dec!(50))),
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -3650,7 +3635,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 }),
-                assets: test_assets_config(),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
@@ -3718,12 +3706,11 @@ mod tests {
                     orderbook,
                     owner: order_owner,
                 },
-                VaultRegistryCommand::DiscoverEquityVault {
+                VaultRegistryCommand::SeedEquityVaultFromConfig {
                     token: test_token,
                     vault_id: fixed_bytes!(
                         "0x0000000000000000000000000000000000000000000000000000000000000001"
                     ),
-                    discovered_in: TxHash::ZERO,
                     symbol: symbol.clone(),
                 },
             )
@@ -3737,7 +3724,7 @@ mod tests {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc(dec!(1000000)), Usdc(dec!(1000000)))
+            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000)))
             .update_equity(
                 &symbol,
                 Inventory::available(
@@ -3774,7 +3761,10 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 }),
-                assets: test_assets_config(),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
                 disabled_assets: HashSet::new(),
             },
             vault_registry,

@@ -444,7 +444,7 @@ mod tests {
     fn test_float_constants_from_v5_interface() {
         // Verify our implementation matches Float constants from LibDecimalFloat.sol
 
-        // FLOAT_ONE = bytes32(uint256(1)) = coefficient=1, exponent=0 → 1.0
+        // FLOAT_ONE = bytes32(uint256(1)) = coefficient=1, exponent=0 -> 1.0
         let float_one = B256::from([
             0x00, 0x00, 0x00, 0x00, // exponent = 0
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -453,7 +453,7 @@ mod tests {
         ]);
         assert!((float_to_decimal(float_one).unwrap() - dec!(1.0)).abs() < dec!(0.000001));
 
-        // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
+        // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 -> 0.5
         let float_half = B256::from([
             0xff, 0xff, 0xff, 0xff, // exponent = -1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -462,7 +462,7 @@ mod tests {
         ]);
         assert!((float_to_decimal(float_half).unwrap() - dec!(0.5)).abs() < dec!(0.000001));
 
-        // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
+        // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 -> 2.0
         let float_two = B256::from([
             0x00, 0x00, 0x00, 0x00, // exponent = 0
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
