@@ -1,30 +1,30 @@
-//! Shared helpers for e2e test assertions.
+//! Shared assertion helpers for e2e tests.
 //!
-//! Provides the `ExpectedPosition` struct, DB assertion utilities, and bot
-//! lifecycle helpers used across `hedging.rs` and `rebalancing.rs`.
+//! Provides `ExpectedPosition`, DB assertion utilities, and the
+//! `assert_decimal_eq!` macro used across hedging and rebalancing tests.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::Value;
 use sqlx::SqlitePool;
-use tokio::task::JoinHandle;
 
 use st0x_event_sorcery::Projection;
+use st0x_execution::alpaca_broker_api::{
+    AlpacaBrokerMock, MockOrderSnapshot, MockPositionSnapshot, OrderSide, OrderStatus,
+};
 use st0x_execution::{Direction, SupportedExecutor, Symbol};
-use st0x_hedge::config::Ctx;
-use st0x_hedge::{Dollars, OffchainOrder, Position, launch};
+use st0x_hedge::{Dollars, OffchainOrder, Position};
 
 use crate::assert_decimal_eq;
-use crate::services::alpaca_broker::{AlpacaBrokerMock, MockOrderSnapshot, MockPositionSnapshot};
-use crate::services::base_chain::TakeDirection;
+use crate::base_chain::TakeDirection;
+use crate::poll::fetch_all_domain_events;
 
 /// Per-symbol expected final state after all trades are processed.
 ///
 /// `amount` is the total expected hedge shares for this symbol across
-/// all trades (e.g., 3 sells of 1.0 each → amount = "3.0").
+/// all trades (e.g., 3 sells of 1.0 each -> amount = "3.0").
 ///
 /// Two prices are tracked separately:
 /// - `onchain_price`: the execution price from the Raindex order (USDC per
@@ -80,10 +80,10 @@ impl ExpectedPosition {
         }
     }
 
-    pub fn expected_broker_side(&self) -> &'static str {
+    pub fn expected_broker_side(&self) -> OrderSide {
         match self.direction {
-            TakeDirection::SellEquity => "buy",
-            TakeDirection::BuyEquity => "sell",
+            TakeDirection::SellEquity => OrderSide::Buy,
+            TakeDirection::BuyEquity => OrderSide::Sell,
             TakeDirection::NetZero => panic!("NetZero position has no broker side"),
         }
     }
@@ -96,223 +96,6 @@ pub struct StoredEvent {
     pub aggregate_id: String,
     pub event_type: String,
     pub payload: Value,
-}
-
-/// Spawns the full bot as a background task.
-pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
-    tokio::spawn(launch(ctx))
-}
-
-/// Sleeps for `seconds`, then panics if the bot task has already finished
-/// (indicating it crashed during processing).
-pub async fn wait_for_processing(bot: &mut JoinHandle<anyhow::Result<()>>, seconds: u64) {
-    tokio::select! {
-        result = &mut *bot => {
-            match result {
-                Ok(Ok(())) => panic!("Bot exited cleanly before processing completed ({seconds}s)"),
-                Ok(Err(error)) => panic!("Bot crashed during wait_for_processing: {error:#}"),
-                Err(join_error) => panic!("Bot task panicked: {join_error}"),
-            }
-        }
-        () = tokio::time::sleep(Duration::from_secs(seconds)) => {}
-
-    }
-}
-
-pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
-pub const DEFAULT_POLL_TIMEOUT_SECS: u64 = 30;
-
-/// Sleeps for [`POLL_INTERVAL`], panicking immediately if the bot task
-/// exits (crash or clean shutdown) during the sleep.
-pub async fn sleep_or_crash(bot: &mut JoinHandle<anyhow::Result<()>>, context: &str) {
-    tokio::select! {
-        result = &mut *bot => {
-            match result {
-                Ok(Ok(())) => panic!("Bot exited cleanly while polling for: {context}"),
-                Ok(Err(error)) => panic!("Bot crashed while polling for: {context}: {error:#}"),
-                Err(join_error) => panic!("Bot panicked while polling for: {context}: {join_error}"),
-            }
-        }
-        () = tokio::time::sleep(POLL_INTERVAL) => {}
-    }
-}
-
-/// Polls the CQRS events table until at least `expected_count` events of
-/// the given `event_type` exist, using the default 30s timeout.
-pub async fn poll_for_events(
-    bot: &mut JoinHandle<anyhow::Result<()>>,
-    db_path: &std::path::Path,
-    event_type: &str,
-    expected_count: i64,
-) {
-    poll_for_events_with_timeout(
-        bot,
-        db_path,
-        event_type,
-        expected_count,
-        Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS),
-    )
-    .await;
-}
-
-/// Polls the CQRS events table until at least `expected_count` events of
-/// the given `event_type` exist, with an explicit timeout.
-///
-/// Tolerates the database not existing yet (the bot creates it on
-/// startup via migrations), retrying the connection each poll cycle.
-pub async fn poll_for_events_with_timeout(
-    bot: &mut JoinHandle<anyhow::Result<()>>,
-    db_path: &std::path::Path,
-    event_type: &str,
-    expected_count: i64,
-    timeout: Duration,
-) {
-    let url = format!("sqlite:{}", db_path.display());
-    let deadline = tokio::time::Instant::now() + timeout;
-    let context = format!("{expected_count}x {event_type}");
-
-    loop {
-        sleep_or_crash(bot, &context).await;
-
-        // The DB file may not exist yet if the bot is still starting up.
-        let Ok(pool) = SqlitePool::connect(&url).await else {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} (database not ready)",
-            );
-            continue;
-        };
-
-        let query_result =
-            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind(event_type)
-                .fetch_one(&pool)
-                .await;
-
-        pool.close().await;
-
-        match query_result {
-            Ok((count,)) if count >= expected_count => return,
-            Ok((count,)) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} (found {count})",
-            ),
-            Err(query_error) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} \
-                 (query failed: {query_error})",
-            ),
-        }
-    }
-}
-
-/// Polls for events matching an `aggregate_type` whose `event_type`
-/// contains `type_substring` (e.g. "Failed"). Uses the default 30s
-/// timeout.
-///
-/// Tolerates the database not existing yet (see
-/// [`poll_for_events_with_timeout`]).
-pub async fn poll_for_aggregate_events_containing(
-    bot: &mut JoinHandle<anyhow::Result<()>>,
-    db_path: &std::path::Path,
-    aggregate_type: &str,
-    type_substring: &str,
-    expected_count: i64,
-) {
-    let url = format!("sqlite:{}", db_path.display());
-    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
-    let deadline = tokio::time::Instant::now() + timeout;
-    let context = format!("{expected_count}x {aggregate_type}/*{type_substring}*");
-
-    loop {
-        sleep_or_crash(bot, &context).await;
-
-        let Ok(pool) = SqlitePool::connect(&url).await else {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} (database not ready)",
-            );
-            continue;
-        };
-
-        let query_result = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM events \
-             WHERE aggregate_type = ? AND event_type LIKE '%' || ? || '%'",
-        )
-        .bind(aggregate_type)
-        .bind(type_substring)
-        .fetch_one(&pool)
-        .await;
-
-        pool.close().await;
-
-        match query_result {
-            Ok((count,)) if count >= expected_count => return,
-            Ok((count,)) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} (found {count})",
-            ),
-            Err(query_error) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} \
-                 (query failed: {query_error})",
-            ),
-        }
-    }
-}
-
-/// Opens a SQLite connection to the test database.
-pub async fn connect_db(db_path: &std::path::Path) -> anyhow::Result<SqlitePool> {
-    let url = format!("sqlite:{}", db_path.display());
-    Ok(SqlitePool::connect(&url).await?)
-}
-
-/// Counts CQRS events for a specific aggregate type.
-pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE aggregate_type = ?")
-        .bind(aggregate_type)
-        .fetch_one(pool)
-        .await?;
-
-    Ok(row.0)
-}
-
-/// Counts all domain events (excludes `SchemaRegistry` bookkeeping events).
-pub async fn count_all_domain_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM events WHERE aggregate_type != 'SchemaRegistry'")
-            .fetch_one(pool)
-            .await?;
-
-    Ok(row.0)
-}
-
-/// Counts hedging-specific domain events, excluding bookkeeping
-/// (`SchemaRegistry`) and background polling (`InventorySnapshot`)
-/// aggregates whose event counts are non-deterministic due to timing.
-pub async fn count_hedging_domain_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM events \
-         WHERE aggregate_type NOT IN ('SchemaRegistry', 'InventorySnapshot')",
-    )
-    .fetch_one(pool)
-    .await?;
-
-    Ok(row.0)
-}
-
-/// Fetches all domain events ordered by insertion.
-pub async fn fetch_all_domain_events(pool: &SqlitePool) -> anyhow::Result<Vec<StoredEvent>> {
-    let events: Vec<StoredEvent> = sqlx::query_as(
-        "SELECT aggregate_type, aggregate_id, event_type, payload \
-         FROM events \
-         WHERE aggregate_type != 'SchemaRegistry' \
-         ORDER BY rowid ASC",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(events)
 }
 
 /// Asserts broker orders and positions match expected state per symbol.
@@ -369,16 +152,10 @@ pub fn assert_broker_state(expected_positions: &[ExpectedPosition], broker: &Alp
 fn assert_broker_order(expected_position: &ExpectedPosition, order: &MockOrderSnapshot) {
     assert_eq!(order.symbol, expected_position.symbol);
     assert_eq!(order.side, expected_position.expected_broker_side());
-    assert_eq!(order.status, "filled");
-    let _parsed_order_qty: Decimal = order.qty.parse().unwrap_or_else(|error| {
-        panic!(
-            "Broker order qty for {} should be a valid Decimal, got '{}': {error}",
-            expected_position.symbol, order.qty
-        )
-    });
+    assert_eq!(order.status, OrderStatus::Filled);
     assert_eq!(
-        order.filled_price.as_deref(),
-        Some(expected_position.broker_fill_price.to_string()).as_deref(),
+        order.filled_price,
+        Some(expected_position.broker_fill_price),
         "Broker fill price for {} should match configured mock price",
         expected_position.symbol
     );
@@ -388,39 +165,21 @@ fn assert_total_broker_order_qty(
     expected_position: &ExpectedPosition,
     symbol_orders: &[&MockOrderSnapshot],
 ) {
-    let total_qty = symbol_orders.iter().fold(Decimal::ZERO, |acc, order| {
-        let qty: Decimal = order.qty.parse().unwrap_or_else(|error| {
-            panic!(
-                "Broker order qty for {} should be a valid Decimal, got '{}': {error}",
-                expected_position.symbol, order.qty
-            )
-        });
-        acc + qty
-    });
+    let total_quantity = symbol_orders
+        .iter()
+        .fold(Decimal::ZERO, |acc, order| acc + order.quantity);
 
     assert_decimal_eq!(
-        total_qty,
+        total_quantity,
         expected_position.amount,
         DEFAULT_EPSILON,
-        "Total broker order qty for {} should match expected hedge amount",
+        "Total broker order quantity for {} should match expected hedge amount",
         expected_position.symbol
     );
 }
 
 fn assert_broker_position(expected_position: &ExpectedPosition, position: &MockPositionSnapshot) {
     assert_eq!(position.symbol, expected_position.symbol);
-
-    // Verify the qty is a valid Decimal. We intentionally don't compare it
-    // against `expected_position.amount` because rebalancing operations
-    // (equity mint/redeem) modify the broker position qty independently of
-    // the original hedge amount. Total order qty is validated separately by
-    // `assert_total_broker_order_qty`.
-    let _parsed_qty: Decimal = position.qty.parse().unwrap_or_else(|error| {
-        panic!(
-            "Broker position qty for {} should be a valid Decimal, got '{}': {error}",
-            expected_position.symbol, position.qty
-        )
-    });
 }
 
 /// Comprehensive CQRS assertions for one or more expected positions.
@@ -825,24 +584,6 @@ async fn assert_offchain_order_views(
     Ok(())
 }
 
-/// Fetches events for a specific aggregate type, ordered by insertion.
-pub async fn fetch_events_by_type(
-    pool: &SqlitePool,
-    aggregate_type: &str,
-) -> anyhow::Result<Vec<StoredEvent>> {
-    let events: Vec<StoredEvent> = sqlx::query_as(
-        "SELECT aggregate_type, aggregate_id, event_type, payload \
-         FROM events \
-         WHERE aggregate_type = ? \
-         ORDER BY rowid ASC",
-    )
-    .bind(aggregate_type)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(events)
-}
-
 /// Asserts that events contain the expected event types as an ordered
 /// subsequence (types appear in order, but gaps are allowed between them).
 pub fn assert_event_subsequence(events: &[StoredEvent], expected_types: &[&str]) {
@@ -870,17 +611,6 @@ pub fn assert_event_subsequence(events: &[StoredEvent], expected_types: &[&str])
 
 /// Asserts that exactly one rebalancing aggregate exists for the given type
 /// and that no error events were emitted.
-///
-/// This catches two classes of bugs:
-/// - **Duplicate triggers**: If the trigger fires twice, two aggregates are
-///   created. The subsequence check on combined events could hide the second
-///   aggregate's failure.
-/// - **Silent errors**: If the pipeline produces error events alongside
-///   success events (e.g. a retry that fails then succeeds), the subsequence
-///   check passes but the error goes unnoticed.
-///
-/// `error_substrings` are patterns that indicate error event types
-/// (e.g. "Failed", "Rejected").
 pub fn assert_single_clean_aggregate(events: &[StoredEvent], error_substrings: &[&str]) {
     let aggregate_ids: std::collections::HashSet<&str> = events
         .iter()
@@ -923,7 +653,8 @@ macro_rules! assert_decimal_eq {
         let diff = (l - r).abs();
         if diff > eps {
             panic!(
-                "assertion failed: `(left == right)` (within epsilon {})\n  left: `{:?}`\n right: `{:?}`\n delta: `{:?}`",
+                "assertion failed: `(left == right)` (within epsilon {})\n  \
+                 left: `{:?}`\n right: `{:?}`\n delta: `{:?}`",
                 eps, l, r, diff
             );
         }
@@ -933,25 +664,27 @@ macro_rules! assert_decimal_eq {
         let diff = (l - r).abs();
         if diff > eps {
             panic!(
-                "assertion failed: `(left == right)` (within epsilon {})\n  left: `{:?}`\n right: `{:?}`\n delta: `{:?}`\n{}",
+                "assertion failed: `(left == right)` (within epsilon {})\n  \
+                 left: `{:?}`\n right: `{:?}`\n delta: `{:?}`\n{}",
                 eps, l, r, diff, format_args!($($arg)+)
             );
         }
     };
 }
-const DEFAULT_EPSILON: Decimal = dec!(0.000000000000001);
+pub(crate) const DEFAULT_EPSILON: Decimal = dec!(0.000000000000001);
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use serde_json::json;
 
-    use rust_decimal_macros::dec;
+    use st0x_execution::alpaca_broker_api::{OrderSide, OrderStatus};
 
     use super::{
         ExpectedPosition, MockOrderSnapshot, MockPositionSnapshot, StoredEvent,
         assert_broker_position, assert_single_clean_aggregate, assert_total_broker_order_qty,
     };
-    use crate::services::base_chain::TakeDirection;
+    use crate::base_chain::TakeDirection;
 
     fn expected_position(
         direction: TakeDirection,
@@ -1015,16 +748,16 @@ mod tests {
         let buy_hedge = expected_position(TakeDirection::SellEquity, dec!(7.5));
         let long_position = MockPositionSnapshot {
             symbol: "AAPL".to_string(),
-            qty: "7.5".to_string(),
-            market_value: "742.5".to_string(),
+            quantity: dec!(7.5),
+            market_value: dec!(742.5),
         };
         assert_broker_position(&buy_hedge, &long_position);
 
         let any_position = expected_position(TakeDirection::BuyEquity, dec!(7.5));
         let signed_position = MockPositionSnapshot {
             symbol: "AAPL".to_string(),
-            qty: "-7.5".to_string(),
-            market_value: "-742.5".to_string(),
+            quantity: dec!(-7.5),
+            market_value: dec!(-742.5),
         };
         assert_broker_position(&any_position, &signed_position);
     }
@@ -1035,37 +768,39 @@ mod tests {
         let first = MockOrderSnapshot {
             order_id: "1".to_string(),
             symbol: "AAPL".to_string(),
-            qty: "5.25".to_string(),
-            side: "buy".to_string(),
-            status: "filled".to_string(),
+            quantity: dec!(5.25),
+            side: OrderSide::Buy,
+            status: OrderStatus::Filled,
             poll_count: 1,
-            filled_price: Some("99".to_string()),
+            filled_price: Some(dec!(99)),
         };
         let second = MockOrderSnapshot {
             order_id: "2".to_string(),
             symbol: "AAPL".to_string(),
-            qty: "5.5".to_string(),
-            side: "buy".to_string(),
-            status: "filled".to_string(),
+            quantity: dec!(5.5),
+            side: OrderSide::Buy,
+            status: OrderStatus::Filled,
             poll_count: 1,
-            filled_price: Some("99".to_string()),
+            filled_price: Some(dec!(99)),
         };
 
         assert_total_broker_order_qty(&expected, &[&first, &second]);
     }
 
     #[test]
-    #[should_panic(expected = "Total broker order qty for AAPL should match expected hedge amount")]
+    #[should_panic(
+        expected = "Total broker order quantity for AAPL should match expected hedge amount"
+    )]
     fn assert_total_broker_order_qty_rejects_wrong_total() {
         let expected = expected_position(TakeDirection::SellEquity, dec!(10.75));
         let only = MockOrderSnapshot {
             order_id: "1".to_string(),
             symbol: "AAPL".to_string(),
-            qty: "10.5".to_string(),
-            side: "buy".to_string(),
-            status: "filled".to_string(),
+            quantity: dec!(10.5),
+            side: OrderSide::Buy,
+            status: OrderStatus::Filled,
             poll_count: 1,
-            filled_price: Some("99".to_string()),
+            filled_price: Some(dec!(99)),
         };
 
         assert_total_broker_order_qty(&expected, &[&only]);

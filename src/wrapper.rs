@@ -19,24 +19,6 @@ pub(crate) use share::WrapperService;
 #[cfg(test)]
 pub(crate) use ratio::RATIO_ONE;
 
-/// Simplified equity token addresses for test constructors.
-///
-/// Maps a symbol to its wrapped/unwrapped token addresses and
-/// which operations are enabled.
-#[cfg(any(test, feature = "test-support"))]
-pub struct EquityTokenAddresses {
-    pub wrapped: Address,
-    pub unwrapped: Address,
-    /// Whether trading is enabled for this asset.
-    pub enabled: bool,
-    /// Whether rebalancing is enabled. Defaults to `false` when
-    /// not specified so hedging-only tests don't need to set it.
-    pub rebalancing: bool,
-    /// Optional Raindex vault ID for this equity. Required when
-    /// rebalancing is enabled.
-    pub vault_id: Option<alloy::primitives::B256>,
-}
-
 /// Error type for wrapper operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WrapperError {

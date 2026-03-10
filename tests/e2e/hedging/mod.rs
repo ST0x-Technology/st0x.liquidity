@@ -8,9 +8,11 @@
 //! Every hedging test calls `assert_full_hedging_flow` which checks broker state,
 //! onchain vault balances, and all CQRS events/views comprehensively.
 
-mod utils;
+mod assertions;
 
-use self::utils::*;
+use st0x_execution::alpaca_broker_api::OrderStatus;
+
+use self::assertions::*;
 
 #[test_log::test(tokio::test)]
 async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
@@ -35,10 +37,10 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -61,7 +63,7 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
         &[expected_position],
         &[take_result],
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -89,10 +91,10 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -201,10 +203,10 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -234,7 +236,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
         &expected_positions,
         &take_results,
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -283,10 +285,10 @@ async fn backfilling() -> anyhow::Result<()> {
     // Start bot with deployment_block set to BEFORE the first take-order
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(pre_trade_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -321,7 +323,7 @@ async fn backfilling() -> anyhow::Result<()> {
         &[expected_position],
         &take_results,
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -345,10 +347,10 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     // Phase 1: Start bot, process 1 trade, wait for fill
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -388,10 +390,10 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
 
     let ctx2 = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 
@@ -434,7 +436,7 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         &[expected_position],
         &[take1, take2],
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -485,10 +487,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     let ref_block = ref_infra.base_chain.provider.get_block_number().await?;
     let ref_ctx = build_ctx()
         .chain(&ref_infra.base_chain)
-        .equity_addresses(&ref_infra.equity_addresses)
         .broker(&ref_infra.broker_service)
         .db_path(&ref_infra.db_path)
         .deployment_block(ref_block)
+        .assets(ref_infra.assets_config())
         .call()?;
     let mut ref_bot = spawn_bot(ref_ctx);
 
@@ -538,7 +540,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         &expected_positions,
         &ref_take_results,
         &ref_infra.base_chain.provider,
-        ref_infra.base_chain.orderbook_addr,
+        ref_infra.base_chain.orderbook,
         ref_infra.base_chain.owner,
         &ref_infra.broker_service,
         &ref_infra.db_path.display().to_string(),
@@ -565,10 +567,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     // Phase 1: process first trade, then crash
     let ctx1 = build_ctx()
         .chain(&crash_infra.base_chain)
-        .equity_addresses(&crash_infra.equity_addresses)
         .broker(&crash_infra.broker_service)
         .db_path(&crash_infra.db_path)
         .deployment_block(crash_block)
+        .assets(crash_infra.assets_config())
         .call()?;
     let mut bot1 = spawn_bot(ctx1);
 
@@ -606,10 +608,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     let ctx2 = build_ctx()
         .chain(&crash_infra.base_chain)
-        .equity_addresses(&crash_infra.equity_addresses)
         .broker(&crash_infra.broker_service)
         .db_path(&crash_infra.db_path)
         .deployment_block(crash_block)
+        .assets(crash_infra.assets_config())
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 
@@ -637,7 +639,7 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
         &expected_positions,
         &[crash_take1, crash_take2],
         &crash_infra.base_chain.provider,
-        crash_infra.base_chain.orderbook_addr,
+        crash_infra.base_chain.orderbook,
         crash_infra.base_chain.owner,
         &crash_infra.broker_service,
         &crash_infra.db_path.display().to_string(),
@@ -684,10 +686,10 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -758,7 +760,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         &[expected_position],
         &[take_result],
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -812,10 +814,10 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
     let high_threshold = Positive::<FractionalShares>::new(FractionalShares::new(dec!(200)))?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .execution_threshold_override(ExecutionThreshold::Shares(high_threshold))
         .call()?;
 
@@ -857,7 +859,7 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
         &[expected_position],
         &[take_result_sell, take_result_buy],
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -881,15 +883,15 @@ async fn broker_placement_fails() -> anyhow::Result<()> {
 
     infra
         .broker_service
-        .set_mode(e2e_tests::services::alpaca_broker::MockMode::PlacementFails);
+        .set_mode(st0x_execution::alpaca_broker_api::MockMode::PlacementFails);
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -970,15 +972,15 @@ async fn broker_order_rejected() -> anyhow::Result<()> {
 
     infra
         .broker_service
-        .set_mode(e2e_tests::services::alpaca_broker::MockMode::OrderRejected);
+        .set_mode(st0x_execution::alpaca_broker_api::MockMode::OrderRejected);
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1034,7 +1036,8 @@ async fn broker_order_rejected() -> anyhow::Result<()> {
     );
     for order in &broker_orders {
         assert_eq!(
-            order.status, "rejected",
+            order.status,
+            OrderStatus::Rejected,
             "Broker order {} should be rejected",
             order.order_id
         );
@@ -1067,17 +1070,17 @@ async fn delayed_fill() -> anyhow::Result<()> {
     // Order stays "new" for 3 polls before filling
     infra
         .broker_service
-        .set_mode(e2e_tests::services::alpaca_broker::MockMode::DelayedFill {
+        .set_mode(st0x_execution::alpaca_broker_api::MockMode::DelayedFill {
             polls_before_fill: 3,
         });
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1135,10 +1138,10 @@ async fn delayed_fill() -> anyhow::Result<()> {
         1,
         "Should have exactly one broker order"
     );
-    assert_eq!(broker_orders[0].status, "filled");
+    assert_eq!(broker_orders[0].status, OrderStatus::Filled);
     assert_eq!(
-        broker_orders[0].filled_price.as_deref(),
-        Some("150.25"),
+        broker_orders[0].filled_price,
+        Some(dec!(150.25)),
         "Should fill at configured broker price"
     );
 
@@ -1182,10 +1185,10 @@ async fn small_fractional_amounts() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1207,7 +1210,7 @@ async fn small_fractional_amounts() -> anyhow::Result<()> {
         &[expected_position],
         &[take_result],
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -1263,10 +1266,10 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1295,7 +1298,7 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
         &expected_positions,
         &take_results,
         &infra.base_chain.provider,
-        infra.base_chain.orderbook_addr,
+        infra.base_chain.orderbook,
         infra.base_chain.owner,
         &infra.broker_service,
         &infra.db_path.display().to_string(),
@@ -1349,10 +1352,10 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
     // Phase 1: process 1 trade, wait for full hedging
     let ctx = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1388,10 +1391,10 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
     // Phase 2: restart bot with SAME deployment_block (re-backfills same events)
     let ctx2 = build_ctx()
         .chain(&infra.base_chain)
-        .equity_addresses(&infra.equity_addresses)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
+        .assets(infra.assets_config())
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 

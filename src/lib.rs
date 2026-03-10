@@ -39,6 +39,8 @@ mod symbol;
 mod telemetry;
 mod threshold;
 mod tokenization;
+#[cfg(feature = "mock")]
+pub use tokenization::mock_api;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;
@@ -49,6 +51,8 @@ pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 #[cfg(any(test, feature = "test-support"))]
 pub use config::TradingMode;
 #[cfg(any(test, feature = "test-support"))]
+pub use config::{AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+#[cfg(any(test, feature = "test-support"))]
 pub use inventory::ImbalanceThreshold;
 #[cfg(any(test, feature = "test-support"))]
 pub use offchain_order::{Dollars, OffchainOrder, OffchainOrderId};
@@ -58,8 +62,6 @@ pub use position::Position;
 pub use rebalancing::{RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
 #[cfg(any(test, feature = "test-support"))]
 pub use threshold::ExecutionThreshold;
-#[cfg(any(test, feature = "test-support"))]
-pub use wrapper::EquityTokenAddresses;
 
 #[cfg(test)]
 mod integration_tests;

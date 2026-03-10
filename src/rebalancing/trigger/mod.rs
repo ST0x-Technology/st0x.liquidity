@@ -5,7 +5,7 @@ mod usdc;
 
 pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -28,7 +28,7 @@ use st0x_evm::fireblocks::{
 };
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
 
-use crate::config::{AssetsConfig, OperationMode};
+use crate::config::AssetsConfig;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
@@ -109,14 +109,12 @@ pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
-    pub(crate) usdc_vault_id: B256,
     pub(crate) fireblocks_vault_account_id: FireblocksVaultAccountId,
     pub(crate) fireblocks_chain_asset_ids: ChainAssetIds,
     pub(crate) fireblocks_environment: FireblocksEnvironment,
     /// Override the Fireblocks API base URL. When absent, determined
     /// by `fireblocks_environment`.
-    #[serde(rename = "fireblocks_base_url")]
-    pub(crate) _fireblocks_base_url: Option<Url>,
+    pub(crate) fireblocks_base_url: Option<Url>,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -131,11 +129,9 @@ pub(crate) struct RebalancingConfig {
 #[derive(Clone)]
 pub struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) usdc: Option<ImbalanceThreshold>,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    /// Raindex vault ID for the USDC vault.
-    pub(crate) usdc_vault_id: B256,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Pre-built wallet for the base chain (e.g. Base mainnet).
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
@@ -194,19 +190,15 @@ impl RebalancingCtx {
 
         let usdc = match config.usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
-                ImbalanceThreshold { target, deviation }
+                Some(ImbalanceThreshold { target, deviation })
             }
-            UsdcRebalancing::Disabled => ImbalanceThreshold {
-                target: Decimal::ZERO,
-                deviation: Decimal::ZERO,
-            },
+            UsdcRebalancing::Disabled => None,
         };
 
         Ok(Self {
             equity: config.equity,
             usdc,
             redemption_wallet: config.redemption_wallet,
-            usdc_vault_id: config.usdc_vault_id,
             alpaca_broker_auth: broker_auth,
             base_wallet: Arc::new(base_wallet),
             ethereum_wallet: Arc::new(ethereum_wallet),
@@ -239,7 +231,7 @@ impl RebalancingCtx {
             vault_account_id: config.fireblocks_vault_account_id,
             environment: config.fireblocks_environment,
             asset_id,
-            base_url: None,
+            base_url: config.fireblocks_base_url.clone(),
             provider,
             required_confirmations: REQUIRED_CONFIRMATIONS,
         })
@@ -265,7 +257,7 @@ impl RebalancingCtx {
     #[builder]
     pub(crate) fn stub(
         equity: ImbalanceThreshold,
-        usdc: ImbalanceThreshold,
+        usdc: Option<ImbalanceThreshold>,
         redemption_wallet: Address,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
@@ -275,7 +267,6 @@ impl RebalancingCtx {
             equity,
             usdc,
             redemption_wallet,
-            usdc_vault_id: B256::ZERO,
             alpaca_broker_auth,
             base_wallet: wallet.clone(),
             ethereum_wallet: wallet,
@@ -299,26 +290,21 @@ impl RebalancingCtx {
         equity: ImbalanceThreshold,
         usdc: UsdcRebalancing,
         redemption_wallet: Address,
-        usdc_vault_id: B256,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
         base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
         ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ) -> Self {
         let usdc = match usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
-                ImbalanceThreshold { target, deviation }
+                Some(ImbalanceThreshold { target, deviation })
             }
-            UsdcRebalancing::Disabled => ImbalanceThreshold {
-                target: Decimal::ZERO,
-                deviation: Decimal::ZERO,
-            },
+            UsdcRebalancing::Disabled => None,
         };
 
         Self {
             equity,
             usdc,
             redemption_wallet,
-            usdc_vault_id,
             alpaca_broker_auth,
             base_wallet,
             ethereum_wallet,
@@ -356,7 +342,6 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
             .field("wallet", &self.base_wallet.address())
             .finish_non_exhaustive()
@@ -367,7 +352,7 @@ impl std::fmt::Debug for RebalancingCtx {
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: ImbalanceThreshold,
+    pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) assets: AssetsConfig,
     pub(crate) disabled_assets: HashSet<Symbol>,
 }
@@ -818,19 +803,17 @@ impl RebalancingTrigger {
 
     /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
     fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
-        let Some(cash) = self.config.assets.cash.as_ref() else {
-            debug!("No assets.cash configured, USDC rebalancing disabled");
-            return None;
-        };
+        let threshold = self.config.usdc.as_ref()?;
 
-        if matches!(cash.rebalancing, OperationMode::Disabled) {
-            debug!("USDC rebalancing disabled via assets.cash config");
-            return None;
-        }
+        let usdc_limit = self
+            .config
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.operational_limit)
+            .map(Positive::inner);
 
-        let usdc_limit = cash.operational_limit.map(Positive::inner);
-
-        Some((self.config.usdc, usdc_limit))
+        Some((*threshold, usdc_limit))
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
@@ -1096,7 +1079,7 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -1112,7 +1095,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::config::{CashAssetConfig, EquitiesConfig};
+    use crate::config::{CashAssetConfig, EquitiesConfig, OperationMode};
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
@@ -1131,10 +1114,10 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: ImbalanceThreshold {
+            usdc: Some(ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
-            },
+            }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
@@ -1213,14 +1196,10 @@ mod tests {
         let trigger = RebalancingTrigger::new(
             RebalancingTriggerConfig {
                 equity: test_config().equity,
-                usdc: test_config().usdc,
+                usdc: None,
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
-                    cash: Some(CashAssetConfig {
-                        vault_id: Some(B256::ZERO),
-                        rebalancing: OperationMode::Disabled,
-                        operational_limit: None,
-                    }),
+                    cash: None,
                 },
                 disabled_assets: HashSet::new(),
             },
@@ -3238,7 +3217,6 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3274,7 +3252,7 @@ mod tests {
         assert_eq!(config.equity.deviation, dec!(0.2));
 
         let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("Expected UsdcRebalancing::Enabled");
+            panic!("expected UsdcRebalancing::Enabled");
         };
         assert_eq!(target, dec!(0.5));
         assert_eq!(deviation, dec!(0.3));
@@ -3295,7 +3273,6 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3319,7 +3296,7 @@ mod tests {
         assert_eq!(config.equity.deviation, dec!(0.1));
 
         let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("Expected UsdcRebalancing::Enabled");
+            panic!("expected UsdcRebalancing::Enabled");
         };
         assert_eq!(target, dec!(0.4));
         assert_eq!(deviation, dec!(0.15));
@@ -3328,7 +3305,6 @@ mod tests {
     #[test]
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3375,7 +3351,6 @@ mod tests {
         // integer in TOML, not a quoted string.
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = "1"
             fireblocks_environment = "sandbox"
 
@@ -3406,7 +3381,6 @@ mod tests {
     fn deserialize_integer_vault_account_id_succeeds() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 1
             fireblocks_environment = "sandbox"
 
@@ -3432,7 +3406,6 @@ mod tests {
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -3457,7 +3430,6 @@ mod tests {
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 

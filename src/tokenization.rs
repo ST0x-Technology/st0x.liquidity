@@ -4,6 +4,8 @@
 //! allowing different implementations (Alpaca, mock, etc.) to be used interchangeably.
 
 pub(crate) mod alpaca;
+#[cfg(feature = "mock")]
+pub mod mock_api;
 
 #[cfg(test)]
 pub(crate) mod mock;

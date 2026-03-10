@@ -137,10 +137,10 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc: ImbalanceThreshold {
+            usdc: Some(ImbalanceThreshold {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
-            },
+            }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,

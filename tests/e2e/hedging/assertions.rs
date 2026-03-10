@@ -1,38 +1,32 @@
-use std::collections::HashMap;
-
 use alloy::primitives::{Address, B256, U256};
-use rain_math_float::Float;
-use sqlx::SqlitePool;
-use tokio::task::JoinHandle;
-
-use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
-use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{BrokerCtx, Ctx};
-use st0x_hedge::{EquityTokenAddresses, TradingMode};
-
-use e2e_tests::common::{assert_broker_state, assert_cqrs_state};
-use e2e_tests::services::alpaca_broker;
-use e2e_tests::services::alpaca_broker::AlpacaBrokerMock;
-use e2e_tests::services::base_chain::{self, TakeOrderResult};
-
-pub(crate) use std::str::FromStr;
-pub(crate) use std::time::Duration;
-
 pub(crate) use alloy::providers::Provider;
+use rain_math_float::Float;
 pub(crate) use rust_decimal::Decimal;
 pub(crate) use rust_decimal_macros::dec;
+use sqlx::SqlitePool;
+pub(crate) use std::str::FromStr;
+pub(crate) use std::time::Duration;
+use tokio::task::JoinHandle;
+
 pub(crate) use st0x_event_sorcery::Projection;
+use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
+use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
+use st0x_hedge::TradingMode;
+use st0x_hedge::bindings::IOrderBookV6;
+use st0x_hedge::config::{AssetsConfig, BrokerCtx, Ctx};
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
-pub(crate) use e2e_tests::common::{
-    DEFAULT_POLL_TIMEOUT_SECS, ExpectedPosition, connect_db, count_events,
-    poll_for_aggregate_events_containing, poll_for_events, sleep_or_crash, spawn_bot,
-    wait_for_processing,
+pub(crate) use crate::assert::ExpectedPosition;
+use crate::assert::{assert_broker_state, assert_cqrs_state};
+pub(crate) use crate::base_chain::TakeDirection;
+use crate::base_chain::{self, TakeOrderResult};
+pub(crate) use crate::poll::{
+    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_events, poll_for_aggregate_events_containing,
+    poll_for_events, sleep_or_crash, spawn_bot, wait_for_processing,
 };
-pub(crate) use e2e_tests::services::TestInfra;
-pub(crate) use e2e_tests::services::base_chain::TakeDirection;
+pub(crate) use crate::test_infra::TestInfra;
 
 /// Builds a `Ctx` pointing at the given chain, broker, and database path.
 #[bon::builder]
@@ -41,44 +35,28 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     broker: &AlpacaBrokerMock,
     db_path: &std::path::Path,
     deployment_block: u64,
-    #[builder(default)] equity_addresses: &[(String, Address, Address)],
+    assets: AssetsConfig,
     execution_threshold_override: Option<st0x_hedge::ExecutionThreshold>,
 ) -> anyhow::Result<Ctx> {
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-        api_key: alpaca_broker::TEST_API_KEY.to_owned(),
-        api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
+        api_key: TEST_API_KEY.to_owned(),
+        api_secret: TEST_API_SECRET.to_owned(),
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
     });
 
-    let equities: HashMap<Symbol, EquityTokenAddresses> = equity_addresses
-        .iter()
-        .map(|(symbol, wrapped, unwrapped)| {
-            Ok((
-                Symbol::new(symbol)?,
-                EquityTokenAddresses {
-                    wrapped: *wrapped,
-                    unwrapped: *unwrapped,
-                    enabled: true,
-                    rebalancing: false,
-                    vault_id: None,
-                },
-            ))
-        })
-        .collect::<anyhow::Result<_>>()?;
-
     Ctx::for_test()
         .database_url(db_path.display().to_string())
         .ws_rpc_url(chain.ws_endpoint()?)
-        .orderbook(chain.orderbook_addr)
+        .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Standalone {
             order_owner: chain.owner,
         })
-        .equities(equities)
+        .assets(assets)
         .maybe_execution_threshold_override(execution_threshold_override)
         .call()
         .map_err(Into::into)
@@ -158,7 +136,7 @@ pub(crate) async fn assert_full_hedging_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],
     take_results: &[TakeOrderResult],
     provider: &P,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     broker: &AlpacaBrokerMock,
     database_url: &str,
@@ -166,7 +144,7 @@ pub(crate) async fn assert_full_hedging_flow<P: Provider>(
     assert_broker_state(expected_positions, broker);
 
     for take_result in take_results {
-        assert_onchain_vaults(provider, orderbook_addr, owner, take_result).await?;
+        assert_onchain_vaults(provider, orderbook, owner, take_result).await?;
     }
 
     assert_cqrs_state(expected_positions, take_results.len(), database_url).await?;
@@ -184,11 +162,11 @@ fn vault_token_decimals(token: Address) -> u8 {
 
 async fn assert_onchain_vaults<P: Provider>(
     provider: &P,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     take_result: &TakeOrderResult,
 ) -> anyhow::Result<()> {
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook_addr, provider);
+    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
 
     let output_balance_now = orderbook
         .vaultBalance2(owner, take_result.output_token, take_result.output_vault_id)

@@ -8,7 +8,7 @@
 
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256, utils::parse_units};
+use alloy::primitives::{Address, B256, Bytes, U256, address, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
@@ -19,7 +19,12 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use url::Url;
 
+use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
+use st0x_hedge::bindings::IOrderBookV6::{self, TakeOrderV3};
 pub use st0x_hedge::bindings::{DeployableERC20, IERC20};
+use st0x_hedge::bindings::{
+    Deployer, Interpreter, OrderBook, Parser, Store as RainStore, TOFUTokenDecimals,
+};
 
 /// Base chain USDC address, defined locally so e2e tests don't
 /// need `st0x_hedge` to export the constant.
@@ -28,13 +33,8 @@ pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    TestVault, "src/services/TestVault.json"
+    TestVault, "tests/e2e/TestVault.json"
 );
-
-use st0x_hedge::bindings::IOrderBookV6::{self, TakeOrderV3};
-use st0x_hedge::bindings::{
-    Deployer, Interpreter, OrderBook, Parser, Store as RainStore, TOFUTokenDecimals,
-};
 
 /// OpenZeppelin ERC20 `_balances` mapping storage slot.
 ///
@@ -46,7 +46,7 @@ const USDC_BALANCES_SLOT: u8 = 0;
 /// Result of a successful `take_order` call, providing both the tx hash
 /// and the vault/token details needed for on-chain assertions.
 pub struct TakeOrderResult {
-    pub tx_hash: B256,
+    pub _tx_hash: B256,
     pub input_vault_id: B256,
     pub output_vault_id: B256,
     pub input_token: Address,
@@ -107,10 +107,10 @@ pub struct BaseChain<P> {
     /// collisions with the bot's concurrent transactions from the owner.
     pub taker: Address,
     taker_provider: P,
-    pub orderbook_addr: Address,
-    deployer_addr: Address,
-    interpreter_addr: Address,
-    store_addr: Address,
+    pub orderbook: Address,
+    deployer: Address,
+    interpreter: Address,
+    store: Address,
     equity_tokens: HashMap<String, Address>,
 }
 
@@ -135,7 +135,7 @@ impl BaseChain<()> {
             .await?;
 
         let orderbook = OrderBook::deploy(&provider).await?;
-        let orderbook_addr = *orderbook.address();
+        let orderbook = *orderbook.address();
 
         // Place USDC contract at the canonical USDC_BASE address so vault
         // discovery and all downstream code recognizes it.
@@ -152,20 +152,20 @@ impl BaseChain<()> {
         let store = RainStore::deploy(&provider).await?;
         let parser = Parser::deploy(&provider).await?;
 
-        let interpreter_addr = *interpreter.address();
-        let store_addr = *store.address();
+        let interpreter = *interpreter.address();
+        let store = *store.address();
 
         let deployer = Deployer::deploy(
             &provider,
             Deployer::RainterpreterExpressionDeployerConstructionConfigV2 {
-                interpreter: interpreter_addr,
-                store: store_addr,
+                interpreter,
+                store,
                 parser: *parser.address(),
             },
         )
         .await?;
 
-        let deployer_addr = *deployer.address();
+        let deployer = *deployer.address();
 
         let taker_key = B256::from_slice(&anvil.keys()[1].to_bytes());
         let taker_signer = PrivateKeySigner::from_bytes(&taker_key)?;
@@ -191,10 +191,10 @@ impl BaseChain<()> {
             owner_key: key,
             taker,
             taker_provider,
-            orderbook_addr,
-            deployer_addr,
-            interpreter_addr,
-            store_addr,
+            orderbook,
+            deployer,
+            interpreter,
+            store,
             equity_tokens: HashMap::new(),
         })
     }
@@ -282,8 +282,7 @@ impl<P: Provider + Clone> BaseChain<P> {
     /// Used by USDC rebalancing tests so the bot has a known vault to
     /// withdraw from (BaseToAlpaca) or deposit into (AlpacaToBase).
     pub async fn create_usdc_vault(&self, amount: U256) -> anyhow::Result<B256> {
-        let orderbook =
-            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook_addr, &self.provider);
+        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
         let vault_id = B256::random();
 
         // Over-approve for Rain float precision rounding
@@ -321,8 +320,7 @@ impl<P: Provider + Clone> BaseChain<P> {
         amount: U256,
         decimals: u8,
     ) -> anyhow::Result<()> {
-        let orderbook =
-            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook_addr, &self.provider);
+        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
 
         // Over-approve for Rain float precision rounding
         IERC20::new(token, &self.provider)
@@ -377,9 +375,8 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get(symbol)
             .ok_or_else(|| anyhow::anyhow!("Equity token for {symbol} not deployed"))?;
 
-        let orderbook =
-            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook_addr, &self.provider);
-        let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
+        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
+        let deployer_instance = Deployer::DeployerInstance::new(self.deployer, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
         let usdc_total = amount * price;
@@ -425,8 +422,8 @@ impl<P: Provider + Clone> BaseChain<P> {
 
         let order_config = IOrderBookV6::OrderConfigV4 {
             evaluable: IOrderBookV6::EvaluableV4 {
-                interpreter: self.interpreter_addr,
-                store: self.store_addr,
+                interpreter: self.interpreter,
+                store: self.store,
                 bytecode: Bytes::from(parsed_bytecode),
             },
             validInputs: vec![IOrderBookV6::IOV2 {
@@ -511,7 +508,7 @@ impl<P: Provider + Clone> BaseChain<P> {
         prepared: &PreparedOrder,
     ) -> anyhow::Result<TakeOrderResult> {
         let orderbook =
-            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook_addr, &self.taker_provider);
+            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.taker_provider);
 
         // Approve taker's input token payment (taker pays input_token)
         DeployableERC20::new(prepared.input_token, &self.taker_provider)
@@ -579,7 +576,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .await?;
 
         Ok(TakeOrderResult {
-            tx_hash: take_log
+            _tx_hash: take_log
                 .transaction_hash
                 .ok_or_else(|| anyhow::anyhow!("TakeOrderV3 log missing transaction_hash"))?,
             input_vault_id: prepared.input_vault_id,
@@ -619,9 +616,8 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get(symbol)
             .ok_or_else(|| anyhow::anyhow!("Equity token for {symbol} not deployed"))?;
 
-        let orderbook =
-            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook_addr, &self.provider);
-        let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
+        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
+        let deployer_instance = Deployer::DeployerInstance::new(self.deployer, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
         let usdc_total = amount * price;
@@ -660,8 +656,8 @@ impl<P: Provider + Clone> BaseChain<P> {
 
         let order_config = IOrderBookV6::OrderConfigV4 {
             evaluable: IOrderBookV6::EvaluableV4 {
-                interpreter: self.interpreter_addr,
-                store: self.store_addr,
+                interpreter: self.interpreter,
+                store: self.store,
                 bytecode: Bytes::from(parsed_bytecode),
             },
             validInputs: vec![IOrderBookV6::IOV2 {
@@ -800,7 +796,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .await?;
 
         Ok(TakeOrderResult {
-            tx_hash: take_log
+            _tx_hash: take_log
                 .transaction_hash
                 .ok_or_else(|| anyhow::anyhow!("TakeOrderV3 log missing transaction_hash"))?,
             input_vault_id,
@@ -833,21 +829,14 @@ async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) -> anyho
         .anvil_set_storage_at(USDC_BASE, U256::from(2), total_supply.into())
         .await?;
 
-    // Slot 3: _name = "USD Coin" (Solidity short-string: data left-aligned,
-    // len*2 in last byte)
-    let mut name_bytes = [0u8; 32];
-    name_bytes[..8].copy_from_slice(b"USD Coin");
-    name_bytes[31] = 16;
+    // Slot 3: _name = "USD Coin"
     provider
-        .anvil_set_storage_at(USDC_BASE, U256::from(3), B256::from(name_bytes))
+        .anvil_set_storage_at(USDC_BASE, U256::from(3), solidity_short_string(b"USD Coin"))
         .await?;
 
-    // Slot 4: _symbol = "USDC" (Solidity short-string encoding)
-    let mut symbol_bytes = [0u8; 32];
-    symbol_bytes[..4].copy_from_slice(b"USDC");
-    symbol_bytes[31] = 8;
+    // Slot 4: _symbol = "USDC"
     provider
-        .anvil_set_storage_at(USDC_BASE, U256::from(4), B256::from(symbol_bytes))
+        .anvil_set_storage_at(USDC_BASE, U256::from(4), solidity_short_string(b"USDC"))
         .await?;
 
     // Slot 5: _decimals = 6
@@ -856,9 +845,7 @@ async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) -> anyho
         .await?;
 
     // _balances[owner] at slot 0 (OpenZeppelin ERC20 layout)
-    let mut slot_key = [0u8; 64];
-    slot_key[12..32].copy_from_slice(owner.as_slice());
-    let balance_slot = U256::from_be_bytes(keccak256(slot_key).0);
+    let balance_slot = evm_mapping_slot(owner, USDC_BALANCES_SLOT);
     provider
         .anvil_set_storage_at(USDC_BASE, balance_slot, total_supply.into())
         .await?;
@@ -873,13 +860,10 @@ async fn mint_usdc<P: Provider>(
     recipient: Address,
     amount: U256,
 ) -> anyhow::Result<()> {
-    let mut slot_data = [0u8; 64];
-    slot_data[12..32].copy_from_slice(recipient.as_slice());
-    slot_data[63] = USDC_BALANCES_SLOT;
-    let balance_slot = keccak256(slot_data);
+    let balance_slot = evm_mapping_slot(recipient, USDC_BALANCES_SLOT);
 
     provider
-        .anvil_set_storage_at(USDC_BASE, balance_slot.into(), amount.into())
+        .anvil_set_storage_at(USDC_BASE, balance_slot, amount.into())
         .await?;
 
     Ok(())

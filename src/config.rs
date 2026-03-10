@@ -42,7 +42,7 @@ pub struct Env {
 /// Whether a per-asset operation (trading or rebalancing) is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum OperationMode {
+pub enum OperationMode {
     Enabled,
     Disabled,
 }
@@ -50,32 +50,24 @@ pub(crate) enum OperationMode {
 /// Per-equity asset configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EquityAssetConfig {
-    /// Tokenized equity always one-to-one backed and redeemable with
-    /// real shares held in the issuer account
-    pub(crate) tokenized_equity: Address,
-    /// Wrapped version of tokenized shares to handle corporate actions in a
-    /// manner compatible with other DeFi protocols
-    pub(crate) tokenized_equity_derivative: Address,
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
+pub struct EquityAssetConfig {
+    pub tokenized_equity: Address,
+    pub tokenized_equity_derivative: Address,
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) trading: OperationMode,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
+    pub vault_id: Option<B256>,
+    pub trading: OperationMode,
+    pub rebalancing: OperationMode,
+    pub operational_limit: Option<Positive<FractionalShares>>,
 }
 
 /// Cash asset (USDC) configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CashAssetConfig {
-    /// Raindex vault ID. When set, the vault is seeded at startup;
-    /// when omitted, it is discovered from onchain trade events.
+pub struct CashAssetConfig {
     #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub(crate) vault_id: Option<B256>,
-    pub(crate) rebalancing: OperationMode,
-    pub(crate) operational_limit: Option<Positive<Usdc>>,
+    pub vault_id: Option<B256>,
+    pub rebalancing: OperationMode,
+    pub operational_limit: Option<Positive<Usdc>>,
 }
 
 /// Equity assets configuration keyed by symbol.
@@ -85,17 +77,17 @@ pub(crate) struct CashAssetConfig {
 /// `deny_unknown_fields` is intentionally absent because it is
 /// incompatible with `flatten`.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct EquitiesConfig {
+pub struct EquitiesConfig {
     #[serde(flatten)]
-    pub(crate) symbols: HashMap<Symbol, EquityAssetConfig>,
+    pub symbols: HashMap<Symbol, EquityAssetConfig>,
 }
 
 /// Top-level assets configuration containing equities and cash.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AssetsConfig {
-    pub(crate) equities: EquitiesConfig,
-    pub(crate) cash: Option<CashAssetConfig>,
+pub struct AssetsConfig {
+    pub equities: EquitiesConfig,
+    pub cash: Option<CashAssetConfig>,
 }
 
 /// Deserializes a hex string (possibly short, e.g. `"0xfab"`) into a
@@ -581,52 +573,13 @@ impl Ctx {
         deployment_block: u64,
         broker: BrokerCtx,
         trading_mode: TradingMode,
-        #[builder(default)] equities: HashMap<Symbol, crate::wrapper::EquityTokenAddresses>,
+        assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
         execution_threshold_override: Option<ExecutionThreshold>,
-        cash_vault_id: Option<B256>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
             Some(threshold) => threshold,
             None => broker.execution_threshold()?,
-        };
-
-        let assets = AssetsConfig {
-            equities: EquitiesConfig {
-                symbols: equities
-                    .into_iter()
-                    .map(|(symbol, addrs)| {
-                        let trading = if addrs.enabled {
-                            OperationMode::Enabled
-                        } else {
-                            OperationMode::Disabled
-                        };
-
-                        let rebalancing = if addrs.rebalancing {
-                            OperationMode::Enabled
-                        } else {
-                            OperationMode::Disabled
-                        };
-
-                        (
-                            symbol,
-                            EquityAssetConfig {
-                                tokenized_equity: addrs.unwrapped,
-                                tokenized_equity_derivative: addrs.wrapped,
-                                vault_id: addrs.vault_id,
-                                trading,
-                                rebalancing,
-                                operational_limit: None,
-                            },
-                        )
-                    })
-                    .collect(),
-            },
-            cash: cash_vault_id.map(|vault_id| CashAssetConfig {
-                vault_id: Some(vault_id),
-                rebalancing: OperationMode::Enabled,
-                operational_limit: None,
-            }),
         };
 
         Ok(Self {
@@ -1017,7 +970,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1115,7 +1067,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1206,7 +1157,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1345,7 +1295,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 
@@ -1500,7 +1449,6 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             fireblocks_vault_account_id = 0
             fireblocks_environment = "sandbox"
 

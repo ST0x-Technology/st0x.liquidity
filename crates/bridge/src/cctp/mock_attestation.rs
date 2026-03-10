@@ -1,4 +1,4 @@
-//! Mock Circle CCTP Attestation API for E2E tests.
+//! Mock Circle CCTP Attestation API for tests.
 //!
 //! Provides an HTTP mock server that responds to the endpoints the bot calls
 //! when bridging USDC via CCTP: fee schedule queries and attestation polling.
@@ -24,6 +24,7 @@ use httpmock::prelude::*;
 use rand::Rng;
 use serde_json::json;
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 sol! {
     #[sol(all_derives = true)]
@@ -72,8 +73,6 @@ impl CctpAttestationMock {
             attestations: HashMap::new(),
         }));
 
-        // Single dynamic handler for all attestation polling requests.
-        // Looks up the `transactionHash` query param in shared state.
         let handler_state = Arc::clone(&state);
 
         server.mock(|when, then| {
@@ -137,73 +136,96 @@ impl CctpAttestationMock {
     /// The watcher polls recent blocks on both chains, extracts CCTP messages,
     /// signs them with the test attester key, and stores them in shared state
     /// for the dynamic mock handler to serve.
-    pub fn start_watcher<EP, BP>(
+    pub async fn start_watcher<EP, BP>(
         &self,
         ethereum_provider: EP,
         base_provider: BP,
         attester_key: B256,
-    ) -> JoinHandle<()>
+    ) -> anyhow::Result<JoinHandle<()>>
     where
         EP: Provider + Clone + Send + Sync + 'static,
         BP: Provider + Clone + Send + Sync + 'static,
     {
         let state = Arc::clone(&self.state);
 
-        tokio::spawn(async move {
-            let Ok(signer) = PrivateKeySigner::from_bytes(&attester_key) else {
-                panic!("invalid attester private key");
-            };
+        let signer = PrivateKeySigner::from_bytes(&attester_key)?;
 
-            let Ok(eth_last_block) = ethereum_provider.get_block_number().await else {
-                panic!("failed to get initial Ethereum block number");
-            };
-            let mut eth_last_block = eth_last_block;
+        let eth_start = ethereum_provider.get_block_number().await?;
 
-            let Ok(base_last_block) = base_provider.get_block_number().await else {
-                panic!("failed to get initial Base block number");
-            };
-            let mut base_last_block = base_last_block;
+        let base_start = base_provider.get_block_number().await?;
+
+        Ok(tokio::spawn(async move {
+            let mut eth_last_block = eth_start;
+            let mut base_last_block = base_start;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
-                if let Ok(current) = ethereum_provider.get_block_number().await
-                    && current > eth_last_block
-                {
-                    for block_num in (eth_last_block + 1)..=current {
-                        scan_block_for_messages(&ethereum_provider, block_num, &signer, &state)
-                            .await;
+                match ethereum_provider.get_block_number().await {
+                    Ok(current) if current > eth_last_block => {
+                        let range_ok = scan_message_range(
+                            &ethereum_provider,
+                            eth_last_block + 1,
+                            current,
+                            &signer,
+                            &state,
+                        )
+                        .await;
+
+                        if range_ok {
+                            eth_last_block = current;
+                        }
                     }
-                    eth_last_block = current;
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, "failed to poll ethereum head");
+                    }
                 }
 
-                if let Ok(current) = base_provider.get_block_number().await
-                    && current > base_last_block
-                {
-                    for block_num in (base_last_block + 1)..=current {
-                        scan_block_for_messages(&base_provider, block_num, &signer, &state).await;
+                match base_provider.get_block_number().await {
+                    Ok(current) if current > base_last_block => {
+                        let range_ok = scan_message_range(
+                            &base_provider,
+                            base_last_block + 1,
+                            current,
+                            &signer,
+                            &state,
+                        )
+                        .await;
+
+                        if range_ok {
+                            base_last_block = current;
+                        }
                     }
-                    base_last_block = current;
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, "failed to poll base head");
+                    }
                 }
             }
-        })
+        }))
     }
 }
 
 /// Scans a single block for `MessageSent` events and registers attestation
 /// data in shared state for any new ones found.
+/// Returns `true` if the block was fully processed, `false` on RPC error.
 async fn scan_block_for_messages<P: Provider>(
     provider: &P,
     block_number: u64,
     signer: &PrivateKeySigner,
     state: &Arc<Mutex<AttestationState>>,
-) {
+) -> bool {
     let Ok(Some(block)) = provider
         .get_block_by_number(block_number.into())
         .full()
         .await
     else {
-        return;
+        warn!(
+            block_number,
+            "Failed to fetch block for CCTP message scanning"
+        );
+        return false;
     };
 
     for tx_hash in block.transactions.hashes() {
@@ -216,7 +238,8 @@ async fn scan_block_for_messages<P: Provider>(
         }
 
         let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await else {
-            continue;
+            warn!(%tx_hash, block_number, "Failed to fetch receipt for CCTP message scanning");
+            return false;
         };
 
         for log in receipt.inner.logs() {
@@ -225,7 +248,6 @@ async fn scan_block_for_messages<P: Provider>(
             };
             let message = event.message.to_vec();
 
-            // Sign the message with nonce and finality threshold filled in
             let Some((attestation_bytes, modified_message)) =
                 sign_cctp_message(&message, signer).await
             else {
@@ -245,6 +267,26 @@ async fn scan_block_for_messages<P: Provider>(
             );
         }
     }
+
+    true
+}
+
+/// Scans a range of blocks for CCTP messages, returning true only if
+/// every block in the range was fully processed.
+async fn scan_message_range<P: Provider>(
+    provider: &P,
+    from: u64,
+    to: u64,
+    signer: &PrivateKeySigner,
+    state: &Arc<Mutex<AttestationState>>,
+) -> bool {
+    for block_num in from..=to {
+        if !scan_block_for_messages(provider, block_num, signer, state).await {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Signs a CCTP message as the test attester.
@@ -347,7 +389,6 @@ mod tests {
 
         let (attestation_bytes, modified) = sign_cctp_message(&message, &signer).await.unwrap();
 
-        // Recover the signer from the signature and verify it matches
         let message_hash = keccak256(&modified);
         let signature = alloy::primitives::Signature::try_from(attestation_bytes.as_slice())
             .expect("attestation should be a valid 65-byte signature");
@@ -366,7 +407,6 @@ mod tests {
     async fn sign_cctp_message_preserves_other_bytes() {
         let signer = test_signer();
         let mut message = zeroed_message(200);
-        // Fill with a recognizable pattern
         for (index, byte) in message.iter_mut().enumerate() {
             *byte = u8::try_from(index % 256).unwrap();
         }
@@ -374,7 +414,6 @@ mod tests {
         let original = message.clone();
         let (_, modified) = sign_cctp_message(&message, &signer).await.unwrap();
 
-        // Bytes outside nonce (12..44) and finality (144..148) should be unchanged.
         for index in 0..200 {
             let in_nonce_range = (12..44).contains(&index);
             let in_finality_range = (144..148).contains(&index);

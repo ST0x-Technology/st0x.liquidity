@@ -1,8 +1,8 @@
-//! Mocks and helpers for end-to-end tests.
+//! Composite test harness for e2e tests.
 //!
-//! Provides `TestInfra` -- the composite test harness that wires together
-//! `AlpacaBrokerMock`, `AlpacaTokenizationMock`, `BaseChain`,
-//! `DeployableERC20`, and `CctpAttestationMock` into a single startup call.
+//! Provides `TestInfra` which wires together `AlpacaBrokerMock`,
+//! `AlpacaTokenizationMock`, `BaseChain`, `DeployableERC20`, and
+//! `CctpAttestationMock` into a single startup call.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,17 +12,13 @@ use alloy::providers::Provider;
 use rust_decimal::Decimal;
 use tempfile::TempDir;
 
+use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_execution::Symbol;
+use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
+use st0x_hedge::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
 
-use crate::services::alpaca_broker::{AlpacaBrokerMock, MockPosition};
-use crate::services::alpaca_tokenization::{AlpacaTokenizationMock, REDEMPTION_WALLET};
-use crate::services::base_chain::{BaseChain, DeployableERC20};
-use crate::services::cctp::attestation::CctpAttestationMock;
-
-pub mod alpaca_broker;
-pub mod alpaca_tokenization;
-pub mod base_chain;
-pub mod cctp;
+use crate::base_chain::{BaseChain, DeployableERC20};
 
 pub struct TestInfra<P> {
     /// Kept alive so the temp directory isn't deleted while the test runs.
@@ -34,6 +30,34 @@ pub struct TestInfra<P> {
     pub attestation_service: CctpAttestationMock,
     /// `(symbol, vault_address, underlying_address)` per deployed equity vault.
     pub equity_addresses: Vec<(String, Address, Address)>,
+}
+
+impl<P> TestInfra<P> {
+    /// Builds an `AssetsConfig` with trading enabled for all deployed
+    /// equities. Use this when constructing `Ctx::for_test()` in hedging
+    /// tests so the conductor treats the symbols as active.
+    pub fn assets_config(&self) -> AssetsConfig {
+        let symbols = self
+            .equity_addresses
+            .iter()
+            .map(|(symbol, vault_addr, underlying_addr)| {
+                let config = EquityAssetConfig {
+                    tokenized_equity: *underlying_addr,
+                    tokenized_equity_derivative: *vault_addr,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    operational_limit: None,
+                };
+                (Symbol::force_new(symbol.clone()), config)
+            })
+            .collect();
+
+        AssetsConfig {
+            equities: EquitiesConfig { symbols },
+            cash: None,
+        }
+    }
 }
 
 impl TestInfra<()> {
@@ -72,15 +96,15 @@ impl TestInfra<()> {
 
         let symbol_positions: Vec<MockPosition> = equity_positions
             .iter()
-            .map(|(symbol, qty)| {
+            .map(|(symbol, quantity)| {
                 let sym = Symbol::new(*symbol)?;
                 let price = price_lookup.get(&sym).ok_or_else(|| {
                     anyhow::anyhow!("no price configured for position symbol {symbol}")
                 })?;
                 Ok(MockPosition {
                     symbol: sym,
-                    qty: *qty,
-                    market_value: qty * price,
+                    quantity: *quantity,
+                    market_value: quantity * price,
                 })
             })
             .collect::<anyhow::Result<_>>()?;
@@ -103,11 +127,13 @@ impl TestInfra<()> {
                 ]
             })
             .collect();
-        tokenization_service.start_redemption_watcher(
-            base_chain.provider.clone(),
-            REDEMPTION_WALLET,
-            token_symbols,
-        )?;
+        tokenization_service
+            .start_redemption_watcher(
+                base_chain.provider.clone(),
+                REDEMPTION_WALLET,
+                token_symbols,
+            )
+            .await?;
         let attestation_service = CctpAttestationMock::start().await;
 
         Ok(TestInfra {

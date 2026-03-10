@@ -3,10 +3,9 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
-
-use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::threshold::Usdc;

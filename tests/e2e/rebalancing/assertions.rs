@@ -25,30 +25,35 @@ pub(crate) use std::str::FromStr;
 use std::sync::Arc;
 pub(crate) use std::time::Duration;
 
+use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_evm::{Evm, EvmError, Wallet};
+use st0x_execution::alpaca_broker_api::{
+    AlpacaBrokerMock, OrderSide, OrderStatus, TEST_API_KEY, TEST_API_SECRET, TransferDirection,
+    TransferStatus,
+};
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Symbol, TimeInForce,
 };
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
 use st0x_hedge::config::{BrokerCtx, Ctx};
-use st0x_hedge::{EquityTokenAddresses, ImbalanceThreshold, TradingMode};
-
-pub(crate) use e2e_tests::common::ExpectedPosition;
-use e2e_tests::common::{
-    assert_broker_state, assert_cqrs_state, assert_event_subsequence,
-    assert_single_clean_aggregate, connect_db, fetch_events_by_type,
+pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
+use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationRequestType, TokenizationStatus};
+use st0x_hedge::{
+    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ImbalanceThreshold,
+    OperationMode, TradingMode,
 };
-pub(crate) use e2e_tests::common::{poll_for_events_with_timeout, spawn_bot};
-pub(crate) use e2e_tests::services::TestInfra;
-use e2e_tests::services::alpaca_broker::{self, AlpacaBrokerMock};
-use e2e_tests::services::alpaca_tokenization::AlpacaTokenizationMock;
-pub(crate) use e2e_tests::services::alpaca_tokenization::REDEMPTION_WALLET;
-pub(crate) use e2e_tests::services::base_chain::TakeDirection;
-use e2e_tests::services::base_chain::{self, TakeOrderResult};
-use e2e_tests::services::cctp::CctpOverrides;
-use e2e_tests::services::cctp::attestation::CctpAttestationMock;
-pub(crate) use e2e_tests::services::cctp::{CctpInfra, USDC_ETHEREUM};
+
+pub(crate) use crate::assert::ExpectedPosition;
+use crate::assert::{
+    assert_broker_state, assert_cqrs_state, assert_event_subsequence, assert_single_clean_aggregate,
+};
+pub(crate) use crate::base_chain::TakeDirection;
+use crate::base_chain::{self, TakeOrderResult};
+pub(crate) use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
+use crate::poll::{connect_db, fetch_events_by_type};
+pub(crate) use crate::poll::{poll_for_events_with_timeout, spawn_bot};
+pub(crate) use crate::test_infra::TestInfra;
 
 /// Local signing wallet for rebalancing e2e tests that exposes
 /// `Provider = RootProvider`.
@@ -133,18 +138,22 @@ impl Wallet for TestWallet {
 }
 
 /// Builds a `Ctx` with rebalancing enabled.
+#[bon::builder]
 pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     chain: &base_chain::BaseChain<P>,
     broker: &AlpacaBrokerMock,
     db_path: &std::path::Path,
     deployment_block: u64,
     equity_tokens: &[(String, Address, Address)],
+    equity_vault_ids: &HashMap<String, B256>,
+    cash_vault_id: B256,
     usdc_rebalancing: UsdcRebalancing,
+    cash_rebalancing: OperationMode,
     redemption_wallet: Address,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
-        api_key: alpaca_broker::TEST_API_KEY.to_owned(),
-        api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
+        api_key: TEST_API_KEY.to_owned(),
+        api_secret: TEST_API_SECRET.to_owned(),
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
@@ -152,17 +161,18 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
 
-    let equities: HashMap<Symbol, EquityTokenAddresses> = equity_tokens
+    let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
         .iter()
         .map(|&(ref symbol, wrapped, unwrapped)| {
             Ok((
                 Symbol::new(symbol)?,
-                EquityTokenAddresses {
-                    wrapped,
-                    unwrapped,
-                    enabled: true,
-                    rebalancing: true,
-                    vault_id: Some(B256::random()),
+                EquityAssetConfig {
+                    tokenized_equity: unwrapped,
+                    tokenized_equity_derivative: wrapped,
+                    vault_id: equity_vault_ids.get(symbol).copied(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: None,
                 },
             ))
         })
@@ -178,21 +188,28 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .equity(ImbalanceThreshold::new(dec!(0.5), dec!(0.1))?)
         .usdc(usdc_rebalancing)
         .redemption_wallet(redemption_wallet)
-        .usdc_vault_id(B256::random())
         .alpaca_broker_auth(alpaca_auth)
         .base_wallet(wallet.clone())
         .ethereum_wallet(wallet)
         .call();
 
+    let assets = AssetsConfig {
+        equities: EquitiesConfig { symbols: equities },
+        cash: Some(CashAssetConfig {
+            vault_id: Some(cash_vault_id),
+            rebalancing: cash_rebalancing,
+            operational_limit: None,
+        }),
+    };
+
     Ctx::for_test()
         .database_url(db_path.display().to_string())
         .ws_rpc_url(chain.ws_endpoint()?)
-        .orderbook(chain.orderbook_addr)
+        .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
-        .equities(equities)
-        .cash_vault_id(B256::random())
+        .assets(assets)
         .call()
         .map_err(Into::into)
 }
@@ -213,8 +230,8 @@ where
     BP: Provider + Clone,
 {
     let alpaca_auth = AlpacaBrokerApiCtx {
-        api_key: alpaca_broker::TEST_API_KEY.to_owned(),
-        api_secret: alpaca_broker::TEST_API_SECRET.to_owned(),
+        api_key: TEST_API_KEY.to_owned(),
+        api_secret: TEST_API_SECRET.to_owned(),
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
@@ -222,17 +239,18 @@ where
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
 
-    let equities: HashMap<Symbol, EquityTokenAddresses> = equity_tokens
+    let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
         .iter()
         .map(|(symbol, wrapped, unwrapped)| {
             Ok((
                 Symbol::new(symbol)?,
-                EquityTokenAddresses {
-                    wrapped: *wrapped,
-                    unwrapped: *unwrapped,
-                    enabled: true,
-                    rebalancing: true,
-                    vault_id: Some(B256::random()),
+                EquityAssetConfig {
+                    tokenized_equity: *unwrapped,
+                    tokenized_equity_derivative: *wrapped,
+                    vault_id: None,
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    operational_limit: None,
                 },
             ))
         })
@@ -253,7 +271,6 @@ where
             deviation: dec!(0.1),
         })
         .redemption_wallet(Address::random())
-        .usdc_vault_id(usdc_vault_id)
         .alpaca_broker_auth(alpaca_auth)
         .base_wallet(base_wallet)
         .ethereum_wallet(ethereum_wallet)
@@ -264,12 +281,18 @@ where
     Ctx::for_test()
         .database_url(db_path.display().to_string())
         .ws_rpc_url(base_chain.ws_endpoint()?)
-        .orderbook(base_chain.orderbook_addr)
+        .orderbook(base_chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
-        .equities(equities)
-        .cash_vault_id(usdc_vault_id)
+        .assets(AssetsConfig {
+            equities: EquitiesConfig { symbols: equities },
+            cash: Some(CashAssetConfig {
+                vault_id: Some(usdc_vault_id),
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            }),
+        })
         .inventory_poll_interval(15)
         .call()
         .map_err(Into::into)
@@ -290,7 +313,7 @@ pub(crate) enum EquityRebalanceType<'a> {
 
 async fn assert_inventory_snapshots(
     pool: &SqlitePool,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     expected_symbols: &[&str],
     assert_cash: bool,
@@ -303,7 +326,7 @@ async fn assert_inventory_snapshots(
 
     let expected_aggregate_id = format!(
         "{}:{}",
-        orderbook_addr.to_checksum(None),
+        orderbook.to_checksum(None),
         owner.to_checksum(None),
     );
     for event in &events {
@@ -406,7 +429,7 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
     pool: &SqlitePool,
     take_results: &[TakeOrderResult],
     provider: &P,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     symbol: &str,
     tokenization: &AlpacaTokenizationMock,
@@ -432,7 +455,7 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
     let mint_requests: Vec<_> = tokenization
         .tokenization_requests()
         .into_iter()
-        .filter(|req| req.request_type == "mint" && req.symbol == symbol)
+        .filter(|req| req.request_type == TokenizationRequestType::Mint && req.symbol == symbol)
         .collect();
     assert_eq!(
         mint_requests.len(),
@@ -443,22 +466,27 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
 
     let completed_mint = &mint_requests[0];
     assert_eq!(
-        completed_mint.status.as_str(),
-        "completed",
+        completed_mint.status,
+        TokenizationStatus::Completed,
         "Mint request for {symbol} should complete"
     );
 
+    // Compute the expected vault balance after the take from the
+    // before-take snapshot minus the take event delta. The live query
+    // (`output_vault_balance_after_take`) is racey because the
+    // inventory poller may detect the vault change and trigger a
+    // deposit before the test re-queries the chain.
     let consumed_output_vaults: HashMap<(Address, B256), B256> = take_results
         .iter()
         .map(|result| {
-            (
-                (result.output_token, result.output_vault_id),
-                result.output_vault_balance_after_take,
-            )
+            let before = Float::from_raw(result.output_vault_balance_before_take);
+            let delta = Float::from_raw(result.output_vault_delta_from_take_event);
+            let after_take = (before - delta)?.get_inner();
+            Ok(((result.output_token, result.output_vault_id), after_take))
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook_addr, provider);
+    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
     let mut total_refilled_wrapped_shares_delta = U256::ZERO;
     for ((token, vault_id), pre_rebalance_balance) in consumed_output_vaults {
         let post_rebalance_balance = orderbook
@@ -505,10 +533,10 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
     let wrapped_shares: U256 = wrapped_shares_str.parse().map_err(|error| {
         anyhow::anyhow!("Invalid wrapped_shares '{wrapped_shares_str}': {error}")
     })?;
-    let mint_qty_units: U256 = parse_units(&completed_mint.qty, 18)?.into();
+    let mint_quantity_units: U256 = parse_units(&completed_mint.quantity.to_string(), 18)?.into();
     assert_eq!(
-        mint_qty_units, wrapped_shares,
-        "Tokenization completed mint qty should match TokensWrapped.wrapped_shares"
+        mint_quantity_units, wrapped_shares,
+        "Tokenization completed mint quantity should match TokensWrapped.wrapped_shares"
     );
 
     assert_eq!(
@@ -524,7 +552,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     pool: &SqlitePool,
     take_results: &[TakeOrderResult],
     provider: &P,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     symbol: &str,
     tokenization: &AlpacaTokenizationMock,
@@ -552,7 +580,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     let redeem_requests: Vec<_> = tokenization
         .tokenization_requests()
         .into_iter()
-        .filter(|req| req.request_type == "redeem" && req.symbol == symbol)
+        .filter(|req| req.request_type == TokenizationRequestType::Redeem && req.symbol == symbol)
         .collect();
     assert_eq!(
         redeem_requests.len(),
@@ -563,18 +591,19 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
 
     let completed_redeem = &redeem_requests[0];
     assert_eq!(
-        completed_redeem.status.as_str(),
-        "completed",
+        completed_redeem.status,
+        TokenizationStatus::Completed,
         "Redeem request for {symbol} should complete"
     );
 
     let redemption_wallet_delta = redemption_wallet_balance_after
         .checked_sub(redemption_wallet_balance_before)
         .ok_or_else(|| anyhow::anyhow!("Redemption wallet balance underflow"))?;
-    let expected_wallet_delta: U256 = parse_units(&completed_redeem.qty, 18)?.into();
+    let expected_wallet_delta: U256 =
+        parse_units(&completed_redeem.quantity.to_string(), 18)?.into();
     assert_eq!(
         redemption_wallet_delta, expected_wallet_delta,
-        "Redemption wallet delta should match completed redeem qty (18 decimals)"
+        "Redemption wallet delta should match completed redeem quantity (18 decimals)"
     );
 
     // Sum TokensWrapped.wrapped_shares only for mint aggregates matching this
@@ -620,24 +649,29 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
                 .ok_or_else(|| anyhow::anyhow!("Concurrent mint wrapped share overflow"))
         })?;
 
+    // Compute the expected vault balance after the take from the
+    // before-take snapshot plus the take event delta. The live query
+    // (`input_vault_balance_after_take`) is racey because the
+    // inventory poller may detect the vault change and trigger a
+    // withdrawal before the test re-queries the chain.
     let redeemed_input_vaults: HashMap<(Address, B256), B256> = take_results
         .iter()
         .map(|result| {
-            (
-                (result.input_token, result.input_vault_id),
-                result.input_vault_balance_after_take,
-            )
+            let before = Float::from_raw(result.input_vault_balance_before_take);
+            let delta = Float::from_raw(result.input_vault_delta_from_take_event);
+            let after_take = (before + delta)?.get_inner();
+            Ok(((result.input_token, result.input_vault_id), after_take))
         })
-        .collect();
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook_addr, provider);
+        .collect::<anyhow::Result<_>>()?;
+    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
     let mut total_withdrawn_wrapped_shares = U256::ZERO;
-    for ((token, vault_id), pre_rebalance_balance) in redeemed_input_vaults {
+    for ((token, vault_id), pre_rebalance_balance) in &redeemed_input_vaults {
         let post_rebalance_balance = orderbook
-            .vaultBalance2(owner, token, vault_id)
+            .vaultBalance2(owner, *token, *vault_id)
             .call()
             .await?;
 
-        let pre_rebalance_shares = Float::from_raw(pre_rebalance_balance)
+        let pre_rebalance_shares = Float::from_raw(*pre_rebalance_balance)
             .to_fixed_decimal_lossy(18)?
             .0;
         let post_rebalance_shares = Float::from_raw(post_rebalance_balance)
@@ -648,7 +682,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Redemption should not increase redeemed input vault shares (pre={}, post={})",
-                    Float::from_raw(pre_rebalance_balance)
+                    Float::from_raw(*pre_rebalance_balance)
                         .format_with_scientific(false)
                         .unwrap_or_else(|_| "???".to_string()),
                     Float::from_raw(post_rebalance_balance)
@@ -669,7 +703,11 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
         })?;
     assert_eq!(
         total_withdrawn_wrapped_shares, expected_net_vault_drain,
-        "Redeemed Raindex vault net share delta should match completed redeem qty minus concurrent mint wrapped shares"
+        "Redeemed Raindex vault net share delta should match completed redeem qty \
+         minus concurrent mint wrapped shares\n\
+         redeemed_input_vaults: {redeemed_input_vaults:?}\n\
+         expected_wallet_delta: {expected_wallet_delta}\n\
+         concurrent_mint_wrapped_shares: {concurrent_mint_wrapped_shares}"
     );
 
     let last_event = redeem_events
@@ -707,7 +745,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],
     take_results: &[TakeOrderResult],
     provider: &P,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     broker: &AlpacaBrokerMock,
     db_path: &std::path::Path,
@@ -725,7 +763,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
             *symbol
         }
     };
-    assert_inventory_snapshots(&pool, orderbook_addr, owner, &[equity_symbol], false).await?;
+    assert_inventory_snapshots(&pool, orderbook, owner, &[equity_symbol], false).await?;
 
     match rebalance_type {
         EquityRebalanceType::Mint {
@@ -736,7 +774,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
                 &pool,
                 take_results,
                 provider,
-                orderbook_addr,
+                orderbook,
                 owner,
                 symbol,
                 tokenization,
@@ -753,7 +791,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
                 .pool(&pool)
                 .take_results(take_results)
                 .provider(provider)
-                .orderbook_addr(orderbook_addr)
+                .orderbook(orderbook)
                 .owner(owner)
                 .symbol(symbol)
                 .tokenization(tokenization)
@@ -777,13 +815,15 @@ pub(crate) enum UsdcRebalanceType {
 struct UsdcRebalanceExpectations<'a> {
     event_sequence: &'a [&'a str],
     direction_str: &'a str,
-    expected_broker_side: &'a str,
-    expected_transfer_direction: &'a str,
+    expected_broker_side: OrderSide,
+    expected_transfer_direction: TransferDirection,
 }
 
 struct UsdcRebalanceEventAmounts {
-    initiated_amount_units: U256,
-    bridged_amount_received_units: U256,
+    initiated_amount: U256,
+    bridged_amount_received: U256,
+    /// Full amount burned on source chain = amount_received + fee_collected
+    bridged_amount_burned: U256,
 }
 
 fn usdc_rebalance_expectations(
@@ -803,8 +843,8 @@ fn usdc_rebalance_expectations(
                 "UsdcRebalanceEvent::DepositConfirmed",
             ],
             direction_str: "AlpacaToBase",
-            expected_broker_side: "buy",
-            expected_transfer_direction: "OUTGOING",
+            expected_broker_side: OrderSide::Buy,
+            expected_transfer_direction: TransferDirection::Outgoing,
         },
         UsdcRebalanceType::BaseToAlpaca => UsdcRebalanceExpectations {
             event_sequence: &[
@@ -819,8 +859,8 @@ fn usdc_rebalance_expectations(
                 "UsdcRebalanceEvent::ConversionConfirmed",
             ],
             direction_str: "BaseToAlpaca",
-            expected_broker_side: "sell",
-            expected_transfer_direction: "INCOMING",
+            expected_broker_side: OrderSide::Sell,
+            expected_transfer_direction: TransferDirection::Incoming,
         },
     }
 }
@@ -828,12 +868,12 @@ fn usdc_rebalance_expectations(
 async fn assert_usdc_rebalancing_db_state(
     expected_positions: &[ExpectedPosition],
     pool: &SqlitePool,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     expectations: &UsdcRebalanceExpectations<'_>,
 ) -> anyhow::Result<UsdcRebalanceEventAmounts> {
     let equity_symbols: Vec<&str> = expected_positions.iter().map(|pos| pos.symbol).collect();
-    assert_inventory_snapshots(pool, orderbook_addr, owner, &equity_symbols, true).await?;
+    assert_inventory_snapshots(pool, orderbook, owner, &equity_symbols, true).await?;
 
     let usdc_events = fetch_events_by_type(pool, "UsdcRebalance").await?;
     assert_eq!(
@@ -878,10 +918,20 @@ async fn assert_usdc_rebalancing_db_state(
         .get("amount_received")
         .and_then(|val| val.as_str())
         .ok_or_else(|| anyhow::anyhow!("Bridged event missing amount_received"))?;
+    let fee_collected = bridged_payload
+        .get("fee_collected")
+        .and_then(|val| val.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Bridged event missing fee_collected"))?;
+
+    let received_units: U256 = parse_units(amount_received, 6)?.into();
+    let fee_units: U256 = parse_units(fee_collected, 6)?.into();
 
     Ok(UsdcRebalanceEventAmounts {
-        initiated_amount_units: parse_units(initiated_amount_str, 6)?.into(),
-        bridged_amount_received_units: parse_units(amount_received, 6)?.into(),
+        initiated_amount: parse_units(initiated_amount_str, 6)?.into(),
+        bridged_amount_received: received_units,
+        bridged_amount_burned: received_units
+            .checked_add(fee_units)
+            .ok_or_else(|| anyhow::anyhow!("burned amount overflow"))?,
     })
 }
 
@@ -907,12 +957,11 @@ fn assert_usdc_rebalancing_broker_state(
         matched_order.side, expectations.expected_broker_side,
         "Unexpected USDCUSD order side"
     );
-    let _parsed_order_qty: Decimal = matched_order.qty.parse().unwrap_or_else(|err| {
-        panic!(
-            "Failed to parse USDCUSD order qty '{}': {err}",
-            matched_order.qty
-        )
-    });
+    assert_eq!(
+        matched_order.status,
+        OrderStatus::Filled,
+        "USDCUSD conversion order should be filled"
+    );
 
     let transfers: Vec<_> = broker
         .wallet_transfers()
@@ -928,21 +977,24 @@ fn assert_usdc_rebalancing_broker_state(
     );
     let transfer = &transfers[0];
     assert_eq!(
-        transfer.status, "COMPLETE",
+        transfer.status,
+        TransferStatus::Complete,
         "{} transfer {} should be COMPLETE, got {}",
-        expectations.expected_transfer_direction, transfer.transfer_id, transfer.status
+        expectations.expected_transfer_direction,
+        transfer.transfer_id,
+        transfer.status
     );
 
     let expected_rebalance_usdc_units = match rebalance_type {
-        UsdcRebalanceType::AlpacaToBase => event_amounts.initiated_amount_units,
-        UsdcRebalanceType::BaseToAlpaca => event_amounts.bridged_amount_received_units,
+        UsdcRebalanceType::AlpacaToBase => event_amounts.initiated_amount,
+        UsdcRebalanceType::BaseToAlpaca => event_amounts.bridged_amount_received,
     };
-    let order_qty_units: U256 = parse_units(&matched_order.qty, 6)?.into();
+    let order_quantity_units: U256 = parse_units(&matched_order.quantity.to_string(), 6)?.into();
     assert_eq!(
-        order_qty_units, expected_rebalance_usdc_units,
-        "USDCUSD conversion order qty should match USDC rebalance amount"
+        order_quantity_units, expected_rebalance_usdc_units,
+        "USDCUSD conversion order quantity should match USDC rebalance amount"
     );
-    let transfer_units: U256 = parse_units(&transfer.amount, 6)?.into();
+    let transfer_units: U256 = parse_units(&transfer.amount.to_string(), 6)?.into();
     assert_eq!(
         transfer_units, expected_rebalance_usdc_units,
         "{} wallet transfer amount should match USDC rebalance event amount",
@@ -955,7 +1007,7 @@ fn assert_usdc_rebalancing_broker_state(
 #[bon::builder]
 async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     provider: &P,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     usdc_vault_id: B256,
     usdc_vault_balance_before_rebalance: B256,
@@ -965,7 +1017,7 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     event_amounts: &UsdcRebalanceEventAmounts,
     take_results: &[TakeOrderResult],
 ) -> anyhow::Result<()> {
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook_addr, provider);
+    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
     let vault_balance = orderbook
         .vaultBalance2(owner, base_chain::USDC_BASE, usdc_vault_id)
         .call()
@@ -1008,10 +1060,10 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
 
     let expected_post_units = match rebalance_type {
         UsdcRebalanceType::AlpacaToBase => pre_plus_trades
-            .checked_add(event_amounts.bridged_amount_received_units)
+            .checked_add(event_amounts.bridged_amount_received)
             .ok_or_else(|| anyhow::anyhow!("USDC expected post overflow on AlpacaToBase"))?,
         UsdcRebalanceType::BaseToAlpaca => pre_plus_trades
-            .checked_sub(event_amounts.initiated_amount_units)
+            .checked_sub(event_amounts.initiated_amount)
             .ok_or_else(|| anyhow::anyhow!("USDC expected post underflow on BaseToAlpaca"))?,
     };
     assert_eq!(
@@ -1029,11 +1081,19 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     );
 
     let expected_ethereum_post_units = match rebalance_type {
-        UsdcRebalanceType::AlpacaToBase => ethereum_usdc_balance_before_rebalance
-            .checked_sub(event_amounts.initiated_amount_units)
-            .ok_or_else(|| anyhow::anyhow!("Ethereum USDC underflow on AlpacaToBase burn"))?,
+        UsdcRebalanceType::AlpacaToBase => {
+            // In production, the Alpaca withdrawal deposits USDC on
+            // Ethereum and the CCTP burn removes the same amount (net
+            // zero). The mock broker records the transfer but does NOT
+            // mint USDC on-chain, so only the burn is reflected. The
+            // burn amount is the full source-chain amount (received +
+            // fee), not just the amount received on the destination.
+            ethereum_usdc_balance_before_rebalance
+                .checked_sub(event_amounts.bridged_amount_burned)
+                .ok_or_else(|| anyhow::anyhow!("Ethereum USDC underflow on AlpacaToBase burn"))?
+        }
         UsdcRebalanceType::BaseToAlpaca => ethereum_usdc_balance_before_rebalance
-            .checked_add(event_amounts.bridged_amount_received_units)
+            .checked_add(event_amounts.bridged_amount_received)
             .ok_or_else(|| anyhow::anyhow!("Ethereum USDC overflow on BaseToAlpaca mint"))?,
     };
     assert_eq!(
@@ -1049,7 +1109,7 @@ pub(crate) async fn assert_usdc_rebalancing_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],
     take_results: &[TakeOrderResult],
     provider: &P,
-    orderbook_addr: Address,
+    orderbook: Address,
     owner: Address,
     broker: &AlpacaBrokerMock,
     attestation: &CctpAttestationMock,
@@ -1071,7 +1131,7 @@ pub(crate) async fn assert_usdc_rebalancing_flow<P: Provider>(
     let event_amounts = assert_usdc_rebalancing_db_state(
         expected_positions,
         &pool,
-        orderbook_addr,
+        orderbook,
         owner,
         &expectations,
     )
@@ -1087,7 +1147,7 @@ pub(crate) async fn assert_usdc_rebalancing_flow<P: Provider>(
     );
     assert_usdc_rebalancing_onchain_state()
         .provider(provider)
-        .orderbook_addr(orderbook_addr)
+        .orderbook(orderbook)
         .owner(owner)
         .usdc_vault_id(usdc_vault_id)
         .usdc_vault_balance_before_rebalance(usdc_vault_balance_before_rebalance)

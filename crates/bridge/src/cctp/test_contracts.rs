@@ -1,10 +1,8 @@
-//! CCTP contract deployment for e2e tests.
+//! CCTP contract deployment for tests.
 //!
 //! Deploys Circle's CCTP V2 contracts (TokenMessengerV2, MessageTransmitterV2,
 //! TokenMinterV2) and MockMintBurnToken on plain Anvil instances. This allows
 //! testing the full USDC bridge pipeline without forking mainnet.
-//!
-//! Adapted from `LocalCctp` in `crates/bridge/src/cctp/mod.rs` tests.
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
@@ -13,14 +11,12 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 
-// Committed ABIs: CCTP contracts use solc 0.7.6 which solc.nix doesn't have
-// for aarch64-darwin
 sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
     #[derive(serde::Serialize, serde::Deserialize)]
     TokenMessengerV2,
-    "../../crates/bridge/cctp-abis/TokenMessengerV2.json"
+    "cctp-abis/TokenMessengerV2.json"
 );
 
 sol!(
@@ -28,25 +24,32 @@ sol!(
     #[allow(clippy::too_many_arguments)]
     #[derive(serde::Serialize, serde::Deserialize)]
     MessageTransmitterV2,
-    "../../crates/bridge/cctp-abis/MessageTransmitterV2.json"
+    "cctp-abis/MessageTransmitterV2.json"
 );
 
 sol!(
     #![sol(all_derives = true, rpc)]
     TokenMinterV2,
-    "../../crates/bridge/cctp-abis/TokenMinterV2.json"
+    "cctp-abis/TokenMinterV2.json"
 );
 
 sol!(
     #![sol(all_derives = true, rpc)]
     AdminUpgradableProxy,
-    "../../crates/bridge/cctp-abis/AdminUpgradableProxy.json"
+    "cctp-abis/AdminUpgradableProxy.json"
 );
 
 sol!(
     #![sol(all_derives = true, rpc)]
     MockMintBurnToken,
-    "../../crates/bridge/cctp-abis/MockMintBurnToken.json"
+    "cctp-abis/MockMintBurnToken.json"
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    TestMintBurnToken,
+    "cctp-abis/TestMintBurnToken.json"
 );
 
 /// CCTP domain identifier for Ethereum mainnet.
@@ -63,6 +66,14 @@ const MESSAGE_BODY_VERSION: u32 = 1;
 
 /// Max message body size.
 const MAX_MESSAGE_BODY_SIZE: U256 = U256::from_limbs([8192, 0, 0, 0]);
+
+/// Result of deploying CCTP contracts on a single chain.
+pub struct DeployedCctpChain {
+    pub usdc: Address,
+    pub token_messenger: Address,
+    pub message_transmitter: Address,
+    pub token_minter: Address,
+}
 
 /// Deploys all CCTP contracts on the given Anvil endpoint and returns their
 /// addresses.
@@ -166,18 +177,11 @@ pub async fn deploy_cctp_on_chain(
     })
 }
 
-/// Result of deploying CCTP contracts on a single chain.
-pub struct DeployedCctpChain {
-    pub usdc: Address,
-    pub token_messenger: Address,
-    pub message_transmitter: Address,
-    pub token_minter: Address,
-}
-
 /// Registers an additional local token with the `TokenMinterV2`.
 ///
-/// Sets its max burn amount. Used when the bot's USDC address (e.g. `USDC_BASE`)
-/// differs from the `MockMintBurnToken` deployed by `deploy_cctp_on_chain`.
+/// Sets its max burn amount. Used when the bot's USDC address (e.g.
+/// `USDC_BASE`) differs from the `MockMintBurnToken` deployed by
+/// `deploy_cctp_on_chain`.
 pub async fn set_max_burn_amount(
     endpoint: &str,
     deployer_key: &B256,
