@@ -109,20 +109,26 @@ pub(crate) async fn poll_for_hedged_position(
     }
 }
 
-/// Counts rows in the `event_queue` table.
+/// Counts order-fill jobs in the apalis Jobs table.
+///
+/// Uses `LIKE '%OrderFillJob'` to match regardless of module path prefix
+/// that `std::any::type_name` includes.
 pub(crate) async fn count_queued_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_queue")
-        .fetch_one(pool)
-        .await?;
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type LIKE '%OrderFillJob'")
+            .fetch_one(pool)
+            .await?;
 
     Ok(row.0)
 }
 
-/// Counts processed rows in the `event_queue` table.
+/// Counts completed order-fill jobs in the apalis Jobs table.
 pub(crate) async fn count_processed_queue_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_queue WHERE processed = 1")
-        .fetch_one(pool)
-        .await?;
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM Jobs WHERE job_type LIKE '%OrderFillJob' AND status = 'Done'",
+    )
+    .fetch_one(pool)
+    .await?;
 
     Ok(row.0)
 }

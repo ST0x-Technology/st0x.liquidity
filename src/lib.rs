@@ -69,12 +69,25 @@ mod integration_tests;
 #[cfg(test)]
 pub mod test_utils;
 
+/// Runs app database migrations, tolerating pre-existing apalis migrations
+/// in the shared `_sqlx_migrations` table.
+///
+/// Apalis and the app share the `_sqlx_migrations` table. After a bot run
+/// that applied apalis migrations, restarting would fail because sqlx finds
+/// apalis migration records that aren't in the app's migrations directory.
+/// `set_ignore_missing(true)` skips those foreign records instead of failing.
+async fn run_app_migrations(pool: &SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut migrator = sqlx::migrate!();
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await
+}
+
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     let launch_span = info_span!("launch");
     let _enter = launch_span.enter();
 
     let pool = ctx.get_sqlite_pool().await?;
-    sqlx::migrate!().run(&pool).await?;
+    run_app_migrations(&pool).await?;
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
     let inventory = Arc::new(inventory::BroadcastingInventory::new(

@@ -4,7 +4,7 @@
 //! the task handles; [`run_market_hours_loop`] drives the lifecycle.
 
 mod builder;
-mod job;
+pub(crate) mod job;
 mod manifest;
 mod order_fill_monitor;
 mod order_fill_processor;
@@ -34,7 +34,8 @@ use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
-use crate::offchain::order_poller::OrderStatusPoller;
+use crate::offchain::order_status_ctx::PollOrderStatusQueue;
+use crate::offchain::poll_order_status::PollOrderStatus;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
@@ -87,7 +88,6 @@ pub(crate) struct TradeProcessingCqrs {
 pub(crate) struct Conductor {
     pub(crate) supervisor: task_supervisor::SupervisorHandle,
     pub(crate) monitor: JoinHandle<()>,
-    pub(crate) order_poller: JoinHandle<()>,
     pub(crate) position_checker: JoinHandle<()>,
     pub(crate) executor_maintenance: Option<JoinHandle<()>>,
     pub(crate) rebalancer: Option<JoinHandle<()>>,
@@ -261,6 +261,7 @@ impl Conductor {
                 execution_threshold: ctx.execution_threshold,
                 frameworks,
                 poll_notify: Arc::new(tokio::sync::Notify::new()),
+                pool: pool.clone(),
             };
 
             let mut builder = ConductorBuilder::new(conductor_ctx, job_queue)
@@ -285,9 +286,6 @@ impl Conductor {
             result = &mut self.monitor => {
                 check_task_result(result, "Apalis monitor")?;
             }
-            result = &mut self.order_poller => {
-                check_task_result(result, "Order poller")?;
-            }
             result = &mut self.position_checker => {
                 check_task_result(result, "Position checker")?;
             }
@@ -305,7 +303,6 @@ impl Conductor {
             error!(%error, "Supervisor shutdown failed");
         }
         self.monitor.abort();
-        self.order_poller.abort();
         self.position_checker.abort();
 
         info!("Trading tasks aborted successfully");
@@ -539,41 +536,13 @@ async fn build_position_cqrs(
         .await?)
 }
 
-fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
-    ctx: &Ctx,
-    executor: E,
-    offchain_order_projection: Projection<OffchainOrder>,
-    offchain_order: Arc<Store<OffchainOrder>>,
-    position: Arc<Store<Position>>,
-) -> JoinHandle<()> {
-    let poller_ctx = ctx.get_order_poller_ctx();
-    info!(
-        "Starting order status poller with interval: {:?}, max jitter: {:?}",
-        poller_ctx.polling_interval, poller_ctx.max_jitter
-    );
-
-    let poller = OrderStatusPoller::new(
-        poller_ctx,
-        executor,
-        offchain_order_projection,
-        offchain_order,
-        position,
-    );
-    tokio::spawn(async move {
-        if let Err(error) = poller.run().await {
-            error!("Order poller failed: {error}");
-        } else {
-            info!("Order poller completed successfully");
-        }
-    })
-}
-
 #[bon::builder]
 fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
+    poll_queue: Arc<tokio::sync::Mutex<PollOrderStatusQueue>>,
     execution_threshold: ExecutionThreshold,
     check_interval: Duration,
     ctx: Ctx,
@@ -596,6 +565,7 @@ where
                 &position,
                 &position_projection,
                 &offchain_order,
+                &poll_queue,
                 &execution_threshold,
                 &ctx.assets,
                 |symbol| ctx.is_trading_enabled(symbol),
@@ -900,6 +870,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     queued_event: &QueuedEvent,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
+    poll_queue: &tokio::sync::Mutex<PollOrderStatusQueue>,
     asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, OrderFillError> {
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
@@ -923,12 +894,13 @@ pub(crate) async fn process_queued_trade<E: Executor>(
         return Ok(None);
     };
 
-    place_offchain_order(&execution, cqrs).await
+    place_offchain_order(&execution, cqrs, poll_queue).await
 }
 
 async fn place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
+    poll_queue: &tokio::sync::Mutex<PollOrderStatusQueue>,
 ) -> Result<Option<OffchainOrderId>, OrderFillError> {
     let offchain_order_id = OffchainOrderId::new();
 
@@ -938,20 +910,115 @@ async fn place_offchain_order(
 
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
-    let aggregate = cqrs.offchain_order.load(&offchain_order_id).await;
-
-    if let Ok(Some(OffchainOrder::Failed { error, .. })) = aggregate {
-        warn!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            %error,
-            "Broker rejected order, clearing position pending state"
-        );
-        execute_fail_offchain_order_position(&cqrs.position, offchain_order_id, execution, error)
+    match cqrs.offchain_order.load(&offchain_order_id).await {
+        Ok(Some(OffchainOrder::Failed { error, .. })) => {
+            warn!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                %error,
+                "Broker rejected order, clearing position pending state"
+            );
+            execute_fail_offchain_order_position(
+                &cqrs.position,
+                offchain_order_id,
+                execution,
+                error,
+            )
             .await;
+        }
+        Ok(Some(OffchainOrder::Submitted {
+            executor_order_id, ..
+        })) => {
+            enqueue_poll_job(
+                poll_queue,
+                offchain_order_id,
+                &executor_order_id,
+                &execution.symbol,
+                execution.shares,
+                execution.direction,
+            )
+            .await;
+        }
+        _ => {}
     }
 
     Ok(Some(offchain_order_id))
+}
+
+async fn enqueue_poll_job(
+    poll_queue: &tokio::sync::Mutex<PollOrderStatusQueue>,
+    offchain_order_id: OffchainOrderId,
+    executor_order_id: &st0x_execution::ExecutorOrderId,
+    symbol: &Symbol,
+    shares: st0x_execution::Positive<FractionalShares>,
+    direction: st0x_execution::Direction,
+) {
+    let job = PollOrderStatus {
+        offchain_order_id,
+        executor_order_id: executor_order_id.clone(),
+        symbol: symbol.clone(),
+        shares,
+        direction,
+    };
+
+    match poll_queue.lock().await.push(job).await {
+        Ok(()) => info!(
+            %offchain_order_id,
+            %symbol,
+            "Enqueued PollOrderStatus job"
+        ),
+        Err(error) => error!(
+            %offchain_order_id,
+            %symbol,
+            "Failed to enqueue PollOrderStatus job: {error}"
+        ),
+    }
+}
+
+/// Re-enqueues `PollOrderStatus` jobs for any orders still in `Submitted`
+/// state when the conductor starts. This handles crash recovery: orders that
+/// were submitted before the previous run crashed have no pending poll jobs,
+/// so without this they would never be polled to completion.
+pub(crate) async fn reenqueue_submitted_orders(
+    offchain_order_projection: &Projection<OffchainOrder>,
+    poll_queue: &tokio::sync::Mutex<PollOrderStatusQueue>,
+) {
+    let submitted = match offchain_order_projection
+        .filter(
+            st0x_event_sorcery::Column("status"),
+            &st0x_execution::OrderStatus::Submitted,
+        )
+        .await
+    {
+        Ok(orders) => orders,
+        Err(error) => {
+            error!(%error, "Failed to query submitted orders for crash recovery");
+            return;
+        }
+    };
+
+    for (offchain_order_id, order) in submitted {
+        let OffchainOrder::Submitted {
+            ref executor_order_id,
+            ref symbol,
+            shares,
+            direction,
+            ..
+        } = order
+        else {
+            continue;
+        };
+
+        enqueue_poll_job(
+            poll_queue,
+            offchain_order_id,
+            executor_order_id,
+            symbol,
+            shares,
+            direction,
+        )
+        .await;
+    }
 }
 
 async fn execute_fail_offchain_order_position(
@@ -1074,6 +1141,7 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     position: &Store<Position>,
     position_projection: &Projection<Position>,
     offchain_order: &Arc<Store<OffchainOrder>>,
+    poll_queue: &tokio::sync::Mutex<PollOrderStatusQueue>,
     threshold: &ExecutionThreshold,
     assets: &AssetsConfig,
     is_trading_enabled: impl Fn(&Symbol) -> bool,
@@ -1157,17 +1225,36 @@ where
             ),
         }
 
-        if let Ok(Some(OffchainOrder::Failed { error, .. })) =
-            offchain_order.load(&offchain_order_id).await
-        {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                %error,
-                "Broker rejected order, clearing position pending state"
-            );
-            execute_fail_offchain_order_position(position, offchain_order_id, &execution, error)
+        match offchain_order.load(&offchain_order_id).await {
+            Ok(Some(OffchainOrder::Failed { error, .. })) => {
+                warn!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    %error,
+                    "Broker rejected order, clearing position pending state"
+                );
+                execute_fail_offchain_order_position(
+                    position,
+                    offchain_order_id,
+                    &execution,
+                    error,
+                )
                 .await;
+            }
+            Ok(Some(OffchainOrder::Submitted {
+                executor_order_id, ..
+            })) => {
+                enqueue_poll_job(
+                    poll_queue,
+                    offchain_order_id,
+                    &executor_order_id,
+                    &execution.symbol,
+                    execution.shares,
+                    execution.direction,
+                )
+                .await;
+            }
+            _ => {}
         }
     }
 
@@ -1340,6 +1427,7 @@ mod tests {
                 execution_threshold: ExecutionThreshold::whole_share(),
                 frameworks,
                 poll_notify: Arc::new(tokio::sync::Notify::new()),
+                pool: pool.clone(),
             },
             job_queue,
         )
@@ -1359,7 +1447,6 @@ mod tests {
         let pool = setup_test_db().await;
         let conductor = build_test_conductor(&pool).await;
 
-        assert!(!conductor.order_poller.is_finished());
         assert!(!conductor.position_checker.is_finished());
 
         conductor.abort_all();
@@ -1405,6 +1492,7 @@ mod tests {
                 execution_threshold: ExecutionThreshold::whole_share(),
                 frameworks,
                 poll_notify: Arc::new(tokio::sync::Notify::new()),
+                pool: pool.clone(),
             },
             job_queue,
         )
@@ -1447,6 +1535,7 @@ mod tests {
                 execution_threshold: ExecutionThreshold::whole_share(),
                 frameworks,
                 poll_notify: Arc::new(tokio::sync::Notify::new()),
+                pool: pool.clone(),
             },
             job_queue,
         )
@@ -2053,12 +2142,21 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         let queued_event = make_queued_event(10);
         let trade = test_trade_with_amount(dec!(0.5), 10);
 
-        let result =
-            process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true).await;
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event,
+            trade,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await;
 
         assert_eq!(
             result.unwrap(),
@@ -2091,12 +2189,21 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         let queued_event = make_queued_event(20);
         let trade = test_trade_with_amount(dec!(1.5), 20);
 
-        let result =
-            process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true).await;
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event,
+            trade,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await;
 
         let offchain_order_id = result
             .unwrap()
@@ -2135,12 +2242,21 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         let queued_event_1 = make_queued_event(30);
         let trade_1 = test_trade_with_amount(dec!(0.5), 30);
 
-        let result_1 =
-            process_queued_trade(&MockExecutor::new(), &queued_event_1, trade_1, &cqrs, true).await;
+        let result_1 = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event_1,
+            trade_1,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await;
 
         assert_eq!(
             result_1.unwrap(),
@@ -2151,8 +2267,15 @@ mod tests {
         let queued_event_2 = make_queued_event(31);
         let trade_2 = test_trade_with_amount(dec!(0.7), 31);
 
-        let result_2 =
-            process_queued_trade(&MockExecutor::new(), &queued_event_2, trade_2, &cqrs, true).await;
+        let result_2 = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event_2,
+            trade_2,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await;
 
         assert!(
             result_2.unwrap().is_some(),
@@ -2177,21 +2300,36 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         let queued_event_1 = make_queued_event(40);
         let trade_1 = test_trade_with_amount(dec!(1.5), 40);
 
-        let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &queued_event_1, trade_1, &cqrs, true)
-                .await
-                .unwrap()
-                .expect("first trade should place an order");
+        let first_order_id = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event_1,
+            trade_1,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
 
         let queued_event_2 = make_queued_event(41);
         let trade_2 = test_trade_with_amount(dec!(1.5), 41);
 
-        let result_2 =
-            process_queued_trade(&MockExecutor::new(), &queued_event_2, trade_2, &cqrs, true).await;
+        let result_2 = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event_2,
+            trade_2,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await;
 
         assert_eq!(
             result_2.unwrap(),
@@ -2225,24 +2363,39 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         // Process first trade -> places order
         let queued_event_1 = make_queued_event(50);
         let trade_1 = test_trade_with_amount(dec!(1.5), 50);
 
-        let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &queued_event_1, trade_1, &cqrs, true)
-                .await
-                .unwrap()
-                .expect("first trade should place an order");
+        let first_order_id = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event_1,
+            trade_1,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
 
         // Process second trade -> blocked by pending order
         let queued_event_2 = make_queued_event(51);
         let trade_2 = test_trade_with_amount(dec!(1.5), 51);
 
-        process_queued_trade(&MockExecutor::new(), &queued_event_2, trade_2, &cqrs, true)
-            .await
-            .unwrap();
+        process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event_2,
+            trade_2,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await
+        .unwrap();
 
         // Complete the first order via CQRS
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2283,6 +2436,7 @@ mod tests {
             &cqrs.position,
             &cqrs.position_projection,
             &cqrs.offchain_order,
+            &poll_queue,
             &cqrs.execution_threshold,
             &cqrs.assets,
             |_| true,
@@ -2315,12 +2469,21 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         let queued_event = make_queued_event(60);
         let trade = test_trade_with_amount(dec!(2.0), 60);
 
-        let result =
-            process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true).await;
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event,
+            trade,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await;
 
         assert!(
             result.unwrap().is_some(),
@@ -2984,13 +3147,22 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, failing_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         let queued_event = make_queued_event(70);
         let trade = test_trade_with_amount(dec!(1.5), 70);
 
-        process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true)
-            .await
-            .unwrap();
+        process_queued_trade(
+            &MockExecutor::new(),
+            &queued_event,
+            trade,
+            &cqrs,
+            &poll_queue,
+            true,
+        )
+        .await
+        .unwrap();
 
         let position = cqrs
             .position_projection
@@ -3024,6 +3196,7 @@ mod tests {
             &cqrs.position,
             &cqrs.position_projection,
             &cqrs.offchain_order,
+            &poll_queue,
             &cqrs.execution_threshold,
             &cqrs.assets,
             |_| true,
@@ -3070,6 +3243,8 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, rejecting_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let poll_queue: tokio::sync::Mutex<PollOrderStatusQueue> =
+            tokio::sync::Mutex::new(apalis_sqlite::SqliteStorage::new(&pool));
 
         // Accumulate a position by acknowledging an onchain fill
         let symbol = Symbol::new("AAPL").unwrap();
@@ -3108,6 +3283,7 @@ mod tests {
             &cqrs.position,
             &cqrs.position_projection,
             &cqrs.offchain_order,
+            &poll_queue,
             &cqrs.execution_threshold,
             &cqrs.assets,
             |_| true,
