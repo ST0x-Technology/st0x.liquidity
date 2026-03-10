@@ -11,12 +11,13 @@ use super::{RATIO_ONE, UnderlyingPerWrapped, Wrapper, WrapperError};
 pub(crate) struct MockWrapper {
     owner: Address,
     unwrap_tx: TxHash,
-    unwrapped_token: Address,
+    tokenized_shares: Address,
     wrapped_token: Address,
     ratio: U256,
     wrap_fails: bool,
     unwrap_fails: bool,
     lookup_fails: bool,
+    derivative_lookup_fails: bool,
 }
 
 impl MockWrapper {
@@ -24,12 +25,13 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
+            tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
             ratio: RATIO_ONE,
             wrap_fails: false,
             unwrap_fails: false,
             lookup_fails: false,
+            derivative_lookup_fails: false,
         }
     }
 
@@ -38,22 +40,24 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
+            tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
             ratio,
             wrap_fails: false,
             unwrap_fails: false,
             lookup_fails: false,
+            derivative_lookup_fails: false,
         }
     }
 
-    /// Sets the address returned by `lookup_tokenized_equity`.
-    pub(crate) fn with_unwrapped_token(mut self, token: Address) -> Self {
-        self.unwrapped_token = token;
+    /// Sets the tokenized shares address returned by `lookup_underlying`.
+    pub(crate) fn with_tokenized_shares(mut self, token: Address) -> Self {
+        self.tokenized_shares = token;
         self
     }
 
-    /// Sets the address returned by `lookup_tokenized_equity_derivative`.
+    /// Sets the wrapped (derivative) token address returned by
+    /// `lookup_derivative`.
     pub(crate) fn with_wrapped_token(mut self, token: Address) -> Self {
         self.wrapped_token = token;
         self
@@ -64,12 +68,13 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
+            tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
             ratio: RATIO_ONE,
             wrap_fails: true,
             unwrap_fails: false,
             lookup_fails: false,
+            derivative_lookup_fails: false,
         }
     }
 
@@ -78,12 +83,13 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
+            tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
             ratio: RATIO_ONE,
             wrap_fails: false,
             unwrap_fails: true,
             lookup_fails: false,
+            derivative_lookup_fails: false,
         }
     }
 
@@ -92,12 +98,29 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
+            tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
             ratio: RATIO_ONE,
             wrap_fails: false,
             unwrap_fails: false,
             lookup_fails: true,
+            derivative_lookup_fails: false,
+        }
+    }
+
+    /// Creates a mock wrapper that succeeds on underlying token lookup but
+    /// fails on derivative token lookup.
+    pub(crate) fn failing_derivative_lookup() -> Self {
+        Self {
+            owner: Address::random(),
+            unwrap_tx: TxHash::random(),
+            tokenized_shares: Address::random(),
+            wrapped_token: Address::random(),
+            ratio: RATIO_ONE,
+            wrap_fails: false,
+            unwrap_fails: false,
+            lookup_fails: false,
+            derivative_lookup_fails: true,
         }
     }
 }
@@ -111,15 +134,15 @@ impl Wrapper for MockWrapper {
         Ok(UnderlyingPerWrapped::new(self.ratio).expect("ratio is non-zero"))
     }
 
-    fn lookup_tokenized_equity(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+    fn lookup_underlying(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
         if self.lookup_fails {
             return Err(WrapperError::SymbolNotConfigured(symbol.clone()));
         }
-        Ok(self.unwrapped_token)
+        Ok(self.tokenized_shares)
     }
 
-    fn lookup_tokenized_equity_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
-        if self.lookup_fails {
+    fn lookup_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+        if self.lookup_fails || self.derivative_lookup_fails {
             return Err(WrapperError::SymbolNotConfigured(symbol.clone()));
         }
         Ok(self.wrapped_token)

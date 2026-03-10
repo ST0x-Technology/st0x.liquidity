@@ -15,3 +15,4 @@ tarpaulin-report.html
 .worktrees/
 out/
 cache/
+.tmp/

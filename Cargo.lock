@@ -6573,6 +6573,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "st0x-finance",
  "ts-rs",
 ]
 
@@ -6644,12 +6645,27 @@ dependencies = [
  "serial_test",
  "sqlite-es",
  "sqlx",
+ "st0x-finance",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
  "url",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "st0x-finance"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "num-traits",
+ "proptest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -6696,6 +6712,7 @@ dependencies = [
  "st0x-event-sorcery",
  "st0x-evm",
  "st0x-execution",
+ "st0x-finance",
  "st0x-hedge",
  "temp-env",
  "tempfile",

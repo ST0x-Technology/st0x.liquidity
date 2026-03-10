@@ -16,11 +16,12 @@ use st0x_execution::{
     ArithmeticError, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
     Symbol,
 };
+use st0x_finance::Usdc;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
 use crate::offchain_order::{Dollars, OffchainOrderId};
-use crate::threshold::{ExecutionThreshold, Usdc};
+use crate::threshold::ExecutionThreshold;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Position {
@@ -316,14 +317,14 @@ impl Position {
                 };
 
                 let net_abs = self.net.abs();
-                let dollar_value = (Usdc(price) * net_abs.inner())?;
+                let dollar_value = (Usdc::new(price) * net_abs.inner())?;
 
-                if dollar_value.0 >= threshold_dollars.0 {
+                if dollar_value.inner() >= threshold_dollars.inner() {
                     Ok(Some(TriggerReason::DollarThreshold {
                         net_position_shares: self.net.inner(),
-                        dollar_value: dollar_value.0,
+                        dollar_value: dollar_value.inner(),
                         price_usdc: price,
-                        threshold_dollars: threshold_dollars.0,
+                        threshold_dollars: threshold_dollars.inner(),
                     }))
                 } else {
                     Ok(None)
@@ -365,7 +366,7 @@ impl Position {
     pub(crate) fn is_ready_for_execution(
         &self,
         executor: SupportedExecutor,
-        shares_limit: Option<Positive<FractionalShares>>,
+        shares_limit: Option<FractionalShares>,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
         if self.pending_offchain_order_id.is_some() {
             return Ok(None);
@@ -378,15 +379,14 @@ impl Position {
                 let raw_shares = self.net.abs();
 
                 let capped_shares = shares_limit.map_or(raw_shares, |cap| {
-                    let cap_value = cap.inner();
-                    if raw_shares > cap_value {
+                    if raw_shares > cap {
                         warn!(
                             symbol = %self.symbol,
                             computed = %raw_shares,
-                            limit = %cap_value,
+                            limit = %cap,
                             "Counter trade shares capped by operational limit"
                         );
-                        cap_value
+                        cap
                     } else {
                         raw_shares
                     }
@@ -595,8 +595,9 @@ mod tests {
 
     use st0x_event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
 
+    use st0x_finance::Usdc;
+
     use super::*;
-    use crate::threshold::Usdc;
 
     fn one_share_threshold() -> ExecutionThreshold {
         ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
@@ -1057,7 +1058,7 @@ mod tests {
 
     #[test]
     fn threshold_updated_changes_threshold() {
-        let new_threshold = ExecutionThreshold::dollar_value(Usdc(dec!(10000))).unwrap();
+        let new_threshold = ExecutionThreshold::dollar_value(Usdc::new(dec!(10000))).unwrap();
 
         let position = replay::<Position>(vec![
             PositionEvent::Initialized {
@@ -1249,7 +1250,7 @@ mod tests {
             accumulated_long: FractionalShares::new(dec!(1.212)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            threshold: ExecutionThreshold::dollar_value(Usdc::new(dec!(1))).unwrap(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),
         };
@@ -1277,7 +1278,7 @@ mod tests {
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(dec!(2.567)),
             pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            threshold: ExecutionThreshold::dollar_value(Usdc::new(dec!(1))).unwrap(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),
         };
@@ -1310,7 +1311,7 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
@@ -1340,7 +1341,7 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
@@ -1370,7 +1371,7 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50.7))).unwrap();
+        let shares_limit = FractionalShares::new(dec!(50.7));
 
         let (_, shares) = position
             .is_ready_for_execution(SupportedExecutor::Schwab, Some(shares_limit))
@@ -1400,7 +1401,7 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(7.5))).unwrap();
+        let shares_limit = FractionalShares::new(dec!(7.5));
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
@@ -1430,7 +1431,7 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(5))).unwrap();
+        let shares_limit = FractionalShares::new(dec!(5));
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
@@ -1460,7 +1461,7 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
@@ -1527,7 +1528,7 @@ mod tests {
 
     #[test]
     fn capped_execution_leaves_remaining_exposure_triggerable() {
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = FractionalShares::new(dec!(50));
 
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
