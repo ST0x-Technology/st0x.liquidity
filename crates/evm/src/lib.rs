@@ -38,6 +38,9 @@ pub mod fireblocks;
 #[cfg(feature = "local-signer")]
 pub mod local;
 
+#[cfg(feature = "turnkey")]
+pub mod turnkey;
+
 /// Errors that can occur during EVM operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EvmError {
@@ -58,6 +61,16 @@ pub enum EvmError {
     #[cfg(feature = "fireblocks")]
     #[error("Fireblocks error: {0}")]
     Fireblocks(#[from] fireblocks::FireblocksError),
+    #[cfg(feature = "turnkey")]
+    #[error("Turnkey error: {0}")]
+    Turnkey(#[from] turnkey::TurnkeyError),
+}
+
+#[cfg(feature = "turnkey")]
+impl From<alloy_signer_turnkey::TurnkeySignerError> for EvmError {
+    fn from(error: alloy_signer_turnkey::TurnkeySignerError) -> Self {
+        Self::Turnkey(turnkey::TurnkeyError::from(error))
+    }
 }
 
 #[cfg(feature = "fireblocks")]

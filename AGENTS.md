@@ -65,6 +65,37 @@ The project uses a strict document hierarchy:
 **Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
 plan the implementation.
 
+### Goal-Oriented Planning
+
+Organize around the **goal**, not implementation streams. Start from the desired
+end state and work backwards. Implementation details (crate, branch) are
+downstream from the goal.
+
+### Epic Decomposition for Parallel Execution
+
+Decompose epics to maximize independent parallel execution:
+
+1. **Identify coupling boundaries.** Work touching disjoint code areas can
+   proceed in parallel.
+2. **Sequence only where necessary.** A branch depends on another only when it
+   needs types/traits/behavior introduced by that branch.
+3. **Every branch must be independently valid.** Each PR must pass CI and make
+   sense on its own -- never leave a broken intermediate state.
+4. **Defer integration.** Push integration PRs to the end, stacked on both
+   parallel branches.
+5. **Shared dependencies go first.** Extract shared types/traits/schemas into a
+   base PR to unblock all downstream branches.
+6. **Conflict-prone work goes last.** Schedule after parallel branches merge.
+7. **Converge to a single terminal node.** One final PR depends on all parallel
+   streams for integration.
+
+### Managing Epics in the Roadmap
+
+An epic groups related issues toward a single goal. Lead with motivation (why
+this matters), show dependency structure via Mermaid diagrams, reference issues
+not solutions, and mark progress inline (`[x]` with PR link). Move completed
+epics to "Completed."
+
 ## Plan & Review
 
 ### While implementing
@@ -357,36 +388,16 @@ is the source of truth for terminology and naming conventions.
   `.with_required_confirmations(self.required_confirmations).get_receipt()` on
   all pending transactions. Never use bare `.get_receipt().await` in production
   code paths.
-- **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
-  cqrs-es framework for event sourcing. **NEVER write directly to the `events`
-  table**. This is strictly forbidden and violates the CQRS architecture:
-  - **FORBIDDEN**: Direct INSERT statements into the `events` table
-  - **FORBIDDEN**: Manual sequence number management for events
-  - **FORBIDDEN**: Bypassing the CqrsFramework to write events
-  - **REQUIRED**: Always use `CqrsFramework::execute()` or
-    `CqrsFramework::execute_with_metadata()` to emit events
-  - **REQUIRED**: Events must be emitted through aggregate commands that
-    generate domain events
-  - The cqrs-es framework handles event persistence, sequence numbers, aggregate
-    loading, and consistency guarantees
-  - Direct table writes break aggregate consistency, event ordering, and the
-    event sourcing pattern
-  - If you see existing code writing directly to `events` table, that code is
-    incorrect and should be refactored to use CqrsFramework
-- **CRITICAL: Single CQRS Framework Instance Per Aggregate**: In the main bot
-  flow, each aggregate type must have exactly ONE `SqliteCqrs<A>` instance,
-  constructed once during startup in `Conductor::start`, then passed to all
-  consumers. This prevents silent production bugs where missing query processors
-  cause events to persist without triggering required side effects.
-  - **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` anywhere in
-    the server binary's code path outside `Conductor::start`
-  - **FORBIDDEN**: Creating multiple `SqliteCqrs<A>` instances for the same
-    aggregate type in the bot flow
-  - **REQUIRED**: When adding a new query processor, add it to the framework
-    construction in `Conductor::start`
-  - **ALLOWED**: Direct construction in test code, CLI code, and migration code
-    (different execution contexts with intentionally different query processor
-    needs)
+- **CRITICAL: CQRS/Event Sourcing Architecture**: **NEVER write directly to the
+  `events` table** — no direct INSERTs, no manual sequence numbers, no bypassing
+  `CqrsFramework`. Always use `CqrsFramework::execute()` or
+  `execute_with_metadata()` to emit events through aggregate commands. The
+  framework handles persistence, sequence numbers, and consistency
+- **CRITICAL: Single CQRS Framework Instance Per Aggregate**: Each aggregate
+  must have exactly ONE `SqliteCqrs<A>` in the server binary, constructed in
+  `Conductor::start`. Never call `sqlite_cqrs()` or `CqrsFramework::new()`
+  elsewhere in the server path. Direct construction is fine in
+  test/CLI/migration code
 - **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
   `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
@@ -395,10 +406,12 @@ is the source of truth for terminology and naming conventions.
   system. Use ADTs and enums to encode business rules and state transitions
   directly in types rather than runtime validation. See "Type modeling" in Code
   Style for details
-- **SDK Boundary Conversion**: Functions that call external SDKs must accept
-  domain types and convert to SDK types internally. Never strip domain types to
-  primitives (`&str`, `u64`, etc.) at the call site — the conversion belongs
-  inside the function that needs the primitive for the SDK call
+- **SDK Boundary Conversion**: Prefer accepting domain newtypes and converting
+  to SDK primitives inside the callee when you control the callee boundary.
+  Exception: when the callee lives in a different crate that cannot depend on
+  the caller's domain types (e.g., `convert_usdc_usd` in `st0x-execution`
+  accepts `Decimal` because `Usdc` is defined in the main crate), destructuring
+  at the call site is fine
 - **Schema Design**: Avoid database columns that can contradict each other. Use
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where

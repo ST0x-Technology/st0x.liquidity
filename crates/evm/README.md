@@ -14,17 +14,23 @@ from "how to sign and submit" (key management, owned by this crate).
 
 ## Implementations
 
-### `FireblocksWallet` (production)
+### `FireblocksWallet`
 
 Wraps the Fireblocks SDK client. Builds a `CONTRACT_CALL` transaction request,
 submits it to the Fireblocks API, polls for completion, and fetches the receipt
 from a read-only RPC provider. Uses MPC-based key management -- the private key
 never exists in a single location.
 
-### `RawPrivateKeyWallet` (tests only)
+### `TurnkeyWallet`
+
+Wraps `alloy-signer-turnkey` to sign transactions via the Turnkey API. Key
+material is managed by Turnkey's secure infrastructure. Enabled behind the
+`turnkey` feature flag.
+
+### `RawPrivateKeyWallet`
 
 Wraps an alloy provider with an embedded `EthereumWallet` for anvil-based
-testing. Not compiled in production builds.
+testing.
 
 ## Configuration
 
