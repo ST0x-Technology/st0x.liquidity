@@ -88,6 +88,55 @@ Everything below has not been organized into epics yet.
 - [ ] [#332 No way to enable/disable individual asset markets](https://github.com/ST0x-Technology/st0x.liquidity/issues/332)
   - PR (draft):
     [#335 add per-asset market enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/pull/335)
+    <<<<<<< HEAD =======
+- [ ] [#353 Per-asset operations config: independent trading/rebalancing toggles, vault IDs, operational limits](https://github.com/ST0x-Technology/st0x.liquidity/issues/353)
+  - PR:
+    [#355 per-asset operations config: independent trading/rebalancing toggles](https://github.com/ST0x-Technology/st0x.liquidity/pull/355)
+
+>>>>>>> 59779ecb (link PR #355 in roadmap)
+
+### Operational visibility and reliable wallet signing
+
+We are actively testing auto-rebalancing with cross-venue inventory transfers
+and currently rely on logs to understand system state. We need dashboard panels
+showing inventory snapshots and transfer lifecycle so operators can see what is
+happening without tailing logs. Separately, Fireblocks has been unreliable for
+onchain signing (high latency, outages), so we are adding Turnkey as an
+alternative wallet provider.
+
+These two goals touch disjoint code areas (Turnkey: evm crate only; dashboard:
+dto + main crate + dashboard frontend), so they proceed in parallel. Wiring
+Turnkey into the main crate config is deferred to last to avoid conflicts with
+dashboard work in the same crate.
+
+All branches stack on #355 (per-asset operations config).
+
+```mermaid
+graph TD
+    A["#355 per-asset-operations-config"] --> B["roadmap update"]
+    B --> C["#354 Turnkey wallet<br/>(evm crate)"]
+    B --> D["#376 DTO schema update"]
+    C --> E["#380 wallet provider config<br/>(main crate, last)"]
+    D --> F["#377 dashboard backend"]
+    D --> G["#378 dashboard frontend"]
+    F --> H["#379 dashboard integration"]
+    G --> H
+```
+
+#### Turnkey wallet (evm crate, independent)
+
+- [ ] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
+
+#### Dashboard inventory & transfer monitoring
+
+- [ ] [#376 Review and update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/issues/376)
+- [ ] [#377 Dashboard backend: serve inventory history and transfer status via WebSocket](https://github.com/ST0x-Technology/st0x.liquidity/issues/377)
+- [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
+- [ ] [#379 Dashboard integration: verify nix build, deployment, and end-to-end data flow](https://github.com/ST0x-Technology/st0x.liquidity/issues/379)
+
+#### Wallet provider config (main crate, depends on Turnkey wallet)
+
+- [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
 
 #### Wrapped Token Handling
 
