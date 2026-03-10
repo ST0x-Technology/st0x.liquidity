@@ -1,10 +1,13 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::providers::Provider;
 use apalis::prelude::{Monitor, WorkerBuilder};
+use sqlx::SqlitePool;
 use task_supervisor::SupervisorBuilder;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -16,11 +19,11 @@ use super::job::Job;
 use super::order_fill_monitor::{OrderFillJobQueue, OrderFillMonitor};
 use super::order_fill_processor::OrderFillCtx;
 use super::{
-    Conductor, OrderFillError, spawn_inventory_poller, spawn_order_poller,
-    spawn_periodic_accumulated_position_check,
+    Conductor, OrderFillError, spawn_inventory_poller, spawn_periodic_accumulated_position_check,
 };
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot};
+use crate::offchain::order_status_ctx::{OrderStatusCtx, PollOrderStatusQueue};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
@@ -51,6 +54,7 @@ pub(crate) struct ConductorCtx<P, E> {
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) poll_notify: Arc<tokio::sync::Notify>,
+    pub(crate) pool: SqlitePool,
 }
 
 pub(crate) struct Initial;
@@ -137,19 +141,22 @@ where
         ));
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 
-        let order_poller = spawn_order_poller(
-            &self.common.ctx,
-            self.common.executor.clone(),
-            (*self.common.frameworks.offchain_order_projection).clone(),
-            self.common.frameworks.offchain_order.clone(),
-            self.common.frameworks.position.clone(),
-        );
+        let poll_queue: PollOrderStatusQueue = apalis_sqlite::SqliteStorage::new(&self.common.pool);
+
+        let order_status_ctx = Arc::new(OrderStatusCtx {
+            executor: self.common.executor.clone(),
+            offchain_order: self.common.frameworks.offchain_order.clone(),
+            position: self.common.frameworks.position.clone(),
+            poll_queue: Mutex::new(poll_queue.clone()),
+            poll_interval: Duration::from_secs(self.common.ctx.order_polling_interval),
+        });
 
         let position_checker = spawn_periodic_accumulated_position_check()
             .executor(self.common.executor.clone())
             .position(self.common.frameworks.position.clone())
             .position_projection(self.common.frameworks.position_projection.clone())
             .offchain_order(self.common.frameworks.offchain_order.clone())
+            .poll_queue(Arc::new(Mutex::new(poll_queue.clone())))
             .execution_threshold(self.common.execution_threshold)
             .check_interval(std::time::Duration::from_secs(
                 self.common.ctx.position_check_interval,
@@ -174,6 +181,7 @@ where
             cqrs: trade_cqrs,
             vault_registry: self.common.frameworks.vault_registry,
             executor: self.common.executor,
+            poll_queue: Mutex::new(poll_queue.clone()),
         });
 
         let order_fill_monitor = OrderFillMonitor::new(
@@ -187,11 +195,18 @@ where
             .build()
             .run();
 
+        let offchain_order_projection = self.common.frameworks.offchain_order_projection;
+        let startup_poll_queue = Arc::new(Mutex::new(poll_queue.clone()));
+        tokio::spawn(async move {
+            super::reenqueue_submitted_orders(&offchain_order_projection, &startup_poll_queue)
+                .await;
+        });
+
         let job_queue = self.job_queue;
         let monitor = tokio::spawn(async move {
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, attempt| {
-                    info!(attempt, "Restarting order fill worker");
+                    info!(attempt, "Restarting apalis worker");
                     true
                 })
                 .register(move |index| {
@@ -199,6 +214,12 @@ where
                         .backend(job_queue.clone())
                         .data(order_fill_ctx.clone())
                         .build(Job::<OrderFillCtx<P, E>>::work)
+                })
+                .register(move |index| {
+                    WorkerBuilder::new(format!("poll-order-status-worker-{index}"))
+                        .backend(poll_queue.clone())
+                        .data(order_status_ctx.clone())
+                        .build(Job::<OrderStatusCtx<E>>::work)
                 });
 
             if let Err(monitor_error) = monitor.run().await {
@@ -209,7 +230,6 @@ where
         Conductor {
             supervisor,
             monitor,
-            order_poller,
             position_checker,
             executor_maintenance,
             rebalancer,

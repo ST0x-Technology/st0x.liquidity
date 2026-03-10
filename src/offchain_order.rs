@@ -116,6 +116,7 @@ impl EventSourced for OffchainOrder {
 
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use OffchainOrderEvent::*;
+
         match event {
             Placed { .. } => Ok(None),
 
@@ -389,17 +390,6 @@ impl OffchainOrder {
             | PartiallyFilled { direction, .. }
             | Filled { direction, .. }
             | Failed { direction, .. } => *direction,
-        }
-    }
-
-    pub(crate) fn executor(&self) -> SupportedExecutor {
-        use OffchainOrder::*;
-        match self {
-            Pending { executor, .. }
-            | Submitted { executor, .. }
-            | PartiallyFilled { executor, .. }
-            | Filled { executor, .. }
-            | Failed { executor, .. } => *executor,
         }
     }
 

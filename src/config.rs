@@ -22,7 +22,6 @@ use st0x_execution::{
 };
 use st0x_finance::Usdc;
 
-use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
@@ -525,13 +524,6 @@ impl Ctx {
         match &self.trading_mode {
             TradingMode::Rebalancing(ctx) => Ok(ctx),
             TradingMode::Standalone { .. } => Err(CtxError::NotRebalancing),
-        }
-    }
-
-    pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
-        OrderPollerCtx {
-            polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
-            max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
         }
     }
 
