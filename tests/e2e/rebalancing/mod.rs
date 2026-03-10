@@ -28,6 +28,7 @@ mod assertions;
 
 use std::collections::HashMap;
 
+use st0x_execution::SharesBlockchain;
 use st0x_hedge::OperationMode;
 
 use self::assertions::*;

@@ -38,7 +38,9 @@ panels showing inventory snapshots, change history, and transfer lifecycle
 status. Touches dto + main crate + dashboard frontend -- disjoint from the
 Turnkey work above, so both proceed in parallel.
 
-- [ ] [#376 Review and update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/issues/376)
+- [x] [#376 Review and update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/issues/376)
+  - PR:
+    [#382 update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/pull/382)
 - [ ] [#377 Dashboard backend: serve inventory history and transfer status via WebSocket](https://github.com/ST0x-Technology/st0x.liquidity/issues/377)
 - [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
 - [ ] [#379 Dashboard integration: verify nix build, deployment, and end-to-end data flow](https://github.com/ST0x-Technology/st0x.liquidity/issues/379)
@@ -62,6 +64,8 @@ control which wallet backends are compiled into the binary.
 ## Not epic
 
 Everything below has not been organized into epics yet.
+
+- [ ] [#488 Inconsistent rebalancing semantics: whitelist config vs blacklist trigger](https://github.com/ST0x-Technology/st0x.liquidity/issues/488)
 
 ### Fireblocks Contract Calls
 

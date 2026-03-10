@@ -195,7 +195,10 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .call();
 
     let assets = AssetsConfig {
-        equities: EquitiesConfig { symbols: equities },
+        equities: EquitiesConfig {
+            symbols: equities,
+            operational_limit: None,
+        },
         cash: Some(CashAssetConfig {
             vault_id: Some(cash_vault_id),
             rebalancing: cash_rebalancing,
@@ -287,7 +290,10 @@ where
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
         .assets(AssetsConfig {
-            equities: EquitiesConfig { symbols: equities },
+            equities: EquitiesConfig {
+                symbols: equities,
+                operational_limit: None,
+            },
             cash: Some(CashAssetConfig {
                 vault_id: Some(usdc_vault_id),
                 rebalancing: OperationMode::Enabled,

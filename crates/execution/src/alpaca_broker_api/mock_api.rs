@@ -3,7 +3,7 @@
 //! Uses `respond_with` dynamic closures backed by shared `Arc<Mutex<MockState>>`
 //! so the mock auto-responds based on request content. Tests configure a mode
 //! (happy path, rejected, placement fails) and optionally set initial account
-//! state via the builder — no per-request mock setup needed.
+//! state via the builder - no per-request mock setup needed.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -94,7 +94,7 @@ impl std::fmt::Display for OrderStatus {
 }
 
 struct MockOrder {
-    symbol: String,
+    symbol: Symbol,
     quantity: Decimal,
     side: OrderSide,
     status: OrderStatus,
@@ -354,7 +354,7 @@ impl AlpacaBrokerMock {
             .iter()
             .map(|(order_id, order)| MockOrderSnapshot {
                 order_id: order_id.clone(),
-                symbol: order.symbol.clone(),
+                symbol: order.symbol.to_string(),
                 quantity: order.quantity,
                 side: order.side,
                 status: order.status,
@@ -563,7 +563,7 @@ async fn scan_deposit_range<P: Provider>(
 }
 
 /// Locks the mutex, recovering from poisoning (a previous holder panicked).
-/// Safe for test mocks — we still want to inspect state after panics.
+/// Safe for test mocks - we still want to inspect state after panics.
 fn lock(state: &Mutex<MockState>) -> MutexGuard<'_, MockState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -704,7 +704,9 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 );
             };
 
-            let symbol = symbol.to_string();
+            let Ok(symbol) = Symbol::new(symbol) else {
+                return json_response(400, &json!({"message": "symbol cannot be empty"}));
+            };
             let Ok(quantity) = Decimal::from_str(qty) else {
                 return json_response(400, &json!({"message": format!("invalid qty: {qty}")}));
             };
@@ -726,7 +728,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 return json_response(422, &json!({"message": "order rejected"}));
             }
 
-            if symbol == "USDCUSD" {
+            if symbol.to_string() == "USDCUSD" {
                 return handle_crypto_order(&mut state, &order_id, &symbol, quantity, side);
             }
 
@@ -762,13 +764,16 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
 fn handle_crypto_order(
     state: &mut MockState,
     order_id: &str,
-    symbol: &str,
+    symbol: &Symbol,
     quantity: Decimal,
     side: OrderSide,
 ) -> HttpMockResponse {
-    // USDC has 6 decimal places; USD cash settles in whole cents.
-    let filled_quantity = quantity.round_dp(6);
+    // Real Alpaca cash balances are denominated in USD cents, so applying a
+    // sub-cent USDC quantity directly would create fractional cents and break
+    // subsequent inventory polls. Round to 2 decimal places (cents precision)
+    // to mirror the real API's behaviour.
     let cash_delta = quantity.round_dp(2);
+
     match side {
         OrderSide::Buy => state.account.cash -= cash_delta,
         OrderSide::Sell => state.account.cash += cash_delta,
@@ -779,8 +784,8 @@ fn handle_crypto_order(
     state.orders.insert(
         order_id.to_string(),
         MockOrder {
-            symbol: symbol.to_string(),
-            quantity: filled_quantity,
+            symbol: symbol.clone(),
+            quantity,
             side,
             status: OrderStatus::Filled,
             poll_count: 0,
@@ -793,11 +798,11 @@ fn handle_crypto_order(
         &json!({
             "id": order_id,
             "symbol": symbol,
-            "qty": filled_quantity.to_string(),
+            "qty": quantity.to_string(),
             "side": side.to_string(),
             "status": "filled",
             "filled_avg_price": fill_price.to_string(),
-            "filled_qty": filled_quantity.to_string(),
+            "filled_qty": quantity.to_string(),
             "created_at": "2025-01-06T12:00:00Z"
         }),
     )
@@ -829,8 +834,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
 
                 match mode {
                     MockMode::HappyPath => {
-                        let symbol = state.orders[&order_id].symbol.clone();
-                        let symbol_key = Symbol::force_new(symbol);
+                        let symbol_key = state.orders[&order_id].symbol.clone();
 
                         let delay = state
                             .symbol_fill_delays
@@ -864,11 +868,9 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                             .is_some_and(|o| o.poll_count >= polls_before_fill);
 
                         if ready {
-                            let symbol = state.orders[&order_id].symbol.clone();
-                            let Some(fill_price) = state
-                                .symbol_fill_prices
-                                .get(&Symbol::force_new(symbol))
-                                .copied()
+                            let symbol_key = state.orders[&order_id].symbol.clone();
+                            let Some(fill_price) =
+                                state.symbol_fill_prices.get(&symbol_key).copied()
                             else {
                                 return json_response(
                                     500,
@@ -880,7 +882,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                         }
                     }
                     MockMode::PlacementFails => {
-                        // Placement already rejected at order creation —
+                        // Placement already rejected at order creation -
                         // no orders exist to poll.
                     }
                 }
@@ -922,10 +924,9 @@ fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price: Deci
         return;
     }
 
-    let symbol = state.orders[order_id].symbol.clone();
+    let symbol_key = state.orders[order_id].symbol.clone();
     let quantity = state.orders[order_id].quantity;
     let side = state.orders[order_id].side;
-    let symbol_key = Symbol::force_new(symbol);
 
     if let Some(order) = state.orders.get_mut(order_id) {
         order.status = OrderStatus::Filled;
@@ -1345,7 +1346,7 @@ mod tests {
             "100000"
         );
 
-        // Beyond u64::MAX — the bug the refactor fixed
+        // Beyond u64::MAX - the bug the refactor fixed
         let beyond_u64 = U256::from(u64::MAX) + U256::from(1);
         assert_eq!(format_u256_as_usdc(beyond_u64), "18446744073709.551616");
     }

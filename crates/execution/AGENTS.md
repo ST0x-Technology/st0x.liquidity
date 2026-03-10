@@ -16,8 +16,6 @@ abstraction. When working in this crate:
 
 - **Stay focused on execution abstractions**: This crate should remain
   independent of the parent application
-- **No parent crate dependencies**: Never add dependencies on `st0x-hedge` or
-  other workspace members
 - **Type safety first**: Use newtypes and enums to prevent invalid states
 - **Zero-cost abstractions**: Leverage generics and associated types for
   implementations

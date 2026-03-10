@@ -15,7 +15,9 @@ use tracing::debug;
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
-use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
+use st0x_execution::{
+    Executor, FractionalShares, InventoryResult, SharesBlockchain, SharesConversionError, Symbol,
+};
 
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::bindings::IERC20;
@@ -476,8 +478,8 @@ mod tests {
     use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletError, AlpacaWalletService};
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::threshold::Usdc;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+    use st0x_finance::Usdc;
 
     struct MockEthereumWallet {
         address: Address,
@@ -1371,7 +1373,7 @@ mod tests {
         else {
             panic!("Expected AlpacaWalletCash event, got {alpaca_wallet_cash_event:?}");
         };
-        assert_eq!(*usdc_balance, Usdc(dec!(1250.75)));
+        assert_eq!(*usdc_balance, Usdc::new(dec!(1250.75)));
         wallets_mock.assert();
     }
 

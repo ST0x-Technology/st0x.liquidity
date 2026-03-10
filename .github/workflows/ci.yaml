@@ -28,11 +28,20 @@ jobs:
       - name: Build Solidity artifacts
         run: nix run .#prepSolArtifacts
 
-      - name: Build and test
-        run: nix build --impure .#st0x-liquidity
+      - name: Setup database
+        run: nix develop -c sqlx db reset -y
+
+      - name: Validate standalone build
+        run: nix develop -c cargo check --workspace
+
+      - name: Test
+        run: nix develop -c cargo nextest run --workspace --all-features --profile ci
 
       - name: Clippy
-        run: nix build --impure .#st0x-clippy
+        run: |
+          nix develop -c cargo clippy \
+            --workspace --all-targets --all-features \
+            -- -D clippy::all -D warnings
 
   dashboard:
     runs-on: ubuntu-latest

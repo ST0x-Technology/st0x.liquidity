@@ -11,8 +11,9 @@ use st0x_event_sorcery::{Column, Projection, ProjectionError, SendError, Store};
 use st0x_execution::{
     ExecutionError, Executor, ExecutorOrderId, OrderState, OrderStatus, PersistenceError, Symbol,
 };
+use st0x_finance::Usd;
 
-use crate::offchain_order::{Dollars, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
+use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId};
 use crate::onchain::OnChainError;
 use crate::position::{Position, PositionCommand};
 
@@ -170,7 +171,7 @@ impl<E: Executor> OrderStatusPoller<E> {
                 self.handle_filled_order(
                     offchain_order_id,
                     order,
-                    Dollars(*price),
+                    Usd::new(*price),
                     &ExecutorOrderId::new(&order_id),
                     *executed_at,
                 )
@@ -198,7 +199,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         &self,
         offchain_order_id: OffchainOrderId,
         order: &OffchainOrder,
-        price: Dollars,
+        price: Usd,
         executor_order_id: &ExecutorOrderId,
         broker_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), OrderPollingError> {
@@ -227,7 +228,7 @@ impl<E: Executor> OrderStatusPoller<E> {
     async fn complete_offchain_order_fill(
         &self,
         offchain_order_id: OffchainOrderId,
-        price: Dollars,
+        price: Usd,
     ) -> Result<(), OrderPollingError> {
         self.offchain_order
             .send(
@@ -242,7 +243,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         &self,
         offchain_order_id: OffchainOrderId,
         order: &OffchainOrder,
-        price: Dollars,
+        price: Usd,
         executor_order_id: &ExecutorOrderId,
         broker_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), OrderPollingError> {
@@ -495,7 +496,7 @@ mod tests {
             .handle_filled_order(
                 offchain_order_id,
                 &order,
-                Dollars(dec!(150.25)),
+                Usd::new(dec!(150.25)),
                 &ExecutorOrderId::new("ORD123"),
                 Utc::now(),
             )

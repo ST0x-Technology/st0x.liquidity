@@ -91,10 +91,17 @@ Decompose epics to maximize independent parallel execution:
 
 ### Managing Epics in the Roadmap
 
-An epic groups related issues toward a single goal. Lead with motivation (why
-this matters), show dependency structure via Mermaid diagrams, reference issues
-not solutions, and mark progress inline (`[x]` with PR link). Move completed
-epics to "Completed."
+An epic is a roadmap subsection grouping related issues toward a single goal.
+
+- **Lead with motivation**: One or two sentences explaining why this work
+  matters and what the end state looks like.
+- **Show the dependency structure**: Use a Mermaid diagram (GitHub renders them
+  natively) to make the execution order and parallelism obvious at a glance.
+- **Reference issues, not solutions**: Each item links to a GitHub issue. The
+  issue describes the desired outcome; the PR (added later) describes the
+  solution.
+- **Mark progress inline**: `[x]` with PR link as branches merge. When all items
+  complete, move the section to "Completed."
 
 ## Plan & Review
 
@@ -248,11 +255,61 @@ resolution and feature selection.
   linting
 - `cargo fmt` - Format code
 
+### Bacon (Background Checker)
+
+**Before running `cargo check` or `cargo clippy`, check if bacon is running** by
+reading `.bacon-locations`. If the file exists and is non-empty, bacon is active
+-- prefer it over manual cargo commands:
+
+- **Read errors/warnings**: Read `.bacon-locations` for current errors and
+  warnings. Filter out lines containing `lib/` (external submodule warnings we
+  don't control). This is faster and always up to date (bacon re-checks on every
+  file save). No need to run `cargo check` or `cargo clippy` yourself.
+- **Switch jobs**: Use `bacon --send 'job:clippy'` or
+  `bacon --send 'job:nextest'` to change what bacon is checking.
+- **Wait for completion**: After switching jobs, check if the job is still
+  running with `ps axu | grep <tool>` (e.g., `grep nextest`, `grep cargo`). Only
+  read `.bacon-locations` once the process has exited — reading while the job is
+  still running gives stale results from the previous job.
+- **Escalation chain**: `check-all` -> `nextest` -> `clippy`. Start with
+  `check-all` to catch compilation errors fast, run tests next, then clippy last
+  as a polish step.
+- **Only fall back to manual cargo commands** if `.bacon-locations` doesn't
+  exist (bacon not running).
+
+Jobs are scoped to workspace crates only (excludes vendored `lib/` submodules).
+Configuration is in `bacon.toml`.
+
 ### Nix Development Environment
 
 - `nix develop` - Enter development shell with all dependencies
 - `nix run .#prepSolArtifacts` - Build Solidity artifacts for orderbook
   interface
+
+### Configuration Files
+
+| File                    | Purpose                                                                             |
+| ----------------------- | ----------------------------------------------------------------------------------- |
+| `Cargo.toml`            | Workspace definition, `[workspace.lints.clippy]` lint config, shared dependencies   |
+| `clippy.toml`           | Clippy behavior settings (thresholds, disallowed methods, test permissions)         |
+| `bacon.toml`            | Bacon background checker jobs and lint allow-lists (keep in sync with `Cargo.toml`) |
+| `flake.nix`             | Nix flake: dev shell, NixOS deployment, helper scripts                              |
+| `rust.nix`              | Rust toolchain and cargo/clippy nix config                                          |
+| `os.nix`                | NixOS server configuration for deployment                                           |
+| `services.nix`          | Systemd service definitions for the deployed server                                 |
+| `deploy.nix`            | Deployment targets and settings                                                     |
+| `disko.nix`             | Disk partitioning for server                                                        |
+| `infra/default.nix`     | Infrastructure module aggregator                                                    |
+| `infra/secrets.nix`     | Agenix secret declarations (paths, not values)                                      |
+| `dashboard/default.nix` | Dashboard build derivation                                                          |
+| `dashboard/bun.nix`     | Bun runtime nix packaging for dashboard                                             |
+| `e2e/config.toml`       | End-to-end test configuration                                                       |
+| `.config/nextest.toml`  | Nextest runner configuration                                                        |
+| `crates/*/Cargo.toml`   | Per-crate dependencies and `[lints] workspace = true`                               |
+
+**Sync requirements:** `Cargo.toml` `[workspace.lints.clippy]` and `bacon.toml`
+clippy job `-A` flags must stay in sync. When allowing/denying a lint, update
+both files.
 
 ## Development Workflow Notes
 
@@ -352,25 +409,13 @@ is the source of truth for terminology and naming conventions.
 
 ### Code Quality & Best Practices
 
-- **CRITICAL: Package by Feature, Not by Layer**: NEVER organize code by
-  language primitives or technical layers. ALWAYS organize by business
-  feature/domain.
-  - **FORBIDDEN**: `types.rs`, `error.rs`, `models.rs`, `utils.rs`,
-    `helpers.rs`, `http.rs`, `dto.rs`, `entities.rs`, `services.rs`, `domain.rs`
-    (when used as catch-all technical layer modules)
-  - **CORRECT**: `position.rs`, `offchain_order.rs`, `onchain_trade.rs`
-    (organized by business domain)
-  - Each feature module should contain ALL related code: types, errors,
-    commands, events, aggregates, views, and endpoints
-  - This makes it easy to understand and modify a feature without jumping
-    between unrelated files
-  - Value objects and newtypes should live in the feature module where they're
-    primarily defined/used
-  - When types are shared across features, import from the owning feature (e.g.,
-    `offchain_order` can import `FractionalShares` from `position` module)
-  - **Flat by default**: Start with a single file per feature (e.g.,
-    `position.rs`). Only split into a directory with submodules when natural
-    business logic boundaries emerge and the split provides clear value
+- **CRITICAL: Package by Feature, Not by Layer**: Organize by business domain,
+  not technical layers. **FORBIDDEN** catch-all modules: `types.rs`, `error.rs`,
+  `models.rs`, `utils.rs`, `helpers.rs`, `http.rs`, `dto.rs`, `entities.rs`,
+  `services.rs`, `domain.rs`. **CORRECT**: `position.rs`, `offchain_order.rs`,
+  `onchain_trade.rs`. Each feature module contains ALL related code. Shared
+  types import from the owning feature. **Flat by default**: single file per
+  feature, split into directory only when business logic boundaries emerge
 - **Event-Driven Architecture**: Each trade spawns independent async task for
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and
@@ -465,48 +510,26 @@ is the source of truth for terminology and naming conventions.
   (`#[cfg(test)]` modules) where panicking on unexpected state is the desired
   behavior
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
-  String values that throw away type information**. This is strictly forbidden
-  and violates our error handling principles:
-  - **FORBIDDEN**: `SomeError(String)` - throws away all type information
-  - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
-  - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
-    interpolation
-  - **FORBIDDEN**: Using `format!()` to convert typed values into String fields
-    in error variants (e.g., `format!("{side:?}")`) - store the actual typed
-    value instead
-  - **FORBIDDEN**: Unpacking newtypes into their inner type to store in error
-    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`, not
-    `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
-    representation. Never discard type safety by extracting inner values.
-  - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
-    preserve all type information
-  - **REQUIRED**: Each error variant must preserve the complete error chain with
-    `#[source]`
-  - **REQUIRED**: Discover error variants as needed during implementation, not
-    preemptively
-  - **FORBIDDEN: `.map_err` for error conversion**: Use `#[from]` + `?` instead.
-    To log before converting, chain
-    `.inspect_err(|error| error!(?error, "context"))` before `?`
+  String values.** No `SomeError(String)`, no `.to_string()` or `format!()`
+  conversions, no unpacking newtypes (store `Symbol` not `String`). Prefer
+  `#[from]` + `?` for error conversion; preserve error chains with `#[source]`;
+  discover variants during implementation not preemptively. `.map_err` is
+  permitted when adding call-site context or adapting a source error type that
+  cannot implement `From`/`#[from]` - do not reach for it as the default when
+  `#[from]` + `?` suffices. To log before converting:
+  `.inspect_err(|error| error!(?error, "ctx"))` before `?`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
   impossible
-- **No Duplicate Values in Debug Output**: Never hardcode values that exist
-  elsewhere in the implementation (URLs, paths, constants, config values, etc.)
-  into debug/log statements. These duplicates will inevitably drift out of sync
-  with the real implementation, misleading debugging efforts instead of helping
-  them. Always log the actual runtime value being used, not a hardcoded copy
-- **Visibility Levels**: Always keep visibility levels as restrictive as
-  possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
-  better dead code detection by the compiler and tooling. This makes the
-  codebase easier to navigate and understand by making the relevance scope
-  explicit
-- **Type Aliases**: Only add type aliases when clippy complains about type
-  complexity. Proactive type aliases obscure the actual types, making code
-  harder to understand without providing any additional type safety. If clippy
-  doesn't flag the type as too complex, the full type is clearer than an alias.
-  If you need to actually distinguish between different with the same internal
-  representation, add proper newtypes instead.
+- **No Duplicate Values in Debug Output**: Never hardcode values (URLs, paths,
+  constants) into log statements. Always log the actual runtime value —
+  hardcoded copies inevitably drift from the real implementation
+- **Visibility Levels**: Keep visibility as restrictive as possible (private >
+  `pub(crate)` > `pub`) for better dead code detection and clearer scope
+- **Type Aliases**: Only add when clippy complains about type complexity. If
+  clippy doesn't flag it, the full type is clearer. Use newtypes (not aliases)
+  to distinguish types with the same representation.
 
 ### CRITICAL: Financial Data Integrity
 
@@ -564,10 +587,8 @@ reviewing code that uses configuration instead of reading secrets directly.
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
-- **No ad-hoc debugging scripts**: Never write ad-hoc scripts, code snippets, or
-  temporary files outside the project for debugging. If you need to debug an
-  issue, write a proper test function within the project's test suite and remove
-  it once you've obtained the information you need.
+- **No ad-hoc debugging scripts**: Debug via test functions in the test suite,
+  not ad-hoc scripts or temp files.
 - **Test Quality**: Never write tests that only exercise language features
   without testing our application logic. Tests should verify actual business
   logic, not just struct field assignments or basic language operations
@@ -664,32 +685,22 @@ that cannot be expressed through code structure alone.
 - Describing function signatures (use doc comments instead)
 - Adding obvious test setup descriptions
 - Marking code sections that are clear from structure
-- **Referencing internal task tracking or ephemeral context**: NEVER leave
-  comments like `// Task 7: ...`, `// TODO from ticket XYZ`,
-  `// Part of sprint 5 work`, or any reference to task numbers, issue trackers,
-  todo lists, or session context that won't exist for future readers. These
-  comments are meaningless to PR reviewers, future maintainers, and anyone
-  without access to your internal state. If the code needs explanation, explain
-  WHAT it does and WHY - not which task number led to writing it.
-
-#### Examples
-
-Good: explaining non-obvious business logic ("USDC input + t-prefix output means
-the order sold tokenized equity, so hedge by buying on Schwab"), test data
-context ("9 shares with 18 decimal places"), or external system constraints
-("ClearV2 doesn't contain amounts, so query AfterClear").
-
-Bad: restating what code does (`// Store test tokens`), redundant with function
-name, test section markers (`// 1. Test token refresh`).
+- **NEVER reference task numbers, issue trackers, or session context** in
+  comments — explain WHAT and WHY, not which task led to writing it
 
 Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 ### Code style
 
-#### ASCII only in code
+#### ASCII in code, unicode in user-facing output
 
-Use ASCII characters only in code and comments. For arrows, use `->` not `->`.
-Unicode breaks vim navigation and grep workflows.
+Use ASCII characters only in identifiers, comments, log messages, and config
+keys. For arrows in comments, use `->` not `→`. Unicode breaks vim navigation
+and grep workflows.
+
+In user-facing string literals (GUI templates, CLI display, rendered text),
+prefer unicode characters (`←`, `→`, `·`, `▲`, `▼`, etc.) for readability and
+polish.
 
 #### No single-letter variables or arguments
 
@@ -709,22 +720,9 @@ when the meaning is unambiguous from context.
 
 #### Module Organization
 
-Organize code within modules by importance to the reader, not by when it was
-added. Public API first, then private implementation, then tests. A reader
-should understand what a module provides and how to use it before encountering
-implementation details.
-
-**Module docstrings**: Every module should have a `//!` docstring explaining
-what it provides. This makes it obvious what parts of the module are most
-important (and should be placed higher up) while also helping identify when
-something doesn't belong in the module and should be moved elsewhere.
-
-**Determining importance**: What a module _does_ (types consumers use, functions
-they call) matters more than what _supports_ it (error types, internal helpers,
-private traits). If code A uses code B, then A is more important than B -
-because B exists to serve A, not the other way around. For example, a function
-that can fail is more important than the error type it returns, since the error
-type is a byproduct of the function's implementation.
+Order by importance: public API first, private implementation, then tests. Every
+module should have a `//!` docstring. What a module _does_ (consumer-facing
+types/functions) goes before what _supports_ it (error types, helpers).
 
 #### Line width in docstrings and macros
 
@@ -733,32 +731,12 @@ All doc comments (`//!` and `///`) and long strings inside attribute macros
 does not enforce this (without nightly rustfmt), so be careful and check
 manually.
 
-For multi-line `#[error]` strings, use `\` continuation:
-
-```rust
-#[error(
-    "Expected IO to contain USDC and one tokenized equity \
-     (t prefix) but got {0} and {1}"
-)]
-```
+For multi-line `#[error]` strings, use `\` continuation.
 
 #### Never use `is_err()`/`is_ok()` assertions in tests
 
-`assert!(result.is_err())` is never acceptable - every error test must verify
-the exact error variant:
-
-```rust
-// FORBIDDEN: doesn't check which error
-assert!(result.is_err());
-
-// REQUIRED: unwrap first, then assert the exact variant
-let error = result.unwrap_err();
-assert!(matches!(error, SomeError::SpecificVariant { .. }));
-```
-
-`assert!(result.is_ok())` is equally bad - just call `.unwrap()`.
-
-**FORBIDDEN**: `assert!(x.is_err())`, `assert!(x.is_ok())`
+**FORBIDDEN**: `assert!(x.is_err())`, `assert!(x.is_ok())`. For errors, unwrap
+and assert the exact variant with `matches!`. For ok, just `.unwrap()`.
 
 #### Prefer exhaustive `match` over `matches!` in production code
 
@@ -809,15 +787,7 @@ constructors or getters unless they add logic beyond setting/getting values.
 
 For newtypes, prefer `let TypeName(inner) = value` over `value.0`. The
 destructuring pattern names the type explicitly, making the code
-self-documenting:
-
-```rust
-// GOOD: reader sees exactly what type is being unwrapped
-let Table(table) = Entity::PROJECTION.ok_or(ProjectionError::NoTable)?;
-
-// BAD: .0 is opaque — reader must look up what type this is
-let table = entity_projection.0;
-```
+self-documenting.
 
 #### No one-liner helpers
 
