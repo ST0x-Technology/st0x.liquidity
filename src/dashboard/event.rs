@@ -246,7 +246,9 @@ mod tests {
                         i + 1
                     );
                 }
-                ServerMessage::Initial(_) => panic!("receiver {} expected Event message", i + 1),
+                ServerMessage::Initial(_) => {
+                    panic!("receiver {} expected Event message", i + 1)
+                }
             }
         }
     }

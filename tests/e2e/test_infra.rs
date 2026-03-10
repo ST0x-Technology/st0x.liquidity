@@ -49,12 +49,15 @@ impl<P> TestInfra<P> {
                     rebalancing: OperationMode::Disabled,
                     operational_limit: None,
                 };
-                (Symbol::force_new(symbol.clone()), config)
+                (Symbol::new(symbol.clone()).unwrap(), config)
             })
             .collect();
 
         AssetsConfig {
-            equities: EquitiesConfig { symbols },
+            equities: EquitiesConfig {
+                symbols,
+                operational_limit: None,
+            },
             cash: None,
         }
     }

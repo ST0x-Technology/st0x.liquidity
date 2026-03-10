@@ -3,6 +3,7 @@ target/
 node_modules/
 .DS_Store
 .env
+*.log
 *.db
 *.db-shm
 *.db-wal
@@ -15,3 +16,5 @@ tarpaulin-report.html
 .worktrees/
 out/
 cache/
+.tmp/
+.bacon-locations

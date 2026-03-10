@@ -1,12 +1,25 @@
 [test-groups.e2e]
-max-threads = 2
+max-threads = 8
 
-[[profile.default.overrides]]
+# Default profile: shared base settings
+[profile.default]
+fail-fast = true
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+# Dev profile: fast feedback, skip e2e and slow tests
+[profile.dev]
+default-filter = "not binary(=e2e) & not test(slow)"
+
+# CI profile: thorough, run everything including e2e
+[profile.ci]
+fail-fast = false
+
+[[profile.ci.overrides]]
 filter = "binary(=e2e)"
 test-group = "e2e"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
-[[profile.default.overrides]]
+[[profile.ci.overrides]]
 filter = "kind(test)"
 slow-timeout = { period = "120s" }
 retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }

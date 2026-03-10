@@ -16,11 +16,12 @@ use st0x_execution::{
     ArithmeticError, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
     Symbol,
 };
+use st0x_finance::{Usd, Usdc};
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
-use crate::offchain_order::{Dollars, OffchainOrderId};
-use crate::threshold::{ExecutionThreshold, Usdc};
+use crate::offchain_order::OffchainOrderId;
+use crate::threshold::ExecutionThreshold;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Position {
@@ -316,14 +317,14 @@ impl Position {
                 };
 
                 let net_abs = self.net.abs();
-                let dollar_value = (Usdc(price) * net_abs.inner())?;
+                let dollar_value = (Usdc::new(price) * net_abs.inner())?;
 
-                if dollar_value.0 >= threshold_dollars.0 {
+                if dollar_value.inner() >= threshold_dollars.inner() {
                     Ok(Some(TriggerReason::DollarThreshold {
                         net_position_shares: self.net.inner(),
-                        dollar_value: dollar_value.0,
+                        dollar_value: dollar_value.inner(),
                         price_usdc: price,
-                        threshold_dollars: threshold_dollars.0,
+                        threshold_dollars: threshold_dollars.inner(),
                     }))
                 } else {
                     Ok(None)
@@ -378,15 +379,15 @@ impl Position {
                 let raw_shares = self.net.abs();
 
                 let capped_shares = shares_limit.map_or(raw_shares, |cap| {
-                    let cap_value = cap.inner();
-                    if raw_shares > cap_value {
+                    let cap = cap.inner();
+                    if raw_shares > cap {
                         warn!(
                             symbol = %self.symbol,
                             computed = %raw_shares,
-                            limit = %cap_value,
+                            limit = %cap,
                             "Counter trade shares capped by operational limit"
                         );
-                        cap_value
+                        cap
                     } else {
                         raw_shares
                     }
@@ -472,7 +473,7 @@ pub enum PositionCommand {
         shares_filled: Positive<FractionalShares>,
         direction: Direction,
         executor_order_id: ExecutorOrderId,
-        price: Dollars,
+        price: Usd,
         broker_timestamp: DateTime<Utc>,
     },
     FailOffChainOrder {
@@ -512,7 +513,7 @@ pub enum PositionEvent {
         shares_filled: Positive<FractionalShares>,
         direction: Direction,
         executor_order_id: ExecutorOrderId,
-        price: Dollars,
+        price: Usd,
         broker_timestamp: DateTime<Utc>,
     },
     OffChainOrderFailed {
@@ -595,8 +596,9 @@ mod tests {
 
     use st0x_event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
 
+    use st0x_finance::Usdc;
+
     use super::*;
-    use crate::threshold::Usdc;
 
     fn one_share_threshold() -> ExecutionThreshold {
         ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
@@ -829,7 +831,7 @@ mod tests {
                 shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
                 direction: Direction::Sell,
                 executor_order_id: ExecutorOrderId::new("ORDER123"),
-                price: Dollars(dec!(150.50)),
+                price: Usd::new(dec!(150.50)),
                 broker_timestamp: Utc::now(),
             })
             .await
@@ -939,7 +941,7 @@ mod tests {
                 shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                 direction: Direction::Sell,
                 executor_order_id: ExecutorOrderId::new("ORDER123"),
-                price: Dollars(dec!(150.50)),
+                price: Usd::new(dec!(150.50)),
                 broker_timestamp: Utc::now(),
             },
         ])
@@ -991,7 +993,7 @@ mod tests {
                 shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                 direction: Direction::Buy,
                 executor_order_id: ExecutorOrderId::new("ORDER456"),
-                price: Dollars(dec!(150.50)),
+                price: Usd::new(dec!(150.50)),
                 broker_timestamp: Utc::now(),
             },
         ])
@@ -1057,7 +1059,7 @@ mod tests {
 
     #[test]
     fn threshold_updated_changes_threshold() {
-        let new_threshold = ExecutionThreshold::dollar_value(Usdc(dec!(10000))).unwrap();
+        let new_threshold = ExecutionThreshold::dollar_value(Usdc::new(dec!(10000))).unwrap();
 
         let position = replay::<Position>(vec![
             PositionEvent::Initialized {
@@ -1152,7 +1154,7 @@ mod tests {
             shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
             direction: Direction::Sell,
             executor_order_id: ExecutorOrderId::new("ORD123"),
-            price: Dollars(dec!(150.00)),
+            price: Usd::new(dec!(150.00)),
             broker_timestamp: timestamp,
         };
 
@@ -1249,7 +1251,7 @@ mod tests {
             accumulated_long: FractionalShares::new(dec!(1.212)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            threshold: ExecutionThreshold::dollar_value(Usdc::new(dec!(1))).unwrap(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),
         };
@@ -1277,7 +1279,7 @@ mod tests {
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(dec!(2.567)),
             pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            threshold: ExecutionThreshold::dollar_value(Usdc::new(dec!(1))).unwrap(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),
         };
