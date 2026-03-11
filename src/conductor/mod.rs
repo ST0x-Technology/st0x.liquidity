@@ -185,6 +185,8 @@ impl Conductor {
                 Err(error) => return Err(error.into()),
             };
 
+            let base_wallet_for_polling = rebalancing.as_ref().map(|ctx| ctx.base_wallet().clone());
+
             let (position, position_projection, snapshot, rebalancer) =
                 if let Some(rebalancing_ctx) = rebalancing {
                     let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
@@ -251,6 +253,10 @@ impl Conductor {
 
             if let Some(rebalancer_handle) = rebalancer {
                 builder = builder.with_rebalancer(rebalancer_handle);
+            }
+
+            if let Some(wallet) = base_wallet_for_polling {
+                builder = builder.with_base_wallet(wallet);
             }
 
             Ok(builder.spawn())
@@ -705,12 +711,7 @@ where
 }
 
 fn spawn_inventory_poller<Chain, Exe>(
-    raindex_service: Arc<RaindexService<Chain>>,
-    executor: Exe,
-    vault_registry: Arc<Store<VaultRegistry>>,
-    orderbook: Address,
-    order_owner: Address,
-    snapshot: Arc<Store<InventorySnapshot>>,
+    service: InventoryPollingService<Chain, Exe>,
     poll_interval: std::time::Duration,
 ) -> JoinHandle<()>
 where
@@ -718,15 +719,6 @@ where
     Exe: Executor + Clone + Send + 'static,
 {
     info!("Starting inventory poller");
-
-    let service = InventoryPollingService::new(
-        raindex_service,
-        executor,
-        vault_registry,
-        orderbook,
-        order_owner,
-        snapshot,
-    );
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);

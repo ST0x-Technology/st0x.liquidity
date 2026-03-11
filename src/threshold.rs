@@ -53,10 +53,23 @@ impl Usdc {
         self.0.is_sign_negative()
     }
 
+    /// Converts a raw U256 with 6 decimal places (USDC standard) into a Usdc
+    /// domain type.
+    ///
+    /// Returns an error if the value cannot be represented as a Decimal.
+    pub(crate) fn from_u256_6_decimals(raw: U256) -> Result<Self, UsdcConversionError> {
+        let raw_decimal = Decimal::from_str_exact(&raw.to_string())
+            .map_err(|_| UsdcConversionError::FromU256Overflow { raw })?;
+        let usdc = raw_decimal
+            .checked_div(USDC_DECIMAL_SCALE)
+            .ok_or(UsdcConversionError::FromU256Overflow { raw })?;
+        Ok(Self(usdc))
+    }
+
     /// Converts to U256 with 6 decimal places (USDC standard).
     ///
     /// Returns an error for negative values or overflow during scaling.
-    pub fn to_u256_6_decimals(self) -> Result<U256, UsdcConversionError> {
+    pub(crate) fn to_u256_6_decimals(self) -> Result<U256, UsdcConversionError> {
         if self.0.is_sign_negative() {
             return Err(UsdcConversionError::NegativeValue(self.0));
         }
@@ -71,13 +84,15 @@ impl Usdc {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum UsdcConversionError {
+pub(crate) enum UsdcConversionError {
     #[error("USDC amount cannot be negative: {0}")]
     NegativeValue(Decimal),
     #[error("overflow when scaling USDC to 6 decimals")]
     Overflow,
     #[error("failed to parse U256: {0}")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
+    #[error("USDC value cannot be represented as Decimal: {raw}")]
+    FromU256Overflow { raw: U256 },
 }
 
 impl From<Usdc> for Decimal {
@@ -328,5 +343,27 @@ mod tests {
     fn from_cents_handles_large_values() {
         let usdc = Usdc::from_cents(i64::MAX).unwrap();
         assert_eq!(usdc.0, Decimal::from(i64::MAX) / Decimal::from(100));
+    }
+
+    #[test]
+    fn from_u256_6_decimals_roundtrips_with_to_u256() {
+        let original = Usdc(dec!(1234.567890));
+        let u256 = original.to_u256_6_decimals().unwrap();
+        let roundtripped = Usdc::from_u256_6_decimals(u256).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn from_u256_6_decimals_zero() {
+        let usdc = Usdc::from_u256_6_decimals(U256::ZERO).unwrap();
+        assert!(usdc.is_zero());
+    }
+
+    #[test]
+    fn from_u256_6_decimals_large_value() {
+        let large = Usdc(dec!(999_999_999.999999));
+        let u256 = large.to_u256_6_decimals().unwrap();
+        let roundtripped = Usdc::from_u256_6_decimals(u256).unwrap();
+        assert_eq!(roundtripped, large);
     }
 }

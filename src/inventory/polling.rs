@@ -7,19 +7,23 @@
 //! tracked inventory.
 
 use alloy::primitives::Address;
+use alloy::providers::RootProvider;
 use futures_util::future::try_join_all;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
 use st0x_event_sorcery::{SendError, Store};
-use st0x_evm::{Evm, OpenChainErrorRegistry};
+use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{Executor, InventoryResult};
 
+use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
+use crate::onchain::USDC_BASE;
 use crate::onchain::raindex::{RaindexError, RaindexService, RaindexVaultId};
+use crate::threshold::{Usdc, UsdcConversionError};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Error type for inventory polling operations.
@@ -38,6 +42,10 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
         expected: Vec<Address>,
         actual: Vec<Address>,
     },
+    #[error(transparent)]
+    Evm(#[from] EvmError),
+    #[error(transparent)]
+    UsdcConversion(#[from] UsdcConversionError),
 }
 
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
@@ -51,6 +59,7 @@ where
     orderbook: Address,
     order_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
+    base_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -65,6 +74,7 @@ where
         orderbook: Address,
         order_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
+        base_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
     ) -> Self {
         Self {
             raindex_service,
@@ -73,6 +83,7 @@ where
             orderbook,
             order_owner,
             snapshot,
+            base_wallet,
         }
     }
 
@@ -91,6 +102,7 @@ where
         };
 
         self.poll_onchain(&snapshot_id).await?;
+        self.poll_base_wallet_cash(&snapshot_id).await?;
         self.poll_offchain(&snapshot_id).await?;
 
         Ok(())
@@ -201,6 +213,36 @@ where
         Ok(())
     }
 
+    async fn poll_base_wallet_cash(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let Some(wallet) = &self.base_wallet else {
+            debug!("No Base wallet configured, skipping Base cash polling");
+            return Ok(());
+        };
+
+        let raw_balance = wallet
+            .call::<OpenChainErrorRegistry, _>(
+                USDC_BASE,
+                IERC20::balanceOfCall {
+                    account: wallet.address(),
+                },
+            )
+            .await?;
+
+        let usdc_balance = Usdc::from_u256_6_decimals(raw_balance)?;
+
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::BaseWalletCash { usdc_balance },
+            )
+            .await?;
+
+        Ok(())
+    }
+
     async fn poll_offchain(
         &self,
         snapshot_id: &InventorySnapshotId,
@@ -244,9 +286,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, TxHash, address, b256};
+    use alloy::primitives::{B256, Bytes, TxHash, U256, address, b256};
     use alloy::providers::mock::Asserter;
-    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+    use alloy::rpc::client::RpcClient;
+    use alloy::rpc::types::TransactionReceipt;
+    use alloy::sol_types::SolValue;
+    use async_trait::async_trait;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::{Row, SqlitePool};
@@ -258,7 +304,47 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
+    use crate::threshold::Usdc;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+
+    struct MockBaseWallet {
+        address: Address,
+        provider: RootProvider,
+    }
+
+    impl MockBaseWallet {
+        fn with_asserter(asserter: &Asserter) -> Arc<dyn Wallet<Provider = RootProvider>> {
+            Arc::new(Self {
+                address: address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+                provider: RootProvider::new(RpcClient::mocked(asserter.clone())),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Evm for MockBaseWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            &self.provider
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for MockBaseWallet {
+        fn address(&self) -> Address {
+            self.address
+        }
+
+        async fn send(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            panic!("MockBaseWallet::send should not be called in polling tests")
+        }
+    }
 
     /// A Float (bytes32) representing zero balance, used as mock vaultBalance2 response.
     const ZERO_FLOAT_HEX: &str =
@@ -334,6 +420,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -381,6 +468,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -424,6 +512,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -457,6 +546,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         // Should succeed without error
@@ -512,6 +602,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -559,6 +650,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -600,6 +692,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -693,6 +786,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -742,6 +836,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -792,6 +887,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         service.poll_and_record().await.unwrap();
@@ -840,6 +936,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -871,6 +968,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
+            None,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -919,5 +1017,110 @@ mod tests {
                 serde_json::from_str(&payload).unwrap()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_emits_base_wallet_cash_when_wallet_provided() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
+        let asserter = Asserter::new();
+        let encoded = format!("0x{}", alloy::hex::encode(raw_usdc.abi_encode()));
+        asserter.push_success(&encoded);
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            Some(base_wallet),
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let base_wallet_cash_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::BaseWalletCash { .. }))
+            .expect("Expected BaseWalletCash event to be emitted");
+
+        let InventorySnapshotEvent::BaseWalletCash { usdc_balance, .. } = base_wallet_cash_event
+        else {
+            panic!("Expected BaseWalletCash event, got {base_wallet_cash_event:?}");
+        };
+        let expected = Usdc::from_u256_6_decimals(raw_usdc).unwrap();
+        assert_eq!(*usdc_balance, expected, "USDC balance mismatch");
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_and_record_skips_base_wallet_cash_when_no_wallet() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let has_base_wallet_cash = events
+            .iter()
+            .any(|event| matches!(event, InventorySnapshotEvent::BaseWalletCash { .. }));
+
+        assert!(
+            !has_base_wallet_cash,
+            "Should NOT emit BaseWalletCash when no Base wallet configured"
+        );
+        assert!(
+            logs_contain("No Base wallet configured, skipping Base cash polling"),
+            "Should log debug message explaining why Base cash polling was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_propagates_base_wallet_rpc_failure() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("Base RPC failure");
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            Some(base_wallet),
+        );
+
+        let error = service.poll_and_record().await.unwrap_err();
+        assert!(matches!(error, InventoryPollingError::Evm(_)));
     }
 }

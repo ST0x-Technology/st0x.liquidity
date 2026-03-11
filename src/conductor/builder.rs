@@ -1,6 +1,6 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
-use alloy::providers::Provider;
+use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_event_sorcery::{Projection, Store};
-use st0x_evm::ReadOnlyEvm;
+use st0x_evm::{ReadOnlyEvm, Wallet};
 use st0x_execution::Executor;
 
 use super::{
@@ -21,7 +21,7 @@ use super::{
 };
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::InventorySnapshot;
+use crate::inventory::{InventoryPollingService, InventorySnapshot};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
@@ -69,6 +69,7 @@ pub(crate) struct WithDexStreams {
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
+    base_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -141,6 +142,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_sender,
                 event_receiver,
                 rebalancer: None,
+                base_wallet: None,
             },
         }
     }
@@ -154,6 +156,14 @@ where
 {
     pub(crate) fn with_rebalancer(mut self, rebalancer: JoinHandle<()>) -> Self {
         self.state.rebalancer = Some(rebalancer);
+        self
+    }
+
+    pub(crate) fn with_base_wallet(
+        mut self,
+        wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        self.state.base_wallet = Some(wallet);
         self
     }
 
@@ -175,13 +185,17 @@ where
             order_owner,
         ));
 
-        let inventory_poller = Some(spawn_inventory_poller(
+        let polling_service = InventoryPollingService::new(
             raindex_service,
             self.common.executor.clone(),
             self.common.frameworks.vault_registry.clone(),
             self.common.ctx.evm.orderbook,
             order_owner,
             self.common.frameworks.snapshot,
+            self.state.base_wallet,
+        );
+        let inventory_poller = Some(spawn_inventory_poller(
+            polling_service,
             std::time::Duration::from_secs(self.common.ctx.inventory_poll_interval),
         ));
         log_optional_task_status("inventory poller", inventory_poller.is_some());

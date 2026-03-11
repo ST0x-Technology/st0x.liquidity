@@ -74,6 +74,8 @@ pub(crate) struct InventorySnapshot {
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
     /// Latest offchain cash balance in cents
     pub(crate) offchain_cash_cents: Option<i64>,
+    /// Latest Base wallet USDC balance (outside Raindex vaults)
+    pub(crate) base_wallet_usdc: Option<Usdc>,
     /// When this snapshot was last updated
     pub(crate) last_updated: DateTime<Utc>,
 }
@@ -97,6 +99,7 @@ impl EventSourced for InventorySnapshot {
             onchain_cash: None,
             offchain_equity: BTreeMap::new(),
             offchain_cash_cents: None,
+            base_wallet_usdc: None,
             last_updated: event.timestamp(),
         };
         snapshot.apply_event(event);
@@ -132,6 +135,10 @@ impl EventSourced for InventorySnapshot {
                 cash_balance_cents,
                 fetched_at: now,
             },
+            BaseWalletCash { usdc_balance } => InventorySnapshotEvent::BaseWalletCash {
+                usdc_balance,
+                fetched_at: now,
+            },
         }])
     }
 
@@ -142,24 +149,34 @@ impl EventSourced for InventorySnapshot {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use InventorySnapshotCommand::*;
         let now = Utc::now();
-        Ok(vec![match command {
-            OnchainEquity { balances } => InventorySnapshotEvent::OnchainEquity {
+
+        match command {
+            OnchainEquity { balances } => Ok(vec![InventorySnapshotEvent::OnchainEquity {
                 balances,
                 fetched_at: now,
-            },
-            OnchainCash { usdc_balance } => InventorySnapshotEvent::OnchainCash {
+            }]),
+            OnchainCash { usdc_balance } => Ok(vec![InventorySnapshotEvent::OnchainCash {
                 usdc_balance,
                 fetched_at: now,
-            },
-            OffchainEquity { positions } => InventorySnapshotEvent::OffchainEquity {
+            }]),
+            OffchainEquity { positions } => Ok(vec![InventorySnapshotEvent::OffchainEquity {
                 positions,
                 fetched_at: now,
-            },
-            OffchainCash { cash_balance_cents } => InventorySnapshotEvent::OffchainCash {
+            }]),
+            OffchainCash { cash_balance_cents } => Ok(vec![InventorySnapshotEvent::OffchainCash {
                 cash_balance_cents,
                 fetched_at: now,
-            },
-        }])
+            }]),
+            BaseWalletCash { usdc_balance } => {
+                if self.base_wallet_usdc == Some(usdc_balance) {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::BaseWalletCash {
+                    usdc_balance,
+                    fetched_at: now,
+                }])
+            }
+        }
     }
 }
 
@@ -182,6 +199,9 @@ impl InventorySnapshot {
             } => {
                 self.offchain_cash_cents = Some(*cash_balance_cents);
             }
+            InventorySnapshotEvent::BaseWalletCash { usdc_balance, .. } => {
+                self.base_wallet_usdc = Some(*usdc_balance);
+            }
         }
     }
 }
@@ -199,6 +219,9 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OffchainCash {
         cash_balance_cents: i64,
+    },
+    BaseWalletCash {
+        usdc_balance: Usdc,
     },
 }
 
@@ -220,6 +243,10 @@ pub(crate) enum InventorySnapshotEvent {
         cash_balance_cents: i64,
         fetched_at: DateTime<Utc>,
     },
+    BaseWalletCash {
+        usdc_balance: Usdc,
+        fetched_at: DateTime<Utc>,
+    },
 }
 
 impl InventorySnapshotEvent {
@@ -228,7 +255,8 @@ impl InventorySnapshotEvent {
             Self::OnchainEquity { fetched_at, .. }
             | Self::OnchainCash { fetched_at, .. }
             | Self::OffchainEquity { fetched_at, .. }
-            | Self::OffchainCash { fetched_at, .. } => *fetched_at,
+            | Self::OffchainCash { fetched_at, .. }
+            | Self::BaseWalletCash { fetched_at, .. } => *fetched_at,
         }
     }
 }
@@ -240,6 +268,7 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OnchainCash { .. } => "InventorySnapshotEvent::OnchainCash".to_string(),
             Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
             Self::OffchainCash { .. } => "InventorySnapshotEvent::OffchainCash".to_string(),
+            Self::BaseWalletCash { .. } => "InventorySnapshotEvent::BaseWalletCash".to_string(),
         }
     }
 
@@ -473,5 +502,85 @@ mod tests {
 
         assert_eq!(snapshot.onchain_equity, second_balances);
         assert!(!snapshot.onchain_equity.contains_key(&test_symbol("AAPL")));
+    }
+
+    #[tokio::test]
+    async fn base_wallet_cash_initializes_on_first_command() {
+        let usdc_balance = Usdc::from_str("500").unwrap();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::BaseWalletCash { usdc_balance })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let InventorySnapshotEvent::BaseWalletCash {
+            usdc_balance: event_balance,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BaseWalletCash event, got {:?}", events[0]);
+        };
+        assert_eq!(*event_balance, usdc_balance);
+    }
+
+    #[tokio::test]
+    async fn base_wallet_cash_emits_on_change() {
+        let old_balance = Usdc::from_str("500").unwrap();
+        let new_balance = Usdc::from_str("750").unwrap();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::BaseWalletCash {
+                usdc_balance: old_balance,
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::BaseWalletCash {
+                usdc_balance: new_balance,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let InventorySnapshotEvent::BaseWalletCash {
+            usdc_balance: event_balance,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BaseWalletCash event, got {:?}", events[0]);
+        };
+        assert_eq!(*event_balance, new_balance);
+    }
+
+    #[tokio::test]
+    async fn base_wallet_cash_skips_when_unchanged() {
+        let balance = Usdc::from_str("500").unwrap();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::BaseWalletCash {
+                usdc_balance: balance,
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::BaseWalletCash {
+                usdc_balance: balance,
+            })
+            .await
+            .events();
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn apply_event_updates_base_wallet_usdc() {
+        let usdc = Usdc::from_str("1234.56").unwrap();
+
+        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::BaseWalletCash {
+            usdc_balance: usdc,
+            fetched_at: Utc::now(),
+        }])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(snapshot.base_wallet_usdc, Some(usdc));
     }
 }
