@@ -1,6 +1,6 @@
 //! Spawns the rebalancing infrastructure.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -14,7 +14,7 @@ use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Ex
 
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
-use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
+use super::{Rebalancer, RebalancingCtx, TriggeredOperation, UsdcRebalancing};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::config::EquityAssetConfig;
 use crate::equity_redemption::EquityRedemption;
@@ -36,6 +36,8 @@ pub(crate) enum SpawnRebalancerError {
     Cctp(#[from] Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
+    #[error("USDC rebalancing is enabled but no vault ID is configured")]
+    MissingUsdcVaultId,
 }
 
 pub(crate) struct RebalancingCqrsFrameworks {
@@ -93,7 +95,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
                 #[cfg(feature = "test-support")]
                 message_transmitter: ctx.message_transmitter,
             })
-            .map_err(Box::new)?,
+            .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?,
         );
 
         let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
@@ -115,11 +117,19 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// processors.
     pub(crate) fn spawn(
         self,
+        ctx: &RebalancingCtx,
         market_maker_wallet: Address,
-        usdc_vault_id: RaindexVaultId,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
-    ) -> JoinHandle<()> {
+    ) -> Result<JoinHandle<()>, SpawnRebalancerError> {
+        let usdc_vault_id = match ctx.usdc {
+            UsdcRebalancing::Enabled { .. } => ctx
+                .usdc_vault_id
+                .map(RaindexVaultId)
+                .ok_or(SpawnRebalancerError::MissingUsdcVaultId)?,
+            UsdcRebalancing::Disabled => RaindexVaultId(B256::ZERO),
+        };
+
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -148,9 +158,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         );
 
         info!("Rebalancing infrastructure initialized");
-        tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             rebalancer.run().await;
-        })
+        }))
     }
 }
 
@@ -158,7 +168,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
 mod tests {
     use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, address, b256};
+    use alloy::primitives::{address, b256};
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
@@ -179,7 +189,6 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
-    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -412,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_dispatches_mint_operation() {
         let server = MockServer::start();
-        let (services, _ctx) = make_services_with_mock_wallet(&server).await;
+        let (services, ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
         let mock_services = EquityTransferServices {
@@ -433,12 +442,9 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let handle = services.spawn(
-            Address::random(),
-            RaindexVaultId(B256::ZERO),
-            rx,
-            frameworks,
-        );
+        let handle = services
+            .spawn(&ctx, Address::random(), rx, frameworks)
+            .unwrap();
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
