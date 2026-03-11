@@ -69,7 +69,7 @@ type SigningProvider = FillProvider<
     alloy::network::Ethereum,
 >;
 
-struct TestWallet {
+pub(crate) struct TestWallet {
     address: Address,
     read_provider: RootProvider,
     signing_provider: SigningProvider,
@@ -77,7 +77,7 @@ struct TestWallet {
 }
 
 impl TestWallet {
-    fn new(
+    pub(crate) fn new(
         private_key: &B256,
         rpc_url: url::Url,
         required_confirmations: u64,

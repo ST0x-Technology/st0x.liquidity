@@ -27,7 +27,12 @@
 mod assertions;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use alloy::providers::RootProvider;
+use alloy::providers::ext::AnvilApi as _;
+
+use st0x_evm::test_chain::evm_mapping_slot;
 use st0x_hedge::OperationMode;
 
 use self::assertions::*;
@@ -881,6 +886,130 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .call()
         .await?;
 
+    bot.abort();
+    Ok(())
+}
+
+/// Base wallet USDC balance detected by inventory poller.
+///
+/// When rebalancing is enabled, the conductor wires the Base wallet
+/// into the inventory polling service. Each polling cycle reads the
+/// wallet's USDC balance via `balanceOf` at the canonical Base USDC
+/// address and emits a `BaseWalletCash` snapshot event.
+///
+/// Expected CQRS event:
+/// - `InventorySnapshot`: BaseWalletCash (usdc_balance = funded amount)
+///
+/// Infrastructure: Uses the existing Base Anvil from TestInfra with
+/// `DeployableERC20` bytecode already deployed at `USDC_BASE`. The bot
+/// owner's balance is set via `anvil_set_storage_at`. No CCTP contracts
+/// or trade activity required -- pure polling verification.
+#[test_log::test(tokio::test)]
+async fn base_wallet_usdc_balance_detected_by_inventory_poller() -> anyhow::Result<()> {
+    let infra = TestInfra::start(vec![("AAPL", dec!(150))], vec![]).await?;
+
+    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
+        Arc::new(TestWallet::new(
+            &infra.base_chain.owner_key,
+            infra.base_chain.endpoint().parse()?,
+            1,
+        )?);
+
+    let alpaca_auth = st0x_execution::AlpacaBrokerApiCtx {
+        api_key: st0x_execution::alpaca_broker_api::TEST_API_KEY.to_owned(),
+        api_secret: st0x_execution::alpaca_broker_api::TEST_API_SECRET.to_owned(),
+        account_id: st0x_execution::AlpacaAccountId::new(uuid::uuid!(
+            "904837e3-3b76-47ec-b432-046db621571b"
+        )),
+        mode: Some(st0x_execution::AlpacaBrokerApiMode::Mock(
+            infra.broker_service.base_url(),
+        )),
+        asset_cache_ttl: Duration::from_secs(3600),
+        time_in_force: st0x_execution::TimeInForce::Day,
+    };
+
+    let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
+        .equity(st0x_hedge::ImbalanceThreshold::new(dec!(0.5), dec!(0.1))?)
+        .usdc(UsdcRebalancing::Disabled)
+        .redemption_wallet(alloy::primitives::Address::random())
+        .alpaca_broker_auth(alpaca_auth.clone())
+        .base_wallet(base_wallet.clone())
+        .ethereum_wallet(base_wallet)
+        .call();
+
+    let broker_ctx = st0x_hedge::config::BrokerCtx::AlpacaBrokerApi(alpaca_auth);
+
+    let usdc_vault_id = infra
+        .base_chain
+        .create_usdc_vault(parse_units("1000", 6)?.into())
+        .await?;
+
+    let funded_amount: U256 = parse_units("10000", 6)?.into();
+    let balance_slot = evm_mapping_slot(infra.base_chain.owner, 0);
+    infra
+        .base_chain
+        .provider
+        .anvil_set_storage_at(
+            crate::base_chain::USDC_BASE,
+            balance_slot,
+            funded_amount.into(),
+        )
+        .await?;
+
+    let mut assets = infra.assets_config();
+    assets.cash = Some(st0x_hedge::config::CashAssetConfig {
+        vault_id: Some(usdc_vault_id),
+        rebalancing: OperationMode::Disabled,
+        operational_limit: None,
+    });
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+
+    let ctx = st0x_hedge::config::Ctx::for_test()
+        .database_url(infra.db_path.display().to_string())
+        .ws_rpc_url(infra.base_chain.ws_endpoint()?)
+        .orderbook(infra.base_chain.orderbook)
+        .deployment_block(current_block)
+        .broker(broker_ctx)
+        .trading_mode(st0x_hedge::TradingMode::Rebalancing(Box::new(
+            rebalancing_ctx,
+        )))
+        .assets(assets)
+        .inventory_poll_interval(2)
+        .call()?;
+
+    let mut bot = spawn_bot(ctx);
+
+    crate::poll::poll_for_events(
+        &mut bot,
+        &infra.db_path,
+        "InventorySnapshotEvent::BaseWalletCash",
+        1,
+    )
+    .await;
+
+    let pool = crate::poll::connect_db(&infra.db_path).await?;
+    let events = crate::poll::fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    let base_wallet_cash_event = events
+        .iter()
+        .find(|event| event.event_type == "InventorySnapshotEvent::BaseWalletCash")
+        .expect("Expected BaseWalletCash event");
+
+    let usdc_balance_str = base_wallet_cash_event
+        .payload
+        .get("BaseWalletCash")
+        .and_then(|val| val.get("usdc_balance"))
+        .and_then(|val| val.as_str())
+        .expect("BaseWalletCash payload missing usdc_balance");
+    let usdc_balance: Decimal = usdc_balance_str.parse()?;
+
+    assert_eq!(
+        usdc_balance,
+        dec!(10000),
+        "Base wallet USDC balance should match funded amount"
+    );
+
+    pool.close().await;
     bot.abort();
     Ok(())
 }
