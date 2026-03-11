@@ -758,9 +758,15 @@ fn handle_crypto_order(
     quantity: Decimal,
     side: OrderSide,
 ) -> HttpMockResponse {
+    // Real Alpaca cash balances are denominated in USD cents, so applying a
+    // sub-cent USDC quantity directly would create fractional cents and break
+    // subsequent inventory polls. Round to 2 decimal places (cents precision)
+    // to mirror the real API's behaviour.
+    let cash_delta = quantity.round_dp(2);
+
     match side {
-        OrderSide::Buy => state.account.cash -= quantity,
-        OrderSide::Sell => state.account.cash += quantity,
+        OrderSide::Buy => state.account.cash -= cash_delta,
+        OrderSide::Sell => state.account.cash += cash_delta,
     }
 
     let fill_price = Decimal::ONE;
