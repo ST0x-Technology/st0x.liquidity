@@ -188,6 +188,7 @@ where
             self.common.ctx.evm.ws_rpc_url.clone(),
             self.common.ctx.evm.orderbook,
             self.job_queue.clone(),
+            self.common.pool.clone(),
         );
 
         let supervisor = SupervisorBuilder::default()
