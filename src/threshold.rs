@@ -366,4 +366,13 @@ mod tests {
         let roundtripped = Usdc::from_u256_6_decimals(u256).unwrap();
         assert_eq!(roundtripped, large);
     }
+
+    #[test]
+    fn from_u256_6_decimals_overflow_returns_error() {
+        let error = Usdc::from_u256_6_decimals(U256::MAX).unwrap_err();
+        assert!(matches!(
+            error,
+            UsdcConversionError::FromU256Overflow { .. }
+        ));
+    }
 }
