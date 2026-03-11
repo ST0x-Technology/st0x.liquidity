@@ -46,8 +46,10 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::warn;
 
+use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_finance::Id;
 
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::TokenizationRequestStatus;
@@ -343,6 +345,7 @@ pub(crate) enum TokenizedEquityMint {
         wrap_tx_hash: TxHash,
         /// Vault deposit transaction
         vault_deposit_tx_hash: TxHash,
+        requested_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
 
@@ -354,6 +357,105 @@ pub(crate) enum TokenizedEquityMint {
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+}
+
+impl TokenizedEquityMint {
+    pub(crate) fn to_dto(&self, id: &IssuerRequestId) -> TransferOperation {
+        match self {
+            Self::MintRequested {
+                symbol,
+                quantity,
+                requested_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(id.0.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityMintStatus::Minting,
+                started_at: *requested_at,
+                updated_at: *requested_at,
+            }),
+
+            Self::MintAccepted {
+                symbol,
+                quantity,
+                requested_at,
+                accepted_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(id.0.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityMintStatus::Minting,
+                started_at: *requested_at,
+                updated_at: *accepted_at,
+            }),
+
+            Self::TokensReceived {
+                symbol,
+                quantity,
+                requested_at,
+                received_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(id.0.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityMintStatus::Wrapping,
+                started_at: *requested_at,
+                updated_at: *received_at,
+            }),
+
+            Self::TokensWrapped {
+                symbol,
+                quantity,
+                requested_at,
+                wrapped_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(id.0.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityMintStatus::Depositing,
+                started_at: *requested_at,
+                updated_at: *wrapped_at,
+            }),
+
+            Self::DepositedIntoRaindex {
+                symbol,
+                quantity,
+                requested_at,
+                deposited_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(id.0.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityMintStatus::Completed {
+                    completed_at: *deposited_at,
+                },
+                started_at: *requested_at,
+                updated_at: *deposited_at,
+            }),
+
+            Self::Failed {
+                symbol,
+                quantity,
+                requested_at,
+                failed_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(id.0.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityMintStatus::Failed {
+                    failed_at: *failed_at,
+                },
+                started_at: *requested_at,
+                updated_at: *failed_at,
+            }),
+        }
+    }
 }
 
 /// Our tokenized equity tokens use 18 decimals.
@@ -590,6 +692,7 @@ impl EventSourced for TokenizedEquityMint {
                     tokenization_request_id,
                     tx_hash,
                     wrap_tx_hash,
+                    requested_at,
                     ..
                 } = entity
                 else {
@@ -604,6 +707,7 @@ impl EventSourced for TokenizedEquityMint {
                     token_tx_hash: *tx_hash,
                     wrap_tx_hash: *wrap_tx_hash,
                     vault_deposit_tx_hash: *vault_deposit_tx_hash,
+                    requested_at: *requested_at,
                     deposited_at: *deposited_at,
                 })
             }
@@ -941,6 +1045,7 @@ mod tests {
             token_tx_hash: TxHash::random(),
             wrap_tx_hash: TxHash::random(),
             vault_deposit_tx_hash: TxHash::random(),
+            requested_at: Utc::now(),
             deposited_at: Utc::now(),
         };
 
@@ -1348,5 +1453,153 @@ mod tests {
             ),
             "Expected DepositedIntoRaindex after full lifecycle, got: {state:?}"
         );
+    }
+
+    #[test]
+    fn to_dto_maps_in_progress_variants() {
+        let id = IssuerRequestId::new("MINT-001");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(60);
+
+        let requested = TokenizedEquityMint::MintRequested {
+            symbol: symbol.clone(),
+            quantity: dec!(10),
+            wallet: Address::ZERO,
+            requested_at: now,
+        };
+        let dto = requested.to_dto(&id);
+        let TransferOperation::EquityMint(op) = dto else {
+            panic!("Expected EquityMint, got: {dto:?}");
+        };
+        assert_eq!(op.id, Id::new("MINT-001"));
+        assert_eq!(op.symbol, symbol);
+        assert_eq!(op.quantity, FractionalShares::new(dec!(10)));
+        assert!(
+            matches!(op.status, EquityMintStatus::Minting),
+            "Expected Minting, got: {:?}",
+            op.status
+        );
+        assert_eq!(op.started_at, now);
+        assert_eq!(op.updated_at, now);
+
+        let accepted = TokenizedEquityMint::MintAccepted {
+            symbol: symbol.clone(),
+            quantity: dec!(10),
+            wallet: Address::ZERO,
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            requested_at: now,
+            accepted_at: later,
+        };
+        let TransferOperation::EquityMint(op) = accepted.to_dto(&id) else {
+            panic!("Expected EquityMint");
+        };
+        assert!(
+            matches!(op.status, EquityMintStatus::Minting),
+            "Expected Minting, got: {:?}",
+            op.status
+        );
+        assert_eq!(op.started_at, now);
+        assert_eq!(op.updated_at, later);
+
+        let received = TokenizedEquityMint::TokensReceived {
+            symbol: symbol.clone(),
+            quantity: dec!(10),
+            wallet: Address::ZERO,
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tx_hash: TxHash::random(),
+            receipt_id: ReceiptId(U256::from(1)),
+            shares_minted: U256::from(10_000_000_000_000_000_000_u128),
+            requested_at: now,
+            accepted_at: now,
+            received_at: later,
+        };
+        let TransferOperation::EquityMint(op) = received.to_dto(&id) else {
+            panic!("Expected EquityMint");
+        };
+        assert!(
+            matches!(op.status, EquityMintStatus::Wrapping),
+            "Expected Wrapping, got: {:?}",
+            op.status
+        );
+        assert_eq!(op.started_at, now);
+        assert_eq!(op.updated_at, later);
+
+        let wrapped = TokenizedEquityMint::TokensWrapped {
+            symbol,
+            quantity: dec!(10),
+            wallet: Address::ZERO,
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tx_hash: TxHash::random(),
+            receipt_id: ReceiptId(U256::from(1)),
+            shares_minted: U256::from(10_000_000_000_000_000_000_u128),
+            wrap_tx_hash: TxHash::random(),
+            wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+            requested_at: now,
+            accepted_at: now,
+            received_at: now,
+            wrapped_at: later,
+        };
+        let TransferOperation::EquityMint(op) = wrapped.to_dto(&id) else {
+            panic!("Expected EquityMint");
+        };
+        assert!(
+            matches!(op.status, EquityMintStatus::Depositing),
+            "Expected Depositing, got: {:?}",
+            op.status
+        );
+        assert_eq!(op.started_at, now);
+        assert_eq!(op.updated_at, later);
+    }
+
+    #[test]
+    fn to_dto_maps_terminal_variants() {
+        let id = IssuerRequestId::new("MINT-001");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(60);
+
+        let deposited = TokenizedEquityMint::DepositedIntoRaindex {
+            symbol: symbol.clone(),
+            quantity: dec!(10),
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            token_tx_hash: TxHash::random(),
+            wrap_tx_hash: TxHash::random(),
+            vault_deposit_tx_hash: TxHash::random(),
+            requested_at: now,
+            deposited_at: later,
+        };
+        let TransferOperation::EquityMint(op) = deposited.to_dto(&id) else {
+            panic!("Expected EquityMint");
+        };
+        assert!(
+            matches!(op.status, EquityMintStatus::Completed { .. }),
+            "Expected Completed, got: {:?}",
+            op.status
+        );
+        assert_eq!(op.started_at, now);
+        assert_eq!(op.updated_at, later);
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol,
+            quantity: dec!(10),
+            reason: "Something went wrong".to_string(),
+            requested_at: now,
+            failed_at: later,
+        };
+        let TransferOperation::EquityMint(op) = failed.to_dto(&id) else {
+            panic!("Expected EquityMint");
+        };
+        assert!(
+            matches!(op.status, EquityMintStatus::Failed { .. }),
+            "Expected Failed, got: {:?}",
+            op.status
+        );
+        assert_eq!(op.started_at, now);
+        assert_eq!(op.updated_at, later);
     }
 }

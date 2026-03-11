@@ -257,6 +257,44 @@ pub enum UsdcBridgeStatus {
     Failed { failed_at: DateTime<Utc> },
 }
 
+impl TransferOperation {
+    /// Whether this transfer is in a terminal state (completed or failed).
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::EquityMint(op) => {
+                use EquityMintStatus::*;
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Minting | Wrapping | Depositing => false,
+                }
+            }
+            Self::EquityRedemption(op) => {
+                use EquityRedemptionStatus::*;
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Withdrawing | Unwrapping | Sending | PendingConfirmation => false,
+                }
+            }
+            Self::UsdcBridge(op) => {
+                use UsdcBridgeStatus::*;
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Converting | Withdrawing | Bridging | Depositing => false,
+                }
+            }
+        }
+    }
+
+    /// The last time this transfer was updated.
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::EquityMint(op) => op.updated_at,
+            Self::EquityRedemption(op) => op.updated_at,
+            Self::UsdcBridge(op) => op.updated_at,
+        }
+    }
+}
+
 /// Absolute and percentage profit/loss.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 pub struct PnL {

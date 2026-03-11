@@ -361,3 +361,88 @@ impl<T> DomainError for T where
     T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
 }
+
+/// Load a single entity by replaying events from the store.
+///
+/// Creates a lightweight, temporary event store — no CQRS framework, no
+/// query processors. Suitable for read-only access from contexts that
+/// don't own a [`Store`] (e.g., dashboard transfer loading).
+pub async fn load_entity<Entity: EventSourced>(
+    pool: &SqlitePool,
+    id: &Entity::Id,
+) -> Result<Option<Entity>, SendError<Entity>> {
+    let repo = SqliteEventRepository::new(pool.clone());
+    let event_store =
+        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_event_store(repo);
+
+    let context = event_store.load_aggregate(&id.to_string()).await?;
+
+    Ok(context.aggregate.into_result()?)
+}
+
+/// Load all aggregate IDs for a given entity type.
+///
+/// Queries the events table for distinct aggregate IDs. Used
+/// by dashboard transfer loading to enumerate all transfer
+/// aggregates without requiring access to a [`Store`].
+///
+/// Returns an error if any stored aggregate ID fails to parse,
+/// since that indicates data corruption or a schema mismatch.
+pub async fn load_all_ids<Entity: EventSourced>(
+    pool: &SqlitePool,
+) -> Result<Vec<Entity::Id>, LoadAllIdsError>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT aggregate_id FROM events \
+         WHERE aggregate_type = ?1 \
+         ORDER BY aggregate_id ASC",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .fetch_all(pool)
+    .await?;
+
+    let (ids, invalid) = rows.into_iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut ids, mut invalid), (id_str,)| {
+            match id_str.parse::<Entity::Id>() {
+                Ok(id) => ids.push(id),
+                Err(parse_error) => {
+                    tracing::warn!(
+                        aggregate_id = id_str,
+                        aggregate_type = Entity::AGGREGATE_TYPE,
+                        ?parse_error,
+                        "Failed to parse aggregate ID"
+                    );
+                    invalid.push(id_str);
+                }
+            }
+            (ids, invalid)
+        },
+    );
+
+    if invalid.is_empty() {
+        Ok(ids)
+    } else {
+        Err(LoadAllIdsError::InvalidIds {
+            aggregate_type: Entity::AGGREGATE_TYPE,
+            ids: invalid,
+        })
+    }
+}
+
+/// Errors that can occur when loading all aggregate IDs.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadAllIdsError {
+    #[error("Database error: {0}")]
+    Sql(#[from] sqlx::Error),
+    #[error(
+        "Found unparseable aggregate IDs for {aggregate_type}: \
+         {ids:?}"
+    )]
+    InvalidIds {
+        aggregate_type: &'static str,
+        ids: Vec<String>,
+    },
+}
