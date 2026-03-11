@@ -33,7 +33,8 @@ use crate::config::AssetsConfig;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
-    ImbalanceThreshold, Inventory, InventoryView, InventoryViewError, Operator, TransferOp, Venue,
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
+    Operator, TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::{
@@ -355,6 +356,11 @@ impl RebalancingCtx {
 
             #[cfg(feature = "wallet-private-key")]
             (WalletConfig::PrivateKey { address }, WalletSecrets::PrivateKey { private_key }) => {
+                // Ensure at least one await point exists regardless of feature
+                // flags — without this, clippy::unused_async fires when only
+                // synchronous wallet backends are compiled.
+                std::future::ready(()).await;
+
                 let provider = RootProvider::new(http_client_with_retry(rpc_url));
 
                 let wallet = st0x_evm::local::RawPrivateKeyWallet::new(
@@ -375,12 +381,14 @@ impl RebalancingCtx {
 
             #[cfg(not(feature = "wallet-private-key"))]
             (WalletConfig::PrivateKey { .. }, WalletSecrets::PrivateKey { .. }) => {
+                std::future::ready(()).await;
                 Err(RebalancingCtxError::WalletNotCompiled {
                     wallet_type: WalletBackend::PrivateKey,
                 })
             }
 
             (WalletConfig::Turnkey { .. }, WalletSecrets::PrivateKey { .. }) => {
+                std::future::ready(()).await;
                 Err(RebalancingCtxError::WalletTypeMismatch {
                     config_type: WalletBackend::Turnkey,
                     secrets_type: WalletBackend::PrivateKey,
@@ -388,6 +396,7 @@ impl RebalancingCtx {
             }
 
             (WalletConfig::PrivateKey { .. }, WalletSecrets::Turnkey { .. }) => {
+                std::future::ready(()).await;
                 Err(RebalancingCtxError::WalletTypeMismatch {
                     config_type: WalletBackend::PrivateKey,
                     secrets_type: WalletBackend::Turnkey,
@@ -573,7 +582,7 @@ pub(crate) struct RebalancingTrigger {
     vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
     order_owner: Address,
-    inventory: Arc<RwLock<InventoryView>>,
+    inventory: Arc<BroadcastingInventory>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
@@ -592,7 +601,7 @@ impl RebalancingTrigger {
         vault_registry: Arc<Store<VaultRegistry>>,
         orderbook: Address,
         order_owner: Address,
-        inventory: Arc<RwLock<InventoryView>>,
+        inventory: Arc<BroadcastingInventory>,
         sender: mpsc::Sender<TriggeredOperation>,
         wrapper: Arc<dyn Wrapper>,
     ) -> Self {
@@ -1283,8 +1292,8 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
+    use tokio::sync::{broadcast, mpsc};
     use uuid::Uuid;
 
     use super::*;
@@ -1327,7 +1336,11 @@ mod tests {
 
     async fn make_trigger() -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
         let pool = crate::test_utils::setup_test_db().await;
         let wrapper = Arc::new(MockWrapper::new());
 
@@ -1384,7 +1397,11 @@ mod tests {
     #[tokio::test]
     async fn test_usdc_disabled_via_cash_config_does_not_send() {
         let (sender, mut receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
         let pool = crate::test_utils::setup_test_db().await;
         let wrapper = Arc::new(MockWrapper::new());
 
@@ -1421,7 +1438,11 @@ mod tests {
     async fn disabled_asset_skips_equity_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
         let pool = crate::test_utils::setup_test_db().await;
         let wrapper = Arc::new(MockWrapper::new());
 
@@ -1562,7 +1583,8 @@ mod tests {
         inventory: InventoryView,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(inventory));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, inventory_sender));
         let pool = crate::test_utils::setup_test_db().await;
 
         (
@@ -1597,7 +1619,8 @@ mod tests {
         wrapper: Arc<MockWrapper>,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(inventory));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, inventory_sender));
         let pool = crate::test_utils::setup_test_db().await;
 
         seed_vault_registry(&pool, symbol).await;
@@ -1667,8 +1690,10 @@ mod tests {
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000))),
+            inventory_sender,
         ));
         let pool = crate::test_utils::setup_test_db().await;
 
@@ -3558,6 +3583,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
+        // Regression: when usdc is None, startup must not require assets.cash.vault_id.
+        // The trigger returns no USDC rebalancing params, so no USDC vault lookup occurs.
+        let (sender, _receiver) = mpsc::channel(10);
+        let (inventory_sender, _) = broadcast::channel(16);
+        let pool = crate::test_utils::setup_test_db().await;
+        let wrapper = Arc::new(MockWrapper::new());
+
+        let trigger = RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc: None,
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
+                disabled_assets: HashSet::new(),
+            },
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            Arc::new(BroadcastingInventory::new(
+                InventoryView::default(),
+                inventory_sender,
+            )),
+            sender,
+            wrapper,
+        );
+
+        assert!(
+            trigger.usdc_rebalancing_params().is_none(),
+            "Expected usdc_rebalancing_params to be None when cash ratio is absent"
+        );
+    }
+
     #[test]
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
@@ -3929,8 +3993,10 @@ mod tests {
     async fn trigger_clears_in_progress_flag_when_terminal_event_received() {
         let (sender, _receiver) = mpsc::channel(10);
         let pool = crate::test_utils::setup_test_db().await;
-        let inventory = Arc::new(tokio::sync::RwLock::new(
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(Usdc::new(dec!(5000)), Usdc::new(dec!(5000))),
+            inventory_sender,
         ));
 
         let trigger = Arc::new(RebalancingTrigger::new(
@@ -4123,7 +4189,11 @@ mod tests {
         let symbol = Symbol::new("RKLB").unwrap();
 
         // Empty inventory - simulates startup state before polling completes
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
 
         let (sender, mut receiver) = mpsc::channel(10);
         let pool = crate::test_utils::setup_test_db().await;
@@ -4187,7 +4257,11 @@ mod tests {
     async fn trigger_fires_when_both_venues_have_data() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
         let (sender, mut receiver) = mpsc::channel(10);
 
         seed_vault_registry(&pool, &symbol).await;
@@ -4264,7 +4338,11 @@ mod tests {
     async fn logs_show_partial_data_skips_imbalance_check() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
         let (sender, _receiver) = mpsc::channel(10);
 
         seed_vault_registry(&pool, &symbol).await;
@@ -4322,7 +4400,11 @@ mod tests {
     async fn logs_show_trigger_fires_with_complete_data() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            inventory_sender,
+        ));
         let (sender, _receiver) = mpsc::channel(10);
 
         seed_vault_registry(&pool, &symbol).await;

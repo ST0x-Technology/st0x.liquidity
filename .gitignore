@@ -16,3 +16,4 @@ tarpaulin-report.html
 out/
 cache/
 .tmp/
+*.log
