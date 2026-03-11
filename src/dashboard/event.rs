@@ -2,12 +2,15 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::warn;
 
 use st0x_dto::{EventStoreEntry, ServerMessage};
-use st0x_event_sorcery::{DomainEvent, EntityList, EventSourced, Never, Reactor, deps};
+use st0x_event_sorcery::{
+    DomainEvent, EntityList, EventSourced, Never, Reactor, deps, load_entity,
+};
 
 use crate::equity_redemption::EquityRedemption;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -21,16 +24,20 @@ deps!(
 /// Reactor that broadcasts events to connected WebSocket clients.
 ///
 /// Implements [`Reactor`] with exhaustive handling for all
-/// broadcast-eligible aggregate types.
+/// broadcast-eligible aggregate types. Sends both `Event` entries
+/// (lightweight metadata) and `TransferUpdate` messages (full
+/// aggregate state as DTO) on each event.
 pub(crate) struct EventBroadcaster {
     sender: broadcast::Sender<ServerMessage>,
+    pool: SqlitePool,
     sequence: AtomicU64,
 }
 
 impl EventBroadcaster {
-    pub(crate) fn new(sender: broadcast::Sender<ServerMessage>) -> Self {
+    pub(crate) fn new(sender: broadcast::Sender<ServerMessage>, pool: SqlitePool) -> Self {
         Self {
             sender,
+            pool,
             sequence: AtomicU64::new(0),
         }
     }
@@ -63,17 +70,85 @@ impl Reactor for EventBroadcaster {
         event
             .on(|id, event| async move {
                 self.broadcast_event::<TokenizedEquityMint>(&id, &event);
+                self.broadcast_transfer_update_mint(&id).await;
             })
             .on(|id, event| async move {
                 self.broadcast_event::<EquityRedemption>(&id, &event);
+                self.broadcast_transfer_update_redemption(&id).await;
             })
             .on(|id, event| async move {
                 self.broadcast_event::<UsdcRebalance>(&id, &event);
+                self.broadcast_transfer_update_usdc(&id).await;
             })
             .exhaustive()
             .await;
 
         Ok(())
+    }
+}
+
+impl EventBroadcaster {
+    async fn broadcast_transfer_update_mint(&self, id: &<TokenizedEquityMint as EventSourced>::Id) {
+        match load_entity::<TokenizedEquityMint>(&self.pool, id).await {
+            Ok(Some(entity)) => {
+                let dto = entity.to_dto(id);
+                let _ = self.sender.send(ServerMessage::TransferUpdate(dto));
+            }
+            Ok(None) => {
+                warn!(?id, "Mint aggregate not found for transfer update");
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    ?id,
+                    "Failed to load mint aggregate for transfer update"
+                );
+            }
+        }
+    }
+
+    async fn broadcast_transfer_update_redemption(
+        &self,
+        id: &<EquityRedemption as EventSourced>::Id,
+    ) {
+        match load_entity::<EquityRedemption>(&self.pool, id).await {
+            Ok(Some(entity)) => {
+                let dto = entity.to_dto(id);
+                let _ = self.sender.send(ServerMessage::TransferUpdate(dto));
+            }
+            Ok(None) => {
+                warn!(?id, "Redemption aggregate not found for transfer update");
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    ?id,
+                    "Failed to load redemption aggregate for transfer update"
+                );
+            }
+        }
+    }
+
+    async fn broadcast_transfer_update_usdc(&self, id: &<UsdcRebalance as EventSourced>::Id) {
+        match load_entity::<UsdcRebalance>(&self.pool, id).await {
+            Ok(Some(entity)) => {
+                let dto = entity.to_dto(id);
+                let _ = self.sender.send(ServerMessage::TransferUpdate(dto));
+            }
+            Ok(None) => {
+                warn!(
+                    ?id,
+                    "USDC rebalance aggregate not found for transfer update"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    ?id,
+                    "Failed to load USDC rebalance aggregate for transfer update"
+                );
+            }
+        }
     }
 }
 
@@ -89,6 +164,12 @@ mod tests {
     use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
     use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
     use crate::usdc_rebalance::{UsdcRebalanceEvent, UsdcRebalanceId};
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
 
     fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
@@ -114,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn event_broadcaster_sends_to_channel() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = EventBroadcaster::new(sender, create_test_pool().await);
 
         let id = IssuerRequestId::new("mint-123".to_string());
 
@@ -137,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn event_broadcaster_handles_no_receivers() {
         let (sender, _) = broadcast::channel::<ServerMessage>(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = EventBroadcaster::new(sender, create_test_pool().await);
 
         let id = IssuerRequestId::new("mint-456".to_string());
 
@@ -147,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn reactor_receive_broadcasts_mint_event() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender, create_test_pool().await));
 
         let id = IssuerRequestId::new("mint-multi".to_string());
 
@@ -171,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn reactor_receive_works_for_equity_redemption() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender, create_test_pool().await));
 
         let id = RedemptionAggregateId::new("redemption-123".to_string());
 
@@ -197,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn reactor_receive_works_for_usdc_rebalance() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender, create_test_pool().await));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -225,7 +306,7 @@ mod tests {
         let (sender, mut receiver1) = broadcast::channel(16);
         let mut receiver2 = sender.subscribe();
         let mut receiver3 = sender.subscribe();
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = EventBroadcaster::new(sender, create_test_pool().await);
 
         let id = IssuerRequestId::new("multi-sub".to_string());
 
@@ -266,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_empty_does_nothing() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let _broadcaster = EventBroadcaster::new(sender);
+        let _broadcaster = EventBroadcaster::new(sender, create_test_pool().await);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await;
@@ -274,10 +355,10 @@ mod tests {
         assert!(result.is_err(), "should timeout with no messages");
     }
 
-    #[test]
-    fn event_store_entry_serializes_correctly() {
+    #[tokio::test]
+    async fn event_store_entry_serializes_correctly() {
         let (sender, _) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = EventBroadcaster::new(sender, create_test_pool().await);
 
         let id = IssuerRequestId::new("serialize-test".to_string());
 

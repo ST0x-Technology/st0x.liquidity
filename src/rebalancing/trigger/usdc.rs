@@ -4,13 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rust_decimal::Decimal;
-use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
 use st0x_finance::Usdc;
 
 use super::TriggeredOperation;
-use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
+use crate::inventory::{BroadcastingInventory, Imbalance, ImbalanceThreshold};
 
 /// Minimum USDC amount for Alpaca withdrawals.
 /// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~17bps observed in live tests),
@@ -74,7 +73,7 @@ impl Drop for InProgressGuard {
 /// or `UsdcBaseToAlpaca` if there's too much USDC on Base that needs to be bridged to Alpaca.
 pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
-    inventory: &Arc<RwLock<InventoryView>>,
+    inventory: &Arc<BroadcastingInventory>,
     usdc_limit: Option<Usdc>,
 ) -> Result<TriggeredOperation, UsdcTriggerSkip> {
     let imbalance = {
@@ -126,8 +125,11 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+    use tokio::sync::broadcast;
+
+    use super::*;
+    use crate::inventory::InventoryView;
 
     #[test]
     fn test_guard_releases_on_drop() {
@@ -168,7 +170,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_balanced_inventory_returns_no_imbalance() {
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -195,7 +198,8 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(dec!(10)), Usdc::new(dec!(90)));
 
-        let inventory = Arc::new(RwLock::new(inventory));
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, sender));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -216,7 +220,8 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500)));
 
-        let inventory = Arc::new(RwLock::new(inventory));
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, sender));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -238,7 +243,8 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(dec!(0)), Usdc::new(dec!(102)));
 
-        let inventory = Arc::new(RwLock::new(inventory));
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, sender));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -261,7 +267,8 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(dec!(90)), Usdc::new(dec!(10)));
 
-        let inventory = Arc::new(RwLock::new(inventory));
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, sender));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -279,7 +286,8 @@ mod tests {
     async fn operational_limits_cap_usdc_amount() {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500)));
-        let inventory = Arc::new(RwLock::new(inventory));
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, sender));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -303,8 +311,10 @@ mod tests {
         let usdc_limit = Some(Usdc::new(dec!(100)));
 
         // 100 onchain / 500 offchain -> 83% offchain, excess = 200
-        let inventory = Arc::new(RwLock::new(
+        let (sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500))),
+            sender,
         ));
 
         let first = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
@@ -315,8 +325,10 @@ mod tests {
 
         // After transferring 100: 200 onchain / 400 offchain -> 67% offchain
         // Still above 70% threshold? No - 400/600 = 66.7%, within 30%-70%. No trigger.
-        let after_first = Arc::new(RwLock::new(
+        let (sender, _) = broadcast::channel(16);
+        let after_first = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(Usdc::new(dec!(200)), Usdc::new(dec!(400))),
+            sender,
         ));
 
         let second =
@@ -329,8 +341,10 @@ mod tests {
 
         // But if only 50 was transferred: 150 onchain / 450 offchain -> 75% offchain
         // Still above 70%, so triggers again
-        let partially_resolved = Arc::new(RwLock::new(
+        let (sender, _) = broadcast::channel(16);
+        let partially_resolved = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(Usdc::new(dec!(150)), Usdc::new(dec!(450))),
+            sender,
         ));
 
         let third =
@@ -344,8 +358,10 @@ mod tests {
     #[tokio::test]
     async fn capped_amount_below_minimum_skips_withdrawal() {
         // excess = $200 (above $51 minimum), but limit = $30 caps it below minimum
-        let inventory = Arc::new(RwLock::new(
+        let (inventory_sender, _) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(500))),
+            inventory_sender,
         ));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),

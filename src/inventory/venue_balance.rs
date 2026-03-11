@@ -58,12 +58,10 @@ where
         }
     }
 
-    #[cfg(test)]
     pub(super) fn available(self) -> T {
         self.available
     }
 
-    #[cfg(test)]
     pub(super) fn inflight(self) -> T {
         self.inflight
     }
