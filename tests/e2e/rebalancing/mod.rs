@@ -27,7 +27,13 @@
 mod assertions;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use alloy::node_bindings::Anvil;
+use alloy::providers::RootProvider;
+use alloy::providers::ext::AnvilApi as _;
+
+use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
 use st0x_hedge::OperationMode;
 
 use self::assertions::*;
@@ -881,6 +887,163 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .call()
         .await?;
 
+    bot.abort();
+    Ok(())
+}
+
+/// Ethereum wallet USDC balance detected by inventory poller.
+///
+/// When rebalancing is enabled, the conductor wires an Ethereum wallet
+/// into the inventory polling service. Each polling cycle reads the
+/// wallet's USDC balance via `balanceOf` at the canonical Ethereum USDC
+/// address and emits an `EthereumCash` snapshot event.
+///
+/// Expected CQRS event:
+/// - `InventorySnapshot`: EthereumCash (usdc_balance = funded amount)
+///
+/// Infrastructure: A separate Ethereum Anvil (chain_id 1) with
+/// `DeployableERC20` bytecode deployed at `USDC_ETHEREUM` and the bot
+/// owner's balance set via `anvil_set_storage_at`. No CCTP contracts
+/// or trade activity required -- pure polling verification.
+#[test_log::test(tokio::test)]
+async fn ethereum_usdc_balance_detected_by_inventory_poller() -> anyhow::Result<()> {
+    let infra = TestInfra::start(vec![("AAPL", dec!(150))], vec![]).await?;
+
+    let ethereum_anvil = Anvil::new().chain_id(1u64).spawn();
+    let ethereum_endpoint = ethereum_anvil.endpoint();
+    let eth_provider = alloy::providers::ProviderBuilder::new()
+        .connect(&ethereum_endpoint)
+        .await?;
+
+    let usdc_address = USDC_ETHEREUM;
+    let total_supply = U256::from(1_000_000_000_000u64);
+
+    eth_provider
+        .anvil_set_code(
+            usdc_address,
+            crate::base_chain::DeployableERC20::DEPLOYED_BYTECODE.clone(),
+        )
+        .await?;
+
+    eth_provider
+        .anvil_set_storage_at(usdc_address, U256::from(2), total_supply.into())
+        .await?;
+
+    eth_provider
+        .anvil_set_storage_at(
+            usdc_address,
+            U256::from(3),
+            solidity_short_string(b"USD Coin"),
+        )
+        .await?;
+
+    eth_provider
+        .anvil_set_storage_at(usdc_address, U256::from(4), solidity_short_string(b"USDC"))
+        .await?;
+
+    eth_provider
+        .anvil_set_storage_at(usdc_address, U256::from(5), U256::from(6).into())
+        .await?;
+
+    let funded_amount: U256 = parse_units("10000", 6)?.into();
+    let balance_slot = evm_mapping_slot(infra.base_chain.owner, 0);
+    eth_provider
+        .anvil_set_storage_at(usdc_address, balance_slot, funded_amount.into())
+        .await?;
+
+    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
+        Arc::new(TestWallet::new(
+            &infra.base_chain.owner_key,
+            infra.base_chain.endpoint().parse()?,
+            1,
+        )?);
+    let ethereum_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(
+        TestWallet::new(&infra.base_chain.owner_key, ethereum_endpoint.parse()?, 1)?,
+    );
+
+    let alpaca_auth = st0x_execution::AlpacaBrokerApiCtx {
+        api_key: st0x_execution::alpaca_broker_api::TEST_API_KEY.to_owned(),
+        api_secret: st0x_execution::alpaca_broker_api::TEST_API_SECRET.to_owned(),
+        account_id: st0x_execution::AlpacaAccountId::new(uuid::uuid!(
+            "904837e3-3b76-47ec-b432-046db621571b"
+        )),
+        mode: Some(st0x_execution::AlpacaBrokerApiMode::Mock(
+            infra.broker_service.base_url(),
+        )),
+        asset_cache_ttl: Duration::from_secs(3600),
+        time_in_force: st0x_execution::TimeInForce::Day,
+    };
+
+    let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
+        .equity(st0x_hedge::ImbalanceThreshold::new(dec!(0.5), dec!(0.1))?)
+        .usdc(UsdcRebalancing::Disabled)
+        .redemption_wallet(alloy::primitives::Address::random())
+        .alpaca_broker_auth(alpaca_auth.clone())
+        .base_wallet(base_wallet)
+        .ethereum_wallet(ethereum_wallet)
+        .call();
+
+    let broker_ctx = st0x_hedge::config::BrokerCtx::AlpacaBrokerApi(alpaca_auth);
+
+    let usdc_vault_id = infra
+        .base_chain
+        .create_usdc_vault(parse_units("1000", 6)?.into())
+        .await?;
+
+    let mut assets = infra.assets_config();
+    assets.cash = Some(st0x_hedge::config::CashAssetConfig {
+        vault_id: Some(usdc_vault_id),
+        rebalancing: OperationMode::Disabled,
+        operational_limit: None,
+    });
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+
+    let ctx = st0x_hedge::config::Ctx::for_test()
+        .database_url(infra.db_path.display().to_string())
+        .ws_rpc_url(infra.base_chain.ws_endpoint()?)
+        .orderbook(infra.base_chain.orderbook)
+        .deployment_block(current_block)
+        .broker(broker_ctx)
+        .trading_mode(st0x_hedge::TradingMode::Rebalancing(Box::new(
+            rebalancing_ctx,
+        )))
+        .assets(assets)
+        .inventory_poll_interval(2)
+        .call()?;
+
+    let mut bot = spawn_bot(ctx);
+
+    crate::poll::poll_for_events(
+        &mut bot,
+        &infra.db_path,
+        "InventorySnapshotEvent::EthereumCash",
+        1,
+    )
+    .await;
+
+    let pool = crate::poll::connect_db(&infra.db_path).await?;
+    let events = crate::poll::fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    let ethereum_cash_event = events
+        .iter()
+        .find(|event| event.event_type == "InventorySnapshotEvent::EthereumCash")
+        .expect("Expected EthereumCash event");
+
+    let usdc_balance_str = ethereum_cash_event
+        .payload
+        .get("EthereumCash")
+        .and_then(|val| val.get("usdc_balance"))
+        .and_then(|val| val.as_str())
+        .expect("EthereumCash payload missing usdc_balance");
+    let usdc_balance: Decimal = usdc_balance_str.parse()?;
+
+    assert_eq!(
+        usdc_balance,
+        dec!(10000),
+        "Ethereum USDC balance should match funded amount"
+    );
+
+    pool.close().await;
     bot.abort();
     Ok(())
 }
