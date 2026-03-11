@@ -6,12 +6,10 @@
 
 ## Go to prod with auto-rebalancing
 
-Manual rebalancing cannot keep up with liquidity demand. Auto-rebalancing is
-essential, but it already stalls after a few cycles in testing - capital gets
-stuck mid-flight and requires manual recovery. Going live requires granular
-balance tracking across venues, crash-safe task management, automatic capital
-recovery, operational observability, and production-grade wallet signing. The
-subsections below break each area down.
+Manual rebalancing cannot keep up with liquidity demand. Auto-rebalancing is essential, but it already stalls after a
+few cycles in testing - capital gets stuck mid-flight and requires manual recovery. Going live requires granular balance
+tracking across venues, crash-safe task management, automatic capital recovery, operational observability, and
+production-grade wallet signing. The subsections below break each area down.
 
 ### Current focus
 
@@ -24,16 +22,14 @@ subsections below break each area down.
 #### Ready to pick up
 
 - [#427]: Track tokenization requests and set in-flight balance
-- [#429], [#430], [#431], [#432]: In-flight balance polling (Ethereum, Base,
-  tSTOCKs, wtSTOCKs)
+- [#429], [#430], [#431], [#432]: In-flight balance polling (Ethereum, Base, tSTOCKs, wtSTOCKs)
 - After [#296] lands, [#423] (inventory polling) becomes unblocked too
 
 <br>
 
 > 🔵 in progress | 🟣 in review | 🔴 blocked | 🟡 ready to start | 🟢 done
 >
-> Rectangles are issues. Rounded boxes are prerequisites from other tracks or
-> goals that completing the issues achieves.
+> Rectangles are issues. Rounded boxes are prerequisites from other tracks or goals that completing the issues achieves.
 
 ```mermaid
 graph LR
@@ -63,10 +59,9 @@ graph LR
 
 ### Granular balance tracking
 
-Add balance checks for every in-flight location, then wire them into the
-snapshot polling loop. Four of five checks can start immediately ([#429],
-[#430], [#431], [#432]). [#428] is blocked — `AlpacaWalletService` lacks a
-crypto position/balance query and needs a new Alpaca API integration first.
+Add balance checks for every in-flight location, then wire them into the snapshot polling loop. Four of five checks can
+start immediately ([#429], [#430], [#431], [#432]). [#428] is blocked — `AlpacaWalletService` lacks a crypto
+position/balance query and needs a new Alpaca API integration first.
 
 ```mermaid
 graph LR
@@ -110,11 +105,10 @@ graph LR
 
 ### Reliable task management
 
-Migrate to apalis, convert the two essential job families (order lifecycle and
-inventory/rebalancing), then unify recovery dispatch so recovery jobs use the
-same pipeline as standard transfers. Position checker and startup/maintenance
-conversions are deferred to the monitoring and optimization epic -- they
-self-heal on the next poll cycle and aren't blocking go-live.
+Migrate to apalis, convert the two essential job families (order lifecycle and inventory/rebalancing), then unify
+recovery dispatch so recovery jobs use the same pipeline as standard transfers. Position checker and startup/maintenance
+conversions are deferred to the monitoring and optimization epic -- they self-heal on the next poll cycle and aren't
+blocking go-live.
 
 ```mermaid
 graph TD
@@ -137,11 +131,9 @@ graph TD
 ```
 
 - [ ] [#296 Set up apalis + task-supervisor infrastructure and convert event processing pipeline](https://github.com/ST0x-Technology/st0x.liquidity/issues/296)
-  - PR:
-    [#414 upgrade orchestration](https://github.com/ST0x-Technology/st0x.liquidity/pull/414)
+  - PR: [#414 upgrade orchestration](https://github.com/ST0x-Technology/st0x.liquidity/pull/414)
 - [ ] [#421 Convert order lifecycle to apalis jobs](https://github.com/ST0x-Technology/st0x.liquidity/issues/421)
-  - PR:
-    [#454 supervised order polling](https://github.com/ST0x-Technology/st0x.liquidity/pull/454)
+  - PR: [#454 supervised order polling](https://github.com/ST0x-Technology/st0x.liquidity/pull/454)
 - [ ] [#423 Convert inventory polling and rebalancing to apalis jobs](https://github.com/ST0x-Technology/st0x.liquidity/issues/423)
 - [ ] [#425 Unify USDC recovery dispatch with standard transfer lifecycle](https://github.com/ST0x-Technology/st0x.liquidity/issues/425)
 - [ ] [#452 Unify equity recovery dispatch with standard transfer lifecycle](https://github.com/ST0x-Technology/st0x.liquidity/issues/452)
@@ -170,19 +162,16 @@ graph TD
 ```
 
 - [x] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
-  - PR:
-    [#390 add turnkey support to st0x-evm](https://github.com/ST0x-Technology/st0x.liquidity/pull/390)
+  - PR: [#390 add turnkey support to st0x-evm](https://github.com/ST0x-Technology/st0x.liquidity/pull/390)
 - [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
-  - PR:
-    [#394 wallet selection on hedge bot](https://github.com/ST0x-Technology/st0x.liquidity/pull/394)
+  - PR: [#394 wallet selection on hedge bot](https://github.com/ST0x-Technology/st0x.liquidity/pull/394)
 - [ ] [#434 Use Turnkey for all onchain operations](https://github.com/ST0x-Technology/st0x.liquidity/issues/434)
 
 <br>
 
 ### Operational observability
 
-Build out dashboard panels until the system is observable end-to-end. Backend
-and frontend are parallel after DTOs.
+Build out dashboard panels until the system is observable end-to-end. Backend and frontend are parallel after DTOs.
 
 ```mermaid
 graph TD
@@ -208,38 +197,31 @@ graph TD
   - PR:
     [#382 update DTO types for inventory snapshots and transfer status](https://github.com/ST0x-Technology/st0x.liquidity/pull/382)
 - [ ] [#377 Dashboard backend: serve inventory history and transfer status via WebSocket](https://github.com/ST0x-Technology/st0x.liquidity/issues/377)
-  - PR:
-    [#393 dashboard backend](https://github.com/ST0x-Technology/st0x.liquidity/pull/393)
+  - PR: [#393 dashboard backend](https://github.com/ST0x-Technology/st0x.liquidity/pull/393)
 - [ ] [#378 Dashboard frontend: inventory and transfer status panels](https://github.com/ST0x-Technology/st0x.liquidity/issues/378)
-  - PR:
-    [#392 inventory frontend](https://github.com/ST0x-Technology/st0x.liquidity/pull/392)
+  - PR: [#392 inventory frontend](https://github.com/ST0x-Technology/st0x.liquidity/pull/392)
 - [ ] [#181 Dashboard: Trade History Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/181)
 
 <br>
 
 ### Automatic capital recovery
 
-Recovery needs to know where capital is stuck (from detection) and how to resume
-stalled transfers (from tracking). Two shared prerequisites feed both USDC and
-equity streams:
+Recovery needs to know where capital is stuck (from detection) and how to resume stalled transfers (from tracking). Two
+shared prerequisites feed both USDC and equity streams:
 
-- **[#449]** stores aggregate IDs alongside inflight balances so recovery can
-  `Store::load(id)` and resume. **Ready to pick up - no dependencies.**
-- **[#433]** (from detection) extends the inventory snapshot so recovery knows
-  _where_ capital is stuck.
+- **[#449]** stores aggregate IDs alongside inflight balances so recovery can `Store::load(id)` and resume. **Ready to
+  pick up - no dependencies.**
+- **[#433]** (from detection) extends the inventory snapshot so recovery knows _where_ capital is stuck.
 
-Each stream then has its own dispatch and per-venue recovery. [#442] converges
-everything.
+Each stream then has its own dispatch and per-venue recovery. [#442] converges everything.
 
 - [ ] [#449 Track active transfer aggregate IDs in inventory view](https://github.com/ST0x-Technology/st0x.liquidity/issues/449)
-  - PR:
-    [#457 track active transfer aggregate IDs](https://github.com/ST0x-Technology/st0x.liquidity/pull/457)
+  - PR: [#457 track active transfer aggregate IDs](https://github.com/ST0x-Technology/st0x.liquidity/pull/457)
 
 #### USDC recovery
 
-Three venues hold USDC in flight: Alpaca crypto wallet, Ethereum, and Base. Each
-gets a parallel recovery implementation. [#425] (from crash-safe) provides the
-dispatch mechanism. [#441] gates go-live.
+Three venues hold USDC in flight: Alpaca crypto wallet, Ethereum, and Base. Each gets a parallel recovery
+implementation. [#425] (from crash-safe) provides the dispatch mechanism. [#441] gates go-live.
 
 ```mermaid
 graph TD
@@ -269,9 +251,8 @@ graph TD
 
 #### Equity recovery
 
-Equity recovery additionally needs [#427] (tokenization tracking) and [#452]
-(equity dispatch from crash-safe). Two venues: wrapped and unwrapped tokens on
-Base. [#442] converges USDC and equity recovery.
+Equity recovery additionally needs [#427] (tokenization tracking) and [#452] (equity dispatch from crash-safe). Two
+venues: wrapped and unwrapped tokens on Base. [#442] converges USDC and equity recovery.
 
 ```mermaid
 graph TD
@@ -300,9 +281,8 @@ graph TD
 
 ### Safely go live
 
-Each step verifies a larger slice of the system works. USDC rebalancing and
-single-equity rebalancing can be tested in parallel. Both must be stable before
-multi-equity stability testing, then go live.
+Each step verifies a larger slice of the system works. USDC rebalancing and single-equity rebalancing can be tested in
+parallel. Both must be stable before multi-equity stability testing, then go live.
 
 ```mermaid
 graph TD
@@ -333,8 +313,7 @@ graph TD
 
 - [x] [#453 Live bidirectional equity auto-rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/issues/453)
 - [ ] [#407 Untouchable cash reserve for rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/issues/407)
-  - PR:
-    [#458 untouchable cash reserve](https://github.com/ST0x-Technology/st0x.liquidity/pull/458)
+  - PR: [#458 untouchable cash reserve](https://github.com/ST0x-Technology/st0x.liquidity/pull/458)
 - [ ] [#443 See end-to-end USDC auto rebalancing in both directions](https://github.com/ST0x-Technology/st0x.liquidity/issues/443)
 - [ ] [#444 See repeated USDC auto rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/issues/444)
 - [ ] [#445 See repeated single-equity auto rebalancing with counter trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/445)
@@ -349,11 +328,10 @@ graph TD
 
 ## Harden production
 
-Once auto-rebalancing is live, priority shifts to making the deployment robust
-and observable. The system runs on a remote server handling real capital --
-securing access, encrypting traffic, and having visibility into what's happening
-are prerequisites for operating with confidence. The quant researcher also needs
-execution data and monitoring tools to analyze and optimize trading parameters.
+Once auto-rebalancing is live, priority shifts to making the deployment robust and observable. The system runs on a
+remote server handling real capital -- securing access, encrypting traffic, and having visibility into what's happening
+are prerequisites for operating with confidence. The quant researcher also needs execution data and monitoring tools to
+analyze and optimize trading parameters.
 
 ### Infrastructure security
 
@@ -370,16 +348,16 @@ execution data and monitoring tools to analyze and optimize trading parameters.
 
 ### Remaining job conversions
 
-De-scoped from go-live because they self-heal on the next cycle. Converting to
-apalis improves reliability and gives better observability into job health.
+De-scoped from go-live because they self-heal on the next cycle. Converting to apalis improves reliability and gives
+better observability into job health.
 
 - [ ] [#422 Convert position checker to apalis job](https://github.com/ST0x-Technology/st0x.liquidity/issues/422)
 - [ ] [#424 Convert startup operations and executor maintenance to apalis jobs and supervised tasks](https://github.com/ST0x-Technology/st0x.liquidity/issues/424)
 
 ### Quant research data
 
-Ensure the event store captures all data needed for quantitative research --
-execution timing, market conditions, and operational metrics.
+Ensure the event store captures all data needed for quantitative research -- execution timing, market conditions, and
+operational metrics.
 
 - [ ] [#303 Audit external integrations: record start/end timestamps for all calls in event store](https://github.com/ST0x-Technology/st0x.liquidity/issues/303)
 
@@ -426,8 +404,7 @@ Everything below has not been organized into epics yet.
 
 ### Architecture & code quality
 
-Split monolith into focused crates for faster builds, stricter abstraction
-boundaries, and reduced coupling.
+Split monolith into focused crates for faster builds, stricter abstraction boundaries, and reduced coupling.
 
 - [ ] [#54 Create BrokerAuthProvider trait to abstract authentication across codebase](https://github.com/ST0x-Technology/st0x.liquidity/issues/54)
 - [ ] [#269 Extract st0x-tokenization crate with Tokenizer trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/269)
@@ -445,21 +422,16 @@ boundaries, and reduced coupling.
 ### Completed: Alpaca / trading fixes
 
 - [x] [#105 Run the Alpaca instance without whole share accumulation](https://github.com/ST0x-Technology/st0x.liquidity/issues/105)
-  - Resolved by
-    [#236](https://github.com/ST0x-Technology/st0x.liquidity/pull/236)
-    (dollar-threshold counter trades)
+  - Resolved by [#236](https://github.com/ST0x-Technology/st0x.liquidity/pull/236) (dollar-threshold counter trades)
 - [x] [#258 BUG: Alpaca Broker API should be expected with rebalancing enabled, not Alpaca Trading API](https://github.com/ST0x-Technology/st0x.liquidity/issues/258)
-  - PR:
-    [#257 Fix rebalancing not triggered](https://github.com/ST0x-Technology/st0x.liquidity/pull/257)
+  - PR: [#257 Fix rebalancing not triggered](https://github.com/ST0x-Technology/st0x.liquidity/pull/257)
 - [x] [#282 USDC inventory not updated from Position events (Buy/Sell trades)](https://github.com/ST0x-Technology/st0x.liquidity/issues/282)
   - PR:
     [#336 Track USDC inventory updates alongside equity fills](https://github.com/ST0x-Technology/st0x.liquidity/pull/336)
 - [x] [#283 USDC rebalancing trigger doesn't fire after USDC inventory changes](https://github.com/ST0x-Technology/st0x.liquidity/issues/283)
-  - PR:
-    [#348 Add USDC rebalancing trigger](https://github.com/ST0x-Technology/st0x.liquidity/pull/348)
+  - PR: [#348 Add USDC rebalancing trigger](https://github.com/ST0x-Technology/st0x.liquidity/pull/348)
 - [x] [#284 Equity mint completion trusts Alpaca API without onchain verification](https://github.com/ST0x-Technology/st0x.liquidity/issues/284)
-  - PR:
-    [#350 Verify equity mints on-chain](https://github.com/ST0x-Technology/st0x.liquidity/pull/350)
+  - PR: [#350 Verify equity mints on-chain](https://github.com/ST0x-Technology/st0x.liquidity/pull/350)
 
 ### Completed: CI/CD Improvements
 
@@ -470,25 +442,19 @@ boundaries, and reduced coupling.
 ### Completed: Production Fixes (Jan 2026)
 
 - [x] [#251 Manual operations on trading venues not detected by inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/issues/251)
-  - PR:
-    [#253 Fix inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/253)
+  - PR: [#253 Fix inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/253)
 - [x] [#234 Spec out infrastructure and deployment improvements](https://github.com/ST0x-Technology/st0x.liquidity/issues/234)
-  - PR:
-    [#237 Propose better deployment and infra setup](https://github.com/ST0x-Technology/st0x.liquidity/pull/237)
-- PR:
-  [#266 Fix cqrs inventory management](https://github.com/ST0x-Technology/st0x.liquidity/pull/266)
+  - PR: [#237 Propose better deployment and infra setup](https://github.com/ST0x-Technology/st0x.liquidity/pull/237)
+- PR: [#266 Fix cqrs inventory management](https://github.com/ST0x-Technology/st0x.liquidity/pull/266)
 
 ### Completed: Alpaca Production Go-Live
 
 - [x] [#223 Auto-rebalancing flow missing USDC/USD conversion step](https://github.com/ST0x-Technology/st0x.liquidity/issues/223)
-  - PR:
-    [#227 usdc-usd conversion during auto-rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/pull/227)
+  - PR: [#227 usdc-usd conversion during auto-rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/pull/227)
 - [x] [#228 Set up Alpaca instance for real trading in production](https://github.com/ST0x-Technology/st0x.liquidity/issues/228)
-  - PR:
-    [#230 set up alpaca deployment configurations](https://github.com/ST0x-Technology/st0x.liquidity/pull/230)
+  - PR: [#230 set up alpaca deployment configurations](https://github.com/ST0x-Technology/st0x.liquidity/pull/230)
 - [x] [#229 Set up dashboard deployment](https://github.com/ST0x-Technology/st0x.liquidity/issues/229)
-  - PR:
-    [#230 set up alpaca deployment configurations](https://github.com/ST0x-Technology/st0x.liquidity/pull/230)
+  - PR: [#230 set up alpaca deployment configurations](https://github.com/ST0x-Technology/st0x.liquidity/pull/230)
 - [x] [#244 Implement dollar-value-based counter trade trigger to use alpaca fractional share trading feature](https://github.com/ST0x-Technology/st0x.liquidity/issues/244)
   - PR:
     [#236 implement dollar-threshold counter trade trigger condition](https://github.com/ST0x-Technology/st0x.liquidity/pull/236)
@@ -499,11 +465,9 @@ boundaries, and reduced coupling.
 ### Completed: Admin Dashboard Foundation
 
 - [x] [#188 spec out the dashboard](https://github.com/ST0x-Technology/st0x.liquidity/issues/188)
-  - PR:
-    [#203 Admin Dashboard specification and roadmap](https://github.com/ST0x-Technology/st0x.liquidity/pull/203)
+  - PR: [#203 Admin Dashboard specification and roadmap](https://github.com/ST0x-Technology/st0x.liquidity/pull/203)
 - [x] [#207 Initialize WS backend for the dashboard](https://github.com/ST0x-Technology/st0x.liquidity/issues/207)
-  - PR:
-    [#204 Add dashboard backend API](https://github.com/ST0x-Technology/st0x.liquidity/pull/204)
+  - PR: [#204 Add dashboard backend API](https://github.com/ST0x-Technology/st0x.liquidity/pull/204)
 - [x] [#208 Initialize Svelte frontend with shadcn](https://github.com/ST0x-Technology/st0x.liquidity/issues/208)
   - PR:
     [#221 init dashboard frontend with SvelteKit and shadcn-svelte](https://github.com/ST0x-Technology/st0x.liquidity/pull/221)
@@ -513,33 +477,26 @@ boundaries, and reduced coupling.
 
 ### Completed: CQRS/ES Migration with Automated Rebalancing
 
-Migrated to event-sourced architecture through 3 phases. Automated rebalancing
-implemented as first major feature on new architecture (Alpaca-only, Schwab
-remains manual).
+Migrated to event-sourced architecture through 3 phases. Automated rebalancing implemented as first major feature on new
+architecture (Alpaca-only, Schwab remains manual).
 
 #### Phase 1: Dual-Write Foundation (Shadow Mode)
 
 - [x] [#124 Add CQRS/ES migration specification to SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/issues/124)
-  - PR:
-    [#145 Phased CQRS/ES migration specification](https://github.com/ST0x-Technology/st0x.liquidity/pull/145)
+  - PR: [#145 Phased CQRS/ES migration specification](https://github.com/ST0x-Technology/st0x.liquidity/pull/145)
 - [x] [#125 Implement event sourcing infrastructure with SchwabAuth aggregate](https://github.com/ST0x-Technology/st0x.liquidity/issues/125)
   - PR:
     [#146 Event sourcing infrastructure and SchwabAuth aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/146)
 - [x] [#126 Implement OnChainTrade aggregate](https://github.com/ST0x-Technology/st0x.liquidity/issues/126)
-  - PR:
-    [#160 onchain trade aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/160)
+  - PR: [#160 onchain trade aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/160)
 - [x] [#127 Implement Position aggregate](https://github.com/ST0x-Technology/st0x.liquidity/issues/127)
-  - PR:
-    [#148 Position aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/148)
+  - PR: [#148 Position aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/148)
 - [x] [#128 Implement OffchainOrder aggregate](https://github.com/ST0x-Technology/st0x.liquidity/issues/128)
-  - PR:
-    [#149 OffchainOrder aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/149)
+  - PR: [#149 OffchainOrder aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/149)
 - [x] [#129 Implement data migration binary for existing CRUD data](https://github.com/ST0x-Technology/st0x.liquidity/issues/129)
-  - PR:
-    [#150 Add existing data to the event store](https://github.com/ST0x-Technology/st0x.liquidity/pull/150)
+  - PR: [#150 Add existing data to the event store](https://github.com/ST0x-Technology/st0x.liquidity/pull/150)
 - [x] [#130 Implement dual-write in Conductor](https://github.com/ST0x-Technology/st0x.liquidity/issues/130)
-  - PR:
-    [#158 implement dual-write for CQRS/ES aggregates](https://github.com/ST0x-Technology/st0x.liquidity/pull/158)
+  - PR: [#158 implement dual-write for CQRS/ES aggregates](https://github.com/ST0x-Technology/st0x.liquidity/pull/158)
 - [x] [#169 Lifecycle wrapper for event-sourced aggregates](https://github.com/ST0x-Technology/st0x.liquidity/issues/169)
   - PR:
     [#168 Lifecycle wrapper for event-sourced aggregates](https://github.com/ST0x-Technology/st0x.liquidity/pull/168)
@@ -547,8 +504,7 @@ remains manual).
 #### Phase 2: Automated Rebalancing (Alpaca-Only)
 
 - [x] [#132 Implement Alpaca crypto wallet service](https://github.com/ST0x-Technology/st0x.liquidity/issues/132)
-  - PR:
-    [#151 Implement Alpaca crypto wallet service](https://github.com/ST0x-Technology/st0x.liquidity/pull/151)
+  - PR: [#151 Implement Alpaca crypto wallet service](https://github.com/ST0x-Technology/st0x.liquidity/pull/151)
 - [x] [#133 Implement Circle CCTP bridge service](https://github.com/ST0x-Technology/st0x.liquidity/issues/133)
   - PR:
     [#156 Add Circle CCTP bridge service for cross-chain USDC transfers](https://github.com/ST0x-Technology/st0x.liquidity/pull/156)
@@ -559,26 +515,20 @@ remains manual).
   - PR:
     [#170 Tokenized equity mint and redemption aggregates](https://github.com/ST0x-Technology/st0x.liquidity/pull/170)
 - [x] [#136 Implement UsdcRebalance aggregate](https://github.com/ST0x-Technology/st0x.liquidity/issues/136)
-  - PR:
-    [#159 UsdcRebalance aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/159)
+  - PR: [#159 UsdcRebalance aggregate](https://github.com/ST0x-Technology/st0x.liquidity/pull/159)
 - [x] [#171 Implement Alpaca tokenization API client](https://github.com/ST0x-Technology/st0x.liquidity/issues/171)
-  - PR:
-    [#172 Implement Alpaca tokenization API client](https://github.com/ST0x-Technology/st0x.liquidity/pull/172)
+  - PR: [#172 Implement Alpaca tokenization API client](https://github.com/ST0x-Technology/st0x.liquidity/pull/172)
 - [x] [#137 Implement rebalancing orchestration](https://github.com/ST0x-Technology/st0x.liquidity/issues/137)
-  - PR:
-    [#173 Implement rebalancing orchestration managers](https://github.com/ST0x-Technology/st0x.liquidity/pull/173)
+  - PR: [#173 Implement rebalancing orchestration managers](https://github.com/ST0x-Technology/st0x.liquidity/pull/173)
 - [x] [#138 Implement InventoryView and imbalance detection](https://github.com/ST0x-Technology/st0x.liquidity/issues/138)
   - PR:
     [#174 Implement InventoryView and imbalance detection](https://github.com/ST0x-Technology/st0x.liquidity/pull/174)
 - [x] [#139 Wire up rebalancing triggers from inventory events](https://github.com/ST0x-Technology/st0x.liquidity/issues/139)
-  - PR:
-    [#175 Wire up rebalancing triggers](https://github.com/ST0x-Technology/st0x.liquidity/pull/175)
+  - PR: [#175 Wire up rebalancing triggers](https://github.com/ST0x-Technology/st0x.liquidity/pull/175)
 - [x] [#120 Migrate to V5 orderbook](https://github.com/ST0x-Technology/st0x.liquidity/issues/120)
-  - PR:
-    [#154 Upgrade to V5 orderbook](https://github.com/ST0x-Technology/st0x.liquidity/pull/154)
+  - PR: [#154 Upgrade to V5 orderbook](https://github.com/ST0x-Technology/st0x.liquidity/pull/154)
 - [x] [#224 Manual rebalancing CLI commands](https://github.com/ST0x-Technology/st0x.liquidity/issues/224)
-  - PR:
-    [#190 manual rebalancing CLI](https://github.com/ST0x-Technology/st0x.liquidity/pull/190)
+  - PR: [#190 manual rebalancing CLI](https://github.com/ST0x-Technology/st0x.liquidity/pull/190)
 
 ### Completed: Multi-Crate Architecture Phase 1
 
@@ -589,8 +539,7 @@ remains manual).
   - PR:
     [#222 decouple VaultService from Evm, remove signer type parameter](https://github.com/ST0x-Technology/st0x.liquidity/pull/222)
 - [x] [#268 Extract st0x-bridge crate with Bridge trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/268)
-  - PR:
-    [#193 Pull out bridging logic into st0x-bridge](https://github.com/ST0x-Technology/st0x.liquidity/pull/193)
+  - PR: [#193 Pull out bridging logic into st0x-bridge](https://github.com/ST0x-Technology/st0x.liquidity/pull/193)
 
 ### Completed: Bug Fixes
 
@@ -601,17 +550,13 @@ remains manual).
   - PR:
     [#252 fix successful orders getting marked as failed](https://github.com/ST0x-Technology/st0x.liquidity/pull/252)
 - [x] [#245 Counter trades use whole shares instead of fractional shares](https://github.com/ST0x-Technology/st0x.liquidity/issues/245)
-  - PR:
-    [#246 Fix fractional counter trades](https://github.com/ST0x-Technology/st0x.liquidity/pull/246)
+  - PR: [#246 Fix fractional counter trades](https://github.com/ST0x-Technology/st0x.liquidity/pull/246)
 - [x] [#243 Intermittent RPC failures with load-balanced providers](https://github.com/ST0x-Technology/st0x.liquidity/issues/243)
-  - PR:
-    [#242 improve onchain ops reliability](https://github.com/ST0x-Technology/st0x.liquidity/pull/242)
+  - PR: [#242 improve onchain ops reliability](https://github.com/ST0x-Technology/st0x.liquidity/pull/242)
 - [x] [#238 CCTP fee API returns float for minimum_fee, deserialization fails](https://github.com/ST0x-Technology/st0x.liquidity/issues/238)
-  - PR:
-    [#239 fix fee/slippage handling during rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/pull/239)
+  - PR: [#239 fix fee/slippage handling during rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/pull/239)
 - [x] [#231 Alpaca Broker API market hours check fails with response decoding error](https://github.com/ST0x-Technology/st0x.liquidity/issues/231)
-  - PR:
-    [#232 Fix market hours decoding](https://github.com/ST0x-Technology/st0x.liquidity/pull/232)
+  - PR: [#232 Fix market hours decoding](https://github.com/ST0x-Technology/st0x.liquidity/pull/232)
 - [x] [#220 Dual-write consistency bugs in offchain order handling](https://github.com/ST0x-Technology/st0x.liquidity/issues/220)
   - PR:
     [#219 Fix dual-write consistency bugs in offchain order handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/219)
@@ -622,20 +567,16 @@ remains manual).
   - PR:
     [#215 Add fallback to tx receipt when get_logs returns incomplete data](https://github.com/ST0x-Technology/st0x.liquidity/pull/215)
 - [x] [#214 Fix denormalized net position column](https://github.com/ST0x-Technology/st0x.liquidity/issues/214)
-  - PR:
-    [#213 Fix net position tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/213)
+  - PR: [#213 Fix net position tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/213)
 - [x] [#211 Schwab orders stuck in PENDING status](https://github.com/ST0x-Technology/st0x.liquidity/issues/211)
   - PR:
     [#210 Fix legacy table not updating from PENDING to SUBMITTED](https://github.com/ST0x-Technology/st0x.liquidity/pull/210)
 - [x] [#167 tSPLG hedging as SPYM](https://github.com/ST0x-Technology/st0x.liquidity/issues/167)
-  - PR:
-    [#166 splg symbol](https://github.com/ST0x-Technology/st0x.liquidity/pull/166)
+  - PR: [#166 splg symbol](https://github.com/ST0x-Technology/st0x.liquidity/pull/166)
 - [x] [#164 Fix take order inputs and outputs](https://github.com/ST0x-Technology/st0x.liquidity/issues/164)
-  - PR:
-    [#163 fix take order IO handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/163)
+  - PR: [#163 fix take order IO handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/163)
 - [x] [#162 Fix rain-math-float deployment bug](https://github.com/ST0x-Technology/st0x.liquidity/issues/162)
-  - PR:
-    [#161 fix deployment](https://github.com/ST0x-Technology/st0x.liquidity/pull/161)
+  - PR: [#161 fix deployment](https://github.com/ST0x-Technology/st0x.liquidity/pull/161)
 - [x] [#119 Bot stuck in infinite retry loop due to stale PENDING execution](https://github.com/ST0x-Technology/st0x.liquidity/issues/119)
   - PR:
     [#118 Fix: Clean up stale PENDING executions to prevent infinite retry loops](https://github.com/ST0x-Technology/st0x.liquidity/pull/118)
@@ -643,55 +584,41 @@ remains manual).
 ### Completed: Multi-Broker Support
 
 - [x] [#60 Create a complete abstraction for Broker](https://github.com/ST0x-Technology/st0x.liquidity/issues/60)
-  - PR:
-    [#72 broker trait](https://github.com/ST0x-Technology/st0x.liquidity/pull/72)
+  - PR: [#72 broker trait](https://github.com/ST0x-Technology/st0x.liquidity/pull/72)
 - [x] [#76 Integrate Alpaca](https://github.com/ST0x-Technology/st0x.liquidity/issues/76)
-  - PR:
-    [#83 Feat/alpaca](https://github.com/ST0x-Technology/st0x.liquidity/pull/83)
+  - PR: [#83 Feat/alpaca](https://github.com/ST0x-Technology/st0x.liquidity/pull/83)
 - [x] [#192 Add Alpaca Broker API executor](https://github.com/ST0x-Technology/st0x.liquidity/issues/192)
-  - PR:
-    [#191 Trading via Alpaca Broker API](https://github.com/ST0x-Technology/st0x.liquidity/pull/191)
+  - PR: [#191 Trading via Alpaca Broker API](https://github.com/ST0x-Technology/st0x.liquidity/pull/191)
 
 ### Completed: Performance Monitoring & Profitability Analysis
 
 - [x] [#91 Track onchain Pyth prices](https://github.com/ST0x-Technology/st0x.liquidity/issues/91)
-  - PR:
-    [#84 Pyth prices](https://github.com/ST0x-Technology/st0x.liquidity/pull/84)
+  - PR: [#84 Pyth prices](https://github.com/ST0x-Technology/st0x.liquidity/pull/84)
 - [x] [#48 Calculate and save P&L for each Schwab trade](https://github.com/ST0x-Technology/st0x.liquidity/issues/48)
-  - PR:
-    [#90 Reporter service with P&L calculations](https://github.com/ST0x-Technology/st0x.liquidity/pull/90)
+  - PR: [#90 Reporter service with P&L calculations](https://github.com/ST0x-Technology/st0x.liquidity/pull/90)
 - [x] [#75 Track onchain gas fees](https://github.com/ST0x-Technology/st0x.liquidity/issues/75)
-  - PR:
-    [#82 gas fee tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/82)
+  - PR: [#82 gas fee tracking](https://github.com/ST0x-Technology/st0x.liquidity/pull/82)
 - [x] [#79 track block timestamps](https://github.com/ST0x-Technology/st0x.liquidity/issues/79)
-  - PR:
-    [#80 Add block timestamp field](https://github.com/ST0x-Technology/st0x.liquidity/pull/80)
+  - PR: [#80 Add block timestamp field](https://github.com/ST0x-Technology/st0x.liquidity/pull/80)
 - [x] [#81 Fix block timestamp collection](https://github.com/ST0x-Technology/st0x.liquidity/issues/81)
-  - PR:
-    [#100 Fix block timestamp collection](https://github.com/ST0x-Technology/st0x.liquidity/pull/100)
+  - PR: [#100 Fix block timestamp collection](https://github.com/ST0x-Technology/st0x.liquidity/pull/100)
 - [x] [#9 Implement performance reporting process](https://github.com/ST0x-Technology/st0x.liquidity/issues/9)
-  - PR:
-    [#90 Reporter service with P&L calculations](https://github.com/ST0x-Technology/st0x.liquidity/pull/90)
+  - PR: [#90 Reporter service with P&L calculations](https://github.com/ST0x-Technology/st0x.liquidity/pull/90)
 - [x] [#6 Integrate HyperDX](https://github.com/ST0x-Technology/st0x.liquidity/issues/6)
-  - PR:
-    [#101 hyperdx](https://github.com/ST0x-Technology/st0x.liquidity/pull/101)
+  - PR: [#101 hyperdx](https://github.com/ST0x-Technology/st0x.liquidity/pull/101)
 - [x] [#88 store schwab db tokens in encrypted format](https://github.com/ST0x-Technology/st0x.liquidity/issues/88)
-  - PR:
-    [#98 Fix/tokencryption](https://github.com/ST0x-Technology/st0x.liquidity/pull/98)
+  - PR: [#98 Fix/tokencryption](https://github.com/ST0x-Technology/st0x.liquidity/pull/98)
 
 ### Completed: Deployment & Infrastructure
 
 - [x] [#11 Set up automated deployment](https://github.com/ST0x-Technology/st0x.liquidity/issues/11)
   - PR: [#39 CD](https://github.com/ST0x-Technology/st0x.liquidity/pull/39)
 - [x] [#106 fix two instance deployment configuration](https://github.com/ST0x-Technology/st0x.liquidity/issues/106)
-  - PR:
-    [#102 fix deployment & implement a rollback script](https://github.com/ST0x-Technology/st0x.liquidity/pull/102)
+  - PR: [#102 fix deployment & implement a rollback script](https://github.com/ST0x-Technology/st0x.liquidity/pull/102)
 - [x] [#108 fix deployment permissions](https://github.com/ST0x-Technology/st0x.liquidity/issues/108)
-  - PR:
-    [#109 simplify permissions](https://github.com/ST0x-Technology/st0x.liquidity/pull/109)
+  - PR: [#109 simplify permissions](https://github.com/ST0x-Technology/st0x.liquidity/pull/109)
 - [x] [#110 fix logging and db env vars in deployment](https://github.com/ST0x-Technology/st0x.liquidity/issues/110)
-  - PR:
-    [#111 fix logging and db env vars](https://github.com/ST0x-Technology/st0x.liquidity/pull/111)
+  - PR: [#111 fix logging and db env vars](https://github.com/ST0x-Technology/st0x.liquidity/pull/111)
 
 ### Completed: Code Quality & Documentation
 
@@ -700,11 +627,9 @@ remains manual).
 - [x] [#67 Fix market hours check for weekends/holidays](https://github.com/ST0x-Technology/st0x.liquidity/issues/67)
 - [x] [#65 Address the 100% CPU utilization issue](https://github.com/ST0x-Technology/st0x.liquidity/issues/65)
 - [x] [#58 Add dry-run mode to the bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/58)
-  - PR:
-    [#55 Dry run mode](https://github.com/ST0x-Technology/st0x.liquidity/pull/55)
+  - PR: [#55 Dry run mode](https://github.com/ST0x-Technology/st0x.liquidity/pull/55)
 - [x] [#97 Fix README and generalize AI docs](https://github.com/ST0x-Technology/st0x.liquidity/issues/97)
-  - PR:
-    [#93 AGENTS.md and update docs](https://github.com/ST0x-Technology/st0x.liquidity/pull/93)
+  - PR: [#93 AGENTS.md and update docs](https://github.com/ST0x-Technology/st0x.liquidity/pull/93)
 - [x] [#104 update ai and human docs post broker crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/104)
   - PR:
     [#103 broker crate docs and AGENTS.md downsize to fix Claude Code warning](https://github.com/ST0x-Technology/st0x.liquidity/pull/103)
@@ -714,18 +639,14 @@ remains manual).
 The core arbitrage bot functionality is now live and operational:
 
 - [x] [#3 Set up trade event stream (Clear and TakeOrder events)](https://github.com/ST0x-Technology/st0x.liquidity/issues/3)
-  - PR:
-    [#1 Trade event stream](https://github.com/ST0x-Technology/st0x.liquidity/pull/1)
+  - PR: [#1 Trade event stream](https://github.com/ST0x-Technology/st0x.liquidity/pull/1)
 - [x] [#12 Set up CI checks](https://github.com/ST0x-Technology/st0x.liquidity/issues/12)
-  - PR:
-    [#13 Set up the project](https://github.com/ST0x-Technology/st0x.liquidity/pull/13)
+  - PR: [#13 Set up the project](https://github.com/ST0x-Technology/st0x.liquidity/pull/13)
 - [x] [#14 Set up the crate with bindings and env](https://github.com/ST0x-Technology/st0x.liquidity/issues/14)
-  - PR:
-    [#13 Set up the project](https://github.com/ST0x-Technology/st0x.liquidity/pull/13)
+  - PR: [#13 Set up the project](https://github.com/ST0x-Technology/st0x.liquidity/pull/13)
 - [x] [#4 Set up SQLite and store incoming trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/4)
 - [x] [#19 Take the opposite side of the trade on Schwab](https://github.com/ST0x-Technology/st0x.liquidity/issues/19)
-  - PR:
-    [#20 Take the opposite side of the trade](https://github.com/ST0x-Technology/st0x.liquidity/pull/20)
+  - PR: [#20 Take the opposite side of the trade](https://github.com/ST0x-Technology/st0x.liquidity/pull/20)
 - [x] [#22 Create a CLI command for manually placing a Schwab trade](https://github.com/ST0x-Technology/st0x.liquidity/issues/22)
   - PR:
     [#25 Create a CLI command for manually placing a Schwab trade](https://github.com/ST0x-Technology/st0x.liquidity/pull/25)
@@ -733,8 +654,7 @@ The core arbitrage bot functionality is now live and operational:
   - PR:
     [#28 Create a CLI command for taking the opposite side of a trade](https://github.com/ST0x-Technology/st0x.liquidity/pull/28)
 - [x] [#24 Stop the bot during market close and restart on market open](https://github.com/ST0x-Technology/st0x.liquidity/issues/24)
-  - PR:
-    [#53 Only run the bot during market open hours](https://github.com/ST0x-Technology/st0x.liquidity/pull/53)
+  - PR: [#53 Only run the bot during market open hours](https://github.com/ST0x-Technology/st0x.liquidity/pull/53)
 
 ### [SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/blob/master/SPEC.md)
 
