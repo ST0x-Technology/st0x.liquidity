@@ -185,13 +185,17 @@ impl Conductor {
                 Err(error) => return Err(error.into()),
             };
 
+            let ethereum_wallet = rebalancing
+                .as_ref()
+                .map(|ctx| ctx.ethereum_wallet().clone());
+
             let (position, position_projection, snapshot, rebalancer) =
                 if let Some(rebalancing_ctx) = rebalancing {
-                    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+                    let eth_wallet = rebalancing_ctx.ethereum_wallet().clone();
                     let base_wallet = rebalancing_ctx.base_wallet().clone();
                     let infra = spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
-                        ethereum_wallet,
+                        eth_wallet,
                         base_wallet,
                         RebalancingDeps {
                             pool: pool.clone(),
@@ -248,6 +252,10 @@ impl Conductor {
             )
             .with_executor_maintenance(executor_maintenance)
             .with_dex_event_streams(clear_stream, take_stream);
+
+            if let Some(wallet) = ethereum_wallet {
+                builder = builder.with_ethereum_wallet(wallet);
+            }
 
             if let Some(rebalancer_handle) = rebalancer {
                 builder = builder.with_rebalancer(rebalancer_handle);
@@ -705,12 +713,7 @@ where
 }
 
 fn spawn_inventory_poller<Chain, Exe>(
-    raindex_service: Arc<RaindexService<Chain>>,
-    executor: Exe,
-    vault_registry: Arc<Store<VaultRegistry>>,
-    orderbook: Address,
-    order_owner: Address,
-    snapshot: Arc<Store<InventorySnapshot>>,
+    service: InventoryPollingService<Chain, Exe>,
     poll_interval: std::time::Duration,
 ) -> JoinHandle<()>
 where
@@ -718,15 +721,6 @@ where
     Exe: Executor + Clone + Send + 'static,
 {
     info!("Starting inventory poller");
-
-    let service = InventoryPollingService::new(
-        raindex_service,
-        executor,
-        vault_registry,
-        orderbook,
-        order_owner,
-        snapshot,
-    );
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
