@@ -15,6 +15,7 @@ use apalis_sqlite::fetcher::SqliteFetcher;
 use apalis_sqlite::{CompactType, SqliteStorage};
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{error, info, trace};
 use url::Url;
@@ -49,14 +50,21 @@ pub(crate) struct OrderFillMonitor {
     ws_url: Url,
     orderbook: Address,
     storage: OrderFillJobQueue,
+    pool: SqlitePool,
 }
 
 impl OrderFillMonitor {
-    pub(crate) fn new(ws_url: Url, orderbook: Address, storage: OrderFillJobQueue) -> Self {
+    pub(crate) fn new(
+        ws_url: Url,
+        orderbook: Address,
+        storage: OrderFillJobQueue,
+        pool: SqlitePool,
+    ) -> Self {
         Self {
             ws_url,
             orderbook,
             storage,
+            pool,
         }
     }
 }
@@ -123,9 +131,30 @@ impl OrderFillMonitor {
             }
         };
 
+        let tx_hash = format!("{:?}", queued_event.tx_hash);
+        let log_index = queued_event.log_index as i64;
+
+        let rows_affected = sqlx::query(
+            "INSERT OR IGNORE INTO order_fill_job_dedup (tx_hash, log_index) VALUES (?, ?)",
+        )
+        .bind(&tx_hash)
+        .bind(log_index)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            trace!(
+                tx_hash = %tx_hash,
+                log_index,
+                "Skipping duplicate order fill event"
+            );
+            return Ok(());
+        }
+
         trace!(
-            tx_hash = ?queued_event.tx_hash,
-            log_index = queued_event.log_index,
+            tx_hash = %tx_hash,
+            log_index,
             "Pushing order fill job into apalis storage"
         );
 
@@ -162,6 +191,7 @@ mod tests {
             ws_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: Address::ZERO,
             storage,
+            pool: pool.clone(),
         };
 
         (monitor, pool)
@@ -288,5 +318,27 @@ mod tests {
         let _result = monitor.listen(clear_stream, take_stream).await;
 
         assert_eq!(job_count(&pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn enqueue_trade_event_deduplicates_same_tx_hash_and_log_index() {
+        let (mut monitor, pool) = create_test_monitor_with_pool().await;
+        let log = create_log(42);
+
+        monitor
+            .enqueue_trade_event(TradeEvent::ClearV3(Box::new(test_clear_event())), &log)
+            .await
+            .unwrap();
+
+        monitor
+            .enqueue_trade_event(TradeEvent::TakeOrderV3(Box::new(test_take_event())), &log)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            job_count(&pool).await,
+            1,
+            "Second event with same (tx_hash, log_index) must be skipped"
+        );
     }
 }
