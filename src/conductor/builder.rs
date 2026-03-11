@@ -1,6 +1,6 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
-use alloy::providers::{Provider, RootProvider};
+use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_event_sorcery::{Projection, Store};
-use st0x_evm::{ReadOnlyEvm, Wallet};
+use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
 use super::{
@@ -21,7 +21,7 @@ use super::{
 };
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::{InventoryPollingService, InventorySnapshot};
+use crate::inventory::{BaseWalletPollingConfig, InventoryPollingService, InventorySnapshot};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
@@ -69,7 +69,7 @@ pub(crate) struct WithDexStreams {
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
-    base_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
+    base_wallet: Option<BaseWalletPollingConfig>,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -159,11 +159,8 @@ where
         self
     }
 
-    pub(crate) fn with_base_wallet(
-        mut self,
-        wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    ) -> Self {
-        self.state.base_wallet = Some(wallet);
+    pub(crate) fn with_base_wallet(mut self, config: BaseWalletPollingConfig) -> Self {
+        self.state.base_wallet = Some(config);
         self
     }
 

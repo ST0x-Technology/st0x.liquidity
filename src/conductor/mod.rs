@@ -32,7 +32,9 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
+use crate::inventory::{
+    BaseWalletPollingConfig, InventoryPollingService, InventorySnapshot, InventoryView,
+};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -256,7 +258,17 @@ impl Conductor {
             }
 
             if let Some(wallet) = base_wallet_for_polling {
-                builder = builder.with_base_wallet(wallet);
+                let equity_token_addresses = ctx
+                    .assets
+                    .equities
+                    .symbols
+                    .iter()
+                    .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
+                    .collect();
+                builder = builder.with_base_wallet(BaseWalletPollingConfig {
+                    wallet,
+                    equity_token_addresses,
+                });
             }
 
             Ok(builder.spawn())
