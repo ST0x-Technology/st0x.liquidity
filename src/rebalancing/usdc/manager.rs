@@ -828,7 +828,7 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
 }
 
 /// Converts a U256 amount (with 6 decimals) to USDC decimal.
-fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
+pub(crate) fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
     let amount_u128: u128 = amount.try_into()?;
     let decimal = Decimal::from(amount_u128) / Decimal::from(1_000_000u64);
     Ok(Usdc(decimal))

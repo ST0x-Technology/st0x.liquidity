@@ -23,7 +23,7 @@ use crate::inventory::snapshot::{
 };
 use crate::onchain::USDC_ETHEREUM;
 use crate::onchain::raindex::{RaindexError, RaindexService, RaindexVaultId};
-use crate::threshold::{Usdc, UsdcConversionError};
+use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Error type for inventory polling operations.
@@ -40,7 +40,7 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
     Evm(#[from] EvmError),
     #[error(transparent)]
-    UsdcConversion(#[from] UsdcConversionError),
+    UsdcConversion(#[from] UsdcTransferError),
     #[error("vault balance mismatch: expected {expected:?}, got {actual:?}")]
     VaultBalanceMismatch {
         expected: Vec<Address>,
@@ -230,7 +230,7 @@ where
             )
             .await?;
 
-        let usdc_balance = Usdc::from_u256_6_decimals(raw_balance)?;
+        let usdc_balance = u256_to_usdc(raw_balance)?;
 
         self.snapshot
             .send(
@@ -303,7 +303,6 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::threshold::Usdc;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     struct MockEthereumWallet {
@@ -1054,7 +1053,7 @@ mod tests {
         let InventorySnapshotEvent::EthereumCash { usdc_balance, .. } = ethereum_cash_event else {
             panic!("Expected EthereumCash event, got {ethereum_cash_event:?}");
         };
-        let expected = Usdc::from_u256_6_decimals(raw_usdc).unwrap();
+        let expected = u256_to_usdc(raw_usdc).unwrap();
         assert_eq!(*usdc_balance, expected, "USDC balance mismatch");
     }
 
