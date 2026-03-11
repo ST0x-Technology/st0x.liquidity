@@ -474,6 +474,8 @@ impl RebalancingTrigger {
                 }
 
                 EthereumCash { .. } => Ok(inventory.clone()),
+
+                BaseWalletCash { .. } => Ok(inventory.clone()),
             }?;
 
         *inventory = updated;
@@ -564,6 +566,8 @@ impl RebalancingTrigger {
                 }
 
                 EthereumCash { .. } => Ok(inventory.clone()),
+
+                BaseWalletCash { .. } => Ok(inventory.clone()),
             }?;
 
         *inventory = updated;
@@ -596,6 +600,7 @@ impl RebalancingTrigger {
                 self.check_and_trigger_usdc().await;
             }
             EthereumCash { .. } => {}
+            BaseWalletCash { .. } => {}
         }
 
         Ok(())

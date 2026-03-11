@@ -70,6 +70,7 @@ pub(crate) struct WithDexStreams {
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
     ethereum_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
+    base_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -143,6 +144,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_receiver,
                 rebalancer: None,
                 ethereum_wallet: None,
+                base_wallet: None,
             },
         }
     }
@@ -164,6 +166,14 @@ where
         wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ) -> Self {
         self.state.ethereum_wallet = Some(wallet);
+        self
+    }
+
+    pub(crate) fn with_base_wallet(
+        mut self,
+        wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        self.state.base_wallet = Some(wallet);
         self
     }
 
@@ -193,6 +203,7 @@ where
             order_owner,
             self.common.frameworks.snapshot,
             self.state.ethereum_wallet,
+            self.state.base_wallet,
         );
         let inventory_poller = Some(spawn_inventory_poller(
             polling_service,
