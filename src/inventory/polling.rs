@@ -21,8 +21,8 @@ use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::onchain::raindex::{RaindexError, RaindexService, RaindexVaultId};
+use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
@@ -46,10 +46,11 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
         expected: Vec<Address>,
         actual: Vec<Address>,
     },
-    #[error(transparent)]
-    Evm(#[from] EvmError),
-    #[error(transparent)]
-    UsdcConversion(#[from] UsdcConversionError),
+}
+
+pub(crate) struct WalletPollingConfig {
+    pub(crate) ethereum: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
+    pub(crate) base: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
 }
 
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
@@ -63,8 +64,7 @@ where
     orderbook: Address,
     order_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
-    ethereum_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
-    base_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
+    wallet_polling: WalletPollingConfig,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -79,8 +79,7 @@ where
         orderbook: Address,
         order_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
-        ethereum_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
-        base_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
+        wallet_polling: WalletPollingConfig,
     ) -> Self {
         Self {
             raindex_service,
@@ -89,8 +88,7 @@ where
             orderbook,
             order_owner,
             snapshot,
-            ethereum_wallet,
-            base_wallet,
+            wallet_polling,
         }
     }
 
@@ -224,7 +222,7 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
-        let Some(wallet) = &self.ethereum_wallet else {
+        let Some(wallet) = &self.wallet_polling.ethereum else {
             debug!("No Ethereum wallet configured, skipping Ethereum cash polling");
             return Ok(());
         };
@@ -254,7 +252,7 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
-        let Some(wallet) = &self.base_wallet else {
+        let Some(wallet) = &self.wallet_polling.base else {
             debug!("No Base wallet configured, skipping Base cash polling");
             return Ok(());
         };
@@ -495,7 +493,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -543,7 +544,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -587,7 +591,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -621,7 +628,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         // Should succeed without error
@@ -677,7 +687,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -725,7 +738,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -767,7 +783,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -861,7 +880,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -911,7 +933,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -962,7 +987,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -1011,7 +1039,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1043,7 +1074,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1116,8 +1150,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            Some(ethereum_wallet),
-            None,
+            WalletPollingConfig {
+                ethereum: Some(ethereum_wallet),
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -1157,8 +1193,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
-            Some(base_wallet),
+            WalletPollingConfig {
+                ethereum: None,
+                base: Some(base_wallet),
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -1194,8 +1232,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -1232,8 +1272,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
-            None,
+            WalletPollingConfig {
+                ethereum: None,
+                base: None,
+            },
         );
 
         service.poll_and_record().await.unwrap();
@@ -1273,8 +1315,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            Some(ethereum_wallet),
-            None,
+            WalletPollingConfig {
+                ethereum: Some(ethereum_wallet),
+                base: None,
+            },
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1301,8 +1345,10 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            None,
-            Some(base_wallet),
+            WalletPollingConfig {
+                ethereum: None,
+                base: Some(base_wallet),
+            },
         );
 
         let error = service.poll_and_record().await.unwrap_err();
