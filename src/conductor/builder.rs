@@ -73,6 +73,7 @@ pub(crate) struct WithDexStreams {
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
     wallet_polling: WalletPollingCtx,
+    tokenizer: Option<Arc<dyn crate::tokenization::Tokenizer>>,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -146,6 +147,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_receiver,
                 rebalancer: None,
                 wallet_polling: WalletPollingCtx::default(),
+                tokenizer: None,
             },
         }
     }
@@ -188,6 +190,14 @@ where
         self
     }
 
+    pub(crate) fn with_tokenizer(
+        mut self,
+        tokenizer: Arc<dyn crate::tokenization::Tokenizer>,
+    ) -> Self {
+        self.state.tokenizer = Some(tokenizer);
+        self
+    }
+
     pub(crate) fn spawn(self) -> Conductor {
         info!("Starting conductor orchestration");
 
@@ -206,15 +216,16 @@ where
             order_owner,
         ));
 
-        let polling_service = InventoryPollingService::new(
-            raindex_service,
-            self.common.executor.clone(),
-            self.common.frameworks.vault_registry.clone(),
-            self.common.ctx.evm.orderbook,
-            order_owner,
-            self.common.frameworks.snapshot,
-            self.state.wallet_polling,
-        );
+        let polling_service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(self.common.executor.clone())
+            .vault_registry(self.common.frameworks.vault_registry.clone())
+            .orderbook(self.common.ctx.evm.orderbook)
+            .order_owner(order_owner)
+            .snapshot(self.common.frameworks.snapshot)
+            .wallet_polling(self.state.wallet_polling)
+            .maybe_tokenizer(self.state.tokenizer)
+            .build();
         let inventory_poller = Some(spawn_inventory_poller(
             polling_service,
             std::time::Duration::from_secs(self.common.ctx.inventory_poll_interval),

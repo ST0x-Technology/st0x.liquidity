@@ -1941,19 +1941,22 @@ know about cross-venue inventory.
   (completes transfer to Raindex, already counted at TokensReceived)
 - `TokenizedEquityMintEvent::RaindexDepositFailed` - No balance change (tokens
   await retry or manual recovery)
-- `TokenizedEquityMintEvent::MintRejected` - Reconciles inflight back to Alpaca
-  available
+- `TokenizedEquityMintEvent::MintRejected` - No balance change (rejected before
+  shares left Alpaca)
 - `TokenizedEquityMintEvent::MintAcceptanceFailed` - Reconciles inflight back to
   Alpaca available
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - No balance change (conversion
   between wrapped/unwrapped forms)
+- `EquityRedemptionEvent::TransferFailed` - Cancels inflight back to Raindex
+  available (tokens never left our wallet)
 - `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
 - `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
 - `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)
-- `EquityRedemptionEvent::RedemptionRejected` - Reconciles inflight back to
-  Raindex available (tokens returned by Alpaca)
+- `EquityRedemptionEvent::RedemptionRejected` - Token disposition uncertain
+  after rejection; keep inflight until an operator manually resolves the asset
+  location and a subsequent snapshot captures the corrected state
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;
@@ -1970,6 +1973,10 @@ know about cross-venue inventory.
   from broker
 - `InventorySnapshotEvent::OffchainCash` - Offchain cash balance fetched from
   broker
+- `InventorySnapshotEvent::InflightEquity` - Pending tokenization requests
+  polled from Alpaca; sets inflight at Hedging (mints) and MarketMaking
+  (redemptions). Available balances are unchanged -- they are set by separate
+  available-balance snapshots
 
 ##### Separation of concerns
 
