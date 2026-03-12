@@ -139,7 +139,12 @@ impl BaseChain<()> {
 
         // Place USDC contract at the canonical USDC_BASE address so vault
         // discovery and all downstream code recognizes it.
-        deploy_usdc_at_base(&provider, owner).await?;
+        deploy_usdc_at(&provider, USDC_BASE, owner).await?;
+
+        // Place USDC at the canonical USDC_ETHEREUM address so the
+        // inventory poller can call balanceOf when an ethereum_wallet
+        // shares this Anvil provider (equity e2e tests).
+        deploy_usdc_at(&provider, crate::cctp::USDC_ETHEREUM, owner).await?;
 
         // Place USDC at the canonical USDC_ETHEREUM address so the
         // inventory poller can call balanceOf when an ethereum_wallet
@@ -818,14 +823,9 @@ impl<P: Provider + Clone> BaseChain<P> {
     }
 }
 
-/// Deploys a USDC ERC20 at the canonical `USDC_BASE` address using
-/// `anvil_set_code` with `DeployableERC20` bytecode, then initialises
-/// OpenZeppelin storage slots (totalSupply, name, symbol, decimals) and
-/// gives the owner 1B USDC.
-async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) -> anyhow::Result<()> {
-    deploy_usdc_at(provider, USDC_BASE, owner).await
-}
-
+/// Deploys a USDC ERC20 at the given address using `anvil_set_code` with
+/// `DeployableERC20` bytecode, then initialises OpenZeppelin storage slots
+/// (totalSupply, name, symbol, decimals) and gives the owner 1B USDC.
 async fn deploy_usdc_at<P: Provider>(
     provider: &P,
     usdc_address: Address,

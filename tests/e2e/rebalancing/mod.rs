@@ -727,23 +727,8 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    let pool = crate::poll::connect_db(&infra.db_path).await?;
-    let events = crate::poll::fetch_events_by_type(&pool, "InventorySnapshot").await?;
-    let has_ethereum_cash = events
-        .iter()
-        .any(|event| event.event_type == "InventorySnapshotEvent::EthereumCash");
-    assert!(
-        has_ethereum_cash,
-        "Expected EthereumCash snapshot from Ethereum wallet polling"
-    );
-    let has_base_wallet_cash = events
-        .iter()
-        .any(|event| event.event_type == "InventorySnapshotEvent::BaseWalletCash");
-    assert!(
-        has_base_wallet_cash,
-        "Expected BaseWalletCash snapshot from Base wallet polling"
-    );
-    pool.close().await;
+    assert_ethereum_cash_event_exists(&infra.db_path).await?;
+    assert_base_wallet_cash_event_exists(&infra.db_path).await?;
 
     bot.abort();
     Ok(())
