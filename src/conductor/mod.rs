@@ -12,6 +12,7 @@ use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -88,6 +89,16 @@ pub(crate) struct TradingTasks {
     pub(crate) event_processor: JoinHandle<()>,
     pub(crate) position_checker: JoinHandle<()>,
     pub(crate) queue_processor: JoinHandle<()>,
+}
+
+fn base_wallet_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
+    ctx.assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
+        .collect()
 }
 
 /// Event processing errors for live event handling.
@@ -260,13 +271,7 @@ impl Conductor {
             }
 
             if let Some(wallet) = base_wallet {
-                let equity_token_addresses = ctx
-                    .assets
-                    .equities
-                    .symbols
-                    .iter()
-                    .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
-                    .collect();
+                let equity_token_addresses = base_wallet_equity_token_addresses(&ctx);
                 builder = builder.with_base_wallet(wallet, equity_token_addresses);
             }
 
@@ -1583,7 +1588,7 @@ mod tests {
     use futures_util::stream;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
@@ -1642,6 +1647,75 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: test_assets_config(),
         }
+    }
+
+    #[test]
+    fn base_wallet_equity_token_addresses_skips_disabled_assets() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let spym = Symbol::new("SPYM").unwrap();
+        let aapl_token = Address::random();
+        let tsla_token = Address::random();
+        let spym_token = Address::random();
+
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            aapl.clone(),
+            EquityAssetConfig {
+                tokenized_equity: aapl_token,
+                tokenized_equity_derivative: Address::random(),
+                vault_id: None,
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        symbols.insert(
+            tsla.clone(),
+            EquityAssetConfig {
+                tokenized_equity: tsla_token,
+                tokenized_equity_derivative: Address::random(),
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+        symbols.insert(
+            spym.clone(),
+            EquityAssetConfig {
+                tokenized_equity: spym_token,
+                tokenized_equity_derivative: Address::random(),
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities: EquitiesConfig { symbols },
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        };
+
+        let actual = base_wallet_equity_token_addresses(&ctx);
+
+        assert_eq!(
+            actual.len(),
+            2,
+            "Only trading-enabled or rebalancing-enabled assets should be polled"
+        );
+        assert_eq!(actual.get(&aapl), Some(&aapl_token));
+        assert_eq!(actual.get(&tsla), Some(&tsla_token));
+        assert!(
+            !actual.contains_key(&spym),
+            "Disabled assets should be excluded from Base-wallet equity polling"
+        );
     }
 
     #[tokio::test]

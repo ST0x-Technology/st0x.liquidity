@@ -32,7 +32,7 @@ use st0x_execution::alpaca_broker_api::{
     TransferStatus,
 };
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Symbol, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
 };
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
@@ -302,10 +302,12 @@ pub(crate) enum EquityRebalanceType<'a> {
     Mint {
         symbol: &'a str,
         tokenization: &'a AlpacaTokenizationMock,
+        unwrapped_token: Address,
     },
     Redeem {
         symbol: &'a str,
         tokenization: &'a AlpacaTokenizationMock,
+        unwrapped_token: Address,
         redemption_wallet_balance_before: U256,
         redemption_wallet_balance_after: U256,
     },
@@ -740,9 +742,11 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     Ok(())
 }
 
-async fn assert_base_wallet_equity_snapshot(
+async fn assert_base_wallet_equity_snapshot<P: Provider>(
     pool: &SqlitePool,
-    expected_symbols: &[&str],
+    provider: &P,
+    owner: Address,
+    expected_tokens: &[(&str, Address)],
 ) -> anyhow::Result<()> {
     let events = fetch_events_by_type(pool, "InventorySnapshot").await?;
     let last_base_wallet_equity = events
@@ -756,14 +760,28 @@ async fn assert_base_wallet_equity_snapshot(
         .and_then(|val| val.get("balances"))
         .ok_or_else(|| anyhow::anyhow!("BaseWalletEquity payload missing balances"))?;
 
-    for symbol in expected_symbols {
-        let balance_str = balances
+    for (symbol, token_addr) in expected_tokens {
+        let snapshot_balance_str = balances
             .get(*symbol)
             .and_then(|val| val.as_str())
             .unwrap_or_else(|| panic!("BaseWalletEquity missing symbol {symbol}, got: {balances}"));
-        let _parsed_balance: Decimal = balance_str.parse().unwrap_or_else(|err| {
-            panic!("Failed to parse BaseWalletEquity balance for {symbol}: {err}")
-        });
+        let snapshot_balance: FractionalShares = snapshot_balance_str.parse().map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to parse BaseWalletEquity balance '{snapshot_balance_str}' for \
+                     {symbol}: {error}"
+            )
+        })?;
+        let actual_balance_raw = crate::base_chain::IERC20::new(*token_addr, provider)
+            .balanceOf(owner)
+            .call()
+            .await?;
+        let actual_balance = FractionalShares::from_u256_18_decimals(actual_balance_raw)?;
+
+        assert_eq!(
+            snapshot_balance, actual_balance,
+            "BaseWalletEquity mismatch for {symbol}: snapshot={snapshot_balance}, \
+             onchain={actual_balance}"
+        );
     }
 
     Ok(())
@@ -787,18 +805,28 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
 
     let pool = connect_db(db_path).await?;
 
-    let equity_symbol = match &rebalance_type {
-        EquityRebalanceType::Mint { symbol, .. } | EquityRebalanceType::Redeem { symbol, .. } => {
-            *symbol
+    let (equity_symbol, unwrapped_token) = match &rebalance_type {
+        EquityRebalanceType::Mint {
+            symbol,
+            unwrapped_token,
+            ..
         }
+        | EquityRebalanceType::Redeem {
+            symbol,
+            unwrapped_token,
+            ..
+        } => (*symbol, *unwrapped_token),
     };
+    let expected_base_wallet_tokens = [(equity_symbol, unwrapped_token)];
     assert_inventory_snapshots(&pool, orderbook, owner, &[equity_symbol], false).await?;
-    assert_base_wallet_equity_snapshot(&pool, &[equity_symbol]).await?;
+    assert_base_wallet_equity_snapshot(&pool, provider, owner, &expected_base_wallet_tokens)
+        .await?;
 
     match rebalance_type {
         EquityRebalanceType::Mint {
             symbol,
             tokenization,
+            ..
         } => {
             assert_equity_mint_rebalancing(
                 &pool,
@@ -816,6 +844,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
             tokenization,
             redemption_wallet_balance_before,
             redemption_wallet_balance_after,
+            ..
         } => {
             assert_equity_redeem_rebalancing()
                 .pool(&pool)
