@@ -10,6 +10,7 @@ use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
+use chrono::Utc;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -33,7 +34,10 @@ use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
+use crate::equity_redemption::symbols_with_stuck_redemptions;
+use crate::inventory::{
+    BroadcastingInventory, Inventory, InventoryPollingService, InventorySnapshot, Venue,
+};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -192,13 +196,39 @@ impl Conductor {
             let cutoff_block =
                 get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool).await?;
 
-            if let Some(end_block) = cutoff_block.checked_sub(1) {
-                backfill_events(&pool, &provider, &ctx.evm, end_block).await?;
-            }
+            // Backfill up to and including cutoff_block. The queue uses
+            // INSERT OR IGNORE so any events also delivered by the live
+            // WebSocket subscription are silently deduplicated. Including
+            // cutoff_block closes the race window where a block is mined
+            // at the exact moment the subscription is established: without
+            // this, that block falls in neither the backfill range nor the
+            // live stream.
+            backfill_events(&pool, &provider, &ctx.evm, cutoff_block).await?;
 
             let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
                 .build(())
                 .await?;
+
+            // Recover inflight state from event history. Redemptions that
+            // ended in DetectionFailed or RedemptionRejected have tokens
+            // physically in Alpaca's wallet with no snapshot source -- set
+            // their inflight directly so the system doesn't re-trigger.
+            let stuck_redemptions = symbols_with_stuck_redemptions(&pool).await?;
+            if !stuck_redemptions.is_empty() {
+                let mut view = inventory.write().await;
+                for (symbol, quantity) in &stuck_redemptions {
+                    *view = view.clone().update_equity(
+                        symbol,
+                        Inventory::set_inflight(Venue::MarketMaking, *quantity),
+                        Utc::now(),
+                    )?;
+                }
+                drop(view);
+                info!(
+                    stuck = ?stuck_redemptions,
+                    "Recovered inflight from event history"
+                );
+            }
 
             let (vault_registry, vault_registry_projection) =
                 StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -221,6 +251,7 @@ impl Conductor {
                 ethereum_wallet,
                 base_wallet,
                 alpaca_wallet,
+                tokenizer,
             ) = if let Some(rebalancing_ctx) = rebalancing {
                 let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
                 let base_wallet = rebalancing_ctx.base_wallet().clone();
@@ -249,6 +280,7 @@ impl Conductor {
                     Some(ethereum_wallet),
                     Some(base_wallet),
                     Some(components.alpaca_wallet),
+                    Some(components.tokenizer),
                 )
             } else {
                 let (position, position_projection) = build_position_cqrs(&pool).await?;
@@ -260,6 +292,7 @@ impl Conductor {
                     position,
                     position_projection,
                     snapshot,
+                    None,
                     None,
                     None,
                     None,
@@ -320,6 +353,10 @@ impl Conductor {
 
             if let Some(wallet) = alpaca_wallet {
                 builder = builder.with_alpaca_wallet(wallet);
+            }
+
+            if let Some(tokenizer) = tokenizer {
+                builder = builder.with_tokenizer(tokenizer);
             }
 
             Ok(builder.spawn())
@@ -383,6 +420,7 @@ struct RebalancingComponents<Chain: Wallet> {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     alpaca_wallet: Arc<AlpacaWalletService>,
+    tokenizer: Arc<dyn Tokenizer>,
     spawner: RebalancerSpawner<Chain>,
 }
 
@@ -580,7 +618,7 @@ fn build_rebalancing_infrastructure<Chain: Wallet + Clone>(
             ethereum_wallet,
             base_wallet,
             raindex_service,
-            tokenizer,
+            tokenizer.clone(),
         )
         .await?;
 
@@ -597,6 +635,7 @@ fn build_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             alpaca_wallet,
+            tokenizer,
             spawner: RebalancerSpawner {
                 services,
                 usdc_vault_id: RaindexVaultId(usdc_vault_id),
@@ -3024,7 +3063,7 @@ mod tests {
     }
 
     async fn get_vault_registry_events(pool: &SqlitePool) -> Vec<String> {
-        sqlx::query_scalar!("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
+        sqlx::query_scalar("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
             .fetch_all(pool)
             .await
             .unwrap()
@@ -3181,8 +3220,8 @@ mod tests {
         }
         .to_string();
 
-        let aggregate_ids: Vec<String> = sqlx::query_scalar!(
-            "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'"
+        let aggregate_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'",
         )
         .fetch_all(&pool)
         .await
@@ -4610,8 +4649,8 @@ mod tests {
         .await
         .unwrap();
 
-        let event_types = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'"
+        let event_types: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'",
         )
         .fetch_all(&pool)
         .await
@@ -4656,8 +4695,8 @@ mod tests {
         .await
         .unwrap();
 
-        let event_types = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'"
+        let event_types: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'",
         )
         .fetch_all(&pool)
         .await

@@ -1,6 +1,6 @@
 //! Inventory view for tracking cross-venue asset positions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::{Add, Sub};
 use std::sync::LazyLock;
 
@@ -137,7 +137,7 @@ impl TryFrom<RawImbalanceThreshold> for ImbalanceThreshold {
 }
 
 /// Discriminant for the two venues tracked by an [`Inventory`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum Venue {
     /// Onchain venue (Raindex) -- where market making happens.
     MarketMaking,
@@ -489,6 +489,10 @@ where
         })
     }
 
+    pub(crate) fn last_rebalancing(&self) -> Option<DateTime<Utc>> {
+        self.last_rebalancing
+    }
+
     pub(crate) fn with_last_rebalancing(
         timestamp: DateTime<Utc>,
     ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
@@ -497,6 +501,32 @@ where
                 last_rebalancing: Some(timestamp),
                 ..inventory
             })
+        })
+    }
+
+    /// Replace the inflight balance at a venue with a polled value
+    /// from an external system (Alpaca's tokenization API).
+    ///
+    /// Unlike `transfer(TransferOp::Start)` which moves from available to
+    /// inflight, this directly sets inflight without touching available.
+    /// The available balance is already correct from a separate snapshot.
+    pub(crate) fn set_inflight(
+        venue: Venue,
+        amount: T,
+    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory| {
+            let existing = inventory.get_venue(venue);
+
+            // Don't initialize a venue that doesn't exist yet when the
+            // inflight amount is zero — that would create a spurious
+            // Some(0, 0) balance for an uninitialized venue.
+            if existing.is_none() && amount.is_zero()? {
+                return Ok(inventory);
+            }
+
+            let balance = existing.unwrap_or_default().set_inflight(amount)?;
+
+            Ok(inventory.set_venue(venue, Some(balance)))
         })
     }
 
@@ -690,6 +720,28 @@ impl InventoryView {
         self
     }
 
+    /// Returns the equity available balance at the given venue for a symbol.
+    #[cfg(test)]
+    pub(crate) fn equity_available(
+        &self,
+        symbol: &Symbol,
+        venue: Venue,
+    ) -> Option<FractionalShares> {
+        let inventory = self.equities.get(symbol)?;
+        inventory.get_venue(venue).map(VenueBalance::available)
+    }
+
+    /// Returns the equity inflight balance at the given venue for a symbol.
+    #[cfg(test)]
+    pub(crate) fn equity_inflight(
+        &self,
+        symbol: &Symbol,
+        venue: Venue,
+    ) -> Option<FractionalShares> {
+        let inventory = self.equities.get(symbol)?;
+        inventory.get_venue(venue).map(VenueBalance::inflight)
+    }
+
     /// Returns the USDC available balance at the given venue.
     #[cfg(test)]
     pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
@@ -747,6 +799,92 @@ impl InventoryView {
             last_updated: now,
             equities: self.equities,
         })
+    }
+
+    /// Returns the set of symbols that currently have inflight balances
+    /// at any venue.
+    #[cfg(test)]
+    pub(crate) fn symbols_with_inflight(&self) -> std::collections::HashSet<Symbol> {
+        self.equities
+            .iter()
+            .filter(|(_, inventory)| {
+                inventory
+                    .has_inflight()
+                    .expect("has_inflight should not fail on valid inventory")
+            })
+            .map(|(symbol, _)| symbol.clone())
+            .collect()
+    }
+
+    /// Whether a symbol's inflight snapshot predates its last rebalancing.
+    fn is_stale_for_symbol(&self, symbol: &Symbol, fetched_at: DateTime<Utc>) -> bool {
+        self.equities
+            .get(symbol)
+            .and_then(Inventory::last_rebalancing)
+            .is_some_and(|last_rebalancing| fetched_at < last_rebalancing)
+    }
+
+    /// Apply an inflight equity snapshot from the tokenization provider poll.
+    ///
+    /// Only sets inflight for symbols **present** in the maps. Symbols absent
+    /// from the maps are left untouched — their inflight is managed exclusively
+    /// by CQRS terminal events (`TransferOp::Complete`, `TransferOp::Cancel`).
+    /// This prevents a race where the poll sees no pending request (e.g. after
+    /// a fast rejection) and zeros inflight before the CQRS event arrives.
+    ///
+    /// Skips symbols whose `last_rebalancing` is more recent than `fetched_at`,
+    /// because a stale poll could otherwise re-introduce inflight that was
+    /// already cleared by a completed transfer.
+    ///
+    /// Mints are inflight at Hedging (shares leaving offchain broker toward
+    /// onchain). Redemptions are inflight at MarketMaking (shares leaving
+    /// onchain toward offchain broker).
+    pub(crate) fn apply_inflight_snapshot(
+        self,
+        mints: &BTreeMap<Symbol, FractionalShares>,
+        redemptions: &BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let mut view = self;
+
+        for (symbol, &quantity) in mints {
+            if view.is_stale_for_symbol(symbol, fetched_at) {
+                debug!(
+                    %symbol,
+                    ?fetched_at,
+                    "Skipping mint inflight snapshot: \
+                     fetched before last rebalancing"
+                );
+                continue;
+            }
+
+            view = view.update_equity(
+                symbol,
+                Inventory::set_inflight(Venue::Hedging, quantity),
+                now,
+            )?;
+        }
+
+        for (symbol, &quantity) in redemptions {
+            if view.is_stale_for_symbol(symbol, fetched_at) {
+                debug!(
+                    %symbol,
+                    ?fetched_at,
+                    "Skipping redemption inflight snapshot: \
+                     fetched before last rebalancing"
+                );
+                continue;
+            }
+
+            view = view.update_equity(
+                symbol,
+                Inventory::set_inflight(Venue::MarketMaking, quantity),
+                now,
+            )?;
+        }
+
+        Ok(view)
     }
 }
 
@@ -1333,6 +1471,222 @@ mod tests {
 
         let onchain = result.onchain.unwrap();
         assert_eq!(onchain.total().unwrap(), shares(999));
+    }
+
+    #[test]
+    fn inflight_snapshot_skipped_when_fetched_before_last_rebalancing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let last_rebalancing = Utc::now();
+        let stale_fetched_at = last_rebalancing - Duration::seconds(5);
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::with_last_rebalancing(last_rebalancing),
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Snapshot with the symbol present but stale fetched_at -- should NOT
+        // update inflight because the snapshot predates last_rebalancing.
+        let mut stale_redemptions = BTreeMap::new();
+        stale_redemptions.insert(symbol.clone(), shares(5));
+
+        let result = view
+            .apply_inflight_snapshot(
+                &BTreeMap::new(),
+                &stale_redemptions,
+                stale_fetched_at,
+                Utc::now(),
+            )
+            .unwrap();
+
+        let inventory = result.equities.get(&symbol).unwrap();
+        assert_eq!(
+            inventory.onchain.unwrap().inflight(),
+            shares(10),
+            "Stale snapshot should preserve original inflight of 10, not update to 5"
+        );
+    }
+
+    #[test]
+    fn present_symbol_inflight_updated_when_fetched_after_last_rebalancing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let last_rebalancing = Utc::now();
+        let fresh_fetched_at = last_rebalancing + Duration::seconds(5);
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::with_last_rebalancing(last_rebalancing),
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Snapshot with symbol present and fresh fetched_at: should update inflight.
+        let mut redemptions = BTreeMap::new();
+        redemptions.insert(symbol.clone(), shares(5));
+
+        let result = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &redemptions, fresh_fetched_at, Utc::now())
+            .unwrap();
+
+        let inventory = result.equities.get(&symbol).unwrap();
+        assert_eq!(
+            inventory.onchain.unwrap().inflight(),
+            shares(5),
+            "Fresh snapshot should update MarketMaking inflight to the snapshot value"
+        );
+    }
+
+    #[test]
+    fn present_symbol_inflight_updated_when_no_last_rebalancing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Snapshot with symbol present: should update inflight to the new value.
+        let mut redemptions = BTreeMap::new();
+        redemptions.insert(symbol.clone(), shares(5));
+
+        let result = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &redemptions, Utc::now(), Utc::now())
+            .unwrap();
+
+        let inventory = result.equities.get(&symbol).unwrap();
+        assert_eq!(
+            inventory.onchain.unwrap().inflight(),
+            shares(5),
+            "Should update MarketMaking inflight to the snapshot value"
+        );
+    }
+
+    #[test]
+    fn absent_symbol_inflight_preserved_by_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Empty snapshot (symbol absent from both maps) should not zero inflight.
+        // Only CQRS terminal events (TransferOp::Complete/Cancel) zero inflight.
+        let result = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), Utc::now(), Utc::now())
+            .unwrap();
+
+        let inventory = result.equities.get(&symbol).unwrap();
+        assert_eq!(
+            inventory.onchain.unwrap().inflight(),
+            shares(10),
+            "Absent symbol should preserve original MarketMaking inflight of 10"
+        );
+    }
+
+    #[test]
+    fn apply_inflight_snapshot_does_not_initialize_missing_venue() {
+        // When a symbol has only one venue initialized (e.g. offchain only),
+        // applying an empty inflight snapshot should NOT conjure a
+        // Some(0, 0) VenueBalance for the missing venue.
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            equities: std::iter::once((
+                symbol.clone(),
+                Inventory {
+                    onchain: None,
+                    offchain: Some(VenueBalance::new(shares(100), FractionalShares::ZERO)),
+                    last_rebalancing: None,
+                },
+            ))
+            .collect(),
+            ..InventoryView::default()
+        };
+
+        // Onchain (MarketMaking) is None before the snapshot
+        let pre = view.equities.get(&symbol).unwrap();
+        assert!(
+            pre.onchain.is_none(),
+            "Precondition: onchain should be None"
+        );
+
+        let result = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), Utc::now(), Utc::now())
+            .unwrap();
+
+        let inventory = result.equities.get(&symbol).unwrap();
+
+        // The bug: set_inflight calls unwrap_or_default() which creates
+        // Some(available=0, inflight=0) for the missing venue.
+        // After fix, the missing venue should remain None.
+        assert!(
+            inventory.onchain.is_none(),
+            "Empty inflight snapshot should not initialize a missing venue to Some(0, 0)"
+        );
+
+        // Imbalance detection should still return None since one venue is uninitialized
+        let thresh = threshold("0.5", "0.2");
+        assert_eq!(
+            inventory.detect_imbalance(&thresh).unwrap(),
+            None,
+            "Imbalance detection should return None when a venue is uninitialized"
+        );
+    }
+
+    #[test]
+    fn present_symbol_inflight_updated_by_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        // When the symbol IS in the snapshot map, inflight is updated to
+        // the snapshot's value.
+        let mut redemptions = BTreeMap::new();
+        redemptions.insert(symbol.clone(), shares(5));
+
+        let result = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &redemptions, Utc::now(), Utc::now())
+            .unwrap();
+
+        let inventory = result.equities.get(&symbol).unwrap();
+        assert_eq!(
+            inventory.onchain.unwrap().inflight(),
+            shares(5),
+            "Present symbol should have MarketMaking inflight updated from 10 to 5"
+        );
     }
 
     #[test]

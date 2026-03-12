@@ -27,6 +27,8 @@ pub(crate) enum InventoryError<T> {
         "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
     )]
     InsufficientInflight { requested: T, inflight: T },
+    #[error("negative inflight value: {value:?}")]
+    NegativeInflight { value: T },
     #[error("arithmetic error: {0}")]
     Arithmetic(#[from] FloatError),
 }
@@ -157,6 +159,23 @@ where
         Ok(Self {
             available: new_available,
             inflight: self.inflight,
+        })
+    }
+
+    /// Replace the inflight balance with a polled value from an external system.
+    ///
+    /// Unlike `move_to_inflight` which transfers from available, this directly
+    /// sets the inflight amount -- used when the external system (Alpaca's
+    /// tokenization API) reports pending operations. The available balance is
+    /// unchanged because it was already set by a separate available snapshot.
+    pub(super) fn set_inflight(self, inflight: T) -> Result<Self, InventoryError<T>> {
+        if inflight.is_negative()? {
+            return Err(InventoryError::NegativeInflight { value: inflight });
+        }
+
+        Ok(Self {
+            available: self.available,
+            inflight,
         })
     }
 
@@ -406,6 +425,40 @@ mod tests {
     #[derive(Debug)]
     struct TestError {
         _reason: &'static str,
+    }
+
+    #[test]
+    fn set_inflight_replaces_inflight_without_changing_available() {
+        let balance = equity_balance(100, 10);
+
+        let result = balance
+            .set_inflight(FractionalShares::new(float!("25")))
+            .unwrap();
+
+        assert!(
+            result.available().inner().eq(float!("100")).unwrap(),
+            "set_inflight should not change available"
+        );
+        assert!(
+            result.inflight().inner().eq(float!("25")).unwrap(),
+            "set_inflight should replace inflight with the new value"
+        );
+    }
+
+    #[test]
+    fn set_inflight_to_zero_clears_inflight() {
+        let balance = equity_balance(100, 30);
+
+        let result = balance.set_inflight(FractionalShares::ZERO).unwrap();
+
+        assert!(
+            result.available().inner().eq(float!("100")).unwrap(),
+            "set_inflight(ZERO) should not change available"
+        );
+        assert!(
+            result.inflight().is_zero().unwrap(),
+            "set_inflight(ZERO) should zero out inflight"
+        );
     }
 
     #[test]

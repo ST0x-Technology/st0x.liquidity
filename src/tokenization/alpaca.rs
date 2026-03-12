@@ -878,6 +878,20 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
     ) -> Result<(), MintVerificationError> {
         Self::verify_mint_tx(self, tx_hash, token_address, wallet, expected_amount).await
     }
+
+    async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError> {
+        let params = ListRequestsParams {
+            status: Some(TokenizationRequestStatus::Pending),
+            ..Default::default()
+        };
+
+        let requests = self.client.list_requests(params).await?;
+
+        Ok(requests
+            .into_iter()
+            .filter(|request| request.status == TokenizationRequestStatus::Pending)
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -2346,5 +2360,61 @@ pub(crate) mod tests {
             request.token_symbol, None,
             "Empty token_symbol string should deserialize as None"
         );
+    }
+
+    #[tokio::test]
+    async fn list_pending_requests_sends_status_pending_query_param() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("status", "pending");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_tokenization_request_json(
+                    "req_1", "mint", "AAPL"
+                )]));
+        });
+
+        let result = service.list_pending_requests().await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn list_pending_requests_filters_non_pending_from_response() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        // Simulate an API response that includes a non-pending request
+        // despite the status=pending query param (defensive against API drift).
+        let mut pending_req = sample_tokenization_request_json("req_1", "mint", "AAPL");
+        pending_req["status"] = json!("pending");
+
+        let mut completed_req = sample_tokenization_request_json("req_2", "redeem", "TSLA");
+        completed_req["status"] = json!("completed");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("status", "pending");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([pending_req, completed_req]));
+        });
+
+        let result = service.list_pending_requests().await.unwrap();
+
+        assert_eq!(result.len(), 1, "Should filter out non-pending requests");
+        assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
+        list_mock.assert();
     }
 }

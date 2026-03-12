@@ -16,7 +16,7 @@ use st0x_execution::{FractionalShares, Symbol};
 
 pub(crate) use alpaca::{
     AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequest,
-    TokenizationRequestStatus,
+    TokenizationRequestStatus, TokenizationRequestType,
 };
 
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
@@ -117,4 +117,10 @@ pub(crate) trait Tokenizer: Send + Sync {
         wallet: Address,
         expected_amount: U256,
     ) -> Result<(), MintVerificationError>;
+
+    /// List all pending tokenization requests from the external provider.
+    ///
+    /// Returns requests that are currently in-flight (status = pending),
+    /// used by inventory polling to reconcile in-flight balances.
+    async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError>;
 }
