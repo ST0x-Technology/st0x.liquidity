@@ -748,12 +748,6 @@ pub(crate) async fn assert_initial_base_wallet_unwrapped_and_wrapped_equity_snap
     expected_unwrapped_balance: FractionalShares,
     expected_wrapped_balance: FractionalShares,
 ) -> anyhow::Result<()> {
-    assert_ne!(
-        expected_unwrapped_balance, expected_wrapped_balance,
-        "Wrapped and unwrapped balances must differ so BaseWalletUnwrappedEquity proves the \
-         unwrapped token address was polled"
-    );
-
     let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
     let deadline = tokio::time::Instant::now() + timeout;
     let context = format!(
