@@ -44,6 +44,9 @@ pub enum TokenizationStatus {
     Pending,
     Completed,
     Failed,
+    /// Maps to `"rejected"` in the Alpaca API, which the bot deserializes
+    /// as `TokenizationRequestStatus::Rejected`.
+    Rejected,
 }
 
 impl std::fmt::Display for TokenizationStatus {
@@ -52,6 +55,7 @@ impl std::fmt::Display for TokenizationStatus {
             Self::Pending => write!(formatter, "pending"),
             Self::Completed => write!(formatter, "completed"),
             Self::Failed => write!(formatter, "failed"),
+            Self::Rejected => write!(formatter, "rejected"),
         }
     }
 }
@@ -93,10 +97,21 @@ struct MockTokenizationRequest {
     needs_mint_execution: bool,
 }
 
+/// Controls what happens when a redemption request reaches its poll threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedemptionOutcome {
+    /// Auto-complete after `polls_until_complete` polls (default behavior).
+    Complete,
+    /// Transition to `Rejected` after `polls_until_complete` polls.
+    Reject,
+}
+
 struct TokenizationState {
     requests: Vec<MockTokenizationRequest>,
     /// Number of polls before mint requests transition to "completed".
     polls_until_complete: usize,
+    /// What happens when a redemption request reaches its poll threshold.
+    redemption_outcome: RedemptionOutcome,
 }
 
 /// Snapshot of a tokenization request, returned by
@@ -137,6 +152,7 @@ impl AlpacaTokenizationMock {
         let state = Arc::new(Mutex::new(TokenizationState {
             requests: Vec::new(),
             polls_until_complete: 2,
+            redemption_outcome: RedemptionOutcome::Complete,
         }));
 
         register_mint_endpoint(server, &state);
@@ -154,6 +170,11 @@ impl AlpacaTokenizationMock {
     /// adds a redemption tokenization request to the mock state so the
     /// bot's `poll_for_redemption` call finds a matching entry.
     ///
+    /// `order_owner` is the bot's wallet address, used as the
+    /// `wallet_address` on created requests (matching real Alpaca API
+    /// behavior where the field identifies the account holder, not the
+    /// transfer destination).
+    ///
     /// `token_symbols` maps token contract address -> underlying symbol
     /// (e.g. vault_addr -> "AAPL"). The Transfer event's `value` field
     /// (U256 with 18 decimals) is decoded to determine the quantity.
@@ -161,6 +182,7 @@ impl AlpacaTokenizationMock {
         &mut self,
         provider: P,
         redemption_wallet: Address,
+        order_owner: Address,
         token_symbols: HashMap<Address, String>,
     ) -> anyhow::Result<()> {
         let state = self.state.clone();
@@ -186,6 +208,7 @@ impl AlpacaTokenizationMock {
                     last_block + 1,
                     current,
                     redemption_wallet,
+                    order_owner,
                     &token_symbols,
                 )
                 .await;
@@ -213,6 +236,40 @@ impl AlpacaTokenizationMock {
                 status: request.status,
             })
             .collect()
+    }
+
+    /// Configures what happens when redemption requests reach their poll
+    /// threshold. Defaults to [`RedemptionOutcome::Complete`].
+    pub fn set_redemption_outcome(&self, outcome: RedemptionOutcome) {
+        lock(&self.state).redemption_outcome = outcome;
+    }
+
+    /// Injects a pending tokenization request with an arbitrary wallet
+    /// address. Used to simulate requests from other conductors sharing
+    /// the same Alpaca account.
+    pub fn inject_pending_request(
+        &self,
+        symbol: &str,
+        quantity: Float,
+        wallet: Address,
+        request_type: TokenizationRequestType,
+    ) {
+        let mut state = lock(&self.state);
+        let polls_until_complete = state.polls_until_complete;
+
+        state.requests.push(MockTokenizationRequest {
+            tokenization_request_id: Uuid::new_v4().to_string(),
+            issuer_request_id: String::new(),
+            underlying_symbol: symbol.to_string(),
+            quantity,
+            wallet_address: wallet,
+            status: TokenizationStatus::Pending,
+            poll_count: 0,
+            polls_until_complete,
+            request_type,
+            tx_hash: String::new(),
+            needs_mint_execution: false,
+        });
     }
 
     /// Starts a background task that executes real ERC-20 transfers on the
@@ -321,6 +378,7 @@ async fn scan_block_for_redemptions<P: Provider>(
     state: &Mutex<TokenizationState>,
     block_num: u64,
     redemption_wallet: Address,
+    order_owner: Address,
     token_symbols: &HashMap<Address, String>,
 ) -> bool {
     let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).full().await else {
@@ -383,7 +441,10 @@ async fn scan_block_for_redemptions<P: Provider>(
                 issuer_request_id: String::new(),
                 underlying_symbol: symbol.clone(),
                 quantity,
-                wallet_address: redemption_wallet,
+                // Use the bot's wallet (order_owner), matching real Alpaca
+                // API behavior where wallet_address identifies the account
+                // holder, not the transfer destination.
+                wallet_address: order_owner,
                 status: TokenizationStatus::Pending,
                 poll_count: 0,
                 polls_until_complete,
@@ -405,11 +466,19 @@ async fn scan_redemption_range<P: Provider>(
     from: u64,
     to: u64,
     redemption_wallet: Address,
+    order_owner: Address,
     token_symbols: &HashMap<Address, String>,
 ) -> bool {
     for block_num in from..=to {
-        if !scan_block_for_redemptions(provider, state, block_num, redemption_wallet, token_symbols)
-            .await
+        if !scan_block_for_redemptions(
+            provider,
+            state,
+            block_num,
+            redemption_wallet,
+            order_owner,
+            token_symbols,
+        )
+        .await
         {
             return false;
         }
@@ -539,6 +608,8 @@ fn register_tokenization_requests_with_filter_endpoint(
             let requests: Vec<Value> = {
                 let mut state = lock(&state);
 
+                let redemption_outcome = state.redemption_outcome;
+
                 for req in &mut state.requests {
                     if req.status == TokenizationStatus::Pending && !req.needs_mint_execution {
                         req.poll_count += 1;
@@ -549,7 +620,12 @@ fn register_tokenization_requests_with_filter_endpoint(
                                 // The background mint executor will handle it.
                                 req.needs_mint_execution = true;
                             } else {
-                                req.status = TokenizationStatus::Completed;
+                                // Redeem requests transition based on the
+                                // configured outcome.
+                                req.status = match redemption_outcome {
+                                    RedemptionOutcome::Complete => TokenizationStatus::Completed,
+                                    RedemptionOutcome::Reject => TokenizationStatus::Rejected,
+                                };
                             }
                         }
                     }
