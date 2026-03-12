@@ -74,6 +74,8 @@ pub(crate) struct InventorySnapshot {
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
     /// Latest offchain cash balance in cents
     pub(crate) offchain_cash_cents: Option<i64>,
+    /// Latest Ethereum wallet USDC balance
+    pub(crate) ethereum_cash: Option<Usdc>,
     /// When this snapshot was last updated
     pub(crate) last_updated: DateTime<Utc>,
 }
@@ -97,6 +99,7 @@ impl EventSourced for InventorySnapshot {
             onchain_cash: None,
             offchain_equity: BTreeMap::new(),
             offchain_cash_cents: None,
+            ethereum_cash: None,
             last_updated: event.timestamp(),
         };
         snapshot.apply_event(event);
@@ -132,6 +135,10 @@ impl EventSourced for InventorySnapshot {
                 cash_balance_cents,
                 fetched_at: now,
             },
+            EthereumCash { usdc_balance } => InventorySnapshotEvent::EthereumCash {
+                usdc_balance,
+                fetched_at: now,
+            },
         }])
     }
 
@@ -159,6 +166,15 @@ impl EventSourced for InventorySnapshot {
                 cash_balance_cents,
                 fetched_at: now,
             },
+            EthereumCash { usdc_balance } => {
+                if self.ethereum_cash == Some(usdc_balance) {
+                    return Ok(vec![]);
+                }
+                InventorySnapshotEvent::EthereumCash {
+                    usdc_balance,
+                    fetched_at: now,
+                }
+            }
         }])
     }
 }
@@ -182,6 +198,9 @@ impl InventorySnapshot {
             } => {
                 self.offchain_cash_cents = Some(*cash_balance_cents);
             }
+            InventorySnapshotEvent::EthereumCash { usdc_balance, .. } => {
+                self.ethereum_cash = Some(*usdc_balance);
+            }
         }
     }
 }
@@ -199,6 +218,9 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OffchainCash {
         cash_balance_cents: i64,
+    },
+    EthereumCash {
+        usdc_balance: Usdc,
     },
 }
 
@@ -220,6 +242,10 @@ pub(crate) enum InventorySnapshotEvent {
         cash_balance_cents: i64,
         fetched_at: DateTime<Utc>,
     },
+    EthereumCash {
+        usdc_balance: Usdc,
+        fetched_at: DateTime<Utc>,
+    },
 }
 
 impl InventorySnapshotEvent {
@@ -228,7 +254,8 @@ impl InventorySnapshotEvent {
             Self::OnchainEquity { fetched_at, .. }
             | Self::OnchainCash { fetched_at, .. }
             | Self::OffchainEquity { fetched_at, .. }
-            | Self::OffchainCash { fetched_at, .. } => *fetched_at,
+            | Self::OffchainCash { fetched_at, .. }
+            | Self::EthereumCash { fetched_at, .. } => *fetched_at,
         }
     }
 }
@@ -240,6 +267,7 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OnchainCash { .. } => "InventorySnapshotEvent::OnchainCash".to_string(),
             Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
             Self::OffchainCash { .. } => "InventorySnapshotEvent::OffchainCash".to_string(),
+            Self::EthereumCash { .. } => "InventorySnapshotEvent::EthereumCash".to_string(),
         }
     }
 
@@ -473,5 +501,85 @@ mod tests {
 
         assert_eq!(snapshot.onchain_equity, second_balances);
         assert!(!snapshot.onchain_equity.contains_key(&test_symbol("AAPL")));
+    }
+
+    #[tokio::test]
+    async fn ethereum_cash_command_initializes_aggregate() {
+        let usdc_balance = Usdc::from_str("5000.50").unwrap();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::EthereumCash { usdc_balance })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            InventorySnapshotEvent::EthereumCash {
+                usdc_balance: event_balance,
+                ..
+            } => {
+                assert_eq!(*event_balance, usdc_balance);
+            }
+            _ => panic!("Expected EthereumCash event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ethereum_cash_command_emits_event_on_existing_aggregate() {
+        let usdc_balance = Usdc::from_str("2500").unwrap();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OnchainCash {
+                usdc_balance: Usdc::from_str("1000").unwrap(),
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::EthereumCash { usdc_balance })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            InventorySnapshotEvent::EthereumCash {
+                usdc_balance: event_balance,
+                ..
+            } => {
+                assert_eq!(*event_balance, usdc_balance);
+            }
+            _ => panic!("Expected EthereumCash event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ethereum_cash_command_skips_event_when_unchanged() {
+        let usdc_balance = Usdc::from_str("5000").unwrap();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::EthereumCash {
+                usdc_balance,
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::EthereumCash { usdc_balance })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "Should not emit event when balance unchanged"
+        );
+    }
+
+    #[test]
+    fn apply_event_updates_ethereum_cash() {
+        let usdc = Usdc::from_str("7500").unwrap();
+
+        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::EthereumCash {
+            usdc_balance: usdc,
+            fetched_at: Utc::now(),
+        }])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(snapshot.ethereum_cash, Some(usdc));
     }
 }

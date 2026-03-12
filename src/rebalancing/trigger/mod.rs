@@ -472,6 +472,8 @@ impl RebalancingTrigger {
                         .clone()
                         .update_usdc(Inventory::on_snapshot(Venue::Hedging, usdc), now)
                 }
+
+                EthereumCash { .. } => Ok(inventory.clone()),
             }?;
 
         *inventory = updated;
@@ -560,6 +562,8 @@ impl RebalancingTrigger {
                         now,
                     )
                 }
+
+                EthereumCash { .. } => Ok(inventory.clone()),
             }?;
 
         *inventory = updated;
@@ -591,6 +595,7 @@ impl RebalancingTrigger {
             OnchainCash { .. } | OffchainCash { .. } => {
                 self.check_and_trigger_usdc().await;
             }
+            EthereumCash { .. } => {}
         }
 
         Ok(())

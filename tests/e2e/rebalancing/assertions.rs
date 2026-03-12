@@ -69,7 +69,7 @@ type SigningProvider = FillProvider<
     alloy::network::Ethereum,
 >;
 
-struct TestWallet {
+pub(crate) struct TestWallet {
     address: Address,
     read_provider: RootProvider,
     signing_provider: SigningProvider,
@@ -77,7 +77,7 @@ struct TestWallet {
 }
 
 impl TestWallet {
-    fn new(
+    pub(crate) fn new(
         private_key: &B256,
         rpc_url: url::Url,
         required_confirmations: u64,
@@ -1101,6 +1101,25 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
         "Ethereum USDC balance should reconcile exactly with CCTP transfer amount"
     );
 
+    Ok(())
+}
+
+/// Asserts that at least one `EthereumCash` inventory snapshot was emitted.
+pub(crate) async fn assert_ethereum_cash_event_exists(
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let pool = connect_db(db_path).await?;
+    let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+
+    let has_ethereum_cash = events
+        .iter()
+        .any(|event| event.event_type == "InventorySnapshotEvent::EthereumCash");
+    assert!(
+        has_ethereum_cash,
+        "Expected EthereumCash snapshot from Ethereum wallet polling"
+    );
+
+    pool.close().await;
     Ok(())
 }
 
