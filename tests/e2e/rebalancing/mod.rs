@@ -115,7 +115,6 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
         .rebalance_type(EquityRebalanceType::Mint {
             symbol: "AAPL",
             tokenization: &infra.tokenization_service,
-            unwrapped_token: infra.equity_addresses[0].2,
         })
         .call()
         .await?;
@@ -176,6 +175,25 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         );
     }
 
+    let owner_unwrapped_balance_before_takes =
+        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_wrapped_balance_before_takes =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_unwrapped_shares_before_takes =
+        st0x_execution::FractionalShares::from_u256_18_decimals(
+            owner_unwrapped_balance_before_takes,
+        )?;
+    let owner_wrapped_shares_before_takes =
+        st0x_execution::FractionalShares::from_u256_18_decimals(
+            owner_wrapped_balance_before_takes,
+        )?;
+
     // Capture block AFTER setup so the bot sees the orders
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
@@ -195,8 +213,14 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .call()?;
     let mut bot = spawn_bot(ctx);
 
-    // Let bot finish coordination before submitting takes.
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_initial_base_wallet_equity_snapshot(
+        &mut bot,
+        &infra.db_path,
+        "AAPL",
+        owner_unwrapped_shares_before_takes,
+        owner_wrapped_shares_before_takes,
+    )
+    .await?;
 
     // Take all orders without delay so the inventory poller sees the
     // full imbalance in one pass and triggers a single mint cycle.
@@ -225,22 +249,6 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .expected_net(dec!(0))
         .build()];
 
-    let owner_unwrapped_balance_after_rebalance =
-        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
-    let owner_wrapped_balance_after_rebalance =
-        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
-    assert_ne!(
-        owner_unwrapped_balance_after_rebalance, owner_wrapped_balance_after_rebalance,
-        "Wrapped and unwrapped owner balances must stay distinct so BaseWalletEquity proves the \
-         poller used the unwrapped token address"
-    );
-
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
         .take_results(&take_results)
@@ -252,7 +260,6 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .rebalance_type(EquityRebalanceType::Mint {
             symbol: "AAPL",
             tokenization: &infra.tokenization_service,
-            unwrapped_token,
         })
         .call()
         .await?;
@@ -377,7 +384,6 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .rebalance_type(EquityRebalanceType::Redeem {
             symbol: "AAPL",
             tokenization: &infra.tokenization_service,
-            unwrapped_token: underlying_addr,
             redemption_wallet_balance_before,
             redemption_wallet_balance_after,
         })
@@ -493,7 +499,6 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .rebalance_type(EquityRebalanceType::Redeem {
             symbol: "AAPL",
             tokenization: &infra.tokenization_service,
-            unwrapped_token: underlying_addr,
             redemption_wallet_balance_before,
             redemption_wallet_balance_after,
         })
@@ -610,7 +615,6 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .rebalance_type(EquityRebalanceType::Redeem {
             symbol: "AAPL",
             tokenization: &infra.tokenization_service,
-            unwrapped_token: underlying_addr,
             redemption_wallet_balance_before,
             redemption_wallet_balance_after,
         })

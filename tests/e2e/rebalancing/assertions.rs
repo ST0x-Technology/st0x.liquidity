@@ -24,6 +24,7 @@ use std::collections::HashMap;
 pub(crate) use std::str::FromStr;
 use std::sync::Arc;
 pub(crate) use std::time::Duration;
+use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_evm::{Evm, EvmError, Wallet};
@@ -51,7 +52,7 @@ use crate::assert::{
 pub(crate) use crate::base_chain::TakeDirection;
 use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
-use crate::poll::{connect_db, fetch_events_by_type};
+use crate::poll::{DEFAULT_POLL_TIMEOUT_SECS, connect_db, fetch_events_by_type, sleep_or_crash};
 pub(crate) use crate::poll::{poll_for_events_with_timeout, spawn_bot};
 pub(crate) use crate::test_infra::TestInfra;
 
@@ -302,12 +303,10 @@ pub(crate) enum EquityRebalanceType<'a> {
     Mint {
         symbol: &'a str,
         tokenization: &'a AlpacaTokenizationMock,
-        unwrapped_token: Address,
     },
     Redeem {
         symbol: &'a str,
         tokenization: &'a AlpacaTokenizationMock,
-        unwrapped_token: Address,
         redemption_wallet_balance_before: U256,
         redemption_wallet_balance_after: U256,
     },
@@ -742,49 +741,80 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     Ok(())
 }
 
-async fn assert_base_wallet_equity_snapshot<P: Provider>(
-    pool: &SqlitePool,
-    provider: &P,
-    owner: Address,
-    expected_tokens: &[(&str, Address)],
+pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    symbol: &str,
+    expected_unwrapped_balance: FractionalShares,
+    wrapped_balance: FractionalShares,
 ) -> anyhow::Result<()> {
-    let events = fetch_events_by_type(pool, "InventorySnapshot").await?;
-    let last_base_wallet_equity = events
-        .iter()
-        .rev()
-        .find(|ev| ev.event_type == "InventorySnapshotEvent::BaseWalletEquity")
-        .ok_or_else(|| anyhow::anyhow!("Missing BaseWalletEquity event"))?;
-    let balances = last_base_wallet_equity
-        .payload
-        .get("BaseWalletEquity")
-        .and_then(|val| val.get("balances"))
-        .ok_or_else(|| anyhow::anyhow!("BaseWalletEquity payload missing balances"))?;
+    assert_ne!(
+        expected_unwrapped_balance, wrapped_balance,
+        "Wrapped and unwrapped balances must differ so BaseWalletEquity proves the unwrapped \
+         token address was polled"
+    );
 
-    for (symbol, token_addr) in expected_tokens {
-        let snapshot_balance_str = balances
-            .get(*symbol)
-            .and_then(|val| val.as_str())
-            .unwrap_or_else(|| panic!("BaseWalletEquity missing symbol {symbol}, got: {balances}"));
-        let snapshot_balance: FractionalShares = snapshot_balance_str.parse().map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to parse BaseWalletEquity balance '{snapshot_balance_str}' for \
-                     {symbol}: {error}"
-            )
-        })?;
-        let actual_balance_raw = crate::base_chain::IERC20::new(*token_addr, provider)
-            .balanceOf(owner)
-            .call()
-            .await?;
-        let actual_balance = FractionalShares::from_u256_18_decimals(actual_balance_raw)?;
+    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context =
+        format!("BaseWalletEquity snapshot for {symbol} matching {expected_unwrapped_balance}");
 
-        assert_eq!(
-            snapshot_balance, actual_balance,
-            "BaseWalletEquity mismatch for {symbol}: snapshot={snapshot_balance}, \
-             onchain={actual_balance}"
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = connect_db(db_path).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let events = fetch_events_by_type(&pool, "InventorySnapshot").await;
+        pool.close().await;
+
+        let snapshot_balance = match events {
+            Ok(events) => events
+                .iter()
+                .rev()
+                .find(|event| event.event_type == "InventorySnapshotEvent::BaseWalletEquity")
+                .and_then(|event| {
+                    event
+                        .payload
+                        .get("BaseWalletEquity")
+                        .and_then(|value| value.get("balances"))
+                        .and_then(|balances| balances.get(symbol))
+                        .and_then(|value| value.as_str())
+                })
+                .map(|balance_str| {
+                    balance_str.parse::<FractionalShares>().map_err(|error| {
+                        anyhow::anyhow!(
+                            "Failed to parse BaseWalletEquity balance '{balance_str}' for \
+                             {symbol}: {error}"
+                        )
+                    })
+                })
+                .transpose()?,
+            Err(error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "Timed out after {timeout:?} waiting for {context} \
+                     (query failed: {error})",
+                );
+                continue;
+            }
+        };
+
+        if snapshot_balance == Some(expected_unwrapped_balance) {
+            return Ok(());
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context} \
+             (found latest snapshot balance {snapshot_balance:?}, wrapped balance {wrapped_balance})",
         );
     }
-
-    Ok(())
 }
 
 #[bon::builder]
@@ -805,22 +835,12 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
 
     let pool = connect_db(db_path).await?;
 
-    let (equity_symbol, unwrapped_token) = match &rebalance_type {
-        EquityRebalanceType::Mint {
-            symbol,
-            unwrapped_token,
-            ..
+    let equity_symbol = match &rebalance_type {
+        EquityRebalanceType::Mint { symbol, .. } | EquityRebalanceType::Redeem { symbol, .. } => {
+            *symbol
         }
-        | EquityRebalanceType::Redeem {
-            symbol,
-            unwrapped_token,
-            ..
-        } => (*symbol, *unwrapped_token),
     };
-    let expected_base_wallet_tokens = [(equity_symbol, unwrapped_token)];
     assert_inventory_snapshots(&pool, orderbook, owner, &[equity_symbol], false).await?;
-    assert_base_wallet_equity_snapshot(&pool, provider, owner, &expected_base_wallet_tokens)
-        .await?;
 
     match rebalance_type {
         EquityRebalanceType::Mint {
