@@ -1689,6 +1689,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_and_record_propagates_base_wallet_unwrapped_equity_shares_conversion_failure() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        let equity_encoded = alloy::hex::encode_prefixed(U256::MAX.abi_encode());
+        asserter.push_success(&usdc_encoded); // USDC balanceOf succeeds
+        asserter.push_success(&equity_encoded); // equity balanceOf overflows conversion
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut equity_tokens = HashMap::new();
+        equity_tokens.insert(
+            test_symbol("AAPL"),
+            address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: equity_tokens,
+                wrapped_equity_token_addresses: HashMap::new(),
+            },
+        );
+
+        let error = service.poll_and_record().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                InventoryPollingError::SharesConversion(SharesConversionError::DecimalConversion(
+                    _
+                ))
+            ),
+            "Expected shares conversion error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn poll_and_record_emits_base_wallet_wrapped_equity_when_wallet_and_tokens_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
