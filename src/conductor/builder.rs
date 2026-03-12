@@ -23,7 +23,7 @@ use super::{
 };
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingConfig};
+use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
@@ -71,7 +71,7 @@ pub(crate) struct WithDexStreams {
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
-    wallet_polling: WalletPollingConfig,
+    wallet_polling: WalletPollingCtx,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -144,7 +144,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_sender,
                 event_receiver,
                 rebalancer: None,
-                wallet_polling: WalletPollingConfig {
+                wallet_polling: WalletPollingCtx {
                     ethereum: None,
                     base: None,
                     unwrapped_equity_token_addresses: HashMap::new(),

@@ -50,7 +50,7 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     SharesConversion(#[from] SharesConversionError),
 }
 
-pub(crate) struct WalletPollingConfig {
+pub(crate) struct WalletPollingCtx {
     pub(crate) ethereum: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
     pub(crate) base: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
     pub(crate) unwrapped_equity_token_addresses: HashMap<Symbol, Address>,
@@ -68,7 +68,7 @@ where
     orderbook: Address,
     order_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
-    wallet_polling: WalletPollingConfig,
+    wallet_polling: WalletPollingCtx,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -83,7 +83,7 @@ where
         orderbook: Address,
         order_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
-        wallet_polling: WalletPollingConfig,
+        wallet_polling: WalletPollingCtx,
     ) -> Self {
         Self {
             raindex_service,
@@ -597,7 +597,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -649,7 +649,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -697,7 +697,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -736,7 +736,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -797,7 +797,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -850,7 +850,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -897,7 +897,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -995,7 +995,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1049,7 +1049,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1104,7 +1104,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1158,7 +1158,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1195,7 +1195,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1260,7 +1260,7 @@ mod tests {
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
         let asserter = Asserter::new();
-        let encoded = format!("0x{}", alloy::hex::encode(raw_usdc.abi_encode()));
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
         asserter.push_success(&encoded);
         let ethereum_wallet = MockEthereumWallet::with_asserter(&asserter);
 
@@ -1273,7 +1273,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: Some(ethereum_wallet),
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1305,7 +1305,7 @@ mod tests {
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
         let asserter = Asserter::new();
-        let encoded = format!("0x{}", alloy::hex::encode(raw_usdc.abi_encode()));
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
         asserter.push_success(&encoded);
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
 
@@ -1318,7 +1318,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1359,7 +1359,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1401,7 +1401,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1446,7 +1446,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: Some(ethereum_wallet),
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1478,7 +1478,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1500,9 +1500,9 @@ mod tests {
         let token_addr = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let raw_balance = U256::from(500_000u64) * U256::from(10u64).pow(U256::from(18u64)); // 500,000 tokens (18 decimals)
         let asserter = Asserter::new();
-        let usdc_encoded = format!("0x{}", alloy::hex::encode(U256::ZERO.abi_encode()));
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
         asserter.push_success(&usdc_encoded); // USDC balanceOf (zero)
-        let equity_encoded = format!("0x{}", alloy::hex::encode(raw_balance.abi_encode()));
+        let equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
         asserter.push_success(&equity_encoded); // equity token balanceOf
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
 
@@ -1518,7 +1518,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: equity_tokens,
@@ -1568,7 +1568,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1605,7 +1605,7 @@ mod tests {
 
         let raw_usdc = U256::from(1_000_000u64); // 1 USDC
         let asserter = Asserter::new();
-        let encoded = format!("0x{}", alloy::hex::encode(raw_usdc.abi_encode()));
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
         asserter.push_success(&encoded);
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
 
@@ -1618,7 +1618,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1653,7 +1653,7 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
-        let usdc_encoded = format!("0x{}", alloy::hex::encode(U256::ZERO.abi_encode()));
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
         asserter.push_success(&usdc_encoded); // USDC balanceOf succeeds
         asserter.push_failure_msg("Equity RPC failure"); // equity balanceOf fails
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
@@ -1673,7 +1673,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: equity_tokens,

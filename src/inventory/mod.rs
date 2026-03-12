@@ -5,7 +5,7 @@ pub(crate) mod snapshot;
 mod venue_balance;
 pub(crate) mod view;
 
-pub(crate) use polling::{InventoryPollingService, WalletPollingConfig};
+pub(crate) use polling::{InventoryPollingService, WalletPollingCtx};
 pub(crate) use snapshot::InventorySnapshot;
 pub use view::ImbalanceThreshold;
 pub(crate) use view::{
