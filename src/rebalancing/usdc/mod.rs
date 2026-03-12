@@ -8,7 +8,7 @@ mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
 
-pub(crate) use manager::CrossVenueCashTransfer;
+pub(crate) use manager::{CrossVenueCashTransfer, u256_to_usdc};
 
 use alloy::primitives::ruint::FromUintError;
 use thiserror::Error;

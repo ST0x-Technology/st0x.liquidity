@@ -139,7 +139,17 @@ impl BaseChain<()> {
 
         // Place USDC contract at the canonical USDC_BASE address so vault
         // discovery and all downstream code recognizes it.
-        deploy_usdc_at_base(&provider, owner).await?;
+        deploy_usdc_at(&provider, USDC_BASE, owner).await?;
+
+        // Place USDC at the canonical USDC_ETHEREUM address so the
+        // inventory poller can call balanceOf when an ethereum_wallet
+        // shares this Anvil provider (equity e2e tests).
+        deploy_usdc_at(&provider, crate::cctp::USDC_ETHEREUM, owner).await?;
+
+        // Place USDC at the canonical USDC_ETHEREUM address so the
+        // inventory poller can call balanceOf when an ethereum_wallet
+        // shares this Anvil provider (equity e2e tests).
+        deploy_usdc_at(&provider, crate::cctp::USDC_ETHEREUM, owner).await?;
 
         provider
             .anvil_set_code(
@@ -813,41 +823,48 @@ impl<P: Provider + Clone> BaseChain<P> {
     }
 }
 
-/// Deploys a USDC ERC20 at the canonical `USDC_BASE` address using
-/// `anvil_set_code` with `DeployableERC20` bytecode, then initialises
-/// OpenZeppelin storage slots (totalSupply, name, symbol, decimals) and
-/// gives the owner 1B USDC.
-async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) -> anyhow::Result<()> {
+/// Deploys a USDC ERC20 at the given address using `anvil_set_code` with
+/// `DeployableERC20` bytecode, then initialises OpenZeppelin storage slots
+/// (totalSupply, name, symbol, decimals) and gives the owner 1B USDC.
+async fn deploy_usdc_at<P: Provider>(
+    provider: &P,
+    usdc_address: Address,
+    owner: Address,
+) -> anyhow::Result<()> {
     let total_supply = U256::from(1_000_000_000_000u64);
 
     provider
-        .anvil_set_code(USDC_BASE, DeployableERC20::DEPLOYED_BYTECODE.clone())
+        .anvil_set_code(usdc_address, DeployableERC20::DEPLOYED_BYTECODE.clone())
         .await?;
 
     // Slot 2: _totalSupply
     provider
-        .anvil_set_storage_at(USDC_BASE, U256::from(2), total_supply.into())
+        .anvil_set_storage_at(usdc_address, U256::from(2), total_supply.into())
         .await?;
 
     // Slot 3: _name = "USD Coin"
     provider
-        .anvil_set_storage_at(USDC_BASE, U256::from(3), solidity_short_string(b"USD Coin"))
+        .anvil_set_storage_at(
+            usdc_address,
+            U256::from(3),
+            solidity_short_string(b"USD Coin"),
+        )
         .await?;
 
     // Slot 4: _symbol = "USDC"
     provider
-        .anvil_set_storage_at(USDC_BASE, U256::from(4), solidity_short_string(b"USDC"))
+        .anvil_set_storage_at(usdc_address, U256::from(4), solidity_short_string(b"USDC"))
         .await?;
 
     // Slot 5: _decimals = 6
     provider
-        .anvil_set_storage_at(USDC_BASE, U256::from(5), U256::from(6).into())
+        .anvil_set_storage_at(usdc_address, U256::from(5), U256::from(6).into())
         .await?;
 
     // _balances[owner] at slot 0 (OpenZeppelin ERC20 layout)
     let balance_slot = evm_mapping_slot(owner, USDC_BALANCES_SLOT);
     provider
-        .anvil_set_storage_at(USDC_BASE, balance_slot, total_supply.into())
+        .anvil_set_storage_at(usdc_address, balance_slot, total_supply.into())
         .await?;
 
     Ok(())

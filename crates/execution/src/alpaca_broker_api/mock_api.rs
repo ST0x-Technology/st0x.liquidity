@@ -756,9 +756,12 @@ fn handle_crypto_order(
     quantity: Decimal,
     side: OrderSide,
 ) -> HttpMockResponse {
+    // USDC has 6 decimal places; USD cash settles in whole cents.
+    let filled_quantity = quantity.round_dp(6);
+    let cash_delta = quantity.round_dp(2);
     match side {
-        OrderSide::Buy => state.account.cash -= quantity,
-        OrderSide::Sell => state.account.cash += quantity,
+        OrderSide::Buy => state.account.cash -= cash_delta,
+        OrderSide::Sell => state.account.cash += cash_delta,
     }
 
     let fill_price = Decimal::ONE;
@@ -767,7 +770,7 @@ fn handle_crypto_order(
         order_id.to_string(),
         MockOrder {
             symbol: symbol.to_string(),
-            quantity,
+            quantity: filled_quantity,
             side,
             status: OrderStatus::Filled,
             poll_count: 0,
@@ -780,11 +783,11 @@ fn handle_crypto_order(
         &json!({
             "id": order_id,
             "symbol": symbol,
-            "qty": quantity.to_string(),
+            "qty": filled_quantity.to_string(),
             "side": side.to_string(),
             "status": "filled",
             "filled_avg_price": fill_price.to_string(),
-            "filled_qty": quantity.to_string(),
+            "filled_qty": filled_quantity.to_string(),
             "created_at": "2025-01-06T12:00:00Z"
         }),
     )

@@ -1104,6 +1104,43 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     Ok(())
 }
 
+/// Asserts that at least one `EthereumCash` inventory snapshot was emitted.
+pub(crate) async fn assert_ethereum_cash_event_exists(
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let pool = connect_db(db_path).await?;
+    let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+
+    let has_ethereum_cash = events
+        .iter()
+        .any(|event| event.event_type == "InventorySnapshotEvent::EthereumCash");
+    assert!(
+        has_ethereum_cash,
+        "Expected EthereumCash snapshot from Ethereum wallet polling"
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
+pub(crate) async fn assert_base_wallet_cash_event_exists(
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let pool = connect_db(db_path).await?;
+    let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+
+    let has_base_wallet_cash = events
+        .iter()
+        .any(|event| event.event_type == "InventorySnapshotEvent::BaseWalletCash");
+    assert!(
+        has_base_wallet_cash,
+        "Expected BaseWalletCash snapshot from Base wallet polling"
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
 #[bon::builder]
 pub(crate) async fn assert_usdc_rebalancing_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],

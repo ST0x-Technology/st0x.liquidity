@@ -32,9 +32,7 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::inventory::{
-    BaseWalletPollingConfig, InventoryPollingService, InventorySnapshot, InventoryView,
-};
+use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -187,16 +185,14 @@ impl Conductor {
                 Err(error) => return Err(error.into()),
             };
 
-            let base_wallet_for_polling = rebalancing.as_ref().map(|ctx| ctx.base_wallet().clone());
-
-            let (position, position_projection, snapshot, rebalancer) =
+            let (position, position_projection, snapshot, rebalancer, ethereum_wallet, base_wallet) =
                 if let Some(rebalancing_ctx) = rebalancing {
                     let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
                     let base_wallet = rebalancing_ctx.base_wallet().clone();
                     let infra = spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
-                        ethereum_wallet,
-                        base_wallet,
+                        ethereum_wallet.clone(),
+                        base_wallet.clone(),
                         RebalancingDeps {
                             pool: pool.clone(),
                             ctx: ctx.clone(),
@@ -213,13 +209,15 @@ impl Conductor {
                         infra.position_projection,
                         infra.snapshot,
                         Some(infra.rebalancer),
+                        Some(ethereum_wallet),
+                        Some(base_wallet),
                     )
                 } else {
                     let (position, position_projection) = build_position_cqrs(&pool).await?;
                     let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                         .build(())
                         .await?;
-                    (position, position_projection, snapshot, None)
+                    (position, position_projection, snapshot, None, None, None)
                 };
 
             let order_placer: Arc<dyn OrderPlacer> =
@@ -253,11 +251,15 @@ impl Conductor {
             .with_executor_maintenance(executor_maintenance)
             .with_dex_event_streams(clear_stream, take_stream);
 
+            if let Some(wallet) = ethereum_wallet {
+                builder = builder.with_ethereum_wallet(wallet);
+            }
+
             if let Some(rebalancer_handle) = rebalancer {
                 builder = builder.with_rebalancer(rebalancer_handle);
             }
 
-            if let Some(wallet) = base_wallet_for_polling {
+            if let Some(wallet) = base_wallet {
                 let equity_token_addresses = ctx
                     .assets
                     .equities
@@ -265,10 +267,7 @@ impl Conductor {
                     .iter()
                     .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
                     .collect();
-                builder = builder.with_base_wallet(BaseWalletPollingConfig {
-                    wallet,
-                    equity_token_addresses,
-                });
+                builder = builder.with_base_wallet(wallet, equity_token_addresses);
             }
 
             Ok(builder.spawn())

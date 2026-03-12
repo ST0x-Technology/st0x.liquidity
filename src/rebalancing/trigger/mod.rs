@@ -473,7 +473,9 @@ impl RebalancingTrigger {
                         .update_usdc(Inventory::on_snapshot(Venue::Hedging, usdc), now)
                 }
 
-                BaseWalletCash { .. } | BaseWalletEquity { .. } => Ok(inventory.clone()),
+                EthereumCash { .. } | BaseWalletCash { .. } | BaseWalletEquity { .. } => {
+                    Ok(inventory.clone())
+                }
             }?;
 
         *inventory = updated;
@@ -563,7 +565,9 @@ impl RebalancingTrigger {
                     )
                 }
 
-                BaseWalletCash { .. } | BaseWalletEquity { .. } => Ok(inventory.clone()),
+                EthereumCash { .. } | BaseWalletCash { .. } | BaseWalletEquity { .. } => {
+                    Ok(inventory.clone())
+                }
             }?;
 
         *inventory = updated;
@@ -595,7 +599,7 @@ impl RebalancingTrigger {
             OnchainCash { .. } | OffchainCash { .. } => {
                 self.check_and_trigger_usdc().await;
             }
-            BaseWalletCash { .. } | BaseWalletEquity { .. } => {}
+            EthereumCash { .. } | BaseWalletCash { .. } | BaseWalletEquity { .. } => {}
         }
 
         Ok(())

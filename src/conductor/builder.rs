@@ -1,18 +1,20 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
-use alloy::providers::Provider;
+use alloy::primitives::Address;
+use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_event_sorcery::{Projection, Store};
-use st0x_evm::ReadOnlyEvm;
-use st0x_execution::Executor;
+use st0x_evm::{ReadOnlyEvm, Wallet};
+use st0x_execution::{Executor, Symbol};
 
 use super::{
     Conductor, EventProcessingError, TradingTasks, spawn_event_processor, spawn_inventory_poller,
@@ -21,7 +23,7 @@ use super::{
 };
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::{BaseWalletPollingConfig, InventoryPollingService, InventorySnapshot};
+use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingConfig};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
@@ -69,7 +71,7 @@ pub(crate) struct WithDexStreams {
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
-    base_wallet: Option<BaseWalletPollingConfig>,
+    wallet_polling: WalletPollingConfig,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -142,7 +144,11 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_sender,
                 event_receiver,
                 rebalancer: None,
-                base_wallet: None,
+                wallet_polling: WalletPollingConfig {
+                    ethereum: None,
+                    base: None,
+                    equity_token_addresses: HashMap::new(),
+                },
             },
         }
     }
@@ -159,8 +165,21 @@ where
         self
     }
 
-    pub(crate) fn with_base_wallet(mut self, config: BaseWalletPollingConfig) -> Self {
-        self.state.base_wallet = Some(config);
+    pub(crate) fn with_ethereum_wallet(
+        mut self,
+        wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        self.state.wallet_polling.ethereum = Some(wallet);
+        self
+    }
+
+    pub(crate) fn with_base_wallet(
+        mut self,
+        wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        equity_token_addresses: HashMap<Symbol, Address>,
+    ) -> Self {
+        self.state.wallet_polling.base = Some(wallet);
+        self.state.wallet_polling.equity_token_addresses = equity_token_addresses;
         self
     }
 
@@ -189,7 +208,7 @@ where
             self.common.ctx.evm.orderbook,
             order_owner,
             self.common.frameworks.snapshot,
-            self.state.base_wallet,
+            self.state.wallet_polling,
         );
         let inventory_poller = Some(spawn_inventory_poller(
             polling_service,
