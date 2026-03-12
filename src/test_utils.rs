@@ -163,7 +163,6 @@ impl OnchainTradeBuilder {
     pub(crate) fn new() -> Self {
         Self {
             trade: OnchainTrade {
-                id: None,
                 tx_hash: fixed_bytes!(
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
@@ -176,13 +175,9 @@ impl OnchainTradeBuilder {
                 direction: Direction::Buy,
                 price: Usdc::new(Float::parse("150".to_string()).unwrap()).unwrap(),
                 block_timestamp: Some(Utc::now()),
-                created_at: None,
                 gas_used: None,
                 effective_gas_price: None,
                 pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
             },
         }
     }

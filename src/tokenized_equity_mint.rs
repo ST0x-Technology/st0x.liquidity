@@ -130,6 +130,15 @@ pub(crate) enum TokenizedEquityMintError {
     /// Completed mint response missing tx_hash
     #[error("Missing tx_hash in completed mint response")]
     MissingTxHash,
+    /// Alpaca returned a token symbol that doesn't match the requested symbol
+    #[error(
+        "Token symbol mismatch: expected t{expected_symbol} \
+         but Alpaca returned {actual_token_symbol}"
+    )]
+    TokenSymbolMismatch {
+        expected_symbol: Symbol,
+        actual_token_symbol: String,
+    },
     /// Negative quantity is invalid for minting
     #[error("Negative quantity: {value:?}")]
     NegativeQuantity {
@@ -171,6 +180,16 @@ impl PartialEq for TokenizedEquityMintError {
             (Self::NegativeQuantity { value: a }, Self::NegativeQuantity { value: b }) => {
                 a.eq(*b).unwrap_or(false)
             }
+            (
+                Self::TokenSymbolMismatch {
+                    expected_symbol: exp_a,
+                    actual_token_symbol: act_a,
+                },
+                Self::TokenSymbolMismatch {
+                    expected_symbol: exp_b,
+                    actual_token_symbol: act_b,
+                },
+            ) => exp_a == exp_b && act_a == act_b,
             _ => false,
         }
     }
@@ -251,6 +270,13 @@ pub(crate) enum TokenizedEquityMintEvent {
         tx_hash: TxHash,
         receipt_id: ReceiptId,
         shares_minted: U256,
+        /// Tokenization fees charged by Alpaca (if reported).
+        #[serde(
+            default,
+            serialize_with = "crate::float_serde::serialize_option_float",
+            deserialize_with = "crate::float_serde::deserialize_option_float_from_number_or_string"
+        )]
+        fees: Option<Float>,
         received_at: DateTime<Utc>,
     },
 
@@ -353,15 +379,27 @@ impl PartialEq for TokenizedEquityMintEvent {
                     tx_hash: hash_a,
                     receipt_id: rcpt_a,
                     shares_minted: mint_a,
+                    fees: fees_a,
                     received_at: time_a,
                 },
                 Self::TokensReceived {
                     tx_hash: hash_b,
                     receipt_id: rcpt_b,
                     shares_minted: mint_b,
+                    fees: fees_b,
                     received_at: time_b,
                 },
-            ) => hash_a == hash_b && rcpt_a == rcpt_b && mint_a == mint_b && time_a == time_b,
+            ) => {
+                hash_a == hash_b
+                    && rcpt_a == rcpt_b
+                    && mint_a == mint_b
+                    && match (fees_a, fees_b) {
+                        (Some(a), Some(b)) => a.eq(*b).unwrap_or(false),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                    && time_a == time_b
+            }
             (
                 Self::TokensWrapped {
                     wrap_tx_hash: hash_a,
@@ -477,6 +515,12 @@ pub(crate) enum TokenizedEquityMint {
         tx_hash: TxHash,
         receipt_id: ReceiptId,
         shares_minted: U256,
+        #[serde(
+            default,
+            serialize_with = "crate::float_serde::serialize_option_float",
+            deserialize_with = "crate::float_serde::deserialize_option_float_from_number_or_string"
+        )]
+        fees: Option<Float>,
         requested_at: DateTime<Utc>,
         accepted_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
@@ -598,6 +642,7 @@ impl PartialEq for TokenizedEquityMint {
                     tx_hash: hash_a,
                     receipt_id: rcpt_a,
                     shares_minted: mint_a,
+                    fees: fees_a,
                     requested_at: req_a,
                     accepted_at: acc_a,
                     received_at: recv_a,
@@ -611,6 +656,7 @@ impl PartialEq for TokenizedEquityMint {
                     tx_hash: hash_b,
                     receipt_id: rcpt_b,
                     shares_minted: mint_b,
+                    fees: fees_b,
                     requested_at: req_b,
                     accepted_at: acc_b,
                     received_at: recv_b,
@@ -624,6 +670,11 @@ impl PartialEq for TokenizedEquityMint {
                     && hash_a == hash_b
                     && rcpt_a == rcpt_b
                     && mint_a == mint_b
+                    && match (fees_a, fees_b) {
+                        (Some(a), Some(b)) => a.eq(*b).unwrap_or(false),
+                        (None, None) => true,
+                        _ => false,
+                    }
                     && req_a == req_b
                     && acc_a == acc_b
                     && recv_a == recv_b
@@ -781,12 +832,11 @@ impl EventSourced for TokenizedEquityMint {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use TokenizedEquityMintEvent::*;
-
         Ok(match event {
             MintRequested { .. } => None,
-
             WrappingFailed {
                 symbol,
                 quantity,
@@ -795,7 +845,6 @@ impl EventSourced for TokenizedEquityMint {
                 let Self::TokensReceived { requested_at, .. } = entity else {
                     return Ok(None);
                 };
-
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
@@ -804,7 +853,6 @@ impl EventSourced for TokenizedEquityMint {
                     failed_at: *failed_at,
                 })
             }
-
             MintRejected {
                 reason,
                 rejected_at,
@@ -818,7 +866,6 @@ impl EventSourced for TokenizedEquityMint {
                 else {
                     return Ok(None);
                 };
-
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
@@ -878,6 +925,7 @@ impl EventSourced for TokenizedEquityMint {
                 tx_hash,
                 receipt_id,
                 shares_minted,
+                fees,
                 received_at,
             } => {
                 let Self::MintAccepted {
@@ -902,6 +950,7 @@ impl EventSourced for TokenizedEquityMint {
                     tx_hash: *tx_hash,
                     receipt_id: receipt_id.clone(),
                     shares_minted: *shares_minted,
+                    fees: *fees,
                     requested_at: *requested_at,
                     accepted_at: *accepted_at,
                     received_at: *received_at,
@@ -925,6 +974,7 @@ impl EventSourced for TokenizedEquityMint {
                     requested_at,
                     accepted_at,
                     received_at,
+                    ..
                 } = entity
                 else {
                     return Ok(None);
@@ -1078,6 +1128,7 @@ impl EventSourced for TokenizedEquityMint {
 
             TokenizedEquityMintCommand::Poll => match self {
                 Self::MintAccepted {
+                    symbol,
                     quantity,
                     tokenization_request_id,
                     ..
@@ -1102,12 +1153,26 @@ impl EventSourced for TokenizedEquityMint {
                             let tx_hash = completed
                                 .tx_hash
                                 .ok_or(TokenizedEquityMintError::MissingTxHash)?;
+
+                            // Validate that Alpaca returned the expected
+                            // tokenized symbol (e.g. "tAAPL" for AAPL).
+                            let expected_token_symbol = format!("t{symbol}");
+                            if let Some(actual) = &completed.token_symbol
+                                && *actual != expected_token_symbol
+                            {
+                                return Err(TokenizedEquityMintError::TokenSymbolMismatch {
+                                    expected_symbol: symbol.clone(),
+                                    actual_token_symbol: actual.clone(),
+                                });
+                            }
+
                             let shares_minted = quantity_to_u256_18_decimals(*quantity)?;
 
                             Ok(vec![TokensReceived {
                                 tx_hash,
                                 receipt_id: ReceiptId(U256::ZERO),
                                 shares_minted,
+                                fees: completed.fees,
                                 received_at: Utc::now(),
                             }])
                         }
@@ -1218,6 +1283,7 @@ mod tests {
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            fees: None,
             received_at: Utc::now(),
         }
     }
@@ -1281,6 +1347,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_completed_with_wrong_token_symbol_errors() {
+        let tokenizer = MockTokenizer::new().with_token_symbol_override("tGME");
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        let error = store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    TokenizedEquityMintError::TokenSymbolMismatch {
+                        ref expected_symbol,
+                        ref actual_token_symbol,
+                    }
+                )) if expected_symbol == &Symbol::new("AAPL").unwrap()
+                    && actual_token_symbol == "tGME"
+            ),
+            "Expected TokenSymbolMismatch, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn poll_rejected_emits_acceptance_failed() {
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
@@ -1335,6 +1428,7 @@ mod tests {
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            fees: None,
             received_at: Utc::now(),
         };
 
@@ -1595,6 +1689,7 @@ mod tests {
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(1)),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
+            fees: None,
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
             received_at: Utc::now(),

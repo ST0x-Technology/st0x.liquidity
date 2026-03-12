@@ -66,6 +66,8 @@ pub(crate) struct MockTokenizer {
     verification_outcome: MockVerificationOutcome,
     should_fail_send: bool,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
+    /// Override the token_symbol in completed mint responses.
+    token_symbol_override: Option<String>,
 }
 
 impl MockTokenizer {
@@ -80,6 +82,7 @@ impl MockTokenizer {
             verification_outcome: MockVerificationOutcome::Success,
             should_fail_send: false,
             last_issuer_request_id: Mutex::new(None),
+            token_symbol_override: None,
         }
     }
 
@@ -110,6 +113,11 @@ impl MockTokenizer {
 
     pub(crate) fn with_send_failure(mut self) -> Self {
         self.should_fail_send = true;
+        self
+    }
+
+    pub(crate) fn with_token_symbol_override(mut self, symbol: impl Into<String>) -> Self {
+        self.token_symbol_override = Some(symbol.into());
         self
     }
 
@@ -150,7 +158,13 @@ impl Tokenizer for MockTokenizer {
         _id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
         match self.mint_poll_outcome {
-            MockMintPollOutcome::Completed => Ok(TokenizationRequest::mock_completed()),
+            MockMintPollOutcome::Completed => {
+                let mut request = TokenizationRequest::mock_completed();
+                if let Some(override_symbol) = &self.token_symbol_override {
+                    request.token_symbol = Some(override_symbol.clone());
+                }
+                Ok(request)
+            }
             MockMintPollOutcome::Rejected => Ok(TokenizationRequest::mock(
                 TokenizationRequestStatus::Rejected,
             )),

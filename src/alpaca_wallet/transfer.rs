@@ -101,8 +101,6 @@ pub(crate) struct Transfer {
     pub(crate) direction: TransferDirection,
     #[serde(deserialize_with = "deserialize_float_from_string")]
     pub(crate) amount: Float,
-    #[serde(deserialize_with = "deserialize_float_from_string")]
-    pub(crate) usd_value: Float,
     pub(crate) chain: String,
     pub(crate) asset: TokenSymbol,
     #[serde(rename = "from_address")]
@@ -111,10 +109,6 @@ pub(crate) struct Transfer {
     pub(crate) to: Address,
     pub(crate) status: TransferStatus,
     pub(crate) created_at: DateTime<Utc>,
-    #[serde(deserialize_with = "deserialize_float_from_string")]
-    pub(crate) network_fee: Float,
-    #[serde(deserialize_with = "deserialize_float_from_string")]
-    pub(crate) fees: Float,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -344,7 +338,6 @@ mod tests {
         assert_eq!(transfer.asset.as_ref(), "USDC");
         assert_eq!(transfer.to, expected_address);
         assert_eq!(transfer.status, TransferStatus::Pending);
-        assert!(transfer.network_fee.eq(float!("0.5")).unwrap());
 
         withdrawal_mock.assert();
     }

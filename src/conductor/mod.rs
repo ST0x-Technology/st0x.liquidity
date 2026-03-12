@@ -1161,6 +1161,38 @@ async fn execute_witness_trade(
     }
 }
 
+async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &OnchainTrade) {
+    let (Some(gas_used), Some(effective_gas_price), Some(pyth_price)) = (
+        trade.gas_used,
+        trade.effective_gas_price,
+        trade.pyth_price.clone(),
+    ) else {
+        return;
+    };
+
+    let trade_id = OnChainTradeId {
+        tx_hash: trade.tx_hash,
+        log_index: trade.log_index,
+    };
+
+    let command = OnChainTradeCommand::Enrich {
+        gas_used,
+        effective_gas_price,
+        pyth_price,
+    };
+
+    match onchain_trade.send(&trade_id, command).await {
+        Ok(()) => info!(
+            "Successfully executed OnChainTrade::Enrich command: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        ),
+        Err(error) => error!(
+            "Failed to execute OnChainTrade::Enrich command: {error}, tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        ),
+    }
+}
+
 async fn execute_acknowledge_fill(
     position: &Store<Position>,
     trade: &OnchainTrade,
@@ -1224,6 +1256,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     );
 
     execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
+    execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
 
     let base_symbol = trade.symbol.base();
 

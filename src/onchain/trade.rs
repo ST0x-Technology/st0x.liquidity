@@ -17,12 +17,13 @@ use tracing::{error, warn};
 use st0x_evm::Evm;
 use st0x_execution::{Direction, FractionalShares, HasZero};
 
-use super::pyth::PythPricing;
+use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
 use crate::bindings::IOrderBookV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::EvmCtx;
 use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain_trade::PythPrice;
 use crate::symbol::cache::SymbolCache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +137,6 @@ pub(crate) fn extract_owned_vaults(
 
 #[derive(Debug, Clone)]
 pub struct OnchainTrade {
-    pub(crate) id: Option<i64>,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedSymbol<WrappedTokenizedShares>,
@@ -145,13 +145,9 @@ pub struct OnchainTrade {
     pub(crate) direction: Direction,
     pub(crate) price: Usdc,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
-    pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) gas_used: Option<u64>,
     pub(crate) effective_gas_price: Option<u128>,
-    pub(crate) pyth_price: Option<Float>,
-    pub(crate) pyth_confidence: Option<Float>,
-    pub(crate) pyth_exponent: Option<i32>,
-    pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
+    pub(crate) pyth_price: Option<PythPrice>,
 }
 
 impl OnchainTrade {
@@ -167,7 +163,6 @@ impl OnchainTrade {
         let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
         let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
 
-        // Fetch transaction receipt to get gas information
         let receipt = evm.provider().get_transaction_receipt(tx_hash).await?;
         let (gas_used, effective_gas_price) = match receipt {
             Some(receipt) => (Some(receipt.gas_used), Some(receipt.effective_gas_price)),
@@ -217,15 +212,16 @@ impl OnchainTrade {
         };
         let equity_symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse(&equity_symbol_str)?;
 
-        let pyth_pricing = match PythPricing::try_from_tx_hash(
+        let pyth_price = match extract_pyth_price(
             tx_hash,
             evm.provider(),
             &equity_symbol.base().to_string(),
             feed_id_cache,
         )
         .await
+        .and_then(|raw_price| raw_price_to_pyth_price(&raw_price))
         {
-            Ok(pricing) => Some(pricing),
+            Ok(pyth_price) => Some(pyth_price),
             Err(error) => {
                 error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {error}");
                 None
@@ -235,7 +231,6 @@ impl OnchainTrade {
         let price = Usdc::new(price_per_share_usdc)?;
 
         let trade = Self {
-            id: None,
             tx_hash,
             log_index,
             symbol: equity_symbol,
@@ -247,13 +242,9 @@ impl OnchainTrade {
                 let secs: i64 = timestamp_secs.try_into().ok()?;
                 DateTime::from_timestamp(secs, 0)
             }),
-            created_at: None,
             gas_used,
             effective_gas_price,
-            pyth_price: pyth_pricing.as_ref().map(|pricing| pricing.price),
-            pyth_confidence: pyth_pricing.as_ref().map(|pricing| pricing.confidence),
-            pyth_exponent: pyth_pricing.as_ref().map(|pricing| pricing.exponent),
-            pyth_publish_time: pyth_pricing.as_ref().map(|pricing| pricing.publish_time),
+            pyth_price,
         };
 
         Ok(Some(trade))
