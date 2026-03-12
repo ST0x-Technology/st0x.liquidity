@@ -182,7 +182,7 @@ enum BrokerSecrets {
 /// Encodes the two mutually exclusive operating modes at the type level.
 ///
 /// `Standalone`: order_owner comes from config, no rebalancing.
-/// `Rebalancing`: order_owner resolved from Fireblocks at runtime.
+/// `Rebalancing`: order_owner resolved from the wallet at runtime.
 #[derive(Clone, Debug)]
 pub enum TradingMode {
     Standalone { order_owner: Address },
@@ -462,7 +462,7 @@ impl Ctx {
                 ))
             }
             (Some(_), Some(_), Some(configured)) => {
-                return Err(CtxError::OrderOwnerConflictsWithFireblocks { configured });
+                return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
             }
             (None, None, Some(order_owner)) => TradingMode::Standalone { order_owner },
             (None, None, None) => return Err(CtxError::MissingOrderOwner),
@@ -524,8 +524,8 @@ impl Ctx {
     /// Returns the wallet address that owns orders on the orderbook.
     ///
     /// In `Standalone` mode this is the statically-configured order owner.
-    /// In `Rebalancing` mode this is the Fireblocks wallet address resolved
-    /// during async construction.
+    /// In `Rebalancing` mode this is the wallet address resolved during
+    /// async construction.
     pub(crate) fn order_owner(&self) -> Address {
         match &self.trading_mode {
             TradingMode::Standalone { order_owner } => *order_owner,
@@ -641,10 +641,10 @@ pub enum CtxError {
     #[error("rebalancing secrets present but rebalancing config missing in config")]
     RebalancingConfigMissing,
     #[error(
-        "order_owner {configured} must not be set when Fireblocks \
-         rebalancing is enabled (address is derived from vault)"
+        "order_owner {configured} must not be set when rebalancing \
+         is enabled (address comes from the configured wallet)"
     )]
-    OrderOwnerConflictsWithFireblocks { configured: Address },
+    OrderOwnerConflictsWithRebalancing { configured: Address },
     #[error(
         "assets.cash operational_limit {configured} is below Alpaca's \
          minimum withdrawal of {minimum}"
@@ -685,8 +685,8 @@ impl CtxError {
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",
-            Self::OrderOwnerConflictsWithFireblocks { .. } => {
-                "order_owner conflicts with fireblocks"
+            Self::OrderOwnerConflictsWithRebalancing { .. } => {
+                "order_owner conflicts with rebalancing"
             }
             Self::CashOperationalLimitBelowMinimumWithdrawal { .. } => {
                 "cash operational limit below minimum withdrawal"
@@ -949,8 +949,10 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+
+            [rebalancing.wallet]
+            type = "private-key"
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
 
@@ -970,12 +972,10 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
 
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
+            [rebalancing.wallet]
+            type = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
             target = "0.5"
@@ -1050,8 +1050,10 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+
+            [rebalancing.wallet]
+            type = "private-key"
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
 
@@ -1067,12 +1069,10 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
 
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
+            [rebalancing.wallet]
+            type = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
             target = "0.5"
@@ -1122,16 +1122,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn rebalancing_with_missing_secret_file_fails() {
-        let error = Ctx::load_files(example_config_toml(), example_secrets_toml())
+    async fn example_config_and_secrets_parse_successfully() {
+        let ctx = Ctx::load_files(example_config_toml(), example_secrets_toml())
             .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::FireblocksSecretRead { .. })
-            ),
-            "Expected FireblocksSecretRead IO error for non-existent secret file, got {error:?}"
+            .unwrap();
+
+        // Example configs enable rebalancing with a private-key wallet.
+        assert!(matches!(ctx.trading_mode, TradingMode::Rebalancing(_)));
+
+        // In rebalancing mode, order_owner is derived from the wallet key.
+        // The example key 0x0123...cdef derives to this address.
+        assert_eq!(
+            ctx.order_owner(),
+            address!("0xfcad0b19bb29d4674531d6f115237e16afce377c")
         );
     }
 
@@ -1157,11 +1160,10 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
 
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
+            [rebalancing.wallet]
+            type = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
             target = "0.5"
@@ -1178,8 +1180,8 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, CtxError::OrderOwnerConflictsWithFireblocks { .. }),
-            "Expected OrderOwnerConflictsWithFireblocks, got: {error:?}"
+            matches!(error, CtxError::OrderOwnerConflictsWithRebalancing { .. }),
+            "Expected OrderOwnerConflictsWithRebalancing, got: {error:?}"
         );
     }
 
@@ -1295,12 +1297,10 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
 
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
+            [rebalancing.wallet]
+            type = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
             target = "0.5"
@@ -1432,8 +1432,10 @@ pub(crate) mod tests {
             [rebalancing]
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
-            fireblocks_api_user_id = "test-user"
-            fireblocks_secret_path = "/tmp/test.key"
+
+            [rebalancing.wallet]
+            type = "private-key"
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
 
@@ -1449,12 +1451,10 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            fireblocks_vault_account_id = 0
-            fireblocks_environment = "sandbox"
 
-            [rebalancing.fireblocks_chain_asset_ids]
-            1 = "ETH"
-            8453 = "BASECHAIN_ETH"
+            [rebalancing.wallet]
+            type = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
             target = "0.5"

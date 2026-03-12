@@ -84,7 +84,8 @@
             body = ''
               set -euxo pipefail
               cargo check --workspace
-              cargo nextest run --workspace
+              cargo check --workspace --all-features
+              cargo nextest run --workspace --all-features
               cargo clippy --workspace --all-targets --all-features
               cargo fmt -- --check
             '';
