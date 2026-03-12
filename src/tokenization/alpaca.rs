@@ -42,7 +42,6 @@ use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
 use super::{MintVerificationError, Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
-use crate::onchain::io::{OneToOneTokenizedShares, TokenizedSymbol};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
@@ -269,12 +268,10 @@ pub(crate) struct TokenizationRequest {
     pub(crate) r#type: Option<TokenizationRequestType>,
     pub(crate) status: TokenizationRequestStatus,
     pub(crate) underlying_symbol: Symbol,
-    #[serde(deserialize_with = "deserialize_tokenized_symbol")]
-    pub(crate) token_symbol: Option<TokenizedSymbol<OneToOneTokenizedShares>>,
+    #[serde(default, deserialize_with = "deserialize_token_symbol")]
+    pub(crate) token_symbol: Option<String>,
     #[serde(rename = "qty")]
     pub(crate) quantity: FractionalShares,
-    issuer: Issuer,
-    network: Network,
     #[serde(rename = "wallet_address")]
     pub(crate) wallet: Option<Address>,
     pub(crate) issuer_request_id: Option<IssuerRequestId>,
@@ -285,9 +282,8 @@ pub(crate) struct TokenizationRequest {
         serialize_with = "st0x_float_serde::serialize_option_float",
         deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
     )]
-    fees: Option<Float>,
+    pub(crate) fees: Option<Float>,
     pub(crate) created_at: DateTime<Utc>,
-    updated_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -301,14 +297,11 @@ impl TokenizationRequest {
             underlying_symbol: Symbol::new("AAPL").unwrap(),
             token_symbol: None,
             quantity: FractionalShares::ZERO,
-            issuer: Issuer::new("alpaca"),
-            network: Network::new("base"),
             wallet: None,
             issuer_request_id: None,
             tx_hash: None,
             fees: None,
             created_at: Utc::now(),
-            updated_at: None,
         }
     }
 
@@ -319,30 +312,25 @@ impl TokenizationRequest {
             r#type: None,
             status: TokenizationRequestStatus::Completed,
             underlying_symbol: Symbol::new("AAPL").unwrap(),
-            token_symbol: None,
+            token_symbol: Some("tAAPL".to_string()),
             quantity: FractionalShares::ZERO,
-            issuer: Issuer::new("alpaca"),
-            network: Network::new("base"),
             wallet: None,
             issuer_request_id: None,
             tx_hash: Some(TxHash::ZERO),
             fees: None,
             created_at: Utc::now(),
-            updated_at: None,
         }
     }
 }
 
-fn deserialize_tokenized_symbol<'de, D>(
-    deserializer: D,
-) -> Result<Option<TokenizedSymbol<OneToOneTokenizedShares>>, D::Error>
+/// Deserialize token_symbol that may be an empty string
+/// (Alpaca returns "" before the symbol is assigned).
+fn deserialize_token_symbol<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.filter(|symbol_str| !symbol_str.is_empty())
-        .map(|symbol_str| symbol_str.parse().map_err(serde::de::Error::custom))
-        .transpose()
+    Ok(opt.filter(|symbol_str| !symbol_str.is_empty()))
 }
 
 /// Deserialize tx_hash that may be an empty string (Alpaca quirk).
@@ -945,8 +933,6 @@ pub(crate) mod tests {
             Some("tAAPL".to_string())
         );
         assert_eq!(result.quantity, FractionalShares::new(float!(100.5)));
-        assert_eq!(result.issuer, Issuer::new("st0x"));
-        assert_eq!(result.network, Network::new("base"));
         assert_eq!(
             result.issuer_request_id,
             Some(IssuerRequestId("iss_req_456".to_string()))
@@ -2022,6 +2008,49 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn deserialize_tokenization_request_with_fees() {
+        let json = json!({
+            "tokenization_request_id": "tok_req_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "10",
+            "issuer": "alpaca",
+            "network": "base",
+            "fees": "0.25",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        let fees = request
+            .fees
+            .expect("fees should be Some when present in JSON");
+        assert!(
+            fees.eq(Float::parse("0.25".to_string()).unwrap()).unwrap(),
+            "Expected fees to be 0.25, got: {fees:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_tokenization_request_without_fees() {
+        let json = json!({
+            "tokenization_request_id": "tok_req_no_fees",
+            "status": "pending",
+            "underlying_symbol": "AAPL",
+            "qty": "10",
+            "issuer": "alpaca",
+            "network": "base",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert!(
+            request.fees.is_none(),
+            "fees should be None when absent from JSON"
+        );
     }
 
     #[test]
