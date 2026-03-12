@@ -349,6 +349,12 @@ async fn seed_vault_registry_from_config(
 
     for (symbol, equity_config) in &ctx.assets.equities.symbols {
         let Some(vault_id) = equity_config.vault_id else {
+            if ctx.is_rebalancing_enabled(symbol) {
+                return Err(CtxError::MissingEquityVaultId {
+                    symbol: symbol.clone(),
+                }
+                .into());
+            }
             continue;
         };
 

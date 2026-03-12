@@ -7,9 +7,7 @@ pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
-#[cfg(any(feature = "wallet-turnkey", feature = "wallet-private-key"))]
 use alloy::rpc::client::RpcClient;
-#[cfg(any(feature = "wallet-turnkey", feature = "wallet-private-key"))]
 use alloy::transports::layers::RetryBackoffLayer;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -23,9 +21,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
-use st0x_evm::Wallet;
-#[cfg(feature = "wallet-turnkey")]
-use st0x_evm::turnkey::{TurnkeyApiPrivateKey, TurnkeyCtx, TurnkeyOrganizationId, TurnkeyWallet};
+use st0x_evm::{Wallet, WalletCtx, WalletKind};
 use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
 use st0x_finance::Usdc;
 
@@ -79,57 +75,20 @@ impl std::fmt::Display for Chain {
     }
 }
 
-/// Wallet backend discriminator for error reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalletBackend {
-    Turnkey,
-    PrivateKey,
-}
-
-impl std::fmt::Display for WalletBackend {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Turnkey => write!(formatter, "turnkey"),
-            Self::PrivateKey => write!(formatter, "private-key"),
-        }
-    }
-}
-
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
-    #[error(
-        "wallet config type mismatch: config specifies {config_type} \
-         but secrets specifies {secrets_type}"
-    )]
-    WalletTypeMismatch {
-        config_type: WalletBackend,
-        secrets_type: WalletBackend,
-    },
-    #[error(
-        "configured wallet address {configured} does not match \
-         address {derived} derived from private key"
-    )]
-    AddressMismatch {
-        configured: Address,
-        derived: Address,
-    },
-    #[error(
-        "wallet type \"{wallet_type}\" configured but not compiled \
-         into this binary (missing cargo feature)"
-    )]
-    WalletNotCompiled { wallet_type: WalletBackend },
-    #[error("RPC error during wallet setup: {0}")]
-    Rpc(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
+    #[error("invalid wallet config: {0}")]
+    WalletConfig(#[from] toml::de::Error),
+    #[error(transparent)]
+    Evm(#[from] st0x_evm::EvmError),
     #[error("RPC connectivity check failed for {chain} wallet: {source}")]
     RpcConnectivity {
         chain: Chain,
         source: alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
     },
-    #[error(transparent)]
-    Evm(#[from] st0x_evm::EvmError),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -140,12 +99,44 @@ pub enum UsdcRebalancing {
     Disabled,
 }
 
-#[derive(Debug, Deserialize)]
+/// Extracts just the `kind` discriminant from the wallet TOML table,
+/// ignoring backend-specific fields that vary by wallet type.
+#[derive(Deserialize)]
+struct WalletKindTag {
+    kind: WalletKind,
+}
+
+/// Newtype over [`toml::Value`] implementing [`Parser`] so
+/// [`WalletKind::try_into_wallet`] can deserialize any
+/// `DeserializeOwned` type from raw TOML config/secrets.
+struct TomlValue(toml::Value);
+
+impl st0x_evm::Parser for TomlValue {
+    type Error = st0x_evm::EvmError;
+
+    fn parse<Target: serde::de::DeserializeOwned>(self) -> Result<Target, Self::Error> {
+        Target::deserialize(self.0)
+            .map_err(|error| st0x_evm::EvmError::WalletConfigParse(Box::new(error)))
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
     pub(crate) base_rpc_url: Url,
     pub(crate) ethereum_rpc_url: Url,
-    pub(crate) wallet: WalletSecrets,
+    pub(crate) wallet: toml::Value,
+}
+
+impl std::fmt::Debug for RebalancingSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RebalancingSecrets")
+            .field("base_rpc_url", &self.base_rpc_url)
+            .field("ethereum_rpc_url", &self.ethereum_rpc_url)
+            .field("wallet", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -154,59 +145,7 @@ pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
-    pub(crate) wallet: WalletConfig,
-}
-
-/// Wallet provider plaintext configuration, selected by `type` tag.
-///
-/// Both variants always parse from TOML regardless of compiled
-/// features. Feature-gated `build_wallet` arms convert these into
-/// the concrete wallet types at construction time.
-// Serde reads the fields during deserialization, and feature-gated
-// `build_wallet` arms destructure them. Neither is visible to the
-// compiler's dead-code pass when wallet features are disabled.
-#[allow(dead_code)]
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
-pub(crate) enum WalletConfig {
-    Turnkey {
-        address: Address,
-        organization_id: String,
-    },
-    PrivateKey {
-        address: Address,
-    },
-}
-
-/// Wallet provider secret credentials, selected by `type` tag.
-///
-/// Both variants always parse from TOML regardless of compiled
-/// features. See [`WalletConfig`] for rationale.
-#[allow(dead_code)]
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
-pub(crate) enum WalletSecrets {
-    Turnkey {
-        api_private_key: String,
-    },
-    PrivateKey {
-        private_key: alloy::primitives::B256,
-    },
-}
-
-impl std::fmt::Debug for WalletSecrets {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Turnkey { .. } => formatter
-                .debug_struct("Turnkey")
-                .field("api_private_key", &"[REDACTED]")
-                .finish(),
-            Self::PrivateKey { .. } => formatter
-                .debug_struct("PrivateKey")
-                .field("private_key", &"[REDACTED]")
-                .finish(),
-        }
-    }
+    pub(crate) wallet: toml::Value,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -244,26 +183,15 @@ pub struct RebalancingCtx {
 /// operations that depend on the state change. This ensures state propagates
 /// across load-balanced RPC providers (like dRPC) that may route requests to
 /// different backend nodes.
-#[cfg(any(feature = "wallet-turnkey", feature = "wallet-private-key"))]
 const REQUIRED_CONFIRMATIONS: u64 = 3;
-
-/// Maximum retries for transient RPC errors (rate limits, null responses, etc.)
-#[cfg(any(feature = "wallet-turnkey", feature = "wallet-private-key"))]
 const RPC_MAX_RETRIES: u32 = 10;
-
-/// Initial backoff duration in milliseconds before retrying
-#[cfg(any(feature = "wallet-turnkey", feature = "wallet-private-key"))]
 const RPC_INITIAL_BACKOFF_MS: u64 = 1000;
-
-/// Compute units per second budget for rate limiting
-#[cfg(any(feature = "wallet-turnkey", feature = "wallet-private-key"))]
 const RPC_COMPUTE_UNITS_PER_SECOND: u64 = 100;
 
 /// Creates an HTTP RPC client with retry layer for transient errors.
 ///
 /// Use with `ProviderBuilder::new().connect_client(client)` for read-only calls,
 /// or `ProviderBuilder::new().wallet(w).connect_client(client)` for signing.
-#[cfg(any(feature = "wallet-turnkey", feature = "wallet-private-key"))]
 fn http_client_with_retry(url: Url) -> RpcClient {
     let retry_layer = RetryBackoffLayer::new(
         RPC_MAX_RETRIES,
@@ -273,19 +201,49 @@ fn http_client_with_retry(url: Url) -> RpcClient {
     RpcClient::builder().layer(retry_layer).http(url)
 }
 
+async fn build_wallet(
+    kind: &WalletKind,
+    wallet_config: toml::Value,
+    wallet_secrets: toml::Value,
+    rpc_url: Url,
+) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, RebalancingCtxError> {
+    let provider = RootProvider::new(http_client_with_retry(rpc_url));
+
+    Ok(kind
+        .try_into_wallet(WalletCtx {
+            settings: TomlValue(wallet_config),
+            credentials: TomlValue(wallet_secrets),
+            provider,
+            required_confirmations: REQUIRED_CONFIRMATIONS,
+        })
+        .await?)
+}
+
 impl RebalancingCtx {
     /// Construct from config, secrets, and broker auth.
     ///
     /// Builds wallets for both chains (Turnkey or raw private key,
-    /// selected by TOML `type` tag) and stores them immutably.
+    /// selected by TOML `kind` tag) and stores them immutably.
     pub(crate) async fn new(
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
+        let WalletKindTag { kind } = WalletKindTag::deserialize(config.wallet.clone())?;
+
         let (base_wallet, ethereum_wallet) = tokio::try_join!(
-            Self::build_wallet(&config.wallet, &secrets.wallet, secrets.base_rpc_url),
-            Self::build_wallet(&config.wallet, &secrets.wallet, secrets.ethereum_rpc_url),
+            build_wallet(
+                &kind,
+                config.wallet.clone(),
+                secrets.wallet.clone(),
+                secrets.base_rpc_url,
+            ),
+            build_wallet(
+                &kind,
+                config.wallet,
+                secrets.wallet,
+                secrets.ethereum_rpc_url,
+            ),
         )?;
 
         info!(
@@ -314,86 +272,6 @@ impl RebalancingCtx {
             #[cfg(feature = "test-support")]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         })
-    }
-
-    // `rpc_url` is consumed by feature-gated wallet arms; when no
-    // wallet feature is compiled, it appears unused.
-    async fn build_wallet(
-        config: &WalletConfig,
-        secrets: &WalletSecrets,
-        #[allow(unused_variables)] rpc_url: Url,
-    ) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, RebalancingCtxError> {
-        match (config, secrets) {
-            #[cfg(feature = "wallet-turnkey")]
-            (
-                WalletConfig::Turnkey {
-                    address,
-                    organization_id,
-                },
-                WalletSecrets::Turnkey { api_private_key },
-            ) => {
-                let provider = RootProvider::new(http_client_with_retry(rpc_url));
-
-                let wallet = TurnkeyWallet::new(TurnkeyCtx {
-                    api_private_key: TurnkeyApiPrivateKey::new(api_private_key.clone()),
-                    organization_id: TurnkeyOrganizationId::new(organization_id.clone()),
-                    address: *address,
-                    provider,
-                    required_confirmations: REQUIRED_CONFIRMATIONS,
-                })
-                .await?;
-
-                Ok(Arc::new(wallet))
-            }
-
-            #[cfg(not(feature = "wallet-turnkey"))]
-            (WalletConfig::Turnkey { .. }, WalletSecrets::Turnkey { .. }) => {
-                Err(RebalancingCtxError::WalletNotCompiled {
-                    wallet_type: WalletBackend::Turnkey,
-                })
-            }
-
-            #[cfg(feature = "wallet-private-key")]
-            (WalletConfig::PrivateKey { address }, WalletSecrets::PrivateKey { private_key }) => {
-                let provider = RootProvider::new(http_client_with_retry(rpc_url));
-
-                let wallet = st0x_evm::local::RawPrivateKeyWallet::new(
-                    private_key,
-                    provider,
-                    REQUIRED_CONFIRMATIONS,
-                )?;
-
-                if wallet.address() != *address {
-                    return Err(RebalancingCtxError::AddressMismatch {
-                        configured: *address,
-                        derived: wallet.address(),
-                    });
-                }
-
-                Ok(Arc::new(wallet))
-            }
-
-            #[cfg(not(feature = "wallet-private-key"))]
-            (WalletConfig::PrivateKey { .. }, WalletSecrets::PrivateKey { .. }) => {
-                Err(RebalancingCtxError::WalletNotCompiled {
-                    wallet_type: WalletBackend::PrivateKey,
-                })
-            }
-
-            (WalletConfig::Turnkey { .. }, WalletSecrets::PrivateKey { .. }) => {
-                Err(RebalancingCtxError::WalletTypeMismatch {
-                    config_type: WalletBackend::Turnkey,
-                    secrets_type: WalletBackend::PrivateKey,
-                })
-            }
-
-            (WalletConfig::PrivateKey { .. }, WalletSecrets::Turnkey { .. }) => {
-                Err(RebalancingCtxError::WalletTypeMismatch {
-                    config_type: WalletBackend::PrivateKey,
-                    secrets_type: WalletBackend::Turnkey,
-                })
-            }
-        }
     }
 
     /// Validate RPC connectivity for both chain wallets.
@@ -4420,111 +4298,46 @@ mod tests {
             });
     }
 
-    #[tokio::test]
-    async fn wallet_type_mismatch_config_turnkey_secrets_private_key() {
-        let config = WalletConfig::Turnkey {
-            address: Address::ZERO,
-            organization_id: "test-org".to_string(),
-        };
-        let secrets = WalletSecrets::PrivateKey {
-            private_key: B256::ZERO,
-        };
-
-        let result =
-            RebalancingCtx::build_wallet(&config, &secrets, "https://example.com".parse().unwrap())
-                .await;
-
-        let error = result.err().expect("expected Err, got Ok");
-        assert!(
-            matches!(
-                error,
-                RebalancingCtxError::WalletTypeMismatch {
-                    config_type: WalletBackend::Turnkey,
-                    secrets_type: WalletBackend::PrivateKey,
-                }
-            ),
-            "expected WalletTypeMismatch, got: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn wallet_type_mismatch_config_private_key_secrets_turnkey() {
-        let config = WalletConfig::PrivateKey {
-            address: Address::ZERO,
-        };
-        let secrets = WalletSecrets::Turnkey {
-            api_private_key: "fake-key".to_string(),
-        };
-
-        let result =
-            RebalancingCtx::build_wallet(&config, &secrets, "https://example.com".parse().unwrap())
-                .await;
-
-        let error = result.err().expect("expected Err, got Ok");
-        assert!(
-            matches!(
-                error,
-                RebalancingCtxError::WalletTypeMismatch {
-                    config_type: WalletBackend::PrivateKey,
-                    secrets_type: WalletBackend::Turnkey,
-                }
-            ),
-            "expected WalletTypeMismatch, got: {error:?}"
-        );
-    }
-
     #[cfg(feature = "wallet-private-key")]
     #[tokio::test]
-    async fn address_mismatch_returns_error() {
-        // A random private key -- the derived address will NOT match Address::ZERO.
-        let private_key = B256::random();
-        let wrong_address = Address::ZERO;
-
-        let config = WalletConfig::PrivateKey {
-            address: wrong_address,
-        };
-        let secrets = WalletSecrets::PrivateKey { private_key };
-
-        // Use a dummy RPC URL -- the RawPrivateKeyWallet constructor doesn't
-        // make RPC calls, so the URL doesn't need to be valid.
-        let result =
-            RebalancingCtx::build_wallet(&config, &secrets, "https://example.com".parse().unwrap())
-                .await;
-
-        let error = result.err().expect("expected Err, got Ok");
-        assert!(
-            matches!(
-                error,
-                RebalancingCtxError::AddressMismatch { configured, derived }
-                    if configured == wrong_address && derived != wrong_address
-            ),
-            "expected AddressMismatch, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn wallet_secrets_debug_redacts_private_key() {
+    async fn build_wallet_private_key_derives_address_from_key() {
         let private_key =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        let secrets = WalletSecrets::PrivateKey { private_key };
 
-        let debug = format!("{secrets:?}");
+        let wallet_config = toml::toml! {
+            kind = "private-key"
+        };
 
-        assert!(
-            debug.contains("[REDACTED]"),
-            "expected redaction marker, got {debug}"
-        );
-        assert!(
-            !debug.contains(&private_key.to_string()),
-            "debug output leaked the private key: {debug}"
+        let private_key_str = private_key.to_string();
+        let wallet_secrets = toml::toml! {
+            private_key = private_key_str
+        };
+
+        let wallet = build_wallet(
+            &WalletKind::PrivateKey,
+            wallet_config.into(),
+            wallet_secrets.into(),
+            "https://example.com".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            wallet.address(),
+            Address::ZERO,
+            "wallet address should be derived from key, not zero"
         );
     }
 
     #[test]
-    fn wallet_secrets_debug_redacts_turnkey_api_private_key() {
-        let api_private_key = "super-secret-turnkey-key".to_string();
-        let secrets = WalletSecrets::Turnkey {
-            api_private_key: api_private_key.clone(),
+    fn rebalancing_secrets_debug_redacts_wallet() {
+        let secrets = RebalancingSecrets {
+            base_rpc_url: "https://base-rpc.example.com".parse().unwrap(),
+            ethereum_rpc_url: "https://eth-rpc.example.com".parse().unwrap(),
+            wallet: toml::toml! {
+                api_private_key = "super-secret-key"
+            }
+            .into(),
         };
 
         let debug = format!("{secrets:?}");
@@ -4534,8 +4347,8 @@ mod tests {
             "expected redaction marker, got {debug}"
         );
         assert!(
-            !debug.contains(&api_private_key),
-            "debug output leaked the API private key: {debug}"
+            !debug.contains("super-secret-key"),
+            "debug output leaked wallet secrets: {debug}"
         );
     }
 }

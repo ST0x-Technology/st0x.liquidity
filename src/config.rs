@@ -90,7 +90,7 @@ impl EquitiesConfig {
     /// Symbol-specific limit takes precedence over the global limit.
     /// Returns `None` when neither is configured (unlimited).
     #[cfg(test)]
-    fn shares_limit_for(&self, symbol: &Symbol) -> Option<Positive<FractionalShares>> {
+    pub(crate) fn shares_limit_for(&self, symbol: &Symbol) -> Option<Positive<FractionalShares>> {
         self.symbols
             .get(symbol)
             .and_then(|config| config.operational_limit)
