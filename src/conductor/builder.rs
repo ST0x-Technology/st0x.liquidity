@@ -21,7 +21,7 @@ use super::{
 };
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::{InventoryPollingService, InventorySnapshot};
+use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingConfig};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
@@ -69,7 +69,7 @@ pub(crate) struct WithDexStreams {
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
-    ethereum_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
+    wallet_polling: WalletPollingConfig,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -142,7 +142,10 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_sender,
                 event_receiver,
                 rebalancer: None,
-                ethereum_wallet: None,
+                wallet_polling: WalletPollingConfig {
+                    ethereum: None,
+                    base: None,
+                },
             },
         }
     }
@@ -163,7 +166,15 @@ where
         mut self,
         wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ) -> Self {
-        self.state.ethereum_wallet = Some(wallet);
+        self.state.wallet_polling.ethereum = Some(wallet);
+        self
+    }
+
+    pub(crate) fn with_base_wallet(
+        mut self,
+        wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    ) -> Self {
+        self.state.wallet_polling.base = Some(wallet);
         self
     }
 
@@ -192,7 +203,7 @@ where
             self.common.ctx.evm.orderbook,
             order_owner,
             self.common.frameworks.snapshot,
-            self.state.ethereum_wallet,
+            self.state.wallet_polling,
         );
         let inventory_poller = Some(spawn_inventory_poller(
             polling_service,

@@ -146,6 +146,11 @@ impl BaseChain<()> {
         // shares this Anvil provider (equity e2e tests).
         deploy_usdc_at(&provider, crate::cctp::USDC_ETHEREUM, owner).await?;
 
+        // Place USDC at the canonical USDC_ETHEREUM address so the
+        // inventory poller can call balanceOf when an ethereum_wallet
+        // shares this Anvil provider (equity e2e tests).
+        deploy_usdc_at(&provider, crate::cctp::USDC_ETHEREUM, owner).await?;
+
         provider
             .anvil_set_code(
                 address!("F66761F6b5F58202998D6Cd944C81b22Dc6d4f1E"),

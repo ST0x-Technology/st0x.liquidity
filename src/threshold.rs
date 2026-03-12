@@ -56,7 +56,7 @@ impl Usdc {
     /// Converts to U256 with 6 decimal places (USDC standard).
     ///
     /// Returns an error for negative values or overflow during scaling.
-    pub fn to_u256_6_decimals(self) -> Result<U256, UsdcConversionError> {
+    pub(crate) fn to_u256_6_decimals(self) -> Result<U256, UsdcConversionError> {
         if self.0.is_sign_negative() {
             return Err(UsdcConversionError::NegativeValue(self.0));
         }
@@ -71,7 +71,7 @@ impl Usdc {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum UsdcConversionError {
+pub(crate) enum UsdcConversionError {
     #[error("USDC amount cannot be negative: {0}")]
     NegativeValue(Decimal),
     #[error("overflow when scaling USDC to 6 decimals")]

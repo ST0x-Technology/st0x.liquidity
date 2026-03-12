@@ -728,6 +728,7 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         .await?;
 
     assert_ethereum_cash_event_exists(&infra.db_path).await?;
+    assert_base_wallet_cash_event_exists(&infra.db_path).await?;
 
     bot.abort();
     Ok(())

@@ -185,14 +185,14 @@ impl Conductor {
                 Err(error) => return Err(error.into()),
             };
 
-            let (position, position_projection, snapshot, rebalancer, ethereum_wallet) =
+            let (position, position_projection, snapshot, rebalancer, ethereum_wallet, base_wallet) =
                 if let Some(rebalancing_ctx) = rebalancing {
                     let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
                     let base_wallet = rebalancing_ctx.base_wallet().clone();
                     let infra = spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
                         ethereum_wallet.clone(),
-                        base_wallet,
+                        base_wallet.clone(),
                         RebalancingDeps {
                             pool: pool.clone(),
                             ctx: ctx.clone(),
@@ -210,13 +210,14 @@ impl Conductor {
                         infra.snapshot,
                         Some(infra.rebalancer),
                         Some(ethereum_wallet),
+                        Some(base_wallet),
                     )
                 } else {
                     let (position, position_projection) = build_position_cqrs(&pool).await?;
                     let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                         .build(())
                         .await?;
-                    (position, position_projection, snapshot, None, None)
+                    (position, position_projection, snapshot, None, None, None)
                 };
 
             let order_placer: Arc<dyn OrderPlacer> =
@@ -256,6 +257,10 @@ impl Conductor {
 
             if let Some(rebalancer_handle) = rebalancer {
                 builder = builder.with_rebalancer(rebalancer_handle);
+            }
+
+            if let Some(wallet) = base_wallet {
+                builder = builder.with_base_wallet(wallet);
             }
 
             Ok(builder.spawn())
