@@ -740,6 +740,35 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     Ok(())
 }
 
+async fn assert_base_wallet_equity_snapshot(
+    pool: &SqlitePool,
+    expected_symbols: &[&str],
+) -> anyhow::Result<()> {
+    let events = fetch_events_by_type(pool, "InventorySnapshot").await?;
+    let last_base_wallet_equity = events
+        .iter()
+        .rev()
+        .find(|ev| ev.event_type == "InventorySnapshotEvent::BaseWalletEquity")
+        .ok_or_else(|| anyhow::anyhow!("Missing BaseWalletEquity event"))?;
+    let balances = last_base_wallet_equity
+        .payload
+        .get("BaseWalletEquity")
+        .and_then(|val| val.get("balances"))
+        .ok_or_else(|| anyhow::anyhow!("BaseWalletEquity payload missing balances"))?;
+
+    for symbol in expected_symbols {
+        let balance_str = balances
+            .get(*symbol)
+            .and_then(|val| val.as_str())
+            .unwrap_or_else(|| panic!("BaseWalletEquity missing symbol {symbol}, got: {balances}"));
+        let _parsed_balance: Decimal = balance_str.parse().unwrap_or_else(|err| {
+            panic!("Failed to parse BaseWalletEquity balance for {symbol}: {err}")
+        });
+    }
+
+    Ok(())
+}
+
 #[bon::builder]
 pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],
@@ -764,6 +793,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
         }
     };
     assert_inventory_snapshots(&pool, orderbook, owner, &[equity_symbol], false).await?;
+    assert_base_wallet_equity_snapshot(&pool, &[equity_symbol]).await?;
 
     match rebalance_type {
         EquityRebalanceType::Mint {
