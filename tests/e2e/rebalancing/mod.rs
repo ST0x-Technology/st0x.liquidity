@@ -150,7 +150,8 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     let unwrapped_token = infra.equity_addresses[0].2;
 
     // Keep the owner's direct wrapped and unwrapped balances distinct so the
-    // BaseWalletEquity snapshot assertion proves we polled the unwrapped token.
+    // BaseWalletUnwrappedEquity snapshot assertion proves we polled the
+    // unwrapped token.
     let balance_skew: U256 = parse_units("1", 18)?.into();
     crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
         .transfer(infra.base_chain.taker, balance_skew)
@@ -213,7 +214,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .call()?;
     let mut bot = spawn_bot(ctx);
 
-    assert_initial_base_wallet_equity_snapshot(
+    assert_initial_base_wallet_unwrapped_and_wrapped_equity_snapshot(
         &mut bot,
         &infra.db_path,
         "AAPL",
