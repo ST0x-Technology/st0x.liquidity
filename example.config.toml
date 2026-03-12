@@ -9,12 +9,24 @@ deployment_block = 1
 
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-fireblocks_vault_account_id = 0
-fireblocks_environment = "sandbox"
-
-fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
+
+# Wallet provider — select via `type`:
+#   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
+#   "private-key" — local raw private key signing     (requires --features wallet-private-key)
+#
+# The `type` here must match `[rebalancing.wallet].type` in the secrets file.
+# For "private-key", `address` must match the address derived from the secret key.
+[rebalancing.wallet]
+type = "private-key"
+address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
+
+# For type = "turnkey", use instead:
+# [rebalancing.wallet]
+# type = "turnkey"
+# address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# organization_id = "org-example-turnkey-org-id"
 
 [assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

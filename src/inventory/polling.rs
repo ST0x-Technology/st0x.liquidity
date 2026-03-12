@@ -1698,9 +1698,9 @@ mod tests {
         let token_addr = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
         let raw_balance = U256::from(250_000u64) * U256::from(10u64).pow(U256::from(18u64));
         let asserter = Asserter::new();
-        let usdc_encoded = format!("0x{}", alloy::hex::encode(U256::ZERO.abi_encode()));
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
         asserter.push_success(&usdc_encoded); // USDC balanceOf (zero)
-        let equity_encoded = format!("0x{}", alloy::hex::encode(raw_balance.abi_encode()));
+        let equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
         asserter.push_success(&equity_encoded); // wrapped equity token balanceOf
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
 
@@ -1716,7 +1716,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1758,8 +1758,8 @@ mod tests {
 
         let raw_balance = U256::from(42u64) * U256::from(10u64).pow(U256::from(18u64));
         let asserter = Asserter::new();
-        let usdc_encoded = format!("0x{}", alloy::hex::encode(U256::ZERO.abi_encode()));
-        let wrapped_equity_encoded = format!("0x{}", alloy::hex::encode(raw_balance.abi_encode()));
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        let wrapped_equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
         asserter.push_success(&usdc_encoded); // USDC balanceOf (zero)
         asserter.push_success(&wrapped_equity_encoded); // first wrapped token balanceOf
         asserter.push_success(&wrapped_equity_encoded); // second wrapped token balanceOf
@@ -1784,7 +1784,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1837,7 +1837,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1874,7 +1874,7 @@ mod tests {
 
         let raw_usdc = U256::from(1_000_000u64); // 1 USDC
         let asserter = Asserter::new();
-        let encoded = format!("0x{}", alloy::hex::encode(raw_usdc.abi_encode()));
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
         asserter.push_success(&encoded);
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
 
@@ -1887,7 +1887,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1922,7 +1922,7 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
-        let usdc_encoded = format!("0x{}", alloy::hex::encode(U256::ZERO.abi_encode()));
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
         asserter.push_success(&usdc_encoded); // USDC balanceOf succeeds
         asserter.push_failure_msg("Wrapped equity RPC failure"); // wrapped equity balanceOf fails
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
@@ -1942,7 +1942,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),
@@ -1966,8 +1966,8 @@ mod tests {
 
         let raw_balance = U256::from(3u64) * U256::from(10u64).pow(U256::from(18u64));
         let asserter = Asserter::new();
-        let usdc_encoded = format!("0x{}", alloy::hex::encode(U256::ZERO.abi_encode()));
-        let wrapped_equity_encoded = format!("0x{}", alloy::hex::encode(raw_balance.abi_encode()));
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        let wrapped_equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
         asserter.push_success(&usdc_encoded); // first poll USDC balanceOf
         asserter.push_success(&wrapped_equity_encoded); // first poll wrapped balanceOf
         asserter.push_success(&usdc_encoded); // second poll USDC balanceOf
@@ -1989,7 +1989,7 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: HashMap::new(),

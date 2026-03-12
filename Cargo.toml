@@ -94,8 +94,15 @@ edition = "2024"
 
 [features]
 default = []
-test-support = ["st0x-bridge/test-support"]
-mock = ["st0x-execution/mock", "dep:httpmock"]
+test-support = ["st0x-bridge/test-support", "wallet-private-key"]
+mock = [
+  "st0x-execution/mock",
+  "st0x-evm/mock",
+  "dep:httpmock",
+  "wallet-private-key",
+]
+wallet-turnkey = ["st0x-evm/turnkey"]
+wallet-private-key = ["st0x-evm/local-signer"]
 
 [dependencies]
 alloy.workspace = true
@@ -145,7 +152,7 @@ ts-rs = { version = "11.1.0", features = [
 rocket_ws = "0.1.1"
 toml = "0.9.11"
 rust_decimal_macros = "1.38.0"
-st0x-evm = { workspace = true, features = ["fireblocks"] }
+st0x-evm.workspace = true
 bon = "3.9.0"
 httpmock = { workspace = true, optional = true }
 
@@ -164,7 +171,7 @@ st0x-bridge = { path = "crates/bridge", features = ["mock"] }
 st0x-event-sorcery = { path = "crates/event-sorcery", features = [
   "test-support",
 ] }
-st0x-evm = { workspace = true, features = ["local-signer", "mock"] }
+st0x-evm = { workspace = true, features = ["mock"] }
 st0x-execution = { path = "crates/execution", features = [
   "mock",
   "test-support",

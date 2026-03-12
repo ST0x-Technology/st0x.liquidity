@@ -5,8 +5,8 @@ are ordered by priority (highest first).
 
 ## Operational visibility and reliable wallet signing
 
-Stop relying on logs for rebalancing visibility, and add a reliable alternative
-to Fireblocks for onchain signing. All branches stack on #355.
+Stop relying on logs for rebalancing visibility, and replace Fireblocks with
+Turnkey/private-key wallet for onchain signing. All branches stack on #355.
 
 ```mermaid
 graph TD
@@ -45,11 +45,13 @@ Turnkey work above, so both proceed in parallel.
 
 ### Wallet provider config (main crate, depends on everything above)
 
-Wires Turnkey into the main crate config so operators can choose between Turnkey
-and Fireblocks. Final convergence point -- stacked on both the Turnkey and
-dashboard integration branches to avoid conflicts in the main crate.
+Wires Turnkey and raw-private-key wallets into the main crate config, removes
+Fireblocks entirely. Wallet type is selected via TOML, while cargo features
+control which wallet backends are compiled into the binary.
 
-- [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
+- [x] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
+  - PR:
+    [#394 Wallet selection on hedge bot](https://github.com/ST0x-Technology/st0x.liquidity/pull/394)
 
 <br>
 
@@ -251,7 +253,9 @@ graph LR
 - [ ] [#294 Document secret management setup and opsec](https://github.com/ST0x-Technology/st0x.liquidity/issues/294)
 - [ ] [#35 Document the bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/35)
 - [ ] [#286 No TLS configured for dashboard and WebSocket traffic](https://github.com/ST0x-Technology/st0x.liquidity/issues/286)
-- [ ] [#275 Optimise Fireblocks transfers: use vault-to-vault for issuance bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/275)
+- [x] [#275 Optimise Fireblocks transfers](https://github.com/ST0x-Technology/st0x.liquidity/issues/275)
+  - Superseded: Fireblocks removed in
+    [#394](https://github.com/ST0x-Technology/st0x.liquidity/pull/394)
 - [ ] [#77 Set up Kafka](https://github.com/ST0x-Technology/st0x.liquidity/issues/77) -
       Event streaming infrastructure
 - [ ] [#78 Integrate Kafka in bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/78)

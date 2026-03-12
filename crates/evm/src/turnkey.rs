@@ -5,8 +5,7 @@
 //! [`RawPrivateKeyWallet`](super::local::RawPrivateKeyWallet), it wraps
 //! the base provider with a [`WalletFiller`] -- the only difference is
 //! the signer: `TurnkeySigner` (remote signing via Turnkey API) instead
-//! of `PrivateKeySigner` (local key). This module is only compiled when
-//! the `turnkey` feature is enabled.
+//! of `PrivateKeySigner` (local key).
 
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, Bytes};
@@ -28,11 +27,23 @@ use crate::{Evm, EvmError, Wallet};
 #[serde(transparent)]
 pub struct TurnkeyOrganizationId(String);
 
+impl TurnkeyOrganizationId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Hex-encoded P-256 API private key for Turnkey authentication
 /// (secret, lives in encrypted config).
 #[derive(Clone, Deserialize)]
 #[serde(transparent)]
 pub struct TurnkeyApiPrivateKey(String);
+
+impl TurnkeyApiPrivateKey {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
 
 impl std::fmt::Debug for TurnkeyApiPrivateKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -231,7 +242,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::node_bindings::Anvil;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::U256;
+    use alloy::providers::ext::AnvilApi;
     use alloy_signer_turnkey::{TurnkeyClient, TurnkeyClientBuilder, TurnkeyP256ApiKey};
     use httpmock::MockServer;
 
@@ -319,5 +332,125 @@ mod tests {
         .unwrap();
 
         assert_eq!(wallet.address(), expected_address);
+    }
+
+    // --- Integration tests (real Turnkey API + local Anvil) ---------
+    //
+    // These tests sign via the real Turnkey API but submit to a local
+    // Anvil instance (no testnet ETH needed -- Anvil funds the address
+    // via `anvil_setBalance`).
+    //
+    // Required env vars (set in `.env`, loaded by direnv):
+    //   TURNKEY_API_PRIVATE_KEY  -- hex-encoded P-256 API private key
+    //   TURNKEY_ORG_ID           -- Turnkey organization ID
+    //   TURNKEY_ADDRESS          -- Ethereum address managed by Turnkey
+    //
+    // See `.env.example` for the template.
+
+    /// Returns `None` when `TURNKEY_*` env vars are absent, allowing
+    /// tests to skip gracefully in environments without credentials.
+    fn turnkey_env() -> Option<(String, String, Address)> {
+        let api_key = std::env::var("TURNKEY_API_PRIVATE_KEY").ok()?;
+        let org_id = std::env::var("TURNKEY_ORG_ID").ok()?;
+        let address: Address = std::env::var("TURNKEY_ADDRESS")
+            .ok()?
+            .parse()
+            .expect("TURNKEY_ADDRESS must be valid hex address");
+
+        Some((api_key, org_id, address))
+    }
+
+    /// Spin up Anvil, fund the Turnkey address, and return a
+    /// `TurnkeyWallet` connected to the local node.
+    async fn integration_wallet(
+        api_key: String,
+        org_id: String,
+        address: Address,
+    ) -> (TurnkeyWallet<impl Provider + Clone>, AnvilInstance) {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        // Fund the Turnkey-managed address on the local Anvil node.
+        provider
+            .anvil_set_balance(address, U256::from(10) * U256::from(10).pow(U256::from(18)))
+            .await
+            .expect("anvil_setBalance should succeed");
+
+        let wallet = TurnkeyWallet::new(TurnkeyCtx {
+            api_private_key: TurnkeyApiPrivateKey::new(api_key),
+            organization_id: TurnkeyOrganizationId::new(org_id),
+            address,
+            provider,
+            required_confirmations: 1,
+        })
+        .await
+        .expect("failed to construct TurnkeyWallet from env vars");
+
+        (wallet, anvil)
+    }
+
+    #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
+    #[tokio::test]
+    async fn turnkey_wallet_address_matches_configured() {
+        let (api_key, org_id, expected) = turnkey_env()
+            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+
+        let (wallet, _anvil) = integration_wallet(api_key, org_id, expected).await;
+
+        assert_eq!(wallet.address(), expected);
+    }
+
+    #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
+    #[tokio::test]
+    async fn turnkey_signs_and_submits_transaction() {
+        let (api_key, org_id, address) = turnkey_env()
+            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+
+        let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
+        let self_address = wallet.address();
+
+        // 0-value self-transfer: minimal gas (21000), exercises the
+        // full Turnkey signing round-trip.
+        let receipt = wallet
+            .send(self_address, Bytes::new(), "integration test self-transfer")
+            .await
+            .expect("Turnkey signing and submission should succeed");
+
+        assert!(
+            receipt.status(),
+            "self-transfer should succeed, tx: {}",
+            receipt.transaction_hash
+        );
+        assert_eq!(
+            receipt.from, self_address,
+            "transaction should be from the configured wallet"
+        );
+    }
+
+    #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
+    #[tokio::test]
+    async fn turnkey_concurrent_signing() {
+        let (api_key, org_id, address) = turnkey_env()
+            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+
+        let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
+        let self_address = wallet.address();
+
+        // Two parallel 0-value self-transfers to verify nonce
+        // management doesn't collide under concurrent signing.
+        let (receipt_a, receipt_b) = tokio::join!(
+            wallet.send(self_address, Bytes::new(), "concurrent-a"),
+            wallet.send(self_address, Bytes::new(), "concurrent-b"),
+        );
+
+        let receipt_a = receipt_a.expect("concurrent send A should succeed");
+        let receipt_b = receipt_b.expect("concurrent send B should succeed");
+
+        assert!(receipt_a.status(), "tx A should succeed");
+        assert!(receipt_b.status(), "tx B should succeed");
+        assert_ne!(
+            receipt_a.transaction_hash, receipt_b.transaction_hash,
+            "transactions must have different hashes"
+        );
     }
 }

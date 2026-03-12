@@ -343,10 +343,17 @@ All SSH keys centralized in `keys.nix` with role-based access:
 ### Wallet Management
 
 All onchain write operations use the `Wallet` trait abstraction from the
-`st0x-evm` crate. The production implementation submits transactions through
-Fireblocks MPC-based key management (`fireblocks` feature). A local-signer
-implementation is available for development and testing (`local-signer`
-feature). Domain logic is decoupled from the signing backend. See
+`st0x-evm` crate. Two wallet backends are available, gated by cargo features on
+the `st0x-evm` crate and configured via the `[rebalancing.wallet]` TOML section
+(`type = "turnkey"` or `type = "private-key"`):
+
+- **Turnkey** (`turnkey` feature): Signs via Turnkey's AWS Nitro secure enclaves
+  for low-latency production signing (50-100ms).
+- **Raw private key** (`local-signer` feature): Signs locally with a raw private
+  key. Also used in development and testing.
+
+The main crate forwards these as `wallet-turnkey` and `wallet-private-key`
+features. Domain logic is decoupled from the signing backend. See
 [crates/evm/](crates/evm/) for implementation details.
 
 ## Crate Architecture
@@ -444,7 +451,7 @@ The system provides two top-level capabilities:
 | `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
 | `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                             |
 | `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                             |
-| `st0x-evm`          | EVM chain interaction and wallet abstraction         | `fireblocks`, `local-signer`       |
+| `st0x-evm`          | EVM chain interaction and wallet abstraction         | `turnkey`, `local-signer`, `mock`  |
 
 Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
 `Raindex`, `Wallet`) with one or more implementations selectable via feature

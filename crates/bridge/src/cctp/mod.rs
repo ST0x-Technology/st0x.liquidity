@@ -947,12 +947,7 @@ mod tests {
 
         bridge
             .ethereum
-            .usdc()
-            .approve(spender, higher_amount)
-            .send()
-            .await
-            .unwrap()
-            .get_receipt()
+            .approve_usdc::<NoOpErrorRegistry>(spender, higher_amount)
             .await
             .unwrap();
 
@@ -1006,12 +1001,7 @@ mod tests {
 
         bridge
             .ethereum
-            .usdc()
-            .approve(spender, initial_allowance_amount)
-            .send()
-            .await
-            .unwrap()
-            .get_receipt()
+            .approve_usdc::<NoOpErrorRegistry>(spender, initial_allowance_amount)
             .await
             .unwrap();
 
@@ -1144,12 +1134,7 @@ mod tests {
 
         bridge
             .base
-            .usdc()
-            .approve(spender, higher_amount)
-            .send()
-            .await
-            .unwrap()
-            .get_receipt()
+            .approve_usdc::<NoOpErrorRegistry>(spender, higher_amount)
             .await
             .unwrap();
 
@@ -1201,12 +1186,7 @@ mod tests {
 
         bridge
             .base
-            .usdc()
-            .approve(spender, initial_allowance_amount)
-            .send()
-            .await
-            .unwrap()
-            .get_receipt()
+            .approve_usdc::<NoOpErrorRegistry>(spender, initial_allowance_amount)
             .await
             .unwrap();
 

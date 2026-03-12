@@ -9,12 +9,12 @@ deployment_block = 41715047
 
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
-fireblocks_vault_account_id = 1
-fireblocks_environment = "production"
-
-fireblocks_chain_asset_ids = { 1 = "ETH", 8453 = "BASECHAIN_ETH" }
 equity = { target = 0.5, deviation = 0.15 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
+
+[rebalancing.wallet]
+type = "private-key"
+address = "0x0000000000000000000000000000000000000000"
 
 [assets.cash]
 vault_id = "0xfab"

@@ -8,7 +8,7 @@ use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{error, info, info_span, warn};
+use tracing::{Instrument, error, info, info_span, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
@@ -69,21 +69,27 @@ mod integration_tests;
 pub mod test_utils;
 
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
-    let launch_span = info_span!("launch");
-    let _enter = launch_span.enter();
+    async {
+        if let config::TradingMode::Rebalancing(ref rebalancing) = ctx.trading_mode {
+            rebalancing.validate_rpc_connectivity().await?;
+        }
 
-    let pool = ctx.get_sqlite_pool().await?;
-    sqlx::migrate!().run(&pool).await?;
+        let pool = ctx.get_sqlite_pool().await?;
+        sqlx::migrate!().run(&pool).await?;
 
-    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+        let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
 
-    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone());
-    let bot_task = spawn_bot_task(ctx, pool, event_sender);
+        let server_task = spawn_server_task(&ctx, &pool, event_sender.clone());
+        let bot_task = spawn_bot_task(ctx, pool, event_sender);
 
-    await_shutdown(server_task, bot_task).await;
+        await_shutdown(server_task, bot_task).await;
 
-    info!("Shutdown complete");
-    Ok(())
+        info!("Shutdown complete");
+
+        Ok(())
+    }
+    .instrument(info_span!("launch"))
+    .await
 }
 
 fn spawn_server_task(
