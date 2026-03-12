@@ -1,10 +1,12 @@
-# ROADMAP.md
+# Roadmap
 
-> Each section is an epic -- a goal and the issues needed to reach it.
+This document tracks the current goal, upcoming milestones, and backlog. The current focus section has full task
+breakdown with dependency graphs. Next milestones are goals we know are coming but haven't fully planned. Backlog is
+grouped by system aspect.
 
-<!-- Separate epics with --- and extra blank lines before and after the rule. -->
+---
 
-## Go to prod with auto-rebalancing
+## Current focus: Go to prod with auto-rebalancing
 
 Manual rebalancing cannot keep up with liquidity demand. Auto-rebalancing is essential, but it already stalls after a
 few cycles in testing - capital gets stuck mid-flight and requires manual recovery. Going live requires granular balance
@@ -21,9 +23,9 @@ production-grade wallet signing. The subsections below break each area down.
 
 #### Ready to pick up
 
+- [#432]: In-flight balance polling (wtSTOCKs on Base) — last unstarted balance check
 - [#427]: Track tokenization requests and set in-flight balance
-- [#429], [#430], [#431], [#432]: In-flight balance polling (Ethereum, Base, tSTOCKs, wtSTOCKs)
-- After [#296] lands, [#423] (inventory polling) becomes unblocked too
+- [#434]: Use Turnkey for all onchain operations — unblocked now that [#380] landed
 
 <br>
 
@@ -38,8 +40,8 @@ graph LR
     classDef todo fill:#5c4a1a,stroke:#f59e0b,color:#fcd34d
 
     a["Reliable task management [0/5]"]:::wip
-    b["Granular balance tracking [0/6]"]:::todo
-    c["Production-grade wallet management [1/3]"]:::wip
+    b["Granular balance tracking [1/6]"]:::wip
+    c["Production-grade wallet management [2/3]"]:::wip
     d["Operational observability [0/4]"]:::wip
     e(["Automatic capital recovery [0/9]"]):::blocked
     f(["Safely go live [1/7]"]):::wip
@@ -59,8 +61,8 @@ graph LR
 
 ### Granular balance tracking
 
-Add balance checks for every in-flight location, then wire them into the snapshot polling loop. Four of five checks can
-start immediately ([#429], [#430], [#431], [#432]). [#428] is blocked — `AlpacaWalletService` lacks a crypto
+Add balance checks for every in-flight location, then wire them into the snapshot polling loop. [#429] is done, [#430]
+and [#431] are in review, [#432] is ready to start. [#428] is blocked — `AlpacaWalletService` lacks a crypto
 position/balance query and needs a new Alpaca API integration first.
 
 ```mermaid
@@ -68,11 +70,12 @@ graph LR
     classDef blocked fill:#5c1a1a,stroke:#ef4444,color:#fca5a5
     classDef todo fill:#5c4a1a,stroke:#f59e0b,color:#fcd34d
     classDef review fill:#3b1a5c,stroke:#a855f7,color:#d8b4fe
+    classDef done fill:#1a5c3b,stroke:#22c55e,color:#86efac
 
     id428["#428 USDC on Alpaca"]:::blocked
-    id429["#429 USDC on Ethereum"]:::review
+    id429["#429 USDC on Ethereum"]:::done
     id430["#430 USDC on Base"]:::review
-    id431["#431 Unwrapped equity on Base"]:::todo
+    id431["#431 Unwrapped equity on Base"]:::review
     id432["#432 Wrapped equity on Base"]:::todo
     id433(["#433 Extend inventory snapshot"]):::blocked
 
@@ -91,13 +94,14 @@ graph LR
 ```
 
 - [ ] [#428 Check USDC balance in Alpaca crypto wallet](https://github.com/ST0x-Technology/st0x.liquidity/issues/428)
-- [ ] [#429 Ethereum USDC balance polling](https://github.com/ST0x-Technology/st0x.liquidity/issues/429)
+- [x] [#429 Ethereum USDC balance polling](https://github.com/ST0x-Technology/st0x.liquidity/issues/429)
   - PR:
     [#459 Poll Ethereum wallet USDC balance in inventory service](https://github.com/ST0x-Technology/st0x.liquidity/pull/459)
 - [ ] [#430 Base USDC balance polling (outside Raindex)](https://github.com/ST0x-Technology/st0x.liquidity/issues/430)
   - PR:
     [#460 Poll Base wallet USDC balance in inventory service](https://github.com/ST0x-Technology/st0x.liquidity/pull/460)
 - [ ] [#431 Base unwrapped equity token balance polling](https://github.com/ST0x-Technology/st0x.liquidity/issues/431)
+  - PR: [#461 Add Base wallet equity token balance polling](https://github.com/ST0x-Technology/st0x.liquidity/pull/461)
 - [ ] [#432 Base wrapped equity token balance polling](https://github.com/ST0x-Technology/st0x.liquidity/issues/432)
 - [ ] [#433 Extend inventory snapshot to include in-flight balances](https://github.com/ST0x-Technology/st0x.liquidity/issues/433)
 
@@ -146,13 +150,13 @@ Replace Fireblocks with Turnkey and make wallet provider configurable.
 
 ```mermaid
 graph TD
-    classDef wip fill:#1a2e5c,stroke:#3b82f6,color:#93c5fd
     classDef blocked fill:#5c1a1a,stroke:#ef4444,color:#fca5a5
+    classDef todo fill:#5c4a1a,stroke:#f59e0b,color:#fcd34d
     classDef done fill:#1a5c3b,stroke:#22c55e,color:#86efac
 
     id354["#354 Turnkey signing"]:::done
-    id380["#380 Wallet provider config"]:::wip
-    id434(["#434 Turnkey in production"]):::blocked
+    id380["#380 Wallet provider config"]:::done
+    id434(["#434 Turnkey in production"]):::todo
 
     id354 --> id380 --> id434
 
@@ -163,8 +167,8 @@ graph TD
 
 - [x] [#354 Replace Fireblocks with Turnkey for onchain transaction signing](https://github.com/ST0x-Technology/st0x.liquidity/issues/354)
   - PR: [#390 add turnkey support to st0x-evm](https://github.com/ST0x-Technology/st0x.liquidity/pull/390)
-- [ ] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
-  - PR: [#394 wallet selection on hedge bot](https://github.com/ST0x-Technology/st0x.liquidity/pull/394)
+- [x] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
+  - PR: [#394 Wallet selection on hedge bot](https://github.com/ST0x-Technology/st0x.liquidity/pull/394)
 - [ ] [#434 Use Turnkey for all onchain operations](https://github.com/ST0x-Technology/st0x.liquidity/issues/434)
 
 <br>
@@ -209,8 +213,8 @@ graph TD
 Recovery needs to know where capital is stuck (from detection) and how to resume stalled transfers (from tracking). Two
 shared prerequisites feed both USDC and equity streams:
 
-- **[#449]** stores aggregate IDs alongside inflight balances so recovery can `Store::load(id)` and resume. **Ready to
-  pick up - no dependencies.**
+- **[#449]** stores aggregate IDs alongside inflight balances so recovery can `Store::load(id)` and resume. **In
+  progress (PR [#457]).**
 - **[#433]** (from detection) extends the inventory snapshot so recovery knows _where_ capital is stuck.
 
 Each stream then has its own dispatch and per-venue recovery. [#442] converges everything.
@@ -326,27 +330,30 @@ graph TD
 
 <br>
 
-## Harden production
+## Next milestones
+
+### Harden production
 
 Once auto-rebalancing is live, priority shifts to making the deployment robust and observable. The system runs on a
 remote server handling real capital -- securing access, encrypting traffic, and having visibility into what's happening
 are prerequisites for operating with confidence. The quant researcher also needs execution data and monitoring tools to
 analyze and optimize trading parameters.
 
-### Infrastructure security
+#### Infrastructure security
 
 - [ ] [#286 No TLS configured for dashboard and WebSocket traffic](https://github.com/ST0x-Technology/st0x.liquidity/issues/286)
 - [ ] [#293 Granular SSH access control: limit root access and per-user deploy keys](https://github.com/ST0x-Technology/st0x.liquidity/issues/293)
 - [ ] [#294 Document secret management setup and opsec](https://github.com/ST0x-Technology/st0x.liquidity/issues/294)
 
-### Reliability
+#### Reliability
 
 - [ ] [#263 Check offchain inventory before placing counter trades](https://github.com/ST0x-Technology/st0x.liquidity/issues/263)
 - [ ] [#277 No automatic retry after offchain order failure](https://github.com/ST0x-Technology/st0x.liquidity/issues/277)
 - [ ] [#240 Conversion slippage not tracked, causing inventory drift](https://github.com/ST0x-Technology/st0x.liquidity/issues/240)
+- [ ] [#469 Verify all onchain operations await required confirmations](https://github.com/ST0x-Technology/st0x.liquidity/issues/469)
 - [ ] [#16 Handle reorgs](https://github.com/ST0x-Technology/st0x.liquidity/issues/16)
 
-### Remaining job conversions
+#### Remaining job conversions
 
 De-scoped from go-live because they self-heal on the next cycle. Converting to apalis improves reliability and gives
 better observability into job health.
@@ -354,37 +361,52 @@ better observability into job health.
 - [ ] [#422 Convert position checker to apalis job](https://github.com/ST0x-Technology/st0x.liquidity/issues/422)
 - [ ] [#424 Convert startup operations and executor maintenance to apalis jobs and supervised tasks](https://github.com/ST0x-Technology/st0x.liquidity/issues/424)
 
-### Quant research data
+#### Quant research data
 
 Ensure the event store captures all data needed for quantitative research -- execution timing, market conditions, and
 operational metrics.
 
 - [ ] [#303 Audit external integrations: record start/end timestamps for all calls in event store](https://github.com/ST0x-Technology/st0x.liquidity/issues/303)
 
-### Dashboard
+#### Dashboard
 
 - [ ] [#399 Dashboard: surface transfer error details and transaction hashes](https://github.com/ST0x-Technology/st0x.liquidity/issues/399)
 
-<br>
+### Request for liquidity flow
+
+(Future -- no issues yet)
+
+### Improve capital efficiency
+
+(Future -- no issues yet)
 
 ---
 
-<br>
+## Backlog
 
-## Not epic
-
-Everything below has not been organized into epics yet.
+Work that doesn't fit into the current epics. These are organized by area but not yet prioritized as epic goals.
 
 ### Event-sorcery framework
 
+- [ ] [#465 Add test utilities to event-sorcery (regression testing, schema version management)](https://github.com/ST0x-Technology/st0x.liquidity/issues/465)
+- [ ] [#467 Plan event-sorcery library extraction and backend agnosticism](https://github.com/ST0x-Technology/st0x.liquidity/issues/467)
+  - Move corresponding issues to new repo when extracted
+  - Make library agnostic to the `cqrs-es` backend
 - [ ] [#450 Persisted multi-entity Reactor in event-sorcery](https://github.com/ST0x-Technology/st0x.liquidity/issues/450)
 - [ ] [#451 Event replay for in-memory Reactors on startup](https://github.com/ST0x-Technology/st0x.liquidity/issues/451)
 
-### Alpaca / trading improvements
+### Trading improvements
 
+- [ ] [#413 Add 24/5 limit order support during market close](https://github.com/ST0x-Technology/st0x.liquidity/issues/413)
 - [ ] [#322 CLI should not depend on database](https://github.com/ST0x-Technology/st0x.liquidity/issues/322)
 
 ### Admin dashboard
+
+#### Design & specification
+
+- [ ] [#470 Explore CLI/dashboard design for improved usability and consistency](https://github.com/ST0x-Technology/st0x.liquidity/issues/470)
+
+#### Core functionality
 
 - [ ] [#400 Dashboard: add Raindex vault links to inventory equity rows](https://github.com/ST0x-Technology/st0x.liquidity/issues/400)
 - [ ] [#401 Dashboard: distinguish enabled vs disabled assets with toggle](https://github.com/ST0x-Technology/st0x.liquidity/issues/401)
@@ -395,6 +417,10 @@ Everything below has not been organized into epics yet.
 - [ ] [#233 Historical data display on dashboard](https://github.com/ST0x-Technology/st0x.liquidity/issues/233)
   - PR:
     [#396 add ratio/target columns, fix live events, improve styling](https://github.com/ST0x-Technology/st0x.liquidity/pull/396)
+
+#### Advanced features
+
+- [ ] [#472 Integrate Effect library into dashboard for improved UX](https://github.com/ST0x-Technology/st0x.liquidity/issues/472)
 - [ ] [#178 Dashboard: Performance Metrics Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/178)
 - [ ] [#180 Dashboard: Spreads Panel](https://github.com/ST0x-Technology/st0x.liquidity/issues/180)
 - [ ] [#183 Dashboard: Circuit Breaker](https://github.com/ST0x-Technology/st0x.liquidity/issues/183)
@@ -403,6 +429,24 @@ Everything below has not been organized into epics yet.
 - [ ] [#186 Dashboard: HyperDX Health Status](https://github.com/ST0x-Technology/st0x.liquidity/issues/186)
 
 ### Architecture & code quality
+
+Improve type system, naming consistency, mock configurations, and module extraction.
+
+#### Type system & domain modeling
+
+- [ ] [#473 Implement type-level newtype composition (Tagged qualifiers)](https://github.com/ST0x-Technology/st0x.liquidity/issues/473)
+- [ ] [#468 Create abstraction for converting between domain types and DTOs](https://github.com/ST0x-Technology/st0x.liquidity/issues/468)
+
+#### Naming & refactoring
+
+- [ ] [#464 Rename `*_cash` fields to `*_usdc` in InventorySnapshot and related types](https://github.com/ST0x-Technology/st0x.liquidity/issues/464)
+- [ ] [#466 Fix boolean blindness in `wrapper::mock` and other mock modules](https://github.com/ST0x-Technology/st0x.liquidity/issues/466)
+
+#### Build & dependencies
+
+- [ ] [#471 Remove submodule dependencies and provide ABIs via nix derivations](https://github.com/ST0x-Technology/st0x.liquidity/issues/471)
+
+#### Monolith extraction
 
 Split monolith into focused crates for faster builds, stricter abstraction boundaries, and reduced coupling.
 
