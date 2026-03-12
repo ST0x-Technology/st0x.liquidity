@@ -741,23 +741,52 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     Ok(())
 }
 
-pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
+pub(crate) async fn assert_initial_base_wallet_unwrapped_and_wrapped_equity_snapshot(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
     symbol: &str,
     expected_unwrapped_balance: FractionalShares,
-    wrapped_balance: FractionalShares,
+    expected_wrapped_balance: FractionalShares,
 ) -> anyhow::Result<()> {
     assert_ne!(
-        expected_unwrapped_balance, wrapped_balance,
-        "Wrapped and unwrapped balances must differ so BaseWalletEquity proves the unwrapped \
-         token address was polled"
+        expected_unwrapped_balance, expected_wrapped_balance,
+        "Wrapped and unwrapped balances must differ so BaseWalletUnwrappedEquity proves the \
+         unwrapped token address was polled"
     );
 
     let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
     let deadline = tokio::time::Instant::now() + timeout;
-    let context =
-        format!("BaseWalletEquity snapshot for {symbol} matching {expected_unwrapped_balance}");
+    let context = format!(
+        "Base-wallet unwrapped and wrapped equity snapshots for {symbol} matching unwrapped \
+             {expected_unwrapped_balance} and wrapped {expected_wrapped_balance}"
+    );
+
+    let parse_snapshot_balance = |events: &[crate::assert::StoredEvent],
+                                  event_type: &str,
+                                  payload_key: &str|
+     -> anyhow::Result<Option<FractionalShares>> {
+        events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == event_type)
+            .and_then(|event| {
+                event
+                    .payload
+                    .get(payload_key)
+                    .and_then(|value| value.get("balances"))
+                    .and_then(|balances| balances.get(symbol))
+                    .and_then(|value| value.as_str())
+            })
+            .map(|balance_str| {
+                balance_str.parse::<FractionalShares>().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to parse {event_type} balance '{balance_str}' for {symbol}: \
+                         {error}"
+                    )
+                })
+            })
+            .transpose()
+    };
 
     loop {
         sleep_or_crash(bot, &context).await;
@@ -773,28 +802,19 @@ pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
         let events = fetch_events_by_type(&pool, "InventorySnapshot").await;
         pool.close().await;
 
-        let snapshot_balance = match events {
-            Ok(events) => events
-                .iter()
-                .rev()
-                .find(|event| event.event_type == "InventorySnapshotEvent::BaseWalletEquity")
-                .and_then(|event| {
-                    event
-                        .payload
-                        .get("BaseWalletEquity")
-                        .and_then(|value| value.get("balances"))
-                        .and_then(|balances| balances.get(symbol))
-                        .and_then(|value| value.as_str())
-                })
-                .map(|balance_str| {
-                    balance_str.parse::<FractionalShares>().map_err(|error| {
-                        anyhow::anyhow!(
-                            "Failed to parse BaseWalletEquity balance '{balance_str}' for \
-                             {symbol}: {error}"
-                        )
-                    })
-                })
-                .transpose()?,
+        let (unwrapped_snapshot_balance, wrapped_snapshot_balance) = match events {
+            Ok(events) => (
+                parse_snapshot_balance(
+                    &events,
+                    "InventorySnapshotEvent::BaseWalletUnwrappedEquity",
+                    "BaseWalletUnwrappedEquity",
+                )?,
+                parse_snapshot_balance(
+                    &events,
+                    "InventorySnapshotEvent::BaseWalletWrappedEquity",
+                    "BaseWalletWrappedEquity",
+                )?,
+            ),
             Err(error) => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -805,14 +825,17 @@ pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
             }
         };
 
-        if snapshot_balance == Some(expected_unwrapped_balance) {
+        if unwrapped_snapshot_balance == Some(expected_unwrapped_balance)
+            && wrapped_snapshot_balance == Some(expected_wrapped_balance)
+        {
             return Ok(());
         }
 
         assert!(
             tokio::time::Instant::now() < deadline,
             "Timed out after {timeout:?} waiting for {context} \
-             (found latest snapshot balance {snapshot_balance:?}, wrapped balance {wrapped_balance})",
+             (found latest unwrapped snapshot {unwrapped_snapshot_balance:?}, latest wrapped \
+              snapshot {wrapped_snapshot_balance:?})",
         );
     }
 }

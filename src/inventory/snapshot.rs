@@ -79,7 +79,9 @@ pub(crate) struct InventorySnapshot {
     /// Latest Base wallet USDC balance (outside Raindex vaults)
     pub(crate) base_wallet_usdc: Option<Usdc>,
     /// Latest Base wallet unwrapped equity token balances
-    pub(crate) base_wallet_equity: BTreeMap<Symbol, FractionalShares>,
+    pub(crate) base_wallet_unwrapped_equity: BTreeMap<Symbol, FractionalShares>,
+    /// Latest Base wallet wrapped equity token balances
+    pub(crate) base_wallet_wrapped_equity: BTreeMap<Symbol, FractionalShares>,
     /// When this snapshot was last updated
     pub(crate) last_updated: DateTime<Utc>,
 }
@@ -105,7 +107,8 @@ impl EventSourced for InventorySnapshot {
             offchain_cash_cents: None,
             ethereum_cash: None,
             base_wallet_usdc: None,
-            base_wallet_equity: BTreeMap::new(),
+            base_wallet_unwrapped_equity: BTreeMap::new(),
+            base_wallet_wrapped_equity: BTreeMap::new(),
             last_updated: event.timestamp(),
         };
         snapshot.apply_event(event);
@@ -149,10 +152,18 @@ impl EventSourced for InventorySnapshot {
                 usdc_balance,
                 fetched_at: now,
             },
-            BaseWalletEquity { balances } => InventorySnapshotEvent::BaseWalletEquity {
-                balances,
-                fetched_at: now,
-            },
+            BaseWalletUnwrappedEquity { balances } => {
+                InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                    balances,
+                    fetched_at: now,
+                }
+            }
+            BaseWalletWrappedEquity { balances } => {
+                InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances,
+                    fetched_at: now,
+                }
+            }
         }])
     }
 
@@ -199,11 +210,20 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }])
             }
-            BaseWalletEquity { balances } => {
-                if self.base_wallet_equity == balances {
+            BaseWalletUnwrappedEquity { balances } => {
+                if self.base_wallet_unwrapped_equity == balances {
                     return Ok(vec![]);
                 }
-                Ok(vec![InventorySnapshotEvent::BaseWalletEquity {
+                Ok(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                    balances,
+                    fetched_at: now,
+                }])
+            }
+            BaseWalletWrappedEquity { balances } => {
+                if self.base_wallet_wrapped_equity == balances {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
                     balances,
                     fetched_at: now,
                 }])
@@ -237,8 +257,11 @@ impl InventorySnapshot {
             InventorySnapshotEvent::BaseWalletCash { usdc_balance, .. } => {
                 self.base_wallet_usdc = Some(*usdc_balance);
             }
-            InventorySnapshotEvent::BaseWalletEquity { balances, .. } => {
-                self.base_wallet_equity = balances.clone();
+            InventorySnapshotEvent::BaseWalletUnwrappedEquity { balances, .. } => {
+                self.base_wallet_unwrapped_equity = balances.clone();
+            }
+            InventorySnapshotEvent::BaseWalletWrappedEquity { balances, .. } => {
+                self.base_wallet_wrapped_equity = balances.clone();
             }
         }
     }
@@ -264,7 +287,10 @@ pub(crate) enum InventorySnapshotCommand {
     BaseWalletCash {
         usdc_balance: Usdc,
     },
-    BaseWalletEquity {
+    BaseWalletUnwrappedEquity {
+        balances: BTreeMap<Symbol, FractionalShares>,
+    },
+    BaseWalletWrappedEquity {
         balances: BTreeMap<Symbol, FractionalShares>,
     },
 }
@@ -295,7 +321,11 @@ pub(crate) enum InventorySnapshotEvent {
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
     },
-    BaseWalletEquity {
+    BaseWalletUnwrappedEquity {
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    },
+    BaseWalletWrappedEquity {
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
@@ -310,7 +340,8 @@ impl InventorySnapshotEvent {
             | Self::OffchainCash { fetched_at, .. }
             | Self::EthereumCash { fetched_at, .. }
             | Self::BaseWalletCash { fetched_at, .. }
-            | Self::BaseWalletEquity { fetched_at, .. } => *fetched_at,
+            | Self::BaseWalletUnwrappedEquity { fetched_at, .. }
+            | Self::BaseWalletWrappedEquity { fetched_at, .. } => *fetched_at,
         }
     }
 }
@@ -324,7 +355,12 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OffchainCash { .. } => "InventorySnapshotEvent::OffchainCash".to_string(),
             Self::EthereumCash { .. } => "InventorySnapshotEvent::EthereumCash".to_string(),
             Self::BaseWalletCash { .. } => "InventorySnapshotEvent::BaseWalletCash".to_string(),
-            Self::BaseWalletEquity { .. } => "InventorySnapshotEvent::BaseWalletEquity".to_string(),
+            Self::BaseWalletUnwrappedEquity { .. } => {
+                "InventorySnapshotEvent::BaseWalletUnwrappedEquity".to_string()
+            }
+            Self::BaseWalletWrappedEquity { .. } => {
+                "InventorySnapshotEvent::BaseWalletWrappedEquity".to_string()
+            }
         }
     }
 
@@ -721,31 +757,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base_wallet_equity_initializes_on_first_command() {
+    async fn base_wallet_unwrapped_equity_initializes_on_first_command() {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(500));
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::BaseWalletEquity {
+            .when(InventorySnapshotCommand::BaseWalletUnwrappedEquity {
                 balances: balances.clone(),
             })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::BaseWalletEquity {
+        let InventorySnapshotEvent::BaseWalletUnwrappedEquity {
             balances: event_balances,
             ..
         } = &events[0]
         else {
-            panic!("Expected BaseWalletEquity event, got {:?}", events[0]);
+            panic!(
+                "Expected BaseWalletUnwrappedEquity event, got {:?}",
+                events[0]
+            );
         };
         assert_eq!(*event_balances, balances);
     }
 
     #[tokio::test]
-    async fn base_wallet_equity_emits_on_change() {
+    async fn base_wallet_unwrapped_equity_emits_on_change() {
         let mut old_balances = BTreeMap::new();
         old_balances.insert(test_symbol("AAPL"), test_shares(500));
 
@@ -753,38 +792,41 @@ mod tests {
         new_balances.insert(test_symbol("AAPL"), test_shares(750));
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::BaseWalletEquity {
+            .given(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
                 balances: old_balances,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletEquity {
+            .when(InventorySnapshotCommand::BaseWalletUnwrappedEquity {
                 balances: new_balances.clone(),
             })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::BaseWalletEquity {
+        let InventorySnapshotEvent::BaseWalletUnwrappedEquity {
             balances: event_balances,
             ..
         } = &events[0]
         else {
-            panic!("Expected BaseWalletEquity event, got {:?}", events[0]);
+            panic!(
+                "Expected BaseWalletUnwrappedEquity event, got {:?}",
+                events[0]
+            );
         };
         assert_eq!(*event_balances, new_balances);
     }
 
     #[tokio::test]
-    async fn base_wallet_equity_skips_when_unchanged() {
+    async fn base_wallet_unwrapped_equity_skips_when_unchanged() {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(500));
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::BaseWalletEquity {
+            .given(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletEquity { balances })
+            .when(InventorySnapshotCommand::BaseWalletUnwrappedEquity { balances })
             .await
             .events();
 
@@ -792,18 +834,144 @@ mod tests {
     }
 
     #[test]
-    fn apply_event_updates_base_wallet_equity() {
+    fn apply_event_updates_base_wallet_unwrapped_equity() {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(500));
 
         let snapshot =
-            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::BaseWalletEquity {
+            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
             }])
             .unwrap()
             .unwrap();
 
-        assert_eq!(snapshot.base_wallet_equity, balances);
+        assert_eq!(snapshot.base_wallet_unwrapped_equity, balances);
+    }
+
+    #[tokio::test]
+    async fn base_wallet_wrapped_equity_initializes_on_first_command() {
+        let mut balances = BTreeMap::new();
+        balances.insert(test_symbol("AAPL"), test_shares(500));
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::BaseWalletWrappedEquity {
+                balances: balances.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let InventorySnapshotEvent::BaseWalletWrappedEquity {
+            balances: event_balances,
+            ..
+        } = &events[0]
+        else {
+            panic!(
+                "Expected BaseWalletWrappedEquity event, got {:?}",
+                events[0]
+            );
+        };
+        assert_eq!(*event_balances, balances);
+    }
+
+    #[tokio::test]
+    async fn base_wallet_wrapped_equity_emits_on_change() {
+        let mut old_balances = BTreeMap::new();
+        old_balances.insert(test_symbol("AAPL"), test_shares(500));
+
+        let mut new_balances = BTreeMap::new();
+        new_balances.insert(test_symbol("AAPL"), test_shares(750));
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances: old_balances,
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::BaseWalletWrappedEquity {
+                balances: new_balances.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let InventorySnapshotEvent::BaseWalletWrappedEquity {
+            balances: event_balances,
+            ..
+        } = &events[0]
+        else {
+            panic!(
+                "Expected BaseWalletWrappedEquity event, got {:?}",
+                events[0]
+            );
+        };
+        assert_eq!(*event_balances, new_balances);
+    }
+
+    #[tokio::test]
+    async fn base_wallet_wrapped_equity_skips_when_unchanged() {
+        let mut balances = BTreeMap::new();
+        balances.insert(test_symbol("AAPL"), test_shares(500));
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances: balances.clone(),
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::BaseWalletWrappedEquity { balances })
+            .await
+            .events();
+
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn base_wallet_wrapped_equity_emits_when_balance_drops_to_zero() {
+        let mut old_balances = BTreeMap::new();
+        old_balances.insert(test_symbol("AAPL"), test_shares(500));
+
+        let mut new_balances = BTreeMap::new();
+        new_balances.insert(test_symbol("AAPL"), test_shares(0));
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances: old_balances,
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::BaseWalletWrappedEquity {
+                balances: new_balances.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let InventorySnapshotEvent::BaseWalletWrappedEquity {
+            balances: event_balances,
+            ..
+        } = &events[0]
+        else {
+            panic!(
+                "Expected BaseWalletWrappedEquity event, got {:?}",
+                events[0]
+            );
+        };
+        assert_eq!(*event_balances, new_balances);
+    }
+
+    #[test]
+    fn apply_event_updates_base_wallet_wrapped_equity() {
+        let mut balances = BTreeMap::new();
+        balances.insert(test_symbol("AAPL"), test_shares(500));
+
+        let snapshot =
+            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances: balances.clone(),
+                fetched_at: Utc::now(),
+            }])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(snapshot.base_wallet_wrapped_equity, balances);
     }
 }

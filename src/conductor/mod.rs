@@ -91,13 +91,23 @@ pub(crate) struct TradingTasks {
     pub(crate) queue_processor: JoinHandle<()>,
 }
 
-fn base_wallet_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
+fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
     ctx.assets
         .equities
         .symbols
         .iter()
         .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
+        .collect()
+}
+
+fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
+    ctx.assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
         .collect()
 }
 
@@ -271,8 +281,15 @@ impl Conductor {
             }
 
             if let Some(wallet) = base_wallet {
-                let equity_token_addresses = base_wallet_equity_token_addresses(&ctx);
-                builder = builder.with_base_wallet(wallet, equity_token_addresses);
+                let unwrapped_equity_token_addresses =
+                    base_wallet_unwrapped_equity_token_addresses(&ctx);
+                let wrapped_equity_token_addresses =
+                    base_wallet_wrapped_equity_token_addresses(&ctx);
+                builder = builder.with_base_wallet(
+                    wallet,
+                    unwrapped_equity_token_addresses,
+                    wrapped_equity_token_addresses,
+                );
             }
 
             Ok(builder.spawn())
@@ -1650,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn base_wallet_equity_token_addresses_skips_disabled_assets() {
+    fn base_wallet_unwrapped_equity_token_addresses_skips_disabled_assets() {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let spym = Symbol::new("SPYM").unwrap();
@@ -1703,7 +1720,7 @@ mod tests {
             ))
         };
 
-        let actual = base_wallet_equity_token_addresses(&ctx);
+        let actual = base_wallet_unwrapped_equity_token_addresses(&ctx);
 
         assert_eq!(
             actual.len(),
@@ -1714,7 +1731,76 @@ mod tests {
         assert_eq!(actual.get(&tsla), Some(&tsla_token));
         assert!(
             !actual.contains_key(&spym),
-            "Disabled assets should be excluded from Base-wallet equity polling"
+            "Disabled assets should be excluded from Base-wallet unwrapped equity polling"
+        );
+    }
+
+    #[test]
+    fn base_wallet_wrapped_equity_token_addresses_skips_disabled_assets() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let spym = Symbol::new("SPYM").unwrap();
+        let aapl_wrapped_token = Address::random();
+        let tsla_wrapped_token = Address::random();
+        let spym_wrapped_token = Address::random();
+
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            aapl.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: aapl_wrapped_token,
+                vault_id: None,
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        symbols.insert(
+            tsla.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: tsla_wrapped_token,
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+        symbols.insert(
+            spym.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: spym_wrapped_token,
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities: EquitiesConfig { symbols },
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        };
+
+        let actual = base_wallet_wrapped_equity_token_addresses(&ctx);
+
+        assert_eq!(
+            actual.len(),
+            2,
+            "Only trading-enabled or rebalancing-enabled assets should be polled"
+        );
+        assert_eq!(actual.get(&aapl), Some(&aapl_wrapped_token));
+        assert_eq!(actual.get(&tsla), Some(&tsla_wrapped_token));
+        assert!(
+            !actual.contains_key(&spym),
+            "Disabled assets should be excluded from Base-wallet wrapped equity polling"
         );
     }
 

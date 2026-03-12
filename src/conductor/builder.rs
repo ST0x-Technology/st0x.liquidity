@@ -147,7 +147,8 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 wallet_polling: WalletPollingConfig {
                     ethereum: None,
                     base: None,
-                    equity_token_addresses: HashMap::new(),
+                    unwrapped_equity_token_addresses: HashMap::new(),
+                    wrapped_equity_token_addresses: HashMap::new(),
                 },
             },
         }
@@ -176,10 +177,13 @@ where
     pub(crate) fn with_base_wallet(
         mut self,
         wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-        equity_token_addresses: HashMap<Symbol, Address>,
+        unwrapped_equity_token_addresses: HashMap<Symbol, Address>,
+        wrapped_equity_token_addresses: HashMap<Symbol, Address>,
     ) -> Self {
         self.state.wallet_polling.base = Some(wallet);
-        self.state.wallet_polling.equity_token_addresses = equity_token_addresses;
+        self.state.wallet_polling.unwrapped_equity_token_addresses =
+            unwrapped_equity_token_addresses;
+        self.state.wallet_polling.wrapped_equity_token_addresses = wrapped_equity_token_addresses;
         self
     }
 
