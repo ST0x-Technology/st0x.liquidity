@@ -9,13 +9,13 @@
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
 use futures_util::future::try_join_all;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::debug;
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
-use st0x_execution::{Executor, InventoryResult};
+use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 
 use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
@@ -46,11 +46,15 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
         expected: Vec<Address>,
         actual: Vec<Address>,
     },
+    #[error(transparent)]
+    SharesConversion(#[from] SharesConversionError),
 }
 
-pub(crate) struct WalletPollingConfig {
+pub(crate) struct WalletPollingCtx {
     pub(crate) ethereum: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
     pub(crate) base: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
+    pub(crate) unwrapped_equity_token_addresses: HashMap<Symbol, Address>,
+    pub(crate) wrapped_equity_token_addresses: HashMap<Symbol, Address>,
 }
 
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
@@ -64,7 +68,7 @@ where
     orderbook: Address,
     order_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
-    wallet_polling: WalletPollingConfig,
+    wallet_polling: WalletPollingCtx,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -79,7 +83,7 @@ where
         orderbook: Address,
         order_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
-        wallet_polling: WalletPollingConfig,
+        wallet_polling: WalletPollingCtx,
     ) -> Self {
         Self {
             raindex_service,
@@ -108,6 +112,8 @@ where
         self.poll_onchain(&snapshot_id).await?;
         self.poll_ethereum_cash(&snapshot_id).await?;
         self.poll_base_wallet_cash(&snapshot_id).await?;
+        self.poll_base_wallet_unwrapped_equity(&snapshot_id).await?;
+        self.poll_base_wallet_wrapped_equity(&snapshot_id).await?;
         self.poll_offchain(&snapshot_id).await?;
 
         Ok(())
@@ -276,6 +282,104 @@ where
             .await?;
 
         Ok(())
+    }
+
+    async fn poll_base_wallet_unwrapped_equity(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let Some(wallet) = &self.wallet_polling.base else {
+            debug!("No Base wallet configured, skipping Base unwrapped equity polling");
+            return Ok(());
+        };
+
+        if self
+            .wallet_polling
+            .unwrapped_equity_token_addresses
+            .is_empty()
+        {
+            debug!(
+                "No unwrapped equity token addresses configured, skipping Base unwrapped equity polling"
+            );
+            return Ok(());
+        }
+
+        let balances = self
+            .poll_base_wallet_token_balances(
+                wallet,
+                &self.wallet_polling.unwrapped_equity_token_addresses,
+            )
+            .await?;
+
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::BaseWalletUnwrappedEquity { balances },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn poll_base_wallet_wrapped_equity(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let Some(wallet) = &self.wallet_polling.base else {
+            debug!("No Base wallet configured, skipping Base wrapped equity polling");
+            return Ok(());
+        };
+
+        if self
+            .wallet_polling
+            .wrapped_equity_token_addresses
+            .is_empty()
+        {
+            debug!(
+                "No wrapped equity token addresses configured, skipping Base wrapped equity polling"
+            );
+            return Ok(());
+        }
+
+        let balances = self
+            .poll_base_wallet_token_balances(
+                wallet,
+                &self.wallet_polling.wrapped_equity_token_addresses,
+            )
+            .await?;
+
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::BaseWalletWrappedEquity { balances },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn poll_base_wallet_token_balances(
+        &self,
+        wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+        token_addresses: &HashMap<Symbol, Address>,
+    ) -> Result<BTreeMap<Symbol, FractionalShares>, InventoryPollingError<Exe::Error>> {
+        let balance_futures = token_addresses.iter().map(|(symbol, token_addr)| async {
+            let raw_balance = wallet
+                .call::<OpenChainErrorRegistry, _>(
+                    *token_addr,
+                    IERC20::balanceOfCall {
+                        account: wallet.address(),
+                    },
+                )
+                .await?;
+
+            let shares = FractionalShares::from_u256_18_decimals(raw_balance)?;
+            Ok::<_, InventoryPollingError<Exe::Error>>((symbol.clone(), shares))
+        });
+
+        let results = try_join_all(balance_futures).await?;
+
+        Ok(results.into_iter().collect())
     }
 
     async fn poll_offchain(
@@ -493,15 +597,16 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
         service.poll_and_record().await.unwrap();
 
-        // Verify OffchainEquity event was emitted with correct positions
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let offchain_equity_event = events
             .iter()
@@ -544,15 +649,16 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
         service.poll_and_record().await.unwrap();
 
-        // Verify OffchainCash event was emitted with correct amount
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let offchain_cash_event = events
             .iter()
@@ -591,9 +697,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -628,9 +736,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -687,9 +797,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -738,9 +850,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -783,15 +897,16 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
         service.poll_and_record().await.unwrap();
 
-        // Verify events were stored under the correct aggregate ID
         let expected_aggregate_id = InventorySnapshotId {
             orderbook,
             owner: order_owner,
@@ -880,9 +995,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -916,7 +1033,6 @@ mod tests {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
-        // Only discover a USDC vault so registry is Live but has no equity vaults
         discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
@@ -933,9 +1049,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -962,7 +1080,6 @@ mod tests {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
-        // Only discover an equity vault so registry is Live but has no USDC vault
         discover_equity_vault(
             &pool,
             orderbook,
@@ -987,9 +1104,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1039,9 +1158,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1074,9 +1195,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1137,7 +1260,7 @@ mod tests {
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
         let asserter = Asserter::new();
-        let encoded = format!("0x{}", alloy::hex::encode(raw_usdc.abi_encode()));
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
         asserter.push_success(&encoded);
         let ethereum_wallet = MockEthereumWallet::with_asserter(&asserter);
 
@@ -1150,9 +1273,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: Some(ethereum_wallet),
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1180,7 +1305,7 @@ mod tests {
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
         let asserter = Asserter::new();
-        let encoded = format!("0x{}", alloy::hex::encode(raw_usdc.abi_encode()));
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
         asserter.push_success(&encoded);
         let base_wallet = MockBaseWallet::with_asserter(&asserter);
 
@@ -1193,9 +1318,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1232,9 +1359,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1272,9 +1401,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1315,9 +1446,11 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: Some(ethereum_wallet),
                 base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
@@ -1345,13 +1478,591 @@ mod tests {
             orderbook,
             order_owner,
             Arc::new(test_store(pool.clone(), ())),
-            WalletPollingConfig {
+            WalletPollingCtx {
                 ethereum: None,
                 base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
             },
         );
 
         let error = service.poll_and_record().await.unwrap_err();
         assert!(matches!(error, InventoryPollingError::Evm(_)));
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_emits_base_wallet_unwrapped_equity_when_wallet_and_tokens_provided() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let token_addr = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let raw_balance = U256::from(500_000u64) * U256::from(10u64).pow(U256::from(18u64)); // 500,000 tokens (18 decimals)
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        asserter.push_success(&usdc_encoded); // USDC balanceOf (zero)
+        let equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
+        asserter.push_success(&equity_encoded); // equity token balanceOf
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut equity_tokens = HashMap::new();
+        equity_tokens.insert(test_symbol("AAPL"), token_addr);
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: equity_tokens,
+                wrapped_equity_token_addresses: HashMap::new(),
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let equity_event = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    InventorySnapshotEvent::BaseWalletUnwrappedEquity { .. }
+                )
+            })
+            .expect("Expected BaseWalletUnwrappedEquity event to be emitted");
+
+        let InventorySnapshotEvent::BaseWalletUnwrappedEquity { balances, .. } = equity_event
+        else {
+            panic!("Expected BaseWalletUnwrappedEquity event, got {equity_event:?}");
+        };
+        let expected = FractionalShares::from_u256_18_decimals(raw_balance).unwrap();
+        assert_eq!(
+            balances.get(&test_symbol("AAPL")),
+            Some(&expected),
+            "AAPL balance mismatch"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_and_record_skips_base_wallet_unwrapped_equity_when_no_wallet() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let has_equity = events.iter().any(|event| {
+            matches!(
+                event,
+                InventorySnapshotEvent::BaseWalletUnwrappedEquity { .. }
+            )
+        });
+
+        assert!(
+            !has_equity,
+            "Should NOT emit BaseWalletUnwrappedEquity when no Base wallet configured"
+        );
+        assert!(logs_contain(
+            "No Base wallet configured, skipping Base unwrapped equity polling"
+        ));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_and_record_skips_base_wallet_unwrapped_equity_when_no_token_addresses() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let raw_usdc = U256::from(1_000_000u64); // 1 USDC
+        let asserter = Asserter::new();
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
+        asserter.push_success(&encoded);
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let has_equity = events.iter().any(|event| {
+            matches!(
+                event,
+                InventorySnapshotEvent::BaseWalletUnwrappedEquity { .. }
+            )
+        });
+
+        assert!(
+            !has_equity,
+            "Should NOT emit BaseWalletUnwrappedEquity when no token addresses configured"
+        );
+        assert!(logs_contain(
+            "No unwrapped equity token addresses configured, skipping Base unwrapped equity polling"
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_propagates_base_wallet_unwrapped_equity_rpc_failure() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        asserter.push_success(&usdc_encoded); // USDC balanceOf succeeds
+        asserter.push_failure_msg("Equity RPC failure"); // equity balanceOf fails
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut equity_tokens = HashMap::new();
+        equity_tokens.insert(
+            test_symbol("AAPL"),
+            address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: equity_tokens,
+                wrapped_equity_token_addresses: HashMap::new(),
+            },
+        );
+
+        let error = service.poll_and_record().await.unwrap_err();
+        assert!(
+            matches!(error, InventoryPollingError::Evm(_)),
+            "Expected Evm error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_propagates_base_wallet_unwrapped_equity_shares_conversion_failure() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        let equity_encoded = alloy::hex::encode_prefixed(U256::MAX.abi_encode());
+        asserter.push_success(&usdc_encoded); // USDC balanceOf succeeds
+        asserter.push_success(&equity_encoded); // equity balanceOf overflows conversion
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut equity_tokens = HashMap::new();
+        equity_tokens.insert(
+            test_symbol("AAPL"),
+            address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: equity_tokens,
+                wrapped_equity_token_addresses: HashMap::new(),
+            },
+        );
+
+        let error = service.poll_and_record().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                InventoryPollingError::SharesConversion(SharesConversionError::DecimalConversion(
+                    _
+                ))
+            ),
+            "Expected shares conversion error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_emits_base_wallet_wrapped_equity_when_wallet_and_tokens_provided() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let token_addr = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+        let raw_balance = U256::from(250_000u64) * U256::from(10u64).pow(U256::from(18u64));
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        asserter.push_success(&usdc_encoded); // USDC balanceOf (zero)
+        let equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
+        asserter.push_success(&equity_encoded); // wrapped equity token balanceOf
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut wrapped_equity_tokens = HashMap::new();
+        wrapped_equity_tokens.insert(test_symbol("AAPL"), token_addr);
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: wrapped_equity_tokens,
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let wrapped_equity_event = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    InventorySnapshotEvent::BaseWalletWrappedEquity { .. }
+                )
+            })
+            .expect("Expected BaseWalletWrappedEquity event to be emitted");
+
+        let InventorySnapshotEvent::BaseWalletWrappedEquity { balances, .. } = wrapped_equity_event
+        else {
+            panic!("Expected BaseWalletWrappedEquity event, got {wrapped_equity_event:?}");
+        };
+        let expected = FractionalShares::from_u256_18_decimals(raw_balance).unwrap();
+        assert_eq!(
+            balances.get(&test_symbol("AAPL")),
+            Some(&expected),
+            "AAPL wrapped balance mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_emits_base_wallet_wrapped_equity_for_multiple_assets() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let raw_balance = U256::from(42u64) * U256::from(10u64).pow(U256::from(18u64));
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        let wrapped_equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
+        asserter.push_success(&usdc_encoded); // USDC balanceOf (zero)
+        asserter.push_success(&wrapped_equity_encoded); // first wrapped token balanceOf
+        asserter.push_success(&wrapped_equity_encoded); // second wrapped token balanceOf
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut wrapped_equity_tokens = HashMap::new();
+        wrapped_equity_tokens.insert(
+            test_symbol("AAPL"),
+            address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        );
+        wrapped_equity_tokens.insert(
+            test_symbol("TSLA"),
+            address!("0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: wrapped_equity_tokens,
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let wrapped_equity_event = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    InventorySnapshotEvent::BaseWalletWrappedEquity { .. }
+                )
+            })
+            .expect("Expected BaseWalletWrappedEquity event to be emitted");
+
+        let InventorySnapshotEvent::BaseWalletWrappedEquity { balances, .. } = wrapped_equity_event
+        else {
+            panic!("Expected BaseWalletWrappedEquity event, got {wrapped_equity_event:?}");
+        };
+        let expected = FractionalShares::from_u256_18_decimals(raw_balance).unwrap();
+        assert_eq!(balances.get(&test_symbol("AAPL")), Some(&expected));
+        assert_eq!(balances.get(&test_symbol("TSLA")), Some(&expected));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_and_record_skips_base_wallet_wrapped_equity_when_no_wallet() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let mut wrapped_equity_tokens = HashMap::new();
+        wrapped_equity_tokens.insert(
+            test_symbol("AAPL"),
+            address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: None,
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: wrapped_equity_tokens,
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let has_wrapped_equity = events.iter().any(|event| {
+            matches!(
+                event,
+                InventorySnapshotEvent::BaseWalletWrappedEquity { .. }
+            )
+        });
+
+        assert!(
+            !has_wrapped_equity,
+            "Should NOT emit BaseWalletWrappedEquity when no Base wallet configured"
+        );
+        assert!(logs_contain(
+            "No Base wallet configured, skipping Base wrapped equity polling"
+        ));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_and_record_skips_base_wallet_wrapped_equity_when_no_token_addresses() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let raw_usdc = U256::from(1_000_000u64); // 1 USDC
+        let asserter = Asserter::new();
+        let encoded = alloy::hex::encode_prefixed(raw_usdc.abi_encode());
+        asserter.push_success(&encoded);
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: HashMap::new(),
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let has_wrapped_equity = events.iter().any(|event| {
+            matches!(
+                event,
+                InventorySnapshotEvent::BaseWalletWrappedEquity { .. }
+            )
+        });
+
+        assert!(
+            !has_wrapped_equity,
+            "Should NOT emit BaseWalletWrappedEquity when no token addresses configured"
+        );
+        assert!(logs_contain(
+            "No wrapped equity token addresses configured, skipping Base wrapped equity polling"
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_propagates_base_wallet_wrapped_equity_rpc_failure() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        asserter.push_success(&usdc_encoded); // USDC balanceOf succeeds
+        asserter.push_failure_msg("Wrapped equity RPC failure"); // wrapped equity balanceOf fails
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut wrapped_equity_tokens = HashMap::new();
+        wrapped_equity_tokens.insert(
+            test_symbol("AAPL"),
+            address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: wrapped_equity_tokens,
+            },
+        );
+
+        let error = service.poll_and_record().await.unwrap_err();
+        assert!(
+            matches!(error, InventoryPollingError::Evm(_)),
+            "Expected Evm error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_skips_unchanged_base_wallet_wrapped_equity_snapshot() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let raw_balance = U256::from(3u64) * U256::from(10u64).pow(U256::from(18u64));
+        let asserter = Asserter::new();
+        let usdc_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        let wrapped_equity_encoded = alloy::hex::encode_prefixed(raw_balance.abi_encode());
+        asserter.push_success(&usdc_encoded); // first poll USDC balanceOf
+        asserter.push_success(&wrapped_equity_encoded); // first poll wrapped balanceOf
+        asserter.push_success(&usdc_encoded); // second poll USDC balanceOf
+        asserter.push_success(&wrapped_equity_encoded); // second poll wrapped balanceOf
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut wrapped_equity_tokens = HashMap::new();
+        wrapped_equity_tokens.insert(
+            test_symbol("AAPL"),
+            address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            orderbook,
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            WalletPollingCtx {
+                ethereum: None,
+                base: Some(base_wallet),
+                unwrapped_equity_token_addresses: HashMap::new(),
+                wrapped_equity_token_addresses: wrapped_equity_tokens,
+            },
+        );
+
+        service.poll_and_record().await.unwrap();
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let wrapped_equity_event_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    InventorySnapshotEvent::BaseWalletWrappedEquity { .. }
+                )
+            })
+            .count();
+
+        assert_eq!(
+            wrapped_equity_event_count, 1,
+            "Should not emit a second BaseWalletWrappedEquity event when the balance is unchanged"
+        );
     }
 }

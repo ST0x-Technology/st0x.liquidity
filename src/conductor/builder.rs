@@ -1,10 +1,12 @@
 //! Typestate builder for constructing a fully-wired Conductor instance.
 
+use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -12,7 +14,7 @@ use tracing::info;
 
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::{ReadOnlyEvm, Wallet};
-use st0x_execution::Executor;
+use st0x_execution::{Executor, Symbol};
 
 use super::{
     Conductor, EventProcessingError, TradingTasks, spawn_event_processor, spawn_inventory_poller,
@@ -21,7 +23,7 @@ use super::{
 };
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingConfig};
+use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
@@ -69,7 +71,7 @@ pub(crate) struct WithDexStreams {
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
     rebalancer: Option<JoinHandle<()>>,
-    wallet_polling: WalletPollingConfig,
+    wallet_polling: WalletPollingCtx,
 }
 
 pub(crate) struct ConductorBuilder<P, E, State> {
@@ -142,9 +144,11 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_sender,
                 event_receiver,
                 rebalancer: None,
-                wallet_polling: WalletPollingConfig {
+                wallet_polling: WalletPollingCtx {
                     ethereum: None,
                     base: None,
+                    unwrapped_equity_token_addresses: HashMap::new(),
+                    wrapped_equity_token_addresses: HashMap::new(),
                 },
             },
         }
@@ -173,8 +177,13 @@ where
     pub(crate) fn with_base_wallet(
         mut self,
         wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        unwrapped_equity_token_addresses: HashMap<Symbol, Address>,
+        wrapped_equity_token_addresses: HashMap<Symbol, Address>,
     ) -> Self {
         self.state.wallet_polling.base = Some(wallet);
+        self.state.wallet_polling.unwrapped_equity_token_addresses =
+            unwrapped_equity_token_addresses;
+        self.state.wallet_polling.wrapped_equity_token_addresses = wrapped_equity_token_addresses;
         self
     }
 
