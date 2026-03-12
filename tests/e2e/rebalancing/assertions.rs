@@ -21,10 +21,12 @@ pub(crate) use rust_decimal::Decimal;
 pub(crate) use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::path::Path;
 pub(crate) use std::str::FromStr;
 use std::sync::Arc;
 pub(crate) use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_evm::{Evm, EvmError, Wallet};
@@ -143,7 +145,7 @@ impl Wallet for TestWallet {
 pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     chain: &base_chain::BaseChain<P>,
     broker: &AlpacaBrokerMock,
-    db_path: &std::path::Path,
+    db_path: &Path,
     deployment_block: u64,
     equity_tokens: &[(String, Address, Address)],
     equity_vault_ids: &HashMap<String, B256>,
@@ -221,7 +223,7 @@ pub(crate) fn build_usdc_rebalancing_ctx<BP>(
     base_chain: &base_chain::BaseChain<BP>,
     ethereum_endpoint: &str,
     broker: &AlpacaBrokerMock,
-    db_path: &std::path::Path,
+    db_path: &Path,
     deployment_block: u64,
     equity_tokens: &[(String, Address, Address)],
     usdc_vault_id: B256,
@@ -743,7 +745,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
 
 pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
     bot: &mut JoinHandle<anyhow::Result<()>>,
-    db_path: &std::path::Path,
+    db_path: &Path,
     symbol: &str,
     expected_unwrapped_balance: FractionalShares,
     wrapped_balance: FractionalShares,
@@ -755,7 +757,7 @@ pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
     );
 
     let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     let context =
         format!("BaseWalletEquity snapshot for {symbol} matching {expected_unwrapped_balance}");
 
@@ -764,7 +766,7 @@ pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
 
         let Ok(pool) = connect_db(db_path).await else {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "Timed out after {timeout:?} waiting for {context} (database not ready)",
             );
             continue;
@@ -797,7 +799,7 @@ pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
                 .transpose()?,
             Err(error) => {
                 assert!(
-                    tokio::time::Instant::now() < deadline,
+                    Instant::now() < deadline,
                     "Timed out after {timeout:?} waiting for {context} \
                      (query failed: {error})",
                 );
@@ -810,7 +812,7 @@ pub(crate) async fn assert_initial_base_wallet_equity_snapshot(
         }
 
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "Timed out after {timeout:?} waiting for {context} \
              (found latest snapshot balance {snapshot_balance:?}, wrapped balance {wrapped_balance})",
         );
@@ -825,7 +827,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
     orderbook: Address,
     owner: Address,
     broker: &AlpacaBrokerMock,
-    db_path: &std::path::Path,
+    db_path: &Path,
     rebalance_type: EquityRebalanceType<'_>,
 ) -> anyhow::Result<()> {
     let database_url = &db_path.display().to_string();
@@ -1184,9 +1186,7 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
 }
 
 /// Asserts that at least one `EthereumCash` inventory snapshot was emitted.
-pub(crate) async fn assert_ethereum_cash_event_exists(
-    db_path: &std::path::Path,
-) -> anyhow::Result<()> {
+pub(crate) async fn assert_ethereum_cash_event_exists(db_path: &Path) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
     let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
 
@@ -1202,9 +1202,7 @@ pub(crate) async fn assert_ethereum_cash_event_exists(
     Ok(())
 }
 
-pub(crate) async fn assert_base_wallet_cash_event_exists(
-    db_path: &std::path::Path,
-) -> anyhow::Result<()> {
+pub(crate) async fn assert_base_wallet_cash_event_exists(db_path: &Path) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
     let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
 
@@ -1229,7 +1227,7 @@ pub(crate) async fn assert_usdc_rebalancing_flow<P: Provider>(
     owner: Address,
     broker: &AlpacaBrokerMock,
     attestation: &CctpAttestationMock,
-    db_path: &std::path::Path,
+    db_path: &Path,
     usdc_vault_id: B256,
     usdc_vault_balance_before_rebalance: B256,
     ethereum_usdc_balance_before_rebalance: U256,

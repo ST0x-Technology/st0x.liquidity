@@ -28,9 +28,11 @@ mod assertions;
 
 use std::collections::HashMap;
 
+use st0x_execution::FractionalShares;
 use st0x_hedge::OperationMode;
 
 use self::assertions::*;
+use crate::base_chain::IERC20;
 
 /// Control test: direct high-precision sell-side Raindex prices should not
 /// break equity rebalancing. This avoids buy-side reciprocal math and verifies
@@ -152,7 +154,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     // Keep the owner's direct wrapped and unwrapped balances distinct so the
     // BaseWalletEquity snapshot assertion proves we polled the unwrapped token.
     let balance_skew: U256 = parse_units("1", 18)?.into();
-    crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+    IERC20::new(unwrapped_token, &infra.base_chain.provider)
         .transfer(infra.base_chain.taker, balance_skew)
         .send()
         .await?
@@ -176,23 +178,18 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     }
 
     let owner_unwrapped_balance_before_takes =
-        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+        IERC20::new(unwrapped_token, &infra.base_chain.provider)
             .balanceOf(infra.base_chain.owner)
             .call()
             .await?;
-    let owner_wrapped_balance_before_takes =
-        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
+    let owner_wrapped_balance_before_takes = IERC20::new(wrapped_token, &infra.base_chain.provider)
+        .balanceOf(infra.base_chain.owner)
+        .call()
+        .await?;
     let owner_unwrapped_shares_before_takes =
-        st0x_execution::FractionalShares::from_u256_18_decimals(
-            owner_unwrapped_balance_before_takes,
-        )?;
+        FractionalShares::from_u256_18_decimals(owner_unwrapped_balance_before_takes)?;
     let owner_wrapped_shares_before_takes =
-        st0x_execution::FractionalShares::from_u256_18_decimals(
-            owner_wrapped_balance_before_takes,
-        )?;
+        FractionalShares::from_u256_18_decimals(owner_wrapped_balance_before_takes)?;
 
     // Capture block AFTER setup so the bot sees the orders
     let current_block = infra.base_chain.provider.get_block_number().await?;
@@ -308,11 +305,10 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
     // ratio jumps to ~0.81 > 0.6 threshold -> Redemption.
     let vault_addr = infra.equity_addresses[0].1;
     let underlying_addr = infra.equity_addresses[0].2;
-    let redemption_wallet_balance_before =
-        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
-            .balanceOf(REDEMPTION_WALLET)
-            .call()
-            .await?;
+    let redemption_wallet_balance_before = IERC20::new(underlying_addr, &infra.base_chain.provider)
+        .balanceOf(REDEMPTION_WALLET)
+        .call()
+        .await?;
     let equity_vault_id = prepared.input_vault_id;
     let extra_equity: U256 = parse_units("20", 18)?.into();
     infra
@@ -367,11 +363,10 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .expected_net(dec!(0))
         .build()];
 
-    let redemption_wallet_balance_after =
-        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
-            .balanceOf(REDEMPTION_WALLET)
-            .call()
-            .await?;
+    let redemption_wallet_balance_after = IERC20::new(underlying_addr, &infra.base_chain.provider)
+        .balanceOf(REDEMPTION_WALLET)
+        .call()
+        .await?;
 
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -427,11 +422,10 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
 
     let vault_addr = infra.equity_addresses[0].1;
     let underlying_addr = infra.equity_addresses[0].2;
-    let redemption_wallet_balance_before =
-        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
-            .balanceOf(REDEMPTION_WALLET)
-            .call()
-            .await?;
+    let redemption_wallet_balance_before = IERC20::new(underlying_addr, &infra.base_chain.provider)
+        .balanceOf(REDEMPTION_WALLET)
+        .call()
+        .await?;
     let equity_vault_id = prepared.input_vault_id;
     let extra_equity: U256 = parse_units("100", 18)?.into();
     infra
@@ -482,11 +476,10 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .expected_net(dec!(0))
         .build()];
 
-    let redemption_wallet_balance_after =
-        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
-            .balanceOf(REDEMPTION_WALLET)
-            .call()
-            .await?;
+    let redemption_wallet_balance_after = IERC20::new(underlying_addr, &infra.base_chain.provider)
+        .balanceOf(REDEMPTION_WALLET)
+        .call()
+        .await?;
 
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -543,11 +536,10 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
 
     let vault_addr = infra.equity_addresses[0].1;
     let underlying_addr = infra.equity_addresses[0].2;
-    let redemption_wallet_balance_before =
-        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
-            .balanceOf(REDEMPTION_WALLET)
-            .call()
-            .await?;
+    let redemption_wallet_balance_before = IERC20::new(underlying_addr, &infra.base_chain.provider)
+        .balanceOf(REDEMPTION_WALLET)
+        .call()
+        .await?;
     let equity_vault_id = prepared.input_vault_id;
     let extra_equity: U256 = parse_units("100", 18)?.into();
     infra
@@ -598,11 +590,10 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .expected_net(dec!(0))
         .build()];
 
-    let redemption_wallet_balance_after =
-        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
-            .balanceOf(REDEMPTION_WALLET)
-            .call()
-            .await?;
+    let redemption_wallet_balance_after = IERC20::new(underlying_addr, &infra.base_chain.provider)
+        .balanceOf(REDEMPTION_WALLET)
+        .call()
+        .await?;
 
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -716,11 +707,10 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         )
         .call()
         .await?;
-    let ethereum_usdc_balance_before_rebalance =
-        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
+    let ethereum_usdc_balance_before_rebalance = IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+        .balanceOf(infra.base_chain.owner)
+        .call()
+        .await?;
 
     poll_for_events_with_timeout(
         &mut bot,
@@ -730,11 +720,10 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         Duration::from_secs(120),
     )
     .await;
-    let ethereum_usdc_balance_after_rebalance =
-        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
+    let ethereum_usdc_balance_after_rebalance = IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+        .balanceOf(infra.base_chain.owner)
+        .call()
+        .await?;
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
@@ -873,11 +862,10 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .expect("at least one take should touch the USDC input vault")
         .input_vault_balance_before_take;
 
-    let ethereum_usdc_balance_before_rebalance =
-        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
+    let ethereum_usdc_balance_before_rebalance = IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+        .balanceOf(infra.base_chain.owner)
+        .call()
+        .await?;
 
     poll_for_events_with_timeout(
         &mut bot,
@@ -887,11 +875,10 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         Duration::from_secs(120),
     )
     .await;
-    let ethereum_usdc_balance_after_rebalance =
-        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
+    let ethereum_usdc_balance_after_rebalance = IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+        .balanceOf(infra.base_chain.owner)
+        .call()
+        .await?;
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
