@@ -147,6 +147,18 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     let amount_per_trade = dec!(7.5);
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let wrapped_token = infra.equity_addresses[0].1;
+    let unwrapped_token = infra.equity_addresses[0].2;
+
+    // Keep the owner's direct wrapped and unwrapped balances distinct so the
+    // BaseWalletEquity snapshot assertion proves we polled the unwrapped token.
+    let balance_skew: U256 = parse_units("1", 18)?.into();
+    crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+        .transfer(infra.base_chain.taker, balance_skew)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
 
     // Set up orders before bot starts (owner nonces, no collision).
     let mut prepared_orders = Vec::new();
@@ -213,6 +225,22 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .expected_net(dec!(0))
         .build()];
 
+    let owner_unwrapped_balance_after_rebalance =
+        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_wrapped_balance_after_rebalance =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    assert_ne!(
+        owner_unwrapped_balance_after_rebalance, owner_wrapped_balance_after_rebalance,
+        "Wrapped and unwrapped owner balances must stay distinct so BaseWalletEquity proves the \
+         poller used the unwrapped token address"
+    );
+
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
         .take_results(&take_results)
@@ -224,7 +252,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .rebalance_type(EquityRebalanceType::Mint {
             symbol: "AAPL",
             tokenization: &infra.tokenization_service,
-            unwrapped_token: infra.equity_addresses[0].2,
+            unwrapped_token,
         })
         .call()
         .await?;
