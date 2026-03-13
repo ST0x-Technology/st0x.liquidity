@@ -1,7 +1,7 @@
 //! Alpaca Broker API crypto wallet client for USDC deposits and withdrawals.
 //!
 //! This module integrates with the wallet endpoints of the Alpaca Broker API,
-//! supporting USDC deposits and withdrawals.
+//! supporting USDC balance checks, deposits, and withdrawals.
 //!
 //! # Authentication
 //!
@@ -21,7 +21,9 @@
 //! Use `poll_transfer_until_complete()` to wait for a
 //! transfer to reach a terminal state.
 
+mod asset;
 mod client;
+mod serde;
 mod status;
 mod transfer;
 mod whitelist;
@@ -29,9 +31,7 @@ mod whitelist;
 use alloy::primitives::{Address, TxHash};
 use std::sync::Arc;
 
-use st0x_execution::Positive;
-
-use st0x_execution::AlpacaAccountId;
+use st0x_execution::{AlpacaAccountId, HasZero, Positive};
 
 use crate::threshold::Usdc;
 
@@ -42,7 +42,8 @@ pub(crate) use whitelist::WhitelistStatus;
 
 /// Service facade for Alpaca crypto wallet operations.
 ///
-/// Provides a high-level API for deposits, withdrawals, and transfer polling.
+/// Provides a high-level API for balance checks, deposits, withdrawals, and
+/// transfer polling.
 pub(crate) struct AlpacaWalletService {
     client: Arc<AlpacaWalletClient>,
     polling_config: PollingConfig,
@@ -138,6 +139,28 @@ impl AlpacaWalletService {
         tx_hash: &TxHash,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
+    }
+
+    /// Gets the current USDC balance held in Alpaca's crypto wallet.
+    ///
+    /// If Alpaca reports no USDC wallet entry, this returns zero.
+    pub(crate) async fn get_usdc_balance(&self) -> Result<Usdc, AlpacaWalletError> {
+        let usdc = TokenSymbol::new("USDC");
+        let wallet_assets = self.client.list_wallet_assets().await?;
+
+        let Some(balance) = wallet_assets
+            .into_iter()
+            .find(|wallet_asset| wallet_asset.asset == usdc)
+            .map(|wallet_asset| wallet_asset.balance)
+        else {
+            return Ok(Usdc::ZERO);
+        };
+
+        if balance.is_sign_negative() {
+            return Err(AlpacaWalletError::NegativeUsdcBalance { balance });
+        }
+
+        Ok(Usdc(balance))
     }
 
     pub(crate) async fn get_wallet_address(
@@ -393,6 +416,79 @@ mod tests {
 
         assert_eq!(result.status, transfer::TransferStatus::Complete);
         status_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_usdc_balance_returns_wallet_balance() {
+        let server = MockServer::start();
+        let service = create_test_service(&server);
+
+        let wallets_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset": "USDC",
+                        "balance": "1250.75"
+                    }
+                ]));
+        });
+
+        let balance = service.get_usdc_balance().await.unwrap();
+
+        assert_eq!(balance, Usdc(dec!(1250.75)));
+        wallets_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_usdc_balance_returns_zero_when_wallet_missing() {
+        let server = MockServer::start();
+        let service = create_test_service(&server);
+
+        let wallets_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset": "BTC",
+                        "balance": "0.5"
+                    }
+                ]));
+        });
+
+        let balance = service.get_usdc_balance().await.unwrap();
+
+        assert_eq!(balance, Usdc::ZERO);
+        wallets_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_usdc_balance_rejects_negative_balance() {
+        let server = MockServer::start();
+        let service = create_test_service(&server);
+
+        let wallets_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset": "USDC",
+                        "balance": "-10"
+                    }
+                ]));
+        });
+
+        assert!(matches!(
+            service.get_usdc_balance().await.unwrap_err(),
+            AlpacaWalletError::NegativeUsdcBalance { balance } if balance == dec!(-10)
+        ));
+        wallets_mock.assert();
     }
 
     #[tokio::test]
