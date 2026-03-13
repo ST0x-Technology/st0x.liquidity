@@ -32,7 +32,8 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
+use crate::equity_redemption::symbols_with_stuck_redemptions;
+use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView, Venue};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -172,6 +173,23 @@ impl Conductor {
 
             let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
+            // Recover sticky inflight state from event history. Redemptions
+            // that ended in DetectionFailed or RedemptionRejected have tokens
+            // physically in Alpaca's wallet with no snapshot source -- mark
+            // them sticky so apply_inflight_snapshot won't zero the balance.
+            let stuck_symbols = symbols_with_stuck_redemptions(&pool).await?;
+            if !stuck_symbols.is_empty() {
+                let mut view = inventory.write().await;
+                for symbol in &stuck_symbols {
+                    view.mark_sticky_inflight(symbol.clone(), Venue::MarketMaking);
+                }
+                drop(view);
+                info!(
+                    symbols = ?stuck_symbols,
+                    "Recovered sticky inflight from event history"
+                );
+            }
+
             let (vault_registry, vault_registry_projection) =
                 StoreBuilder::<VaultRegistry>::new(pool.clone())
                     .build(())
@@ -185,40 +203,56 @@ impl Conductor {
                 Err(error) => return Err(error.into()),
             };
 
-            let (position, position_projection, snapshot, rebalancer, ethereum_wallet, base_wallet) =
-                if let Some(rebalancing_ctx) = rebalancing {
-                    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
-                    let base_wallet = rebalancing_ctx.base_wallet().clone();
-                    let infra = spawn_rebalancing_infrastructure(
-                        rebalancing_ctx,
-                        ethereum_wallet.clone(),
-                        base_wallet.clone(),
-                        RebalancingDeps {
-                            pool: pool.clone(),
-                            ctx: ctx.clone(),
-                            inventory: inventory.clone(),
-                            event_sender,
-                            vault_registry: vault_registry.clone(),
-                            vault_registry_projection: vault_registry_projection.clone(),
-                        },
-                    )
-                    .await?;
+            let (
+                position,
+                position_projection,
+                snapshot,
+                rebalancer,
+                ethereum_wallet,
+                base_wallet,
+                tokenizer,
+            ) = if let Some(rebalancing_ctx) = rebalancing {
+                let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+                let base_wallet = rebalancing_ctx.base_wallet().clone();
+                let infra = spawn_rebalancing_infrastructure(
+                    rebalancing_ctx,
+                    ethereum_wallet.clone(),
+                    base_wallet.clone(),
+                    RebalancingDeps {
+                        pool: pool.clone(),
+                        ctx: ctx.clone(),
+                        inventory: inventory.clone(),
+                        event_sender,
+                        vault_registry: vault_registry.clone(),
+                        vault_registry_projection: vault_registry_projection.clone(),
+                    },
+                )
+                .await?;
 
-                    (
-                        infra.position,
-                        infra.position_projection,
-                        infra.snapshot,
-                        Some(infra.rebalancer),
-                        Some(ethereum_wallet),
-                        Some(base_wallet),
-                    )
-                } else {
-                    let (position, position_projection) = build_position_cqrs(&pool).await?;
-                    let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                        .build(())
-                        .await?;
-                    (position, position_projection, snapshot, None, None, None)
-                };
+                (
+                    infra.position,
+                    infra.position_projection,
+                    infra.snapshot,
+                    Some(infra.rebalancer),
+                    Some(ethereum_wallet),
+                    Some(base_wallet),
+                    Some(infra.tokenizer),
+                )
+            } else {
+                let (position, position_projection) = build_position_cqrs(&pool).await?;
+                let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                    .build(())
+                    .await?;
+                (
+                    position,
+                    position_projection,
+                    snapshot,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
 
             let order_placer: Arc<dyn OrderPlacer> =
                 Arc::new(ExecutorOrderPlacer(executor.clone()));
@@ -261,6 +295,10 @@ impl Conductor {
 
             if let Some(wallet) = base_wallet {
                 builder = builder.with_base_wallet(wallet);
+            }
+
+            if let Some(tokenizer) = tokenizer {
+                builder = builder.with_tokenizer(tokenizer);
             }
 
             Ok(builder.spawn())
@@ -321,6 +359,7 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: JoinHandle<()>,
+    tokenizer: Arc<dyn Tokenizer>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -482,7 +521,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             ethereum_wallet,
             base_wallet,
             raindex_service,
-            tokenizer,
+            tokenizer.clone(),
         )
         .await?;
 
@@ -506,6 +545,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             rebalancer: handle,
+            tokenizer,
         })
     })
 }

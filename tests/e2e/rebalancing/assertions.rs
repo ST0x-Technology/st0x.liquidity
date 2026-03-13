@@ -36,21 +36,21 @@ pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
 use st0x_hedge::config::{BrokerCtx, Ctx};
 pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
-use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationRequestType, TokenizationStatus};
+use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
+pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
 use st0x_hedge::{
     AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ImbalanceThreshold,
     OperationMode, TradingMode,
 };
 
-pub(crate) use crate::assert::ExpectedPosition;
-use crate::assert::{
-    assert_broker_state, assert_cqrs_state, assert_event_subsequence, assert_single_clean_aggregate,
-};
+pub(crate) use crate::assert::{ExpectedPosition, assert_event_subsequence};
+use crate::assert::{assert_broker_state, assert_cqrs_state, assert_single_clean_aggregate};
 pub(crate) use crate::base_chain::TakeDirection;
 use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
-use crate::poll::{connect_db, fetch_events_by_type};
-pub(crate) use crate::poll::{poll_for_events_with_timeout, spawn_bot};
+pub(crate) use crate::poll::{
+    connect_db, fetch_events_by_type, poll_for_events_with_timeout, spawn_bot,
+};
 pub(crate) use crate::test_infra::TestInfra;
 
 /// Local signing wallet for rebalancing e2e tests that exposes

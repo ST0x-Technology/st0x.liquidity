@@ -29,14 +29,15 @@ use crate::bindings::{IERC20, TestERC20};
 use crate::config::{
     AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
 };
-use crate::equity_redemption::EquityRedemption;
-use crate::inventory::{ImbalanceThreshold, InventoryView};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
+use crate::inventory::{ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain_order::{Dollars, OffchainOrderId};
 use crate::onchain::mock::MockRaindex;
 use crate::onchain::raindex::Raindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
+use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
     Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation,
@@ -48,6 +49,7 @@ use crate::tokenization::alpaca::tests::{
     TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
     tokenization_requests_path,
 };
+use crate::tokenization::mock::MockTokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::mock::MockWrapper;
@@ -162,6 +164,7 @@ struct EquityTriggerFixture {
     symbol: Symbol,
     aggregate_id: String,
     trigger: Arc<RebalancingTrigger>,
+    inventory: Arc<RwLock<InventoryView>>,
     position_cqrs: Arc<Store<Position>>,
     receiver: mpsc::Receiver<TriggeredOperation>,
 }
@@ -203,6 +206,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         symbol,
         aggregate_id,
         trigger,
+        inventory,
         position_cqrs,
         receiver,
     }
@@ -402,6 +406,48 @@ fn build_equity_transfer_with_wrapper(
     ))
 }
 
+/// Builds `CrossVenueEquityTransfer` with mint and redemption stores wired to
+/// the `RebalancingTrigger` as a query processor. This mirrors the production
+/// wiring in `Conductor` via `QueryManifest::build()`, ensuring mint/redemption
+/// lifecycle events flow through the trigger and update inflight state.
+async fn build_equity_transfer_with_trigger(
+    pool: &SqlitePool,
+    raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    tokenizer: Arc<dyn Tokenizer>,
+    mock_wrapper: MockWrapper,
+    wallet: Address,
+    trigger: &Arc<RebalancingTrigger>,
+) -> Arc<CrossVenueEquityTransfer> {
+    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+
+    let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        .with(Arc::clone(trigger))
+        .build(equity_services.clone())
+        .await
+        .unwrap();
+
+    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        .with(Arc::clone(trigger))
+        .build(equity_services)
+        .await
+        .unwrap();
+
+    Arc::new(CrossVenueEquityTransfer::new(
+        raindex,
+        tokenizer,
+        wrapper,
+        wallet,
+        mint_store,
+        redemption_store,
+    ))
+}
+
 /// Verifies the full equity mint rebalancing pipeline: position CQRS commands
 /// flow through the RebalancingTrigger (registered as a Query processor),
 /// update the InventoryView, detect an equity imbalance, and dispatch a Mint
@@ -415,6 +461,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         symbol,
         aggregate_id,
         trigger,
+        inventory: _,
         position_cqrs,
         receiver,
     } = setup_equity_trigger().await;
@@ -655,6 +702,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         symbol,
         aggregate_id,
         trigger,
+        inventory: _,
         position_cqrs,
         receiver,
     } = setup_equity_trigger().await;
@@ -1060,6 +1108,7 @@ async fn mint_api_failure_produces_rejected_event() {
         symbol,
         aggregate_id,
         trigger,
+        inventory: _,
         position_cqrs,
         receiver,
     } = setup_equity_trigger().await;
@@ -1525,4 +1574,477 @@ async fn threshold_config_controls_trigger_sensitivity() {
             _ => panic!("Expected UsdcAlpacaToBase operation"),
         }
     }
+}
+
+/// Verifies that a dispatched mint operation sets offchain inflight balance
+/// in the InventoryView. The trigger dispatches a Mint, and MintAccepted flows
+/// through `on_mint` which calls `Inventory::transfer(Hedging, Start, qty)`.
+/// This moves shares from offchain available to offchain inflight, recording
+/// the pending tokenization as in-flight equity.
+#[tokio::test]
+async fn mint_accepted_sets_offchain_inflight() {
+    let EquityTriggerFixture {
+        pool,
+        symbol,
+        aggregate_id: _,
+        trigger,
+        inventory,
+        position_cqrs,
+        mut receiver,
+    } = setup_equity_trigger().await;
+
+    // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
+    build_imbalanced_inventory(Imbalance::Equity {
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!("20"),
+        offchain: float!("80"),
+    })
+    .await;
+
+    // Confirm initial state: offchain has 80 available, 0 inflight
+    let inv = inventory.read().await;
+    let initial_offchain_available = inv.equity_available(&symbol, Venue::Hedging).unwrap();
+    let initial_offchain_inflight = inv.equity_inflight(&symbol, Venue::Hedging).unwrap();
+    drop(inv);
+
+    assert!(
+        initial_offchain_available.inner().eq(float!("80")).unwrap(),
+        "Initial offchain available should be 80"
+    );
+    assert!(
+        initial_offchain_inflight.inner().is_zero().unwrap(),
+        "Initial offchain inflight should be 0"
+    );
+
+    let server = MockServer::start();
+    let (_anvil, endpoint, key) = setup_anvil();
+
+    let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+    let wallet = EthereumWallet::from(signer.clone());
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect(&endpoint)
+        .await
+        .unwrap();
+    let token_contract = TestERC20::deploy(&provider).await.unwrap();
+    let token_address = *token_contract.address();
+
+    seed_vault_registry(&pool, &symbol, token_address).await;
+
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+    );
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let mock_wrapper = MockWrapper::new().with_unwrapped_token(token_address);
+
+    // Wire mint/redemption stores with trigger so lifecycle events update
+    // inflight state through the trigger's Reactor
+    let equity_transfer = build_equity_transfer_with_trigger(
+        &pool,
+        raindex,
+        tokenizer,
+        mock_wrapper,
+        signer.address(),
+        &trigger,
+    )
+    .await;
+
+    // Mock the mint API to accept but never complete (stays pending forever)
+    server.mock(|when, then| {
+        when.method(POST).path(tokenization_mint_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response("inflight_test"));
+    });
+
+    // Mock the poll endpoint to keep returning pending
+    server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_pending_response("inflight_test")]));
+    });
+
+    // Trigger the imbalance via a position command to dispatch the Mint
+    position_cqrs
+        .send(
+            &symbol,
+            PositionCommand::AcknowledgeOnChainFill {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 2,
+                },
+                amount: FractionalShares::new(float!("1")),
+                direction: Direction::Sell,
+                price_usdc: float!("150.0"),
+                block_timestamp: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Receive the dispatched Mint operation and get the quantity
+    let operation = receiver
+        .try_recv()
+        .expect("Trigger should dispatch a Mint operation for the imbalance");
+    let TriggeredOperation::Mint {
+        symbol: mint_symbol,
+        quantity: mint_quantity,
+    } = operation
+    else {
+        panic!("Expected Mint operation, got {operation:?}");
+    };
+    assert_eq!(mint_symbol, symbol);
+
+    // Execute the mint transfer. This calls the Alpaca API, gets MintAccepted,
+    // which triggers on_mint -> Inventory::transfer(Hedging, Start, qty).
+    // The poll will return pending, so the mint aggregate will time out or loop,
+    // but MintAccepted has already fired by then. We spawn and cancel to
+    // get just the MintAccepted event through.
+    let transfer_handle = tokio::spawn({
+        let equity_transfer = Arc::clone(&equity_transfer);
+        let mint_symbol = mint_symbol.clone();
+        async move {
+            let _ = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+                equity_transfer.as_ref(),
+                Equity {
+                    symbol: mint_symbol,
+                    quantity: mint_quantity,
+                },
+            )
+            .await;
+        }
+    });
+
+    // Wait for MintAccepted to propagate: poll until inflight becomes non-zero
+    // rather than relying on a fixed sleep duration that can race on busy CI.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let inv = inventory.read().await;
+        let inflight = inv.equity_inflight(&symbol, Venue::Hedging);
+        drop(inv);
+
+        if let Some(inflight) = inflight
+            && inflight.inner().gt(float!("0")).unwrap()
+        {
+            break;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for MintAccepted to set inflight balance"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    transfer_handle.abort();
+
+    // After MintAccepted, offchain inflight should have increased by the
+    // mint quantity and available decreased by the same amount
+    let inv = inventory.read().await;
+    let offchain_inflight = inv.equity_inflight(&symbol, Venue::Hedging).unwrap();
+    let offchain_available = inv.equity_available(&symbol, Venue::Hedging).unwrap();
+    drop(inv);
+
+    assert!(
+        offchain_inflight.inner().gt(float!("0")).unwrap(),
+        "Offchain inflight should be non-zero after MintAccepted, got {offchain_inflight:?}"
+    );
+
+    // The mint quantity was dispatched from available to inflight
+    let mint_qty_float = mint_quantity.inner();
+    assert!(
+        offchain_inflight.inner().eq(mint_qty_float).unwrap(),
+        "Offchain inflight should equal mint quantity {mint_quantity:?}, \
+         got {offchain_inflight:?}"
+    );
+
+    // available should have decreased: original 80 - mint_quantity
+    let expected_available = (float!("80") - mint_qty_float).unwrap();
+    assert!(
+        offchain_available.inner().eq(expected_available).unwrap(),
+        "Offchain available should be 80 - {mint_quantity:?} = {expected_available:?}, \
+         got {offchain_available:?}"
+    );
+}
+
+/// Verifies that a completed mint clears the offchain inflight balance and
+/// increases the onchain available balance. With mint stores wired to the
+/// trigger (mirroring Conductor's `QueryManifest::build()`), the full mint
+/// lifecycle flows through `on_mint`. `MintAccepted` sets offchain inflight,
+/// and `TokensReceived` clears offchain inflight while adding to onchain
+/// available -- proving the full transfer lifecycle updates InventoryView
+/// correctly.
+#[tokio::test]
+async fn completed_mint_clears_inflight_and_updates_inventory() {
+    let EquityTriggerFixture {
+        pool,
+        symbol,
+        aggregate_id: _,
+        trigger,
+        inventory,
+        position_cqrs,
+        mut receiver,
+    } = setup_equity_trigger().await;
+
+    // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
+    build_imbalanced_inventory(Imbalance::Equity {
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!("20"),
+        offchain: float!("80"),
+    })
+    .await;
+
+    let server = MockServer::start();
+    let (_anvil, endpoint, key) = setup_anvil();
+
+    let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+    let wallet = EthereumWallet::from(signer.clone());
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect(&endpoint)
+        .await
+        .unwrap();
+
+    let token_contract = TestERC20::deploy(&provider).await.unwrap();
+    let token_address = *token_contract.address();
+
+    // Mint tokens so balanceOf verification passes during verify_mint_tx
+    let mint_amount = U256::from(30_500_000_000_000_000_000_u128);
+    let mint_receipt = token_contract
+        .mint(signer.address(), mint_amount)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let mint_tx_hash = mint_receipt.transaction_hash;
+
+    seed_vault_registry(&pool, &symbol, token_address).await;
+
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+    );
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let mock_wrapper = MockWrapper::new().with_unwrapped_token(token_address);
+
+    let equity_transfer = build_equity_transfer_with_trigger(
+        &pool,
+        raindex,
+        tokenizer,
+        mock_wrapper,
+        signer.address(),
+        &trigger,
+    )
+    .await;
+
+    let wallet_hex = format!("{:#x}", signer.address());
+
+    let mint_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path(tokenization_mint_path())
+            .json_body_includes(
+                json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "30.5",
+                    "wallet_address": wallet_hex,
+                })
+                .to_string(),
+            );
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response("completed_mint_test"));
+    });
+
+    let poll_mock = server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_completed_response(
+                "completed_mint_test",
+                mint_tx_hash
+            )]));
+    });
+
+    // Trigger the mint via a position command
+    position_cqrs
+        .send(
+            &symbol,
+            PositionCommand::AcknowledgeOnChainFill {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 2,
+                },
+                amount: FractionalShares::new(float!("1")),
+                direction: Direction::Sell,
+                price_usdc: float!("150.0"),
+                block_timestamp: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Receive the dispatched Mint operation
+    let operation = receiver
+        .try_recv()
+        .expect("Trigger should dispatch a Mint operation");
+    let TriggeredOperation::Mint {
+        symbol: mint_symbol,
+        quantity: mint_quantity,
+    } = operation
+    else {
+        panic!("Expected Mint operation, got {operation:?}");
+    };
+
+    // Record initial onchain available before the mint executes
+    let initial_onchain_available = {
+        let inv = inventory.read().await;
+        inv.equity_available(&symbol, Venue::MarketMaking).unwrap()
+    };
+
+    // Execute the full mint lifecycle through CrossVenueTransfer
+    CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
+        equity_transfer.as_ref(),
+        Equity {
+            symbol: mint_symbol,
+            quantity: mint_quantity,
+        },
+    )
+    .await
+    .unwrap();
+
+    mint_mock.assert();
+    poll_mock.assert();
+
+    // Drop the equity transfer to release Arc refs held by wired stores
+    drop(equity_transfer);
+
+    // After TokensReceived, offchain inflight should be cleared (back to 0)
+    let inv = inventory.read().await;
+    let offchain_inflight = inv.equity_inflight(&symbol, Venue::Hedging).unwrap();
+    let onchain_available = inv.equity_available(&symbol, Venue::MarketMaking).unwrap();
+    drop(inv);
+
+    assert!(
+        offchain_inflight.inner().is_zero().unwrap(),
+        "Offchain inflight should be 0 after mint completes, got {offchain_inflight:?}"
+    );
+
+    // Onchain available should have increased by the mint quantity
+    let mint_qty_float = mint_quantity.inner();
+    let expected_onchain = (initial_onchain_available.inner() + mint_qty_float).unwrap();
+    assert!(
+        onchain_available.inner().eq(expected_onchain).unwrap(),
+        "Onchain available should have increased by {mint_quantity:?}: \
+         expected {expected_onchain:?}, got {onchain_available:?}"
+    );
+}
+
+/// TransferFailed during redemption cancels inflight and restores available.
+///
+/// When tokens are withdrawn from Raindex (WithdrawnFromRaindex), inflight
+/// is set at MarketMaking. If the subsequent send to Alpaca's redemption
+/// wallet fails (TransferFailed), inflight must be cancelled back to
+/// available — tokens never left our wallet.
+#[tokio::test]
+async fn transfer_failed_cancels_redemption_inflight() {
+    let EquityTriggerFixture {
+        pool,
+        symbol,
+        aggregate_id: _,
+        trigger,
+        inventory,
+        position_cqrs,
+        receiver: _,
+    } = setup_equity_trigger().await;
+
+    // Build inventory: 80 onchain, 20 offchain = 80% ratio -> TooMuchOnchain
+    build_imbalanced_inventory(Imbalance::Equity {
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!("80"),
+        offchain: float!("20"),
+    })
+    .await;
+
+    let token_address = Address::random();
+    seed_vault_registry(&pool, &symbol, token_address).await;
+
+    // Build a redemption store wired to the trigger so events flow through
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new().with_send_failure());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::new(MockRaindex::new()),
+        tokenizer,
+        wrapper: Arc::new(MockWrapper::new()),
+    };
+
+    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        .with(Arc::clone(&trigger))
+        .build(equity_services)
+        .await
+        .unwrap();
+
+    let redemption_id = RedemptionAggregateId::new("redemption-transfer-failed");
+
+    // Redeem: withdraws tokens from Raindex vault -> WithdrawnFromRaindex
+    redemption_store
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::Redeem {
+                symbol: symbol.clone(),
+                quantity: float!("10"),
+                token: token_address,
+                amount: U256::from(10_000_000_000_000_000_000_u128),
+            },
+        )
+        .await
+        .unwrap();
+
+    // After WithdrawnFromRaindex, inflight should be set at MarketMaking
+    let inflight_after_withdraw = inventory
+        .read()
+        .await
+        .equity_inflight(&symbol, Venue::MarketMaking)
+        .unwrap();
+    assert!(
+        !inflight_after_withdraw.inner().is_zero().unwrap(),
+        "Inflight should be non-zero after WithdrawnFromRaindex, got {inflight_after_withdraw:?}"
+    );
+
+    // UnwrapTokens -> TokensUnwrapped (no inventory change)
+    redemption_store
+        .send(&redemption_id, EquityRedemptionCommand::UnwrapTokens)
+        .await
+        .unwrap();
+
+    // SendTokens: mock tokenizer fails -> TransferFailed event
+    // The aggregate emits TransferFailed, trigger cancels inflight
+    redemption_store
+        .send(&redemption_id, EquityRedemptionCommand::SendTokens)
+        .await
+        .unwrap();
+
+    // After TransferFailed, inflight should be cleared
+    let inv = inventory.read().await;
+    let inflight_after_fail = inv.equity_inflight(&symbol, Venue::MarketMaking).unwrap();
+    let available_after_fail = inv.equity_available(&symbol, Venue::MarketMaking).unwrap();
+    drop(inv);
+
+    assert!(
+        inflight_after_fail.inner().is_zero().unwrap(),
+        "Inflight should be zero after TransferFailed, got {inflight_after_fail:?}"
+    );
+
+    // Available should have the tokens back (80 original)
+    assert!(
+        available_after_fail.inner().eq(float!("80")).unwrap(),
+        "Available should be restored to 80 after TransferFailed, got {available_after_fail:?}"
+    );
 }

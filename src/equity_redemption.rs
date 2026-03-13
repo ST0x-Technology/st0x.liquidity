@@ -60,6 +60,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::str::FromStr;
 use tracing::{info, warn};
 
@@ -933,6 +935,72 @@ impl EventSourced for EquityRedemption {
     }
 }
 
+/// Returns symbols from `EquityRedemption` aggregates that ended in
+/// `DetectionFailed` or `RedemptionRejected`.
+///
+/// These terminal states leave tokens physically in Alpaca's redemption
+/// wallet with no snapshot source tracking them. The caller should mark
+/// them as sticky inflight to prevent `apply_inflight_snapshot` from
+/// zeroing the inflight balance.
+pub(crate) async fn symbols_with_stuck_redemptions(
+    pool: &SqlitePool,
+) -> Result<HashSet<Symbol>, sqlx::Error> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'EquityRedemption' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id, \
+                json_extract(first_ev.payload, \
+                '$.WithdrawnFromRaindex.symbol') \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         INNER JOIN events first_ev \
+             ON first_ev.aggregate_type = 'EquityRedemption' \
+            AND first_ev.aggregate_id = latest.aggregate_id \
+            AND first_ev.sequence = 0 \
+         WHERE last_ev.aggregate_type = 'EquityRedemption' \
+           AND last_ev.event_type IN ( \
+               'EquityRedemptionEvent::DetectionFailed', \
+               'EquityRedemptionEvent::RedemptionRejected' \
+           )",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(aggregate_id, raw)| {
+            raw.map_or_else(
+                || {
+                    warn!(
+                        %aggregate_id,
+                        "Stuck redemption has NULL symbol in \
+                         WithdrawnFromRaindex payload, skipping"
+                    );
+                    None
+                },
+                |value| match Symbol::new(&value) {
+                    Ok(symbol) => Some(symbol),
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            %aggregate_id,
+                            raw_symbol = %value,
+                            "Stuck redemption has invalid symbol, skipping"
+                        );
+                        None
+                    }
+                },
+            )
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1588,5 +1656,228 @@ mod tests {
             err,
             AggregateError::UserError(LifecycleError::Apply(EquityRedemptionError::AlreadyStarted))
         ));
+    }
+
+    /// Insert a minimal event row into the events table.
+    async fn insert_event(
+        pool: &SqlitePool,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, \
+              event_version, payload, metadata) \
+             VALUES ('EquityRedemption', ?1, ?2, ?3, '1', ?4, '{}')",
+        )
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn withdrawn_payload(symbol: &str) -> String {
+        format!(
+            r#"{{"WithdrawnFromRaindex":{{"symbol":"{symbol}","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn stuck_redemptions_returns_detection_failed_symbols() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // AAPL: WithdrawnFromRaindex -> DetectionFailed (stuck)
+        insert_event(
+            &pool,
+            "redemption-1",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "redemption-1",
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&Symbol::new("AAPL").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn stuck_redemptions_returns_rejection_symbols() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // TSLA: WithdrawnFromRaindex -> RedemptionRejected (stuck)
+        insert_event(
+            &pool,
+            "redemption-2",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("TSLA"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "redemption-2",
+            1,
+            "EquityRedemptionEvent::RedemptionRejected",
+            r#"{"RedemptionRejected":{"reason":"test","rejected_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&Symbol::new("TSLA").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn stuck_redemptions_excludes_completed_and_transfer_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // AAPL: DetectionFailed (stuck)
+        insert_event(
+            &pool,
+            "stuck",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "stuck",
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // MSFT: Completed (not stuck)
+        insert_event(
+            &pool,
+            "completed",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("MSFT"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "completed",
+            1,
+            "EquityRedemptionEvent::Completed",
+            r#"{"Completed":{"completed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // GOOG: TransferFailed (not stuck — tokens still in our wallet)
+        insert_event(
+            &pool,
+            "transfer-failed",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("GOOG"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "transfer-failed",
+            1,
+            "EquityRedemptionEvent::TransferFailed",
+            r#"{"TransferFailed":{"tx_hash":null,"failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+        assert_eq!(result.len(), 1, "Only AAPL should be stuck: {result:?}");
+        assert!(result.contains(&Symbol::new("AAPL").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn stuck_redemptions_empty_when_no_events() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stuck_redemptions_recovers_valid_symbol_alongside_malformed_rows() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // AAPL: valid stuck redemption (DetectionFailed)
+        insert_event(
+            &pool,
+            "valid-stuck",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "valid-stuck",
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // NULL symbol: malformed WithdrawnFromRaindex payload missing symbol
+        insert_event(
+            &pool,
+            "null-symbol",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            r#"{"WithdrawnFromRaindex":{"quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "null-symbol",
+            1,
+            "EquityRedemptionEvent::RedemptionRejected",
+            r#"{"RedemptionRejected":{"reason":"test","rejected_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // Invalid symbol: symbol fails Symbol::new validation
+        insert_event(
+            &pool,
+            "invalid-symbol",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload(""),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "invalid-symbol",
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // Only AAPL should be recovered; the NULL and invalid rows are
+        // skipped with warnings.
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Only valid AAPL should be recovered, got: {result:?}"
+        );
+        assert!(result.contains(&Symbol::new("AAPL").unwrap()));
     }
 }

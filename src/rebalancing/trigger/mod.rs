@@ -673,6 +673,12 @@ impl RebalancingTrigger {
                 }
 
                 EthereumCash { .. } | BaseWalletCash { .. } => Ok(inventory.clone()),
+
+                InflightEquity {
+                    mints, redemptions, ..
+                } => inventory
+                    .clone()
+                    .apply_inflight_snapshot(mints, redemptions, fetched_at, now),
             }?;
 
         *inventory = updated;
@@ -766,6 +772,15 @@ impl RebalancingTrigger {
                 }
 
                 EthereumCash { .. } | BaseWalletCash { .. } => Ok(inventory.clone()),
+
+                // Recovery for inflight snapshots: same as normal path since
+                // set_inflight directly replaces the value regardless of current state.
+                // Recovery skips the fetched_at guard since we're force-recovering.
+                InflightEquity {
+                    mints, redemptions, ..
+                } => inventory
+                    .clone()
+                    .apply_inflight_snapshot(mints, redemptions, now, now),
             }?;
 
         *inventory = updated;
@@ -797,7 +812,9 @@ impl RebalancingTrigger {
             OnchainCash { .. } | OffchainCash { .. } => {
                 self.check_and_trigger_usdc().await;
             }
-            EthereumCash { .. } | BaseWalletCash { .. } => {}
+            // Inflight snapshots don't trigger rebalancing — they indicate
+            // transfers already in progress, not new balances to rebalance.
+            EthereumCash { .. } | BaseWalletCash { .. } | InflightEquity { .. } => {}
         }
 
         Ok(())
@@ -1082,11 +1099,22 @@ impl RebalancingTrigger {
                 TransferOp::Start,
                 quantity,
             )),
-            MintAcceptanceFailed { .. } => Some(Inventory::transfer(
-                Venue::Hedging,
-                TransferOp::Cancel,
-                quantity,
-            )),
+            MintAcceptanceFailed { .. } => {
+                let now = Utc::now();
+                let composed: Box<
+                    dyn FnOnce(
+                            Inventory<FractionalShares>,
+                        ) -> Result<Inventory<FractionalShares>, _>
+                        + Send,
+                > = Box::new(move |inventory| {
+                    let cancelled =
+                        Inventory::transfer(Venue::Hedging, TransferOp::Cancel, quantity)(
+                            inventory,
+                        )?;
+                    Inventory::with_last_rebalancing(now)(cancelled)
+                });
+                Some(composed)
+            }
             TokensReceived { .. } => {
                 // Compose TransferOp::Complete with with_last_rebalancing so that the
                 // staleness guard is active the instant inflight is cleared. Without this,
@@ -1182,8 +1210,28 @@ impl RebalancingTrigger {
                 Some(composed)
             }
 
+            // Tokens failed to reach Alpaca's wallet -- still in ours.
+            // Cancel the inflight started at WithdrawnFromRaindex.
+            // Compose with with_last_rebalancing so the staleness guard
+            // prevents a stale snapshot from overwriting the restored balance.
+            TransferFailed { .. } => {
+                let now = Utc::now();
+                let composed: Box<
+                    dyn FnOnce(
+                            Inventory<FractionalShares>,
+                        ) -> Result<Inventory<FractionalShares>, _>
+                        + Send,
+                > = Box::new(move |inventory| {
+                    let cancelled =
+                        Inventory::transfer(Venue::MarketMaking, TransferOp::Cancel, quantity)(
+                            inventory,
+                        )?;
+                    Inventory::with_last_rebalancing(now)(cancelled)
+                });
+                Some(composed)
+            }
+
             TokensUnwrapped { .. }
-            | TransferFailed { .. }
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
@@ -1196,6 +1244,9 @@ impl RebalancingTrigger {
                 .clone()
                 .update_equity(&symbol, update, Utc::now())?;
         }
+
+        self.update_sticky_inflight_for_redemption(&event, &symbol)
+            .await;
 
         if Self::is_terminal_redemption_event(&event) {
             self.redemption_tracking.write().await.remove(&id);
@@ -1269,6 +1320,42 @@ impl RebalancingTrigger {
             | TokensUnwrapped { .. }
             | TokensSent { .. }
             | Detected { .. } => false,
+        }
+    }
+
+    /// Mark or clear sticky inflight for redemption terminal failure states.
+    ///
+    /// `DetectionFailed` and `RedemptionRejected` leave tokens physically in
+    /// Alpaca's redemption wallet with no snapshot source tracking them.
+    /// Sticky inflight prevents `apply_inflight_snapshot` from zeroing them.
+    async fn update_sticky_inflight_for_redemption(
+        &self,
+        event: &EquityRedemptionEvent,
+        symbol: &Symbol,
+    ) {
+        use EquityRedemptionEvent::*;
+
+        match event {
+            DetectionFailed { .. } | RedemptionRejected { .. } => {
+                self.inventory
+                    .write()
+                    .await
+                    .mark_sticky_inflight(symbol.clone(), Venue::MarketMaking);
+                debug!(
+                    %symbol,
+                    "Marked sticky inflight at MarketMaking after terminal failure"
+                );
+            }
+            Completed { .. } | TransferFailed { .. } => {
+                self.inventory
+                    .write()
+                    .await
+                    .clear_sticky_inflight(symbol, Venue::MarketMaking);
+            }
+            WithdrawnFromRaindex { .. }
+            | TokensUnwrapped { .. }
+            | TokensSent { .. }
+            | Detected { .. } => {}
         }
     }
 
@@ -4557,6 +4644,743 @@ mod tests {
         assert!(
             !debug.contains(&private_key.to_string()),
             "debug output leaked the private key: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_failed_cancels_redemption_inflight_and_restores_imbalance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 80 onchain, 20 offchain = 80% ratio -> TooMuchOnchain triggers Redemption
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("redemption-transfer-cancel");
+
+        // Verify initial imbalance
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(TriggeredOperation::Redemption { .. })
+            ),
+            "80% ratio should trigger Redemption"
+        );
+        trigger.clear_equity_in_progress(&symbol);
+
+        // WithdrawnFromRaindex: 30 tokens move to inflight
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_withdrawn_from_raindex(&symbol, float!("30")),
+            )
+            .await
+            .unwrap();
+
+        // Inflight blocks imbalance detection
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Inflight should block imbalance detection"
+        );
+
+        // TransferFailed: inflight cancelled, tokens return to available
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_transfer_failed())
+            .await
+            .unwrap();
+
+        // After cancel: back to 80 onchain, 20 offchain -> imbalance should re-trigger
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(TriggeredOperation::Redemption { .. })
+            ),
+            "Imbalance should re-trigger after TransferFailed cancels inflight"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_equity_snapshot_sets_inflight_balances() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 50 onchain, 50 offchain = balanced (50% ratio, within 30%-70%)
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(50)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(50)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Verify initially balanced
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "50/50 should be balanced"
+        );
+
+        // Emit InflightEquity with pending mints for AAPL
+        // This sets inflight at Hedging venue, which blocks rebalancing
+        let mut mints = BTreeMap::new();
+        mints.insert(symbol.clone(), shares(10));
+
+        harness
+            .receive::<InventorySnapshot>(
+                id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints,
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Inflight should block rebalancing even though ratios are balanced
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Inflight from InflightEquity snapshot should block rebalancing"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_equity_snapshot_replaces_previous_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 80 onchain, 20 offchain = imbalanced (would trigger Redemption
+        // when not blocked by inflight)
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // First snapshot: set inflight mints
+        let mut mints = BTreeMap::new();
+        mints.insert(symbol.clone(), shares(10));
+
+        harness
+            .receive::<InventorySnapshot>(
+                id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints,
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify inflight blocks rebalancing despite imbalance
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Inflight should block rebalancing"
+        );
+
+        // Second snapshot: empty mints (all completed)
+        harness
+            .receive::<InventorySnapshot>(
+                id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // After clearing inflight, the imbalance should trigger a Redemption
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(TriggeredOperation::Redemption { .. })
+            ),
+            "Clearing inflight should restore triggerability for imbalanced inventory"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_rejected_marks_sticky_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 80 onchain, 20 offchain = imbalanced
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("redemption-sticky-rejected");
+
+        // WithdrawnFromRaindex: start inflight
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_withdrawn_from_raindex(&symbol, float!("10")),
+            )
+            .await
+            .unwrap();
+
+        // RedemptionRejected: terminal failure, marks sticky
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_redemption_rejected())
+            .await
+            .unwrap();
+
+        // Empty InflightEquity snapshot should NOT zero inflight
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .symbols_with_inflight()
+                .contains(&symbol),
+            "Sticky inflight should be preserved after RedemptionRejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_failed_marks_sticky_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("redemption-sticky-detection");
+
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_withdrawn_from_raindex(&symbol, float!("10")),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_detection_failed())
+            .await
+            .unwrap();
+
+        // Empty InflightEquity snapshot should NOT zero inflight
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .symbols_with_inflight()
+                .contains(&symbol),
+            "Sticky inflight should be preserved after DetectionFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_redemption_clears_sticky_allows_zeroing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("redemption-completed-not-sticky");
+
+        // WithdrawnFromRaindex -> Completed (not a failure, so not sticky)
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_withdrawn_from_raindex(&symbol, float!("30")),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_redemption_completed())
+            .await
+            .unwrap();
+
+        // Empty InflightEquity should zero inflight (not sticky)
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger
+                .inventory
+                .read()
+                .await
+                .symbols_with_inflight()
+                .contains(&symbol),
+            "Non-sticky Completed should allow inflight zeroing"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_cleared_defers_trigger_to_next_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 80 onchain, 20 offchain = imbalanced (triggers Redemption)
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Set inflight via snapshot
+        let mut mints = BTreeMap::new();
+        mints.insert(symbol.clone(), shares(10));
+
+        harness
+            .receive::<InventorySnapshot>(
+                id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints,
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Inflight should block rebalancing"
+        );
+
+        // Clear inflight via empty snapshot — should NOT immediately trigger.
+        // Eagerly re-triggering here would evaluate imbalance against stale
+        // available balances from before the inflight was set, risking a
+        // duplicate mint/redemption.
+        harness
+            .receive::<InventorySnapshot>(
+                id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Clearing inflight should not immediately trigger — \
+             available balances may be stale"
+        );
+
+        // Next poll cycle: an available snapshot arrives. Now inflight is
+        // cleared so on_snapshot applies, and check_and_trigger_after_snapshot
+        // fires the rebalancing check with fresh balances.
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(80));
+
+        harness
+            .receive::<InventorySnapshot>(
+                id,
+                InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(TriggeredOperation::Redemption { .. })
+            ),
+            "Available snapshot after inflight cleared should trigger rebalancing"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_still_present_does_not_recheck() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 80 onchain, 20 offchain = imbalanced
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Set inflight
+        let mut mints = BTreeMap::new();
+        mints.insert(symbol.clone(), shares(10));
+
+        harness
+            .receive::<InventorySnapshot>(
+                id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: mints.clone(),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Apply same inflight again -- still present, no recheck
+        harness
+            .receive::<InventorySnapshot>(
+                id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints,
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Inflight still present should not trigger recheck"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_inflight_after_terminal_failure_does_not_reintroduce_inflight() {
+        // Regression test: when a rebalancing operation reaches a terminal
+        // failure (WithdrawnFromRaindex -> TransferFailed), the inflight is
+        // marked sticky and cleared by the failure handler. If a stale
+        // InflightEquity poll arrives (fetched before the failure), it must
+        // NOT re-introduce inflight and must NOT trigger an extra rebalance.
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 80 onchain, 20 offchain = imbalanced (triggers Redemption)
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Simulate: WithdrawnFromRaindex starts inflight for the symbol
+        let redemption_id = RedemptionAggregateId::new("redemption-stale-regression");
+        harness
+            .receive::<EquityRedemption>(
+                redemption_id.clone(),
+                make_withdrawn_from_raindex(&symbol, float!("10")),
+            )
+            .await
+            .unwrap();
+
+        // Verify inflight is present
+        assert!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .symbols_with_inflight()
+                .contains(&symbol),
+            "Inflight should be present after WithdrawnFromRaindex"
+        );
+
+        // TransferFailed: terminal failure, marks sticky inflight
+        harness
+            .receive::<EquityRedemption>(redemption_id, make_transfer_failed())
+            .await
+            .unwrap();
+
+        // Drain any operations triggered so far
+        while receiver.try_recv().is_ok() {}
+        trigger.clear_equity_in_progress(&symbol);
+
+        // Now deliver a "stale" InflightEquity snapshot with mints for the
+        // symbol. This simulates a poll that was fetched before the failure
+        // completed. The sticky guard should prevent it from affecting state.
+        let mut stale_mints = BTreeMap::new();
+        stale_mints.insert(symbol.clone(), shares(10));
+
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::InflightEquity {
+                    mints: stale_mints,
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Inflight should still be present (sticky from terminal failure)
+        // but no extra rebalance should be triggered by the stale snapshot
+        assert!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .symbols_with_inflight()
+                .contains(&symbol),
+            "Sticky inflight should be preserved despite stale InflightEquity snapshot"
+        );
+
+        // No spurious rebalancing operation should have been triggered
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Stale InflightEquity after terminal failure should not trigger extra rebalancing"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_inflight_after_mint_acceptance_failure_does_not_reintroduce_inflight() {
+        // Same regression but for the MintAccepted -> MintAcceptanceFailed path.
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 20 onchain, 80 offchain = imbalanced (triggers Mint)
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        let mint_id = IssuerRequestId::new("mint-stale-regression");
+
+        // MintRequested starts inflight at Hedging venue
+        harness
+            .receive::<TokenizedEquityMint>(
+                mint_id.clone(),
+                make_mint_requested(&symbol, float!("30")),
+            )
+            .await
+            .unwrap();
+
+        // MintAccepted transitions the mint
+        harness
+            .receive::<TokenizedEquityMint>(mint_id.clone(), make_mint_accepted())
+            .await
+            .unwrap();
+
+        // MintAcceptanceFailed: terminal failure
+        harness
+            .receive::<TokenizedEquityMint>(mint_id, make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        // Drain and clear
+        while receiver.try_recv().is_ok() {}
+        trigger.clear_equity_in_progress(&symbol);
+
+        // Deliver stale InflightEquity with redemptions for the symbol
+        let mut stale_redemptions = BTreeMap::new();
+        stale_redemptions.insert(symbol.clone(), shares(5));
+
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: stale_redemptions,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // No spurious rebalancing from the stale snapshot
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Stale InflightEquity after MintAcceptanceFailed should not \
+             trigger extra rebalancing"
         );
     }
 
