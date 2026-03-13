@@ -2,6 +2,7 @@
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
+use rain_math_float::Float;
 use reqwest::StatusCode;
 use std::sync::Mutex;
 
@@ -56,6 +57,16 @@ pub(crate) enum MockVerificationOutcome {
     InsufficientTransferAmount,
 }
 
+#[derive(Clone)]
+enum MockTokenSymbolBehavior {
+    /// Use the default token_symbol from `mock_completed()`.
+    Default,
+    /// Force token_symbol to None.
+    None,
+    /// Override token_symbol with a specific value.
+    Override(String),
+}
+
 pub(crate) struct MockTokenizer {
     redemption_wallet: Address,
     redemption_tx: TxHash,
@@ -66,8 +77,9 @@ pub(crate) struct MockTokenizer {
     verification_outcome: MockVerificationOutcome,
     should_fail_send: bool,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
-    /// Override the token_symbol in completed mint responses.
-    token_symbol_override: Option<String>,
+    token_symbol_behavior: MockTokenSymbolBehavior,
+    /// Override fees in completed mint responses.
+    fees_override: Option<Float>,
 }
 
 impl MockTokenizer {
@@ -82,7 +94,8 @@ impl MockTokenizer {
             verification_outcome: MockVerificationOutcome::Success,
             should_fail_send: false,
             last_issuer_request_id: Mutex::new(None),
-            token_symbol_override: None,
+            token_symbol_behavior: MockTokenSymbolBehavior::Default,
+            fees_override: None,
         }
     }
 
@@ -117,7 +130,17 @@ impl MockTokenizer {
     }
 
     pub(crate) fn with_token_symbol_override(mut self, symbol: impl Into<String>) -> Self {
-        self.token_symbol_override = Some(symbol.into());
+        self.token_symbol_behavior = MockTokenSymbolBehavior::Override(symbol.into());
+        self
+    }
+
+    pub(crate) fn with_no_token_symbol(mut self) -> Self {
+        self.token_symbol_behavior = MockTokenSymbolBehavior::None;
+        self
+    }
+
+    pub(crate) fn with_fees(mut self, fees: Float) -> Self {
+        self.fees_override = Some(fees);
         self
     }
 
@@ -160,8 +183,15 @@ impl Tokenizer for MockTokenizer {
         match self.mint_poll_outcome {
             MockMintPollOutcome::Completed => {
                 let mut request = TokenizationRequest::mock_completed();
-                if let Some(override_symbol) = &self.token_symbol_override {
-                    request.token_symbol = Some(override_symbol.clone());
+                match &self.token_symbol_behavior {
+                    MockTokenSymbolBehavior::Default => {}
+                    MockTokenSymbolBehavior::None => request.token_symbol = None,
+                    MockTokenSymbolBehavior::Override(symbol) => {
+                        request.token_symbol = Some(symbol.clone());
+                    }
+                }
+                if let Some(fees) = &self.fees_override {
+                    request.fees = Some(*fees);
                 }
                 Ok(request)
             }

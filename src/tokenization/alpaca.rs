@@ -2007,6 +2007,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn deserialize_tokenization_request_with_fees() {
+        let json = json!({
+            "tokenization_request_id": "tok_req_fees",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "10",
+            "issuer": "alpaca",
+            "network": "base",
+            "fees": "0.25",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        let fees = request
+            .fees
+            .expect("fees should be Some when present in JSON");
+        assert!(
+            fees.eq(Float::parse("0.25".to_string()).unwrap()).unwrap(),
+            "Expected fees to be 0.25, got: {fees:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_tokenization_request_without_fees() {
+        let json = json!({
+            "tokenization_request_id": "tok_req_no_fees",
+            "status": "pending",
+            "underlying_symbol": "AAPL",
+            "qty": "10",
+            "issuer": "alpaca",
+            "network": "base",
+            "created_at": "2024-01-15T10:30:00Z"
+        });
+
+        let request: TokenizationRequest = serde_json::from_value(json).unwrap();
+        assert!(
+            request.fees.is_none(),
+            "fees should be None when absent from JSON"
+        );
+    }
+
+    #[test]
     fn test_deserialize_tokenization_request_with_empty_token_symbol() {
         let json = json!({
             "tokenization_request_id": "tok_req_empty",

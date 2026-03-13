@@ -799,4 +799,20 @@ mod tests {
             Err(PythError::InvalidTimestamp(_))
         ));
     }
+
+    #[test]
+    fn test_raw_price_to_pyth_price_timestamp_out_of_chrono_range() {
+        // i64::MAX passes i64::try_from but DateTime::from_timestamp rejects it
+        let price = Price {
+            price: 100_000,
+            conf: 500,
+            expo: -5,
+            publishTime: U256::from(i64::MAX as u64),
+        };
+
+        assert!(matches!(
+            raw_price_to_pyth_price(&price),
+            Err(PythError::InvalidTimestamp(_))
+        ));
+    }
 }

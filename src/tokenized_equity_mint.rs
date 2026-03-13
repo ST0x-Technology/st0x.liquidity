@@ -139,6 +139,12 @@ pub(crate) enum TokenizedEquityMintError {
         expected_symbol: Symbol,
         actual_token_symbol: String,
     },
+    /// Completed mint response missing token_symbol
+    #[error(
+        "Missing token symbol in completed mint response \
+         (expected t{expected_symbol})"
+    )]
+    MissingTokenSymbol { expected_symbol: Symbol },
     /// Negative quantity is invalid for minting
     #[error("Negative quantity: {value:?}")]
     NegativeQuantity {
@@ -176,7 +182,11 @@ impl PartialEq for TokenizedEquityMintError {
                 Self::RequestFailed { error_message: b },
             )
             | (Self::Float(a), Self::Float(b)) => a == b,
-            (Self::VaultLookupFailed(a), Self::VaultLookupFailed(b)) => a == b,
+            (Self::VaultLookupFailed(a), Self::VaultLookupFailed(b))
+            | (
+                Self::MissingTokenSymbol { expected_symbol: a },
+                Self::MissingTokenSymbol { expected_symbol: b },
+            ) => a == b,
             (Self::NegativeQuantity { value: a }, Self::NegativeQuantity { value: b }) => {
                 a.eq(*b).unwrap_or(false)
             }
@@ -273,8 +283,8 @@ pub(crate) enum TokenizedEquityMintEvent {
         /// Tokenization fees charged by Alpaca (if reported).
         #[serde(
             default,
-            serialize_with = "crate::float_serde::serialize_option_float",
-            deserialize_with = "crate::float_serde::deserialize_option_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_option_float",
+            deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
         )]
         fees: Option<Float>,
         received_at: DateTime<Utc>,
@@ -517,8 +527,8 @@ pub(crate) enum TokenizedEquityMint {
         shares_minted: U256,
         #[serde(
             default,
-            serialize_with = "crate::float_serde::serialize_option_float",
-            deserialize_with = "crate::float_serde::deserialize_option_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_option_float",
+            deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
         )]
         fees: Option<Float>,
         requested_at: DateTime<Utc>,
@@ -1157,13 +1167,19 @@ impl EventSourced for TokenizedEquityMint {
                             // Validate that Alpaca returned the expected
                             // tokenized symbol (e.g. "tAAPL" for AAPL).
                             let expected_token_symbol = format!("t{symbol}");
-                            if let Some(actual) = &completed.token_symbol
-                                && *actual != expected_token_symbol
-                            {
-                                return Err(TokenizedEquityMintError::TokenSymbolMismatch {
-                                    expected_symbol: symbol.clone(),
-                                    actual_token_symbol: actual.clone(),
-                                });
+                            match &completed.token_symbol {
+                                Some(actual) if *actual == expected_token_symbol => {}
+                                Some(actual) => {
+                                    return Err(TokenizedEquityMintError::TokenSymbolMismatch {
+                                        expected_symbol: symbol.clone(),
+                                        actual_token_symbol: actual.clone(),
+                                    });
+                                }
+                                None => {
+                                    return Err(TokenizedEquityMintError::MissingTokenSymbol {
+                                        expected_symbol: symbol.clone(),
+                                    });
+                                }
                             }
 
                             let shares_minted = quantity_to_u256_18_decimals(*quantity)?;
@@ -1347,6 +1363,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_completed_with_fees_propagates_to_tokens_received() {
+        let expected_fees = float!("0.25");
+        let tokenizer = MockTokenizer::new().with_fees(expected_fees);
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+
+        let id = IssuerRequestId::new("ISS001");
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+
+        match entity {
+            TokenizedEquityMint::TokensReceived { fees, .. } => {
+                let fees = fees.expect("fees should be Some when tokenizer returns fees");
+                assert!(
+                    fees.eq(expected_fees).unwrap(),
+                    "Expected fees={expected_fees:?}, got: {fees:?}"
+                );
+            }
+            other => panic!("Expected TokensReceived state, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn poll_completed_with_wrong_token_symbol_errors() {
         let tokenizer = MockTokenizer::new().with_token_symbol_override("tGME");
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
@@ -1370,6 +1413,31 @@ mod tests {
                     && actual_token_symbol == "tGME"
             ),
             "Expected TokenSymbolMismatch, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_completed_with_missing_token_symbol_errors() {
+        let tokenizer = MockTokenizer::new().with_no_token_symbol();
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        let error = store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    TokenizedEquityMintError::MissingTokenSymbol {
+                        ref expected_symbol,
+                    }
+                )) if expected_symbol == &Symbol::new("AAPL").unwrap()
+            ),
+            "Expected MissingTokenSymbol, got: {error:?}"
         );
     }
 

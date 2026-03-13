@@ -186,6 +186,14 @@ impl EventSourced for OnChainTrade {
                     return Err(OnChainTradeError::AlreadyEnriched);
                 }
 
+                // SQLite stores integers as i64; reject values that would
+                // violate the CHECK constraint on the onchain_trades table.
+                if effective_gas_price > i64::MAX as u128 {
+                    return Err(OnChainTradeError::GasPriceOutOfRange {
+                        effective_gas_price,
+                    });
+                }
+
                 Ok(vec![Enriched {
                     gas_used,
                     effective_gas_price,
@@ -211,6 +219,11 @@ pub(crate) enum OnChainTradeError {
     AlreadyEnriched,
     #[error("Trade has already been filled")]
     AlreadyFilled,
+    #[error(
+        "Effective gas price {effective_gas_price} exceeds i64::MAX \
+         and cannot be stored in SQLite"
+    )]
+    GasPriceOutOfRange { effective_gas_price: u128 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +490,42 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(OnChainTradeError::NotFilled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_gas_price_exceeding_i64_max() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let pyth_price = PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: now,
+        };
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![OnChainTradeEvent::Filled {
+                symbol,
+                amount: float!("10.5"),
+                direction: Direction::Buy,
+                price_usdc: float!("150.25"),
+                block_number: 12345,
+                block_timestamp: now,
+                filled_at: now,
+            }])
+            .when(OnChainTradeCommand::Enrich {
+                gas_used: 50000,
+                effective_gas_price: (i64::MAX as u128) + 1,
+                pyth_price,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::GasPriceOutOfRange { .. })
         ));
     }
 

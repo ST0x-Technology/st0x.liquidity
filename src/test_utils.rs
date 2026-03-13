@@ -214,6 +214,19 @@ impl OnchainTradeBuilder {
         self
     }
 
+    #[must_use]
+    pub(crate) fn with_enrichment(
+        mut self,
+        gas_used: u64,
+        effective_gas_price: u128,
+        pyth_price: crate::onchain_trade::PythPrice,
+    ) -> Self {
+        self.trade.gas_used = Some(gas_used);
+        self.trade.effective_gas_price = Some(effective_gas_price);
+        self.trade.pyth_price = Some(pyth_price);
+        self
+    }
+
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
     }
