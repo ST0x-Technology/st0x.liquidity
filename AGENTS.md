@@ -266,15 +266,12 @@ reading `.bacon-locations`. If the file exists and is non-empty, bacon is active
   warnings. Filter out lines containing `lib/` (external submodule warnings we
   don't control). This is faster and always up to date (bacon re-checks on every
   file save). No need to run `cargo check` or `cargo clippy` yourself.
-- **Switch jobs**: Use `bacon --send 'job:clippy'` or
-  `bacon --send 'job:nextest'` to change what bacon is checking.
-- **Wait for completion**: After switching jobs, check if the job is still
-  running with `ps axu | grep <tool>` (e.g., `grep nextest`, `grep cargo`). Only
-  read `.bacon-locations` once the process has exited — reading while the job is
-  still running gives stale results from the previous job.
-- **Escalation chain**: `check-all` -> `nextest` -> `clippy`. Start with
-  `check-all` to catch compilation errors fast, run tests next, then clippy last
-  as a polish step.
+- **Switch jobs**: Use `bacon --send 'job:clippy'` to switch bacon's active job,
+  then read `.bacon-locations` after it updates. Only switch to clippy as a
+  final polish step after all substantive work is done.
+- **Escalation chain**: `check` -> `nextest` -> `clippy`. Use `check-all` and
+  `nextest` as iteration defaults during development. Run `clippy` only as the
+  last step before merging -- it's a polish pass, not an iteration tool.
 - **Only fall back to manual cargo commands** if `.bacon-locations` doesn't
   exist (bacon not running).
 
@@ -453,28 +450,16 @@ is the source of truth for terminology and naming conventions.
   system. Use ADTs and enums to encode business rules and state transitions
   directly in types rather than runtime validation. See "Type modeling" in Code
   Style for details
-- **SDK Boundary Conversion**: Prefer accepting domain newtypes and converting
-  to SDK primitives inside the callee when you control the callee boundary.
-  Exception: when the callee lives in a different crate that cannot depend on
-  the caller's domain types (e.g., `convert_usdc_usd` in `st0x-execution`
-  accepts `Decimal` because `Usdc` is defined in the main crate), destructuring
-  at the call site is fine
-- **Schema Design**: Avoid database columns that can contradict each other. Use
-  constraints and proper normalization to ensure data consistency at the
-  database level. Align database schemas with type modeling principles where
-  possible
-- **No Denormalized Columns**: Never store values computable from other columns
-  -- they inevitably become stale. Compute derived values on-demand in queries.
-  If performance requires caching, use database views or generated columns,
-  never manually-maintained columns
-- **Functional Programming Patterns**: Favor FP and ADT patterns over OOP
-  patterns. Avoid unnecessary encapsulation, inheritance hierarchies, or
-  getter/setter patterns that don't make sense with Rust's algebraic data types.
-  Use pattern matching, combinators, and type-driven design
-- **Idiomatic Functional Programming**: Prefer iterator-based functional
-  programming patterns over imperative loops unless it increases complexity. Use
-  itertools to be able to do more with iterators and functional programming in
-  Rust
+- **SDK Boundary Conversion**: Accept domain newtypes and convert to SDK
+  primitives inside the callee. Exception: cross-crate boundaries where the
+  callee can't depend on caller's domain types -- destructure at the call site
+- **Schema Design**: No contradictory columns. Use constraints and
+  normalization. Align schemas with type modeling principles
+- **No Denormalized Columns**: Never store values computable from other columns.
+  Compute on-demand; if caching needed, use views or generated columns
+- **Functional Programming**: Favor FP/ADT patterns over OOP. Use pattern
+  matching, combinators, type-driven design. Prefer iterators over imperative
+  loops unless it increases complexity. Use itertools for richer iterator chains
 - **Comments**: Follow comprehensive commenting guidelines (see detailed section
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
@@ -498,18 +483,13 @@ is the source of truth for terminology and naming conventions.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
-- **Import Conventions**: Use qualified imports when they prevent ambiguity
-  (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
-  module is clear (e.g. use `info!` instead of `tracing::info!`). Never use
-  imports inside functions. We don't do function-level imports, instead we do
-  top-of-module imports. Note that I said top-of-module and not top-of-file,
-  e.g. imports required only inside a tests module should be done in the module
-  and not hidden behind #[cfg(test)] at the top of the file
-- **Error Handling**: Avoid `unwrap()` and `.expect()` in production code, even
-  post-validation, since validation logic changes might leave panics in the
-  codebase. **Exception**: `.unwrap()` and `.expect()` are fine in test code
-  (`#[cfg(test)]` modules) where panicking on unexpected state is the desired
-  behavior
+- **Import Conventions**: Qualify imports only to prevent ambiguity (e.g.
+  `contract::Error`), not when the module is clear (e.g. `info!` not
+  `tracing::info!`). Top-of-module imports only (not top-of-file -- test module
+  imports go in the test module, not behind `#[cfg(test)]` at file top)
+- **Error Handling**: No `unwrap()`/`.expect()` in production code (validation
+  logic may change, leaving panics). **Exception**: fine in test code
+  (`#[cfg(test)]` modules)
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
   String values.** No `SomeError(String)`, no `.to_string()` or `format!()`
   conversions, no unpacking newtypes (store `Symbol` not `String`). Prefer
@@ -519,13 +499,10 @@ is the source of truth for terminology and naming conventions.
   cannot implement `From`/`#[from]` - do not reach for it as the default when
   `#[from]` + `?` suffices. To log before converting:
   `.inspect_err(|error| error!(?error, "ctx"))` before `?`
-- **Silent Early Returns**: Never silently return in error/mismatch cases.
-  Always log a warning or error with context before early returns in `let-else`
-  or similar patterns. Silent failures hide bugs and make debugging nearly
-  impossible
-- **No Duplicate Values in Debug Output**: Never hardcode values (URLs, paths,
-  constants) into log statements. Always log the actual runtime value —
-  hardcoded copies inevitably drift from the real implementation
+- **Silent Early Returns**: Always log a warning/error before early returns in
+  `let-else` or similar patterns. Silent failures hide bugs
+- **No Duplicate Values in Debug Output**: Log actual runtime values, never
+  hardcoded copies (they drift from the real implementation)
 - **Visibility Levels**: Keep visibility as restrictive as possible (private >
   `pub(crate)` > `pub`) for better dead code detection and clearer scope
 - **Type Aliases**: Only add when clippy complains about type complexity. If
@@ -571,28 +548,20 @@ reviewing code that uses configuration instead of reading secrets directly.
   tests, fewer integration tests, fewest e2e tests. Integration tests may cover
   failure scenarios when those failures can only be triggered by wiring multiple
   components together
-- **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: Tests
-  exist to verify the system works correctly. If code is broken or incomplete,
-  tests MUST assert the correct expected behavior and FAIL until the code is
-  fixed. NEVER write tests that assert incorrect behavior with comments like
-  "documenting the gap" or "will fix later". A failing test is the correct way
-  to flag broken code - it forces the issue to be addressed. Tests that pass
-  while asserting wrong behavior are worse than no tests at all.
-- **CRITICAL: NEVER delete, skip, or bypass existing tests or checks to make a
-  refactor easier.** If a refactor breaks existing tests, you MUST either: (1)
-  adapt the tests to the new design while preserving their coverage, (2) find a
-  design that keeps the tests passing, or (3) stop and ask the user how to
-  proceed. Replacing tests with comments like "these no longer apply" or
-  "validated by other means" is strictly forbidden. Tests are constraints on
-  correctness -- if your change can't satisfy them, the change is wrong.
-- **Debugging failing tests**: When debugging tests with failing assert! macros,
-  add additional context to the assert! macro instead of adding temporary
+- **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: If
+  code is broken, tests MUST assert correct behavior and FAIL until fixed. NEVER
+  assert incorrect behavior with "will fix later" comments. A failing test is
+  better than a passing test that asserts wrong behavior.
+- **CRITICAL: NEVER delete, skip, or bypass existing tests to ease a refactor.**
+  Either: (1) adapt tests to the new design preserving coverage, (2) find a
+  design that keeps tests passing, or (3) stop and ask. Tests are correctness
+  constraints -- if your change can't satisfy them, the change is wrong.
+- **Debugging failing tests**: Add context to the assert! macro, not temporary
   println! statements
-- **No ad-hoc debugging scripts**: Debug via test functions in the test suite,
-  not ad-hoc scripts or temp files.
-- **Test Quality**: Never write tests that only exercise language features
-  without testing our application logic. Tests should verify actual business
-  logic, not just struct field assignments or basic language operations
+- **No ad-hoc debugging scripts**: Debug via test functions, not scripts or temp
+  files
+- **Test Quality**: Tests must verify business logic, not language features or
+  struct field assignments
 - **Property-Based Testing**: Use `proptest` for property-based tests whenever
   there are clear invariants to verify. Property tests are excellent for:
   - Parsing/serialization roundtrips
@@ -609,20 +578,33 @@ assignments is useless; test actual behavior like
 
 ### Workflow Best Practices
 
-- **Always run verification steps before handing over a piece of work** (skip if
-  only documentation/markdown files were changed). Run them in this order to
-  fail fast:
-  1. `cargo check` - fastest, catches compilation errors first
-  2. `cargo nextest run --workspace` - only run after check passes
-  3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
+- **Incremental verification during development** -- scope checks to the package
+  you're actively working on for fast feedback:
+  1. `cargo check -p <crate>` after every edit -- fast, catches type errors
+  2. `cargo nextest run -p <crate>` after completing a logical unit -- runs that
+     crate's tests only, skips slow e2e and unrelated crates
+  3. `cargo clippy -p <crate>` only after all substantive edits to that crate
+     are done
+  4. Reserve `--workspace` variants for the final verification pass
+- **Final verification before handing over** (skip if only
+  documentation/markdown files were changed). Run full workspace checks in this
+  order to fail fast:
+  1. `cargo check --workspace` - catches compilation errors across all crates
+  2. `cargo nextest run --workspace --all-features` - full test suite including
+     e2e
+  3. `cargo clippy --workspace --all-targets --all-features` - full linting
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
-- **CRITICAL: Do NOT run clippy until ALL substantive work is done.** Clippy is
-  a polish step. Running it while tasks remain open is wasted effort -
-  subsequent code changes will introduce new lint issues. Complete every task on
-  the list first (`cargo check` + `cargo nextest run` passing), then run clippy
-  as a final pass before handing over.
+- **CRITICAL: ALL workspace checks must pass before work is done** (except
+  doc-only changes). Fix every warning/error/failure regardless of origin. CI
+  blocks merging on any failure.
+- **CRITICAL: Do NOT run clippy until ALL substantive work is done.** It's a
+  polish step -- subsequent changes introduce new lints. Run clippy only as the
+  final pass.
+- **CRITICAL: Do NOT run `cargo nextest run --workspace` repeatedly.** Use
+  `-p <crate>` during iteration; full workspace suite only in final
+  verification.
 
 #### CRITICAL: Quality Control Policy
 
@@ -636,9 +618,8 @@ not limited to:
 - Test assertions or validation logic
 - Any other strictness or quality enforcement
 
-Clippy lint errors are not about the exact specific cosmetic thing -- they are
-often indications of poor design or broader things worth reconsidering. Upon
-encountering a lint violation:
+Clippy lints often indicate poor design worth reconsidering. Upon a lint
+violation:
 
 1. **Re-evaluate the design** in the context of what was flagged. If the lint
    reveals a flaw in the broader design or architecture, fix that
@@ -650,44 +631,23 @@ encountering a lint violation:
    and request explicit permission** from the user before suppressing
 
 **FORBIDDEN: Obscure workarounds that silence the linter without fixing the
-problem.** Do not restructure code in weird ways, add unnecessary indirection,
-wrap things in newtypes, or use any other trick whose sole purpose is making the
-lint go away. Either fix the underlying design issue the lint is pointing at, or
-request permission to suppress. There is no third option.
+problem.** Either fix the underlying design issue or request permission to
+suppress. No third option.
 
 **Exception**: Lint suppression inside `sol!` macros is acceptable for issues
 from contract ABI signatures we cannot control.
 
 ### Commenting Guidelines
 
-Code should be primarily self-documenting through clear naming, structure, and
-type modeling. Comments should only be used when they add meaningful context
-that cannot be expressed through code structure alone.
+Code should be self-documenting. Comments only when they add context that code
+structure cannot express.
 
-#### When to Use Comments
+**DO comment**: complex business logic, algorithm rationale, external system
+behavior, non-obvious constraints, test data context, workarounds.
 
-##### ✅ DO comment when:
-
-- **Complex business logic**: Explaining non-obvious domain-specific rules or
-  calculations
-- **Algorithm rationale**: Why a particular approach was chosen over
-  alternatives
-- **External system interactions**: Behavior that depends on external APIs or
-  protocols
-- **Non-obvious technical constraints**: Performance considerations, platform
-  limitations
-- **Test data context**: Explaining what mock values represent or test scenarios
-- **Workarounds**: Temporary solutions with context about why they exist
-
-##### ❌ DON'T comment when:
-
-- The code is self-explanatory through naming and structure
-- Restating what the code obviously does
-- Describing function signatures (use doc comments instead)
-- Adding obvious test setup descriptions
-- Marking code sections that are clear from structure
-- **NEVER reference task numbers, issue trackers, or session context** in
-  comments — explain WHAT and WHY, not which task led to writing it
+**DON'T comment**: self-explanatory code, restating what code does, function
+signature descriptions (use `///`), obvious test setup, section markers. **NEVER
+reference task numbers or issue trackers** in comments.
 
 Use `///` for public APIs. Keep comments focused on "why" not "what".
 
@@ -705,19 +665,13 @@ polish.
 
 #### No single-letter variables or arguments
 
-Single-letter names (`e`, `x`, `n`, `s`, etc.) are **FORBIDDEN** everywhere -
-variables, function arguments, closure parameters, generic type params in
-function signatures. Always use descriptive names. The only exception is
-conventional iterator variables in very short closures where the type makes the
-meaning unambiguous (e.g., `|event| event.payload`), but even then prefer a
-descriptive name.
+Single-letter names are **FORBIDDEN** everywhere -- variables, arguments,
+closure params, generic type params. Always use descriptive names. Exception:
+short closures where the type is unambiguous (e.g., `|event| event.payload`).
 
-**Generic type parameters**: Single-letter type variables (`T`, `P`, `R`, `C`,
-etc.) are forbidden whenever there is more than one type variable in a given
-context (function, impl block, trait definition). Use descriptive names that
-convey the role: `Call`, `Registry`, `Wallet` instead of `C`, `R`, `W`. A lone
-type variable on a simple generic (e.g., `ReadOnlyEvm<P>`) is acceptable only
-when the meaning is unambiguous from context.
+**Generic type parameters**: Single-letter type vars forbidden when multiple
+type vars exist. Use descriptive names (`Call`, `Registry`, `Wallet`). A lone
+type var (e.g., `ReadOnlyEvm<P>`) is acceptable when unambiguous.
 
 #### Module Organization
 
@@ -741,24 +695,14 @@ and assert the exact variant with `matches!`. For ok, just `.unwrap()`.
 
 #### Prefer exhaustive `match` over `matches!` in production code
 
-Outside of test assertions, always use a proper exhaustive `match` instead of
-the `matches!` macro. Exhaustive matches force you to handle new variants when
-enums change, preventing silent bugs. `matches!` hides unhandled variants behind
-a catch-all `_ => false`.
-
-**Test code**: `matches!` is fine for concise assertions (e.g.,
-`assert!(matches!(error, MyError::Specific { .. }))`).
-
-**Production code**: Use exhaustive `match` with explicit arms for every
-variant. When adding a new variant to an enum, the compiler will flag every
-match site that needs updating.
+Exhaustive `match` forces handling new variants; `matches!` hides them behind
+`_ => false`. **Test code**: `matches!` is fine for assertions. **Production
+code**: always exhaustive `match` so the compiler flags new variants.
 
 #### Assertions must be specific
 
-Check for exact expected behavior. Never use `||` in assertions to accept
-multiple outcomes unless genuinely equivalent. Use `assert_eq!` with specific
-values, not `assert!(result.is_some())`. If writing `||` in an assertion, you
-likely don't understand the expected behavior - investigate first.
+Use `assert_eq!` with exact values, not `assert!(result.is_some())`. Never use
+`||` in assertions unless outcomes are genuinely equivalent.
 
 #### Type modeling
 
@@ -786,23 +730,18 @@ constructors or getters unless they add logic beyond setting/getting values.
 
 #### Prefer destructuring over `.0` access
 
-For newtypes, prefer `let TypeName(inner) = value` over `value.0`. The
-destructuring pattern names the type explicitly, making the code
-self-documenting.
+For newtypes, prefer `let TypeName(inner) = value` over `value.0` -- names the
+type explicitly.
 
 #### No one-liner helpers
 
-If a helper function's body is a single expression, it's useless indirection --
-just inline the call. A function that only wraps another function call adds a
-name to learn and a place to jump to without reducing complexity. Helpers earn
-their existence by encapsulating multi-step logic, not by renaming a single
-operation.
+If a helper's body is a single expression, inline it. Wrapping one function call
+in another adds indirection without reducing complexity. Helpers must
+encapsulate multi-step logic.
 
 #### Don't split simple-but-long pattern matches
 
-A function that consists of a single `match` with many trivial arms (e.g. state
-machine transitions, event mapping) should stay as one function even if it
-exceeds line count lints. Each arm is simple field mapping -- extracting arms
-into helpers adds indirection without improving readability. When
-`too_many_lines` fires on such functions, request permission to suppress the
-lint rather than extracting helpers that exist only to satisfy the line count.
+A single `match` with many trivial arms (state transitions, event mapping)
+should stay as one function even if it exceeds line count lints. Request
+permission to suppress `too_many_lines` rather than extracting pointless
+helpers.

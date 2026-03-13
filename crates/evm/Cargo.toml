@@ -7,7 +7,7 @@ edition = "2024"
 default = []
 mock = ["local-signer", "dep:url", "dep:anyhow"]
 local-signer = []
-turnkey = ["dep:alloy-signer-turnkey", "dep:serde"]
+turnkey = ["dep:alloy-signer-turnkey"]
 
 [dependencies]
 alloy.workspace = true
@@ -15,7 +15,7 @@ alloy-signer-turnkey = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
 rain-error-decoding.workspace = true
-serde = { workspace = true, features = ["derive"], optional = true }
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true
 url = { workspace = true, optional = true }
