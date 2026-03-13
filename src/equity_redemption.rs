@@ -58,11 +58,11 @@
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::{info, warn};
 
-use rain_math_float::Float;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::Symbol;
 
@@ -216,8 +216,8 @@ pub(crate) enum EquityRedemptionEvent {
     WithdrawnFromRaindex {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         token: Address,
@@ -404,8 +404,8 @@ pub(crate) enum EquityRedemption {
     WithdrawnFromRaindex {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         token: Address,
@@ -418,8 +418,8 @@ pub(crate) enum EquityRedemption {
     TokensUnwrapped {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         token: Address,
@@ -435,8 +435,8 @@ pub(crate) enum EquityRedemption {
     TokensSent {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         token: Address,
@@ -451,8 +451,8 @@ pub(crate) enum EquityRedemption {
     Pending {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         redemption_tx: TxHash,
@@ -465,8 +465,8 @@ pub(crate) enum EquityRedemption {
     Completed {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         redemption_tx: TxHash,
@@ -483,8 +483,8 @@ pub(crate) enum EquityRedemption {
     Failed {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         raindex_withdraw_tx: Option<TxHash>,

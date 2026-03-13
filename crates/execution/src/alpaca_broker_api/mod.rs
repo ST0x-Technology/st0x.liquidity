@@ -1,6 +1,7 @@
 use rain_math_float::Float;
 use rain_math_float::FloatError;
 use serde::Deserialize;
+use st0x_float_serde::format_float;
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
@@ -140,10 +141,10 @@ pub enum AlpacaBrokerApiError {
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
 
-    #[error("Cash balance {0:?} cannot be converted to cents")]
+    #[error("Cash balance {} cannot be converted to cents", format_float(.0))]
     CashBalanceConversion(Float),
 
-    #[error("Cash balance {0:?} has fractional cents after conversion")]
+    #[error("Cash balance {} has fractional cents after conversion", format_float(.0))]
     FractionalCents(Float),
 
     #[error("Invalid symbol in position: {0}")]

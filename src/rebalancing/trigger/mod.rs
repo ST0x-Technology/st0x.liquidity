@@ -138,9 +138,9 @@ pub enum RebalancingCtxError {
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum UsdcRebalancing {
     Enabled {
-        #[serde(deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string")]
+        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
         target: Float,
-        #[serde(deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string")]
+        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
         deviation: Float,
     },
     Disabled,

@@ -29,7 +29,7 @@ use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::TEST_ACCOUNT_ID;
 
 use crate::bindings::DeployableERC20;
-use crate::float_serde::format_float;
+use st0x_float_serde::format_float;
 
 sol! {
     #[sol(all_derives = true)]

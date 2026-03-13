@@ -715,13 +715,15 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
             .call()
             .await?;
 
+    let total_amount = (amount_per_trade * float!("3")).unwrap();
+
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount((amount_per_trade * float!("3")).unwrap())
+        .amount(total_amount)
         .direction(TakeDirection::BuyEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
-        .expected_accumulated_long((amount_per_trade * float!("3")).unwrap())
+        .expected_accumulated_long(total_amount)
         .expected_accumulated_short(float!("0"))
         .expected_net(float!("0"))
         .build()];
@@ -872,14 +874,16 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
             .call()
             .await?;
 
+    let total_amount = (amount_per_trade * float!("3")).unwrap();
+
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
-        .amount((amount_per_trade * float!("3")).unwrap())
+        .amount(total_amount)
         .direction(TakeDirection::SellEquity)
         .onchain_price(onchain_price)
         .broker_fill_price(broker_fill_price)
         .expected_accumulated_long(float!("0"))
-        .expected_accumulated_short((amount_per_trade * float!("3")).unwrap())
+        .expected_accumulated_short(total_amount)
         .expected_net(float!("0"))
         .build()];
 

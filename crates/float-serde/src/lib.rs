@@ -1,3 +1,8 @@
+//! Serde helpers for `rain_math_float::Float`.
+//!
+//! Provides serialization as decimal strings and deserialization from
+//! JSON strings, numbers, or hex-encoded Float values.
+
 use rain_math_float::Float;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Borrow;
@@ -65,6 +70,14 @@ where
             }
         })
         .transpose()
+}
+
+pub fn serialize_option_float<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Borrow<Option<Float>>,
+{
+    option_float_string_serde::serialize(value, serializer)
 }
 
 pub struct FloatDisplay<'a>(pub &'a Float);

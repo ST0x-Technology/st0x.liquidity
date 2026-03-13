@@ -134,8 +134,8 @@ pub(crate) enum TokenizedEquityMintError {
     #[error("Negative quantity: {value:?}")]
     NegativeQuantity {
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         value: Float,
     },
@@ -221,8 +221,8 @@ pub(crate) enum TokenizedEquityMintEvent {
     MintRequested {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         wallet: Address,
@@ -264,8 +264,8 @@ pub(crate) enum TokenizedEquityMintEvent {
     WrappingFailed {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         failed_at: DateTime<Utc>,
@@ -440,8 +440,8 @@ pub(crate) enum TokenizedEquityMint {
     MintRequested {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         wallet: Address,
@@ -452,8 +452,8 @@ pub(crate) enum TokenizedEquityMint {
     MintAccepted {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         wallet: Address,
@@ -467,8 +467,8 @@ pub(crate) enum TokenizedEquityMint {
     TokensReceived {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         wallet: Address,
@@ -486,8 +486,8 @@ pub(crate) enum TokenizedEquityMint {
     TokensWrapped {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         wallet: Address,
@@ -508,8 +508,8 @@ pub(crate) enum TokenizedEquityMint {
     DepositedIntoRaindex {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         /// Alpaca cross-system identifiers for auditing
@@ -528,8 +528,8 @@ pub(crate) enum TokenizedEquityMint {
     Failed {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
         reason: String,

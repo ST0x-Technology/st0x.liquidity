@@ -542,10 +542,10 @@ fn format_tokenization_request<Writer: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
+    use rain_math_float::Float;
     use url::Url;
     use uuid::uuid;
 
-    use rain_math_float::Float;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 
     use super::*;

@@ -164,7 +164,7 @@ where
 
 #[derive(Serialize)]
 struct WithdrawalRequest<'a> {
-    #[serde(serialize_with = "crate::float_serde::serialize_float_as_string")]
+    #[serde(serialize_with = "st0x_float_serde::serialize_float_as_string")]
     amount: Float,
     asset: &'a TokenSymbol,
     #[serde(serialize_with = "serialize_address_checksummed")]
@@ -1053,5 +1053,29 @@ mod tests {
     fn complete_and_failed_are_not_pending() {
         assert!(!TransferStatus::Complete.is_pending());
         assert!(!TransferStatus::Failed.is_pending());
+    }
+
+    #[test]
+    fn malformed_decimal_string_fails_deserialization() {
+        let malformed = json!({
+            "id": Uuid::new_v4(),
+            "direction": "OUTGOING",
+            "amount": "not_a_number",
+            "usd_value": "100.0",
+            "chain": "BASE",
+            "asset": "USDC",
+            "from_address": Address::ZERO,
+            "to_address": Address::ZERO,
+            "status": "COMPLETE",
+            "created_at": "2025-01-01T00:00:00Z",
+            "network_fee": "0.001",
+            "fees": "0.0"
+        });
+
+        let error = serde_json::from_value::<Transfer>(malformed).unwrap_err();
+        assert!(
+            error.to_string().contains("Float"),
+            "error should indicate Float parse failure: {error}"
+        );
     }
 }

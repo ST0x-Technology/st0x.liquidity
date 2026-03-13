@@ -62,14 +62,14 @@ impl FromStr for OnChainTradeId {
 pub(crate) struct OnChainTrade {
     pub(crate) symbol: Symbol,
     #[serde(
-        serialize_with = "crate::float_serde::serialize_float_as_string",
-        deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
     )]
     pub(crate) amount: Float,
     pub(crate) direction: Direction,
     #[serde(
-        serialize_with = "crate::float_serde::serialize_float_as_string",
-        deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
     )]
     pub(crate) price_usdc: Float,
     pub(crate) block_number: Option<u64>,
@@ -214,14 +214,14 @@ pub(crate) enum OnChainTradeCommand {
     Witness {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         amount: Float,
         direction: Direction,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         price_usdc: Float,
         block_number: u64,
@@ -238,14 +238,14 @@ pub(crate) enum OnChainTradeEvent {
     Filled {
         symbol: Symbol,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         amount: Float,
         direction: Direction,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         price_usdc: Float,
         block_number: u64,

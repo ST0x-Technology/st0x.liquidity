@@ -144,7 +144,7 @@ mod tests {
 
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert!(underlying.inner().eq(float!("100")).unwrap());
+        assert_eq!(underlying, FractionalShares::new(float!("100")));
     }
 
     #[test]
@@ -157,7 +157,7 @@ mod tests {
         let wrapped = FractionalShares::new(float!("100"));
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert!(underlying.inner().eq(float!("105")).unwrap());
+        assert_eq!(underlying, FractionalShares::new(float!("105")));
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         let wrapped = FractionalShares::new(float!("50"));
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
 
-        assert!(underlying.inner().eq(float!("100")).unwrap());
+        assert_eq!(underlying, FractionalShares::new(float!("100")));
     }
 
     #[test]

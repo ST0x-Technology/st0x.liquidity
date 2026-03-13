@@ -36,8 +36,24 @@ macro_rules! symbol {
 }
 
 /// Represents a validated USDC amount (non-negative)
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct Usdc(Float);
+
+impl fmt::Debug for Usdc {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Usdc({})",
+            st0x_float_serde::format_float(&self.0)
+        )
+    }
+}
+
+impl fmt::Display for Usdc {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", st0x_float_serde::format_float(&self.0))
+    }
+}
 
 impl PartialEq for Usdc {
     fn eq(&self, other: &Self) -> bool {

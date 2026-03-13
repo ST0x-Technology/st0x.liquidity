@@ -282,8 +282,8 @@ pub(crate) struct TokenizationRequest {
     pub(crate) tx_hash: Option<TxHash>,
     #[serde(
         default,
-        serialize_with = "crate::float_serde::serialize_option_float",
-        deserialize_with = "crate::float_serde::deserialize_option_float_from_number_or_string"
+        serialize_with = "st0x_float_serde::serialize_option_float",
+        deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
     )]
     fees: Option<Float>,
     pub(crate) created_at: DateTime<Utc>,

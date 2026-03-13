@@ -59,14 +59,14 @@ pub(crate) enum Imbalance<T> {
 pub struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
     #[serde(
-        serialize_with = "crate::float_serde::serialize_float_as_string",
-        deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
     )]
     pub(crate) target: Float,
     /// Deviation from target that triggers rebalancing.
     #[serde(
-        serialize_with = "crate::float_serde::serialize_float_as_string",
-        deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
     )]
     pub(crate) deviation: Float,
 }
@@ -120,9 +120,9 @@ impl ImbalanceThreshold {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawImbalanceThreshold {
-    #[serde(deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string")]
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
     target: Float,
-    #[serde(deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string")]
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
     deviation: Float,
 }
 
@@ -216,14 +216,22 @@ where
         + HasZero
         + std::fmt::Debug,
 {
-    fn has_inflight(&self) -> bool {
-        self.onchain
+    fn has_inflight(&self) -> Result<bool, FloatError> {
+        let onchain_inflight = self
+            .onchain
             .as_ref()
-            .is_some_and(|v| v.has_inflight().unwrap_or(false))
-            || self
-                .offchain
-                .as_ref()
-                .is_some_and(|v| v.has_inflight().unwrap_or(false))
+            .map(|v| v.has_inflight())
+            .transpose()?
+            .unwrap_or(false);
+
+        let offchain_inflight = self
+            .offchain
+            .as_ref()
+            .map(|v| v.has_inflight())
+            .transpose()?
+            .unwrap_or(false);
+
+        Ok(onchain_inflight || offchain_inflight)
     }
 
     fn get_venue(&self, venue: Venue) -> Option<VenueBalance<T>> {
@@ -342,7 +350,7 @@ where
         threshold: &ImbalanceThreshold,
         normalized_onchain: T,
     ) -> Result<Option<Imbalance<T>>, FloatError> {
-        if self.has_inflight() {
+        if self.has_inflight()? {
             return Ok(None);
         }
 
@@ -505,7 +513,7 @@ where
         fetched_at: DateTime<Utc>,
     ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
         Box::new(move |inventory| {
-            if inventory.has_inflight() {
+            if inventory.has_inflight()? {
                 return Ok(inventory);
             }
 
@@ -812,25 +820,25 @@ mod tests {
     #[test]
     fn has_inflight_false_when_no_inflight() {
         let inventory = make_inventory(50, 0, 50, 0);
-        assert!(!inventory.has_inflight());
+        assert!(!inventory.has_inflight().unwrap());
     }
 
     #[test]
     fn has_inflight_true_when_onchain_inflight() {
         let inventory = make_inventory(50, 10, 50, 0);
-        assert!(inventory.has_inflight());
+        assert!(inventory.has_inflight().unwrap());
     }
 
     #[test]
     fn has_inflight_true_when_offchain_inflight() {
         let inventory = make_inventory(50, 0, 50, 10);
-        assert!(inventory.has_inflight());
+        assert!(inventory.has_inflight().unwrap());
     }
 
     #[test]
     fn has_inflight_true_when_both_inflight() {
         let inventory = make_inventory(50, 10, 50, 10);
-        assert!(inventory.has_inflight());
+        assert!(inventory.has_inflight().unwrap());
     }
 
     #[test]

@@ -305,7 +305,7 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::trace::geth::FourByteFrame;
 
-    use crate::float_serde::format_float;
+    use st0x_float_serde::format_float;
 
     fn create_test_call_frame(
         to: Address,

@@ -1,5 +1,4 @@
 [profile.default]
-# Hard timeout for all tests to prevent infinite loops.
 fail-fast = false
 
 [[profile.default.overrides]]

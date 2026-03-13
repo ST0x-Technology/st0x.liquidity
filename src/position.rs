@@ -30,8 +30,8 @@ pub struct Position {
     pub pending_offchain_order_id: Option<OffchainOrderId>,
     pub threshold: ExecutionThreshold,
     #[serde(
-        serialize_with = "crate::float_serde::serialize_option_float",
-        deserialize_with = "crate::float_serde::deserialize_option_float_from_number_or_string"
+        serialize_with = "st0x_float_serde::serialize_option_float",
+        deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
     )]
     pub last_price_usdc: Option<Float>,
     pub last_updated: Option<DateTime<Utc>>,
@@ -506,8 +506,8 @@ pub enum PositionEvent {
         amount: FractionalShares,
         direction: Direction,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         price_usdc: Float,
         block_timestamp: DateTime<Utc>,
@@ -699,35 +699,35 @@ impl std::fmt::Display for TradeId {
 pub enum TriggerReason {
     SharesThreshold {
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         net_position_shares: Float,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         threshold_shares: Float,
     },
     DollarThreshold {
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         net_position_shares: Float,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         dollar_value: Float,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         price_usdc: Float,
         #[serde(
-            serialize_with = "crate::float_serde::serialize_float_as_string",
-            deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         threshold_dollars: Float,
     },

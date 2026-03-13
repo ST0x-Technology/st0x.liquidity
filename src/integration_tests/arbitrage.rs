@@ -38,7 +38,6 @@ use crate::conductor::{
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
-use crate::float_serde::format_float;
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
 use crate::onchain::OnchainTrade;
@@ -52,6 +51,7 @@ use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::vault_registry::VaultRegistryId;
+use st0x_float_serde::format_float;
 
 const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";

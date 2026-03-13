@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
 use rain_math_float::Float;
-use st0x_execution::Symbol;
 use tempfile::TempDir;
 
 use st0x_bridge::cctp::CctpAttestationMock;
+use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
 use st0x_hedge::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};

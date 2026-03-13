@@ -11,9 +11,9 @@ use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
 use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
-use crate::float_serde::format_float;
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::threshold::Usdc;
+use st0x_float_serde::format_float;
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).

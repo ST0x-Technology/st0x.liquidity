@@ -1351,8 +1351,12 @@ fn register_wallet_transfers_get_endpoint(server: &MockServer, state: &Arc<Mutex
                         } else {
                             Value::String(transfer.tx_hash.clone())
                         };
-                        let amount = format_float(transfer.amount)
-                            .unwrap_or_else(|error| format!("format_error:{error}"));
+                        let amount = format_float(transfer.amount).unwrap_or_else(|error| {
+                            panic!(
+                                "mock API: failed to format transfer amount {:?}: {error}",
+                                transfer.amount
+                            )
+                        });
 
                         json!({
                             "id": transfer.transfer_id,

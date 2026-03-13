@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 
 pub(crate) use st0x_float_serde::{
     deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
-    serialize_float_as_string,
+    format_float, serialize_float_as_string,
 };
 
 /// Convenience macro for constructing `Float` values from literals or
@@ -21,6 +21,7 @@ pub(crate) use st0x_float_serde::{
 /// float!(42)        // integer literal
 /// float!(some_var)  // any expression that implements ToString
 /// ```
+#[cfg(any(test, feature = "test-support"))]
 #[macro_export]
 macro_rules! float {
     ($value:expr) => {
@@ -157,11 +158,11 @@ impl std::str::FromStr for Symbol {
 pub enum InvalidSharesError {
     #[error("Shares cannot be zero")]
     Zero,
-    #[error("Value must be positive, got {0:?}")]
+    #[error("Value must be positive, got {}", format_float(.0))]
     NonPositive(Float),
-    #[error("Cannot convert fractional shares {0:?} to whole shares")]
+    #[error("Cannot convert fractional shares {} to whole shares", format_float(.0))]
     Fractional(Float),
-    #[error("Shares value {0:?} exceeds u64 range")]
+    #[error("Shares value {} exceeds u64 range", format_float(.0))]
     Overflow(Float),
     #[error(transparent)]
     TryFromInt(#[from] std::num::TryFromIntError),
@@ -274,8 +275,20 @@ impl Display for Shares {
 /// Represents share quantities that can include fractional amounts (e.g., 1.212 shares).
 /// Can be negative (for position tracking). Use `Positive<FractionalShares>` when
 /// strictly positive values are required (e.g., order quantities).
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct FractionalShares(Float);
+
+impl Debug for FractionalShares {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "FractionalShares({})", format_float(&self.0))
+    }
+}
+
+impl Display for FractionalShares {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", format_float(&self.0))
+    }
+}
 
 impl HasZero for FractionalShares {
     const ZERO: Self = Self(Float::from_raw(alloy::primitives::B256::ZERO));
@@ -371,7 +384,7 @@ impl PartialOrd for FractionalShares {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SharesConversionError {
-    #[error("shares value cannot be negative: {0:?}")]
+    #[error("shares value cannot be negative: {}", format_float(.0))]
     NegativeValue(Float),
     #[error("Float conversion failed: {0}")]
     FloatConversion(#[from] FloatError),
@@ -415,15 +428,6 @@ impl FromStr for FractionalShares {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Float::parse(value.to_string()).map(Self)
-    }
-}
-
-impl Display for FractionalShares {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0.format_with_scientific(false) {
-            Ok(formatted_value) => write!(formatter, "{formatted_value}"),
-            Err(error) => write!(formatter, "<format error: {error}>"),
-        }
     }
 }
 

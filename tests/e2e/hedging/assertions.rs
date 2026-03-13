@@ -1,5 +1,4 @@
 use alloy::primitives::{Address, B256, U256};
-
 pub(crate) use alloy::providers::Provider;
 use rain_math_float::Float;
 use sqlx::SqlitePool;

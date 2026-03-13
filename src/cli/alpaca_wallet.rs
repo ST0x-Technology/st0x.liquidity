@@ -16,9 +16,9 @@ use crate::alpaca_wallet::{
 };
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
-use crate::float_serde::format_float;
 use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 use crate::threshold::Usdc;
+use st0x_float_serde::format_float;
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,

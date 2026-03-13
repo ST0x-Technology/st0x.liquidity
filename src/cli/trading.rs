@@ -19,7 +19,6 @@ use st0x_execution::{
 
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
-use crate::float_serde::format_float;
 use crate::offchain_order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
 };
@@ -29,6 +28,7 @@ use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
+use st0x_float_serde::format_float;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
 /// constructed from config. Handles Schwab auth, symbol mapping, etc.

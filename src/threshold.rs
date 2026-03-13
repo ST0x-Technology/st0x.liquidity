@@ -13,13 +13,19 @@ use std::str::FromStr;
 
 use st0x_execution::{FractionalShares, HasZero, Positive};
 
-use crate::float_serde::{
+use st0x_float_serde::{
     deserialize_float_from_number_or_string, format_float, serialize_float_as_string,
 };
 
 /// A USDC dollar amount used for threshold configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Usdc(pub(crate) Float);
+
+impl std::fmt::Debug for Usdc {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Usdc({})", format_float(&self.0))
+    }
+}
 
 /// Required by `cqrs_es::DomainEvent` since Usdc appears in event types.
 impl PartialEq for Usdc {
@@ -118,7 +124,7 @@ impl Usdc {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UsdcConversionError {
-    #[error("USDC amount cannot be negative: {0:?}")]
+    #[error("USDC amount cannot be negative: {}", format_float(.0))]
     NegativeValue(Float),
     #[error("Float operation failed: {0}")]
     Float(#[from] FloatError),

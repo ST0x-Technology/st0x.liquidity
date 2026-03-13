@@ -8,9 +8,9 @@ use thiserror::Error;
 
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::OpenChainErrorRegistry;
+use st0x_float_serde::format_float;
 
 use crate::config::Ctx;
-use crate::float_serde::format_float;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistry;
@@ -24,7 +24,7 @@ pub(super) struct Deposit {
 
 #[derive(Debug, Error)]
 pub(crate) enum VaultCliError {
-    #[error("negative amount: {0:?}")]
+    #[error("negative amount: {}", format_float(.0))]
     NegativeAmount(Float),
 
     #[error("float operation failed: {0}")]

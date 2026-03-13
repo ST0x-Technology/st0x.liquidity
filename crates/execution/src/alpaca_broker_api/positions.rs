@@ -1,9 +1,8 @@
 //! Position fetching for Alpaca Broker API.
 
+use rain_math_float::Float;
 use serde::Deserialize;
 use tracing::{debug, error};
-
-use rain_math_float::Float;
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
@@ -407,6 +406,49 @@ mod tests {
         assert!(option_float_eq(
             rklb.market_value,
             Some(Float::parse("511.6476".to_string()).unwrap())
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_accepts_numeric_json_values() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty": 10.5,
+                        "market_value": 1575.00
+                    }
+                ]));
+        });
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({ "cash": "50000.00" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let state = fetch_inventory(&client).await.unwrap();
+
+        positions_mock.assert();
+        account_mock.assert();
+
+        assert_eq!(state.positions.len(), 1);
+
+        let aapl = &state.positions[0];
+        assert_eq!(aapl.quantity, shares("10.5"));
+        assert!(option_float_eq(
+            aapl.market_value,
+            Some(Float::parse("1575".to_string()).unwrap())
         ));
     }
 }

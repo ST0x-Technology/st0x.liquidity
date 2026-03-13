@@ -458,12 +458,15 @@ impl Ctx {
                 if let Some(cash) = &config.assets.cash
                     && cash.rebalancing == OperationMode::Enabled
                     && let Some(cash_limit) = &cash.operational_limit
-                    && cash_limit.inner().lt(&minimum).unwrap_or(false)
                 {
-                    return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
-                        configured: cash_limit.inner(),
-                        minimum,
-                    });
+                    let below_minimum = cash_limit.inner().lt(&minimum)?;
+
+                    if below_minimum {
+                        return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
+                            configured: cash_limit.inner(),
+                            minimum,
+                        });
+                    }
                 }
 
                 TradingMode::Rebalancing(Box::new(
@@ -676,6 +679,8 @@ pub enum CtxError {
     MissingEquityVaultId { symbol: Symbol },
     #[error("{field} polling interval must be non-zero")]
     ZeroPollingInterval { field: &'static str },
+    #[error("Float comparison failed during config validation: {0}")]
+    FloatComparison(#[from] rain_math_float::FloatError),
 }
 
 impl From<RebalancingCtxError> for CtxError {
@@ -708,6 +713,7 @@ impl CtxError {
             Self::MissingCashVaultId => "missing cash vault_id",
             Self::MissingEquityVaultId { .. } => "missing equity vault_id",
             Self::ZeroPollingInterval { .. } => "zero polling interval",
+            Self::FloatComparison(_) => "float comparison failed",
         }
     }
 }

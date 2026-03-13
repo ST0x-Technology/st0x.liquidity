@@ -11,6 +11,7 @@ use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
+use st0x_float_serde::format_float;
 use tracing::{error, warn};
 
 use st0x_evm::Evm;
@@ -404,9 +405,9 @@ pub(crate) enum TradeValidationError {
         tx_hash: TxHash,
         clear_log_index: u64,
     },
-    #[error("Negative shares amount: {0:?}")]
+    #[error("Negative shares amount: {}", format_float(.0))]
     NegativeShares(Float),
-    #[error("Negative USDC amount: {0:?}")]
+    #[error("Negative USDC amount: {}", format_float(.0))]
     NegativeUsdc(Float),
     #[error("Float error: {0}")]
     Float(#[from] FloatError),

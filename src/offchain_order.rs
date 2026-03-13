@@ -473,8 +473,8 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Dollars(
     #[serde(
-        serialize_with = "crate::float_serde::serialize_float_as_string",
-        deserialize_with = "crate::float_serde::deserialize_float_from_number_or_string"
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
     )]
     pub Float,
 );
@@ -976,5 +976,32 @@ mod tests {
             .expect("projection should return Some for live order");
 
         assert!(matches!(order, OffchainOrder::Submitted { .. }));
+    }
+
+    #[test]
+    fn dollars_serializes_as_decimal_string() {
+        let dollars = Dollars(float!("150.25"));
+        let json = serde_json::to_value(dollars).unwrap();
+        assert_eq!(json, serde_json::json!("150.25"));
+    }
+
+    #[test]
+    fn dollars_deserializes_from_string() {
+        let dollars: Dollars = serde_json::from_value(serde_json::json!("150.25")).unwrap();
+        assert_eq!(dollars, Dollars(float!("150.25")));
+    }
+
+    #[test]
+    fn dollars_deserializes_from_number() {
+        let dollars: Dollars = serde_json::from_value(serde_json::json!(150.25)).unwrap();
+        assert_eq!(dollars, Dollars(float!("150.25")));
+    }
+
+    #[test]
+    fn dollars_round_trips_through_json() {
+        let original = Dollars(float!("99.99"));
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: Dollars = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
     }
 }

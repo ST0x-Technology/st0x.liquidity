@@ -122,7 +122,6 @@ mod tests {
     use st0x_execution::Symbol;
 
     use super::*;
-
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::onchain::mock::MockRaindex;
