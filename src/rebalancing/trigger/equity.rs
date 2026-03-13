@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
-use tokio::sync::RwLock;
 use tracing::{trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
 use super::{TokenAddressError, TriggeredOperation};
-use crate::inventory::{EquityImbalanceError, Imbalance, ImbalanceThreshold, InventoryView};
+use crate::inventory::{
+    BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold,
+};
 use crate::wrapper::{UnderlyingPerWrapped, WrapperError};
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
@@ -99,7 +100,7 @@ impl Drop for InProgressGuard {
 pub(super) async fn check_imbalance_and_build_operation(
     symbol: &Symbol,
     threshold: &ImbalanceThreshold,
-    inventory: &Arc<RwLock<InventoryView>>,
+    inventory: &Arc<BroadcastingInventory>,
     wrapped_token: Address,
     unwrapped_token: Address,
     vault_ratio: &UnderlyingPerWrapped,
@@ -196,7 +197,7 @@ mod tests {
 
     use super::*;
     use crate::inventory::view::Operator;
-    use crate::inventory::{Inventory, TransferOp, Venue};
+    use crate::inventory::{Inventory, InventoryView, TransferOp, Venue};
     use crate::wrapper::RATIO_ONE;
     use st0x_float_macro::float;
 
@@ -212,7 +213,7 @@ mod tests {
         symbol: &Symbol,
         onchain: i64,
         offchain: i64,
-    ) -> Arc<RwLock<InventoryView>> {
+    ) -> Arc<BroadcastingInventory> {
         let view = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
@@ -228,7 +229,7 @@ mod tests {
             )
             .unwrap();
 
-        Arc::new(RwLock::new(view))
+        Arc::new(BroadcastingInventory::new(view))
     }
 
     #[test]
@@ -277,7 +278,7 @@ mod tests {
     async fn test_balanced_inventory_returns_no_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
-        let inventory = Arc::new(RwLock::new(view));
+        let inventory = Arc::new(BroadcastingInventory::new(view));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -413,7 +414,7 @@ mod tests {
         symbol: &Symbol,
         onchain: &str,
         offchain: &str,
-    ) -> Arc<RwLock<InventoryView>> {
+    ) -> Arc<BroadcastingInventory> {
         let view = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
@@ -429,7 +430,7 @@ mod tests {
             )
             .unwrap();
 
-        Arc::new(RwLock::new(view))
+        Arc::new(BroadcastingInventory::new(view))
     }
 
     /// Verifies that quantity truncation doesn't lose the truncated portion from inventory.

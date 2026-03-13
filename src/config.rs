@@ -1194,7 +1194,29 @@ pub(crate) mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), example_secrets_toml())
+        let secrets = toml_file(
+            r#"
+            hyperdx.api_key = "test-key"
+
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [rebalancing]
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [rebalancing.wallet]
+            type = "private-key"
+        "#,
+        );
+        let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
         assert!(

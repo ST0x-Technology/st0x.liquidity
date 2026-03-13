@@ -3,29 +3,51 @@
 use futures_util::SinkExt;
 use rocket::{Route, State, get, routes};
 use rocket_ws::{Channel, Message, WebSocket};
+use sqlx::SqlitePool;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::warn;
 
 use st0x_dto::{InitialState, ServerMessage};
 
-mod event;
+use crate::inventory::BroadcastingInventory;
 
+mod event;
+mod transfer_loader;
 pub(crate) use event::EventBroadcaster;
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
 }
 
+pub(crate) struct DashboardState {
+    pub(crate) inventory: Arc<BroadcastingInventory>,
+    pub(crate) pool: SqlitePool,
+}
+
 #[get("/ws")]
-fn ws_endpoint(ws: WebSocket, broadcast: &State<Broadcast>) -> Channel<'_> {
+fn ws_endpoint<'r>(
+    ws: WebSocket,
+    broadcast: &'r State<Broadcast>,
+    dashboard: &'r State<DashboardState>,
+) -> Channel<'r> {
     let mut receiver = broadcast.sender.subscribe();
+    let inventory = Arc::clone(&dashboard.inventory);
+    let pool = dashboard.pool.clone();
 
     ws.channel(move |mut stream| {
         Box::pin(async move {
-            // Stub initial state for dashboard skeleton. Real data will be populated as
-            // each panel is implemented: #178 (metrics), #179 (inventory), #180 (spreads),
-            // #181 (trades), #182 (rebalances), #183 (circuit breaker), #184 (auth).
-            let initial = ServerMessage::Initial(Box::new(InitialState::stub()));
+            let inventory_dto = inventory.read().await.to_dto();
+            let transfers = transfer_loader::load_transfers(&pool).await;
+
+            let initial_state = InitialState {
+                inventory: inventory_dto,
+                active_transfers: transfers.active,
+                recent_transfers: transfers.recent,
+                ..InitialState::default()
+            };
+
+            let initial = ServerMessage::Initial(Box::new(initial_state));
             let json = match serde_json::to_string(&initial) {
                 Ok(serialized) => serialized,
                 Err(error) => {
@@ -91,9 +113,20 @@ mod tests {
         Broadcast { sender }
     }
 
+    async fn create_test_dashboard_state() -> DashboardState {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        DashboardState {
+            inventory: Arc::new(BroadcastingInventory::new(
+                crate::inventory::InventoryView::default(),
+            )),
+            pool,
+        }
+    }
+
     #[tokio::test]
     async fn initial_state_stub_serializes_correctly() {
-        let initial = InitialState::stub();
+        let initial = InitialState::default();
         let json = serde_json::to_string(&initial).expect("serialization should succeed");
         assert!(json.contains("recentTrades"));
         assert!(json.contains("inventory"));
@@ -104,7 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_message_initial_serializes_with_type_tag() {
-        let msg = ServerMessage::Initial(Box::new(InitialState::stub()));
+        let msg = ServerMessage::Initial(Box::default());
         let json = serde_json::to_string(&msg).expect("serialization should succeed");
         assert!(json.contains(r#""type":"initial""#));
         assert!(json.contains(r#""data":"#));
@@ -115,7 +148,7 @@ mod tests {
         let broadcast = create_test_broadcast();
         let mut rx = broadcast.sender.subscribe();
 
-        let sent_msg = ServerMessage::Initial(Box::new(InitialState::stub()));
+        let sent_msg = ServerMessage::Initial(Box::default());
         broadcast
             .sender
             .send(sent_msg.clone())
@@ -133,7 +166,7 @@ mod tests {
         let mut receiver1 = broadcast.sender.subscribe();
         let mut receiver2 = broadcast.sender.subscribe();
 
-        let msg = ServerMessage::Initial(Box::new(InitialState::stub()));
+        let msg = ServerMessage::Initial(Box::default());
         broadcast.sender.send(msg).expect("send should succeed");
 
         receiver1
@@ -155,6 +188,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_endpoint_sends_initial_message() {
         let broadcast = create_test_broadcast();
+        let dashboard_state = create_test_dashboard_state().await;
 
         let config = Config {
             port: 0, // Let OS assign a random available port
@@ -169,6 +203,7 @@ mod tests {
             .configure(config)
             .mount("/api", routes())
             .manage(broadcast)
+            .manage(dashboard_state)
             .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
                 Box::pin(async move {
                     let maybe_tx = port_tx.lock().unwrap().take();
@@ -213,6 +248,7 @@ mod tests {
         let broadcast_clone = Broadcast {
             sender: broadcast.sender.clone(),
         };
+        let dashboard_state = create_test_dashboard_state().await;
 
         let config = Config {
             port: 0,
@@ -227,6 +263,7 @@ mod tests {
             .configure(config)
             .mount("/api", routes())
             .manage(broadcast_clone)
+            .manage(dashboard_state)
             .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
                 Box::pin(async move {
                     let maybe_tx = port_tx.lock().unwrap().take();
