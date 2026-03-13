@@ -138,6 +138,8 @@ struct MockState {
     wallet_transfers: Vec<MockWalletTransfer>,
     /// Alpaca deposit wallet address for incoming USDC.
     alpaca_deposit_address: String,
+    /// Wallet balances by asset symbol (e.g. USDC in the crypto wallet).
+    wallet_balances: HashMap<String, Decimal>,
     /// Whitelisted withdrawal addresses.
     whitelisted_addresses: Vec<WhitelistEntry>,
 }
@@ -272,6 +274,7 @@ impl AlpacaBrokerMock {
             calendar_entries,
             wallet_transfers: Vec::new(),
             alpaca_deposit_address: String::new(),
+            wallet_balances: HashMap::new(),
             whitelisted_addresses: Vec::new(),
         }));
 
@@ -336,6 +339,13 @@ impl AlpacaBrokerMock {
         }];
     }
 
+    /// Sets the USDC balance reported by the Alpaca crypto wallet endpoints.
+    pub fn set_wallet_usdc_balance(&self, balance: Decimal) {
+        lock(&self.state)
+            .wallet_balances
+            .insert("USDC".to_string(), balance);
+    }
+
     /// Returns a snapshot of all orders placed through this mock.
     pub fn orders(&self) -> Vec<MockOrderSnapshot> {
         let state = lock(&self.state);
@@ -375,7 +385,6 @@ impl AlpacaBrokerMock {
 
         register_whitelist_get_endpoint(&self.server, &self.state);
         register_whitelist_post_endpoint(&self.server, &self.state);
-        register_wallet_address_endpoint(&self.server, &self.state);
         register_wallet_transfers_post_endpoint(&self.server, &self.state);
         register_wallet_transfers_get_endpoint(&self.server, &self.state);
     }
@@ -564,6 +573,7 @@ fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_account_endpoint(server, state);
     register_calendar_endpoint(server, state);
     register_positions_endpoint(server, state);
+    register_wallet_get_endpoint(server, state);
     register_asset_endpoint(server);
     register_order_placement_endpoint(server, state);
     register_order_status_endpoint(server, state);
@@ -1036,23 +1046,76 @@ fn register_whitelist_post_endpoint(server: &MockServer, state: &Arc<Mutex<MockS
     });
 }
 
-fn register_wallet_address_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+fn register_wallet_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     let state = Arc::clone(state);
 
     server.mock(|when, then| {
         when.method(GET)
             .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets"));
-        then.respond_with(move |_request: &HttpMockRequest| {
-            let deposit_addr = lock(&state).alpaca_deposit_address.clone();
+        then.respond_with(move |request: &HttpMockRequest| {
+            let query: HashMap<_, _> =
+                url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+                    .into_owned()
+                    .collect();
 
-            json_response(
-                200,
-                &json!({
-                    "asset_id": "00000000-0000-0000-0000-000000000000",
-                    "address": deposit_addr,
-                    "created_at": "2025-01-01T00:00:00Z"
-                }),
-            )
+            if let Some(asset) = query.get("asset") {
+                let Some(network) = query.get("network") else {
+                    return json_response(400, &json!({ "message": "missing network query" }));
+                };
+
+                if network != "ethereum" {
+                    return json_response(
+                        400,
+                        &json!({ "message": format!("unsupported network: {network}") }),
+                    );
+                }
+
+                if asset != "USDC" {
+                    return json_response(
+                        400,
+                        &json!({ "message": format!("unsupported asset: {asset}") }),
+                    );
+                }
+
+                let (deposit_addr, balance) = {
+                    let state = lock(&state);
+                    (
+                        state.alpaca_deposit_address.clone(),
+                        state
+                            .wallet_balances
+                            .get(asset)
+                            .copied()
+                            .unwrap_or(Decimal::ZERO),
+                    )
+                };
+
+                return json_response(
+                    200,
+                    &json!({
+                        "asset_id": "00000000-0000-0000-0000-000000000000",
+                        "asset": asset,
+                        "address": deposit_addr,
+                        "balance": balance.to_string(),
+                        "created_at": "2025-01-01T00:00:00Z"
+                    }),
+                );
+            }
+
+            let wallets: Vec<Value> = {
+                let state = lock(&state);
+                state
+                    .wallet_balances
+                    .iter()
+                    .map(|(asset, balance)| {
+                        json!({
+                            "asset": asset,
+                            "balance": balance.to_string()
+                        })
+                    })
+                    .collect()
+            };
+
+            json_response(200, &Value::Array(wallets))
         });
     });
 }
