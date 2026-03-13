@@ -13,9 +13,16 @@ use alloy::providers::{Identity, Provider, ProviderBuilder, WalletProvider};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use serde::Deserialize;
 use tracing::info;
 
-use crate::{Evm, EvmError, Wallet};
+use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
+
+/// Secrets needed to construct a [`RawPrivateKeyWallet`].
+#[derive(Deserialize)]
+pub struct PrivateKeySecrets {
+    pub private_key: B256,
+}
 
 /// Provider type produced by wrapping a base provider with default fillers
 /// and a [`WalletFiller`].
@@ -131,6 +138,23 @@ where
         info!(tx_hash = %receipt.transaction_hash, note, "Transaction confirmed");
 
         Ok(receipt)
+    }
+}
+
+#[async_trait]
+impl<P> TryIntoWallet for RawPrivateKeyWallet<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    type Settings = ();
+    type Credentials = PrivateKeySecrets;
+
+    async fn try_from_ctx(ctx: WalletCtx<(), PrivateKeySecrets, P>) -> Result<Self, EvmError> {
+        Self::new(
+            &ctx.credentials.private_key,
+            ctx.provider,
+            ctx.required_confirmations,
+        )
     }
 }
 
