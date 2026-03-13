@@ -64,7 +64,6 @@
 
           st0xRust = pkgs.callPackage ./rust.nix {
             inherit craneLib;
-            inherit (pkgs) sqlx-cli;
             sol-build-inputs = rainix.sol-build-inputs.${system};
           };
         in rainixPkgs // deployPkgs // {
@@ -91,6 +90,27 @@
             '';
           };
 
+          quickCheck = rainix.mkTask.${system} {
+            name = "chequick";
+            body = ''
+              set -euxo pipefail
+
+              rm -v ./dashboard/src/lib/api/* || true
+
+              cargo check
+              cargo check --workspace --all-features
+              cargo nextest run --workspace --all-features --profile dev
+              cargo clippy --workspace --all-targets --all-features
+              cargo fmt
+
+              cd ./dashboard/
+              bun install
+              bun run check
+              bun run test:run
+              bun run lint:fix
+            '';
+          };
+
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
@@ -101,6 +121,19 @@
               (cd lib/rain.orderbook/lib/rain.interpreter/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
+            '';
+          };
+
+          e2e = rainix.mkTask.${system} {
+            name = "e2e";
+            body = ''
+              set -euxo pipefail
+              (cd dashboard && bun run dev) &
+              dev_pid=$!
+              trap 'kill $dev_pid 2>/dev/null' EXIT
+              sleep 2
+              open http://localhost:5173
+              cargo nextest run --test e2e full_system --nocapture
             '';
           };
 
@@ -206,25 +239,29 @@
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           inherit (rainix.devShells.${system}.default) shellHook;
-          DATABASE_URL = "sqlite:liquidity.db";
-          buildInputs = with pkgs;
-            [
-              bacon
-              bun
-              sqlx-cli
-              cargo-expand
-              cargo-nextest
-              terraform
-              ragenix.packages.${system}.default
-              packages.ci
-              packages.prepSolArtifacts
-              packages.secret
-              packages.rekey
-              packages.remote
-              packages.deployNixos
-              packages.deployService
-              packages.deployAll
-            ] ++ rainix.devShells.${system}.default.buildInputs;
+
+          SQLX_OFFLINE = true;
+          DATABASE_URL = "sqlite:dev.db";
+          FOUNDRY_DISABLE_NIGHTLY_WARNING = true;
+
+          buildInputs = (with pkgs; [
+            bacon
+            bun
+            sqlx-cli
+            cargo-expand
+            cargo-nextest
+            ragenix.packages.${system}.default
+          ]) ++ (with packages; [
+            ci
+            quickCheck
+            prepSolArtifacts
+            secret
+            rekey
+            remote
+            deployNixos
+            deployService
+            deployAll
+          ]) ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
 

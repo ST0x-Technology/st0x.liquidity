@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Once;
 
 use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
@@ -19,6 +20,30 @@ use st0x_hedge::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, Operat
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
 
 use crate::base_chain::{BaseChain, DeployableERC20};
+
+static TRACING_INIT: Once = Once::new();
+
+/// Initializes a compact tracing subscriber filtered to st0x crates only.
+/// Safe to call multiple times — only the first call takes effect.
+pub fn init_tracing() {
+    TRACING_INIT.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            "warn,st0x_hedge=debug,st0x_execution=debug,st0x_dto=debug,\
+             st0x_event_sorcery=debug,st0x_evm=debug,st0x_finance=debug,\
+             st0x_bridge=debug,e2e=debug,rocket=off,hyper=off,\
+             tungstenite=off,tokio_tungstenite=off,reqwest=off"
+                .into()
+        });
+
+        tracing_subscriber::fmt()
+            .compact()
+            .with_env_filter(filter)
+            .with_target(true)
+            .without_time()
+            .try_init()
+            .ok();
+    });
+}
 
 pub struct TestInfra<P> {
     /// Kept alive so the temp directory isn't deleted while the test runs.
