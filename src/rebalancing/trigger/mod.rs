@@ -663,6 +663,7 @@ impl RebalancingTrigger {
 
                 EthereumCash { .. }
                 | BaseWalletCash { .. }
+                | AlpacaWalletCash { .. }
                 | BaseWalletUnwrappedEquity { .. }
                 | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
             }?;
@@ -756,6 +757,7 @@ impl RebalancingTrigger {
 
                 EthereumCash { .. }
                 | BaseWalletCash { .. }
+                | AlpacaWalletCash { .. }
                 | BaseWalletUnwrappedEquity { .. }
                 | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
             }?;
@@ -791,6 +793,7 @@ impl RebalancingTrigger {
             }
             EthereumCash { .. }
             | BaseWalletCash { .. }
+            | AlpacaWalletCash { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. } => {}
         }

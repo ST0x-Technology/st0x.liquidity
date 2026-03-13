@@ -15,7 +15,7 @@ use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Ex
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
 use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
-use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
+use crate::alpaca_wallet::AlpacaWalletService;
 use crate::config::EquityAssetConfig;
 use crate::equity_redemption::EquityRedemption;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
@@ -28,8 +28,6 @@ use crate::wrapper::WrapperService;
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpawnRebalancerError {
-    #[error("failed to create Alpaca wallet service: {0}")]
-    AlpacaWallet(#[from] AlpacaWalletError),
     #[error("failed to create Alpaca broker API: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
@@ -65,6 +63,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// must happen before this constructor is called.
     pub(crate) async fn new(
         ctx: RebalancingCtx,
+        wallet: Arc<AlpacaWalletService>,
         equities: HashMap<Symbol, EquityAssetConfig>,
         ethereum_wallet: Chain,
         base_wallet: Chain,
@@ -72,13 +71,6 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
         let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(ctx.alpaca_broker_auth.clone()).await?);
-
-        let wallet = Arc::new(AlpacaWalletService::new(
-            ctx.alpaca_broker_auth.base_url().to_string(),
-            ctx.alpaca_broker_auth.account_id,
-            ctx.alpaca_broker_auth.api_key.clone(),
-            ctx.alpaca_broker_auth.api_secret.clone(),
-        ));
 
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
@@ -178,7 +170,7 @@ mod tests {
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
+    use crate::alpaca_wallet::AlpacaWalletService;
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
@@ -220,20 +212,6 @@ mod tests {
                 time_in_force: TimeInForce::default(),
             })
             .call()
-    }
-
-    #[test]
-    fn spawn_rebalancer_error_display_alpaca_wallet() {
-        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::TransferNotFound {
-            transfer_id: AlpacaTransferId::from(Uuid::nil()),
-        });
-
-        let display = format!("{err}");
-
-        assert!(
-            display.contains("failed to create Alpaca wallet service"),
-            "Expected error message to contain 'failed to create Alpaca wallet service', got: {display}"
-        );
     }
 
     #[test]
