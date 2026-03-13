@@ -26,9 +26,18 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TradeEvent {
+pub enum RaindexTradeEvent {
     ClearV3(Box<ClearV3>),
     TakeOrderV3(Box<TakeOrderV3>),
+}
+
+impl RaindexTradeEvent {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::ClearV3(_) => "ClearV3",
+            Self::TakeOrderV3(_) => "TakeOrderV3",
+        }
+    }
 }
 
 /// Information about a vault extracted from an order's IO specification.
@@ -227,7 +236,7 @@ impl OnchainTrade {
         {
             Ok(pricing) => Some(pricing),
             Err(error) => {
-                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {error}");
+                warn!(%tx_hash, %error, "Pyth price extraction failed");
                 None
             }
         };

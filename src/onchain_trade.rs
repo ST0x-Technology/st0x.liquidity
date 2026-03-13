@@ -34,10 +34,8 @@ impl std::fmt::Display for OnChainTradeId {
 pub(crate) enum ParseOnChainTradeIdError {
     #[error("expected 'tx_hash:log_index', got '{id_provided}'")]
     MissingDelimiter { id_provided: String },
-
     #[error("invalid tx_hash: {0}")]
     TxHash(#[from] FromHexError),
-
     #[error("invalid log_index: {0}")]
     LogIndex(#[from] ParseIntError),
 }

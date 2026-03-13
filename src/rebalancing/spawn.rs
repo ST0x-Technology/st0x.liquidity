@@ -93,7 +93,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
                 #[cfg(feature = "test-support")]
                 message_transmitter: ctx.message_transmitter,
             })
-            .map_err(Box::new)?,
+            .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?,
         );
 
         let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
@@ -115,8 +115,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// processors.
     pub(crate) fn spawn(
         self,
-        usdc_vault_id: RaindexVaultId,
         market_maker_wallet: Address,
+        usdc_vault_id: RaindexVaultId,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
     ) -> JoinHandle<()> {
@@ -268,9 +268,9 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
-        assert_eq!(usdc_threshold.target, dec!(0.6));
-        assert_eq!(usdc_threshold.deviation, dec!(0.15));
+        let usdc = trigger_config.usdc.unwrap();
+        assert_eq!(usdc.target, dec!(0.6));
+        assert_eq!(usdc.deviation, dec!(0.15));
     }
 
     async fn make_services_with_mock_wallet(
@@ -434,8 +434,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
         let handle = services.spawn(
-            RaindexVaultId(B256::ZERO),
             Address::random(),
+            RaindexVaultId(B256::ZERO),
             rx,
             frameworks,
         );

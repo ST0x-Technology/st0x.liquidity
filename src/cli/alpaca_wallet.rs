@@ -10,7 +10,6 @@ use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApi, ConversionDirection, Executor, FractionalShares, Positive,
     Symbol,
 };
-use st0x_finance::Usdc;
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
@@ -19,6 +18,7 @@ use crate::alpaca_wallet::{
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
 use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
+use st0x_finance::Usdc;
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
@@ -525,8 +525,6 @@ mod tests {
 
     use st0x_evm::NoOpErrorRegistry;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
-
-    use st0x_finance::Usdc;
 
     use super::*;
     use crate::cli::ConvertDirection;

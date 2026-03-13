@@ -96,11 +96,7 @@ async fn check_market_open<E: Executor>(
 /// Loads all active positions from the view, then checks each
 /// against its configured threshold. Skips disabled assets.
 /// Returns execution parameters for positions that are ready.
-#[tracing::instrument(
-    skip(executor, position_projection, is_trading_enabled),
-    fields(executor_type = %executor_type),
-    level = tracing::Level::DEBUG
-)]
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_all_positions<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,

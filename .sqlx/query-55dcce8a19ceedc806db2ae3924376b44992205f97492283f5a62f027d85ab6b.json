@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT event_type FROM events WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence",
+  "describe": {
+    "columns": [
+      {
+        "name": "event_type",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "55dcce8a19ceedc806db2ae3924376b44992205f97492283f5a62f027d85ab6b"
+}

@@ -9,7 +9,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{error, info, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
@@ -33,13 +33,13 @@ mod offchain_order;
 mod onchain;
 mod onchain_trade;
 mod position;
-mod queue;
 mod rebalancing;
 mod shares;
 mod symbol;
 mod telemetry;
 mod threshold;
 mod tokenization;
+mod trading;
 #[cfg(feature = "mock")]
 pub use tokenization::mock_api;
 mod tokenized_equity_mint;
@@ -69,31 +69,31 @@ mod integration_tests;
 #[cfg(test)]
 pub mod test_utils;
 
+#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
-    async {
-        if let config::TradingMode::Rebalancing(ref rebalancing) = ctx.trading_mode {
-            rebalancing.validate_rpc_connectivity().await?;
-        }
+    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+    launch_with_event_channel(ctx, event_sender).await
+}
 
-        let pool = ctx.get_sqlite_pool().await?;
-        sqlx::migrate!().run(&pool).await?;
+#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
+pub async fn launch_with_event_channel(
+    ctx: Ctx,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()> {
+    let pool = ctx.get_sqlite_pool().await?;
+    sqlx::migrate!().run(&pool).await?;
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
-        let inventory = Arc::new(inventory::BroadcastingInventory::new(
-            inventory::InventoryView::default(),
-        ));
+    let inventory = Arc::new(inventory::BroadcastingInventory::new(
+        inventory::InventoryView::default(),
+    ));
 
-        let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
-        let bot_task = spawn_bot_task(ctx, pool, event_sender, inventory);
+    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
+    let bot_task = spawn_bot_task(ctx, pool, event_sender, inventory);
 
-        await_shutdown(server_task, bot_task).await;
+    await_shutdown(server_task, bot_task).await?;
 
-        info!("Shutdown complete");
-
-        Ok(())
-    }
-    .instrument(info_span!("launch"))
-    .await
+    info!("Shutdown complete");
+    Ok(())
 }
 
 fn spawn_server_task(
@@ -127,32 +127,29 @@ fn spawn_bot_task(
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
     inventory: Arc<inventory::BroadcastingInventory>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(error) = run(ctx, pool, event_sender, inventory).await {
-            error!("Bot failed: {error}");
-        }
-    })
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move { run(ctx, pool, event_sender, inventory).await })
 }
 
 async fn await_shutdown(
     server_task: JoinHandle<Result<Rocket<Ignite>, rocket::Error>>,
-    bot_task: JoinHandle<()>,
-) {
+    bot_task: JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let server_abort = server_task.abort_handle();
     let bot_abort = bot_task.abort_handle();
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             handle_ctrl_c(&server_abort, &bot_abort);
+            Ok(())
         }
         result = server_task => {
-            log_server_result(result);
             abort_task("bot", &bot_abort);
+            check_server_result(result)
         }
         result = bot_task => {
-            log_bot_result(result);
             abort_task("server", &server_abort);
+            check_bot_result(result)
         }
     }
 }
@@ -168,18 +165,39 @@ fn abort_task(name: &str, handle: &AbortHandle) {
     handle.abort();
 }
 
-fn log_server_result(result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>) {
+fn check_server_result(
+    result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>,
+) -> anyhow::Result<()> {
     match result {
-        Ok(Ok(_)) => info!("Server completed successfully"),
-        Ok(Err(error)) => error!("Server failed: {error}"),
-        Err(error) => error!("Server task panicked: {error}"),
+        Ok(Ok(_)) => {
+            info!("Server completed successfully");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            error!("Server failed: {error}");
+            Err(anyhow::anyhow!("Server failed: {error}"))
+        }
+        Err(error) => {
+            error!("Server task panicked: {error}");
+            Err(anyhow::anyhow!("Server task panicked: {error}"))
+        }
     }
 }
 
-fn log_bot_result(result: Result<(), JoinError>) {
+fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
     match result {
-        Ok(()) => info!("Bot task completed"),
-        Err(error) => error!("Bot task panicked: {error}"),
+        Ok(Ok(())) => {
+            info!("Bot task completed");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            error!("Bot failed: {error}");
+            Err(error)
+        }
+        Err(error) => {
+            error!("Bot task panicked: {error}");
+            Err(anyhow::anyhow!("Bot task panicked: {error}"))
+        }
     }
 }
 
