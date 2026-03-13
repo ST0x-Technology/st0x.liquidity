@@ -12,6 +12,7 @@
 mod assert;
 mod base_chain;
 mod cctp;
+mod full_system;
 mod hedging;
 mod poll;
 mod rebalancing;

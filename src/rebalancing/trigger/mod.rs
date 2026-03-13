@@ -6,7 +6,7 @@ mod usdc;
 pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
 use alloy::primitives::Address;
-use alloy::providers::{Provider, RootProvider};
+use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
 use alloy::transports::layers::RetryBackoffLayer;
 use async_trait::async_trait;
@@ -60,22 +60,6 @@ pub(crate) enum TokenAddressError {
     Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
 }
 
-/// Chain identifier for RPC connectivity errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Chain {
-    Base,
-    Ethereum,
-}
-
-impl std::fmt::Display for Chain {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Base => write!(formatter, "Base"),
-            Self::Ethereum => write!(formatter, "Ethereum"),
-        }
-    }
-}
-
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
 pub enum RebalancingCtxError {
@@ -85,11 +69,6 @@ pub enum RebalancingCtxError {
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
     Evm(#[from] st0x_evm::EvmError),
-    #[error("RPC connectivity check failed for {chain} wallet: {source}")]
-    RpcConnectivity {
-        chain: Chain,
-        source: alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
-    },
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -292,30 +271,6 @@ impl RebalancingCtx {
     /// Turnkey wallets validate connectivity during construction, but
     /// the private-key path builds wallets locally without any RPC
     /// calls. This method ensures misconfigured or unreachable
-    /// endpoints fail fast at startup rather than on the first live
-    /// call.
-    pub(crate) async fn validate_rpc_connectivity(&self) -> Result<(), RebalancingCtxError> {
-        self.base_wallet
-            .provider()
-            .get_chain_id()
-            .await
-            .map_err(|source| RebalancingCtxError::RpcConnectivity {
-                chain: Chain::Base,
-                source,
-            })?;
-
-        self.ethereum_wallet
-            .provider()
-            .get_chain_id()
-            .await
-            .map_err(|source| RebalancingCtxError::RpcConnectivity {
-                chain: Chain::Ethereum,
-                source,
-            })?;
-
-        Ok(())
-    }
-
     pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.base_wallet
     }

@@ -209,7 +209,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             %offchain_order_id,
             ?price,
             %symbol,
-            "Order filled, executing CQRS commands"
+            "Order filled"
         );
 
         self.complete_offchain_order_fill(offchain_order_id, price)

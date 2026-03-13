@@ -22,3 +22,22 @@ retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }
 # Dev profile: fast feedback, skip e2e and slow tests
 [profile.dev]
 default-filter = "not binary(=e2e) & not test(slow)"
+
+# Full system mega test needs a longer timeout (hedging + rebalancing + CCTP)
+[[profile.default.overrides]]
+filter = "test(full_system)"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# CI profile: thorough, run everything including e2e
+[profile.ci]
+fail-fast = false
+
+[[profile.ci.overrides]]
+filter = "binary(=e2e)"
+test-group = "e2e"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = "kind(test)"
+slow-timeout = { period = "120s" }
+retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }
