@@ -156,9 +156,13 @@ mod tests {
         "../../lib/forge-std/out/IERC20.sol/IERC20.json"
     );
 
-    async fn setup_anvil_with_token()
-    -> (RawPrivateKeyWallet<impl Provider + Clone>, Address, Address) {
-        let anvil = Box::leak(Box::new(Anvil::new().spawn()));
+    async fn setup_anvil_with_token() -> (
+        alloy::node_bindings::AnvilInstance,
+        RawPrivateKeyWallet<impl Provider + Clone>,
+        Address,
+        Address,
+    ) {
+        let anvil = Anvil::new().spawn();
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
 
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
@@ -179,12 +183,12 @@ mod tests {
             .await
             .unwrap();
 
-        (wallet, token_address, signer_address)
+        (anvil, wallet, token_address, signer_address)
     }
 
     #[tokio::test]
     async fn submit_returns_receipt() {
-        let (wallet, token_address, _signer) = setup_anvil_with_token().await;
+        let (_anvil, wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
         let amount = U256::from(1000);
@@ -207,7 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_state_change_persists() {
-        let (wallet, token_address, _signer) = setup_anvil_with_token().await;
+        let (_anvil, wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
         let amount = U256::from(1000);
@@ -245,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_detects_revert() {
-        let (wallet, token_address, _signer) = setup_anvil_with_token().await;
+        let (_anvil, wallet, token_address, _signer) = setup_anvil_with_token().await;
 
         let recipient = Address::random();
         let excessive_amount = U256::from(999_999_999) * U256::from(10).pow(U256::from(18));
