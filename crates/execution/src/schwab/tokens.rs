@@ -256,8 +256,6 @@ mod tests {
     use chrono::Utc;
     use httpmock::prelude::*;
     use serde_json::json;
-    use std::thread;
-    use tokio::time::{Duration as TokioDuration, sleep};
 
     fn create_test_ctx_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
         SchwabAuthCtx {
@@ -727,6 +725,11 @@ mod tests {
         assert_eq!(stored_tokens.refresh_token, "new_refresh_token");
     }
 
+    /// Tests that `handle_token_refresh` refreshes a near-expiration
+    /// token via the mock server. This directly tests the refresh logic
+    /// invoked by the automatic loop on each tick, without spawning the
+    /// loop itself (which uses a 29-minute interval that cannot be
+    /// deterministically controlled in tests).
     #[tokio::test]
     async fn test_automatic_token_refresh_before_expiration() -> Result<(), SchwabError> {
         let server = MockServer::start();
@@ -763,23 +766,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let pool_clone = pool.clone();
-        let ctx_clone = ctx.clone();
-
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                tokio::time::timeout(
-                    TokioDuration::from_secs(5),
-                    start_automatic_token_refresh_loop(pool_clone, ctx_clone),
-                )
-                .await
-            })
-        });
-
-        sleep(TokioDuration::from_millis(2000)).await;
-
-        handle.join().unwrap().unwrap_err();
+        handle_token_refresh(&pool, &ctx).await?;
 
         mock.assert();
 
