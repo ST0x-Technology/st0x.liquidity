@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::{Evm, EvmError, Wallet};
+use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
 /// config).
@@ -58,29 +58,28 @@ pub enum TurnkeyError {
     Signer(#[from] TurnkeySignerError),
 }
 
-/// Construction context for `TurnkeyWallet`.
+/// Non-secret Turnkey configuration: organization ID.
 ///
-/// Contains everything needed to build a wallet: Turnkey API
-/// credentials, the wallet address, and a base provider. Callers
-/// construct this directly via its public fields and pass it to
-/// [`TurnkeyWallet::new`].
-pub struct TurnkeyCtx<P> {
-    pub api_private_key: TurnkeyApiPrivateKey,
-    pub organization_id: TurnkeyOrganizationId,
+/// Address lives in [`WalletCtx::settings`] as the outer layer,
+/// while this groups the Turnkey-specific non-secret fields.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnkeySettings {
     pub address: Address,
-    pub provider: P,
-    pub required_confirmations: u64,
+    pub organization_id: TurnkeyOrganizationId,
 }
 
-impl<P> std::fmt::Debug for TurnkeyCtx<P> {
+/// Secret Turnkey credential: the P-256 API private key.
+#[derive(Clone, Deserialize)]
+pub struct TurnkeyCredentials {
+    pub api_private_key: TurnkeyApiPrivateKey,
+}
+
+impl std::fmt::Debug for TurnkeyCredentials {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("TurnkeyCtx")
-            .field("api_private_key", &self.api_private_key)
-            .field("organization_id", &self.organization_id)
-            .field("address", &self.address)
-            .field("required_confirmations", &self.required_confirmations)
-            .finish_non_exhaustive()
+            .debug_struct("TurnkeyCredentials")
+            .field("api_private_key", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -134,19 +133,25 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
     /// wraps it in an `EthereumWallet`, and builds the signing
     /// provider with standard fillers. The base provider is cloned
     /// and stored separately for read-only access.
-    pub async fn new(ctx: TurnkeyCtx<P>) -> Result<Self, EvmError> {
+    pub async fn new(
+        ctx: WalletCtx<TurnkeySettings, TurnkeyCredentials, P>,
+    ) -> Result<Self, EvmError> {
+        let TurnkeySettings {
+            address,
+            organization_id,
+        } = ctx.settings;
+        let TurnkeyCredentials { api_private_key } = ctx.credentials;
+
         let chain_id = ctx.provider.get_chain_id().await?;
 
-        let TurnkeyApiPrivateKey(api_key_hex) = &ctx.api_private_key;
-        let TurnkeyOrganizationId(organization_id) = ctx.organization_id;
+        let TurnkeyApiPrivateKey(api_key_hex) = &api_private_key;
+        let TurnkeyOrganizationId(org_id) = organization_id;
 
-        let signer =
-            TurnkeySigner::from_api_key(api_key_hex, organization_id, ctx.address, Some(chain_id))?;
+        let signer = TurnkeySigner::from_api_key(api_key_hex, org_id, address, Some(chain_id))?;
 
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = ctx.provider.clone();
-
         let signing_provider = ProviderBuilder::new()
             .wallet(eth_wallet)
             .connect_provider(ctx.provider);
@@ -154,7 +159,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
         Ok(Self {
             provider: base_provider,
             signing_provider,
-            address: ctx.address,
+            address,
             required_confirmations: ctx.required_confirmations,
         })
     }
@@ -237,6 +242,21 @@ where
         info!(tx_hash = %receipt.transaction_hash, note, "Transaction confirmed");
 
         Ok(receipt)
+    }
+}
+
+#[async_trait]
+impl<P> TryIntoWallet for TurnkeyWallet<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    type Settings = TurnkeySettings;
+    type Credentials = TurnkeyCredentials;
+
+    async fn try_from_ctx(
+        ctx: WalletCtx<TurnkeySettings, TurnkeyCredentials, P>,
+    ) -> Result<Self, EvmError> {
+        Self::new(ctx).await
     }
 }
 
@@ -376,10 +396,14 @@ mod tests {
             .await
             .expect("anvil_setBalance should succeed");
 
-        let wallet = TurnkeyWallet::new(TurnkeyCtx {
-            api_private_key: TurnkeyApiPrivateKey::new(api_key),
-            organization_id: TurnkeyOrganizationId::new(org_id),
-            address,
+        let wallet = TurnkeyWallet::new(WalletCtx {
+            settings: TurnkeySettings {
+                address,
+                organization_id: TurnkeyOrganizationId::new(org_id),
+            },
+            credentials: TurnkeyCredentials {
+                api_private_key: TurnkeyApiPrivateKey::new(api_key),
+            },
             provider,
             required_confirmations: 1,
         })

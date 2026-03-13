@@ -14,7 +14,6 @@ use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -32,7 +31,7 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
+use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -117,13 +116,21 @@ pub(crate) async fn run_market_hours_loop<E>(
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
     event_sender: broadcast::Sender<ServerMessage>,
+    inventory: Arc<BroadcastingInventory>,
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    let mut conductor =
-        Conductor::start(ctx, pool, executor, executor_maintenance, event_sender).await?;
+    let mut conductor = Conductor::start(
+        ctx,
+        pool,
+        executor,
+        executor_maintenance,
+        event_sender,
+        inventory,
+    )
+    .await?;
 
     info!("Conductor running");
     let result = conductor.wait_for_completion().await;
@@ -145,6 +152,7 @@ impl Conductor {
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
+        inventory: Arc<BroadcastingInventory>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Self>> + Send>>
     where
         E: Executor + Clone + Send + 'static,
@@ -170,8 +178,6 @@ impl Conductor {
                 .build(())
                 .await?;
 
-            let inventory = Arc::new(RwLock::new(InventoryView::default()));
-
             let (vault_registry, vault_registry_projection) =
                 StoreBuilder::<VaultRegistry>::new(pool.clone())
                     .build(())
@@ -185,7 +191,7 @@ impl Conductor {
                 Err(error) => return Err(error.into()),
             };
 
-            let (position, position_projection, snapshot, rebalancer, ethereum_wallet, base_wallet) =
+            let (position, position_projection, snapshot, rebalancer, wallets) =
                 if let Some(rebalancing_ctx) = rebalancing {
                     let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
                     let base_wallet = rebalancing_ctx.base_wallet().clone();
@@ -209,15 +215,14 @@ impl Conductor {
                         infra.position_projection,
                         infra.snapshot,
                         Some(infra.rebalancer),
-                        Some(ethereum_wallet),
-                        Some(base_wallet),
+                        Some((ethereum_wallet, base_wallet)),
                     )
                 } else {
                     let (position, position_projection) = build_position_cqrs(&pool).await?;
                     let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                         .build(())
                         .await?;
-                    (position, position_projection, snapshot, None, None, None)
+                    (position, position_projection, snapshot, None, None)
                 };
 
             let order_placer: Arc<dyn OrderPlacer> =
@@ -251,16 +256,14 @@ impl Conductor {
             .with_executor_maintenance(executor_maintenance)
             .with_dex_event_streams(clear_stream, take_stream);
 
-            if let Some(wallet) = ethereum_wallet {
-                builder = builder.with_ethereum_wallet(wallet);
-            }
-
             if let Some(rebalancer_handle) = rebalancer {
                 builder = builder.with_rebalancer(rebalancer_handle);
             }
 
-            if let Some(wallet) = base_wallet {
-                builder = builder.with_base_wallet(wallet);
+            if let Some((ethereum_wallet, base_wallet)) = wallets {
+                builder = builder
+                    .with_ethereum_wallet(ethereum_wallet)
+                    .with_base_wallet(base_wallet);
             }
 
             Ok(builder.spawn())
@@ -327,7 +330,7 @@ struct RebalancingInfrastructure {
 struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
-    inventory: Arc<RwLock<InventoryView>>,
+    inventory: Arc<BroadcastingInventory>,
     event_sender: broadcast::Sender<ServerMessage>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
@@ -349,6 +352,12 @@ async fn seed_vault_registry_from_config(
 
     for (symbol, equity_config) in &ctx.assets.equities.symbols {
         let Some(vault_id) = equity_config.vault_id else {
+            if ctx.is_rebalancing_enabled(symbol) {
+                return Err(CtxError::MissingEquityVaultId {
+                    symbol: symbol.clone(),
+                }
+                .into());
+            }
             continue;
         };
 
@@ -489,8 +498,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .ok_or(CtxError::MissingCashVaultId)?;
 
         let handle = services.spawn(
-            market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
+            market_maker_wallet,
             operation_receiver,
             frameworks,
         );
@@ -1578,7 +1587,8 @@ mod tests {
         Direction, ExecutorOrderId, MarketOrder, MockExecutor, MockExecutorCtx, Positive, Symbol,
         TryIntoExecutor,
     };
-    use st0x_finance::{Usd, Usdc};
+    use st0x_finance::Usd;
+    use st0x_finance::Usdc;
 
     use super::*;
     use crate::bindings::IOrderBookV6::{
@@ -1588,7 +1598,7 @@ mod tests {
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::view::Operator;
-    use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
+    use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
@@ -3418,7 +3428,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(imbalanced_inventory(&symbol)));
+        let inventory = Arc::new(BroadcastingInventory::new(imbalanced_inventory(&symbol)));
         let (operation_sender, mut operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3512,7 +3522,7 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory));
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3620,7 +3630,7 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory));
         let (operation_sender, mut receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3746,7 +3756,7 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory));
         let (operation_sender, receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));

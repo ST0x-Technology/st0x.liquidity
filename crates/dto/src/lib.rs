@@ -255,6 +255,47 @@ pub enum UsdcBridgeStatus {
     Failed { failed_at: DateTime<Utc> },
 }
 
+impl TransferOperation {
+    /// Whether this transfer is in a terminal state (completed or failed).
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::EquityMint(op) => {
+                use EquityMintStatus::*;
+
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Minting | Wrapping | Depositing => false,
+                }
+            }
+            Self::EquityRedemption(op) => {
+                use EquityRedemptionStatus::*;
+
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Withdrawing | Unwrapping | Sending | PendingConfirmation => false,
+                }
+            }
+            Self::UsdcBridge(op) => {
+                use UsdcBridgeStatus::*;
+
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Converting | Withdrawing | Bridging | Depositing => false,
+                }
+            }
+        }
+    }
+
+    /// The last time this transfer was updated.
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::EquityMint(op) => op.updated_at,
+            Self::EquityRedemption(op) => op.updated_at,
+            Self::UsdcBridge(op) => op.updated_at,
+        }
+    }
+}
+
 /// Absolute and percentage profit/loss.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 pub struct PnL {
@@ -526,6 +567,110 @@ mod tests {
         assert!(json.contains(r#""kind":"usdc_bridge""#));
         assert!(json.contains(r#""status":"completed""#));
         assert!(json.contains(r#""direction":"alpaca_to_base""#));
+    }
+
+    fn mint_operation(status: EquityMintStatus, updated_at: DateTime<Utc>) -> TransferOperation {
+        TransferOperation::EquityMint(EquityMintOperation {
+            id: Id::new("mint-001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(Decimal::new(10, 0)),
+            status,
+            started_at: Utc::now(),
+            updated_at,
+        })
+    }
+
+    fn redemption_operation(
+        status: EquityRedemptionStatus,
+        updated_at: DateTime<Utc>,
+    ) -> TransferOperation {
+        TransferOperation::EquityRedemption(EquityRedemptionOperation {
+            id: Id::new("redeem-001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(Decimal::new(10, 0)),
+            status,
+            started_at: Utc::now(),
+            updated_at,
+        })
+    }
+
+    fn bridge_operation(status: UsdcBridgeStatus, updated_at: DateTime<Utc>) -> TransferOperation {
+        TransferOperation::UsdcBridge(UsdcBridgeOperation {
+            id: Id::new("bridge-001"),
+            direction: UsdcBridgeDirection::AlpacaToBase,
+            amount: Usdc::new(Decimal::new(1000, 0)),
+            status,
+            started_at: Utc::now(),
+            updated_at,
+        })
+    }
+
+    #[test]
+    fn is_terminal_equity_mint() {
+        let now = Utc::now();
+
+        assert!(
+            mint_operation(EquityMintStatus::Completed { completed_at: now }, now).is_terminal()
+        );
+        assert!(mint_operation(EquityMintStatus::Failed { failed_at: now }, now).is_terminal());
+
+        assert!(!mint_operation(EquityMintStatus::Minting, now).is_terminal());
+        assert!(!mint_operation(EquityMintStatus::Wrapping, now).is_terminal());
+        assert!(!mint_operation(EquityMintStatus::Depositing, now).is_terminal());
+    }
+
+    #[test]
+    fn is_terminal_equity_redemption() {
+        let now = Utc::now();
+
+        assert!(
+            redemption_operation(EquityRedemptionStatus::Completed { completed_at: now }, now)
+                .is_terminal()
+        );
+        assert!(
+            redemption_operation(EquityRedemptionStatus::Failed { failed_at: now }, now)
+                .is_terminal()
+        );
+
+        assert!(!redemption_operation(EquityRedemptionStatus::Withdrawing, now).is_terminal());
+        assert!(!redemption_operation(EquityRedemptionStatus::Unwrapping, now).is_terminal());
+        assert!(!redemption_operation(EquityRedemptionStatus::Sending, now).is_terminal());
+        assert!(
+            !redemption_operation(EquityRedemptionStatus::PendingConfirmation, now).is_terminal()
+        );
+    }
+
+    #[test]
+    fn is_terminal_usdc_bridge() {
+        let now = Utc::now();
+
+        assert!(
+            bridge_operation(UsdcBridgeStatus::Completed { completed_at: now }, now).is_terminal()
+        );
+        assert!(bridge_operation(UsdcBridgeStatus::Failed { failed_at: now }, now).is_terminal());
+
+        assert!(!bridge_operation(UsdcBridgeStatus::Converting, now).is_terminal());
+        assert!(!bridge_operation(UsdcBridgeStatus::Withdrawing, now).is_terminal());
+        assert!(!bridge_operation(UsdcBridgeStatus::Bridging, now).is_terminal());
+        assert!(!bridge_operation(UsdcBridgeStatus::Depositing, now).is_terminal());
+    }
+
+    #[test]
+    fn updated_at_returns_inner_value() {
+        let timestamp = Utc::now();
+
+        assert_eq!(
+            mint_operation(EquityMintStatus::Minting, timestamp).updated_at(),
+            timestamp
+        );
+        assert_eq!(
+            redemption_operation(EquityRedemptionStatus::Withdrawing, timestamp).updated_at(),
+            timestamp
+        );
+        assert_eq!(
+            bridge_operation(UsdcBridgeStatus::Converting, timestamp).updated_at(),
+            timestamp
+        );
     }
 
     #[test]
