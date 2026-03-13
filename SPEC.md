@@ -688,7 +688,7 @@ The source of truth for all table schemas is the `migrations/` directory.
 `equity_redemption_view`, `schwab_auth_view`. Some views use SQLite generated
 columns to expose JSON fields as queryable columns for Grafana dashboards.
 
-**Legacy tables** (still used directly): `event_queue`, `schwab_auth`.
+**Legacy tables** (still used directly): `schwab_auth`.
 
 ### Architecture Decision: Position as Aggregate
 

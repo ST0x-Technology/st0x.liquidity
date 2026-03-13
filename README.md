@@ -79,39 +79,6 @@ cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets
 cargo run --bin reporter -- --config path/to/config.toml
 ```
 
-### Brokerage Setup
-
-**Charles Schwab** (3-5 day approval):
-
-1. Create account at [schwab.com](https://www.schwab.com/)
-2. Register at [Schwab Developer Portal](https://developer.schwab.com/)
-3. Request "Trader API" access under API Products -> Individual Developers
-4. After approval, run `cargo run --bin cli -- auth` for one-time OAuth setup
-
-**Alpaca Broker API** (managed accounts, supports auto-rebalancing):
-
-For managed/omnibus accounts. Requires Broker API access from Alpaca. This is
-the only integration that supports automatic portfolio rebalancing (USDC/equity
-threshold-based).
-
-**Alpaca Trading API** (instant, paper trading available):
-
-For individual accounts. Create an account at
-[alpaca.markets](https://alpaca.markets/) and generate API keys from the
-dashboard.
-
-Add credentials to your TOML config file under the `[broker]` section (see
-`example.config.toml` and `example.secrets.toml`).
-
-### Token Encryption (Schwab only)
-
-Schwab OAuth tokens are encrypted at rest using AES-256-GCM. Generate a key and
-add it to your config:
-
-```bash
-openssl rand -hex 32
-```
-
 ## Deployment
 
 The system runs on a NixOS host on DigitalOcean, managed by deploy-rs. All

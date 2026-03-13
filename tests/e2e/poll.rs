@@ -7,14 +7,67 @@
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use st0x_dto::ServerMessage;
 use st0x_hedge::config::Ctx;
-use st0x_hedge::launch;
+use st0x_hedge::{launch, launch_with_event_channel};
 
 /// Spawns the full bot as a background task.
 pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(launch(ctx))
+}
+
+/// Spawns the full bot with an externally-provided event channel,
+/// allowing tests to inspect `receiver_count()` for dashboard auto-detect.
+pub fn spawn_bot_with_event_channel(
+    ctx: Ctx,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(launch_with_event_channel(ctx, event_sender))
+}
+
+/// After assertions complete, keeps the server alive while dashboard
+/// clients are connected. Waits up to `grace` for a client to connect,
+/// then stays alive until all clients disconnect.
+pub async fn await_dashboard_disconnect(
+    sender: &broadcast::Sender<ServerMessage>,
+    grace: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + grace;
+
+    while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if sender.receiver_count() > 0 {
+        eprintln!("Dashboard connected -- keeping server alive until disconnect");
+        while sender.receiver_count() > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Polls the bot's health endpoint until it responds, panicking if the
+/// bot crashes or the timeout (30s) expires before it becomes ready.
+pub async fn poll_for_ready(bot: &mut JoinHandle<anyhow::Result<()>>, port: u16) {
+    let url = format!("http://localhost:{port}/api/health");
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    loop {
+        sleep_or_crash(bot, "health endpoint").await;
+
+        if client.get(&url).send().await.is_ok() {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for bot health endpoint at {url}",
+        );
+    }
 }
 
 /// Sleeps for `seconds`, then panics if the bot task has already finished
@@ -174,6 +227,59 @@ pub async fn poll_for_aggregate_events_containing(
     }
 }
 
+/// Polls until at least `expected_total` jobs exist and all have status 'Done'.
+///
+/// Jobs that retry with exponential backoff (e.g., due to CQRS aggregate
+/// conflicts) may still be in-flight after higher-level conditions are met.
+/// Use this instead of an immediate `count_done_jobs` assertion.
+pub async fn poll_for_all_jobs_done(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    expected_total: i64,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("{expected_total} jobs all done");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let total = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(&pool)
+            .await;
+
+        let done = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs WHERE status = 'Done'")
+            .fetch_one(&pool)
+            .await;
+
+        pool.close().await;
+
+        match (total, done) {
+            (Ok((total,)), Ok((done,))) if total >= expected_total && done >= expected_total => {
+                return;
+            }
+            (Ok((total,)), Ok((done,))) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} \
+                 (total={total}, done={done})",
+            ),
+            _ => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (query failed)",
+            ),
+        }
+    }
+}
+
 /// Opens a SQLite connection to the test database.
 pub async fn connect_db(db_path: &std::path::Path) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::new().filename(db_path);
@@ -184,6 +290,24 @@ pub async fn connect_db(db_path: &std::path::Path) -> anyhow::Result<SqlitePool>
 pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Result<i64> {
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE aggregate_type = ?")
         .bind(aggregate_type)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(row.0)
+}
+
+/// Counts total apalis jobs enqueued.
+pub async fn count_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs")
+        .fetch_one(pool)
+        .await?;
+
+    Ok(row.0)
+}
+
+/// Counts apalis jobs that have been processed (status = 'Done').
+pub async fn count_done_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE status = 'Done'")
         .fetch_one(pool)
         .await?;
 

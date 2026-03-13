@@ -10,8 +10,7 @@ import { reactive } from '$lib/frp.svelte'
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error'
 type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 
-const RECONNECT_DELAY_MS = 1000
-const MAX_RECONNECT_DELAY_MS = 30000
+const RECONNECT_DELAY_MS = 5000
 const MAX_EVENTS = 100
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -84,8 +83,7 @@ const isServerMessage = (value: unknown): value is ServerMessage => {
 
 const matchMessage = matcher<ServerMessage>()('type')
 
-const getReconnectDelay = (attempts: number): number =>
-  Math.min(RECONNECT_DELAY_MS * Math.pow(2, attempts), MAX_RECONNECT_DELAY_MS)
+const getReconnectDelay = (): number => RECONNECT_DELAY_MS
 
 export type ErrorContext = {
   attempts: number
@@ -150,6 +148,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     socket = new WebSocket(url)
 
     socket.onopen = () => {
+      console.log(`[ws] connected to ${url}`)
       fsm.send('open')
     }
 
@@ -162,13 +161,17 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
           return
         }
 
+        const { type, data } = parsed
+        console.log(`[ws] received "${type}"`, data)
+
         handleMessage(parsed)
       } catch (e) {
         console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data)
       }
     }
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
+      console.log(`[ws] closed (code=${String(event.code)}, reason="${event.reason}")`)
       socket = null
       fsm.send('close')
     }
@@ -198,7 +201,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
 
   const scheduleReconnect = () => {
     cancelReconnect()
-    const delay = getReconnectDelay(reconnectAttempts.current)
+    const delay = getReconnectDelay()
     error.update(() => ({ attempts: reconnectAttempts.current + 1, nextRetryMs: delay }))
     reconnectAttempts.update(attempts => attempts + 1)
     reconnectTimeoutId = setTimeout(() => fsm.send('connect'), delay)

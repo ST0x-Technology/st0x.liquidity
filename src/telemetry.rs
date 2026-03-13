@@ -59,6 +59,7 @@
 //! This prevents external crate spam (e.g., from `alloy`, `rocket`) from cluttering
 //! traces while still allowing those logs in console if needed.
 
+use itertools::Itertools;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::ExporterBuildError;
@@ -241,14 +242,29 @@ impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
 /// maintained for semantic clarity.
 const TRACER_NAME: &str = "st0x-tracer";
 
+// TODO: parse from the manifest or something
+const CRATES: [&str; 6] = [
+    "dto",
+    "event-sorcery",
+    "execution",
+    "finance",
+    "bridge",
+    "evm",
+];
+
 pub fn setup_tracing(log_level: &crate::config::LogLevel) {
     let level: tracing::Level = log_level.into();
-    let default_filter = format!("st0x_hedge={level},st0x_execution={level}");
+
+    let fallback_filter = CRATES
+        .iter()
+        .map(|pkg| format!("st0x_{pkg}={level}"))
+        .join(",");
 
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
+                .unwrap_or_else(|_| fallback_filter.into()),
         )
+        .compact()
         .init();
 }

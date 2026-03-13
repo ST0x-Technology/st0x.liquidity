@@ -4,7 +4,9 @@
 //! the task handles; [`run_market_hours_loop`] drives the lifecycle.
 
 mod builder;
+pub(crate) mod job;
 mod manifest;
+mod order_fill_monitor;
 
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -41,15 +43,11 @@ use crate::offchain_order::{
 use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
-use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
+use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
+use crate::onchain::{OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::queue::{
-    EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
-};
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
@@ -60,11 +58,23 @@ use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
+use crate::trading::onchain::inclusion::ChainIncluded;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::WrapperService;
 
 use self::manifest::QueryManifest;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
+
+/// Sets up apalis SQLite storage tables, tolerating pre-existing
+/// application migrations in the shared `_sqlx_migrations` table.
+pub(crate) async fn setup_apalis_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    apalis_sqlite::SqliteStorage::migrations()
+        .set_ignore_missing(true)
+        .run(pool)
+        .await?;
+
+    Ok(())
+}
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
 pub(crate) struct TradeProcessingCqrs {
@@ -114,12 +124,6 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
 /// Event processing errors for live event handling.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EventProcessingError {
-    #[error("Event queue error: {0}")]
-    Queue(#[from] EventQueueError),
-    #[error("Failed to enqueue ClearV3 event: {0}")]
-    EnqueueClearV3(#[source] EventQueueError),
-    #[error("Failed to enqueue TakeOrderV3 event: {0}")]
-    EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Vault registry command failed: {0}")]
@@ -676,75 +680,6 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     })
 }
 
-fn spawn_onchain_event_receiver(
-    event_sender: UnboundedSender<(TradeEvent, Log)>,
-    clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send + 'static,
-    take_stream: impl Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
-    + Unpin
-    + Send
-    + 'static,
-) -> JoinHandle<()> {
-    info!("Starting blockchain event receiver");
-    tokio::spawn(receive_blockchain_events(
-        clear_stream,
-        take_stream,
-        event_sender,
-    ))
-}
-
-fn spawn_event_processor(
-    pool: SqlitePool,
-    mut event_receiver: tokio::sync::mpsc::UnboundedReceiver<(TradeEvent, Log)>,
-) -> JoinHandle<()> {
-    info!("Starting event processor");
-    tokio::spawn(async move {
-        while let Some((event, log)) = event_receiver.recv().await {
-            trace!(
-                "Processing live event: tx_hash={:?}, log_index={:?}",
-                log.transaction_hash, log.log_index
-            );
-            if let Err(error) = process_live_event(&pool, event, log).await {
-                error!("Failed to process live event: {error}");
-            }
-        }
-        info!("Event processing loop ended");
-    })
-}
-
-fn spawn_queue_processor<P, E>(
-    executor: E,
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    cache: &SymbolCache,
-    provider: P,
-    cqrs: TradeProcessingCqrs,
-    vault_registry: Arc<Store<VaultRegistry>>,
-) -> JoinHandle<()>
-where
-    P: Provider + Clone + Send + 'static,
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    info!("Starting queue processor service");
-    let ctx_clone = ctx.clone();
-    let pool_clone = pool.clone();
-    let cache_clone = cache.clone();
-    let evm = ReadOnlyEvm::new(provider);
-
-    tokio::spawn(async move {
-        run_queue_processor(
-            &executor,
-            &ctx_clone,
-            &pool_clone,
-            &cache_clone,
-            &evm,
-            &cqrs,
-            &vault_registry,
-        )
-        .await;
-    })
-}
-
 #[bon::builder]
 fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
@@ -809,276 +744,6 @@ where
     })
 }
 
-async fn receive_blockchain_events<S1, S2>(
-    mut clear_stream: S1,
-    mut take_stream: S2,
-    event_sender: UnboundedSender<(TradeEvent, Log)>,
-) where
-    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
-    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
-{
-    loop {
-        let event_result = tokio::select! {
-            Some(result) = clear_stream.next() => {
-                result.map(|(event, log)| (TradeEvent::ClearV3(Box::new(event)), log))
-            }
-            Some(result) = take_stream.next() => {
-                result.map(|(event, log)| (TradeEvent::TakeOrderV3(Box::new(event)), log))
-            }
-            else => {
-                error!("All event streams ended, shutting down event receiver");
-                break;
-            }
-        };
-
-        if !dispatch_blockchain_event(event_result, &event_sender) {
-            break;
-        }
-    }
-}
-
-/// Returns `false` if the event loop should stop.
-fn dispatch_blockchain_event(
-    event_result: Result<(TradeEvent, Log), sol_types::Error>,
-    event_sender: &UnboundedSender<(TradeEvent, Log)>,
-) -> bool {
-    match event_result {
-        Ok((event, log)) => {
-            trace!(
-                "Received blockchain event: tx_hash={:?}, \
-                 log_index={:?}, block_number={:?}",
-                log.transaction_hash, log.log_index, log.block_number
-            );
-            if event_sender.send((event, log)).is_err() {
-                error!("Event receiver dropped, shutting down");
-                return false;
-            }
-            true
-        }
-        Err(error) => {
-            error!("Error in event stream: {error}");
-            true
-        }
-    }
-}
-
-pub(crate) async fn get_cutoff_block<S1, S2, P>(
-    clear_stream: &mut S1,
-    take_stream: &mut S2,
-    provider: &P,
-    pool: &SqlitePool,
-) -> anyhow::Result<u64>
-where
-    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
-    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
-    P: Provider + Clone,
-{
-    info!("Starting WebSocket subscriptions and waiting for first event...");
-
-    let first_event_result = wait_for_first_event_with_timeout(
-        clear_stream,
-        take_stream,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
-
-    let Some((mut event_buffer, block_number)) = first_event_result else {
-        let current_block = provider.get_block_number().await?;
-        info!(
-            "No subscription events within timeout, \
-             using current block {current_block} as cutoff"
-        );
-        return Ok(current_block);
-    };
-
-    buffer_live_events(clear_stream, take_stream, &mut event_buffer, block_number).await;
-
-    crate::queue::enqueue_buffer(pool, event_buffer).await;
-
-    Ok(block_number)
-}
-
-async fn process_live_event(
-    pool: &SqlitePool,
-    event: TradeEvent,
-    log: Log,
-) -> Result<(), EventProcessingError> {
-    match &event {
-        TradeEvent::ClearV3(clear_event) => {
-            info!(
-                "Enqueuing ClearV3 event: tx_hash={:?}, log_index={:?}",
-                log.transaction_hash, log.log_index
-            );
-
-            enqueue(pool, clear_event.as_ref(), &log)
-                .await
-                .map_err(EventProcessingError::EnqueueClearV3)?;
-        }
-        TradeEvent::TakeOrderV3(take_event) => {
-            info!(
-                "Enqueuing TakeOrderV3 event: tx_hash={:?}, log_index={:?}",
-                log.transaction_hash, log.log_index
-            );
-
-            enqueue(pool, take_event.as_ref(), &log)
-                .await
-                .map_err(EventProcessingError::EnqueueTakeOrderV3)?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_queue_processor<E>(
-    executor: &E,
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    cache: &SymbolCache,
-    evm: &impl Evm,
-    cqrs: &TradeProcessingCqrs,
-    vault_registry: &Store<VaultRegistry>,
-) where
-    E: Executor + Clone,
-    EventProcessingError: From<E::Error>,
-{
-    info!("Starting queue processor service");
-
-    let feed_id_cache = FeedIdCache::default();
-
-    log_unprocessed_count(pool).await;
-
-    let queue_context = QueueProcessingCtx {
-        cache,
-        feed_id_cache: &feed_id_cache,
-        vault_registry,
-        executor,
-        order_owner: ctx.order_owner(),
-    };
-
-    loop {
-        let delay = process_queue_step(ctx, pool, evm, cqrs, &queue_context).await;
-        sleep(delay).await;
-    }
-}
-
-async fn log_unprocessed_count(pool: &SqlitePool) {
-    match crate::queue::count_unprocessed(pool).await {
-        Ok(count) if count > 0 => {
-            info!("Found {count} unprocessed events from previous sessions to process");
-        }
-        Ok(_) => info!("No unprocessed events found, starting fresh"),
-        Err(error) => error!("Failed to count unprocessed events: {error}"),
-    }
-}
-
-async fn process_queue_step<E: Executor>(
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    evm: &impl Evm,
-    cqrs: &TradeProcessingCqrs,
-    queue_context: &QueueProcessingCtx<'_, E>,
-) -> Duration {
-    match process_next_queued_event(ctx, pool, evm, cqrs, queue_context).await {
-        Ok(Some(offchain_order_id)) => {
-            info!(%offchain_order_id, "Offchain order placed successfully");
-            std::time::Duration::ZERO
-        }
-        Ok(None) => std::time::Duration::from_millis(100),
-        Err(error) => {
-            error!("Error processing queued event: {error}");
-            std::time::Duration::from_millis(500)
-        }
-    }
-}
-
-/// Context for queue event processing containing caches and CQRS components.
-struct QueueProcessingCtx<'a, E> {
-    cache: &'a SymbolCache,
-    feed_id_cache: &'a FeedIdCache,
-    vault_registry: &'a Store<VaultRegistry>,
-    executor: &'a E,
-    order_owner: Address,
-}
-
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn process_next_queued_event<E: Executor>(
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    evm: &impl Evm,
-    cqrs: &TradeProcessingCqrs,
-    queue_context: &QueueProcessingCtx<'_, E>,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    let queued_event = get_next_unprocessed_event(pool).await?;
-    let Some(queued_event) = queued_event else {
-        return Ok(None);
-    };
-
-    let event_id = queued_event.id.ok_or(EventProcessingError::Queue(
-        EventQueueError::MissingQueuedEventId,
-    ))?;
-
-    let onchain_trade = convert_event_to_trade(
-        ctx,
-        queue_context.cache,
-        evm,
-        &queued_event,
-        queue_context.feed_id_cache,
-        queue_context.order_owner,
-    )
-    .await?;
-
-    let Some(trade) = onchain_trade else {
-        info!(
-            "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
-            match &queued_event.event {
-                TradeEvent::ClearV3(_) => "ClearV3",
-                TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-            },
-            queued_event.tx_hash,
-            queued_event.log_index
-        );
-        mark_event_processed(pool, event_id).await?;
-        return Ok(None);
-    };
-
-    let vault_discovery_ctx = VaultDiscoveryCtx {
-        vault_registry: queue_context.vault_registry,
-        orderbook: ctx.evm.orderbook,
-        order_owner: queue_context.order_owner,
-    };
-
-    info!(
-        "Event successfully converted to trade: event_type={:?}, \
-         tx_hash={:?}, log_index={}, symbol={}, amount={}",
-        match &queued_event.event {
-            TradeEvent::ClearV3(_) => "ClearV3",
-            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-        },
-        trade.tx_hash,
-        trade.log_index,
-        trade.symbol,
-        trade.amount
-    );
-
-    discover_vaults_for_trade(&queued_event, &trade, &vault_discovery_ctx).await?;
-
-    let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
-    let _guard = symbol_lock.lock().await;
-
-    let trading_enabled = ctx.is_trading_enabled(trade.symbol.base());
-
-    process_queued_trade(
-        queue_context.executor,
-        pool,
-        &queued_event,
-        event_id,
-        trade,
-        cqrs,
-        trading_enabled,
-    )
-    .await
-}
-
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
@@ -1089,17 +754,17 @@ async fn process_next_queued_event<E: Executor>(
 /// - USDC vault: token == USDC_BASE
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
 pub(crate) async fn discover_vaults_for_trade(
-    queued_event: &QueuedEvent,
+    trade_event: &ChainIncluded<RaindexTradeEvent>,
     trade: &OnchainTrade,
     context: &VaultDiscoveryCtx<'_>,
 ) -> Result<(), EventProcessingError> {
-    let tx_hash = queued_event.tx_hash;
+    let tx_hash = trade_event.tx_hash;
     let base_symbol = trade.symbol.base();
     let expected_equity_token = trade.equity_token;
 
-    let owned_vaults = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => extract_vaults_from_clear(clear_event),
-        TradeEvent::TakeOrderV3(take_event) => extract_owned_vaults(
+    let owned_vaults = match &trade_event.event {
+        RaindexTradeEvent::ClearV3(clear_event) => extract_vaults_from_clear(clear_event),
+        RaindexTradeEvent::TakeOrderV3(take_event) => extract_owned_vaults(
             &take_event.config.order,
             take_event.config.inputIOIndex,
             take_event.config.outputIOIndex,
@@ -1148,46 +813,6 @@ pub(crate) async fn discover_vaults_for_trade(
     }
 
     Ok(())
-}
-
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn convert_event_to_trade(
-    ctx: &Ctx,
-    cache: &SymbolCache,
-    evm: &impl Evm,
-    queued_event: &QueuedEvent,
-    feed_id_cache: &FeedIdCache,
-    order_owner: Address,
-) -> Result<Option<OnchainTrade>, EventProcessingError> {
-    let reconstructed_log = reconstruct_log_from_queued_event(&ctx.evm, queued_event);
-
-    let onchain_trade = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => {
-            OnchainTrade::try_from_clear_v3(
-                &ctx.evm,
-                cache,
-                evm,
-                *clear_event.clone(),
-                reconstructed_log,
-                feed_id_cache,
-                order_owner,
-            )
-            .await?
-        }
-        TradeEvent::TakeOrderV3(take_event) => {
-            OnchainTrade::try_from_take_order_if_target_owner(
-                cache,
-                evm,
-                *take_event.clone(),
-                reconstructed_log,
-                order_owner,
-                feed_id_cache,
-            )
-            .await?
-        }
-    };
-
-    Ok(onchain_trade)
 }
 
 async fn execute_witness_trade(
@@ -1317,9 +942,7 @@ async fn execute_acknowledge_fill(
 
 pub(crate) async fn process_queued_trade<E: Executor>(
     executor: &E,
-    pool: &SqlitePool,
-    queued_event: &QueuedEvent,
-    event_id: i64,
+    trade_event: &ChainIncluded<RaindexTradeEvent>,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
@@ -1327,14 +950,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
-    mark_event_processed(pool, event_id).await?;
-
-    info!(
-        "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",
-        event_id, queued_event.tx_hash, queued_event.log_index
-    );
-
-    execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
+    execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
     execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
 
     let base_symbol = trade.symbol.base();
@@ -1471,34 +1087,6 @@ async fn execute_create_offchain_order(
     }
 }
 
-fn reconstruct_log_from_queued_event(
-    ctx: &EvmCtx,
-    queued_event: &crate::queue::QueuedEvent,
-) -> Log {
-    let log_data = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
-        TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
-    };
-
-    let block_timestamp = queued_event
-        .block_timestamp
-        .and_then(|dt| u64::try_from(dt.timestamp()).ok());
-
-    Log {
-        inner: alloy::primitives::Log {
-            address: ctx.orderbook,
-            data: log_data,
-        },
-        block_hash: None,
-        block_number: Some(queued_event.block_number),
-        block_timestamp,
-        transaction_hash: Some(queued_event.tx_hash),
-        transaction_index: None,
-        log_index: Some(queued_event.log_index),
-        removed: false,
-    }
-}
-
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
@@ -1603,78 +1191,6 @@ where
     }
 
     Ok(())
-}
-
-/// Maps database symbols to current executor-recognized tickers.
-async fn wait_for_first_event_with_timeout<S1, S2>(
-    clear_stream: &mut S1,
-    take_stream: &mut S2,
-    timeout: std::time::Duration,
-) -> Option<(Vec<(TradeEvent, Log)>, u64)>
-where
-    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
-    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
-{
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-
-    let mut events = Vec::new();
-
-    loop {
-        let event_result = tokio::select! {
-            Some(result) = clear_stream.next() => {
-                result.map(|(event, log)| (TradeEvent::ClearV3(Box::new(event)), log))
-            }
-            Some(result) = take_stream.next() => {
-                result.map(|(event, log)| (TradeEvent::TakeOrderV3(Box::new(event)), log))
-            }
-            () = &mut deadline => return None,
-        };
-
-        match event_result {
-            Ok((event, log)) => {
-                let Some(block_number) = log.block_number else {
-                    error!("Event missing block number during startup");
-                    continue;
-                };
-                events.push((event, log));
-                return Some((std::mem::take(&mut events), block_number));
-            }
-            Err(error) => {
-                error!("Error in event stream during startup: {error}");
-            }
-        }
-    }
-}
-
-async fn buffer_live_events<S1, S2>(
-    clear_stream: &mut S1,
-    take_stream: &mut S2,
-    event_buffer: &mut Vec<(TradeEvent, Log)>,
-    cutoff_block: u64,
-) where
-    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
-    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
-{
-    loop {
-        tokio::select! {
-            Some(result) = clear_stream.next() => match result {
-                Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
-                    event_buffer.push((TradeEvent::ClearV3(Box::new(event)), log));
-                }
-                Err(error) => error!("Error in clear event stream during backfill: {error}"),
-                _ => {}
-            },
-            Some(result) = take_stream.next() => match result {
-                Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
-                    event_buffer.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
-                }
-                Err(error) => error!("Error in take event stream during backfill: {error}"),
-                _ => {}
-            },
-            else => break,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2588,7 +2104,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
+        assert!(matches!(queued_event.event, RaindexTradeEvent::ClearV3(_)));
 
         let reconstructed_log = reconstruct_log_from_queued_event(&ctx.evm, &queued_event);
         assert_eq!(reconstructed_log.inner.address, ctx.evm.orderbook);
@@ -2675,7 +2191,7 @@ mod tests {
         .unwrap();
         assert_eq!(block_number, 1000);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].0, TradeEvent::ClearV3(_)));
+        assert!(matches!(events[0].0, RaindexTradeEvent::ClearV3(_)));
     }
 
     #[tokio::test]
@@ -2767,9 +2283,13 @@ mod tests {
         };
 
         let log = get_test_log();
-        process_live_event(&pool, TradeEvent::ClearV3(Box::new(clear_event)), log)
-            .await
-            .unwrap();
+        process_live_event(
+            &pool,
+            RaindexTradeEvent::ClearV3(Box::new(clear_event)),
+            log,
+        )
+        .await
+        .unwrap();
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
@@ -2838,7 +2358,7 @@ mod tests {
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
-            event: TradeEvent::ClearV3(Box::new(clear_event)),
+            event: RaindexTradeEvent::ClearV3(Box::new(clear_event)),
             processed: false,
             created_at: None,
             processed_at: None,
@@ -2864,7 +2384,7 @@ mod tests {
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
-            event: TradeEvent::TakeOrderV3(Box::new(take_event)),
+            event: RaindexTradeEvent::TakeOrderV3(Box::new(take_event)),
             processed: false,
             created_at: None,
             processed_at: None,
