@@ -8,7 +8,7 @@
 //! Every hedging test calls `assert_full_hedging_flow` which checks broker state,
 //! onchain vault balances, and all CQRS events/views comprehensively.
 
-mod assertions;
+pub(crate) mod assertions;
 
 use rain_math_float::Float;
 use st0x_execution::alpaca_broker_api::OrderStatus;
@@ -308,13 +308,10 @@ async fn backfilling() -> anyhow::Result<()> {
 
     // Verify all historical events were picked up via backfill
     let pool = connect_db(&infra.db_path).await?;
-    let queued = count_queued_events(&pool).await?;
-    assert_eq!(
-        queued, trade_count,
-        "Expected exact queued event count from backfill",
-    );
-    let processed = count_processed_queue_events(&pool).await?;
-    assert_eq!(processed, queued, "All queued events should be processed");
+    let jobs = count_jobs(&pool).await?;
+    assert_eq!(jobs, trade_count, "Expected exact job count from backfill",);
+    let done_jobs = count_done_jobs(&pool).await?;
+    assert_eq!(done_jobs, jobs, "All jobs should be done");
     pool.close().await;
 
     let expected_position = ExpectedPosition::builder()
@@ -557,8 +554,8 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     .await?;
 
     let ref_pool = connect_db(&ref_infra.db_path).await?;
-    let ref_queued_events = count_queued_events(&ref_pool).await?;
-    let ref_processed_queue_events = count_processed_queue_events(&ref_pool).await?;
+    let ref_jobs = count_jobs(&ref_pool).await?;
+    let ref_done_jobs = count_done_jobs(&ref_pool).await?;
     let ref_onchain_events = count_events(&ref_pool, "OnChainTrade").await?;
     let ref_offchain_events = count_events(&ref_pool, "OffchainOrder").await?;
     ref_pool.close().await;
@@ -656,19 +653,19 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     .await?;
 
     let crash_pool = connect_db(&crash_infra.db_path).await?;
-    let crash_queued_events = count_queued_events(&crash_pool).await?;
-    let crash_processed_queue_events = count_processed_queue_events(&crash_pool).await?;
+    let crash_jobs = count_jobs(&crash_pool).await?;
+    let crash_done_jobs = count_done_jobs(&crash_pool).await?;
     let crash_onchain_events = count_events(&crash_pool, "OnChainTrade").await?;
     let crash_offchain_events = count_events(&crash_pool, "OffchainOrder").await?;
     crash_pool.close().await;
 
     assert_eq!(
-        crash_queued_events, ref_queued_events,
-        "Crash recovery should enqueue the exact same number of onchain events as reference",
+        crash_jobs, ref_jobs,
+        "Crash recovery should have the exact same number of jobs as reference",
     );
     assert_eq!(
-        crash_processed_queue_events, ref_processed_queue_events,
-        "Crash recovery should process the exact same number of queued events as reference",
+        crash_done_jobs, ref_done_jobs,
+        "Crash recovery should have the exact same number of done jobs as reference",
     );
     assert_eq!(
         crash_onchain_events, ref_onchain_events,
@@ -777,12 +774,9 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     .await?;
 
     let pool = connect_db(&infra.db_path).await?;
-    let queued = count_queued_events(&pool).await?;
-    let processed = count_processed_queue_events(&pool).await?;
-    assert_eq!(
-        queued, processed,
-        "All queued events should be processed exactly once"
-    );
+    let jobs = count_jobs(&pool).await?;
+    let done_jobs = count_done_jobs(&pool).await?;
+    assert_eq!(jobs, done_jobs, "All jobs should be done exactly once");
     pool.close().await;
 
     bot.abort();
@@ -1349,7 +1343,7 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
 ///
 /// The position checker may legitimately emit new events on restart
 /// (e.g., re-checking accumulated positions), so we only assert
-/// strict equality on queue-level and onchain-aggregate-level counts,
+/// strict equality on job-level and onchain-aggregate-level counts,
 /// and verify the position projection converges to the same state.
 #[test_log::test(tokio::test)]
 async fn duplicate_event_delivery() -> anyhow::Result<()> {
@@ -1387,8 +1381,6 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
 
     // Snapshot counts before restart
     let pool = connect_db(&infra.db_path).await?;
-    let pre_queued = count_queued_events(&pool).await?;
-    let pre_processed = count_processed_queue_events(&pool).await?;
     let pre_onchain_events = count_events(&pool, "OnChainTrade").await?;
 
     let pre_position = Projection::<Position>::sqlite(pool.clone())
@@ -1415,22 +1407,10 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
 
     let pool = connect_db(&infra.db_path).await?;
 
-    // Queue-level dedup: no new rows from re-backfilling the same events
-    let post_queued = count_queued_events(&pool).await?;
-    let post_processed = count_processed_queue_events(&pool).await?;
-    assert_eq!(
-        pre_queued, post_queued,
-        "Queue count should be unchanged after re-backfill: \
-         pre={pre_queued}, post={post_queued}"
-    );
-    assert_eq!(
-        pre_processed, post_processed,
-        "Processed count should be unchanged after re-backfill: \
-         pre={pre_processed}, post={post_processed}"
-    );
-
     // OnChainTrade aggregate events: CQRS prevents duplicate events on
-    // the same aggregate (same tx_hash:log_index ID)
+    // the same aggregate (same tx_hash:log_index ID). Apalis may
+    // re-enqueue the job from backfill, but the CQRS layer rejects the
+    // duplicate command, so no new events are created.
     let post_onchain_events = count_events(&pool, "OnChainTrade").await?;
     assert_eq!(
         pre_onchain_events, post_onchain_events,

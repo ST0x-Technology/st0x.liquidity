@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT event_type FROM events WHERE aggregate_type = 'Position' AND aggregate_id = 'TSLA' ORDER BY sequence",
+  "describe": {
+    "columns": [
+      {
+        "name": "event_type",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a882f3630aa7103276c4c9bdc864c8ccccf4cde247362cd6e10565b63389c09d"
+}
