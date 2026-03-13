@@ -1871,18 +1871,21 @@ mod tests {
         );
 
         // Order starts as pending then gets rejected
-        let _place_mock = create_conversion_order_pending_mock(&server, "1000");
+        let amount_received = usdc("99.99");
+        let _place_mock = create_conversion_order_pending_mock(&server, "99.99");
 
         let _get_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
             "rejected",
-            "1000",
+            "99.99",
         );
 
         assert!(
             matches!(
-                manager.execute_usdc_to_usd_conversion(&id, amount).await,
+                manager
+                    .execute_usdc_to_usd_conversion(&id, amount_received)
+                    .await,
                 Err(UsdcTransferError::AlpacaBrokerApi(
                     AlpacaBrokerApiError::CryptoOrderFailed {
                         reason: CryptoOrderFailureReason::Rejected,
@@ -2065,11 +2068,11 @@ mod tests {
                 .json_body(json!({
                     "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
                     "symbol": "USDCUSD",
-                    "qty": "1000",
+                    "qty": "99.99",
                     "status": "filled",
                     "side": "sell",
                     "filled_avg_price": "0.9999",
-                    "filled_qty": "1000",
+                    "filled_qty": "99.99",
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
         });
@@ -2078,16 +2081,17 @@ mod tests {
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
             "filled",
-            "1000",
+            "99.99",
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("1000");
+        let amount_received = usdc("99.99");
 
         advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, amount).await;
 
         manager
-            .execute_usdc_to_usd_conversion(&id, amount)
+            .execute_usdc_to_usd_conversion(&id, amount_received)
             .await
             .unwrap();
 

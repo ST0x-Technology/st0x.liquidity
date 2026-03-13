@@ -120,7 +120,8 @@ const createInitialState = (): InitialState => ({
   activeTransfers: [],
   recentTransfers: [],
   authStatus: { status: 'not_configured' },
-  circuitBreaker: { status: 'active' }
+  circuitBreaker: { status: 'active' },
+  warnings: []
 })
 
 describe('createWebSocket', () => {
@@ -567,7 +568,7 @@ describe('createWebSocket', () => {
     consoleSpy.mockRestore()
   })
 
-  it('handles inventory_update by replacing inventory cache', () => {
+  it('handles snapshot by replacing inventory cache', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
@@ -592,13 +593,13 @@ describe('createWebSocket', () => {
       fetchedAt: '2024-01-01T00:00:00Z'
     }
 
-    const message: ServerMessage = { type: 'inventory_update', data: snapshot }
+    const message: ServerMessage = { type: 'snapshot', data: snapshot }
     MockWebSocket.getInstance(0).simulateMessage(message)
 
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['inventory'], inventory)
   })
 
-  it('handles transfer_update by adding new active transfer', () => {
+  it('handles transfer by adding new active transfer', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
@@ -615,7 +616,7 @@ describe('createWebSocket', () => {
       updatedAt: '2024-01-01T00:00:00Z'
     }
 
-    const message: ServerMessage = { type: 'transfer_update', data: transfer }
+    const message: ServerMessage = { type: 'transfer', data: transfer }
     MockWebSocket.getInstance(0).simulateMessage(message)
 
     const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
@@ -634,7 +635,7 @@ describe('createWebSocket', () => {
     expect(result).toEqual([transfer])
   })
 
-  it('handles transfer_update by replacing existing active transfer with same id', () => {
+  it('handles transfer by replacing existing active transfer with same id', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
@@ -661,7 +662,7 @@ describe('createWebSocket', () => {
       updatedAt: '2024-01-01T00:00:30Z'
     }
 
-    const message: ServerMessage = { type: 'transfer_update', data: updatedTransfer }
+    const message: ServerMessage = { type: 'transfer', data: updatedTransfer }
     MockWebSocket.getInstance(0).simulateMessage(message)
 
     const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
@@ -681,7 +682,7 @@ describe('createWebSocket', () => {
     expect(result[0]).toEqual(updatedTransfer)
   })
 
-  it('handles transfer_update by moving completed transfer to recent', () => {
+  it('handles transfer by moving completed transfer to recent', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
@@ -708,7 +709,7 @@ describe('createWebSocket', () => {
       updatedAt: '2024-01-01T00:01:00Z'
     }
 
-    const message: ServerMessage = { type: 'transfer_update', data: completedTransfer }
+    const message: ServerMessage = { type: 'transfer', data: completedTransfer }
     MockWebSocket.getInstance(0).simulateMessage(message)
 
     const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
@@ -741,7 +742,7 @@ describe('createWebSocket', () => {
     expect(recentResult).toEqual([completedTransfer])
   })
 
-  it('validates inventory_update message structure', () => {
+  it('validates snapshot message structure', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -750,18 +751,18 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(0).simulateOpen()
 
     MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({ type: 'inventory_update', data: { invalid: true } })
+      JSON.stringify({ type: 'snapshot', data: { invalid: true } })
     )
 
     expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
     expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'inventory_update',
+      type: 'snapshot',
       data: { invalid: true }
     })
     consoleSpy.mockRestore()
   })
 
-  it('validates transfer_update message structure', () => {
+  it('validates transfer message structure', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -770,18 +771,18 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(0).simulateOpen()
 
     MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({ type: 'transfer_update', data: { noKind: true } })
+      JSON.stringify({ type: 'transfer', data: { noKind: true } })
     )
 
     expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
     expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'transfer_update',
+      type: 'transfer',
       data: { noKind: true }
     })
     consoleSpy.mockRestore()
   })
 
-  it('rejects transfer_update with missing nested status field', () => {
+  it('rejects transfer with missing nested status field', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -791,7 +792,7 @@ describe('createWebSocket', () => {
 
     MockWebSocket.getInstance(0).simulateRawMessage(
       JSON.stringify({
-        type: 'transfer_update',
+        type: 'transfer',
         data: { kind: 'equity_mint', id: 'mint-1', symbol: 'tAAPL', quantity: '100' }
       })
     )
@@ -799,12 +800,12 @@ describe('createWebSocket', () => {
     expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
     expect(consoleSpy).toHaveBeenCalledWith(
       'Invalid ServerMessage structure:',
-      expect.objectContaining({ type: 'transfer_update' })
+      expect.objectContaining({ type: 'transfer' })
     )
     consoleSpy.mockRestore()
   })
 
-  it('rejects inventory_update with missing nested usdc fields', () => {
+  it('rejects snapshot with missing nested usdc fields', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -814,15 +815,18 @@ describe('createWebSocket', () => {
 
     MockWebSocket.getInstance(0).simulateRawMessage(
       JSON.stringify({
-        type: 'inventory_update',
-        data: { perSymbol: [], usdc: {} }
+        type: 'snapshot',
+        data: {
+          inventory: { perSymbol: [], usdc: {} },
+          fetchedAt: '2024-01-01T00:00:00Z'
+        }
       })
     )
 
     expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
     expect(consoleSpy).toHaveBeenCalledWith(
       'Invalid ServerMessage structure:',
-      expect.objectContaining({ type: 'inventory_update' })
+      expect.objectContaining({ type: 'snapshot' })
     )
     consoleSpy.mockRestore()
   })
