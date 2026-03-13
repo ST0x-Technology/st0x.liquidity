@@ -7,12 +7,13 @@
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use st0x_execution::Positive;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
+use super::serde::{deserialize_decimal_from_string, serialize_decimal_as_string};
 use crate::threshold::Usdc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,14 +155,6 @@ impl std::fmt::Display for Network {
     }
 }
 
-fn deserialize_decimal_from_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    raw.parse::<Decimal>().map_err(serde::de::Error::custom)
-}
-
 #[derive(Serialize)]
 struct WithdrawalRequest<'a> {
     #[serde(serialize_with = "serialize_decimal_as_string")]
@@ -179,13 +172,6 @@ where
     // None = standard EIP-55 checksum (no chain-specific EIP-1191 encoding).
     // Fine for now since this system only handles Ethereum mainnet.
     serializer.serialize_str(&address.to_checksum(None))
-}
-
-fn serialize_decimal_as_string<S>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&value.to_string())
 }
 
 pub(super) async fn initiate_withdrawal(
