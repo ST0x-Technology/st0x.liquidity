@@ -1105,7 +1105,13 @@ async fn delayed_fill() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+    poll_for_events(
+        &mut bot,
+        &infra.db_path,
+        "PositionEvent::OffChainOrderFilled",
+        1,
+    )
+    .await;
 
     let pool = connect_db(&infra.db_path).await?;
 
