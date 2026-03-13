@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)\n            VALUES\n                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 0),\n                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 150, '{}', 0)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "c8a052755d57883e324e757a992a4219107187fb3014f223c166a9b7b777c92e"
+}

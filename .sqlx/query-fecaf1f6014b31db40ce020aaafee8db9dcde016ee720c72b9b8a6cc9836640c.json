@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT OR IGNORE INTO event_queue\n        (tx_hash, log_index, block_number, event_data, processed, block_timestamp)\n        VALUES (?, ?, ?, ?, 0, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "fecaf1f6014b31db40ce020aaafee8db9dcde016ee720c72b9b8a6cc9836640c"
+}
