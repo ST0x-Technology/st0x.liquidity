@@ -122,11 +122,13 @@ impl EventSourced for OnChainTrade {
         match event {
             Enriched {
                 gas_used,
+                effective_gas_price,
                 pyth_price,
                 enriched_at,
             } => Ok(Some(Self {
                 enrichment: Some(Enrichment {
                     gas_used: *gas_used,
+                    effective_gas_price: *effective_gas_price,
                     pyth_price: pyth_price.clone(),
                     enriched_at: *enriched_at,
                 }),
@@ -177,14 +179,24 @@ impl EventSourced for OnChainTrade {
 
             Enrich {
                 gas_used,
+                effective_gas_price,
                 pyth_price,
             } => {
                 if self.is_enriched() {
                     return Err(OnChainTradeError::AlreadyEnriched);
                 }
 
+                // SQLite stores integers as i64; reject values that would
+                // violate the CHECK constraint on the onchain_trades table.
+                if effective_gas_price > i64::MAX as u128 {
+                    return Err(OnChainTradeError::GasPriceOutOfRange {
+                        effective_gas_price,
+                    });
+                }
+
                 Ok(vec![Enriched {
                     gas_used,
+                    effective_gas_price,
                     pyth_price,
                     enriched_at: Utc::now(),
                 }])
@@ -207,6 +219,11 @@ pub(crate) enum OnChainTradeError {
     AlreadyEnriched,
     #[error("Trade has already been filled")]
     AlreadyFilled,
+    #[error(
+        "Effective gas price {effective_gas_price} exceeds i64::MAX \
+         and cannot be stored in SQLite"
+    )]
+    GasPriceOutOfRange { effective_gas_price: u128 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +246,7 @@ pub(crate) enum OnChainTradeCommand {
     },
     Enrich {
         gas_used: u64,
+        effective_gas_price: u128,
         pyth_price: PythPrice,
     },
 }
@@ -254,6 +272,7 @@ pub(crate) enum OnChainTradeEvent {
     },
     Enriched {
         gas_used: u64,
+        effective_gas_price: u128,
         pyth_price: PythPrice,
         enriched_at: DateTime<Utc>,
     },
@@ -294,15 +313,17 @@ impl PartialEq for OnChainTradeEvent {
             (
                 Self::Enriched {
                     gas_used: g1,
+                    effective_gas_price: egp1,
                     pyth_price: pp1,
                     enriched_at: e1,
                 },
                 Self::Enriched {
                     gas_used: g2,
+                    effective_gas_price: egp2,
                     pyth_price: pp2,
                     enriched_at: e2,
                 },
-            ) => g1 == g2 && pp1 == pp2 && e1 == e2,
+            ) => g1 == g2 && egp1 == egp2 && pp1 == pp2 && e1 == e2,
             _ => false,
         }
     }
@@ -326,6 +347,7 @@ impl DomainEvent for OnChainTradeEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Enrichment {
     pub(crate) gas_used: u64,
+    pub(crate) effective_gas_price: u128,
     pub(crate) pyth_price: PythPrice,
     pub(crate) enriched_at: DateTime<Utc>,
 }
@@ -390,6 +412,7 @@ mod tests {
             }])
             .when(OnChainTradeCommand::Enrich {
                 gas_used: 50000,
+                effective_gas_price: 1_000_000_000,
                 pyth_price,
             })
             .await
@@ -424,12 +447,14 @@ mod tests {
                 },
                 OnChainTradeEvent::Enriched {
                     gas_used: 50000,
+                    effective_gas_price: 1_000_000_000,
                     pyth_price: pyth_price.clone(),
                     enriched_at: now,
                 },
             ])
             .when(OnChainTradeCommand::Enrich {
                 gas_used: 50000,
+                effective_gas_price: 1_000_000_000,
                 pyth_price,
             })
             .await
@@ -456,6 +481,7 @@ mod tests {
             .given_no_previous_events()
             .when(OnChainTradeCommand::Enrich {
                 gas_used: 50000,
+                effective_gas_price: 1_000_000_000,
                 pyth_price,
             })
             .await
@@ -464,6 +490,42 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(OnChainTradeError::NotFilled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_gas_price_exceeding_i64_max() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let pyth_price = PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: now,
+        };
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![OnChainTradeEvent::Filled {
+                symbol,
+                amount: float!("10.5"),
+                direction: Direction::Buy,
+                price_usdc: float!("150.25"),
+                block_number: 12345,
+                block_timestamp: now,
+                filled_at: now,
+            }])
+            .when(OnChainTradeCommand::Enrich {
+                gas_used: 50000,
+                effective_gas_price: (i64::MAX as u128) + 1,
+                pyth_price,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::GasPriceOutOfRange { .. })
         ));
     }
 
@@ -524,6 +586,7 @@ mod tests {
                 },
                 OnChainTradeEvent::Enriched {
                     gas_used: 50000,
+                    effective_gas_price: 1_000_000_000,
                     pyth_price,
                     enriched_at: now,
                 },
@@ -591,6 +654,7 @@ mod tests {
             },
             OnChainTradeEvent::Enriched {
                 gas_used: 50000,
+                effective_gas_price: 1_000_000_000,
                 pyth_price: pyth_price.clone(),
                 enriched_at: now,
             },
@@ -601,6 +665,7 @@ mod tests {
         assert!(trade.is_enriched());
         let enrichment = trade.enrichment.unwrap();
         assert_eq!(enrichment.gas_used, 50000);
+        assert_eq!(enrichment.effective_gas_price, 1_000_000_000);
         assert_eq!(enrichment.pyth_price, pyth_price);
     }
 
@@ -615,6 +680,7 @@ mod tests {
 
         let error = replay::<OnChainTrade>(vec![OnChainTradeEvent::Enriched {
             gas_used: 50000,
+            effective_gas_price: 1_000_000_000,
             pyth_price,
             enriched_at: Utc::now(),
         }])

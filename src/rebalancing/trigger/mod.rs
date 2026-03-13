@@ -1939,6 +1939,7 @@ mod tests {
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(30_000_000_000_000_000_000_u128),
+            fees: None,
             received_at: Utc::now(),
         }
     }

@@ -163,7 +163,6 @@ impl OnchainTradeBuilder {
     pub(crate) fn new() -> Self {
         Self {
             trade: OnchainTrade {
-                id: None,
                 tx_hash: fixed_bytes!(
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
@@ -176,13 +175,9 @@ impl OnchainTradeBuilder {
                 direction: Direction::Buy,
                 price: Usdc::new(Float::parse("150".to_string()).unwrap()).unwrap(),
                 block_timestamp: Some(Utc::now()),
-                created_at: None,
                 gas_used: None,
                 effective_gas_price: None,
                 pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
             },
         }
     }
@@ -216,6 +211,19 @@ impl OnchainTradeBuilder {
     #[must_use]
     pub(crate) fn with_log_index(mut self, index: u64) -> Self {
         self.trade.log_index = index;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_enrichment(
+        mut self,
+        gas_used: u64,
+        effective_gas_price: u128,
+        pyth_price: crate::onchain_trade::PythPrice,
+    ) -> Self {
+        self.trade.gas_used = Some(gas_used);
+        self.trade.effective_gas_price = Some(effective_gas_price);
+        self.trade.pyth_price = Some(pyth_price);
         self
     }
 

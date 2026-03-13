@@ -1161,6 +1161,46 @@ async fn execute_witness_trade(
     }
 }
 
+async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &OnchainTrade) {
+    let (Some(gas_used), Some(effective_gas_price), Some(pyth_price)) = (
+        trade.gas_used,
+        trade.effective_gas_price,
+        trade.pyth_price.clone(),
+    ) else {
+        warn!(
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            gas_used = ?trade.gas_used,
+            effective_gas_price = ?trade.effective_gas_price,
+            pyth_price = ?trade.pyth_price,
+            "Cannot enrich trade: missing gas_used, effective_gas_price, or pyth_price"
+        );
+        return;
+    };
+
+    let trade_id = OnChainTradeId {
+        tx_hash: trade.tx_hash,
+        log_index: trade.log_index,
+    };
+
+    let command = OnChainTradeCommand::Enrich {
+        gas_used,
+        effective_gas_price,
+        pyth_price,
+    };
+
+    match onchain_trade.send(&trade_id, command).await {
+        Ok(()) => info!(
+            "Successfully executed OnChainTrade::Enrich command: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        ),
+        Err(error) => error!(
+            "Failed to execute OnChainTrade::Enrich command: {error}, tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        ),
+    }
+}
+
 async fn execute_acknowledge_fill(
     position: &Store<Position>,
     trade: &OnchainTrade,
@@ -1224,6 +1264,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     );
 
     execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
+    execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
 
     let base_symbol = trade.symbol.base();
 
@@ -4153,6 +4194,111 @@ mod tests {
         assert_eq!(
             position.pending_offchain_order_id, None,
             "Periodic checker should clear pending order after broker rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrichment_fields_present_emits_enrich_event() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 50).await;
+
+        let pyth_price = crate::onchain_trade::PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: chrono::Utc::now(),
+        };
+
+        let trade = OnchainTradeBuilder::default()
+            .with_symbol("wtAAPL")
+            .with_equity_token(TEST_EQUITY_TOKEN)
+            .with_amount(float!("1.5"))
+            .with_log_index(50)
+            .with_enrichment(50000, 1_000_000_000, pyth_price)
+            .build();
+
+        process_queued_trade(
+            &MockExecutor::new(),
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let event_types = sqlx::query_scalar!(
+            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            event_types
+                .iter()
+                .any(|event_type| event_type == "OnChainTradeEvent::Filled"),
+            "Expected a Filled event from Witness, got: {event_types:?}"
+        );
+
+        assert!(
+            event_types
+                .iter()
+                .any(|event_type| event_type == "OnChainTradeEvent::Enriched"),
+            "Expected an Enriched event when enrichment fields are present, got: {event_types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_enrichment_fields_skips_enrich_event() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 60).await;
+
+        let trade = test_trade_with_amount(float!("1.5"), 60);
+
+        process_queued_trade(
+            &MockExecutor::new(),
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let event_types = sqlx::query_scalar!(
+            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            event_types
+                .iter()
+                .any(|event_type| event_type == "OnChainTradeEvent::Filled"),
+            "Expected a Filled event from Witness, got: {event_types:?}"
+        );
+
+        assert!(
+            !event_types
+                .iter()
+                .any(|event_type| event_type == "OnChainTradeEvent::Enriched"),
+            "Should not emit Enriched when enrichment fields are None, got: {event_types:?}"
         );
     }
 }
