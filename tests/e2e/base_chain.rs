@@ -15,7 +15,6 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolEvent as _;
 use rain_math_float::Float;
-use rust_decimal::Decimal;
 use std::collections::HashMap;
 use url::Url;
 
@@ -25,6 +24,27 @@ pub use st0x_hedge::bindings::{DeployableERC20, IERC20};
 use st0x_hedge::bindings::{
     Deployer, Interpreter, OrderBook, Parser, Store as RainStore, TOFUTokenDecimals,
 };
+
+/// Rounds a Float to `decimals` decimal places and formats as a string.
+fn round_and_format(value: Float, decimals: u8) -> anyhow::Result<String> {
+    let (fixed, _) = value
+        .to_fixed_decimal_lossy(decimals)
+        .map_err(|err| anyhow::anyhow!("to_fixed_decimal_lossy failed: {err:?}"))?;
+
+    let (rounded, _) = Float::from_fixed_decimal_lossy(fixed, decimals)
+        .map_err(|err| anyhow::anyhow!("from_fixed_decimal_lossy failed: {err:?}"))?;
+
+    rounded
+        .format_with_scientific(false)
+        .map_err(|err| anyhow::anyhow!("format_with_scientific failed: {err:?}"))
+}
+
+/// Formats a Float as a decimal string.
+fn format_float(value: Float) -> anyhow::Result<String> {
+    value
+        .format_with_scientific(false)
+        .map_err(|err| anyhow::anyhow!("format_with_scientific failed: {err:?}"))
+}
 
 /// Base chain USDC address, defined locally so e2e tests don't
 /// need `st0x_hedge` to export the constant.
@@ -374,8 +394,8 @@ impl<P: Provider + Clone> BaseChain<P> {
     pub async fn setup_order(
         &self,
         symbol: &str,
-        amount: Decimal,
-        price: Decimal,
+        amount: Float,
+        price: Float,
         direction: TakeDirection,
         usdc_vault_id: Option<B256>,
         rain_expression_override: Option<String>,
@@ -389,9 +409,10 @@ impl<P: Provider + Clone> BaseChain<P> {
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
-        let usdc_total = amount * price;
-        let amount_str = format!("{amount:.6}");
-        let usdc_total_str = format!("{usdc_total:.6}");
+        let usdc_total =
+            (amount * price).map_err(|err| anyhow::anyhow!("Float mul failed: {err:?}"))?;
+        let amount_str = round_and_format(amount, 6)?;
+        let usdc_total_str = round_and_format(usdc_total, 6)?;
 
         let (input_token, output_token) = if is_sell {
             (USDC_BASE, equity_vault_addr)
@@ -399,12 +420,13 @@ impl<P: Provider + Clone> BaseChain<P> {
             (equity_vault_addr, USDC_BASE)
         };
 
+        let price_str = format_float(price)?;
         let (max_amount_base, io_ratio_str) = if is_sell {
             let base: U256 = parse_units(&amount_str, 18)?.into();
-            (base, price.to_string())
+            (base, price_str)
         } else {
             let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            (base, format!("inv({price})"))
+            (base, format!("inv({price_str})"))
         };
         let default_expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
         let expression = rain_expression_override.unwrap_or(default_expression);
@@ -616,8 +638,8 @@ impl<P: Provider + Clone> BaseChain<P> {
     pub async fn take_order(
         &self,
         symbol: &str,
-        amount: Decimal,
-        price: Decimal,
+        amount: Float,
+        price: Float,
         direction: TakeDirection,
         rain_expression_override: Option<String>,
     ) -> anyhow::Result<TakeOrderResult> {
@@ -630,9 +652,10 @@ impl<P: Provider + Clone> BaseChain<P> {
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
-        let usdc_total = amount * price;
-        let amount_str = format!("{amount:.6}");
-        let usdc_total_str = format!("{usdc_total:.6}");
+        let usdc_total =
+            (amount * price).map_err(|err| anyhow::anyhow!("Float mul failed: {err:?}"))?;
+        let amount_str = round_and_format(amount, 6)?;
+        let usdc_total_str = round_and_format(usdc_total, 6)?;
 
         // Order: input = what order receives, output = what order gives
         let (input_token, output_token) = if is_sell {
@@ -645,12 +668,13 @@ impl<P: Provider + Clone> BaseChain<P> {
         // Sell: output = equity, input = USDC, ioRatio = price (USDC per equity)
         // Buy:  output = USDC, input = equity, ioRatio = inv(price)
         // Keep the reciprocal inside Rainlang to avoid precomputing it in Rust.
+        let price_str = format_float(price)?;
         let (max_amount_base, io_ratio_str) = if is_sell {
             let base: U256 = parse_units(&amount_str, 18)?.into();
-            (base, price.to_string())
+            (base, price_str)
         } else {
             let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            (base, format!("inv({price})"))
+            (base, format!("inv({price_str})"))
         };
         let default_expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
         let expression = rain_expression_override.unwrap_or(default_expression);

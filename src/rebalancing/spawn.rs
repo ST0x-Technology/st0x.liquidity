@@ -165,17 +165,16 @@ mod tests {
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use httpmock::Method::GET;
     use httpmock::MockServer;
-    use rust_decimal_macros::dec;
     use serde_json::json;
-    use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
-        TimeInForce,
-    };
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
+        TimeInForce,
+    };
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
@@ -203,12 +202,12 @@ mod tests {
     fn make_ctx() -> RebalancingCtx {
         RebalancingCtx::stub()
             .equity(ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
+                target: float!("0.5"),
+                deviation: float!("0.2"),
             })
             .usdc(ImbalanceThreshold {
-                target: dec!(0.6),
-                deviation: dec!(0.15),
+                target: float!("0.6"),
+                deviation: float!("0.15"),
             })
             .redemption_wallet(address!("0x1234567890123456789012345678901234567890"))
             .alpaca_broker_auth(AlpacaBrokerApiCtx {
@@ -250,8 +249,8 @@ mod tests {
             disabled_assets: HashSet::new(),
         };
 
-        assert_eq!(trigger_config.equity.target, dec!(0.5));
-        assert_eq!(trigger_config.equity.deviation, dec!(0.2));
+        assert!(trigger_config.equity.target.eq(float!("0.5")).unwrap());
+        assert!(trigger_config.equity.deviation.eq(float!("0.2")).unwrap());
     }
 
     #[test]
@@ -269,8 +268,8 @@ mod tests {
         };
 
         let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
-        assert_eq!(usdc_threshold.target, dec!(0.6));
-        assert_eq!(usdc_threshold.deviation, dec!(0.15));
+        assert!(usdc_threshold.target.eq(float!("0.6")).unwrap());
+        assert!(usdc_threshold.deviation.eq(float!("0.15")).unwrap());
     }
 
     async fn make_services_with_mock_wallet(
@@ -442,7 +441,7 @@ mod tests {
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(dec!(10)),
+            quantity: FractionalShares::new(float!("10")),
         })
         .await
         .unwrap();

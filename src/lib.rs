@@ -11,6 +11,9 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{Instrument, error, info, info_span, warn};
 
 use st0x_dto::ServerMessage;
+#[cfg(test)]
+#[macro_use]
+extern crate st0x_execution;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
 
 use crate::config::{BrokerCtx, Ctx};

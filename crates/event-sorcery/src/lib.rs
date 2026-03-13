@@ -176,7 +176,7 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     /// Aggregate identity type, used as the key in the event store.
     type Id: Display + FromStr + Send + Sync;
     /// Domain event type emitted by commands and applied during replay.
-    type Event: DomainEvent + Eq;
+    type Event: DomainEvent;
     /// Command type that drives state transitions.
     type Command: Send + Sync;
     /// Domain error type returned by command handlers and event

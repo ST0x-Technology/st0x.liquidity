@@ -1,7 +1,7 @@
 //! CCTP bridge and recovery CLI commands.
 
 use alloy::primitives::{B256, U256};
-use rust_decimal::Decimal;
+use rain_math_float::Float;
 use std::io::Write;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
@@ -13,6 +13,7 @@ use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::threshold::Usdc;
+use st0x_float_serde::format_float;
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).
@@ -77,7 +78,8 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
         CctpChain::Ethereum => CctpChain::Base,
         CctpChain::Base => CctpChain::Ethereum,
     };
-    let amount_display = Decimal::from(amount_u256.to::<u128>()) / Decimal::from(1_000_000u64);
+    let amount_float = Float::from_fixed_decimal(amount_u256, 6)?;
+    let amount_display = format_float(&amount_float);
     writeln!(
         stdout,
         "CCTP Bridge: {from:?} -> {dest:?}, Amount: {amount_display} USDC"
@@ -241,10 +243,9 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
-    use rust_decimal::Decimal;
-    use std::str::FromStr;
     use url::Url;
 
+    use rain_math_float::Float;
     use st0x_evm::OpenChainErrorRegistry;
 
     use super::*;
@@ -282,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn test_cctp_bridge_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
+        let amount = Some(Usdc(Float::parse("100".to_string()).unwrap()));
 
         let mut stdout = Vec::new();
         let error = cctp_bridge_command::<OpenChainErrorRegistry, _>(

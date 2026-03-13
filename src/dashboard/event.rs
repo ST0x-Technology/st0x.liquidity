@@ -80,23 +80,28 @@ impl Reactor for EventBroadcaster {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
-    use st0x_execution::Symbol;
+    use rain_math_float::Float;
     use uuid::Uuid;
 
     use st0x_event_sorcery::ReactorHarness;
+    use st0x_execution::Symbol;
 
     use super::*;
     use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
     use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
     use crate::usdc_rebalance::{UsdcRebalanceEvent, UsdcRebalanceId};
 
-    fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
+    fn make_mint_requested_float(symbol: &str, quantity: Float) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new(symbol).unwrap(),
-            quantity: quantity.into(),
+            quantity,
             wallet: Address::ZERO,
             requested_at: chrono::Utc::now(),
         }
+    }
+
+    fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
+        make_mint_requested_float(symbol, Float::parse(quantity.to_string()).unwrap())
     }
 
     fn make_redemption_completed() -> EquityRedemptionEvent {
@@ -287,5 +292,28 @@ mod tests {
         assert!(json.contains("\"sequence\":42"));
         assert!(json.contains("\"event_type\":\"TokenizedEquityMintEvent::MintRequested\""));
         assert!(json.contains("\"timestamp\""));
+    }
+
+    #[tokio::test]
+    async fn reactor_broadcasts_mint_event_with_fractional_quantity() {
+        let (sender, mut receiver) = broadcast::channel(16);
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+
+        let id = IssuerRequestId::new("mint-frac".to_string());
+        let fractional_qty = Float::parse("25.5".to_string()).unwrap();
+
+        harness
+            .receive::<TokenizedEquityMint>(id, make_mint_requested_float("TSLA", fractional_qty))
+            .await
+            .unwrap();
+
+        let msg = receiver.recv().await.expect("should receive message");
+
+        match msg {
+            ServerMessage::Event(entry) => {
+                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
+            }
+            ServerMessage::Initial(_) => panic!("expected Event message"),
+        }
     }
 }

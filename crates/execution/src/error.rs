@@ -21,8 +21,6 @@ pub enum PersistenceError {
     Execution(#[source] Box<crate::ExecutionError>),
     #[error("Invalid shares in database: {0}")]
     InvalidShares(#[from] crate::InvalidSharesError),
-    #[error("Decimal parse error: {0}")]
-    DecimalParse(#[from] rust_decimal::Error),
 }
 
 impl From<crate::ExecutionError> for PersistenceError {

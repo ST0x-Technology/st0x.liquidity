@@ -6,15 +6,16 @@
 
 use alloy::primitives::{Address, B256, FixedBytes};
 use clap::Parser;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use tracing::Level;
 use url::Url;
 
+use rain_math_float::Float;
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
     AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
@@ -28,6 +29,21 @@ use crate::rebalancing::{
 };
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
+
+/// Schwab minimum execution threshold: 1 share.
+static SCHWAB_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(|| {
+    Positive::new(FractionalShares::new(
+        Float::parse("1".to_string()).unwrap_or_else(|_| unreachable!()),
+    ))
+    .unwrap_or_else(|_| {
+        // Positive::new only fails for zero/negative — "1" is always positive.
+        unreachable!()
+    })
+});
+
+/// Alpaca minimum execution threshold: $2.
+static ALPACA_MIN_DOLLARS: LazyLock<Usdc> =
+    LazyLock::new(|| Usdc(Float::parse("2".to_string()).unwrap_or_else(|_| unreachable!())));
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -229,11 +245,9 @@ impl BrokerCtx {
 
     fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
-            Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(
-                Positive::<FractionalShares>::ONE,
-            )),
+            Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(*SCHWAB_MIN_SHARES)),
             Self::AlpacaTradingApi(_) | Self::AlpacaBrokerApi(_) => {
-                Ok(ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))?)
+                Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?)
             }
         }
     }
@@ -439,17 +453,20 @@ impl Ctx {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
                 };
 
-                let minimum = crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+                let minimum = *crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
 
                 if let Some(cash) = &config.assets.cash
                     && cash.rebalancing == OperationMode::Enabled
                     && let Some(cash_limit) = &cash.operational_limit
-                    && cash_limit.inner() < minimum
                 {
-                    return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
-                        configured: cash_limit.inner(),
-                        minimum,
-                    });
+                    let below_minimum = cash_limit.inner().lt(&minimum)?;
+
+                    if below_minimum {
+                        return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
+                            configured: cash_limit.inner(),
+                            minimum,
+                        });
+                    }
                 }
 
                 TradingMode::Rebalancing(Box::new(
@@ -662,6 +679,8 @@ pub enum CtxError {
     MissingEquityVaultId { symbol: Symbol },
     #[error("{field} polling interval must be non-zero")]
     ZeroPollingInterval { field: &'static str },
+    #[error("Float comparison failed during config validation: {0}")]
+    FloatComparison(#[from] rain_math_float::FloatError),
 }
 
 impl From<RebalancingCtxError> for CtxError {
@@ -694,6 +713,7 @@ impl CtxError {
             Self::MissingCashVaultId => "missing cash vault_id",
             Self::MissingEquityVaultId { .. } => "missing equity vault_id",
             Self::ZeroPollingInterval { .. } => "zero polling interval",
+            Self::FloatComparison(_) => "float comparison failed",
         }
     }
 }
@@ -1342,7 +1362,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             ctx.execution_threshold,
-            ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!("1"))).unwrap())
         );
     }
 
@@ -1355,7 +1375,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             ctx.execution_threshold,
-            ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!("1"))).unwrap())
         );
     }
 
@@ -1377,7 +1397,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc(float!("2"))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 
@@ -1400,7 +1420,7 @@ pub(crate) mod tests {
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc(float!("2"))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
     }
 

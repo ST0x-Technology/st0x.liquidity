@@ -34,17 +34,16 @@ uuid = { version = "1.10.0", features = ["v4", "serde"] }
 aes-gcm = "0.10.3"
 cqrs-es.workspace = true
 sqlite-es.workspace = true
-rust_decimal = { workspace = true, features = ["serde-with-float"] }
 num-decimal.workspace = true
-rust_decimal_macros = "1.40.0"
+rain-math-float = { version = "0.1.0", path = "../../lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
 bon = { version = "3.9.0", optional = true }
 httpmock = { workspace = true, optional = true }
 anyhow = { version = "1.0.102", optional = true }
+st0x-float-serde = { version = "0.1.0", path = "../float-serde" }
 
 [dev-dependencies]
 httpmock.workspace = true
 proptest.workspace = true
-rust_decimal_macros = "1.40.0"
 serde_json.workspace = true
 serial_test.workspace = true
 

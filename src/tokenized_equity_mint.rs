@@ -41,7 +41,7 @@
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::warn;
@@ -98,7 +98,7 @@ pub(crate) struct HttpStatusCode(pub(crate) u16);
 ///
 /// These errors enforce state machine constraints and prevent
 /// invalid transitions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 pub(crate) enum TokenizedEquityMintError {
     /// Command sent to a non-existent aggregate (must use RequestMint to initialize)
     #[error("Aggregate not initialized: use RequestMint to start a new mint")]
@@ -130,27 +130,58 @@ pub(crate) enum TokenizedEquityMintError {
     /// Completed mint response missing tx_hash
     #[error("Missing tx_hash in completed mint response")]
     MissingTxHash,
-    /// Decimal overflow when scaling quantity to 18 decimals
-    #[error("Decimal overflow when scaling {value} to 18 decimals")]
-    DecimalScalingOverflow { value: Decimal },
-    /// U256 conversion failed for a scaled decimal value
-    #[error("Failed to convert scaled decimal {scaled_value} to U256")]
-    U256ConversionFailed { scaled_value: String },
     /// Negative quantity is invalid for minting
-    #[error("Negative quantity: {value}")]
-    NegativeQuantity { value: Decimal },
-    /// Input has more than 18 decimal places, conversion would lose precision
-    #[error(
-        "Precision loss: {value} has more than 18 decimal places \
-         (scaled value {scaled} has fractional part)"
-    )]
-    PrecisionLoss { value: Decimal, scaled: Decimal },
+    #[error("Negative quantity: {value:?}")]
+    NegativeQuantity {
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        value: Float,
+    },
+    /// Float arithmetic or conversion error
+    #[error("Float error: {0}")]
+    Float(String),
     /// Vault lookup failed for the given symbol
     #[error("Vault lookup failed for {0}")]
     VaultLookupFailed(Symbol),
     /// Vault deposit transaction failed
     #[error("Vault deposit failed")]
     VaultDepositFailed,
+}
+
+impl PartialEq for TokenizedEquityMintError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NotInitialized, Self::NotInitialized)
+            | (Self::AlreadyInProgress, Self::AlreadyInProgress)
+            | (Self::TokensNotWrapped, Self::TokensNotWrapped)
+            | (Self::NotAccepted, Self::NotAccepted)
+            | (Self::TokensNotReceivedForWrap, Self::TokensNotReceivedForWrap)
+            | (Self::AlreadyCompleted, Self::AlreadyCompleted)
+            | (Self::AlreadyFailed, Self::AlreadyFailed)
+            | (Self::MissingTxHash, Self::MissingTxHash)
+            | (Self::VaultDepositFailed, Self::VaultDepositFailed) => true,
+            (
+                Self::RequestFailed { error_message: a },
+                Self::RequestFailed { error_message: b },
+            )
+            | (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::VaultLookupFailed(a), Self::VaultLookupFailed(b)) => a == b,
+            (Self::NegativeQuantity { value: a }, Self::NegativeQuantity { value: b }) => {
+                a.eq(*b).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TokenizedEquityMintError {}
+
+impl From<FloatError> for TokenizedEquityMintError {
+    fn from(error: FloatError) -> Self {
+        Self::Float(error.to_string())
+    }
 }
 
 /// Commands for the TokenizedEquityMint aggregate.
@@ -168,7 +199,7 @@ pub(crate) enum TokenizedEquityMintCommand {
     RequestMint {
         issuer_request_id: IssuerRequestId,
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: Float,
         wallet: Address,
     },
     /// Calls `poll_mint_until_complete()` on the tokenizer service.
@@ -185,11 +216,15 @@ pub(crate) enum TokenizedEquityMintCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum TokenizedEquityMintEvent {
     MintRequested {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         wallet: Address,
         requested_at: DateTime<Utc>,
     },
@@ -228,7 +263,11 @@ pub(crate) enum TokenizedEquityMintEvent {
     /// Wrapping failed after tokens were received.
     WrappingFailed {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         failed_at: DateTime<Utc>,
     },
 
@@ -244,6 +283,125 @@ pub(crate) enum TokenizedEquityMintEvent {
         failed_at: DateTime<Utc>,
     },
 }
+
+impl PartialEq for TokenizedEquityMintEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::MintRequested {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    wallet: wal_a,
+                    requested_at: req_a,
+                },
+                Self::MintRequested {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    wallet: wal_b,
+                    requested_at: req_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && wal_a == wal_b
+                    && req_a == req_b
+            }
+            (
+                Self::MintRejected {
+                    reason: reason_a,
+                    rejected_at: time_a,
+                },
+                Self::MintRejected {
+                    reason: reason_b,
+                    rejected_at: time_b,
+                },
+            )
+            | (
+                Self::MintAcceptanceFailed {
+                    reason: reason_a,
+                    failed_at: time_a,
+                },
+                Self::MintAcceptanceFailed {
+                    reason: reason_b,
+                    failed_at: time_b,
+                },
+            )
+            | (
+                Self::RaindexDepositFailed {
+                    reason: reason_a,
+                    failed_at: time_a,
+                },
+                Self::RaindexDepositFailed {
+                    reason: reason_b,
+                    failed_at: time_b,
+                },
+            ) => reason_a == reason_b && time_a == time_b,
+            (
+                Self::MintAccepted {
+                    issuer_request_id: iss_a,
+                    tokenization_request_id: tok_a,
+                    accepted_at: acc_a,
+                },
+                Self::MintAccepted {
+                    issuer_request_id: iss_b,
+                    tokenization_request_id: tok_b,
+                    accepted_at: acc_b,
+                },
+            ) => iss_a == iss_b && tok_a == tok_b && acc_a == acc_b,
+            (
+                Self::TokensReceived {
+                    tx_hash: hash_a,
+                    receipt_id: rcpt_a,
+                    shares_minted: mint_a,
+                    received_at: time_a,
+                },
+                Self::TokensReceived {
+                    tx_hash: hash_b,
+                    receipt_id: rcpt_b,
+                    shares_minted: mint_b,
+                    received_at: time_b,
+                },
+            ) => hash_a == hash_b && rcpt_a == rcpt_b && mint_a == mint_b && time_a == time_b,
+            (
+                Self::TokensWrapped {
+                    wrap_tx_hash: hash_a,
+                    wrapped_shares: shares_a,
+                    wrapped_at: time_a,
+                },
+                Self::TokensWrapped {
+                    wrap_tx_hash: hash_b,
+                    wrapped_shares: shares_b,
+                    wrapped_at: time_b,
+                },
+            ) => hash_a == hash_b && shares_a == shares_b && time_a == time_b,
+            (
+                Self::WrappingFailed {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    failed_at: time_a,
+                },
+                Self::WrappingFailed {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    failed_at: time_b,
+                },
+            ) => sym_a == sym_b && qty_a.eq(*qty_b).unwrap_or(false) && time_a == time_b,
+            (
+                Self::DepositedIntoRaindex {
+                    vault_deposit_tx_hash: hash_a,
+                    deposited_at: time_a,
+                },
+                Self::DepositedIntoRaindex {
+                    vault_deposit_tx_hash: hash_b,
+                    deposited_at: time_b,
+                },
+            ) => hash_a == hash_b && time_a == time_b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TokenizedEquityMintEvent {}
 
 impl DomainEvent for TokenizedEquityMintEvent {
     fn event_type(&self) -> String {
@@ -276,12 +434,16 @@ impl DomainEvent for TokenizedEquityMintEvent {
 /// Uses the typestate pattern via enum variants to make invalid
 /// states unrepresentable. Each variant contains exactly the data
 /// valid for that state.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum TokenizedEquityMint {
     /// Mint request initiated with symbol, quantity, and destination wallet
     MintRequested {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         wallet: Address,
         requested_at: DateTime<Utc>,
     },
@@ -289,7 +451,11 @@ pub(crate) enum TokenizedEquityMint {
     /// Alpaca API accepted the mint request and returned tracking identifiers
     MintAccepted {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         wallet: Address,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -300,7 +466,11 @@ pub(crate) enum TokenizedEquityMint {
     /// Onchain token transfer detected with transaction details
     TokensReceived {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         wallet: Address,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -315,7 +485,11 @@ pub(crate) enum TokenizedEquityMint {
     /// Tokens have been wrapped into ERC-4626 vault shares
     TokensWrapped {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         wallet: Address,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -333,7 +507,11 @@ pub(crate) enum TokenizedEquityMint {
     /// Wrapped tokens deposited to Raindex vault
     DepositedIntoRaindex {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         /// Alpaca cross-system identifiers for auditing
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -349,36 +527,227 @@ pub(crate) enum TokenizedEquityMint {
     /// Mint operation failed (terminal state)
     Failed {
         symbol: Symbol,
-        quantity: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
         reason: String,
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
 }
 
+impl PartialEq for TokenizedEquityMint {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::MintRequested {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    wallet: wal_a,
+                    requested_at: req_a,
+                },
+                Self::MintRequested {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    wallet: wal_b,
+                    requested_at: req_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && wal_a == wal_b
+                    && req_a == req_b
+            }
+            (
+                Self::MintAccepted {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    wallet: wal_a,
+                    issuer_request_id: iss_a,
+                    tokenization_request_id: tok_a,
+                    requested_at: req_a,
+                    accepted_at: acc_a,
+                },
+                Self::MintAccepted {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    wallet: wal_b,
+                    issuer_request_id: iss_b,
+                    tokenization_request_id: tok_b,
+                    requested_at: req_b,
+                    accepted_at: acc_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && wal_a == wal_b
+                    && iss_a == iss_b
+                    && tok_a == tok_b
+                    && req_a == req_b
+                    && acc_a == acc_b
+            }
+            (
+                Self::TokensReceived {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    wallet: wal_a,
+                    issuer_request_id: iss_a,
+                    tokenization_request_id: tok_a,
+                    tx_hash: hash_a,
+                    receipt_id: rcpt_a,
+                    shares_minted: mint_a,
+                    requested_at: req_a,
+                    accepted_at: acc_a,
+                    received_at: recv_a,
+                },
+                Self::TokensReceived {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    wallet: wal_b,
+                    issuer_request_id: iss_b,
+                    tokenization_request_id: tok_b,
+                    tx_hash: hash_b,
+                    receipt_id: rcpt_b,
+                    shares_minted: mint_b,
+                    requested_at: req_b,
+                    accepted_at: acc_b,
+                    received_at: recv_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && wal_a == wal_b
+                    && iss_a == iss_b
+                    && tok_a == tok_b
+                    && hash_a == hash_b
+                    && rcpt_a == rcpt_b
+                    && mint_a == mint_b
+                    && req_a == req_b
+                    && acc_a == acc_b
+                    && recv_a == recv_b
+            }
+            (
+                Self::TokensWrapped {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    wallet: wal_a,
+                    issuer_request_id: iss_a,
+                    tokenization_request_id: tok_a,
+                    tx_hash: hash_a,
+                    receipt_id: rcpt_a,
+                    shares_minted: mint_a,
+                    wrap_tx_hash: wrap_hash_a,
+                    wrapped_shares: wrap_shares_a,
+                    requested_at: req_a,
+                    accepted_at: acc_a,
+                    received_at: recv_a,
+                    wrapped_at: wrap_a,
+                },
+                Self::TokensWrapped {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    wallet: wal_b,
+                    issuer_request_id: iss_b,
+                    tokenization_request_id: tok_b,
+                    tx_hash: hash_b,
+                    receipt_id: rcpt_b,
+                    shares_minted: mint_b,
+                    wrap_tx_hash: wrap_hash_b,
+                    wrapped_shares: wrap_shares_b,
+                    requested_at: req_b,
+                    accepted_at: acc_b,
+                    received_at: recv_b,
+                    wrapped_at: wrap_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && wal_a == wal_b
+                    && iss_a == iss_b
+                    && tok_a == tok_b
+                    && hash_a == hash_b
+                    && rcpt_a == rcpt_b
+                    && mint_a == mint_b
+                    && wrap_hash_a == wrap_hash_b
+                    && wrap_shares_a == wrap_shares_b
+                    && req_a == req_b
+                    && acc_a == acc_b
+                    && recv_a == recv_b
+                    && wrap_a == wrap_b
+            }
+            (
+                Self::DepositedIntoRaindex {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    issuer_request_id: iss_a,
+                    tokenization_request_id: tok_a,
+                    token_tx_hash: token_hash_a,
+                    wrap_tx_hash: wrap_hash_a,
+                    vault_deposit_tx_hash: vault_hash_a,
+                    deposited_at: dep_a,
+                },
+                Self::DepositedIntoRaindex {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    issuer_request_id: iss_b,
+                    tokenization_request_id: tok_b,
+                    token_tx_hash: token_hash_b,
+                    wrap_tx_hash: wrap_hash_b,
+                    vault_deposit_tx_hash: vault_hash_b,
+                    deposited_at: dep_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && iss_a == iss_b
+                    && tok_a == tok_b
+                    && token_hash_a == token_hash_b
+                    && wrap_hash_a == wrap_hash_b
+                    && vault_hash_a == vault_hash_b
+                    && dep_a == dep_b
+            }
+            (
+                Self::Failed {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    reason: reason_a,
+                    requested_at: req_a,
+                    failed_at: fail_a,
+                },
+                Self::Failed {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    reason: reason_b,
+                    requested_at: req_b,
+                    failed_at: fail_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && reason_a == reason_b
+                    && req_a == req_b
+                    && fail_a == fail_b
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TokenizedEquityMint {}
+
 /// Our tokenized equity tokens use 18 decimals.
 pub(crate) const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
-fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, TokenizedEquityMintError> {
-    if value.is_sign_negative() {
+fn quantity_to_u256_18_decimals(value: Float) -> Result<U256, TokenizedEquityMintError> {
+    if value.lt(Float::zero()?)? {
         return Err(TokenizedEquityMintError::NegativeQuantity { value });
     }
 
-    let scale_factor = Decimal::from(10u64.pow(18));
-    let scaled = value
-        .checked_mul(scale_factor)
-        .ok_or(TokenizedEquityMintError::DecimalScalingOverflow { value })?;
-
-    if scaled.fract() != Decimal::ZERO {
-        return Err(TokenizedEquityMintError::PrecisionLoss { value, scaled });
-    }
-
-    let repr = scaled.trunc().to_string();
-    let Ok(amount) = U256::from_str_radix(&repr, 10) else {
-        return Err(TokenizedEquityMintError::U256ConversionFailed { scaled_value: repr });
-    };
-
-    Ok(amount)
+    value
+        .to_fixed_decimal(TOKENIZED_EQUITY_DECIMALS)
+        .map_err(TokenizedEquityMintError::from)
 }
 
 #[async_trait]
@@ -453,7 +822,7 @@ impl EventSourced for TokenizedEquityMint {
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    reason: reason.to_string(),
+                    reason: reason.clone(),
                     requested_at: *requested_at,
                     failed_at: *rejected_at,
                 })
@@ -499,7 +868,7 @@ impl EventSourced for TokenizedEquityMint {
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    reason: reason.to_string(),
+                    reason: reason.clone(),
                     requested_at: *requested_at,
                     failed_at: *failed_at,
                 })
@@ -622,7 +991,7 @@ impl EventSourced for TokenizedEquityMint {
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    reason: reason.to_string(),
+                    reason: reason.clone(),
                     requested_at: *requested_at,
                     failed_at: *failed_at,
                 })
@@ -646,7 +1015,7 @@ impl EventSourced for TokenizedEquityMint {
             return Err(TokenizedEquityMintError::NotInitialized);
         };
 
-        if quantity.is_sign_negative() {
+        if quantity.lt(Float::zero()?)? {
             return Err(TokenizedEquityMintError::NegativeQuantity { value: quantity });
         }
 
@@ -733,7 +1102,7 @@ impl EventSourced for TokenizedEquityMint {
                             let tx_hash = completed
                                 .tx_hash
                                 .ok_or(TokenizedEquityMintError::MissingTxHash)?;
-                            let shares_minted = decimal_to_u256_18_decimals(*quantity)?;
+                            let shares_minted = quantity_to_u256_18_decimals(*quantity)?;
 
                             Ok(vec![TokensReceived {
                                 tx_hash,
@@ -800,7 +1169,6 @@ impl EventSourced for TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
@@ -823,7 +1191,7 @@ mod tests {
         TokenizedEquityMintCommand::RequestMint {
             issuer_request_id: IssuerRequestId::new("ISS001"),
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: float!("10"),
             wallet: Address::ZERO,
         }
     }
@@ -831,7 +1199,7 @@ mod tests {
     fn mint_requested_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         }
@@ -935,7 +1303,7 @@ mod tests {
     fn test_evolve_accepted_rejects_wrong_state() {
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             token_tx_hash: TxHash::random(),
@@ -958,7 +1326,7 @@ mod tests {
     fn test_evolve_tokens_received_rejects_wrong_state() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -978,7 +1346,7 @@ mod tests {
     fn test_evolve_rejected_rejects_non_requested_states() {
         let accepted = TokenizedEquityMint::MintAccepted {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
@@ -999,7 +1367,7 @@ mod tests {
     fn test_evolve_acceptance_failed_rejects_non_accepted_states() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -1017,14 +1385,14 @@ mod tests {
     fn test_evolve_rejects_mint_requested_on_existing_state() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
 
         let event = TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new("GOOG").unwrap(),
-            quantity: dec!(50.0),
+            quantity: float!("50"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -1037,7 +1405,7 @@ mod tests {
     fn test_evolve_vault_deposited_rejects_wrong_state() {
         let accepted = TokenizedEquityMint::MintAccepted {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
@@ -1055,8 +1423,8 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_rejects_negative() {
-        let error = decimal_to_u256_18_decimals(dec!(-5)).unwrap_err();
+    fn quantity_to_u256_18_decimals_rejects_negative() {
+        let error = quantity_to_u256_18_decimals(float!("-5")).unwrap_err();
         assert!(
             matches!(error, TokenizedEquityMintError::NegativeQuantity { .. }),
             "Expected NegativeQuantity, got: {error:?}"
@@ -1064,31 +1432,21 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_converts_correctly() {
-        let result = decimal_to_u256_18_decimals(dec!(3)).unwrap();
+    fn quantity_to_u256_18_decimals_converts_correctly() {
+        let result = quantity_to_u256_18_decimals(float!("3")).unwrap();
         assert_eq!(result, U256::from(3_000_000_000_000_000_000_u128));
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_zero_returns_zero() {
-        let result = decimal_to_u256_18_decimals(dec!(0)).unwrap();
+    fn quantity_to_u256_18_decimals_zero_returns_zero() {
+        let result = quantity_to_u256_18_decimals(float!("0")).unwrap();
         assert_eq!(result, U256::ZERO);
     }
 
     #[test]
-    fn decimal_to_u256_18_decimals_rejects_19_decimal_places() {
-        let value = Decimal::from_str("1.1234567890123456789").unwrap();
-        let error = decimal_to_u256_18_decimals(value).unwrap_err();
-        assert!(
-            matches!(error, TokenizedEquityMintError::PrecisionLoss { .. }),
-            "Expected PrecisionLoss, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn decimal_to_u256_18_decimals_accepts_exactly_18_decimal_places() {
-        let value = Decimal::from_str("1.123456789012345678").unwrap();
-        let result = decimal_to_u256_18_decimals(value).unwrap();
+    fn quantity_to_u256_18_decimals_accepts_exactly_18_decimal_places() {
+        let value = Float::parse("1.123456789012345678".to_string()).unwrap();
+        let result = quantity_to_u256_18_decimals(value).unwrap();
         assert_eq!(result, U256::from(1_123_456_789_012_345_678_u128));
     }
 
@@ -1096,7 +1454,7 @@ mod tests {
     fn test_evolve_tokens_wrapped_rejects_wrong_state() {
         let accepted = TokenizedEquityMint::MintAccepted {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: float!("100.5"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
@@ -1207,7 +1565,7 @@ mod tests {
     fn reject_mint_evolves_from_requested_to_failed() {
         let requested = TokenizedEquityMint::MintRequested {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: float!("10"),
             wallet: Address::random(),
             requested_at: Utc::now(),
         };
@@ -1230,7 +1588,7 @@ mod tests {
     fn wrapping_failed_evolves_from_tokens_received_to_failed() {
         let tokens_received = TokenizedEquityMint::TokensReceived {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: float!("10"),
             wallet: Address::random(),
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("REQ001".to_string()),
@@ -1244,7 +1602,7 @@ mod tests {
 
         let event = TokenizedEquityMintEvent::WrappingFailed {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(10),
+            quantity: float!("10"),
             failed_at: Utc::now(),
         };
 

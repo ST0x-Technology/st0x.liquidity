@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS position_view (
 CREATE INDEX IF NOT EXISTS idx_position_view_symbol
     ON position_view(symbol) WHERE symbol IS NOT NULL;
 
--- Index on net_position as TEXT preserves exact decimal representation
+-- Index on net_position as TEXT preserves exact Float representation
 CREATE INDEX IF NOT EXISTS idx_position_view_net_position
     ON position_view(net_position) WHERE net_position IS NOT NULL;
 

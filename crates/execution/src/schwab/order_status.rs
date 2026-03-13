@@ -1,5 +1,10 @@
-use rust_decimal::Decimal;
+use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::{
+    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
+    serialize_float_as_string,
+};
 
 /// Deserialize orderId from Schwab API as int64 and convert to string for database compatibility.
 ///
@@ -38,16 +43,22 @@ pub(crate) enum OrderStatus {
 }
 
 /// Order status response from Schwab API
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OrderStatusResponse {
     #[serde(default, deserialize_with = "deserialize_order_id")]
     pub order_id: Option<String>,
     pub status: Option<OrderStatus>,
-    #[serde(default, with = "rust_decimal::serde::float_option")]
-    pub filled_quantity: Option<Decimal>,
-    #[serde(default, with = "rust_decimal::serde::float_option")]
-    pub remaining_quantity: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    pub filled_quantity: Option<Float>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    pub remaining_quantity: Option<Float>,
     pub entered_time: Option<String>,
     pub close_time: Option<String>,
     #[serde(rename = "orderActivityCollection")]
@@ -55,7 +66,7 @@ pub(crate) struct OrderStatusResponse {
 }
 
 /// Order activity from Schwab API orderActivityCollection
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OrderActivity {
     pub activity_type: Option<String>,
@@ -63,35 +74,84 @@ pub(crate) struct OrderActivity {
 }
 
 /// Execution leg details from Schwab API
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecutionLeg {
-    #[serde(with = "rust_decimal::serde::float")]
-    pub quantity: Decimal,
-    #[serde(with = "rust_decimal::serde::float")]
-    pub price: Decimal,
+    #[serde(
+        deserialize_with = "deserialize_float_from_number_or_string",
+        serialize_with = "serialize_float_as_string"
+    )]
+    pub quantity: Float,
+    #[serde(
+        deserialize_with = "deserialize_float_from_number_or_string",
+        serialize_with = "serialize_float_as_string"
+    )]
+    pub price: Float,
 }
+
+fn option_float_eq(lhs: Option<Float>, rhs: Option<Float>) -> bool {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => lhs.eq(rhs).unwrap_or(false),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl PartialEq for OrderStatusResponse {
+    fn eq(&self, other: &Self) -> bool {
+        self.order_id == other.order_id
+            && self.status == other.status
+            && option_float_eq(self.filled_quantity, other.filled_quantity)
+            && option_float_eq(self.remaining_quantity, other.remaining_quantity)
+            && self.entered_time == other.entered_time
+            && self.close_time == other.close_time
+            && self.order_activity_collection == other.order_activity_collection
+    }
+}
+
+impl PartialEq for OrderActivity {
+    fn eq(&self, other: &Self) -> bool {
+        self.activity_type == other.activity_type && self.execution_legs == other.execution_legs
+    }
+}
+
+impl PartialEq for ExecutionLeg {
+    fn eq(&self, other: &Self) -> bool {
+        self.quantity.eq(other.quantity).unwrap_or(false)
+            && self.price.eq(other.price).unwrap_or(false)
+    }
+}
+
+impl Eq for ExecutionLeg {}
 
 impl OrderStatusResponse {
     /// Weighted average fill price from execution legs.
-    pub(crate) fn price(&self) -> Option<Decimal> {
-        let activities = self.order_activity_collection.as_ref()?;
+    pub(crate) fn price(&self) -> Result<Option<Float>, FloatError> {
+        let Some(activities) = self.order_activity_collection.as_ref() else {
+            return Ok(None);
+        };
 
-        let (total_value, total_quantity) = activities
+        let zero = Float::from_raw(alloy::primitives::B256::ZERO);
+
+        let result: (Float, Float) = activities
             .iter()
             .filter_map(|activity| activity.execution_legs.as_ref())
             .flat_map(|legs| legs.iter())
-            .fold(
-                (Decimal::ZERO, Decimal::ZERO),
-                |(acc_value, acc_qty), leg| {
-                    (acc_value + leg.price * leg.quantity, acc_qty + leg.quantity)
+            .try_fold(
+                (zero, zero),
+                |(acc_value, acc_qty), leg| -> Result<_, FloatError> {
+                    let value = (leg.price * leg.quantity)?;
+                    Ok(((acc_value + value)?, (acc_qty + leg.quantity)?))
                 },
-            );
+            )?;
 
-        if total_quantity > Decimal::ZERO {
-            Some(total_value / total_quantity)
+        let (total_value, total_quantity) = result;
+
+        if total_quantity.gt(zero)? {
+            let price = (total_value / total_quantity)?;
+            Ok(Some(price))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -133,8 +193,6 @@ impl OrderStatusResponse {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use super::*;
 
     #[test]
@@ -172,8 +230,14 @@ mod tests {
 
         assert_eq!(response.order_id, Some("1004055538123".to_string()));
         assert_eq!(response.status, Some(OrderStatus::Filled));
-        assert_eq!(response.filled_quantity.unwrap(), dec!(100.0));
-        assert_eq!(response.remaining_quantity.unwrap(), dec!(0.0));
+        assert!(response.filled_quantity.unwrap().eq(float!("100")).unwrap());
+        assert!(
+            response
+                .remaining_quantity
+                .unwrap()
+                .eq(float!("0"))
+                .unwrap()
+        );
         assert_eq!(
             response.order_activity_collection.as_ref().unwrap().len(),
             1
@@ -185,20 +249,23 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(dec!(100.0)),
-            remaining_quantity: Some(dec!(0.0)),
+            filled_quantity: Some(float!("100")),
+            remaining_quantity: Some(float!("0")),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:00Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![ExecutionLeg {
-                    quantity: dec!(100.0),
-                    price: dec!(150.25),
+                    quantity: float!("100"),
+                    price: float!("150.25"),
                 }]),
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(150.25)));
+        assert!(option_float_eq(
+            response.price().unwrap(),
+            Some(Float::parse("150.25".to_string()).unwrap())
+        ));
     }
 
     #[test]
@@ -206,26 +273,29 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(dec!(200.0)),
-            remaining_quantity: Some(dec!(0.0)),
+            filled_quantity: Some(float!("200")),
+            remaining_quantity: Some(float!("0")),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:10Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![
                     ExecutionLeg {
-                        quantity: dec!(100.0),
-                        price: dec!(150.00),
+                        quantity: float!("100"),
+                        price: float!("150"),
                     },
                     ExecutionLeg {
-                        quantity: dec!(100.0),
-                        price: dec!(151.00),
+                        quantity: float!("100"),
+                        price: float!("151"),
                     },
                 ]),
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(150.5)));
+        assert!(option_float_eq(
+            response.price().unwrap(),
+            Some(Float::parse("150.5".to_string()).unwrap())
+        ));
     }
 
     #[test]
@@ -233,26 +303,29 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(dec!(300.0)),
-            remaining_quantity: Some(dec!(0.0)),
+            filled_quantity: Some(float!("300")),
+            remaining_quantity: Some(float!("0")),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:10Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![
                     ExecutionLeg {
-                        quantity: dec!(200.0),
-                        price: dec!(150.00),
+                        quantity: float!("200"),
+                        price: float!("150"),
                     },
                     ExecutionLeg {
-                        quantity: dec!(100.0),
-                        price: dec!(153.00),
+                        quantity: float!("100"),
+                        price: float!("153"),
                     },
                 ]),
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(151.0)));
+        assert!(option_float_eq(
+            response.price().unwrap(),
+            Some(Float::parse("151".to_string()).unwrap())
+        ));
     }
 
     #[test]
@@ -260,14 +333,14 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Working),
-            filled_quantity: Some(dec!(0.0)),
-            remaining_quantity: Some(dec!(100.0)),
+            filled_quantity: Some(float!("0")),
+            remaining_quantity: Some(float!("100")),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: None,
             order_activity_collection: Some(vec![]),
         };
 
-        assert_eq!(response.price(), None);
+        assert!(option_float_eq(response.price().unwrap(), None));
     }
 
     #[test]
@@ -275,20 +348,23 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(dec!(100.0)),
-            remaining_quantity: Some(dec!(0.0)),
+            filled_quantity: Some(float!("100")),
+            remaining_quantity: Some(float!("0")),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:00Z".to_string()),
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![ExecutionLeg {
-                    quantity: dec!(100.0),
-                    price: dec!(150.254),
+                    quantity: float!("100"),
+                    price: float!("150.254"),
                 }]),
             }]),
         };
 
-        assert_eq!(response.price(), Some(dec!(150.254)));
+        assert!(option_float_eq(
+            response.price().unwrap(),
+            Some(Float::parse("150.254".to_string()).unwrap())
+        ));
     }
 
     #[test]
@@ -296,8 +372,8 @@ mod tests {
         let mut response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Filled),
-            filled_quantity: Some(dec!(100.0)),
-            remaining_quantity: Some(dec!(0.0)),
+            filled_quantity: Some(float!("100")),
+            remaining_quantity: Some(float!("0")),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: Some("2023-10-15T10:30:00Z".to_string()),
             order_activity_collection: Some(vec![]),
@@ -330,8 +406,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(dec!(0.0)),
-                remaining_quantity: Some(dec!(100.0)),
+                filled_quantity: Some(float!("0")),
+                remaining_quantity: Some(float!("100")),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: None,
                 order_activity_collection: Some(vec![]),
@@ -351,8 +427,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(dec!(100.0)),
-                remaining_quantity: Some(dec!(0.0)),
+                filled_quantity: Some(float!("100")),
+                remaining_quantity: Some(float!("0")),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: Some("2023-10-15T10:30:00Z".to_string()),
                 order_activity_collection: Some(vec![]),
@@ -376,8 +452,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(dec!(0.0)),
-                remaining_quantity: Some(dec!(100.0)),
+                filled_quantity: Some(float!("0")),
+                remaining_quantity: Some(float!("100")),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: Some("2023-10-15T10:30:00Z".to_string()),
                 order_activity_collection: Some(vec![]),
@@ -399,8 +475,8 @@ mod tests {
             let response = OrderStatusResponse {
                 order_id: Some("1004055538123".to_string()),
                 status: Some(status),
-                filled_quantity: Some(dec!(0.0)),
-                remaining_quantity: Some(dec!(100.0)),
+                filled_quantity: Some(float!("0")),
+                remaining_quantity: Some(float!("100")),
                 entered_time: Some("2023-10-15T10:25:00Z".to_string()),
                 close_time: None,
                 order_activity_collection: Some(vec![]),
@@ -446,15 +522,24 @@ mod tests {
 
         assert_eq!(response.order_id, Some("1004055538999".to_string()));
         assert_eq!(response.status, Some(OrderStatus::Filled));
-        assert_eq!(response.filled_quantity.unwrap(), dec!(200.0));
-        assert_eq!(response.remaining_quantity.unwrap(), dec!(0.0));
+        assert!(response.filled_quantity.unwrap().eq(float!("200")).unwrap());
+        assert!(
+            response
+                .remaining_quantity
+                .unwrap()
+                .eq(float!("0"))
+                .unwrap()
+        );
         assert_eq!(
             response.order_activity_collection.as_ref().unwrap().len(),
             1
         );
 
         // Test weighted average: (150 * 100.25 + 50 * 100.75) / 200 = (15037.5 + 5037.5) / 200 = 100.375
-        assert_eq!(response.price(), Some(dec!(100.375)));
+        assert!(option_float_eq(
+            response.price().unwrap(),
+            Some(Float::parse("100.375".to_string()).unwrap())
+        ));
     }
 
     #[test]
@@ -462,20 +547,20 @@ mod tests {
         let response = OrderStatusResponse {
             order_id: Some("1004055538123".to_string()),
             status: Some(OrderStatus::Working),
-            filled_quantity: Some(dec!(0.0)),
-            remaining_quantity: Some(dec!(100.0)),
+            filled_quantity: Some(float!("0")),
+            remaining_quantity: Some(float!("100")),
             entered_time: Some("2023-10-15T10:25:00Z".to_string()),
             close_time: None,
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![ExecutionLeg {
-                    quantity: dec!(0.0),
-                    price: dec!(150.25),
+                    quantity: float!("0"),
+                    price: float!("150.25"),
                 }]),
             }]),
         };
 
-        assert_eq!(response.price(), None);
+        assert!(option_float_eq(response.price().unwrap(), None));
     }
 
     #[test]
@@ -537,8 +622,8 @@ mod tests {
         // Verify the parsed values
         assert_eq!(parsed.order_id, Some("1004055538153".to_string()));
         assert_eq!(parsed.status, Some(OrderStatus::Filled));
-        assert_eq!(parsed.filled_quantity.unwrap(), dec!(1.0));
-        assert_eq!(parsed.remaining_quantity.unwrap(), dec!(0.0));
+        assert!(parsed.filled_quantity.unwrap().eq(float!("1")).unwrap());
+        assert!(parsed.remaining_quantity.unwrap().eq(float!("0")).unwrap());
         assert_eq!(
             parsed.entered_time,
             Some("2025-08-29T17:15:17+0000".to_string())
@@ -549,7 +634,10 @@ mod tests {
         );
 
         // Verify price extraction from orderActivityCollection
-        assert_eq!(parsed.price(), Some(dec!(22.7299)));
+        assert!(option_float_eq(
+            parsed.price().unwrap(),
+            Some(Float::parse("22.7299".to_string()).unwrap())
+        ));
     }
 
     #[test]
@@ -610,8 +698,8 @@ mod tests {
 
         assert_eq!(parsed.order_id, None);
         assert_eq!(parsed.status, Some(OrderStatus::Queued));
-        assert_eq!(parsed.filled_quantity, None);
-        assert_eq!(parsed.remaining_quantity, None);
+        assert!(option_float_eq(parsed.filled_quantity, None));
+        assert!(option_float_eq(parsed.remaining_quantity, None));
         assert_eq!(parsed.entered_time, None);
         assert_eq!(parsed.close_time, None);
         assert_eq!(parsed.order_activity_collection, None);
@@ -630,8 +718,11 @@ mod tests {
 
         assert_eq!(parsed.order_id, Some("1004055538123".to_string()));
         assert_eq!(parsed.status, None);
-        assert_eq!(parsed.filled_quantity, Some(dec!(0.0)));
-        assert_eq!(parsed.remaining_quantity, Some(dec!(100.0)));
+        assert!(option_float_eq(parsed.filled_quantity, Some(float!("0"))));
+        assert!(option_float_eq(
+            parsed.remaining_quantity,
+            Some(float!("100"))
+        ));
     }
 
     #[test]
@@ -656,9 +747,12 @@ mod tests {
             .expect("Should parse response with orderActivityCollection");
 
         assert_eq!(parsed.status, Some(OrderStatus::Filled));
-        assert_eq!(parsed.filled_quantity.unwrap(), dec!(2.0));
-        assert_eq!(parsed.remaining_quantity.unwrap(), dec!(0.0));
+        assert!(parsed.filled_quantity.unwrap().eq(float!("2")).unwrap());
+        assert!(parsed.remaining_quantity.unwrap().eq(float!("0")).unwrap());
 
-        assert_eq!(parsed.price(), Some(dec!(101.0)));
+        assert!(option_float_eq(
+            parsed.price().unwrap(),
+            Some(Float::parse("101".to_string()).unwrap())
+        ));
     }
 }
