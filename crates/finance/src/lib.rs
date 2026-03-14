@@ -17,7 +17,7 @@ mod usdc;
 pub use id::{BlankIdError, Id};
 pub use shares::FractionalShares;
 pub use symbol::{EmptySymbolError, Symbol};
-pub use usd::Usd;
+pub use usd::{Usd, UsdToCentsError};
 pub use usdc::{Usdc, UsdcConversionError};
 
 /// Trait for types that have a zero value and can be compared to it.

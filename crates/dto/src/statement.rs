@@ -151,6 +151,7 @@ mod tests {
                 equity_deviation: 0.2,
                 usdc_target: None,
                 usdc_deviation: None,
+                cash_reserved: None,
                 execution_threshold: "1 share".to_string(),
                 assets: Vec::new(),
                 log_level: "Debug".to_string(),

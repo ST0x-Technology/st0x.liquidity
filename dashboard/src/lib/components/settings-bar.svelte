@@ -54,6 +54,12 @@
         Trigger <span class="font-mono font-semibold">{settings.executionThreshold}</span>
       </span>
 
+      {#if settings.cashReserved != null}
+        <span class="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-xs">
+          Reserve <span class="font-mono font-semibold">${settings.cashReserved}</span>
+        </span>
+      {/if}
+
       <button
         class="inline-flex items-center rounded-full bg-muted px-2.5 py-0.5 text-xs text-muted-foreground hover:text-foreground"
         onclick={() => dialogEl?.showModal()}
@@ -67,7 +73,7 @@
   <dialog
     bind:this={dialogEl}
     class="w-full max-w-md rounded-lg border bg-card p-6 text-foreground shadow-lg backdrop:bg-black/50"
-    onclick={(event) => { if (event.target === dialogEl) dialogEl?.close() }}
+    onclick={(event) => { if (event.target === dialogEl) dialogEl.close() }}
   >
     <div class="mb-4 flex items-center justify-between">
       <h3 class="text-sm font-semibold text-foreground">Configuration</h3>
@@ -85,6 +91,7 @@
       <div class="flex justify-between"><span class="text-muted-foreground">Deployment block</span><span>{String(settings.deploymentBlock)}</span></div>
       <div class="flex justify-between"><span class="text-muted-foreground">Order polling</span><span>{String(settings.orderPollingInterval)}s</span></div>
       <div class="flex justify-between"><span class="text-muted-foreground">Inventory polling</span><span>{String(settings.inventoryPollInterval)}s</span></div>
+      <div class="flex justify-between"><span class="text-muted-foreground">Cash reserve</span><span>{settings.cashReserved != null ? `$${settings.cashReserved}` : 'none'}</span></div>
       <div class="flex justify-between"><span class="text-muted-foreground">Orderbook</span><span class="ml-4 truncate">{settings.orderbook}</span></div>
     </div>
   </dialog>

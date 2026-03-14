@@ -44,15 +44,10 @@
   })
 
   type Tab = 'dashboard' | 'logs'
-  type MobilePanel = 'inventory' | 'pending' | 'trades' | 'transfers'
 
   const activeTab = reactive<Tab>('dashboard')
-  const mobilePanel = reactive<MobilePanel>('inventory')
 
-  const mobilePanelClass = (panel: MobilePanel): string =>
-    `relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors ${mobilePanel.current === panel ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}`
-
-  const desktopTabClass = (active: boolean): string =>
+  const tabClass = (active: boolean): string =>
     `relative px-4 py-2.5 text-sm font-medium transition-colors ${active ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}`
 </script>
 
@@ -71,33 +66,16 @@
     </div>
   {/if}
 
-  <!-- Mobile nav: panel tabs + logs -->
-  <nav class="flex shrink-0 gap-1 overflow-x-auto border-b bg-card/50 px-2 md:hidden">
-    {#if activeTab.current === 'dashboard'}
-      <button class={mobilePanelClass('inventory')} onclick={() => mobilePanel.update(() => 'inventory')}>Inventory</button>
-      <button class={mobilePanelClass('pending')} onclick={() => mobilePanel.update(() => 'pending')}>Pending</button>
-      <button class={mobilePanelClass('trades')} onclick={() => mobilePanel.update(() => 'trades')}>Trades</button>
-      <button class={mobilePanelClass('transfers')} onclick={() => mobilePanel.update(() => 'transfers')}>Transfers</button>
-    {/if}
+  <nav class="flex shrink-0 gap-1 border-b bg-card/50 px-2 md:px-4">
     <button
-      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'logs' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
-      onclick={() => activeTab.update((tab) => tab === 'logs' ? 'dashboard' : 'logs')}
-    >
-      Logs
-    </button>
-  </nav>
-
-  <!-- Desktop nav: dashboard vs logs -->
-  <nav class="hidden shrink-0 gap-1 border-b bg-card/50 px-4 md:flex">
-    <button
-      class={desktopTabClass(activeTab.current === 'dashboard')}
+      class={tabClass(activeTab.current === 'dashboard')}
       onclick={() => activeTab.update(() => 'dashboard')}
     >
       Dashboard
     </button>
 
     <button
-      class={desktopTabClass(activeTab.current === 'logs')}
+      class={tabClass(activeTab.current === 'logs')}
       onclick={() => activeTab.update(() => 'logs')}
     >
       Logs
@@ -107,27 +85,13 @@
   <SettingsBar />
 
   {#if activeTab.current === 'dashboard'}
-    <!-- Mobile: one panel at a time -->
-    <main class="flex-1 overflow-hidden p-2 md:hidden">
-      {#if mobilePanel.current === 'inventory'}
-        <InventoryPanel />
-      {:else if mobilePanel.current === 'pending'}
-        <PendingOrders />
-      {:else if mobilePanel.current === 'trades'}
-        <TradeHistoryPanel />
-      {:else}
-        <TransferPanel />
-      {/if}
-    </main>
-
-    <!-- Desktop: all panels, fixed proportions, internal scrolling -->
-    <main class="hidden min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4 md:flex">
-      <div class="grid h-[40%] min-h-0 grid-cols-[2fr_1fr] gap-4">
+    <main class="flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-2 md:p-4">
+      <div class="grid min-h-[280px] gap-4 md:h-[40%] md:min-h-0 md:grid-cols-[2fr_1fr]">
         <InventoryPanel />
         <PendingOrders />
       </div>
 
-      <div class="grid min-h-0 flex-1 grid-cols-2 gap-4">
+      <div class="grid min-h-[280px] flex-1 gap-4 md:min-h-0 md:grid-cols-2">
         <TradeHistoryPanel />
         <TransferPanel />
       </div>

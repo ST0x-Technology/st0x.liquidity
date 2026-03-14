@@ -317,7 +317,7 @@ impl Conductor {
             .maybe_executor_maintenance(executor_maintenance)
             .maybe_rebalancer(rebalancer)
             .job_cleanup(job_cleanup)
-            .call();
+            .call()?;
 
         info!("Conductor running");
         let result = conductor.wait_for_completion().await;

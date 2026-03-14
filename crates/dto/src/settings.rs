@@ -3,7 +3,7 @@
 use serde::Serialize;
 use ts_rs::TS;
 
-use st0x_finance::Symbol;
+use st0x_finance::{Symbol, Usd};
 
 /// Operational settings shown on the dashboard overview.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -13,6 +13,8 @@ pub struct Settings {
     pub equity_deviation: f64,
     pub usdc_target: Option<f64>,
     pub usdc_deviation: Option<f64>,
+    #[ts(as = "Option<String>")]
+    pub cash_reserved: Option<Usd>,
     pub execution_threshold: String,
     pub assets: Vec<AssetSettings>,
 

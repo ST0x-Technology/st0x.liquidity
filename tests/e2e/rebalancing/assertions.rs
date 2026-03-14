@@ -33,6 +33,7 @@ use st0x_execution::alpaca_broker_api::{
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
 };
+use st0x_finance::{Positive, Usd};
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
 use st0x_hedge::config::{BrokerCtx, Ctx};
@@ -202,6 +203,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
             vault_id: Some(cash_vault_id),
             rebalancing: cash_rebalancing,
             operational_limit: None,
+            reserved: None,
         }),
     };
 
@@ -229,6 +231,7 @@ pub(crate) fn build_usdc_rebalancing_ctx<BP>(
     equity_tokens: &[(String, Address, Address)],
     usdc_vault_id: B256,
     cctp: CctpOverrides,
+    reserved: Option<Positive<Usd>>,
 ) -> anyhow::Result<Ctx>
 where
     BP: Provider + Clone,
@@ -300,6 +303,7 @@ where
                 vault_id: Some(usdc_vault_id),
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
+                reserved,
             }),
         })
         .inventory_poll_interval(15)
@@ -1313,6 +1317,59 @@ pub(crate) async fn assert_base_wallet_usdc_event_exists(
 
     pool.close().await;
     Ok(())
+}
+
+/// Polls `InventorySnapshot` events until the latest `OffchainUsd` reports
+/// `broker.cash_balance() - reserved`, proving the inventory poller subtracts
+/// the configured cash reserve before emitting the offchain balance.
+///
+/// Polls because the test may call this before the next inventory poll cycle
+/// has run (poll interval is 15s, hedge fills settle asynchronously).
+pub(crate) async fn assert_offchain_usd_reflects_reserve(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    broker: &AlpacaBrokerMock,
+    reserved: Positive<Usd>,
+) -> anyhow::Result<()> {
+    let reserved_cents = reserved.inner().to_cents()?;
+
+    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = "OffchainUsd snapshot matching broker cash minus reserve".to_string();
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let cash_cents = Usd::new(broker.cash_balance()).to_cents()?;
+        let expected_cents = cash_cents - reserved_cents;
+
+        let pool = connect_db(db_path).await?;
+        let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+        pool.close().await;
+
+        let latest_reported_cents = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "InventorySnapshotEvent::OffchainUsd")
+            .and_then(|event| {
+                event
+                    .payload
+                    .get("OffchainUsd")
+                    .and_then(|value| value.get("usd_balance_cents"))
+                    .and_then(serde_json::Value::as_i64)
+            });
+
+        if latest_reported_cents == Some(expected_cents) {
+            return Ok(());
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context} \
+             (latest reported={latest_reported_cents:?}, expected={expected_cents}, \
+              broker cash={cash_cents} cents, reserved={reserved_cents} cents)",
+        );
+    }
 }
 
 pub(crate) async fn assert_alpaca_wallet_usdc_event(

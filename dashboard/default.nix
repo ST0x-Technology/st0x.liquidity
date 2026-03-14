@@ -19,6 +19,8 @@ in pkgs.stdenv.mkDerivation {
   buildPhase = ''
     st0x-dto dashboard/src/lib/api
     cd dashboard
+    bun run check
+    bun run test:run
     bun run build
   '';
 
