@@ -302,18 +302,20 @@ graph TD
 
     id453["#453 Bidirectional equity rebalancing"]:::done
     id407["#407 Cash reserve"]:::wip
+    id491["#491 Trading enable/disable toggle"]:::blocked
     id443["#443 E2e USDC rebalancing"]:::blocked
     id444["#444 Repeated USDC rebalancing"]:::blocked
     id445["#445 Single-equity rebalancing"]:::blocked
     id446["#446 Multi-equity stability"]:::blocked
     id447(["#447 Go live"]):::blocked
 
-    id453 & id407 --> id443 --> id444
+    id453 & id407 --> id491 --> id443 --> id444
     id453 --> id445
     id444 & id445 --> id446 --> id447
 
     click id453 href "https://github.com/ST0x-Technology/st0x.liquidity/issues/453"
     click id407 href "https://github.com/ST0x-Technology/st0x.liquidity/issues/407"
+    click id491 href "https://github.com/ST0x-Technology/st0x.liquidity/issues/491"
     click id443 href "https://github.com/ST0x-Technology/st0x.liquidity/issues/443"
     click id444 href "https://github.com/ST0x-Technology/st0x.liquidity/issues/444"
     click id445 href "https://github.com/ST0x-Technology/st0x.liquidity/issues/445"
@@ -324,6 +326,7 @@ graph TD
 - [x] [#453 Live bidirectional equity auto-rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/issues/453)
 - [ ] [#407 Untouchable cash reserve for rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/issues/407)
   - PR: [#484 add an untouchable brokerage cash reserve](https://github.com/ST0x-Technology/st0x.liquidity/pull/484)
+- [ ] [#491 Runtime trading enable/disable toggle](https://github.com/ST0x-Technology/st0x.liquidity/issues/491)
 - [ ] [#443 See end-to-end USDC auto rebalancing in both directions](https://github.com/ST0x-Technology/st0x.liquidity/issues/443)
 - [ ] [#444 See repeated USDC auto rebalancing](https://github.com/ST0x-Technology/st0x.liquidity/issues/444)
 - [ ] [#445 See repeated single-equity auto rebalancing with counter trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/445)
@@ -745,6 +748,7 @@ See the specification for detailed system behavior documentation.
 [#441]: https://github.com/ST0x-Technology/st0x.liquidity/issues/441
 [#442]: https://github.com/ST0x-Technology/st0x.liquidity/issues/442
 [#443]: https://github.com/ST0x-Technology/st0x.liquidity/issues/443
+[#491]: https://github.com/ST0x-Technology/st0x.liquidity/issues/491
 [#444]: https://github.com/ST0x-Technology/st0x.liquidity/issues/444
 [#445]: https://github.com/ST0x-Technology/st0x.liquidity/issues/445
 [#446]: https://github.com/ST0x-Technology/st0x.liquidity/issues/446
