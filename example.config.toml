@@ -34,5 +34,9 @@ rebalancing = "disabled"
 
 [assets.cash]
 rebalancing = "enabled"
-# vault_id = "0xcd34"
-# operational_limit = 10000.0
+# Raindex Vault Id
+vault_id = "0xcd34"
+# Maximum USD amount that can be used per trade or transfer
+operational_limit = 10000.0
+# USD amount subtracted from offchain cash to compute available balance
+reserved = 50000.0

@@ -374,6 +374,7 @@ mod tests {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
+            reserved: None,
         }));
         let amount = Usdc::new(dec!(100));
 
@@ -422,6 +423,7 @@ mod tests {
             vault_id: Some(TEST_VAULT_ID),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
+            reserved: None,
         }));
         let amount = Usdc::new(dec!(100));
 

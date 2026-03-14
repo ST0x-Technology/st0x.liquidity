@@ -256,7 +256,9 @@ pub enum UsdcBridgeStatus {
 }
 
 impl TransferOperation {
-    /// Whether this transfer is in a terminal state (completed or failed).
+    /// Whether this transfer is in a terminal state
+    /// (completed or failed).
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::EquityMint(op) => {
@@ -287,6 +289,7 @@ impl TransferOperation {
     }
 
     /// The last time this transfer was updated.
+    #[must_use]
     pub fn updated_at(&self) -> DateTime<Utc> {
         match self {
             Self::EquityMint(op) => op.updated_at,
@@ -330,6 +333,7 @@ pub struct TimeframeMetrics {
 }
 
 impl TimeframeMetrics {
+    #[must_use]
     pub fn zero() -> Self {
         Self {
             aum: Decimal::ZERO,
@@ -363,6 +367,7 @@ pub struct PerformanceMetrics {
 }
 
 impl PerformanceMetrics {
+    #[must_use]
     pub fn zero() -> Self {
         let zero = TimeframeMetrics::zero();
         Self {

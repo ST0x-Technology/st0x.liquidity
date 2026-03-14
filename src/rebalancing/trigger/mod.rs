@@ -457,10 +457,13 @@ impl RebalancingTrigger {
         &self,
         event: InventorySnapshotEvent,
     ) -> Result<(), RebalancingTriggerError> {
+        use InventorySnapshotEvent::{
+            BaseWalletCash, EthereumCash, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
+        };
+
         let now = Utc::now();
         let mut inventory = self.inventory.write().await;
 
-        use InventorySnapshotEvent::*;
         let updated =
             match &event {
                 OnchainEquity { balances, .. } => balances.iter().try_fold(
@@ -522,6 +525,10 @@ impl RebalancingTrigger {
         error: RebalancingTriggerError,
         event: InventorySnapshotEvent,
     ) -> Result<(), RebalancingTriggerError> {
+        use InventorySnapshotEvent::{
+            BaseWalletCash, EthereumCash, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
+        };
+
         let inventory_error = match error {
             RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
             other @ (RebalancingTriggerError::EquityTrigger(_)
@@ -536,8 +543,6 @@ impl RebalancingTrigger {
         let now = Utc::now();
         let mut inventory = self.inventory.write().await;
         *inventory = InventoryView::default();
-
-        use InventorySnapshotEvent::*;
         let updated =
             match &event {
                 OnchainEquity { balances, .. } => balances.iter().try_fold(
@@ -607,7 +612,9 @@ impl RebalancingTrigger {
         &self,
         event: &InventorySnapshotEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        use InventorySnapshotEvent::*;
+        use InventorySnapshotEvent::{
+            BaseWalletCash, EthereumCash, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
+        };
 
         match event {
             OnchainEquity { balances, .. } => {
@@ -651,7 +658,10 @@ impl Reactor for RebalancingTrigger {
     ) -> Result<(), Self::Error> {
         event
             .on(|symbol, event| async move {
-                use PositionEvent::*;
+                use PositionEvent::{
+                    Initialized, OffChainOrderFailed, OffChainOrderFilled, OffChainOrderPlaced,
+                    OnChainOrderFilled, ThresholdUpdated,
+                };
 
                 let timestamp = event.timestamp();
                 let (equity_update, usdc_update) = match &event {
@@ -898,6 +908,11 @@ impl RebalancingTrigger {
         id: IssuerRequestId,
         event: TokenizedEquityMintEvent,
     ) -> Result<(), RebalancingTriggerError> {
+        use TokenizedEquityMintEvent::{
+            DepositedIntoRaindex, MintAcceptanceFailed, MintAccepted, MintRejected, MintRequested,
+            RaindexDepositFailed, TokensReceived, TokensWrapped, WrappingFailed,
+        };
+
         if let Some((symbol, quantity)) = Self::extract_mint_info(&event) {
             self.mint_tracking
                 .write()
@@ -909,8 +924,6 @@ impl RebalancingTrigger {
             warn!(id = %id, "Mint event for untracked aggregate");
             return Ok(());
         };
-
-        use TokenizedEquityMintEvent::*;
 
         let update = match &event {
             MintAccepted { .. } => Some(Inventory::transfer(
@@ -961,6 +974,11 @@ impl RebalancingTrigger {
         id: RedemptionAggregateId,
         event: EquityRedemptionEvent,
     ) -> Result<(), RebalancingTriggerError> {
+        use EquityRedemptionEvent::{
+            Completed, Detected, DetectionFailed, RedemptionRejected, TokensSent, TokensUnwrapped,
+            TransferFailed, WithdrawnFromRaindex,
+        };
+
         if let Some((symbol, quantity)) = Self::extract_redemption_info(&event) {
             self.redemption_tracking
                 .write()
@@ -973,8 +991,6 @@ impl RebalancingTrigger {
             warn!(id = %id, "Redemption event for untracked aggregate");
             return Ok(());
         };
-
-        use EquityRedemptionEvent::*;
 
         let update = match &event {
             WithdrawnFromRaindex { .. } => Some(Inventory::transfer(
@@ -1030,7 +1046,7 @@ impl RebalancingTrigger {
     }
 
     fn extract_mint_info(event: &TokenizedEquityMintEvent) -> Option<(Symbol, FractionalShares)> {
-        use TokenizedEquityMintEvent::*;
+        use TokenizedEquityMintEvent::MintRequested;
 
         if let MintRequested {
             symbol, quantity, ..
@@ -1043,7 +1059,10 @@ impl RebalancingTrigger {
     }
 
     fn is_terminal_mint_event(event: &TokenizedEquityMintEvent) -> bool {
-        use TokenizedEquityMintEvent::*;
+        use TokenizedEquityMintEvent::{
+            DepositedIntoRaindex, MintAcceptanceFailed, MintAccepted, MintRejected, MintRequested,
+            RaindexDepositFailed, TokensReceived, TokensWrapped, WrappingFailed,
+        };
 
         match event {
             DepositedIntoRaindex { .. }
@@ -1062,7 +1081,7 @@ impl RebalancingTrigger {
     fn extract_redemption_info(
         event: &EquityRedemptionEvent,
     ) -> Option<(Symbol, FractionalShares)> {
-        use EquityRedemptionEvent::*;
+        use EquityRedemptionEvent::WithdrawnFromRaindex;
 
         if let WithdrawnFromRaindex {
             symbol, quantity, ..
@@ -1075,7 +1094,10 @@ impl RebalancingTrigger {
     }
 
     fn is_terminal_redemption_event(event: &EquityRedemptionEvent) -> bool {
-        use EquityRedemptionEvent::*;
+        use EquityRedemptionEvent::{
+            Completed, Detected, DetectionFailed, RedemptionRejected, TokensSent, TokensUnwrapped,
+            TransferFailed, WithdrawnFromRaindex,
+        };
 
         match event {
             Completed { .. }
@@ -1091,7 +1113,10 @@ impl RebalancingTrigger {
     }
 
     fn is_terminal_usdc_rebalance_event(event: &UsdcRebalanceEvent) -> bool {
-        use UsdcRebalanceEvent::*;
+        use UsdcRebalanceEvent::{
+            BridgingFailed, ConversionConfirmed, ConversionFailed, DepositConfirmed, DepositFailed,
+            WithdrawalFailed,
+        };
 
         matches!(
             event,
@@ -1160,6 +1185,7 @@ mod tests {
                     vault_id: None,
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),
@@ -3987,7 +4013,7 @@ mod tests {
     /// When inventory polling starts:
     /// 1. Onchain equity is polled first
     /// 2. Trigger fires with onchain=X, offchain=0 (not yet polled)
-    /// 3. Ratio = X/(X+0) = 100% -> detects "TooMuchOnchain" -> Redemption
+    /// 3. Ratio = X/(X+0) = 100% -> detects "`TooMuchOnchain`" -> Redemption
     ///
     /// This is WRONG because offchain hasn't been polled yet, not because
     /// there's actually no offchain inventory.

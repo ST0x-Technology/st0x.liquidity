@@ -11,6 +11,7 @@ use tracing::{error, info};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
+use st0x_finance::{HasZero, Positive, Usd};
 
 use super::job::work;
 use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
@@ -19,7 +20,9 @@ use super::{
     spawn_periodic_accumulated_position_check,
 };
 use crate::config::Ctx;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingConfig};
+use crate::inventory::{
+    InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingConfig,
+};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
@@ -131,14 +134,28 @@ where
             order_owner,
         ));
 
+        let reserved_cash = self
+            .common
+            .ctx
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.reserved)
+            .map_or(Usd::ZERO, Positive::inner);
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: self.common.ctx.evm.orderbook,
+            owner: order_owner,
+        };
+
         let polling_service = InventoryPollingService::new(
             raindex_service,
             self.common.executor.clone(),
             self.common.frameworks.vault_registry.clone(),
-            self.common.ctx.evm.orderbook,
-            order_owner,
+            snapshot_id,
             self.common.frameworks.snapshot,
             self.common.wallet_polling,
+            reserved_cash,
         );
 
         let inventory_poller = Some(spawn_inventory_poller(

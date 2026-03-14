@@ -1,6 +1,6 @@
 //! Integration tests for the inventory rebalancing pipeline: position changes
-//! flow through the RebalancingTrigger (wired as a CQRS query processor),
-//! update the InventoryView, detect equity or USDC imbalances, and dispatch
+//! flow through the `RebalancingTrigger` (wired as a CQRS query processor),
+//! update the `InventoryView`, detect equity or USDC imbalances, and dispatch
 //! operations through the Rebalancer to drive mints, redemptions, and USDC
 //! transfers to completion.
 
@@ -56,7 +56,7 @@ use crate::wrapper::mock::MockWrapper;
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
-/// Seeds the VaultRegistry with the given token address and a deterministic
+/// Seeds the `VaultRegistry` with the given token address and a deterministic
 /// vault ID derived from the symbol.
 async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address) {
     let vault_id = B256::from(keccak256(symbol.to_string().as_bytes()));
@@ -79,8 +79,8 @@ async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address)
     .unwrap();
 }
 
-/// Uses Anvil snapshot/revert to discover the deterministic tx_hash that will
-/// be produced by an ERC20 transfer. Anvil is deterministic: same sender +
+/// Uses Anvil snapshot/revert to discover the deterministic `tx_hash` that will
+/// be produced by an `ERC20` transfer. Anvil is deterministic: same sender +
 /// nonce + calldata = same tx_hash.
 async fn discover_deterministic_tx_hash(
     provider: &impl Provider,
@@ -135,6 +135,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
                 vault_id: None,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
+                reserved: None,
             }),
         },
         disabled_assets: HashSet::new(),
@@ -142,8 +143,8 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
 }
 
 /// Mirrors the private `build_position_cqrs()` from `src/conductor/mod.rs`,
-/// wiring the RebalancingTrigger as a Position CQRS query processor so that
-/// position events flow through trigger.dispatch() -> inventory update.
+/// wiring the `RebalancingTrigger` as a `Position` CQRS query processor so that
+/// position events flow through `trigger.dispatch()` -> inventory update.
 async fn build_position_cqrs_with_trigger(
     pool: &SqlitePool,
     trigger: &Arc<RebalancingTrigger>,
@@ -158,7 +159,7 @@ async fn build_position_cqrs_with_trigger(
 }
 
 /// Shared state for equity rebalancing tests (mint and redemption) that
-/// wires up the Position CQRS with a RebalancingTrigger as a query processor.
+/// wires up the `Position` CQRS with a `RebalancingTrigger` as a query processor.
 struct EquityTriggerFixture {
     pool: SqlitePool,
     symbol: Symbol,
@@ -211,7 +212,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
 }
 
 /// Creates httpmock responses for the Alpaca tokenization API detection and
-/// completion polling endpoints, matching the given tx_hash.
+/// completion polling endpoints, matching the given `tx_hash`.
 fn setup_redemption_mocks(server: &MockServer, expected_tx_hash: TxHash) -> (Mock<'_>, Mock<'_>) {
     let detection_mock = server.mock(|when, then| {
         when.method(GET)
@@ -405,10 +406,10 @@ fn build_equity_transfer_with_wrapper(
 }
 
 /// Verifies the full equity mint rebalancing pipeline: position CQRS commands
-/// flow through the RebalancingTrigger (registered as a Query processor),
-/// update the InventoryView, detect an equity imbalance, and dispatch a Mint
-/// operation through the Rebalancer to the CrossVenueEquityTransfer which
-/// drives the TokenizedEquityMint aggregate to completion via the Alpaca
+/// flow through the `RebalancingTrigger` (registered as a Query processor),
+/// update the `InventoryView`, detect an equity imbalance, and dispatch a Mint
+/// operation through the `Rebalancer` to the `CrossVenueEquityTransfer` which
+/// drives the `TokenizedEquityMint` aggregate to completion via the Alpaca
 /// tokenization API.
 #[tokio::test]
 async fn equity_offchain_imbalance_triggers_mint() {
@@ -643,13 +644,13 @@ async fn equity_offchain_imbalance_triggers_mint() {
 }
 
 /// Verifies the full equity redemption rebalancing pipeline: position CQRS
-/// commands flow through the RebalancingTrigger, detect too much onchain equity,
-/// and dispatch a Redemption operation through the Rebalancer to the real
-/// CrossVenueEquityTransfer. The transfer sends tokens on Anvil, then drives the
-/// EquityRedemption aggregate through TokensSent -> Detected -> Completed via
+/// commands flow through the `RebalancingTrigger`, detect too much onchain equity,
+/// and dispatch a Redemption operation through the `Rebalancer` to the real
+/// `CrossVenueEquityTransfer`. The transfer sends tokens on Anvil, then drives the
+/// `EquityRedemption` aggregate through `TokensSent` -> `Detected` -> `Completed` via
 /// the mocked Alpaca tokenization API.
 ///
-/// Uses Anvil snapshot/revert to discover the deterministic tx_hash before
+/// Uses Anvil snapshot/revert to discover the deterministic `tx_hash` before
 /// setting up httpmock responses, so the mock detection endpoint can match
 /// the exact hash produced by the real onchain transfer.
 #[tokio::test]
@@ -866,8 +867,8 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 }
 
 /// Verifies USDC rebalancing dispatch: a USDC imbalance triggers the
-/// RebalancingTrigger to send a UsdcAlpacaToBase operation through the channel
-/// to the Rebalancer, which dispatches to the USDC manager. Uses mocked managers
+/// `RebalancingTrigger` to send a `UsdcAlpacaToBase` operation through the channel
+/// to the `Rebalancer`, which dispatches to the USDC manager. Uses mocked managers
 /// since the real USDC flow requires CCTP bridge and vault transactions.
 #[tokio::test]
 async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
@@ -940,7 +941,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
 }
 
 /// Verifies USDC onchain imbalance dispatch: 900 onchain / 100 offchain = 90%
-/// onchain ratio (above 70% upper bound) triggers a UsdcBaseToAlpaca operation
+/// onchain ratio (above 70% upper bound) triggers a `UsdcBaseToAlpaca` operation
 /// with excess = 900 - 500 = $400.
 #[tokio::test]
 async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
@@ -1011,7 +1012,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     );
 }
 
-/// Verifies that setting `usdc: None` in RebalancingTriggerConfig
+/// Verifies that setting `usdc: None` in `RebalancingTriggerConfig`
 /// disables USDC rebalancing entirely: even with a severe imbalance,
 /// `check_and_trigger_usdc` dispatches no operations.
 #[tokio::test]
@@ -1211,6 +1212,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+            reserved: None,
         }),
     };
 
@@ -1339,6 +1341,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+            reserved: None,
         }),
     };
     let config = RebalancingTriggerConfig {
@@ -1453,6 +1456,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     vault_id: None,
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),
@@ -1508,6 +1512,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     vault_id: None,
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),

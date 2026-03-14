@@ -2,8 +2,8 @@
 //! snapshot events.
 //!
 //! This service polls onchain vaults and offchain broker accounts to fetch
-//! actual inventory balances, then emits InventorySnapshotCommands to record
-//! the fetched values. The InventoryView reacts to these events to reconcile
+//! actual inventory balances, then emits `InventorySnapshotCommand`s to record
+//! the fetched values. The `InventoryView` reacts to these events to reconcile
 //! tracked inventory.
 
 use alloy::primitives::Address;
@@ -11,11 +11,12 @@ use alloy::providers::RootProvider;
 use futures_util::future::try_join_all;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{Executor, InventoryResult};
+use st0x_finance::Usd;
 
 use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
@@ -36,7 +37,7 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
     SnapshotAggregate(#[from] SendError<InventorySnapshot>),
     #[error(transparent)]
-    VaultRegistry(#[from] SendError<VaultRegistry>),
+    VaultRegistry(#[from] Box<SendError<VaultRegistry>>),
     #[error(transparent)]
     Evm(#[from] EvmError),
     #[error(transparent)]
@@ -46,6 +47,8 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
         expected: Vec<Address>,
         actual: Vec<Address>,
     },
+    #[error("cash reserve {reserved} overflows when converting to cents")]
+    ReserveCentsOverflow { reserved: Usd },
 }
 
 pub(crate) struct WalletPollingConfig {
@@ -61,10 +64,10 @@ where
     raindex_service: Arc<RaindexService<Chain>>,
     executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
-    orderbook: Address,
-    order_owner: Address,
+    snapshot_id: InventorySnapshotId,
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: WalletPollingConfig,
+    reserved_cash: Usd,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -76,19 +79,19 @@ where
         raindex_service: Arc<RaindexService<Chain>>,
         executor: Exe,
         vault_registry: Arc<Store<VaultRegistry>>,
-        orderbook: Address,
-        order_owner: Address,
+        snapshot_id: InventorySnapshotId,
         snapshot: Arc<Store<InventorySnapshot>>,
         wallet_polling: WalletPollingConfig,
+        reserved_cash: Usd,
     ) -> Self {
         Self {
             raindex_service,
             executor,
             vault_registry,
-            orderbook,
-            order_owner,
+            snapshot_id,
             snapshot,
             wallet_polling,
+            reserved_cash,
         }
     }
 
@@ -100,15 +103,10 @@ where
     ///
     /// Registered queries are dispatched when commands are executed.
     pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<Exe::Error>> {
-        let snapshot_id = InventorySnapshotId {
-            orderbook: self.orderbook,
-            owner: self.order_owner,
-        };
-
-        self.poll_onchain(&snapshot_id).await?;
-        self.poll_ethereum_cash(&snapshot_id).await?;
-        self.poll_base_wallet_cash(&snapshot_id).await?;
-        self.poll_offchain(&snapshot_id).await?;
+        self.poll_onchain(&self.snapshot_id).await?;
+        self.poll_ethereum_cash(&self.snapshot_id).await?;
+        self.poll_base_wallet_cash(&self.snapshot_id).await?;
+        self.poll_offchain(&self.snapshot_id).await?;
 
         Ok(())
     }
@@ -134,11 +132,15 @@ where
         &self,
     ) -> Result<Option<VaultRegistry>, InventoryPollingError<Exe::Error>> {
         let vault_registry_id = VaultRegistryId {
-            orderbook: self.orderbook,
-            owner: self.order_owner,
+            orderbook: self.snapshot_id.orderbook,
+            owner: self.snapshot_id.owner,
         };
 
-        Ok(self.vault_registry.load(&vault_registry_id).await?)
+        Ok(self
+            .vault_registry
+            .load(&vault_registry_id)
+            .await
+            .map_err(Box::new)?)
     }
 
     async fn poll_onchain_equity(
@@ -156,7 +158,7 @@ where
         let balance_futures = registry.equity_vaults.values().map(|vault| async {
             self.raindex_service
                 .get_equity_balance::<OpenChainErrorRegistry>(
-                    self.order_owner,
+                    self.snapshot_id.owner,
                     vault.token,
                     RaindexVaultId(vault.vault_id),
                 )
@@ -203,7 +205,7 @@ where
         let usdc_balance = self
             .raindex_service
             .get_usdc_balance::<OpenChainErrorRegistry>(
-                self.order_owner,
+                self.snapshot_id.owner,
                 RaindexVaultId(usdc_vault.vault_id),
             )
             .await?;
@@ -306,16 +308,43 @@ where
             )
             .await?;
 
+        let cash_balance_cents = self.apply_cash_reserve(inventory.cash_balance_cents)?;
+
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::OffchainCash {
-                    cash_balance_cents: inventory.cash_balance_cents,
-                },
+                InventorySnapshotCommand::OffchainCash { cash_balance_cents },
             )
             .await?;
 
         Ok(())
+    }
+
+    /// Subtracts the configured cash reserve from the raw broker balance,
+    /// flooring at zero if the reserve exceeds the balance.
+    fn apply_cash_reserve(
+        &self,
+        raw_balance_cents: i64,
+    ) -> Result<i64, InventoryPollingError<Exe::Error>> {
+        if self.reserved_cash.is_zero() {
+            return Ok(raw_balance_cents);
+        }
+
+        let reserve_cents =
+            self.reserved_cash
+                .to_cents()
+                .ok_or(InventoryPollingError::ReserveCentsOverflow {
+                    reserved: self.reserved_cash,
+                })?;
+
+        let available_cents = raw_balance_cents.saturating_sub(reserve_cents).max(0);
+
+        info!(
+            raw_balance_cents,
+            reserve_cents, available_cents, "Applied cash reserve to offchain balance"
+        );
+
+        Ok(available_cents)
     }
 }
 
@@ -335,6 +364,7 @@ mod tests {
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
+    use st0x_finance::HasZero;
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
@@ -490,13 +520,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -541,13 +574,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -588,13 +624,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -625,13 +664,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         // Should succeed without error
@@ -684,13 +726,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -735,13 +780,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -780,13 +828,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -813,16 +864,15 @@ mod tests {
 
     async fn discover_equity_vault(
         pool: &SqlitePool,
-        orderbook: Address,
-        order_owner: Address,
+        snapshot_id: InventorySnapshotId,
         token: Address,
         vault_id: B256,
         symbol: Symbol,
     ) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
-            orderbook,
-            owner: order_owner,
+            orderbook: snapshot_id.orderbook,
+            owner: snapshot_id.owner,
         };
 
         store
@@ -877,13 +927,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -930,13 +983,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -965,8 +1021,10 @@ mod tests {
         // Only discover an equity vault so registry is Live but has no USDC vault
         discover_equity_vault(
             &pool,
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             TEST_TOKEN,
             TEST_VAULT_ID,
             test_symbol("AAPL"),
@@ -984,13 +1042,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1017,8 +1078,10 @@ mod tests {
 
         discover_equity_vault(
             &pool,
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             TEST_TOKEN,
             TEST_VAULT_ID,
             test_symbol("AAPL"),
@@ -1036,13 +1099,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1071,13 +1137,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1088,7 +1157,7 @@ mod tests {
         );
     }
 
-    /// Loads all InventorySnapshotEvents for the given orderbook/owner from the event store.
+    /// Loads all `InventorySnapshotEvent`s for the given orderbook/owner from the event store.
     async fn load_snapshot_events(
         pool: &SqlitePool,
         orderbook: Address,
@@ -1102,7 +1171,7 @@ mod tests {
         load_events_for_aggregate(pool, &aggregate_id).await
     }
 
-    /// Loads InventorySnapshot events for a specific aggregate ID from the SQLite event store.
+    /// Loads `InventorySnapshot` events for a specific aggregate ID from the `SQLite` event store.
     async fn load_events_for_aggregate(
         pool: &SqlitePool,
         aggregate_id: &str,
@@ -1147,13 +1216,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: Some(ethereum_wallet),
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1190,13 +1262,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: Some(base_wallet),
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1229,13 +1304,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1269,13 +1347,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: None,
             },
+            Usd::ZERO,
         );
 
         service.poll_and_record().await.unwrap();
@@ -1312,13 +1393,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: Some(ethereum_wallet),
                 base: None,
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -1342,13 +1426,16 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             WalletPollingConfig {
                 ethereum: None,
                 base: Some(base_wallet),
             },
+            Usd::ZERO,
         );
 
         let error = service.poll_and_record().await.unwrap_err();
