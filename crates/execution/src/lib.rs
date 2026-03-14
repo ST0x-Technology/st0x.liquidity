@@ -128,8 +128,13 @@ pub trait Executor: Send + Sync + 'static {
     /// Used for database storage and conditional logic
     fn to_supported_executor(&self) -> SupportedExecutor;
 
-    /// Convert a string representation to the executor's OrderId type
-    /// This is needed for converting database-stored order IDs back to executor types
+    /// Convert a string representation to the executor's `OrderId` type.
+    /// This is needed for converting database-stored order IDs back
+    /// to executor types.
+    ///
+    /// # Errors
+    ///
+    /// Returns the executor's error type if parsing fails.
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error>;
 
     /// Run executor-specific maintenance tasks (token refresh, connection health, etc.)
@@ -177,11 +182,17 @@ impl From<SharesConversionError> for InvalidSharesError {
 /// Share quantity newtype wrapper with validation
 ///
 /// Represents whole share quantities with bounds checking.
-/// Values are constrained to 1..=u32::MAX for practical trading limits.
+/// Values are constrained to `1..=u32::MAX` for practical trading limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Shares(u32);
 
 impl Shares {
+    /// Creates a new `Shares` from a `u64` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidSharesError`] if the value is zero or
+    /// exceeds `u32::MAX`.
     pub fn new(shares: u64) -> Result<Self, InvalidSharesError> {
         if shares == 0 {
             return Err(InvalidSharesError::Zero);
@@ -189,6 +200,7 @@ impl Shares {
         Ok(Self(u32::try_from(shares)?))
     }
 
+    #[must_use]
     pub fn value(&self) -> u32 {
         self.0
     }
@@ -226,6 +238,7 @@ pub enum SupportedExecutor {
 
 impl SupportedExecutor {
     /// Returns whether this executor supports fractional share orders.
+    #[must_use]
     pub const fn supports_fractional_shares(self) -> bool {
         match self {
             Self::Schwab => false,
@@ -274,6 +287,7 @@ pub enum Direction {
 }
 
 impl Direction {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Buy => "BUY",

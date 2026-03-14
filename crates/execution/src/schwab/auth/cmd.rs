@@ -7,10 +7,12 @@ use super::super::encryption::EncryptedToken;
 pub struct AccessToken(String);
 
 impl AccessToken {
+    #[must_use]
     pub fn new(token: String) -> Self {
         Self(token)
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -26,10 +28,12 @@ impl AsRef<str> for AccessToken {
 pub struct RefreshToken(String);
 
 impl RefreshToken {
+    #[must_use]
     pub fn new(token: String) -> Self {
         Self(token)
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }

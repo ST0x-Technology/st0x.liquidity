@@ -14,6 +14,7 @@ tarpaulin-report.html
 .sqlx/
 .idea/
 .worktrees/
+.local/
 out/
 cache/
 .tmp/

@@ -115,6 +115,12 @@ pub enum SchwabError {
     FloatConversion(#[from] FloatError),
 }
 
+/// Extracts the authorization code from a Schwab OAuth redirect URL.
+///
+/// # Errors
+///
+/// Returns [`SchwabError`] if the URL is invalid or the `code`
+/// query parameter is missing.
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {
     let parsed_url = url::Url::parse(url)?;
 

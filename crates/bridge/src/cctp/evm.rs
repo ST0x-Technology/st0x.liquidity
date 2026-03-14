@@ -27,9 +27,9 @@ sol!(
 pub(crate) struct CctpEndpoint<W: Wallet> {
     /// USDC token address
     usdc_address: Address,
-    /// TokenMessengerV2 contract address
+    /// `TokenMessengerV2` contract address
     token_messenger_address: Address,
-    /// MessageTransmitterV2 contract address
+    /// `MessageTransmitterV2` contract address
     message_transmitter_address: Address,
     /// Wallet for submitting write transactions
     wallet: W,

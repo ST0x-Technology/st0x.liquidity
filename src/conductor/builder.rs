@@ -11,6 +11,7 @@ use tracing::{error, info};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
+use st0x_finance::{HasZero, Positive, Usd};
 
 use super::job::work;
 use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
@@ -19,7 +20,9 @@ use super::{
     spawn_periodic_accumulated_position_check,
 };
 use crate::config::Ctx;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
+use crate::inventory::{
+    InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
+};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;

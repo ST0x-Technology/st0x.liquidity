@@ -22,7 +22,7 @@
 //!
 //! - **Flat command handling**: A single `handle` method receives
 //!   all commands regardless of lifecycle state. Implementors
-//!   must manually match on (lifecycle_state, command) tuples,
+//!   must manually match on (`lifecycle_state`, `command`) tuples,
 //!   making it easy to accidentally reference state during
 //!   initialization or forget to handle a case.
 //!
@@ -220,6 +220,10 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     ///   (becomes [`LifecycleError::UnexpectedEvent`])
     /// - `Err(error)` -- domain error during application
     ///   (becomes [`LifecycleError::Apply`])
+    ///
+    /// # Errors
+    ///
+    /// Returns `Self::Error` on domain failures during event application.
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error>;
 
     /// Handle a command when the entity doesn't exist yet.
@@ -289,6 +293,10 @@ impl<Entity: EventSourced> Store<Entity> {
     /// - Uninitialized -> `Entity::initialize`
     /// - Live -> `Entity::transition`
     /// - Failed -> returns the stored error
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError` on lifecycle errors or infrastructure failures.
     pub async fn send(
         &self,
         id: &Entity::Id,
@@ -306,6 +314,11 @@ impl<Entity: EventSourced> Store<Entity> {
     /// - `Ok(Some(entity))` if the entity is live
     /// - `Ok(None)` if the entity has not been initialized
     /// - `Err` if the entity is in a failed lifecycle state or on infrastructure error
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError` if the entity is in a failed lifecycle state or
+    /// on infrastructure error.
     pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, SendError<Entity>> {
         let context = self.event_store.load_aggregate(&id.to_string()).await?;
 
@@ -317,6 +330,10 @@ impl<Entity: EventSourced> Store<Entity> {
     ///
     /// Useful in test/CLI contexts where you only need to read
     /// aggregate state and never send commands.
+    /// # Errors
+    ///
+    /// Returns `SendError` if event store loading or lifecycle
+    /// reconstruction fails.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn load_from_pool(
         pool: SqlitePool,

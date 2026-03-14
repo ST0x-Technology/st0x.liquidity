@@ -116,7 +116,10 @@ pub enum JournalStatus {
 
 impl std::fmt::Display for JournalStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use JournalStatus::*;
+        use JournalStatus::{
+            Canceled, Correct, Deleted, Executed, Pending, Queued, Refused, Rejected,
+            SentToClearing,
+        };
 
         match self {
             Queued => write!(f, "queued"),
