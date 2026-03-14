@@ -1873,6 +1873,67 @@ The system tracks two separate inventory categories:
    - Offchain: USDC in Alpaca account
    - Single global ratio (not per-symbol)
 
+##### Asset Location Topology
+
+Assets flow between locations during trading, minting, redemption, and USDC
+rebalancing. The system tracks balances at each location to maintain accurate
+inventory accounting.
+
+```mermaid
+graph LR
+    subgraph Alpaca
+        USD[USD]
+        USDC_USD[USDC/USD]
+        SPYM_pos[SPYM position]
+        STOCK_pos[STOCK position]
+    end
+
+    subgraph Ethereum
+        ETH_USDC[USDC balance]
+        ETH_CCTP[CCTP bridge]
+    end
+
+    subgraph Base["Base (wallet)"]
+        BASE_USDC[USDC balance]
+        BASE_tSPYM[tSPYM]
+        BASE_tSTOCK[tSTOCK]
+        BASE_wtSPYM[wtSPYM]
+        BASE_wtSTOCK[wtSTOCK]
+        BASE_CCTP[CCTP bridge]
+    end
+
+    subgraph Raindex["Base (Raindex vaults)"]
+        VAULT_USDC[USDC]
+        VAULT_wtSPYM[wtSPYM]
+        VAULT_wtSTOCK[wtSTOCK]
+    end
+
+    USDC_USD <-->|conversion| ETH_USDC
+    ETH_USDC <-->|CCTP bridge| ETH_CCTP
+    ETH_CCTP <-->|attestation| BASE_CCTP
+    BASE_CCTP <-->|CCTP bridge| BASE_USDC
+    BASE_USDC <-->|deposit/withdraw| VAULT_USDC
+
+    BASE_tSPYM <-->|wrap/unwrap| BASE_wtSPYM
+    BASE_tSTOCK <-->|wrap/unwrap| BASE_wtSTOCK
+    BASE_wtSPYM <-->|deposit/withdraw| VAULT_wtSPYM
+    BASE_wtSTOCK <-->|deposit/withdraw| VAULT_wtSTOCK
+```
+
+**Primary venues** (where inventory is actively used):
+
+- **Raindex vaults** (onchain): USDC and wrapped equity tokens (wtSPYM, wtSTOCK)
+  used for market making
+- **Alpaca** (offchain): USD cash and equity positions (SPYM, STOCK) used for
+  hedging
+
+**In-flight locations** (intermediate points during transfers):
+
+- **Ethereum wallet**: USDC in transit during CCTP bridging
+- **Base wallet**: USDC, unwrapped tokens (tSPYM), or wrapped tokens (wtSPYM)
+  not yet deposited into Raindex vaults
+- **Alpaca crypto wallet**: USDC pending conversion to/from USD
+
 ##### Imbalance Detection
 
 InventoryView calculates imbalances after each position or rebalancing event by
