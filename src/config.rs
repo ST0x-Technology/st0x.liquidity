@@ -20,7 +20,7 @@ use st0x_execution::{
     AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
     TimeInForce,
 };
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
@@ -69,6 +69,9 @@ pub struct CashAssetConfig {
     pub vault_id: Option<B256>,
     pub rebalancing: OperationMode,
     pub operational_limit: Option<Positive<Usdc>>,
+    /// USD amount subtracted from offchain cash to compute available balance.
+    /// Prevents the system from rebalancing funds that should remain untouched.
+    pub reserved: Option<Positive<Usd>>,
 }
 
 /// Equity assets configuration with an optional global operational limit.
@@ -182,8 +185,8 @@ enum BrokerSecrets {
 
 /// Encodes the two mutually exclusive operating modes at the type level.
 ///
-/// `Standalone`: order_owner comes from config, no rebalancing.
-/// `Rebalancing`: order_owner resolved from the wallet at runtime.
+/// `Standalone`: `order_owner` comes from config, no rebalancing.
+/// `Rebalancing`: `order_owner` resolved from the wallet at runtime.
 #[derive(Clone, Debug)]
 pub enum TradingMode {
     Standalone { order_owner: Address },
@@ -393,6 +396,11 @@ impl From<&LogLevel> for Level {
 }
 
 impl Ctx {
+    /// Load and parse config and secrets files into a runtime context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CtxError` if files cannot be read or parsed.
     pub async fn load_files(config_path: &Path, secrets_path: &Path) -> Result<Self, CtxError> {
         let config_str = tokio::fs::read_to_string(config_path)
             .await
@@ -504,6 +512,11 @@ impl Ctx {
         })
     }
 
+    /// Create and configure a SQLite connection pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `sqlx::Error` if the pool cannot be created.
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
         configure_sqlite_pool(&self.database_url).await
     }
@@ -2104,16 +2117,16 @@ pub(crate) mod tests {
             /// zero-filled on the left to 64 chars.
             #[test]
             fn padded_b256_roundtrip(hex_digits in arb_hex_digits()) {
-                let toml_str = format!(
-                    r#"vault_id = "0x{hex_digits}""#,
-                );
-
                 #[derive(Deserialize)]
                 #[serde(rename_all = "snake_case")]
                 struct Wrapper {
                     #[serde(deserialize_with = "deserialize_padded_b256")]
                     vault_id: Option<B256>,
                 }
+
+                let toml_str = format!(
+                    r#"vault_id = "0x{hex_digits}""#,
+                );
 
                 let wrapper: Wrapper = toml::from_str(&toml_str).unwrap();
                 let parsed = wrapper.vault_id.unwrap();
@@ -2129,17 +2142,17 @@ pub(crate) mod tests {
                 bad_char in "[g-zG-Z!@#$%^&*]",
                 prefix in arb_hex_digits(),
             ) {
-                let hex_str = format!("{prefix}{bad_char}");
-                let toml_str = format!(
-                    r#"vault_id = "0x{hex_str}""#,
-                );
-
                 #[derive(Debug, Deserialize)]
                 #[serde(rename_all = "snake_case")]
                 struct Wrapper {
                     #[serde(deserialize_with = "deserialize_padded_b256")]
                     vault_id: Option<B256>,
                 }
+
+                let hex_str = format!("{prefix}{bad_char}");
+                let toml_str = format!(
+                    r#"vault_id = "0x{hex_str}""#,
+                );
 
                 let result = toml::from_str::<Wrapper>(&toml_str);
                 prop_assert!(
@@ -2180,13 +2193,13 @@ pub(crate) mod tests {
                         value != "enabled" && value != "disabled"
                     })
             ) {
-                let toml_str = format!(r#"mode = "{invalid}""#);
-
                 #[derive(Debug, Deserialize)]
                 struct Wrapper {
                     #[allow(dead_code)]
                     mode: OperationMode,
                 }
+
+                let toml_str = format!(r#"mode = "{invalid}""#);
 
                 let result = toml::from_str::<Wrapper>(&toml_str);
                 prop_assert!(
@@ -2278,8 +2291,6 @@ pub(crate) mod tests {
 
         #[test]
         fn padded_b256_rejects_empty_hex() {
-            let toml_str = r#"vault_id = "0x""#;
-
             #[derive(Debug, Deserialize)]
             #[serde(rename_all = "snake_case")]
             struct Wrapper {
@@ -2287,6 +2298,8 @@ pub(crate) mod tests {
                 #[allow(dead_code)]
                 vault_id: Option<B256>,
             }
+
+            let toml_str = r#"vault_id = "0x""#;
 
             let result = toml::from_str::<Wrapper>(toml_str);
             assert!(
@@ -2297,9 +2310,6 @@ pub(crate) mod tests {
 
         #[test]
         fn padded_b256_rejects_too_long_hex() {
-            let long_hex = "a".repeat(65);
-            let toml_str = format!(r#"vault_id = "0x{long_hex}""#);
-
             #[derive(Debug, Deserialize)]
             #[serde(rename_all = "snake_case")]
             struct Wrapper {
@@ -2307,6 +2317,9 @@ pub(crate) mod tests {
                 #[allow(dead_code)]
                 vault_id: Option<B256>,
             }
+
+            let long_hex = "a".repeat(65);
+            let toml_str = format!(r#"vault_id = "0x{long_hex}""#);
 
             let result = toml::from_str::<Wrapper>(&toml_str);
             assert!(

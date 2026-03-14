@@ -4,7 +4,7 @@
 //!
 //! - [`Evm`] -- read-only chain access with error-decoded view calls.
 //!   Provides the underlying provider and a `call` method that
-//!   automatically decodes Solidity revert data via the OpenChain
+//!   automatically decodes Solidity revert data via the `OpenChain`
 //!   selector registry.
 //!
 //! - [`Wallet`] -- extends `Evm` with a signing identity and
@@ -186,7 +186,7 @@ pub trait Evm: Send + Sync + 'static {
     ///
     /// Encodes the call via `SolCall::abi_encode()`, runs `eth_call`,
     /// decodes the return value on success, and decodes the Solidity
-    /// error via the OpenChain selector registry on revert.
+    /// error via the `OpenChain` selector registry on revert.
     async fn call<Registry: IntoErrorRegistry, Call: SolCall + Send>(
         &self,
         contract: Address,

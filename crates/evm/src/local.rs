@@ -66,6 +66,10 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
     /// The base provider is cloned and stored separately for read-only
     /// access. A second copy is wrapped with gas, nonce, chain ID, and
     /// wallet fillers for transaction signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvmError`] if the private key is invalid.
     pub fn new(
         private_key: &B256,
         provider: P,

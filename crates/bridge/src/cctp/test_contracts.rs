@@ -1,7 +1,7 @@
 //! CCTP contract deployment for tests.
 //!
-//! Deploys Circle's CCTP V2 contracts (TokenMessengerV2, MessageTransmitterV2,
-//! TokenMinterV2) and MockMintBurnToken on plain Anvil instances. This allows
+//! Deploys Circle's CCTP V2 contracts (`TokenMessengerV2`, `MessageTransmitterV2`,
+//! `TokenMinterV2`) and `MockMintBurnToken` on plain Anvil instances. This allows
 //! testing the full USDC bridge pipeline without forking mainnet.
 
 use alloy::network::EthereumWallet;
@@ -78,10 +78,14 @@ pub struct DeployedCctpChain {
 /// Deploys all CCTP contracts on the given Anvil endpoint and returns their
 /// addresses.
 ///
-/// Deploys MockMintBurnToken (USDC), TokenMinterV2, MessageTransmitterV2
-/// (behind AdminUpgradableProxy), and TokenMessengerV2 (behind
-/// AdminUpgradableProxy). The provided attester address is enrolled and
+/// Deploys `MockMintBurnToken` (USDC), `TokenMinterV2`, `MessageTransmitterV2`
+/// (behind `AdminUpgradableProxy`), and `TokenMessengerV2` (behind
+/// `AdminUpgradableProxy`). The provided attester address is enrolled and
 /// the signature threshold set to 1.
+///
+/// # Errors
+///
+/// Returns an error if contract deployment or configuration transactions fail.
 pub async fn deploy_cctp_on_chain(
     endpoint: &str,
     deployer_key: &B256,
@@ -182,6 +186,10 @@ pub async fn deploy_cctp_on_chain(
 /// Sets its max burn amount. Used when the bot's USDC address (e.g.
 /// `USDC_BASE`) differs from the `MockMintBurnToken` deployed by
 /// `deploy_cctp_on_chain`.
+///
+/// # Errors
+///
+/// Returns an error if the burn amount configuration transaction fails.
 pub async fn set_max_burn_amount(
     endpoint: &str,
     deployer_key: &B256,
@@ -209,6 +217,11 @@ pub async fn set_max_burn_amount(
 
 /// Links two CCTP deployments so they recognize each other as remote
 /// chains and can bridge tokens between them.
+///
+/// # Errors
+///
+/// Returns an error if remote messenger or token pair linking transactions
+/// fail.
 pub async fn link_chains(
     ethereum_endpoint: &str,
     base_endpoint: &str,
@@ -312,7 +325,11 @@ async fn link_token_pair(
     Ok(())
 }
 
-/// Mints USDC (MockMintBurnToken) to a recipient on the given chain.
+/// Mints USDC (`MockMintBurnToken`) to a recipient on the given chain.
+///
+/// # Errors
+///
+/// Returns an error if the mint transaction fails.
 pub async fn mint_usdc(
     endpoint: &str,
     deployer_key: &B256,

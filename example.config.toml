@@ -10,7 +10,6 @@ deployment_block = 1
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 equity = { target = 0.5, deviation = 0.2 }
-usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
 # Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
@@ -24,6 +23,12 @@ kind = "private-key"
 # address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 # organization_id = "org-example-turnkey-org-id"
 
+[assets.cash]
+trading = "disabled"
+rebalancing = "enabled"
+usdc_ratio = 0.5
+max_deviation = 0.3
+
 [assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -34,5 +39,9 @@ rebalancing = "disabled"
 
 [assets.cash]
 rebalancing = "enabled"
-# vault_id = "0xcd34"
-# operational_limit = 10000.0
+# Raindex Vault Id
+vault_id = "0xcd34"
+# Maximum USD amount that can be used per trade or transfer
+operational_limit = 10000.0
+# USD amount subtracted from offchain cash to compute available balance
+reserved = 50000.0

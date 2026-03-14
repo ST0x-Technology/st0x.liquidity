@@ -94,12 +94,14 @@ pub(super) async fn get_order_status(
     })
 }
 
-/// Maps Alpaca order status to our simplified OrderStatus enum
+/// Maps Alpaca order status to our simplified `OrderStatus` enum.
 ///
-/// Note: All Alpaca in-progress statuses map to `OrderStatus::Submitted` because
-/// they represent orders that have been submitted to and acknowledged by the broker.
-/// `OrderStatus::Pending` is reserved for orders in our system that haven't been
-/// sent to the broker yet (not applicable here since we're mapping broker responses).
+/// Note: All Alpaca in-progress statuses map to
+/// `OrderStatus::Submitted` because they represent orders that have
+/// been submitted to and acknowledged by the broker.
+/// `OrderStatus::Pending` is reserved for orders in our system that
+/// haven't been sent to the broker yet (not applicable here since
+/// we're mapping broker responses).
 fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
     match status {
         // Submitted to broker and in progress (New, Accepted, working, etc.)

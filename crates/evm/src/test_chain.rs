@@ -27,11 +27,11 @@ sol!(
 /// Base chain USDC address.
 pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
-/// OpenZeppelin ERC20 `_balances` mapping storage slot.
+/// `OpenZeppelin` ERC20 `_balances` mapping storage slot.
 ///
 /// When USDC is deployed fresh via `DeployableERC20` bytecode (not forked
-/// from Circle's FiatTokenV2), the balances mapping lives at slot 0
-/// (standard OpenZeppelin ERC20 layout) instead of slot 9.
+/// from Circle's `FiatTokenV2`), the balances mapping lives at slot 0
+/// (standard `OpenZeppelin` ERC20 layout) instead of slot 9.
 const USDC_BALANCES_SLOT: u8 = 0;
 const TOTAL_SUPPLY_SLOT: u8 = 2;
 
@@ -54,6 +54,11 @@ pub struct AnvilTestChain<P> {
 impl AnvilTestChain<()> {
     /// Spawns a fresh Anvil instance with auto-mining (1s block time),
     /// deploys USDC at `USDC_BASE`, and funds owner + taker accounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Anvil setup, USDC deployment, or account
+    /// funding fails.
     pub async fn start() -> anyhow::Result<AnvilTestChain<impl Provider + Clone>> {
         let anvil = Anvil::new().block_time(1).spawn();
 
@@ -103,11 +108,19 @@ impl<P: Provider + Clone> AnvilTestChain<P> {
     }
 
     /// Returns the WebSocket endpoint URL for the Anvil node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint URL cannot be parsed.
     pub fn ws_endpoint(&self) -> anyhow::Result<url::Url> {
         Ok(self.anvil.ws_endpoint().parse()?)
     }
 
     /// Mines `count` empty blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Anvil RPC call fails.
     pub async fn mine_blocks(&self, count: u64) -> anyhow::Result<()> {
         for _ in 0..count {
             self.provider.anvil_mine(Some(1), None).await?;
@@ -116,12 +129,20 @@ impl<P: Provider + Clone> AnvilTestChain<P> {
     }
 
     /// Sets a recipient's USDC balance by writing directly to the
-    /// OpenZeppelin ERC20 `_balances` storage slot.
+    /// `OpenZeppelin` ERC20 `_balances` storage slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage write fails.
     pub async fn mint_usdc(&self, recipient: Address, amount: U256) -> anyhow::Result<()> {
         mint_usdc(&self.provider, recipient, amount).await
     }
 
     /// Deploys `anvil_set_code` to place arbitrary bytecode at an address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Anvil RPC call fails.
     pub async fn set_code(
         &self,
         address: Address,
@@ -135,6 +156,7 @@ impl<P: Provider + Clone> AnvilTestChain<P> {
 /// Computes the EVM storage slot for `mapping(address => ...)` at
 /// `base_slot`. Solidity stores `mapping[key]` at
 /// `keccak256(abi_encode(key, base_slot))`.
+#[must_use]
 pub fn evm_mapping_slot(address: Address, base_slot: u8) -> U256 {
     let mut slot_data = [0u8; EVM_WORD_SIZE * 2];
     slot_data[ABI_ADDRESS_OFFSET..EVM_WORD_SIZE].copy_from_slice(address.as_slice());
@@ -146,6 +168,11 @@ pub fn evm_mapping_slot(address: Address, base_slot: u8) -> U256 {
 ///
 /// Short strings are stored as `data_left_aligned | (len * 2)` in a
 /// single 32-byte slot.
+///
+/// # Panics
+///
+/// Panics if `value` is 32 bytes or longer.
+#[must_use]
 pub fn solidity_short_string(value: &[u8]) -> B256 {
     assert!(
         value.len() < EVM_WORD_SIZE,
@@ -164,7 +191,7 @@ pub fn solidity_short_string(value: &[u8]) -> B256 {
 
 /// Deploys a USDC ERC20 at the canonical `USDC_BASE` address using
 /// `anvil_set_code` with `DeployableERC20` bytecode, then initialises
-/// OpenZeppelin storage slots (totalSupply, name, symbol, decimals) and
+/// `OpenZeppelin` storage slots (`totalSupply`, name, symbol, decimals) and
 /// gives the owner 1B USDC.
 async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) -> anyhow::Result<()> {
     let total_supply = U256::from(1_000_000_000_000u64);
@@ -208,7 +235,8 @@ async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) -> anyho
 
 /// Mints USDC to `recipient` by adding `amount` to their existing
 /// balance and incrementing `totalSupply` (slot 2). Uses
-/// `anvil_get_storage_at` to read current values before writing.
+/// `anvil_get_storage_at`/`anvil_set_storage_at` to read current
+/// values before writing.
 async fn mint_usdc<P: Provider>(
     provider: &P,
     recipient: Address,
@@ -291,7 +319,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "shorter than 32 bytes")]
     fn solidity_short_string_rejects_long_input() {
-        solidity_short_string(&[b'A'; 32]);
+        let _ = solidity_short_string(&[b'A'; 32]);
     }
 
     #[tokio::test]

@@ -1448,7 +1448,45 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_starts_from_deployment_block() {
         let pool = setup_test_db().await;
+<<<<<<< HEAD
         let job_queue = setup_job_queue(&pool).await;
+=======
+
+        // Insert a processed event at block 100
+        sqlx::query(
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 1)
+            "
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 50, // Earlier than processed block
+        };
+
+        // Mock provider should only receive requests for blocks 101-200, not 50-200
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([])); // clear events for 101-200
+        asserter.push_success(&serde_json::json!([])); // take events for 101-200
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        // Should start from block 101 (last processed + 1), not deployment_block
+        backfill_events(&pool, &provider, &evm_ctx, 200)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_backfill_initial_run_starts_from_deployment() {
+        let pool = setup_test_db().await;
+
+>>>>>>> 62011c95 (feat: broker cash reserve)
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1466,6 +1504,75 @@ mod tests {
             .await
             .unwrap();
 
+<<<<<<< HEAD
         assert_eq!(job_count(&pool).await, 0);
+=======
+    #[tokio::test]
+    async fn test_backfill_skips_when_caught_up() {
+        let pool = setup_test_db().await;
+
+        // Insert processed event at block 150
+        sqlx::query(
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 150, '{}', 1)
+            "
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 50,
+        };
+
+        // No RPC calls should be made since we're already caught up
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        // Last processed: 150, end_block: 150, so start would be 151 > 150
+        backfill_events(&pool, &provider, &evm_ctx, 150)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_backfill_handles_mixed_processed_states() {
+        let pool = setup_test_db().await;
+
+        // Insert events with mixed processed states - only processed ones should affect resume point
+        sqlx::query(
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES
+                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 50, '{}', 1),
+                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 75, '{}', 0),
+                ('0x3333333333333333333333333333333333333333333333333333333333333333', 0, 100, '{}', 1),
+                ('0x4444444444444444444444444444444444444444444444444444444444444444', 0, 125, '{}', 0)
+            "
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+        };
+
+        // Should resume from block 101 (max processed block 100 + 1)
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([])); // clear events for 101-200
+        asserter.push_success(&serde_json::json!([])); // take events for 101-200
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        backfill_events(&pool, &provider, &evm_ctx, 200)
+            .await
+            .unwrap();
+>>>>>>> 62011c95 (feat: broker cash reserve)
     }
 }

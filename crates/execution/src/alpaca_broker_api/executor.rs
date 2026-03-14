@@ -202,6 +202,11 @@ impl AlpacaBrokerApi {
     /// - `UsdToUsdc`: Buys USDC with USD buying power
     ///
     /// Returns the completed order response after the order is filled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaBrokerApiError`] if the order placement or
+    /// polling fails.
     pub async fn convert_usdc_usd(
         &self,
         amount: Decimal,
@@ -221,6 +226,10 @@ impl AlpacaBrokerApi {
 
     /// Journal (transfer) equities from the configured account to a
     /// destination account under the same Alpaca broker firm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaBrokerApiError`] if the journal request fails.
     pub async fn create_journal(
         &self,
         destination: AlpacaAccountId,

@@ -127,13 +127,13 @@ impl BridgeDirection {
     }
 }
 
-/// CCTP TokenMessengerV2 contract address (same on all supported chains).
+/// CCTP `TokenMessengerV2` contract address (same on all supported chains).
 #[cfg(any(test, feature = "test-support"))]
 pub const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
 #[cfg(not(any(test, feature = "test-support")))]
 const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
 
-/// CCTP MessageTransmitterV2 contract address (same on all supported chains).
+/// CCTP `MessageTransmitterV2` contract address (same on all supported chains).
 #[cfg(any(test, feature = "test-support"))]
 pub const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
 #[cfg(not(any(test, feature = "test-support")))]
@@ -166,12 +166,12 @@ struct MintReceipt {
 /// Contains both the CCTP message bytes and the Circle attestation signature,
 /// which together are required to call `receiveMessage()` on the destination chain.
 ///
-/// The nonce is extracted from the attested message, NOT from the original MessageSent
-/// event (which contains a placeholder bytes32(0) in CCTP V2).
+/// The nonce is extracted from the attested message, NOT from the original `MessageSent`
+/// event (which contains a placeholder `bytes32(0)` in CCTP V2).
 #[derive(Debug)]
 pub struct AttestationResponse {
     /// CCTP message bytes from the attestation API.
-    /// Unlike the MessageSent event message, this contains the real nonce
+    /// Unlike the `MessageSent` event message, this contains the real nonce
     /// filled in by Circle's attestation service.
     message: Bytes,
     /// Circle's attestation signature for the message.
@@ -227,7 +227,7 @@ const MIN_MESSAGE_LENGTH: usize = NONCE_INDEX + NONCE_SIZE;
 /// Extracts the 32-byte nonce from a CCTP V2 message.
 ///
 /// Used to extract the real nonce from the attested message returned by Circle's API.
-/// The nonce in the original MessageSent event is always bytes32(0) in CCTP V2.
+/// The nonce in the original `MessageSent` event is always `bytes32(0)` in CCTP V2.
 fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpError> {
     if message.len() < MIN_MESSAGE_LENGTH {
         return Err(CctpError::MessageTooShort {
@@ -357,6 +357,10 @@ struct FeeEntry {
 
 impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Constructs a `CctpBridge` from a runtime context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CctpError`] if contract addresses are invalid.
     pub fn try_from_ctx(ctx: CctpCtx<EthWallet, BaseWallet>) -> Result<Self, CctpError> {
         #[cfg(any(test, feature = "test-support"))]
         let token_messenger = ctx.token_messenger;
@@ -471,18 +475,6 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         const MAX_ATTEMPTS: usize = 60;
         const RETRY_INTERVAL_SECS: u64 = 5;
 
-        let url = format!(
-            "{}/v2/messages/{}?transactionHash={tx_hash}",
-            self.circle_api_base,
-            direction.source_domain()
-        );
-
-        info!(%url, "Polling attestation API");
-
-        let backoff = backon::ConstantBuilder::default()
-            .with_delay(std::time::Duration::from_secs(RETRY_INTERVAL_SECS))
-            .with_max_times(MAX_ATTEMPTS);
-
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
         struct MessageEntry {
@@ -495,6 +487,18 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         struct V2Response {
             messages: Vec<MessageEntry>,
         }
+
+        let url = format!(
+            "{}/v2/messages/{}?transactionHash={tx_hash}",
+            self.circle_api_base,
+            direction.source_domain()
+        );
+
+        info!(%url, "Polling attestation API");
+
+        let backoff = backon::ConstantBuilder::default()
+            .with_delay(std::time::Duration::from_secs(RETRY_INTERVAL_SECS))
+            .with_max_times(MAX_ATTEMPTS);
 
         let fetch_attestation = || async {
             let response = self.http_client.get(&url).send().await?;
@@ -752,15 +756,15 @@ mod tests {
         .await
         .unwrap();
 
-        let url = format!("{}/{message_hash}", server.base_url());
-        let backoff = backon::ConstantBuilder::default()
-            .with_delay(std::time::Duration::from_millis(10))
-            .with_max_times(5);
-
         #[derive(serde::Deserialize)]
         struct AttestationResponse {
             attestation: String,
         }
+
+        let url = format!("{}/{message_hash}", server.base_url());
+        let backoff = backon::ConstantBuilder::default()
+            .with_delay(std::time::Duration::from_millis(10))
+            .with_max_times(5);
 
         let fetch_attestation = || async {
             let response = bridge.http_client.get(&url).send().await?;
@@ -806,15 +810,15 @@ mod tests {
 
         bridge.http_client = reqwest::Client::new();
 
-        let url = format!("{}/{message_hash}", server.base_url());
-        let backoff = backon::ConstantBuilder::default()
-            .with_delay(std::time::Duration::from_millis(10))
-            .with_max_times(3);
-
         #[derive(serde::Deserialize)]
         struct AttestationResponse {
             attestation: String,
         }
+
+        let url = format!("{}/{message_hash}", server.base_url());
+        let backoff = backon::ConstantBuilder::default()
+            .with_delay(std::time::Duration::from_millis(10))
+            .with_max_times(3);
 
         let fetch_attestation = || async {
             let response = bridge.http_client.get(&url).send().await?;
@@ -1622,8 +1626,8 @@ mod tests {
 
         /// Signs a CCTP message as the attester.
         ///
-        /// In CCTP V2, the MessageSent event contains a message with EMPTY_NONCE (bytes32(0))
-        /// and EMPTY_FINALITY_THRESHOLD_EXECUTED (0). The attester service fills in:
+        /// In CCTP V2, the `MessageSent` event contains a message with `EMPTY_NONCE` (`bytes32(0)`)
+        /// and `EMPTY_FINALITY_THRESHOLD_EXECUTED` (0). The attester service fills in:
         /// 1. A unique nonce at position 12-44
         /// 2. The finality threshold achieved at position 144-148
         ///

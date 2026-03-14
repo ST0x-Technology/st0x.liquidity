@@ -439,11 +439,12 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
 > {
     Box::pin(async move {
+        const OPERATION_CHANNEL_CAPACITY: usize = 100;
+
         info!("Initializing rebalancing infrastructure");
 
         let market_maker_wallet = base_wallet.address();
 
-        const OPERATION_CHANNEL_CAPACITY: usize = 100;
         let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
         let raindex_service = Arc::new(RaindexService::new(
@@ -721,20 +722,14 @@ async fn enqueue_buffered_events(
     }
 }
 
-// TODO: this should either be its own job, which probably makes ore sense
-// or alternatively this can be doe as a part of the existing trade processing
-// job but that would be coupling different concerns together.
-//
-//  #########################################################################
-//
-/// Discovers vaults from a trade and emits VaultRegistryCommands.
+/// Discovers vaults from a trade and emits `VaultRegistryCommand`s.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
 /// already-resolved symbol. It extracts vault information from the queued event
-/// and registers vaults owned by the specified order_owner.
+/// and registers vaults owned by the specified `order_owner`.
 ///
 /// Vaults are classified as:
-/// - USDC vault: token == USDC_BASE
+/// - USDC vault: token == `USDC_BASE`
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
 pub(crate) async fn discover_vaults_for_trade(
     trade_event: &ChainIncluded<RaindexTradeEvent>,
@@ -1665,7 +1660,7 @@ mod tests {
     }
 
     async fn get_vault_registry_events(pool: &SqlitePool) -> Vec<String> {
-        sqlx::query_scalar!("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
+        sqlx::query_scalar("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
             .fetch_all(pool)
             .await
             .unwrap()
@@ -1822,8 +1817,8 @@ mod tests {
         }
         .to_string();
 
-        let aggregate_ids: Vec<String> = sqlx::query_scalar!(
-            "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'"
+        let aggregate_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'",
         )
         .fetch_all(&pool)
         .await
@@ -2271,7 +2266,7 @@ mod tests {
     }
 
     /// Builds an `InventoryView` with an equity imbalance: 20% onchain, 80% offchain.
-    /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
+    /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> `TooMuchOffchain`.
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
             .with_equity(
