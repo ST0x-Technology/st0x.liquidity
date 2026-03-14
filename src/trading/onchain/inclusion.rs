@@ -1,8 +1,10 @@
 //! Lightweight envelope used to represent an event included on-chain.
 //!
 //! [`ChainIncluded`] carries just enough metadata to identify and process
-//! an onchain trade event. It is serialized into [`OrderFillJob`] payloads
-//! and stored in apalis's `Jobs` table
+//! an onchain trade event. It is serialized into
+//! [`AccountForDexTrade`] payloads and persisted for processing.
+//!
+//! [`AccountForDexTrade`]: super::trade_accountant::AccountForDexTrade
 
 use alloy::primitives::TxHash;
 use alloy::rpc::types::Log;

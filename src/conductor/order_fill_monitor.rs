@@ -11,11 +11,7 @@ use alloy::providers::WsConnect;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use apalis::prelude::TaskSink;
-use apalis_codec::json::JsonCodec;
-use apalis_sqlite::fetcher::SqliteFetcher;
-use apalis_sqlite::{CompactType, SqliteStorage};
 use futures_util::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
 use task_supervisor::{SupervisedTask, TaskResult};
@@ -25,37 +21,11 @@ use url::Url;
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::onchain::trade::RaindexTradeEvent;
-use crate::queue::QueuedEvent;
+use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAccountingJobQueue};
 
-#[derive(Debug, thiserror::Error)]
-enum OrderFillMonitorError {
-    #[error("DEX event streams closed unexpectedly")]
-    StreamsClosed,
-}
-
-/// Job representing an onchain order fill to be processed via apalis.
-pub(crate) struct OrderFillJob {
-    pub(crate) queued_event: QueuedEvent,
-}
-
-/// Persistent job queue for order fill processing.
-pub(crate) type OrderFillJobQueue =
-    SqliteStorage<OrderFillJob, JsonCodec<CompactType>, SqliteFetcher>;
-
-type BoxedStream<T, Err = sol_types::Error> = Pin<Box<dyn Stream<Item = Result<T, Err>> + Send>>;
-
-/// DEX event streams (ClearV3 / TakeOrderV3) for monitoring order fills.
-///
-/// Passed from `Conductor::start` to avoid a gap between the WS
-/// subscription (used for `get_cutoff_block`) and the monitor's first
-/// `run()` invocation.
-pub(crate) struct DexEventStreams {
-    pub(crate) clear: BoxedStream<(ClearV3, Log)>,
-    pub(crate) take: BoxedStream<(TakeOrderV3, Log)>,
-}
-
-/// Monitors DEX WebSocket streams and pushes events into apalis
-/// storage as [`OrderFillJob`]s.
+/// Monitors DEX WebSocket streams and pushes
+/// [`AccountForDexTrade`] jobs into apalis storage.
 ///
 /// Implements [`SupervisedTask`] so the supervisor restarts it
 /// on WebSocket disconnection or errors. On first run, it consumes
@@ -65,7 +35,7 @@ pub(crate) struct DexEventStreams {
 pub(crate) struct OrderFillMonitor {
     ws_url: Url,
     orderbook: Address,
-    job_queue: OrderFillJobQueue,
+    job_queue: DexTradeAccountingJobQueue,
     dex_streams: Arc<Mutex<Option<DexEventStreams>>>,
 }
 
@@ -73,13 +43,13 @@ impl OrderFillMonitor {
     pub(crate) fn new(
         ws_url: Url,
         orderbook: Address,
-        storage: OrderFillJobQueue,
+        job_queue: DexTradeAccountingJobQueue,
         dex_streams: DexEventStreams,
     ) -> Self {
         Self {
             ws_url,
             orderbook,
-            job_queue: storage,
+            job_queue,
             dex_streams: Arc::new(Mutex::new(Some(dex_streams))),
         }
     }
@@ -97,6 +67,24 @@ impl SupervisedTask for OrderFillMonitor {
 
         self.connect_and_listen().await
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OrderFillMonitorError {
+    #[error("DEX event streams closed unexpectedly")]
+    StreamsClosed,
+}
+
+type BoxedStream<T, Err = sol_types::Error> = Pin<Box<dyn Stream<Item = Result<T, Err>> + Send>>;
+
+/// DEX event streams (ClearV3 / TakeOrderV3) for monitoring order fills.
+///
+/// Passed from `Conductor::start` to avoid a gap between the WS
+/// subscription (used for `get_cutoff_block`) and the monitor's first
+/// `run()` invocation.
+pub(crate) struct DexEventStreams {
+    pub(crate) clear: BoxedStream<(ClearV3, Log)>,
+    pub(crate) take: BoxedStream<(TakeOrderV3, Log)>,
 }
 
 impl OrderFillMonitor {
@@ -153,7 +141,7 @@ impl OrderFillMonitor {
         event: RaindexTradeEvent,
         log: &alloy::rpc::types::Log,
     ) -> TaskResult {
-        let queued_event = match QueuedEvent::from_log(event, log) {
+        let queued_event = match ChainIncluded::<RaindexTradeEvent>::from_log(event, log) {
             Ok(queued_event) => queued_event,
             Err(err) => {
                 error!(%err, "Failed to create queued event from log");
@@ -167,7 +155,11 @@ impl OrderFillMonitor {
             "Pushing order fill job into apalis storage"
         );
 
-        self.job_queue.push(Trade { queued_event }).await?;
+        self.job_queue
+            .push(AccountForDexTrade {
+                trade: queued_event,
+            })
+            .await?;
 
         Ok(())
     }
@@ -176,6 +168,7 @@ impl OrderFillMonitor {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, U256, address};
+    use apalis_sqlite::SqliteStorage;
     use futures_util::stream;
     use sqlx::SqlitePool;
 
@@ -194,7 +187,7 @@ mod tests {
     async fn create_test_monitor_with_pool() -> (OrderFillMonitor, SqlitePool) {
         let pool = setup_test_db().await;
         setup_apalis_tables(&pool).await.unwrap();
-        let storage: OrderFillJobQueue = SqliteStorage::new(&pool);
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
 
         let dex_streams = DexEventStreams {
             clear: Box::pin(stream::empty()),
@@ -204,7 +197,7 @@ mod tests {
         let monitor = OrderFillMonitor::new(
             Url::parse("ws://localhost:8545").unwrap(),
             Address::ZERO,
-            storage,
+            job_queue,
             dex_streams,
         );
 

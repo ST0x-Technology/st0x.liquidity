@@ -45,7 +45,6 @@ use crate::onchain::USDC_BASE;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::Position;
-use crate::queue::QueuedEvent;
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;

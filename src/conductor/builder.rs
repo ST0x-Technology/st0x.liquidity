@@ -13,10 +13,9 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
 use super::job::work;
-use super::order_fill_monitor::{DexEventStreams, OrderFillJobQueue, OrderFillMonitor};
-use super::order_fill_processor::OrderFillCtx;
+use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
 use super::{
-    Conductor, OrderFillError, spawn_inventory_poller, spawn_order_poller,
+    Conductor, spawn_inventory_poller, spawn_order_poller,
     spawn_periodic_accumulated_position_check,
 };
 use crate::config::Ctx;
@@ -28,6 +27,9 @@ use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
+use crate::trading::onchain::trade_accountant::{
+    AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
+};
 use crate::vault_registry::VaultRegistry;
 
 pub(crate) struct CqrsFrameworks {
@@ -63,7 +65,7 @@ pub(crate) struct WithExecutorMaintenance {
 
 pub(crate) struct ConductorBuilder<Prov, Exec, State> {
     common: ConductorCtx<Prov, Exec>,
-    job_queue: OrderFillJobQueue,
+    job_queue: DexTradeAccountingJobQueue,
     dex_streams: DexEventStreams,
     state: State,
 }
@@ -73,7 +75,7 @@ impl<Prov: Provider + Clone + Send + 'static, Exec: Executor + Clone + Send + 's
 {
     pub(crate) fn new(
         common: ConductorCtx<Prov, Exec>,
-        job_queue: OrderFillJobQueue,
+        job_queue: DexTradeAccountingJobQueue,
         dex_streams: DexEventStreams,
     ) -> Self {
         Self {
@@ -104,7 +106,7 @@ impl<Prov, Exec> ConductorBuilder<Prov, Exec, WithExecutorMaintenance>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
     Exec: Executor + Clone + Send + Sync + 'static,
-    OrderFillError: From<Exec::Error>,
+    TradeAccountingError: From<Exec::Error>,
 {
     pub(crate) fn with_rebalancer(mut self, rebalancer: JoinHandle<()>) -> Self {
         self.state.rebalancer = Some(rebalancer);
@@ -175,7 +177,8 @@ where
             assets: self.common.ctx.assets.clone(),
         };
 
-        let order_fill_ctx = Arc::new(OrderFillCtx {
+        let accountant_ctx = Arc::new(AccountantCtx {
+            orderbook: self.common.ctx.evm.orderbook,
             ctx: self.common.ctx.clone(),
             cache: self.common.cache,
             feed_id_cache: FeedIdCache::default(),
@@ -207,8 +210,8 @@ where
                 .register(move |index| {
                     WorkerBuilder::new(format!("order-fill-worker-{index}"))
                         .backend(job_queue.clone())
-                        .data(order_fill_ctx.clone())
-                        .build(work::<_, OrderFillCtx<Prov, Exec>>)
+                        .data(accountant_ctx.clone())
+                        .build(work::<_, AccountantCtx<Prov, Exec>>)
                 });
 
             if let Err(monitor_error) = monitor.run().await {

@@ -1,49 +1,55 @@
-//! [`Job`] implementation for processing order fill events.
+//! [`Job`] implementation for accounting onchain DEX trades.
 //!
-//! [`AccountForDexTrade`] carries a [`QueuedEvent`] through apalis
-//! storage. Its [`execute`] method converts the event to a trade,
-//! discovers vaults, and runs the hedging pipeline.
+//! [`AccountForDexTrade`] carries a [`ChainIncluded`] raindex event.
+//! Its [`perform`] method converts the event to a trade, discovers
+//! vaults, and runs the hedging pipeline.
 //!
-//! [`execute`]: super::job::Job::execute
+//! [`perform`]: Job::perform
 
+use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::Provider;
+use alloy::rpc::types::Log;
+use apalis_codec::json::JsonCodec;
+use apalis_storage_sqlite::{SqliteFetcher, SqliteStorage};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use st0x_event_sorcery::Store;
+use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
-use st0x_execution::Executor;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
+use st0x_execution::{ExecutionError, Executor};
 
 use super::inclusion::ChainIncluded;
 use crate::conductor::job::{Job, Label};
-use crate::conductor::order_fill_monitor::AccountForDexTrade;
 use crate::conductor::{
-    OrderFillError, TradeProcessingCqrs, VaultDiscoveryCtx, convert_event_to_trade,
-    discover_vaults_for_trade, process_queued_trade,
+    TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::Ctx;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::trade::TradeEvent;
+use crate::onchain::trade::RaindexTradeEvent;
+use crate::onchain::{OnChainError, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::vault_registry::VaultRegistry;
 
+/// Persistent job queue for DEX trade accounting.
+pub(crate) type DexTradeAccountingJobQueue =
+    SqliteStorage<AccountForDexTrade, JsonCodec<CompactType>, SqliteFetcher>;
+
 /// An accounting job for processing a single onchain raindex trade event.
 /// It's the unified mechanism for processing both backfilled events as well as
 /// live events from the monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AccountForDexTrade {
     /// Raindex trade event with block inclusion metadata
-    trade: ChainIncluded<TradeEvent>,
+    pub(crate) trade: ChainIncluded<RaindexTradeEvent>,
 }
 
-/// Bundles everything the order fill processing job needs.
-///
-/// Wrapped in an [`Arc`] and injected via apalis [`Data`] so the
-/// handler can access shared state without generics leaking into
-/// apalis.
-///
-/// [`Data`]: apalis::prelude::Data
+/// Bundles the shared dependencies needed by the trade accounting job.
 pub(crate) struct AccountantCtx<Node, Exec> {
+    pub(crate) ctx: Ctx,
     pub(crate) cache: SymbolCache,
     pub(crate) feed_id_cache: FeedIdCache,
     pub(crate) orderbook: Address,
@@ -53,40 +59,41 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) executor: Exec,
 }
 
-impl<Node, Exec> Job for DexTradeAccountingJob
+impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for AccountForDexTrade
 where
     Node: Provider + Clone + Send + Sync + 'static,
-    Broker: Executor + Clone + Send + 'static,
-    DexTradeAccountingError: From<Broker::Error>,
+    Exec: Executor + Clone + Send + 'static,
+    TradeAccountingError: From<Exec::Error>,
 {
-    type Error = DexTradeAccountingError;
+    type Error = TradeAccountingError;
 
     fn label(&self) -> Label {
-        let (ChainIncluded {
+        let ChainIncluded {
             event,
-            block_number: block,
-            log_index: idx,
-        }) = &self.trade;
+            block_number,
+            log_index,
+            ..
+        } = &self.trade;
 
-        Label::new(format!("{event_type}:{block}:{idx}"))
+        Label::new(format!("{}:{block_number}:{log_index}", event.kind()))
     }
 
-    async fn perform(&self, ctx: &Accou<Prov, Exec>) -> Result<(), Self::Error> {
+    async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<(), Self::Error> {
         use RaindexTradeEvent::{ClearV3, TakeOrderV3};
 
         let trade_event = &self.trade;
         let order_owner = ctx.ctx.order_owner();
-        let reconstructed_log = reconstruct_log(&ctx.orderbook, trade_event);
+        let reconstructed_log = reconstruct_log(ctx.orderbook, trade_event);
 
         let onchain_trade = match &trade_event.event {
             ClearV3(clear_event) => {
                 OnchainTrade::try_from_clear_v3(
+                    &ctx.ctx.evm,
+                    &ctx.cache,
                     &ctx.evm,
-                    cache,
-                    evm,
                     *clear_event.clone(),
                     reconstructed_log,
-                    feed_id_cache,
+                    &ctx.feed_id_cache,
                     order_owner,
                 )
                 .await?
@@ -94,12 +101,12 @@ where
 
             TakeOrderV3(take_event) => {
                 OnchainTrade::try_from_take_order_if_target_owner(
-                    cache,
-                    evm,
+                    &ctx.cache,
+                    &ctx.evm,
                     *take_event.clone(),
                     reconstructed_log,
                     order_owner,
-                    feed_id_cache,
+                    &ctx.feed_id_cache,
                 )
                 .await?
             }
@@ -107,7 +114,7 @@ where
 
         let Some(trade) = onchain_trade else {
             info!(
-                event_type = &trade_event,
+                event_type = trade_event.event.kind(),
                 tx_hash = ?trade_event.tx_hash,
                 log_index = trade_event.log_index,
                 "Event filtered out (no matching owner)"
@@ -118,20 +125,17 @@ where
 
         let vault_discovery_ctx = VaultDiscoveryCtx {
             vault_registry: &ctx.vault_registry,
-            orderbook: ctx.ctx.evm.orderbook,
+            orderbook: ctx.orderbook,
             order_owner,
         };
 
         debug!(
-            tx_hash = trade.tx_hash,
-            log_index = trade.log_index,
+            tx_hash = ?trade_event.tx_hash,
+            log_index = trade_event.log_index,
             symbol = %trade.symbol,
             amount = %trade.amount,
-            "Processing a {event_type} event"
-            event_type = match &trade.event {
-                TradeEvent::ClearV3(_) => "ClearV3",
-                TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-            },
+            event_type = trade_event.event.kind(),
+            "Processing trade event",
         );
 
         discover_vaults_for_trade(trade_event, &trade, &vault_discovery_ctx).await?;
@@ -154,12 +158,12 @@ where
     }
 }
 
-fn reconstruct_log(orderbook: Address, trade: &ChainIncluded<TradeEvent>) -> Log {
+fn reconstruct_log(orderbook: Address, trade: &ChainIncluded<RaindexTradeEvent>) -> Log {
     use RaindexTradeEvent::{ClearV3, TakeOrderV3};
 
     let log_data = match &trade.event {
         ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
-        TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
+        TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
     };
 
     let block_timestamp = trade
@@ -181,9 +185,9 @@ fn reconstruct_log(orderbook: Address, trade: &ChainIncluded<TradeEvent>) -> Log
     }
 }
 
-/// Event processing errors for live event handling.
+/// Event processing errors for DEX trade accounting.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum DexTradeAccountingError {
+pub(crate) enum TradeAccountingError {
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Vault registry command failed: {0}")]
@@ -207,18 +211,18 @@ mod tests {
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
+    use crate::bindings::IOrderBookV6;
     use crate::bindings::IOrderBookV6::ClearConfigV2;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::offchain_order::OffchainOrder;
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
-    use crate::queue::QueuedEvent;
     use crate::test_utils::{get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
-    fn test_order_fill_job() -> AccountForDexTrade {
+    fn test_job() -> AccountForDexTrade {
         let log = get_test_log();
-        let event = TradeEvent::ClearV3(Box::new(crate::bindings::IOrderBookV6::ClearV3 {
+        let event = RaindexTradeEvent::ClearV3(Box::new(IOrderBookV6::ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             alice: get_test_order(),
             bob: get_test_order(),
@@ -233,21 +237,25 @@ mod tests {
         }));
 
         AccountForDexTrade {
-            trade: ChainIncluded::from_leg(event, &log).unwrap(),
+            trade: ChainIncluded::from_log(event, &log).unwrap(),
         }
     }
 
     #[test]
-    fn label_returns_order_fill() {
-        let job = test_order_fill_job();
+    fn label_contains_event_type_and_block_info() {
+        let job = test_job();
         let label: Label =
-            <AccountForDexTrade as Job<OrderFillCtx<RootProvider, MockExecutor>>>::label(&job);
+            <AccountForDexTrade as Job<AccountantCtx<RootProvider, MockExecutor>>>::label(&job);
 
-        assert_eq!(label.to_string(), "order-fill");
+        let label_str = label.to_string();
+        assert!(
+            label_str.starts_with("ClearV3:"),
+            "Expected label starting with 'ClearV3:', got: {label_str}"
+        );
     }
 
     #[tokio::test]
-    async fn execute_returns_ok_when_event_filtered_out() {
+    async fn perform_returns_ok_when_event_filtered_out() {
         let pool = setup_test_db().await;
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -287,7 +295,8 @@ mod tests {
             assets: ctx.assets.clone(),
         };
 
-        let order_fill_ctx = OrderFillCtx {
+        let accountant_ctx = AccountantCtx {
+            orderbook: ctx.evm.orderbook,
             ctx,
             cache: SymbolCache::default(),
             feed_id_cache: FeedIdCache::default(),
@@ -297,8 +306,8 @@ mod tests {
             executor,
         };
 
-        let job = test_order_fill_job();
-        let result = job.perform(&order_fill_ctx).await;
+        let job = test_job();
+        let result = job.perform(&accountant_ctx).await;
 
         assert!(
             result.is_ok(),

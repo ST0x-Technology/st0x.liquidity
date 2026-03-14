@@ -20,9 +20,9 @@ use tracing::{debug, info, trace, warn};
 use super::EvmCtx;
 use super::OnChainError;
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
-use crate::conductor::{OrderFillJob, OrderFillJobQueue};
 use crate::onchain::trade::RaindexTradeEvent;
-use crate::queue::QueuedEvent;
+use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAccountingJobQueue};
 
 pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
     const BACKFILL_MAX_RETRIES: usize = 15;
@@ -46,7 +46,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
     evm_ctx: &EvmCtx,
     end_block: u64,
     retry_strategy: B,
-    storage: OrderFillJobQueue,
+    job_queue: DexTradeAccountingJobQueue,
 ) -> Result<(), OnChainError> {
     let start_block = evm_ctx.deployment_block;
 

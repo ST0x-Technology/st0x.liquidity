@@ -49,7 +49,6 @@ use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vau
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::queue::QueuedEvent;
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
@@ -63,8 +62,11 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId
 use crate::wrapper::WrapperService;
 
 use self::manifest::QueryManifest;
+use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::trade_accountant::{
+    AccountForDexTrade, DexTradeAccountingJobQueue, TradeAccountingError,
+};
 pub(crate) use builder::{ConductorBuilder, ConductorCtx, CqrsFrameworks};
-pub(crate) use order_fill_monitor::{OrderFillJob, OrderFillJobQueue};
 
 /// Sets up apalis `SQLite` storage tables, tolerating pre-existing
 /// application migrations in the shared `_sqlx_migrations` table.
@@ -109,7 +111,7 @@ pub(crate) async fn run_market_hours_loop<E>(
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + Sync + 'static,
-    OrderFillError: From<E::Error>,
+    TradeAccountingError: From<E::Error>,
 {
     let mut conductor = Conductor::start(
         ctx,
@@ -145,7 +147,7 @@ impl Conductor {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Self>> + Send>>
     where
         E: Executor + Clone + Send + Sync + 'static,
-        OrderFillError: From<E::Error>,
+        TradeAccountingError: From<E::Error>,
     {
         Box::pin(async move {
             let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
@@ -154,8 +156,7 @@ impl Conductor {
             let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
             setup_apalis_tables(&pool).await?;
-            let mut job_queue: order_fill_monitor::OrderFillJobQueue =
-                apalis_sqlite::SqliteStorage::new(&pool);
+            let mut job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
 
             let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
             let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
@@ -605,7 +606,7 @@ fn spawn_periodic_accumulated_position_check<E>(
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
-    OrderFillError: From<E::Error>,
+    TradeAccountingError: From<E::Error>,
 {
     info!("Starting periodic accumulated position checker");
 
@@ -664,7 +665,7 @@ pub(crate) async fn get_cutoff_block<S1, S2, P>(
     clear_stream: &mut S1,
     take_stream: &mut S2,
     provider: &P,
-    storage: &mut order_fill_monitor::OrderFillJobQueue,
+    storage: &mut DexTradeAccountingJobQueue,
 ) -> anyhow::Result<u64>
 where
     S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
@@ -698,7 +699,7 @@ where
 
 /// Pushes buffered events from the coordination phase into apalis storage.
 async fn enqueue_buffered_events(
-    job_queue: &mut order_fill_monitor::OrderFillJobQueue,
+    job_queue: &mut DexTradeAccountingJobQueue,
     event_buffer: Vec<(RaindexTradeEvent, Log)>,
 ) {
     info!(
@@ -707,7 +708,7 @@ async fn enqueue_buffered_events(
     );
 
     let queued_events = event_buffer.into_iter().filter_map(|(event, log)| {
-        QueuedEvent::from_log(event, &log)
+        ChainIncluded::<TradeEvent>::from_log(event, &log)
             .inspect_err(|error| error!(%error, "Failed to create queued event from log"))
             .ok()
     });
@@ -722,6 +723,12 @@ async fn enqueue_buffered_events(
     }
 }
 
+// TODO: this should either be its own job, which probably makes ore sense
+// or alternatively this can be doe as a part of the existing trade processing
+// job but that would be coupling different concerns together.
+//
+//  #########################################################################
+//
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
@@ -735,7 +742,7 @@ pub(crate) async fn discover_vaults_for_trade(
     queued_event: &QueuedEvent,
     trade: &OnchainTrade,
     context: &VaultDiscoveryCtx<'_>,
-) -> Result<(), OrderFillError> {
+) -> Result<(), TradeAccountingError> {
     let tx_hash = queued_event.tx_hash;
     let base_symbol = trade.symbol.base();
     let expected_equity_token = trade.equity_token;
@@ -791,17 +798,6 @@ pub(crate) async fn discover_vaults_for_trade(
     }
 
     Ok(())
-}
-
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn convert_event_to_trade(
-    ctx: &Ctx,
-    cache: &SymbolCache,
-    evm: &impl Evm,
-    queued_event: &QueuedEvent,
-    feed_id_cache: &FeedIdCache,
-    order_owner: Address,
-) -> Result<Option<OnchainTrade>, OrderFillError> {
 }
 
 /// Witnesses the trade in the OnChainTrade aggregate. Returns `true` if this
@@ -903,7 +899,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
-) -> Result<Option<OffchainOrderId>, OrderFillError> {
+) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
     // Witness first — the OnChainTrade aggregate is keyed by (tx_hash, log_index)
     // and rejects duplicates. Only acknowledge the fill on the Position aggregate
     // if this is a genuinely new trade, preventing double-counting.
@@ -943,7 +939,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
 async fn place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
-) -> Result<Option<OffchainOrderId>, OrderFillError> {
+) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
     let offchain_order_id = OffchainOrderId::new();
 
     if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await {
@@ -1063,10 +1059,10 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     threshold: &ExecutionThreshold,
     assets: &AssetsConfig,
     is_trading_enabled: impl Fn(&Symbol) -> bool,
-) -> Result<(), OrderFillError>
+) -> Result<(), TradeAccountingError>
 where
     E: Executor + Clone + Send + 'static,
-    OrderFillError: From<E::Error>,
+    TradeAccountingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
     let ready_positions = check_all_positions(
@@ -1321,8 +1317,7 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(pool, succeeding_order_placer()).await;
 
         setup_apalis_tables(pool).await.unwrap();
-        let job_queue: super::order_fill_monitor::OrderFillJobQueue =
-            apalis_sqlite::SqliteStorage::new(pool);
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(pool);
 
         ConductorBuilder::new(
             ConductorCtx {
@@ -1385,8 +1380,7 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
 
         setup_apalis_tables(&pool).await.unwrap();
-        let job_queue: super::order_fill_monitor::OrderFillJobQueue =
-            apalis_sqlite::SqliteStorage::new(&pool);
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
 
         let fake_rebalancer = tokio::spawn(async {
             loop {
@@ -1432,8 +1426,7 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
 
         setup_apalis_tables(&pool).await.unwrap();
-        let job_queue: super::order_fill_monitor::OrderFillJobQueue =
-            apalis_sqlite::SqliteStorage::new(&pool);
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
 
         let fake_rebalancer = tokio::spawn(async {
             loop {
@@ -1474,8 +1467,7 @@ mod tests {
     async fn test_get_cutoff_block_with_timeout() {
         let pool = setup_test_db().await;
         setup_apalis_tables(&pool).await.unwrap();
-        let mut storage: order_fill_monitor::OrderFillJobQueue =
-            apalis_sqlite::SqliteStorage::new(&pool);
+        let mut storage: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
         let asserter = Asserter::new();
 
         asserter.push_success(&serde_json::Value::from(12345u64));
