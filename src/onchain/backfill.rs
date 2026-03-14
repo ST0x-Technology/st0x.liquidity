@@ -1548,11 +1548,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Insert a processed event at block 100
-        sqlx::query!(
-            r#"
+        sqlx::query(
+            r"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
             VALUES ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 1)
-            "#
+            "
         )
         .execute(&pool)
         .await
@@ -1604,11 +1604,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Insert processed event at block 150
-        sqlx::query!(
-            r#"
+        sqlx::query(
+            r"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
             VALUES ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 150, '{}', 1)
-            "#
+            "
         )
         .execute(&pool)
         .await
@@ -1635,15 +1635,15 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Insert events with mixed processed states - only processed ones should affect resume point
-        sqlx::query!(
-            r#"
+        sqlx::query(
+            r"
             INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
-            VALUES 
+            VALUES
                 ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 50, '{}', 1),
                 ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 75, '{}', 0),
                 ('0x3333333333333333333333333333333333333333333333333333333333333333', 0, 100, '{}', 1),
                 ('0x4444444444444444444444444444444444444444444444444444444444444444', 0, 125, '{}', 0)
-            "#
+            "
         )
         .execute(&pool)
         .await

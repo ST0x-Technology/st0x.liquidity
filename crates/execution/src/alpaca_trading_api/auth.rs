@@ -33,16 +33,19 @@ pub struct AlpacaTradingApiCtx {
 }
 
 impl AlpacaTradingApiCtx {
+    #[must_use]
     pub fn trading_mode(&self) -> AlpacaTradingApiMode {
         self.trading_mode
             .clone()
             .unwrap_or(AlpacaTradingApiMode::Paper)
     }
 
+    #[must_use]
     pub fn base_url(&self) -> String {
         self.trading_mode().base_url()
     }
 
+    #[must_use]
     pub fn is_paper_trading(&self) -> bool {
         matches!(self.trading_mode(), AlpacaTradingApiMode::Paper)
     }

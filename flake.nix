@@ -73,6 +73,7 @@
           st0x-dto = st0xRust.dto;
           st0x-liquidity = st0xRust.package;
           st0x-clippy = st0xRust.clippy;
+          st0x-sqlx-check = st0xRust.sqlxCheck;
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;
@@ -162,7 +163,8 @@
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
               ${infraPkgs.parseIdentity}
-              ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@" && exec ${rekeySecrets}
+              ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
+              exec ${rekeySecrets}
             '';
           };
 

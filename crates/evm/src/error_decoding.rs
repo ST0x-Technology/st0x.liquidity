@@ -2,7 +2,7 @@
 //!
 //! Provides type-level error registry injection for decoding Solidity
 //! revert data. Production code uses [`OpenChainErrorRegistry`] (backed by
-//! the OpenChain selector API). Tests use [`NoOpErrorRegistry`] to
+//! the `OpenChain` selector API). Tests use [`NoOpErrorRegistry`] to
 //! avoid HTTP calls.
 
 use alloy::eips::BlockId;
@@ -25,7 +25,7 @@ pub trait IntoErrorRegistry: Send + Sync {
     fn error_registry() -> &'static dyn ErrorRegistry;
 }
 
-/// Uses the OpenChain selector registry API via the static
+/// Uses the `OpenChain` selector registry API via the static
 /// `DEFAULT_REGISTRY` instance from `rain_error_decoding`.
 pub struct OpenChainErrorRegistry;
 
@@ -72,7 +72,7 @@ where
 /// Handles a contract error using an optional custom registry.
 ///
 /// This variant allows injecting a mock registry for testing without
-/// making live HTTP requests to the OpenChain selector registry.
+/// making live HTTP requests to the `OpenChain` selector registry.
 pub async fn handle_contract_error_with<E>(
     err: alloy::contract::Error,
     registry: Option<&dyn ErrorRegistry>,

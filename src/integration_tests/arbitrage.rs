@@ -1,9 +1,9 @@
 //! Integration tests for the hedging pipeline: onchain trades flow through
-//! the CQRS aggregates (OnChainTrade, Position, OffchainOrder), accumulate
+//! the CQRS aggregates (`OnChainTrade`, `Position`, `OffchainOrder`), accumulate
 //! fractional shares, and trigger offchain hedge orders when the position
 //! crosses the execution threshold.
 //!
-//! Tests use a real Rain OrderBook deployed on Anvil to produce authentic
+//! Tests use a real Rain `OrderBook` deployed on Anvil to produce authentic
 //! `TakeOrderV3` events, ensuring the full parsing and conversion pipeline
 //! is exercised end-to-end.
 
@@ -93,7 +93,7 @@ async fn assert_position(
     );
 }
 
-/// A trade produced by a real OrderBook take-order on Anvil, containing the parsed
+/// A trade produced by a real `OrderBook` take-order on Anvil, containing the parsed
 /// `OnchainTrade` and a matching `QueuedEvent` ready for CQRS processing.
 struct AnvilTrade {
     trade: OnchainTrade,
@@ -123,9 +123,40 @@ impl AnvilTrade {
         )
         .await
     }
+
+    /// Seeds the event queue with this trade's data and then processes it.
+    async fn seed_and_submit(
+        &self,
+        pool: &SqlitePool,
+        cqrs: &TradeProcessingCqrs,
+    ) -> Result<Option<OffchainOrderId>, OrderFillError> {
+        seed_event_queue(pool, &self.queued_event).await;
+        self.submit(cqrs).await
+    }
 }
 
-/// Creates a poller with the default MockExecutor (returns Filled) and polls pending orders.
+/// Inserts a `QueuedEvent` into the `event_queue` table and returns the
+/// auto-generated row ID. Tests call this before `process_queued_trade` so
+/// that `mark_event_processed` can find the row.
+async fn seed_event_queue(pool: &SqlitePool, queued_event: &QueuedEvent) -> i64 {
+    let tx_hash_str = format!("{:#x}", queued_event.tx_hash);
+    let log_index = i64::try_from(queued_event.log_index).unwrap();
+    let block_number = i64::try_from(queued_event.block_number).unwrap();
+    let event_data = serde_json::to_string(&queued_event.event).unwrap();
+
+    sqlx::query_scalar(
+        "INSERT INTO event_queue (tx_hash, log_index, block_number, event_data) VALUES (?, ?, ?, ?) RETURNING id",
+    )
+    .bind(&tx_hash_str)
+    .bind(log_index)
+    .bind(block_number)
+    .bind(&event_data)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Creates a poller with the default `MockExecutor` (returns Filled) and polls pending orders.
 async fn poll_and_fill(
     offchain_order_projection: &Projection<OffchainOrder>,
     offchain_order: &Arc<Store<crate::offchain_order::OffchainOrder>>,
@@ -142,7 +173,7 @@ async fn poll_and_fill(
     Ok(())
 }
 
-/// Holds a deployed Rain OrderBook on a local Anvil node, ready to create real take-order events.
+/// Holds a deployed Rain `OrderBook` on a local Anvil node, ready to create real take-order events.
 struct AnvilOrderBook<P> {
     _anvil: AnvilInstance,
     provider: P,
@@ -161,7 +192,7 @@ struct AnvilOrderBook<P> {
 /// via Anvil cheat-codes. The system hardcodes this address for vault discovery, so the
 /// contract must live at that exact address -- a normal deploy would land elsewhere.
 ///
-/// Initializes the OpenZeppelin ERC20 storage layout: totalSupply, name ("USD Coin"),
+/// Initializes the OpenZeppelin ERC20 storage layout: `totalSupply`, name ("USD Coin"),
 /// symbol ("USDC"), decimals (6), and balance for `owner`.
 async fn deploy_usdc_at_base<P: alloy::providers::Provider>(provider: &P, owner: Address) {
     let total_supply = U256::from(1_000_000_000_000u64);
@@ -356,7 +387,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         }
     }
 
-    /// Creates an order on the real OrderBook, takes it, and parses the resulting
+    /// Creates an order on the real `OrderBook`, takes it, and parses the resulting
     /// `TakeOrderV3` event through the full `OnchainTrade` pipeline.
     ///
     /// Equity tokens are deployed on first use per symbol and reused for subsequent calls.
@@ -654,7 +685,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
+    let result1 = trade1.seed_and_submit(&pool, &cqrs).await?;
     assert!(
         result1.is_none(),
         "No execution should be created below threshold"
@@ -689,7 +720,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .await;
     let trade2_agg = trade2.aggregate_id();
     let order_id = trade2
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("Threshold crossed, should return OffchainOrderId");
     let order_id_str = order_id.to_string();
@@ -797,7 +828,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    trade1.submit(&cqrs).await?;
+    trade1.seed_and_submit(&pool, &cqrs).await?;
 
     let trade2 = orderbook
         .take_order()
@@ -808,7 +839,10 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade2
+        .seed_and_submit(&pool, &cqrs)
+        .await?
+        .expect("Threshold crossed");
     let order_id_str = order_id.to_string();
 
     // Poller discovers the broker FAILED the order
@@ -945,7 +979,10 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let trade2_agg = trade2.aggregate_id();
 
     // Submit both below-threshold trades concurrently (different symbols)
-    let (aapl_result, msft_result) = tokio::join!(trade1.submit(&cqrs), trade2.submit(&cqrs));
+    let (aapl_result, msft_result) = tokio::join!(
+        trade1.seed_and_submit(&pool, &cqrs),
+        trade2.seed_and_submit(&pool, &cqrs)
+    );
     assert!(aapl_result?.is_none());
     assert!(msft_result?.is_none());
 
@@ -959,7 +996,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let trade3_agg = trade3.aggregate_id();
     let aapl_order_id = trade3
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("AAPL 1.2 crosses threshold");
     let aapl_order_str = aapl_order_id.to_string();
@@ -1086,7 +1123,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let trade4_agg = trade4.aggregate_id();
     let msft_order_id = trade4
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("MSFT 1.0 hits threshold");
     let msft_order_str = msft_order_id.to_string();
@@ -1186,7 +1223,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
+    let result1 = trade1.seed_and_submit(&pool, &cqrs).await?;
     assert!(result1.is_none(), "Below threshold");
 
     assert_position()
@@ -1210,7 +1247,10 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade2
+        .seed_and_submit(&pool, &cqrs)
+        .await?
+        .expect("Threshold crossed");
     let order_id_str = order_id.to_string();
 
     assert_position()
@@ -1306,7 +1346,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("Exactly 1.0 should cross whole-share threshold");
 
@@ -1374,7 +1414,10 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.submit(&cqrs).await?.expect("Threshold crossed");
+    trade1
+        .seed_and_submit(&pool, &cqrs)
+        .await?
+        .expect("Threshold crossed");
     poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     let events_before = fetch_events(&pool).await;
@@ -1425,7 +1468,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order1 = trade1
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("First threshold crossing");
     poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
@@ -1452,7 +1495,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .await;
     let trade2_agg = trade2.aggregate_id();
     let order2 = trade2
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("Second threshold crossing");
     assert_ne!(order1, order2, "Second cycle should create a new order");
@@ -1530,7 +1573,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.submit(&cqrs).await?;
+    trade1.seed_and_submit(&pool, &cqrs).await?;
 
     // Run vault discovery using the same trade data
     let vault_registry = test_store(pool.clone(), ());
@@ -1622,7 +1665,7 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result = trade1.submit(&cqrs).await?;
+    let result = trade1.seed_and_submit(&pool, &cqrs).await?;
     assert!(result.is_none(), "Tiny trade should not trigger execution");
 
     assert_position()
@@ -1668,7 +1711,7 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("500 shares should immediately cross threshold");
 
@@ -1725,7 +1768,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    assert!(trade1.submit(&cqrs).await?.is_none());
+    assert!(trade1.seed_and_submit(&pool, &cqrs).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -1748,7 +1791,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    assert!(trade2.submit(&cqrs).await?.is_none());
+    assert!(trade2.seed_and_submit(&pool, &cqrs).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -1771,7 +1814,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade3_agg = trade3.aggregate_id();
-    assert!(trade3.submit(&cqrs).await?.is_none());
+    assert!(trade3.seed_and_submit(&pool, &cqrs).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -1795,7 +1838,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .await;
     let trade4_agg = trade4.aggregate_id();
     let order_id = trade4
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("Net -1.1 crosses threshold");
     let order_id_str = order_id.to_string();
@@ -1858,7 +1901,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 }
 
 /// Tests that new trades arriving while an offchain order is pending don't trigger
-/// a second offchain order. The position updates but no new PlaceOrder command fires.
+/// a second offchain order. The position updates but no new `PlaceOrder` command fires.
 #[tokio::test]
 async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
@@ -1877,7 +1920,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("1.5 shares crosses threshold");
     let order_id_str = order_id.to_string();
@@ -1903,7 +1946,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let result2 = trade2.submit(&cqrs).await?;
+    let result2 = trade2.seed_and_submit(&pool, &cqrs).await?;
     assert!(
         result2.is_none(),
         "No new offchain order while one is pending"
@@ -1945,7 +1988,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Tests that the event queue deduplicates identical onchain events (same tx_hash + log_index),
+/// Tests that the event queue deduplicates identical onchain events (same `tx_hash` + `log_index`),
 /// ensuring the CQRS pipeline processes each blockchain event exactly once.
 #[tokio::test]
 async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
@@ -1996,21 +2039,27 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
         "Duplicate enqueue should result in only 1 unprocessed event"
     );
 
-    // Process the single queued event through the CQRS pipeline.
-    // The apalis pipeline handles processing -- the legacy queue
-    // row is NOT marked processed by process_queued_trade.
+    // Process the single queued event through the CQRS pipeline
+    let queued = queue::get_next_unprocessed_event(&pool)
+        .await
+        .unwrap()
+        .expect("Should have one unprocessed event");
+    let event_id = queued.id.expect("Queued event should have an id");
+
     trade1.submit(&cqrs).await?;
 
-    // Re-enqueue after processing -- still ignored by INSERT OR IGNORE
-    // (row exists regardless of processed status)
+    // Mark processed (in production, apalis handles this; in tests we do it manually)
+    queue::mark_event_processed(&pool, event_id).await.unwrap();
+
+    // Re-enqueue after processing -- should still be ignored (row exists with processed=1)
     queue::enqueue(&pool, take_event.as_ref(), &enqueue_log)
         .await
         .unwrap();
 
     assert_eq!(
         queue::count_unprocessed(&pool).await.unwrap(),
-        1,
-        "Legacy queue row persists (apalis handles processing, not the legacy queue)"
+        0,
+        "Re-enqueue of processed event should be ignored"
     );
 
     // Verify exactly one set of CQRS events was emitted
@@ -2039,9 +2088,9 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Tests that max_amount constrains counter trade sizes when its
-/// share-equivalent is tighter than max_shares. At $100/share, max_amount=$100
-/// converts to a 1-share cap (tighter than max_shares=2). A 3-share onchain
+/// Tests that `max_amount` constrains counter trade sizes when its
+/// share-equivalent is tighter than `max_shares`. At $100/share, `max_amount`=$100
+/// converts to a 1-share cap (tighter than `max_shares`=2). A 3-share onchain
 /// sell requires 3 cycles of 1-share hedges to fully close.
 #[tokio::test]
 async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
@@ -2082,7 +2131,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         .call()
         .await;
     let order1 = trade1
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("3 shares crosses threshold");
 
@@ -2214,9 +2263,9 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     Ok(())
 }
 
-/// Tests that max_shares constrains counter trade sizes when it is tighter
-/// than the max_amount share-equivalent. max_shares=2 with max_amount=$10000
-/// (100-share equivalent at $100/share), so max_shares is binding. A 5-share
+/// Tests that `max_shares` constrains counter trade sizes when it is tighter
+/// than the `max_amount` share-equivalent. `max_shares`=2 with `max_amount`=$10000
+/// (100-share equivalent at $100/share), so `max_shares` is binding. A 5-share
 /// onchain sell hedges 2 shares, fails, retries (also capped to 2), and the
 /// pending order blocks concurrent checker cycles.
 #[tokio::test]
@@ -2259,7 +2308,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         .call()
         .await;
     let order1 = trade1
-        .submit(&cqrs)
+        .seed_and_submit(&pool, &cqrs)
         .await?
         .expect("5 shares crosses threshold");
 

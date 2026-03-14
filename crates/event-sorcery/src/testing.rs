@@ -1,12 +1,12 @@
-//! Test infrastructure for EventSourced entities and Reactors.
+//! Test infrastructure for `EventSourced` entities and `Reactor`s.
 //!
 //! Provides [`replay`] for reconstructing entity state from events,
 //! [`TestHarness`] for BDD-style command testing, [`TestStore`]
 //! for in-memory command dispatch with state inspection,
 //! [`ReactorHarness`] for ergonomic multi-entity reactor testing,
 //! and [`SpyReactor`] for capturing dispatched events.
-//! All operate at the EventSourced/Reactor level, hiding
-//! Lifecycle/Aggregate internals.
+//! All operate at the `EventSourced`/`Reactor` level, hiding
+//! `Lifecycle`/`Aggregate` internals.
 
 use async_trait::async_trait;
 use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
@@ -20,10 +20,14 @@ use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
 use crate::{EventSourced, Store};
 
-/// Replay events through EventSourced to reconstruct entity state.
+/// Replay events through `EventSourced` to reconstruct entity state.
 ///
 /// Returns the entity if replay produces a live state, or the
 /// lifecycle error if originate/evolve fails.
+///
+/// # Errors
+///
+/// Returns `LifecycleError` if originate or evolve fails.
 pub fn replay<Entity: EventSourced>(
     events: impl IntoIterator<Item = Entity::Event>,
 ) -> Result<Option<Entity>, LifecycleError<Entity>> {
@@ -36,7 +40,7 @@ pub fn replay<Entity: EventSourced>(
     lifecycle.into_result()
 }
 
-/// BDD-style test harness for EventSourced implementations.
+/// BDD-style test harness for `EventSourced` implementations.
 ///
 /// # Example
 ///
@@ -101,6 +105,11 @@ where
     Entity::Event: PartialEq + std::fmt::Debug,
 {
     /// Assert that the command produced exactly these events.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the command returned an error or produced
+    /// different events than expected.
     pub fn then_expect_events(self, expected: &[Entity::Event]) {
         let events = self
             .result
@@ -109,6 +118,10 @@ where
     }
 
     /// Assert that the command produced no events.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the command returned an error or produced events.
     pub fn then_expect_no_events(self) {
         let events = self
             .result
@@ -116,14 +129,22 @@ where
         assert!(events.is_empty(), "expected no events but got {events:?}");
     }
 
-    /// Assert that the command failed with a LifecycleError, and
+    /// Assert that the command failed with a `LifecycleError`, and
     /// return it for further assertions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the command succeeded instead of returning an error.
     pub fn then_expect_error(self) -> LifecycleError<Entity> {
         self.result
             .expect_err("expected error but command succeeded")
     }
 
     /// Return the events for custom assertions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the command returned an error.
     pub fn events(self) -> Vec<Entity::Event> {
         self.result
             .expect("expected events but command returned error")
@@ -185,8 +206,12 @@ impl<R: Reactor> ReactorHarness<R> {
     /// harness.receive::<EquityRedemption>(id, event).await?;
     /// ```
     ///
-    /// Requires [`register_entities!`] to be called for the
+    /// Requires `register_entities!` to be called for the
     /// reactor's entity list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reactor's error type if event processing fails.
     pub async fn receive<Entity: EventSourced>(
         &self,
         id: Entity::Id,
@@ -236,6 +261,7 @@ pub struct SpyReactor<Entity: EventSourced> {
 }
 
 impl<Entity: EventSourced> SpyReactor<Entity> {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
@@ -291,9 +317,9 @@ where
 /// In-memory event store for unit tests.
 ///
 /// Provides the same typed-ID interface as [`Store`] but backed
-/// by an in-memory store instead of SQLite. Also exposes
+/// by an in-memory store instead of `SQLite`. Also exposes
 /// [`load`](Self::load) for inspecting aggregate state after
-/// commands, which production [`Store`] intentionally omits
+/// commands, which production `Store` intentionally omits
 /// (use projections instead).
 pub struct TestStore<Entity: EventSourced> {
     mem_store: mem_store::MemStore<Lifecycle<Entity>>,
@@ -301,7 +327,7 @@ pub struct TestStore<Entity: EventSourced> {
 }
 
 impl<Entity: EventSourced> TestStore<Entity> {
-    /// Create an in-memory TestStore for fast, isolated unit tests.
+    /// Create an in-memory `TestStore` for fast, isolated unit tests.
     pub fn new(services: Entity::Services) -> Self
     where
         Entity: 'static,
@@ -310,7 +336,7 @@ impl<Entity: EventSourced> TestStore<Entity> {
         Self::build(vec![], services)
     }
 
-    /// Create an in-memory TestStore with a reactor that receives
+    /// Create an in-memory `TestStore` with a reactor that receives
     /// dispatched events.
     ///
     /// When `Entity::Services` is `()`, use the single-argument
@@ -344,7 +370,7 @@ impl<Entity: EventSourced> TestStore<Entity>
 where
     Entity::Services: Default,
 {
-    /// Create an in-memory TestStore with a reactor, using
+    /// Create an in-memory `TestStore` with a reactor, using
     /// `Default` services (typically `()`).
     pub fn with_reactor<R>(reactor: Arc<R>) -> Self
     where
@@ -361,6 +387,10 @@ where
 
 impl<Entity: EventSourced> TestStore<Entity> {
     /// Send a command to the entity identified by `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError` if command execution fails.
     pub async fn send(
         &self,
         id: &Entity::Id,
@@ -375,6 +405,14 @@ impl<Entity: EventSourced> TestStore<Entity> {
     /// - `Ok(Some(entity))` if the entity is live
     /// - `Ok(None)` if the entity has not been initialized
     /// - `Err(error)` if the entity is in a failed lifecycle state
+    ///
+    /// # Errors
+    ///
+    /// Returns `LifecycleError` if the entity is in a failed state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying event store load fails.
     #[expect(
         clippy::unwrap_used,
         reason = "test-only helper, panicking on error is fine"
