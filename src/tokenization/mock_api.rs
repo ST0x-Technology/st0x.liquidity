@@ -25,8 +25,8 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
 
-use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::TEST_ACCOUNT_ID;
+use st0x_execution::{FractionalShares, SharesBlockchain};
 
 use crate::bindings::DeployableERC20;
 

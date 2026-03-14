@@ -7,16 +7,25 @@ use st0x_execution::Symbol;
 
 use super::{RATIO_ONE, UnderlyingPerWrapped, Wrapper, WrapperError};
 
+/// Which operation the mock should simulate failing.
+#[derive(Default, PartialEq, Eq)]
+enum MockFailure {
+    #[default]
+    None,
+    Wrap,
+    Unwrap,
+    Lookup,
+    DerivativeLookup,
+}
+
 /// Mock wrapper for testing that returns predictable values.
 pub(crate) struct MockWrapper {
     owner: Address,
     unwrap_tx: TxHash,
-    unwrapped_token: Address,
+    tokenized_shares: Address,
     wrapped_token: Address,
     ratio: U256,
-    wrap_fails: bool,
-    unwrap_fails: bool,
-    lookup_fails: bool,
+    failure: MockFailure,
 }
 
 impl MockWrapper {
@@ -24,12 +33,10 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
+            tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
             ratio: RATIO_ONE,
-            wrap_fails: false,
-            unwrap_fails: false,
-            lookup_fails: false,
+            failure: MockFailure::None,
         }
     }
 
@@ -38,22 +45,21 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
+            tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
             ratio,
-            wrap_fails: false,
-            unwrap_fails: false,
-            lookup_fails: false,
+            failure: MockFailure::None,
         }
     }
 
-    /// Sets the address returned by `lookup_tokenized_equity`.
-    pub(crate) fn with_unwrapped_token(mut self, token: Address) -> Self {
-        self.unwrapped_token = token;
+    /// Sets the tokenized shares address returned by `lookup_underlying`.
+    pub(crate) fn with_tokenized_shares(mut self, token: Address) -> Self {
+        self.tokenized_shares = token;
         self
     }
 
-    /// Sets the address returned by `lookup_tokenized_equity_derivative`.
+    /// Sets the wrapped (derivative) token address returned by
+    /// `lookup_derivative`.
     pub(crate) fn with_wrapped_token(mut self, token: Address) -> Self {
         self.wrapped_token = token;
         self
@@ -62,42 +68,33 @@ impl MockWrapper {
     /// Creates a mock wrapper that fails on wrap operations.
     pub(crate) fn failing() -> Self {
         Self {
-            owner: Address::random(),
-            unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
-            wrapped_token: Address::random(),
-            ratio: RATIO_ONE,
-            wrap_fails: true,
-            unwrap_fails: false,
-            lookup_fails: false,
+            failure: MockFailure::Wrap,
+            ..Self::new()
         }
     }
 
     /// Creates a mock wrapper that fails on unwrap operations.
     pub(crate) fn failing_unwrap() -> Self {
         Self {
-            owner: Address::random(),
-            unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
-            wrapped_token: Address::random(),
-            ratio: RATIO_ONE,
-            wrap_fails: false,
-            unwrap_fails: true,
-            lookup_fails: false,
+            failure: MockFailure::Unwrap,
+            ..Self::new()
         }
     }
 
     /// Creates a mock wrapper that fails on underlying token lookup.
     pub(crate) fn failing_lookup() -> Self {
         Self {
-            owner: Address::random(),
-            unwrap_tx: TxHash::random(),
-            unwrapped_token: Address::random(),
-            wrapped_token: Address::random(),
-            ratio: RATIO_ONE,
-            wrap_fails: false,
-            unwrap_fails: false,
-            lookup_fails: true,
+            failure: MockFailure::Lookup,
+            ..Self::new()
+        }
+    }
+
+    /// Creates a mock wrapper that succeeds on underlying token lookup but
+    /// fails on derivative token lookup.
+    pub(crate) fn failing_derivative_lookup() -> Self {
+        Self {
+            failure: MockFailure::DerivativeLookup,
+            ..Self::new()
         }
     }
 }
@@ -111,15 +108,15 @@ impl Wrapper for MockWrapper {
         Ok(UnderlyingPerWrapped::new(self.ratio).expect("ratio is non-zero"))
     }
 
-    fn lookup_tokenized_equity(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
-        if self.lookup_fails {
+    fn lookup_underlying(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+        if self.failure == MockFailure::Lookup {
             return Err(WrapperError::SymbolNotConfigured(symbol.clone()));
         }
-        Ok(self.unwrapped_token)
+        Ok(self.tokenized_shares)
     }
 
-    fn lookup_tokenized_equity_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
-        if self.lookup_fails {
+    fn lookup_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
+        if self.failure == MockFailure::DerivativeLookup {
             return Err(WrapperError::SymbolNotConfigured(symbol.clone()));
         }
         Ok(self.wrapped_token)
@@ -131,7 +128,7 @@ impl Wrapper for MockWrapper {
         underlying_amount: U256,
         _receiver: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
-        if self.wrap_fails {
+        if self.failure == MockFailure::Wrap {
             return Err(WrapperError::MissingDepositEvent);
         }
         // 1:1 ratio for mock - wrapped amount equals underlying amount
@@ -145,7 +142,7 @@ impl Wrapper for MockWrapper {
         _receiver: Address,
         _owner: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
-        if self.unwrap_fails {
+        if self.failure == MockFailure::Unwrap {
             return Err(WrapperError::MissingWithdrawEvent);
         }
         // 1:1 ratio for mock - underlying amount equals wrapped amount

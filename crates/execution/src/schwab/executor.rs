@@ -9,7 +9,8 @@ use crate::schwab::SchwabAuthCtx;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, TryIntoExecutor,
+    ExecutionError, Executor, InvalidSharesError, MarketOrder, OrderPlacement, OrderState,
+    OrderStatus, TryIntoExecutor,
 };
 
 /// Everything the Schwab executor needs to initialize: auth credentials,
@@ -97,7 +98,10 @@ impl Executor for Schwab {
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         // Schwab API does not support fractional shares - validate before placing order
-        let whole_shares = order.shares.to_whole_shares()?;
+        let whole_shares = order
+            .shares
+            .to_whole_shares()
+            .map_err(InvalidSharesError::from)?;
 
         info!(
             "Placing market order: {} {} shares of {}",
@@ -398,6 +402,30 @@ mod tests {
         assert_eq!(
             executor.to_supported_executor(),
             crate::SupportedExecutor::Schwab
+        );
+    }
+
+    #[tokio::test]
+    async fn place_market_order_rejects_fractional_shares() {
+        let pool = setup_test_db().await;
+        let auth = create_test_auth_env();
+        let broker = Schwab { auth, pool };
+
+        let fractional = st0x_finance::Positive::new(st0x_finance::FractionalShares::new(
+            rust_decimal_macros::dec!(1.5),
+        ))
+        .unwrap();
+
+        let order = MarketOrder {
+            symbol: st0x_finance::Symbol::new("AAPL").unwrap(),
+            shares: fractional,
+            direction: crate::Direction::Buy,
+        };
+
+        let error = broker.place_market_order(order).await.unwrap_err();
+        assert!(
+            matches!(error, ExecutionError::InvalidShares(_)),
+            "expected InvalidShares error for fractional shares, got: {error:?}"
         );
     }
 }

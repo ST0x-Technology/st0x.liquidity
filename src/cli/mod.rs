@@ -19,11 +19,11 @@ use tracing::info;
 
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
+use st0x_finance::Usdc;
 
 use crate::config::{Ctx, Env};
 use crate::offchain_order::OrderPlacer;
 use crate::symbol::cache::SymbolCache;
-use crate::threshold::Usdc;
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1314,6 +1314,7 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig {
+                    operational_limit: None,
                     symbols: test_equity_symbols(),
                 },
                 cash: None,
@@ -2357,11 +2358,7 @@ mod tests {
             r#"
                 database_url = ":memory:"
 
-                [assets.equities.AAPL]
-                tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                trading = "enabled"
-                rebalancing = "disabled"
+                [assets.equities]
 
                 [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"

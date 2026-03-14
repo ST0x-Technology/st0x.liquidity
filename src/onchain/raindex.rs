@@ -21,9 +21,9 @@ use tracing::{debug, info};
 use st0x_event_sorcery::ProjectionError;
 use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_finance::Usdc;
 
 use crate::bindings::{IERC20, IOrderBookV6};
-use crate::threshold::Usdc;
 use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProjection};
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
@@ -266,7 +266,7 @@ impl<E: Evm> RaindexService<E> {
         let decimal = self
             .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id)
             .await?;
-        Ok(Usdc(decimal))
+        Ok(Usdc::new(decimal))
     }
 
     async fn get_vault_balance<Registry: IntoErrorRegistry>(

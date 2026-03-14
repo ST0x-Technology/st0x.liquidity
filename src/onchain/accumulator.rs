@@ -43,7 +43,8 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
         .equities
         .symbols
         .get(symbol)
-        .and_then(|config| config.operational_limit);
+        .and_then(|config| config.operational_limit)
+        .or(assets.equities.operational_limit);
 
     let Some((direction, shares)) = position.is_ready_for_execution(executor_type, shares_limit)?
     else {
@@ -121,7 +122,8 @@ pub(crate) async fn check_all_positions<E: Executor>(
             .equities
             .symbols
             .get(symbol)
-            .and_then(|config| config.operational_limit);
+            .and_then(|config| config.operational_limit)
+            .or(assets.equities.operational_limit);
 
         if let Some((direction, shares)) =
             position.is_ready_for_execution(executor_type, shares_limit)?
@@ -553,6 +555,7 @@ mod tests {
 
         let assets = AssetsConfig {
             equities: EquitiesConfig {
+                operational_limit: None,
                 symbols: HashMap::from([(
                     symbol.clone(),
                     EquityAssetConfig {
