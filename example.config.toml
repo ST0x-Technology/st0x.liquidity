@@ -10,7 +10,6 @@ deployment_block = 1
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 equity = { target = 0.5, deviation = 0.2 }
-usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
 # Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
@@ -23,6 +22,12 @@ kind = "private-key"
 # kind = "turnkey"
 # address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 # organization_id = "org-example-turnkey-org-id"
+
+[assets.cash]
+trading = "disabled"
+rebalancing = "enabled"
+usdc_ratio = 0.5
+max_deviation = 0.3
 
 [assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
