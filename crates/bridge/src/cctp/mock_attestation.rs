@@ -120,12 +120,14 @@ impl CctpAttestationMock {
         Self { server, state }
     }
 
+    #[must_use]
     pub fn base_url(&self) -> String {
         self.server.base_url()
     }
 
     /// Returns how many unique `MessageSent` attestations the watcher has
     /// processed (useful for e2e test assertions).
+    #[must_use]
     pub fn processed_attestation_count(&self) -> usize {
         lock(&self.state).attestations.len()
     }
@@ -136,6 +138,11 @@ impl CctpAttestationMock {
     /// The watcher polls recent blocks on both chains, extracts CCTP messages,
     /// signs them with the test attester key, and stores them in shared state
     /// for the dynamic mock handler to serve.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the attester key is invalid or initial block number
+    /// queries fail.
     pub async fn start_watcher<EP, BP>(
         &self,
         ethereum_provider: EP,
@@ -298,6 +305,10 @@ async fn sign_cctp_message(
     message: &[u8],
     signer: &PrivateKeySigner,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
+    const NONCE_INDEX: usize = 12;
+    const FINALITY_INDEX: usize = 144;
+    const FINALITY_FINALIZED: u32 = 2000;
+
     let mut modified = message.to_vec();
 
     // Generate a random nonce that fits in u64 (upper 24 bytes must be zero
@@ -308,13 +319,10 @@ async fn sign_cctp_message(
     // Ensure nonce is not zero (reserved)
     nonce[31] |= 1;
 
-    const NONCE_INDEX: usize = 12;
     if modified.len() >= NONCE_INDEX + 32 {
         modified[NONCE_INDEX..NONCE_INDEX + 32].copy_from_slice(&nonce);
     }
 
-    const FINALITY_INDEX: usize = 144;
-    const FINALITY_FINALIZED: u32 = 2000;
     if modified.len() >= FINALITY_INDEX + 4 {
         modified[FINALITY_INDEX..FINALITY_INDEX + 4]
             .copy_from_slice(&FINALITY_FINALIZED.to_be_bytes());

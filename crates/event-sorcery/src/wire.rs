@@ -65,6 +65,7 @@ pub struct StoreBuilder<Entity: EventSourced, Materialized = <Entity as EventSou
 
 impl<Entity: EventSourced> StoreBuilder<Entity> {
     /// Creates a new builder for the given entity type.
+    #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,

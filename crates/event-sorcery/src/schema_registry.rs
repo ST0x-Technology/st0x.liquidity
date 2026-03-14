@@ -110,7 +110,7 @@ impl EventSourced for SchemaRegistry {
 
 /// Handles schema version reconciliation at startup.
 ///
-/// Reads state by replaying all SchemaRegistry events from the event
+/// Reads state by replaying all `SchemaRegistry` events from the event
 /// store (no views, no snapshots). Writes go through the CQRS
 /// framework to maintain event sourcing invariants.
 pub struct Reconciler {
@@ -119,13 +119,14 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
+    #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
         #[allow(clippy::disallowed_methods)]
         let cqrs = sqlite_es::sqlite_cqrs(pool.clone(), vec![], ());
         Self { cqrs, pool }
     }
 
-    /// Rebuilds SchemaRegistry state from the full event log.
+    /// Rebuilds `SchemaRegistry` state from the full event log.
     async fn load_registry(&self) -> Result<Option<SchemaRegistry>, ReconcileError> {
         let payloads: Vec<String> = sqlx::query_scalar(
             "SELECT payload FROM events \
@@ -158,6 +159,11 @@ impl Reconciler {
     ///
     /// Returns `true` if snapshots were cleared (schema changed),
     /// `false` if versions matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReconcileError` if the database query, event
+    /// replay, or CQRS command execution fails.
     pub async fn reconcile<Entity: EventSourced>(&self) -> Result<bool, ReconcileError> {
         let name = Entity::AGGREGATE_TYPE;
         let current_version = Entity::SCHEMA_VERSION;

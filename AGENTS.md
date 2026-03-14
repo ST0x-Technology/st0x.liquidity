@@ -32,6 +32,8 @@ the limit:
 - [docs/cqrs.md](docs/cqrs.md) - Event sourcing with st0x-event-sorcery
 - [docs/float.md](docs/float.md) - Float type, precision-safe financial
   arithmetic
+- [docs/sqlx.md](docs/sqlx.md) - SQLx offline mode, query cache, worktree setup,
+  and known pitfalls
 
 **Update at the end:**
 
@@ -277,8 +279,8 @@ reading `.bacon-locations`. If the file exists and is non-empty, bacon is active
 - **Only fall back to manual cargo commands** if `.bacon-locations` doesn't
   exist (bacon not running).
 
-Jobs are scoped to workspace crates only (excludes vendored `lib/` submodules).
-Configuration is in `bacon.toml`.
+Bacon jobs are scoped to workspace crates only (excludes vendored `lib/`
+submodules). Configuration is in `bacon.toml`.
 
 ### Nix Development Environment
 
