@@ -1,6 +1,6 @@
 //! [`Job`] implementation for processing order fill events.
 //!
-//! [`OrderFillJob`] carries a [`QueuedEvent`] through apalis
+//! [`AccountForDexTrade`] carries a [`QueuedEvent`] through apalis
 //! storage. Its [`execute`] method converts the event to a trade,
 //! discovers vaults, and runs the hedging pipeline.
 //!
@@ -14,9 +14,10 @@ use st0x_event_sorcery::Store;
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
-use super::job::{Job, Label};
-use super::order_fill_monitor::OrderFillJob;
-use super::{
+use super::inclusion::ChainIncluded;
+use crate::conductor::job::{Job, Label};
+use crate::conductor::order_fill_monitor::AccountForDexTrade;
+use crate::conductor::{
     OrderFillError, TradeProcessingCqrs, VaultDiscoveryCtx, convert_event_to_trade,
     discover_vaults_for_trade, process_queued_trade,
 };
@@ -27,7 +28,11 @@ use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::vault_registry::VaultRegistry;
 
+/// An accounting job for processing a single onchain raindex trade event.
+/// It's the unified mechanism for processing both backfilled events as well as
+/// live events from the monitor.
 pub(crate) struct AccountForDexTrade {
+    /// Raindex trade event with block inclusion metadata
     trade: ChainIncluded<TradeEvent>,
 }
 
@@ -61,19 +66,20 @@ where
             event,
             block_number: block,
             log_index: idx,
-        }) = &self.queued_event;
+        }) = &self.trade;
 
         Label::new(format!("{event_type}:{block}:{idx}"))
     }
 
     async fn perform(&self, ctx: &Accou<Prov, Exec>) -> Result<(), Self::Error> {
-        let queued_event = &self.queued_event;
+        use RaindexTradeEvent::{ClearV3, TakeOrderV3};
+
+        let trade_event = &self.trade;
         let order_owner = ctx.ctx.order_owner();
+        let reconstructed_log = reconstruct_log(&ctx.orderbook, trade_event);
 
-        let reconstructed_log = reconstruct_log(&ctx.orderbook, queued_event);
-
-        let onchain_trade = match &queued_event.event {
-            RaindexTradeEvent::ClearV3(clear_event) => {
+        let onchain_trade = match &trade_event.event {
+            ClearV3(clear_event) => {
                 OnchainTrade::try_from_clear_v3(
                     &ctx.evm,
                     cache,
@@ -86,7 +92,7 @@ where
                 .await?
             }
 
-            RaindexTradeEvent::TakeOrderV3(take_event) => {
+            TakeOrderV3(take_event) => {
                 OnchainTrade::try_from_take_order_if_target_owner(
                     cache,
                     evm,
@@ -101,9 +107,9 @@ where
 
         let Some(trade) = onchain_trade else {
             info!(
-                event_type = match &queued_event.,
-                tx_hash = ?queued_event.tx_hash,
-                log_index = queued_event.log_index,
+                event_type = &trade_event,
+                tx_hash = ?trade_event.tx_hash,
+                log_index = trade_event.log_index,
                 "Event filtered out (no matching owner)"
             );
 
@@ -122,13 +128,13 @@ where
             symbol = %trade.symbol,
             amount = %trade.amount,
             "Processing a {event_type} event"
-            event_type = match &queued_event.event {
+            event_type = match &trade.event {
                 TradeEvent::ClearV3(_) => "ClearV3",
                 TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
             },
         );
 
-        discover_vaults_for_trade(queued_event, &trade, &vault_discovery_ctx).await?;
+        discover_vaults_for_trade(trade_event, &trade, &vault_discovery_ctx).await?;
 
         let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
         let _guard = symbol_lock.lock().await;
@@ -137,7 +143,7 @@ where
 
         process_queued_trade(
             &ctx.executor,
-            queued_event,
+            trade_event,
             trade,
             &ctx.cqrs,
             trading_enabled,
@@ -151,12 +157,12 @@ where
 fn reconstruct_log(orderbook: Address, trade: &ChainIncluded<TradeEvent>) -> Log {
     use RaindexTradeEvent::{ClearV3, TakeOrderV3};
 
-    let log_data = match &queued_event.event {
+    let log_data = match &trade.event {
         ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
         TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
     };
 
-    let block_timestamp = queued_event
+    let block_timestamp = trade
         .block_timestamp
         .and_then(|dt| u64::try_from(dt.timestamp()).ok());
 
@@ -166,11 +172,11 @@ fn reconstruct_log(orderbook: Address, trade: &ChainIncluded<TradeEvent>) -> Log
             data: log_data,
         },
         block_hash: None,
-        block_number: Some(queued_event.block_number),
+        block_number: Some(trade.block_number),
         block_timestamp,
-        transaction_hash: Some(queued_event.tx_hash),
+        transaction_hash: Some(trade.tx_hash),
         transaction_index: None,
-        log_index: Some(queued_event.log_index),
+        log_index: Some(trade.log_index),
         removed: false,
     }
 }
@@ -210,7 +216,7 @@ mod tests {
     use crate::test_utils::{get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
-    fn test_order_fill_job() -> OrderFillJob {
+    fn test_order_fill_job() -> AccountForDexTrade {
         let log = get_test_log();
         let event = TradeEvent::ClearV3(Box::new(crate::bindings::IOrderBookV6::ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -226,8 +232,8 @@ mod tests {
             },
         }));
 
-        OrderFillJob {
-            queued_event: QueuedEvent::from_log(event, &log).unwrap(),
+        AccountForDexTrade {
+            trade: ChainIncluded::from_leg(event, &log).unwrap(),
         }
     }
 
@@ -235,7 +241,8 @@ mod tests {
     fn label_returns_order_fill() {
         let job = test_order_fill_job();
         let label: Label =
-            <OrderFillJob as Job<OrderFillCtx<RootProvider, MockExecutor>>>::label(&job);
+            <AccountForDexTrade as Job<OrderFillCtx<RootProvider, MockExecutor>>>::label(&job);
+
         assert_eq!(label.to_string(), "order-fill");
     }
 

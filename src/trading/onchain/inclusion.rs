@@ -1,6 +1,6 @@
-//! Lightweight event envelope used by the apalis job pipeline.
+//! Lightweight envelope used to represent an event included on-chain.
 //!
-//! [`QueuedEvent`] carries just enough metadata to identify and process
+//! [`ChainIncluded`] carries just enough metadata to identify and process
 //! an onchain trade event. It is serialized into [`OrderFillJob`] payloads
 //! and stored in apalis's `Jobs` table
 
@@ -8,9 +8,8 @@ use alloy::primitives::TxHash;
 use alloy::rpc::types::Log;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::num::TryFromIntError;
-
-use crate::onchain::trade::TradeEvent;
 
 /// Wraps an arbitrary event type with metadata about the exact point
 /// at which the event was included in the ledger.
@@ -24,9 +23,8 @@ pub(crate) struct ChainIncluded<Event> {
 }
 
 impl<Event> ChainIncluded<Event> {
-    /// Constructs a [`QueuedEvent`] from a decoded trade event and its
-    /// log metadata, without writing to the database. Used by the apalis
-    /// event monitor to build job payloads directly.
+    /// Extracts block inclusion metadata from an RPC log and pairs it
+    /// with the already-decoded event.
     pub(crate) fn from_log(event: Event, log: &Log) -> Result<Self, BlockInclusionError> {
         use BlockInclusionError::MissingLogField;
 
@@ -57,11 +55,11 @@ impl<Event> ChainIncluded<Event> {
     }
 }
 
-/// Event queue errors.
+/// Errors when extracting block inclusion metadata from a log.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BlockInclusionError {
     #[error("Log missing required field: {0}")]
-    MissingRequiredField(RequiredField),
+    MissingLogField(RequiredField),
     #[error("Integer conversion error: {0}")]
     IntConversion(#[from] TryFromIntError),
     #[error("Event serialization failed: {0}")]
@@ -70,12 +68,22 @@ pub(crate) enum BlockInclusionError {
     InvalidTxHash(#[from] alloy::hex::FromHexError),
 }
 
-/// Event queue errors.
+/// Required log fields for constructing a [`ChainIncluded`].
 #[derive(Debug)]
 pub(crate) enum RequiredField {
     TxHash,
     LogIndex,
     BlockNumber,
+}
+
+impl fmt::Display for RequiredField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TxHash => write!(formatter, "transaction_hash"),
+            Self::LogIndex => write!(formatter, "log_index"),
+            Self::BlockNumber => write!(formatter, "block_number"),
+        }
+    }
 }
 
 // TODO: bring over tests

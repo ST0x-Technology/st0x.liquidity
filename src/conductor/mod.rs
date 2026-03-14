@@ -3,8 +3,9 @@
 //! tasks (order polling, rebalancing, inventory tracking). [`Conductor`] owns
 //! the task handles; [`run_market_hours_loop`] drives the lifecycle.
 
+pub(crate) mod job;
+
 mod builder;
-mod job;
 mod manifest;
 mod order_fill_monitor;
 
