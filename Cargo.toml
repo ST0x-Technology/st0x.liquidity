@@ -161,6 +161,10 @@ st0x-evm.workspace = true
 bon = "3.9.0"
 httpmock = { workspace = true, optional = true }
 st0x-finance = { workspace = true, features = ["alloy"] }
+apalis = "1.0.0-rc.4"
+apalis-sqlite = "1.0.0-rc.4"
+task-supervisor = "0.4"
+apalis-codec = "0.1.0-rc.4"
 
 [dev-dependencies]
 async-trait.workspace = true

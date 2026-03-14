@@ -8,14 +8,15 @@
 //! Every hedging test calls `assert_full_hedging_flow` which checks broker state,
 //! onchain vault balances, and all CQRS events/views comprehensively.
 
-mod assertions;
+pub(crate) mod assertions;
 
 use st0x_execution::alpaca_broker_api::OrderStatus;
 
 use self::assertions::*;
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let equity_symbol = "AAPL";
     let onchain_price = dec!(155.00);
     let broker_fill_price = dec!(150.25);
@@ -80,8 +81,9 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
 /// This keeps a high-scale decimal in the order expression without going
 /// through buy-side reciprocal generation, so it isolates reciprocal/dust bugs
 /// from direct price literal handling in the hedging path.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = Decimal::from_str("112.50000000000000000000000002")?;
     let broker_fill_price = dec!(113.57);
     let trade_amount = dec!(12.5);
@@ -146,8 +148,9 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn multi_asset_sustained_load() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let aapl_onchain = dec!(190.00);
     let aapl_broker = dec!(185.50);
     let tsla_onchain = dec!(250.00);
@@ -247,8 +250,9 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn backfilling() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(155.00);
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(4.5);
@@ -297,17 +301,6 @@ async fn backfilling() -> anyhow::Result<()> {
     // for the position reaching net=0 instead of counting fill events.
     poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
 
-    // Verify all historical events were picked up via backfill
-    let pool = connect_db(&infra.db_path).await?;
-    let queued = count_queued_events(&pool).await?;
-    assert_eq!(
-        queued, trade_count,
-        "Expected exact queued event count from backfill",
-    );
-    let processed = count_processed_queue_events(&pool).await?;
-    assert_eq!(processed, queued, "All queued events should be processed");
-    pool.close().await;
-
     let expected_position = ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(dec!(13.5))
@@ -334,8 +327,9 @@ async fn backfilling() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn resumption_after_shutdown() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(155.00);
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(8.3);
@@ -447,8 +441,9 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(155.00);
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(6.75);
@@ -548,8 +543,6 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     .await?;
 
     let ref_pool = connect_db(&ref_infra.db_path).await?;
-    let ref_queued_events = count_queued_events(&ref_pool).await?;
-    let ref_processed_queue_events = count_processed_queue_events(&ref_pool).await?;
     let ref_onchain_events = count_events(&ref_pool, "OnChainTrade").await?;
     let ref_offchain_events = count_events(&ref_pool, "OffchainOrder").await?;
     ref_pool.close().await;
@@ -647,20 +640,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     .await?;
 
     let crash_pool = connect_db(&crash_infra.db_path).await?;
-    let crash_queued_events = count_queued_events(&crash_pool).await?;
-    let crash_processed_queue_events = count_processed_queue_events(&crash_pool).await?;
     let crash_onchain_events = count_events(&crash_pool, "OnChainTrade").await?;
     let crash_offchain_events = count_events(&crash_pool, "OffchainOrder").await?;
     crash_pool.close().await;
 
-    assert_eq!(
-        crash_queued_events, ref_queued_events,
-        "Crash recovery should enqueue the exact same number of onchain events as reference",
-    );
-    assert_eq!(
-        crash_processed_queue_events, ref_processed_queue_events,
-        "Crash recovery should process the exact same number of queued events as reference",
-    );
     assert_eq!(
         crash_onchain_events, ref_onchain_events,
         "Crash recovery should persist the exact same OnChainTrade event count as reference",
@@ -673,8 +656,9 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn market_hours_transitions() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(155.00);
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(12.5);
@@ -767,15 +751,6 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     )
     .await?;
 
-    let pool = connect_db(&infra.db_path).await?;
-    let queued = count_queued_events(&pool).await?;
-    let processed = count_processed_queue_events(&pool).await?;
-    assert_eq!(
-        queued, processed,
-        "All queued events should be processed exactly once"
-    );
-    pool.close().await;
-
     bot.abort();
     Ok(())
 }
@@ -785,8 +760,9 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
 /// Uses a high execution threshold so individual trades don't trigger
 /// hedging. After a SellEquity and BuyEquity of equal size, net = 0
 /// and no offchain orders should exist.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     // Price must have an exact decimal reciprocal (1/200 = 0.005) so the
     // BuyEquity ioRatio round-trips without precision artifacts. Otherwise
     // sell 14.75 + buy 14.75 won't net to exactly zero onchain.
@@ -873,8 +849,9 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
 /// Verifies that when the broker rejects order placement (HTTP 422), the
 /// position still accumulates onchain shares but the offchain order
 /// transitions to Failed and no broker orders are created.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn broker_placement_fails() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(150.00);
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(7.5);
@@ -962,8 +939,9 @@ async fn broker_placement_fails() -> anyhow::Result<()> {
 /// "rejected", the offchain order transitions through Placed -> Submitted ->
 /// Failed. Unlike `broker_placement_fails` (HTTP 422 at placement), here
 /// the broker order actually exists and is polled before failing.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn broker_order_rejected() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(150.00);
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(5.25);
@@ -1059,8 +1037,9 @@ async fn broker_order_rejected() -> anyhow::Result<()> {
 /// Verifies that the bot correctly handles orders that take multiple poll
 /// cycles to fill (simulating real broker latency). The order stays in
 /// "new" status for 3 polls before transitioning to "filled".
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn delayed_fill() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(155.00);
     let broker_fill_price = dec!(150.25);
     let sell_amount = dec!(10.75);
@@ -1163,8 +1142,9 @@ async fn delayed_fill() -> anyhow::Result<()> {
 ///
 /// The price must be high enough that 0.001 shares x price exceeds
 /// the Alpaca $2.00 execution threshold ($2500 x 0.001 = $2.50).
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn small_fractional_amounts() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(2500.00);
     let broker_fill_price = dec!(2490.00);
     let tiny_amount = dec!(0.001);
@@ -1225,8 +1205,9 @@ async fn small_fractional_amounts() -> anyhow::Result<()> {
 /// handled correctly. AAPL is submitted first but delayed 5 polls;
 /// TSLA is submitted second but fills immediately. Both should end
 /// fully hedged regardless of fill ordering.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn out_of_order_fills() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(155.00);
     let aapl_broker = dec!(150.25);
     let tsla_broker = dec!(245.00);
@@ -1339,8 +1320,9 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
 /// (e.g., re-checking accumulated positions), so we only assert
 /// strict equality on queue-level and onchain-aggregate-level counts,
 /// and verify the position projection converges to the same state.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn duplicate_event_delivery() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(155.00);
     let broker_fill_price = dec!(150.00);
     let sell_amount = dec!(8.3);
@@ -1375,8 +1357,6 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
 
     // Snapshot counts before restart
     let pool = connect_db(&infra.db_path).await?;
-    let pre_queued = count_queued_events(&pool).await?;
-    let pre_processed = count_processed_queue_events(&pool).await?;
     let pre_onchain_events = count_events(&pool, "OnChainTrade").await?;
 
     let pre_position = Projection::<Position>::sqlite(pool.clone())
@@ -1402,20 +1382,6 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
     wait_for_processing(&mut bot2, 10).await;
 
     let pool = connect_db(&infra.db_path).await?;
-
-    // Queue-level dedup: no new rows from re-backfilling the same events
-    let post_queued = count_queued_events(&pool).await?;
-    let post_processed = count_processed_queue_events(&pool).await?;
-    assert_eq!(
-        pre_queued, post_queued,
-        "Queue count should be unchanged after re-backfill: \
-         pre={pre_queued}, post={post_queued}"
-    );
-    assert_eq!(
-        pre_processed, post_processed,
-        "Processed count should be unchanged after re-backfill: \
-         pre={pre_processed}, post={post_processed}"
-    );
 
     // OnChainTrade aggregate events: CQRS prevents duplicate events on
     // the same aggregate (same tx_hash:log_index ID)

@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                id,\n                access_token,\n                access_token_fetched_at,\n                refresh_token,\n                refresh_token_fetched_at,\n                encryption_version\n            FROM schwab_auth\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "access_token",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "access_token_fetched_at",
+        "ordinal": 2,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "refresh_token",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "refresh_token_fetched_at",
+        "ordinal": 4,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "encryption_version",
+        "ordinal": 5,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4d652535fb6a3cafce591a1e683f5713497c9f61e8631293d0d8f35897cc2f7f"
+}

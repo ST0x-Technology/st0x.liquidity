@@ -8,10 +8,11 @@ use alloy::rpc::types::trace::geth::{
     CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, GethTrace,
 };
 use alloy::sol_types::{SolCall, SolType};
+use alloy::transports::TransportErrorKind;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::bindings::IPyth::{
     getEmaPriceNoOlderThanCall, getEmaPriceUnsafeCall, getPriceNoOlderThanCall, getPriceUnsafeCall,
@@ -38,14 +39,14 @@ pub enum PythError {
     InvalidTraceVariant,
     #[error("Arithmetic overflow in price conversion")]
     ArithmeticOverflow,
-    #[error("RPC error while fetching trace: {0}")]
-    Rpc(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Invalid timestamp value: {0}")]
     InvalidTimestamp(U256),
     #[error("Exponent conversion failed: {0}")]
     ExponentConversion(#[from] std::num::TryFromIntError),
     #[error("Decimal creation failed: {0}")]
     DecimalCreation(#[from] rust_decimal::Error),
+    #[error(transparent)]
+    RpcTransport(#[from] alloy::transports::RpcError<TransportErrorKind>),
 }
 
 #[derive(Debug, Clone)]
@@ -212,106 +213,7 @@ pub async fn extract_pyth_price<P>(
 where
     P: Provider,
 {
-    debug!("Fetching trace for tx {tx_hash}");
-    let trace = fetch_transaction_trace(tx_hash, provider).await?;
-
-    debug!("Parsing trace for Pyth oracle calls");
-    let pyth_calls = find_pyth_calls(&trace)?;
-
-    let (first_call, rest) = parse_non_empty_pyth_calls(&pyth_calls, tx_hash)?;
-
-    let matching_call = find_matching_pyth_call(first_call, rest, symbol, cache, tx_hash).await?;
-
-    extract_and_log_price(matching_call, symbol, tx_hash)
-}
-
-fn parse_non_empty_pyth_calls(
-    pyth_calls: &[PythCall],
-    tx_hash: TxHash,
-) -> Result<(&PythCall, &[PythCall]), PythError> {
-    let Some((first, rest)) = pyth_calls.split_first() else {
-        warn!("No Pyth call found in transaction {tx_hash}");
-        return Err(PythError::NoPythCall);
-    };
-
-    debug!("Found {} Pyth call(s) in trace", pyth_calls.len());
-    Ok((first, rest))
-}
-
-async fn find_matching_pyth_call<'a>(
-    first_call: &'a PythCall,
-    rest: &'a [PythCall],
-    symbol: &str,
-    cache: &FeedIdCache,
-    tx_hash: TxHash,
-) -> Result<&'a PythCall, PythError> {
-    let cached_feed_id = cache.get(symbol).await;
-
-    if let Some(feed_id) = cached_feed_id {
-        find_call_by_cached_feed_id(first_call, rest, feed_id, symbol, tx_hash)
-    } else {
-        cache_new_feed_id(cache, symbol, first_call).await;
-        Ok(first_call)
-    }
-}
-
-fn find_call_by_cached_feed_id<'a>(
-    first_call: &'a PythCall,
-    rest: &'a [PythCall],
-    feed_id: B256,
-    symbol: &str,
-    tx_hash: TxHash,
-) -> Result<&'a PythCall, PythError> {
-    debug!("Found cached feed ID for {symbol}: {feed_id}");
-
-    std::iter::once(first_call)
-        .chain(rest.iter())
-        .find(|call| call.price_feed_id == feed_id)
-        .ok_or_else(|| {
-            warn!(
-                "No Pyth call found matching cached feed ID {feed_id} \
-                 for {symbol} in transaction {tx_hash}"
-            );
-            PythError::NoMatchingFeedId(feed_id)
-        })
-}
-
-async fn cache_new_feed_id(cache: &FeedIdCache, symbol: &str, call: &PythCall) {
-    debug!("No cached feed ID for {symbol}, using first Pyth call and caching");
-    cache.insert(symbol.to_string(), call.price_feed_id).await;
-    info!(
-        "Cached new feed ID mapping: {symbol} -> {}",
-        call.price_feed_id
-    );
-}
-
-fn extract_and_log_price(
-    matching_call: &PythCall,
-    symbol: &str,
-    tx_hash: TxHash,
-) -> Result<Price, PythError> {
-    debug!(
-        "Using Pyth call at depth {} with feed ID {} for price extraction",
-        matching_call.depth, matching_call.price_feed_id
-    );
-
-    let price = decode_pyth_price(&matching_call.output).map_err(|error| {
-        error!("Failed to extract Pyth price from {tx_hash}: {error}");
-        error
-    })?;
-
-    info!(
-        "Extracted Pyth price for {symbol} (feed {}): {} (expo: {}, conf: {})",
-        matching_call.price_feed_id, price.price, price.expo, price.conf
-    );
-
-    Ok(price)
-}
-
-async fn fetch_transaction_trace<P>(tx_hash: TxHash, provider: &P) -> Result<GethTrace, PythError>
-where
-    P: Provider,
-{
+    trace!("Fetching trace for tx {tx_hash}");
     let options = GethDebugTracingOptions {
         tracer: Some(GethDebugTracerType::BuiltInTracer(
             GethDebugBuiltInTracerType::CallTracer,
@@ -319,12 +221,53 @@ where
         ..Default::default()
     };
 
-    let trace = provider
-        .debug_trace_transaction(tx_hash, options)
-        .await
-        .map_err(|error| PythError::Rpc(Box::new(error)))?;
+    let trace = provider.debug_trace_transaction(tx_hash, options).await?;
 
-    Ok(trace)
+    trace!("Parsing trace for Pyth oracle calls");
+    let pyth_calls = find_pyth_calls(&trace)?;
+
+    let target_call = resolve_pyth_call(&pyth_calls, symbol, tx_hash, cache).await?;
+
+    let price = decode_pyth_price(&target_call.output)?;
+
+    debug!(
+        depth = target_call.depth,
+        feed_id = %target_call.price_feed_id,
+        price = %price.price,
+        "Fetched reference Pyth price"
+    );
+
+    Ok(price)
+}
+
+async fn resolve_pyth_call<'a>(
+    pyth_calls: &'a [PythCall],
+    symbol: &str,
+    tx_hash: TxHash,
+    cache: &FeedIdCache,
+) -> Result<&'a PythCall, PythError> {
+    let Some((first_call, rest)) = pyth_calls.split_first() else {
+        return Err(PythError::NoPythCall);
+    };
+
+    let Some(feed_id) = cache.get(symbol).await else {
+        debug!(%symbol, "No cached feed ID for {symbol}, using first Pyth call and caching");
+        cache
+            .insert(symbol.to_string(), first_call.price_feed_id)
+            .await;
+        return Ok(first_call);
+    };
+
+    std::iter::once(first_call)
+        .chain(rest.iter())
+        .find(|call| call.price_feed_id == feed_id)
+        .ok_or_else(|| {
+            warn!(
+                %tx_hash, %feed_id, %symbol,
+                "No Pyth call found matching cached feed ID"
+            );
+            PythError::NoMatchingFeedId(feed_id)
+        })
 }
 
 #[cfg(test)]
