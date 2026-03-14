@@ -12,7 +12,7 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
-use super::job::handle_job;
+use super::job::work;
 use super::order_fill_monitor::{DexEventStreams, OrderFillJobQueue, OrderFillMonitor};
 use super::order_fill_processor::OrderFillCtx;
 use super::{
@@ -208,7 +208,7 @@ where
                     WorkerBuilder::new(format!("order-fill-worker-{index}"))
                         .backend(job_queue.clone())
                         .data(order_fill_ctx.clone())
-                        .build(handle_job::<_, OrderFillCtx<Prov, Exec>>)
+                        .build(work::<_, OrderFillCtx<Prov, Exec>>)
                 });
 
             if let Err(monitor_error) = monitor.run().await {

@@ -21,7 +21,7 @@ use super::EvmCtx;
 use super::OnChainError;
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::conductor::{OrderFillJob, OrderFillJobQueue};
-use crate::onchain::trade::TradeEvent;
+use crate::onchain::trade::RaindexTradeEvent;
 use crate::queue::QueuedEvent;
 
 pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
@@ -150,11 +150,9 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     .await?;
 
     debug!(
-        "Found {} ClearV3 events and {} TakeOrderV3 events in batch {}-{}",
-        clear_logs.len(),
-        take_logs.len(),
-        batch_start,
-        batch_end
+        total_clear_logs = %clear_logs.len(),
+        total_take_logs = %take_logs.len(),
+        "Processed a batch of blocks from {batch_start} to {batch_end}",
     );
 
     let queued_events = clear_logs
@@ -163,10 +161,10 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .sorted_by_key(|log| (log.block_number, log.log_index))
         .filter_map(|log| {
             if let Ok(clear_event) = log.log_decode::<ClearV3>() {
-                let event = TradeEvent::ClearV3(Box::new(clear_event.data().clone()));
+                let event = RaindexTradeEvent::ClearV3(Box::new(clear_event.data().clone()));
                 Some((event, log))
             } else if let Ok(take_event) = log.log_decode::<TakeOrderV3>() {
-                let event = TradeEvent::TakeOrderV3(Box::new(take_event.data().clone()));
+                let event = RaindexTradeEvent::TakeOrderV3(Box::new(take_event.data().clone()));
                 Some((event, log))
             } else {
                 None

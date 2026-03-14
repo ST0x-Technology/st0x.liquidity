@@ -30,7 +30,7 @@ where
     fn label(&self) -> Label;
 
     /// Process this job using the provided context.
-    async fn execute(&self, ctx: &Ctx) -> Result<(), Self::Error>;
+    async fn perform(&self, ctx: &Ctx) -> Result<(), Self::Error>;
 }
 
 /// Generic apalis handler that bridges [`Job`] implementations
@@ -43,16 +43,16 @@ where
 ///     .data(ctx)
 ///     .build(handle_job::<MyJob, MyCtx>)
 /// ```
-pub(crate) async fn handle_job<J, Ctx>(job: J, ctx: Data<Arc<Ctx>>)
+pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
 where
-    J: Job<Ctx>,
     Ctx: Send + Sync + 'static,
+    J: Job<Ctx>,
 {
     let label = job.label();
 
     debug!(%label, "Processing job");
 
-    let result = (|| job.execute(&ctx))
+    let result = (|| job.perform(&ctx))
         .retry(ExponentialBuilder::default().with_max_times(3))
         .notify(|error, duration| {
             warn!(%label, %error, ?duration, "Retrying job after transient failure");

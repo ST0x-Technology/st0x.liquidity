@@ -33,13 +33,13 @@ mod offchain_order;
 mod onchain;
 mod onchain_trade;
 mod position;
-mod queue;
 mod rebalancing;
 mod shares;
 mod symbol;
 mod telemetry;
 mod threshold;
 mod tokenization;
+mod trading;
 #[cfg(feature = "mock")]
 pub use tokenization::mock_api;
 mod tokenized_equity_mint;

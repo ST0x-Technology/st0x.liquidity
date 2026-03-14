@@ -24,7 +24,7 @@ use tracing::{error, info, trace};
 use url::Url;
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
-use crate::onchain::trade::TradeEvent;
+use crate::onchain::trade::RaindexTradeEvent;
 use crate::queue::QueuedEvent;
 
 #[derive(Debug, thiserror::Error)]
@@ -34,7 +34,6 @@ enum OrderFillMonitorError {
 }
 
 /// Job representing an onchain order fill to be processed via apalis.
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct OrderFillJob {
     pub(crate) queued_event: QueuedEvent,
 }
@@ -66,7 +65,7 @@ pub(crate) struct DexEventStreams {
 pub(crate) struct OrderFillMonitor {
     ws_url: Url,
     orderbook: Address,
-    storage: OrderFillJobQueue,
+    job_queue: OrderFillJobQueue,
     dex_streams: Arc<Mutex<Option<DexEventStreams>>>,
 }
 
@@ -80,7 +79,7 @@ impl OrderFillMonitor {
         Self {
             ws_url,
             orderbook,
-            storage,
+            job_queue: storage,
             dex_streams: Arc::new(Mutex::new(Some(dex_streams))),
         }
     }
@@ -131,11 +130,11 @@ impl OrderFillMonitor {
             let trade_event = tokio::select! {
                 Some(result) = clear_stream.next() => {
                     let (event, log) = result?;
-                    Some((TradeEvent::ClearV3(Box::new(event)), log))
+                    Some((RaindexTradeEvent::ClearV3(Box::new(event)), log))
                 }
                 Some(result) = take_stream.next() => {
                     let (event, log) = result?;
-                    Some((TradeEvent::TakeOrderV3(Box::new(event)), log))
+                    Some((RaindexTradeEvent::TakeOrderV3(Box::new(event)), log))
                 }
                 else => None,
             };
@@ -151,7 +150,7 @@ impl OrderFillMonitor {
 
     async fn enqueue_trade_event(
         &mut self,
-        event: TradeEvent,
+        event: RaindexTradeEvent,
         log: &alloy::rpc::types::Log,
     ) -> TaskResult {
         let queued_event = match QueuedEvent::from_log(event, log) {
@@ -168,7 +167,7 @@ impl OrderFillMonitor {
             "Pushing order fill job into apalis storage"
         );
 
-        self.storage.push(OrderFillJob { queued_event }).await?;
+        self.job_queue.push(Trade { queued_event }).await?;
 
         Ok(())
     }
@@ -285,7 +284,7 @@ mod tests {
     async fn enqueue_trade_event_persists_to_storage() {
         let (mut monitor, pool) = create_test_monitor_with_pool().await;
         let log = create_log(42);
-        let event = TradeEvent::ClearV3(Box::new(test_clear_event()));
+        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
 
         monitor.enqueue_trade_event(event, &log).await.unwrap();
 
@@ -310,7 +309,7 @@ mod tests {
             removed: false,
         };
 
-        let event = TradeEvent::ClearV3(Box::new(test_clear_event()));
+        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
 
         monitor
             .enqueue_trade_event(event, &invalid_log)

@@ -7,7 +7,6 @@ mod builder;
 mod job;
 mod manifest;
 mod order_fill_monitor;
-mod order_fill_processor;
 
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -21,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
@@ -45,7 +44,7 @@ use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execu
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
+use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
@@ -97,23 +96,6 @@ pub(crate) struct Conductor {
     pub(crate) executor_maintenance: Option<JoinHandle<()>>,
     pub(crate) rebalancer: Option<JoinHandle<()>>,
     pub(crate) inventory_poller: Option<JoinHandle<()>>,
-}
-
-/// Event processing errors for live event handling.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum OrderFillError {
-    #[error("Event queue error: {0}")]
-    Queue(#[from] crate::queue::EventQueueError),
-    #[error("Onchain trade processing error: {0}")]
-    OnChain(#[from] OnChainError),
-    #[error("Vault registry command failed: {0}")]
-    VaultRegistry(#[from] SendError<VaultRegistry>),
-    #[error("Execution error: {0}")]
-    Execution(#[from] ExecutionError),
-    #[error("Alpaca trading API error: {0}")]
-    AlpacaTradingApi(#[from] AlpacaTradingApiError),
-    #[error("Alpaca broker API error: {0}")]
-    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
 }
 
 pub(crate) async fn run_market_hours_loop<E>(
@@ -669,7 +651,7 @@ fn spawn_inventory_poller<Chain: Evm, Exe: Executor + Send + 'static>(
                 }
             }
 
-            debug!("Running inventory poll");
+            trace!("Running inventory poll");
             if let Err(error) = service.poll_and_record().await {
                 error!(%error, "Inventory polling failed");
             }
@@ -715,8 +697,8 @@ where
 
 /// Pushes buffered events from the coordination phase into apalis storage.
 async fn enqueue_buffered_events(
-    storage: &mut order_fill_monitor::OrderFillJobQueue,
-    event_buffer: Vec<(TradeEvent, Log)>,
+    job_queue: &mut order_fill_monitor::OrderFillJobQueue,
+    event_buffer: Vec<(RaindexTradeEvent, Log)>,
 ) {
     info!(
         "Coordination Phase: Processing {} buffered events from subscription",
@@ -730,7 +712,7 @@ async fn enqueue_buffered_events(
     });
 
     for queued_event in queued_events {
-        if let Err(error) = storage
+        if let Err(error) = job_queue
             .push(order_fill_monitor::OrderFillJob { queued_event })
             .await
         {
@@ -758,8 +740,8 @@ pub(crate) async fn discover_vaults_for_trade(
     let expected_equity_token = trade.equity_token;
 
     let owned_vaults = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => extract_vaults_from_clear(clear_event),
-        TradeEvent::TakeOrderV3(take_event) => extract_owned_vaults(
+        RaindexTradeEvent::ClearV3(clear_event) => extract_vaults_from_clear(clear_event),
+        RaindexTradeEvent::TakeOrderV3(take_event) => extract_owned_vaults(
             &take_event.config.order,
             take_event.config.inputIOIndex,
             take_event.config.outputIOIndex,
@@ -819,35 +801,6 @@ async fn convert_event_to_trade(
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OrderFillError> {
-    let reconstructed_log = reconstruct_log_from_queued_event(&ctx.evm, queued_event);
-
-    let onchain_trade = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => {
-            OnchainTrade::try_from_clear_v3(
-                &ctx.evm,
-                cache,
-                evm,
-                *clear_event.clone(),
-                reconstructed_log,
-                feed_id_cache,
-                order_owner,
-            )
-            .await?
-        }
-        TradeEvent::TakeOrderV3(take_event) => {
-            OnchainTrade::try_from_take_order_if_target_owner(
-                cache,
-                evm,
-                *take_event.clone(),
-                reconstructed_log,
-                order_owner,
-                feed_id_cache,
-            )
-            .await?
-        }
-    };
-
-    Ok(onchain_trade)
 }
 
 /// Witnesses the trade in the OnChainTrade aggregate. Returns `true` if this
@@ -1100,34 +1053,6 @@ async fn execute_create_offchain_order(
     }
 }
 
-fn reconstruct_log_from_queued_event(
-    ctx: &EvmCtx,
-    queued_event: &crate::queue::QueuedEvent,
-) -> Log {
-    let log_data = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
-        TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
-    };
-
-    let block_timestamp = queued_event
-        .block_timestamp
-        .and_then(|dt| u64::try_from(dt.timestamp()).ok());
-
-    Log {
-        inner: alloy::primitives::Log {
-            address: ctx.orderbook,
-            data: log_data,
-        },
-        block_hash: None,
-        block_number: Some(queued_event.block_number),
-        block_timestamp,
-        transaction_hash: Some(queued_event.tx_hash),
-        transaction_index: None,
-        log_index: Some(queued_event.log_index),
-        removed: false,
-    }
-}
-
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
@@ -1239,7 +1164,7 @@ async fn wait_for_first_event_with_timeout<S1, S2>(
     clear_stream: &mut S1,
     take_stream: &mut S2,
     timeout: std::time::Duration,
-) -> Option<(Vec<(TradeEvent, Log)>, u64)>
+) -> Option<(Vec<(RaindexTradeEvent, Log)>, u64)>
 where
     S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
     S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
@@ -1252,10 +1177,10 @@ where
     loop {
         let event_result = tokio::select! {
             Some(result) = clear_stream.next() => {
-                result.map(|(event, log)| (TradeEvent::ClearV3(Box::new(event)), log))
+                result.map(|(event, log)| (RaindexTradeEvent::ClearV3(Box::new(event)), log))
             }
             Some(result) = take_stream.next() => {
-                result.map(|(event, log)| (TradeEvent::TakeOrderV3(Box::new(event)), log))
+                result.map(|(event, log)| (RaindexTradeEvent::TakeOrderV3(Box::new(event)), log))
             }
             () = &mut deadline => return None,
         };
@@ -1279,7 +1204,7 @@ where
 async fn buffer_live_events<S1, S2>(
     clear_stream: &mut S1,
     take_stream: &mut S2,
-    event_buffer: &mut Vec<(TradeEvent, Log)>,
+    event_buffer: &mut Vec<(RaindexTradeEvent, Log)>,
     cutoff_block: u64,
 ) where
     S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
@@ -1289,14 +1214,14 @@ async fn buffer_live_events<S1, S2>(
         tokio::select! {
             Some(result) = clear_stream.next() => match result {
                 Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
-                    event_buffer.push((TradeEvent::ClearV3(Box::new(event)), log));
+                    event_buffer.push((RaindexTradeEvent::ClearV3(Box::new(event)), log));
                 }
                 Err(error) => error!("Error in clear event stream during backfill: {error}"),
                 _ => {}
             },
             Some(result) = take_stream.next() => match result {
                 Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
-                    event_buffer.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
+                    event_buffer.push((RaindexTradeEvent::TakeOrderV3(Box::new(event)), log));
                 }
                 Err(error) => error!("Error in take event stream during backfill: {error}"),
                 _ => {}
@@ -1612,7 +1537,7 @@ mod tests {
         .unwrap();
         assert_eq!(block_number, 1000);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].0, TradeEvent::ClearV3(_)));
+        assert!(matches!(events[0].0, RaindexTradeEvent::ClearV3(_)));
     }
 
     #[tokio::test]
@@ -1747,7 +1672,7 @@ mod tests {
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
-            event: TradeEvent::ClearV3(Box::new(clear_event)),
+            event: RaindexTradeEvent::ClearV3(Box::new(clear_event)),
             block_timestamp: None,
         }
     }
@@ -1769,7 +1694,7 @@ mod tests {
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
-            event: TradeEvent::TakeOrderV3(Box::new(take_event)),
+            event: RaindexTradeEvent::TakeOrderV3(Box::new(take_event)),
             block_timestamp: None,
         }
     }
@@ -2083,7 +2008,7 @@ mod tests {
             tx_hash: B256::from(hash_bytes),
             log_index,
             block_number: 12345,
-            event: TradeEvent::ClearV3(Box::new(clear_event)),
+            event: RaindexTradeEvent::ClearV3(Box::new(clear_event)),
             block_timestamp: None,
         }
     }

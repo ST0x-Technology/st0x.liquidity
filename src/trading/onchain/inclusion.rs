@@ -12,31 +12,35 @@ use std::num::TryFromIntError;
 
 use crate::onchain::trade::TradeEvent;
 
+/// Wraps an arbitrary event type with metadata about the exact point
+/// at which the event was included in the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct QueuedEvent {
+pub(crate) struct ChainIncluded<Event> {
+    pub(crate) event: Event,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) block_number: u64,
-    pub(crate) event: TradeEvent,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
 }
 
-impl QueuedEvent {
+impl<Event> ChainIncluded<Event> {
     /// Constructs a [`QueuedEvent`] from a decoded trade event and its
     /// log metadata, without writing to the database. Used by the apalis
     /// event monitor to build job payloads directly.
-    pub(crate) fn from_log(event: TradeEvent, log: &Log) -> Result<Self, EventQueueError> {
+    pub(crate) fn from_log(event: Event, log: &Log) -> Result<Self, BlockInclusionError> {
+        use BlockInclusionError::MissingLogField;
+
         let tx_hash = log
             .transaction_hash
-            .ok_or(EventQueueError::MissingLogField("transaction_hash"))?;
+            .ok_or(MissingLogField(RequiredField::TxHash))?;
 
         let log_index = log
             .log_index
-            .ok_or(EventQueueError::MissingLogField("log_index"))?;
+            .ok_or(MissingLogField(RequiredField::LogIndex))?;
 
         let block_number = log
             .block_number
-            .ok_or(EventQueueError::MissingLogField("block_number"))?;
+            .ok_or(MissingLogField(RequiredField::BlockNumber))?;
 
         let block_timestamp = log.block_timestamp.and_then(|ts| {
             let ts_i64 = i64::try_from(ts).ok()?;
@@ -44,10 +48,10 @@ impl QueuedEvent {
         });
 
         Ok(Self {
+            event,
             tx_hash,
             log_index,
             block_number,
-            event,
             block_timestamp,
         })
     }
@@ -55,9 +59,9 @@ impl QueuedEvent {
 
 /// Event queue errors.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EventQueueError {
+pub(crate) enum BlockInclusionError {
     #[error("Log missing required field: {0}")]
-    MissingLogField(&'static str),
+    MissingRequiredField(RequiredField),
     #[error("Integer conversion error: {0}")]
     IntConversion(#[from] TryFromIntError),
     #[error("Event serialization failed: {0}")]
@@ -65,3 +69,13 @@ pub(crate) enum EventQueueError {
     #[error("Invalid tx_hash format: {0}")]
     InvalidTxHash(#[from] alloy::hex::FromHexError),
 }
+
+/// Event queue errors.
+#[derive(Debug)]
+pub(crate) enum RequiredField {
+    TxHash,
+    LogIndex,
+    BlockNumber,
+}
+
+// TODO: bring over tests
