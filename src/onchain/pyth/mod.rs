@@ -53,8 +53,7 @@ pub enum PythError {
 pub struct PythCall {
     pub price_feed_id: B256,
     pub output: Bytes,
-    // temporarily unused. will be useful once stored in the event store
-    _depth: u32,
+    pub depth: u32,
 }
 
 pub(super) struct PythPricing {
@@ -136,7 +135,7 @@ fn traverse_call_frame(frame: &CallFrame, depth: u32) -> Vec<PythCall> {
             extract_price_feed_id(&frame.input).map(|feed_id| PythCall {
                 price_feed_id: feed_id,
                 output: output.clone(),
-                _depth: depth,
+                depth,
             })
         });
 
@@ -227,40 +226,48 @@ where
     trace!("Parsing trace for Pyth oracle calls");
     let pyth_calls = find_pyth_calls(&trace)?;
 
-    let Some((first_call, rest)) = pyth_calls.split_first() else {
-        return Err(PythError::NoPythCall);
-    };
-
-    let cached_feed_id = cache.get(symbol).await;
-
-    let target_call = if let Some(feed_id) = cached_feed_id {
-        std::iter::once(first_call)
-            .chain(rest.iter())
-            .find(|call| call.price_feed_id == feed_id)
-            .ok_or_else(|| {
-                warn!(
-                    %tx_hash, %feed_id, %symbol,
-                    "No Pyth call found matching cached feed ID"
-                );
-                PythError::NoMatchingFeedId(feed_id)
-            })
-    } else {
-        debug!(%symbol, "No cached feed ID for {symbol}, using first Pyth call and caching");
-        cache
-            .insert(symbol.to_string(), first_call.price_feed_id)
-            .await;
-        Ok(first_call)
-    }?;
+    let target_call = resolve_pyth_call(&pyth_calls, symbol, tx_hash, cache).await?;
 
     let price = decode_pyth_price(&target_call.output)?;
 
     debug!(
+        depth = target_call.depth,
         feed_id = %target_call.price_feed_id,
         price = %price.price,
         "Fetched reference Pyth price"
     );
 
     Ok(price)
+}
+
+async fn resolve_pyth_call<'a>(
+    pyth_calls: &'a [PythCall],
+    symbol: &str,
+    tx_hash: TxHash,
+    cache: &FeedIdCache,
+) -> Result<&'a PythCall, PythError> {
+    let Some((first_call, rest)) = pyth_calls.split_first() else {
+        return Err(PythError::NoPythCall);
+    };
+
+    let Some(feed_id) = cache.get(symbol).await else {
+        debug!(%symbol, "No cached feed ID for {symbol}, using first Pyth call and caching");
+        cache
+            .insert(symbol.to_string(), first_call.price_feed_id)
+            .await;
+        return Ok(first_call);
+    };
+
+    std::iter::once(first_call)
+        .chain(rest.iter())
+        .find(|call| call.price_feed_id == feed_id)
+        .ok_or_else(|| {
+            warn!(
+                %tx_hash, %feed_id, %symbol,
+                "No Pyth call found matching cached feed ID"
+            );
+            PythError::NoMatchingFeedId(feed_id)
+        })
 }
 
 #[cfg(test)]
@@ -316,7 +323,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].price_feed_id, feed_id);
         assert_eq!(result[0].output.as_ref(), &output);
-        assert_eq!(result[0]._depth, 0);
+        assert_eq!(result[0].depth, 0);
     }
 
     #[test]
@@ -348,7 +355,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].price_feed_id, feed_id);
         assert_eq!(result[0].output.as_ref(), &output);
-        assert_eq!(result[0]._depth, 1);
+        assert_eq!(result[0].depth, 1);
     }
 
     #[test]
@@ -393,10 +400,10 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].price_feed_id, feed_id1);
         assert_eq!(result[0].output.as_ref(), &output1);
-        assert_eq!(result[0]._depth, 1);
+        assert_eq!(result[0].depth, 1);
         assert_eq!(result[1].price_feed_id, feed_id2);
         assert_eq!(result[1].output.as_ref(), &output2);
-        assert_eq!(result[1]._depth, 1);
+        assert_eq!(result[1].depth, 1);
     }
 
     #[test]
@@ -479,7 +486,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].price_feed_id, feed_id);
         assert_eq!(result[0].output.as_ref(), &output);
-        assert_eq!(result[0]._depth, 2);
+        assert_eq!(result[0].depth, 2);
     }
 
     #[test]
