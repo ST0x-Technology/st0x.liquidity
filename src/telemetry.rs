@@ -243,7 +243,7 @@ impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
 const TRACER_NAME: &str = "st0x-tracer";
 
 // TODO: parse from the manifest or something
-const CRATES: [&'static str; 6] = [
+const CRATES: [&str; 6] = [
     "dto",
     "event-sorcery",
     "execution",

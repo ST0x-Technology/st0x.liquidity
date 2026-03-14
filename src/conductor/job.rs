@@ -46,7 +46,7 @@ where
 pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
 where
     Ctx: Send + Sync + 'static,
-    J: Job<Ctx>,
+    J: Job<Ctx> + Sync,
 {
     let label = job.label();
 

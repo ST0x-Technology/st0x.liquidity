@@ -24,7 +24,7 @@
 //! test verifies the first stage of the pipeline (inventory polling +
 //! snapshot events).
 
-mod assertions;
+pub(crate) mod assertions;
 
 use std::collections::HashMap;
 
@@ -35,8 +35,9 @@ use self::assertions::*;
 /// Control test: direct high-precision sell-side Raindex prices should not
 /// break equity rebalancing. This avoids buy-side reciprocal math and verifies
 /// that direct decimal price literals do not block the mint pipeline.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = Decimal::from_str("112.50000000000000000000000002")?;
     let broker_fill_price = dec!(110);
     let amount_per_trade = dec!(7.5);
@@ -139,8 +140,9 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
 /// TokensReceived, TokensWrapped, and DepositedIntoRaindex. This
 /// verifies the complete flow from tokenization request through
 /// ERC-4626 wrapping and Raindex vault deposit.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(150.00);
     let broker_fill_price = dec!(148.00);
     let amount_per_trade = dec!(7.5);
@@ -245,8 +247,9 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
 /// Requires: ERC-4626 vault wrapper on Anvil (for trigger ratio check),
 /// Raindex vault with sufficient balance for withdrawal, and tokenization
 /// API mock endpoints for redemption detection/completion polling.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(112.50);
     let broker_fill_price = dec!(113.60);
     let trade_amount = dec!(12.5);
@@ -369,8 +372,9 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 /// `cargo test --test e2e -- --ignored --nocapture \
 ///   equity_redemption_buy_inv_repeating_reciprocal_regression`
 #[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(115);
     let broker_fill_price = dec!(113.57);
     let trade_amount = dec!(12.5);
@@ -479,8 +483,9 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
 /// but replaces the generated Rainlang expression with a direct reciprocal
 /// string, matching the old harness path.
 #[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(112);
     let broker_fill_price = dec!(113.57);
     let trade_amount = dec!(12.5);
@@ -604,8 +609,9 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
 /// Infrastructure: Deploys CCTP contracts fresh on two plain Anvil chains
 /// (no mainnet fork required). A background watcher auto-signs attestations
 /// for `MessageSent` events using a test attester key.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(158.39);
     let broker_fill_price = dec!(155.00);
     let amount_per_trade = dec!(7.5);
@@ -748,8 +754,9 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 ///
 /// Infrastructure: Same as `usdc_imbalance_triggers_alpaca_to_base` but the
 /// Raindex USDC vault is pre-funded so the bot can withdraw from it.
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
     let onchain_price = dec!(158.39);
     let broker_fill_price = dec!(155.00);
     let amount_per_trade = dec!(7.5);

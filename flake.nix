@@ -104,6 +104,19 @@
             '';
           };
 
+          e2e = rainix.mkTask.${system} {
+            name = "e2e";
+            body = ''
+              set -euxo pipefail
+              (cd dashboard && bun run dev) &
+              dev_pid=$!
+              trap 'kill $dev_pid 2>/dev/null' EXIT
+              sleep 2
+              open http://localhost:5173
+              cargo nextest run --test e2e full_system --nocapture
+            '';
+          };
+
           genBunNix = rainix.mkTask.${system} {
             name = "gen-bun-nix";
             additionalBuildInputs = [ bun2nix.packages.${system}.default ];

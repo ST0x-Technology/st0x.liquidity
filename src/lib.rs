@@ -71,10 +71,18 @@ pub mod test_utils;
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
+    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+    launch_with_event_channel(ctx, event_sender).await
+}
+
+#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
+pub async fn launch_with_event_channel(
+    ctx: Ctx,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().run(&pool).await?;
 
-    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
         inventory::InventoryView::default(),
     ));

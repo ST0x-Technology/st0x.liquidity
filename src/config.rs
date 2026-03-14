@@ -576,6 +576,7 @@ impl Ctx {
         trading_mode: TradingMode,
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
+        #[builder(default = 0)] server_port: u16,
         execution_threshold_override: Option<ExecutionThreshold>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
@@ -586,7 +587,7 @@ impl Ctx {
         Ok(Self {
             database_url,
             log_level: LogLevel::Debug,
-            server_port: 0,
+            server_port,
             evm: EvmCtx {
                 ws_rpc_url,
                 orderbook,
