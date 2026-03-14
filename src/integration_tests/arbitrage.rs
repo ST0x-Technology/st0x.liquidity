@@ -9,9 +9,7 @@
 
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::AnvilInstance;
-use alloy::primitives::{
-    Address, B256, Bytes, LogData, U256, address, keccak256, utils::parse_units,
-};
+use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Log;
@@ -47,7 +45,7 @@ use crate::onchain::USDC_BASE;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
 use crate::position::Position;
-use crate::queue::{self, QueuedEvent};
+use crate::queue::QueuedEvent;
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
@@ -335,14 +333,10 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let log_index = trade.log_index;
 
         let queued_event = QueuedEvent {
-            id: None,
             tx_hash,
             log_index,
             block_number: take_log.block_number.unwrap(),
             event: TradeEvent::TakeOrderV3(Box::new(take_event_for_queue)),
-            processed: false,
-            created_at: None,
-            processed_at: None,
             block_timestamp: trade.block_timestamp,
         };
 
@@ -672,9 +666,9 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .await;
 
     let mut expected = vec![
+        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
     ];
     assert_events(&pool, &expected).await;
 
@@ -706,8 +700,8 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .await;
 
     expected.extend([
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
+        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
         ExpectedEvent::new(
@@ -719,14 +713,14 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let events = assert_events(&pool, &expected).await;
 
     // Payload spot-checks: financial values in OnChainOrderFilled events
-    assert_eq!(events[1].event_type, "PositionEvent::OnChainOrderFilled");
-    let trade1_filled = &events[1].payload["OnChainOrderFilled"];
+    assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
+    let trade1_filled = &events[2].payload["OnChainOrderFilled"];
     assert_eq!(trade1_filled["amount"].as_str().unwrap(), "0.5");
     assert_eq!(trade1_filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(trade1_filled["price_usdc"].as_str().unwrap(), "100");
 
-    assert_eq!(events[3].event_type, "PositionEvent::OnChainOrderFilled");
-    let trade2_filled = &events[3].payload["OnChainOrderFilled"];
+    assert_eq!(events[4].event_type, "PositionEvent::OnChainOrderFilled");
+    let trade2_filled = &events[4].payload["OnChainOrderFilled"];
     assert_eq!(trade2_filled["amount"].as_str().unwrap(), "0.7");
     assert_eq!(trade2_filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(trade2_filled["price_usdc"].as_str().unwrap(), "100");
@@ -839,11 +833,11 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .await;
 
     let mut expected = vec![
+        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
+        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
         ExpectedEvent::new(
@@ -1001,12 +995,12 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let concurrent_set = [
+        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
+        ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
     ];
     for expected_event in &concurrent_set {
         assert!(
@@ -1019,8 +1013,8 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let mut expected: Vec<ExpectedEvent> = actual_initial;
 
     expected.extend([
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade3_agg, "OnChainTradeEvent::Filled"),
+        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new(
             "OffchainOrder",
@@ -1107,8 +1101,8 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     expected.extend([
-        ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade4_agg, "OnChainTradeEvent::Filled"),
+        ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new(
             "OffchainOrder",
@@ -1226,11 +1220,11 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
 
     // Verify offchain order is Sell direction (hedge for long position)
     let mut expected = vec![
+        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
+        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
         ExpectedEvent::new(
@@ -1242,14 +1236,14 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let events = assert_events(&pool, &expected).await;
 
     // Verify financial values in OnChainOrderFilled events (Buy direction)
-    assert_eq!(events[1].event_type, "PositionEvent::OnChainOrderFilled");
-    let trade1_filled = &events[1].payload["OnChainOrderFilled"];
+    assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
+    let trade1_filled = &events[2].payload["OnChainOrderFilled"];
     assert_eq!(trade1_filled["amount"].as_str().unwrap(), "0.5");
     assert_eq!(trade1_filled["direction"].as_str().unwrap(), "Buy");
     assert_eq!(trade1_filled["price_usdc"].as_str().unwrap(), "100");
 
-    assert_eq!(events[3].event_type, "PositionEvent::OnChainOrderFilled");
-    let trade2_filled = &events[3].payload["OnChainOrderFilled"];
+    assert_eq!(events[4].event_type, "PositionEvent::OnChainOrderFilled");
+    let trade2_filled = &events[4].payload["OnChainOrderFilled"];
     assert_eq!(trade2_filled["amount"].as_str().unwrap(), "0.7");
     assert_eq!(trade2_filled["direction"].as_str().unwrap(), "Buy");
     assert_eq!(trade2_filled["price_usdc"].as_str().unwrap(), "100");
@@ -1323,9 +1317,9 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
 
     let order_id_str = order_id.to_string();
     let expected = vec![
+        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
         ExpectedEvent::new(
@@ -1337,8 +1331,8 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let events = assert_events(&pool, &expected).await;
 
     // Payload spot-checks: financial values in the single-trade threshold crossing
-    assert_eq!(events[1].event_type, "PositionEvent::OnChainOrderFilled");
-    let filled = &events[1].payload["OnChainOrderFilled"];
+    assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
+    let filled = &events[2].payload["OnChainOrderFilled"];
     assert_eq!(filled["amount"].as_str().unwrap(), "1");
     assert_eq!(filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(filled["price_usdc"].as_str().unwrap(), "100");
@@ -1486,9 +1480,9 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let order2_str = order2.to_string();
     let expected = vec![
         // First cycle
+        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order1_str, "OffchainOrderEvent::Placed"),
         ExpectedEvent::new(
@@ -1499,8 +1493,8 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         ExpectedEvent::new("OffchainOrder", &order1_str, "OffchainOrderEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
         // Second cycle
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
+        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order2_str, "OffchainOrderEvent::Placed"),
         ExpectedEvent::new(
@@ -1639,9 +1633,9 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
     assert_events(
         &pool,
         &[
+            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ],
     )
     .await;
@@ -1687,9 +1681,9 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
     assert_events(
         &pool,
         &[
+            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
             ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
             ExpectedEvent::new(
@@ -1815,15 +1809,15 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
     let events = assert_events(
         &pool,
         &[
-            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
-            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
             ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
+            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
             ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
             ExpectedEvent::new("OnChainTrade", &trade3_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
             ExpectedEvent::new("OnChainTrade", &trade4_agg, "OnChainTradeEvent::Filled"),
+            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
             ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
             ExpectedEvent::new(
@@ -1925,9 +1919,9 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         &pool,
         &[
             // Trade 1 events + offchain order
+            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
             ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
             ExpectedEvent::new(
@@ -1936,8 +1930,8 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
                 "OffchainOrderEvent::Submitted",
             ),
             // Trade 2 events: only onchain fill, no offchain order
-            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
             ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
+            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ],
     )
     .await;
@@ -1963,55 +1957,11 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
         .call()
         .await;
 
-    // Build a Log with the trade's tx_hash/log_index for queue enqueue
-    let enqueue_log = Log {
-        inner: alloy::primitives::Log {
-            address: orderbook.orderbook_addr,
-            data: LogData::default(),
-        },
-        block_hash: None,
-        block_number: Some(trade1.queued_event.block_number),
-        block_timestamp: None,
-        transaction_hash: Some(trade1.tx_hash),
-        transaction_index: Some(0),
-        log_index: Some(trade1.log_index),
-        removed: false,
-    };
-
-    let TradeEvent::TakeOrderV3(ref take_event) = trade1.queued_event.event else {
-        panic!("Expected TakeOrderV3 event");
-    };
-
-    // Enqueue the same event twice -- second insert should be silently ignored
-    queue::enqueue(&pool, take_event.as_ref(), &enqueue_log)
-        .await
-        .unwrap();
-    queue::enqueue(&pool, take_event.as_ref(), &enqueue_log)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        queue::count_unprocessed(&pool).await.unwrap(),
-        1,
-        "Duplicate enqueue should result in only 1 unprocessed event"
-    );
-
-    // Process the single queued event through the CQRS pipeline.
-    // The apalis pipeline handles processing -- the legacy queue
-    // row is NOT marked processed by process_queued_trade.
+    // Process the trade through the CQRS pipeline
     trade1.submit(&cqrs).await?;
 
-    // Re-enqueue after processing -- still ignored by INSERT OR IGNORE
-    // (row exists regardless of processed status)
-    queue::enqueue(&pool, take_event.as_ref(), &enqueue_log)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        queue::count_unprocessed(&pool).await.unwrap(),
-        1,
-        "Legacy queue row persists (apalis handles processing, not the legacy queue)"
-    );
+    // Submit the same trade again — CQRS aggregate rejects the duplicate
+    trade1.submit(&cqrs).await?;
 
     // Verify exactly one set of CQRS events was emitted
     assert_position()
@@ -2029,9 +1979,9 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
     assert_events(
         &pool,
         &[
+            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-            ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ],
     )
     .await;

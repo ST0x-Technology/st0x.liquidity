@@ -13,6 +13,7 @@ use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
+use apalis::prelude::TaskSink;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -48,7 +49,7 @@ use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_fro
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::queue::{EventQueueError, QueuedEvent};
+use crate::queue::QueuedEvent;
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
@@ -63,6 +64,7 @@ use crate::wrapper::WrapperService;
 
 use self::manifest::QueryManifest;
 pub(crate) use builder::{ConductorBuilder, ConductorCtx, CqrsFrameworks};
+pub(crate) use order_fill_monitor::{OrderFillJob, OrderFillJobQueue};
 
 /// Sets up apalis `SQLite` storage tables, tolerating pre-existing
 /// application migrations in the shared `_sqlx_migrations` table.
@@ -101,7 +103,7 @@ pub(crate) struct Conductor {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OrderFillError {
     #[error("Event queue error: {0}")]
-    Queue(#[from] EventQueueError),
+    Queue(#[from] crate::queue::EventQueueError),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Vault registry command failed: {0}")]
@@ -168,24 +170,36 @@ impl Conductor {
             let cache = SymbolCache::default();
             let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
+            setup_apalis_tables(&pool).await?;
+            let mut job_queue: order_fill_monitor::OrderFillJobQueue =
+                apalis_sqlite::SqliteStorage::new(&pool);
+
             let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
             let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
 
-            let cutoff_block =
-                get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool).await?;
+            let cutoff_block = get_cutoff_block(
+                &mut clear_stream,
+                &mut take_stream,
+                &provider,
+                &mut job_queue,
+            )
+            .await?;
 
-            // Streams are no longer needed — OrderFillMonitor creates
-            // its own WS connection inside the supervisor.
-            drop(clear_stream);
-            drop(take_stream);
+            let dex_streams = order_fill_monitor::DexEventStreams {
+                clear: Box::pin(clear_stream),
+                take: Box::pin(take_stream),
+            };
 
             if let Some(end_block) = cutoff_block.checked_sub(1) {
-                backfill_events(&pool, &provider, &ctx.evm, end_block).await?;
+                backfill_events(
+                    &provider,
+                    &ctx.evm,
+                    end_block,
+                    crate::onchain::backfill::get_backfill_retry_strat(),
+                    job_queue.clone(),
+                )
+                .await?;
             }
-
-            setup_apalis_tables(&pool).await?;
-            let job_queue: order_fill_monitor::OrderFillJobQueue =
-                apalis_sqlite::SqliteStorage::new(&pool);
 
             let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
                 .build(())
@@ -278,7 +292,7 @@ impl Conductor {
                 wallet_polling,
             };
 
-            let mut builder = ConductorBuilder::new(conductor_ctx, job_queue)
+            let mut builder = ConductorBuilder::new(conductor_ctx, job_queue, dex_streams)
                 .with_executor_maintenance(executor_maintenance);
 
             if let Some(rebalancer_handle) = rebalancer {
@@ -298,28 +312,35 @@ impl Conductor {
                 info!("Supervisor exited");
             }
             result = &mut self.monitor => {
-                if let Err(join_error) = result && !join_error.is_cancelled() {
-                    return Err(anyhow::anyhow!("Apalis monitor failed: {join_error}"));
-                }
-                info!("Apalis monitor exited");
+                check_task_result(result, "Apalis monitor")?;
             }
             result = &mut self.order_poller => {
-                if let Err(join_error) = result && !join_error.is_cancelled() {
-                    return Err(anyhow::anyhow!("Order poller failed: {join_error}"));
-                }
-                info!("Order poller exited");
+                check_task_result(result, "Order poller")?;
             }
             result = &mut self.position_checker => {
-                if let Err(join_error) = result && !join_error.is_cancelled() {
-                    return Err(anyhow::anyhow!("Position checker failed: {join_error}"));
-                }
-                info!("Position checker exited");
+                check_task_result(result, "Position checker")?;
             }
         }
 
         Ok(())
     }
+}
 
+fn check_task_result(
+    result: Result<(), tokio::task::JoinError>,
+    task_name: &str,
+) -> Result<(), anyhow::Error> {
+    if let Err(join_error) = result
+        && !join_error.is_cancelled()
+    {
+        return Err(anyhow::anyhow!("{task_name} failed: {join_error}"));
+    }
+
+    info!("{task_name} exited");
+    Ok(())
+}
+
+impl Conductor {
     pub(crate) fn abort_trading_tasks(&self) {
         info!(
             "Aborting trading tasks (keeping rebalancer, inventory poller, and broker maintenance alive)"
@@ -660,7 +681,7 @@ pub(crate) async fn get_cutoff_block<S1, S2, P>(
     clear_stream: &mut S1,
     take_stream: &mut S2,
     provider: &P,
-    pool: &SqlitePool,
+    storage: &mut order_fill_monitor::OrderFillJobQueue,
 ) -> anyhow::Result<u64>
 where
     S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
@@ -687,9 +708,35 @@ where
 
     buffer_live_events(clear_stream, take_stream, &mut event_buffer, block_number).await;
 
-    crate::queue::enqueue_buffer(pool, event_buffer).await;
+    enqueue_buffered_events(storage, event_buffer).await;
 
     Ok(block_number)
+}
+
+/// Pushes buffered events from the coordination phase into apalis storage.
+async fn enqueue_buffered_events(
+    storage: &mut order_fill_monitor::OrderFillJobQueue,
+    event_buffer: Vec<(TradeEvent, Log)>,
+) {
+    info!(
+        "Coordination Phase: Processing {} buffered events from subscription",
+        event_buffer.len()
+    );
+
+    let queued_events = event_buffer.into_iter().filter_map(|(event, log)| {
+        QueuedEvent::from_log(event, &log)
+            .inspect_err(|error| error!(%error, "Failed to create queued event from log"))
+            .ok()
+    });
+
+    for queued_event in queued_events {
+        if let Err(error) = storage
+            .push(order_fill_monitor::OrderFillJob { queued_event })
+            .await
+        {
+            error!(%error, "Failed to push buffered event into apalis storage");
+        }
+    }
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
@@ -803,11 +850,13 @@ async fn convert_event_to_trade(
     Ok(onchain_trade)
 }
 
+/// Witnesses the trade in the OnChainTrade aggregate. Returns `true` if this
+/// is a new trade, `false` if it was already witnessed (duplicate).
 async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
-) {
+) -> bool {
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
@@ -821,7 +870,7 @@ async fn execute_witness_trade(
             "Missing block_timestamp for OnChainTrade::Witness: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
         );
-        return;
+        return false;
     };
 
     let command = OnChainTradeCommand::Witness {
@@ -834,14 +883,20 @@ async fn execute_witness_trade(
     };
 
     match onchain_trade.send(&trade_id, command).await {
-        Ok(()) => info!(
-            "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
-        ),
-        Err(error) => error!(
-            "Failed to execute OnChainTrade::Witness command: {error}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        ),
+        Ok(()) => {
+            info!(
+                "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
+                trade.tx_hash, trade.log_index
+            );
+            true
+        }
+        Err(error) => {
+            error!(
+                "Failed to execute OnChainTrade::Witness command: {error}, tx_hash={:?}, log_index={}, symbol={}",
+                trade.tx_hash, trade.log_index, trade.symbol
+            );
+            false
+        }
     }
 }
 
@@ -895,9 +950,21 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, OrderFillError> {
-    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
+    // Witness first — the OnChainTrade aggregate is keyed by (tx_hash, log_index)
+    // and rejects duplicates. Only acknowledge the fill on the Position aggregate
+    // if this is a genuinely new trade, preventing double-counting.
+    let is_new_trade =
+        execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
 
-    execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
+    if !is_new_trade {
+        info!(
+            "Skipping duplicate trade: tx_hash={:?}, log_index={}",
+            queued_event.tx_hash, queued_event.log_index
+        );
+        return Ok(None);
+    }
+
+    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
     let base_symbol = trade.symbol.base();
 
@@ -1241,9 +1308,7 @@ async fn buffer_live_events<S1, S2>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{
-        Address, B256, IntoLogData, TxHash, U256, address, bytes, fixed_bytes,
-    };
+    use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
@@ -1283,31 +1348,11 @@ mod tests {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
-    #[tokio::test]
-    async fn test_event_enqueued_when_trade_conversion_returns_none() {
-        let pool = setup_test_db().await;
-
-        let clear_event = ClearV3 {
-            sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-        let log = crate::test_utils::get_test_log();
-
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
-
-        let count = crate::queue::count_unprocessed(&pool).await.unwrap();
-        assert_eq!(count, 1);
+    fn empty_dex_streams() -> super::order_fill_monitor::DexEventStreams {
+        super::order_fill_monitor::DexEventStreams {
+            clear: Box::pin(stream::empty()),
+            take: Box::pin(stream::empty()),
+        }
     }
 
     #[tokio::test]
@@ -1368,6 +1413,7 @@ mod tests {
                 },
             },
             job_queue,
+            empty_dex_streams(),
         )
         .with_executor_maintenance(None)
         .spawn()
@@ -1437,6 +1483,7 @@ mod tests {
                 },
             },
             job_queue,
+            empty_dex_streams(),
         )
         .with_executor_maintenance(None)
         .with_rebalancer(fake_rebalancer)
@@ -1483,6 +1530,7 @@ mod tests {
                 },
             },
             job_queue,
+            empty_dex_streams(),
         )
         .with_executor_maintenance(None)
         .with_rebalancer(fake_rebalancer)
@@ -1497,231 +1545,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_idempotency_bot_restart_during_processing() {
-        let pool = setup_test_db().await;
-
-        let event1 = ClearV3 {
-            sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-        let log1 = crate::test_utils::get_test_log();
-
-        crate::queue::enqueue(&pool, &event1, &log1).await.unwrap();
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 1);
-
-        let queued_event = crate::queue::get_next_unprocessed_event(&pool)
-            .await
-            .unwrap()
-            .unwrap();
-        crate::queue::mark_event_processed(&pool, queued_event.id.unwrap())
-            .await
-            .unwrap();
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
-
-        crate::queue::enqueue(&pool, &event1, &log1).await.unwrap();
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
-
-        let mut log2 = crate::test_utils::get_test_log();
-        log2.log_index = Some(2);
-        crate::queue::enqueue(&pool, &event1, &log2).await.unwrap();
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 1);
-
-        let next_event = crate::queue::get_next_unprocessed_event(&pool)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(next_event.log_index, 2);
-        crate::queue::mark_event_processed(&pool, next_event.id.unwrap())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_deterministic_processing_order() {
-        let pool = setup_test_db().await;
-
-        let events_and_logs = vec![(100, 5), (99, 3), (100, 1), (101, 2), (99, 8)];
-
-        for (block_num, log_idx) in &events_and_logs {
-            let event = ClearV3 {
-                sender: address!("0x1111111111111111111111111111111111111111"),
-                alice: get_test_order(),
-                bob: get_test_order(),
-                clearConfig: ClearConfigV2 {
-                    aliceInputIOIndex: U256::from(0),
-                    aliceOutputIOIndex: U256::from(1),
-                    bobInputIOIndex: U256::from(1),
-                    bobOutputIOIndex: U256::from(0),
-                    aliceBountyVaultId: B256::ZERO,
-                    bobBountyVaultId: B256::ZERO,
-                },
-            };
-            let mut log = crate::test_utils::get_test_log();
-            log.block_number = Some(*block_num);
-            log.log_index = Some(*log_idx);
-            log.transaction_hash = Some(fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ));
-
-            crate::queue::enqueue(&pool, &event, &log).await.unwrap();
-        }
-
-        let expected_order = vec![(99, 3), (99, 8), (100, 1), (100, 5), (101, 2)];
-
-        for (expected_block, expected_log_idx) in expected_order {
-            let event = crate::queue::get_next_unprocessed_event(&pool)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(event.block_number, expected_block);
-            assert_eq!(event.log_index, expected_log_idx);
-            crate::queue::mark_event_processed(&pool, event.id.unwrap())
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            crate::queue::get_next_unprocessed_event(&pool)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_restart_scenarios_edge_cases() {
-        let pool = setup_test_db().await;
-
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
-
-        let mut events = vec![];
-        for i in 0..5 {
-            let event = ClearV3 {
-                sender: address!("0x1111111111111111111111111111111111111111"),
-                alice: get_test_order(),
-                bob: get_test_order(),
-                clearConfig: ClearConfigV2 {
-                    aliceInputIOIndex: U256::from(0),
-                    aliceOutputIOIndex: U256::from(1),
-                    bobInputIOIndex: U256::from(1),
-                    bobOutputIOIndex: U256::from(0),
-                    aliceBountyVaultId: B256::ZERO,
-                    bobBountyVaultId: B256::ZERO,
-                },
-            };
-            let mut log = crate::test_utils::get_test_log();
-            log.log_index = Some(i);
-            let mut hash_bytes = [0u8; 32];
-            hash_bytes[31] = u8::try_from(i).unwrap_or(0);
-            log.transaction_hash = Some(B256::from(hash_bytes));
-
-            crate::queue::enqueue(&pool, &event, &log).await.unwrap();
-            events.push((event, log));
-        }
-
-        for _ in 0..2 {
-            let event = crate::queue::get_next_unprocessed_event(&pool)
-                .await
-                .unwrap()
-                .unwrap();
-            crate::queue::mark_event_processed(&pool, event.id.unwrap())
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 3);
-
-        let mut processed_count = 0;
-        while let Some(event) = crate::queue::get_next_unprocessed_event(&pool)
-            .await
-            .unwrap()
-        {
-            crate::queue::mark_event_processed(&pool, event.id.unwrap())
-                .await
-                .unwrap();
-            processed_count += 1;
-        }
-
-        assert_eq!(processed_count, 3);
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
-
-        for (event, log) in &events {
-            crate::queue::enqueue(&pool, event, log).await.unwrap();
-        }
-
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_process_queued_event_deserialization() {
-        let pool = setup_test_db().await;
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-
-        let clear_event = ClearV3 {
-            sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-
-        let log = get_test_log();
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
-
-        let count = crate::queue::count_unprocessed(&pool).await.unwrap();
-        assert_eq!(count, 1);
-
-        let queued_event = crate::queue::get_next_unprocessed_event(&pool)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
-
-        let reconstructed_log = reconstruct_log_from_queued_event(&ctx.evm, &queued_event);
-        assert_eq!(reconstructed_log.inner.address, ctx.evm.orderbook);
-        assert_eq!(
-            reconstructed_log.transaction_hash.unwrap(),
-            queued_event.tx_hash
-        );
-        assert_eq!(reconstructed_log.log_index.unwrap(), queued_event.log_index);
-        assert_eq!(
-            reconstructed_log.block_number.unwrap(),
-            queued_event.block_number
-        );
-
-        let original_log_data = clear_event.into_log_data();
-        assert_eq!(reconstructed_log.inner.data, original_log_data);
-
-        crate::queue::mark_event_processed(&pool, queued_event.id.unwrap())
-            .await
-            .unwrap();
-        assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
     async fn test_get_cutoff_block_with_timeout() {
         let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+        let mut storage: order_fill_monitor::OrderFillJobQueue =
+            apalis_sqlite::SqliteStorage::new(&pool);
         let asserter = Asserter::new();
 
         asserter.push_success(&serde_json::Value::from(12345u64));
@@ -1730,9 +1558,10 @@ mod tests {
         let mut clear_stream = futures_util::stream::empty();
         let mut take_stream = futures_util::stream::empty();
 
-        let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool)
-            .await
-            .unwrap();
+        let cutoff_block =
+            get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &mut storage)
+                .await
+                .unwrap();
 
         assert_eq!(cutoff_block, 12345);
     }
@@ -1915,14 +1744,10 @@ mod tests {
         };
 
         QueuedEvent {
-            id: Some(1),
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
             event: TradeEvent::ClearV3(Box::new(clear_event)),
-            processed: false,
-            created_at: None,
-            processed_at: None,
             block_timestamp: None,
         }
     }
@@ -1941,14 +1766,10 @@ mod tests {
         };
 
         QueuedEvent {
-            id: Some(1),
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
             event: TradeEvent::TakeOrderV3(Box::new(take_event)),
-            processed: false,
-            created_at: None,
-            processed_at: None,
             block_timestamp: None,
         }
     }
@@ -2259,14 +2080,10 @@ mod tests {
         hash_bytes[31] = u8::try_from(log_index).unwrap_or(0);
 
         QueuedEvent {
-            id: None,
             tx_hash: B256::from(hash_bytes),
             log_index,
             block_number: 12345,
             event: TradeEvent::ClearV3(Box::new(clear_event)),
-            processed: false,
-            created_at: None,
-            processed_at: None,
             block_timestamp: None,
         }
     }
@@ -2561,62 +2378,6 @@ mod tests {
 
         assert_eq!(position.net.inner(), dec!(2.0));
         assert!(position.pending_offchain_order_id.is_some());
-    }
-
-    #[tokio::test]
-    async fn idempotent_event_queue_prevents_double_processing() {
-        let pool = setup_test_db().await;
-
-        let event = ClearV3 {
-            sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-
-        let log = get_test_log();
-
-        // Enqueue same event twice (same tx_hash + log_index -> INSERT OR IGNORE)
-        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
-        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
-
-        assert_eq!(
-            crate::queue::count_unprocessed(&pool).await.unwrap(),
-            1,
-            "Duplicate enqueue should result in only 1 row"
-        );
-
-        // Process and mark as processed
-        let queued = crate::queue::get_next_unprocessed_event(&pool)
-            .await
-            .unwrap()
-            .expect("should have one event");
-
-        crate::queue::mark_event_processed(&pool, queued.id.unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            crate::queue::count_unprocessed(&pool).await.unwrap(),
-            0,
-            "No unprocessed events should remain"
-        );
-
-        // Re-enqueue same event after processing
-        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
-
-        assert_eq!(
-            crate::queue::count_unprocessed(&pool).await.unwrap(),
-            0,
-            "Re-enqueue of already processed event should be ignored"
-        );
     }
 
     /// Builds an `InventoryView` with an equity imbalance: 20% onchain, 80% offchain.

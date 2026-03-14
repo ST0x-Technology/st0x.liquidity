@@ -13,7 +13,7 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
 use super::job::handle_job;
-use super::order_fill_monitor::{OrderFillJobQueue, OrderFillMonitor};
+use super::order_fill_monitor::{DexEventStreams, OrderFillJobQueue, OrderFillMonitor};
 use super::order_fill_processor::OrderFillCtx;
 use super::{
     Conductor, OrderFillError, spawn_inventory_poller, spawn_order_poller,
@@ -64,16 +64,22 @@ pub(crate) struct WithExecutorMaintenance {
 pub(crate) struct ConductorBuilder<Prov, Exec, State> {
     common: ConductorCtx<Prov, Exec>,
     job_queue: OrderFillJobQueue,
+    dex_streams: DexEventStreams,
     state: State,
 }
 
 impl<Prov: Provider + Clone + Send + 'static, Exec: Executor + Clone + Send + 'static>
     ConductorBuilder<Prov, Exec, Initial>
 {
-    pub(crate) fn new(common: ConductorCtx<Prov, Exec>, job_queue: OrderFillJobQueue) -> Self {
+    pub(crate) fn new(
+        common: ConductorCtx<Prov, Exec>,
+        job_queue: OrderFillJobQueue,
+        dex_streams: DexEventStreams,
+    ) -> Self {
         Self {
             common,
             job_queue,
+            dex_streams,
             state: Initial,
         }
     }
@@ -85,6 +91,7 @@ impl<Prov: Provider + Clone + Send + 'static, Exec: Executor + Clone + Send + 's
         ConductorBuilder {
             common: self.common,
             job_queue: self.job_queue,
+            dex_streams: self.dex_streams,
             state: WithExecutorMaintenance {
                 executor_maintenance,
                 rebalancer: None,
@@ -182,6 +189,7 @@ where
             self.common.ctx.evm.ws_rpc_url.clone(),
             self.common.ctx.evm.orderbook,
             self.job_queue.clone(),
+            self.dex_streams,
         );
 
         let supervisor = SupervisorBuilder::default()

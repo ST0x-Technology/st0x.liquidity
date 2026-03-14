@@ -18,7 +18,6 @@ use st0x_execution::{
 };
 
 use crate::position::{Position, PositionError};
-use crate::queue::EventQueueError;
 
 pub(crate) mod accumulator;
 pub(crate) mod backfill;
@@ -95,8 +94,6 @@ pub(crate) enum OnChainError {
     InvalidIndex(#[from] FromUintError<usize>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
-    #[error("Event queue error: {0}")]
-    EventQueue(#[from] EventQueueError),
     #[error("Order status parse error: {0}")]
     OrderStatusParse(#[from] ParseOrderStatusError),
     #[error("Invalid executor: {0}")]

@@ -8,6 +8,7 @@
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use alloy::providers::WsConnect;
+use alloy::rpc::types::Log;
 use alloy::sol_types;
 use apalis::prelude::TaskSink;
 use apalis_codec::json::JsonCodec;
@@ -15,7 +16,10 @@ use apalis_sqlite::fetcher::SqliteFetcher;
 use apalis_sqlite::{CompactType, SqliteStorage};
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
+use std::sync::Arc;
 use task_supervisor::{SupervisedTask, TaskResult};
+use tokio::sync::Mutex;
 use tracing::{error, info, trace};
 use url::Url;
 
@@ -39,24 +43,45 @@ pub(crate) struct OrderFillJob {
 pub(crate) type OrderFillJobQueue =
     SqliteStorage<OrderFillJob, JsonCodec<CompactType>, SqliteFetcher>;
 
+type BoxedStream<T, Err = sol_types::Error> = Pin<Box<dyn Stream<Item = Result<T, Err>> + Send>>;
+
+/// DEX event streams (ClearV3 / TakeOrderV3) for monitoring order fills.
+///
+/// Passed from `Conductor::start` to avoid a gap between the WS
+/// subscription (used for `get_cutoff_block`) and the monitor's first
+/// `run()` invocation.
+pub(crate) struct DexEventStreams {
+    pub(crate) clear: BoxedStream<(ClearV3, Log)>,
+    pub(crate) take: BoxedStream<(TakeOrderV3, Log)>,
+}
+
 /// Monitors DEX WebSocket streams and pushes events into apalis
 /// storage as [`OrderFillJob`]s.
 ///
 /// Implements [`SupervisedTask`] so the supervisor restarts it
-/// on WebSocket disconnection or errors.
+/// on WebSocket disconnection or errors. On first run, it consumes
+/// pre-established streams from `Conductor::start`; on subsequent
+/// restarts it creates a fresh WS connection.
 #[derive(Clone)]
 pub(crate) struct OrderFillMonitor {
     ws_url: Url,
     orderbook: Address,
     storage: OrderFillJobQueue,
+    dex_streams: Arc<Mutex<Option<DexEventStreams>>>,
 }
 
 impl OrderFillMonitor {
-    pub(crate) fn new(ws_url: Url, orderbook: Address, storage: OrderFillJobQueue) -> Self {
+    pub(crate) fn new(
+        ws_url: Url,
+        orderbook: Address,
+        storage: OrderFillJobQueue,
+        dex_streams: DexEventStreams,
+    ) -> Self {
         Self {
             ws_url,
             orderbook,
             storage,
+            dex_streams: Arc::new(Mutex::new(Some(dex_streams))),
         }
     }
 }
@@ -64,6 +89,20 @@ impl OrderFillMonitor {
 impl SupervisedTask for OrderFillMonitor {
     async fn run(&mut self) -> TaskResult {
         info!(ws_url = %self.ws_url, "Connecting to DEX WebSocket");
+        let initial = self.dex_streams.lock().await.take();
+
+        if let Some(streams) = initial {
+            info!("Order fill monitor using pre-established streams");
+            return self.listen(streams.clear, streams.take).await;
+        }
+
+        self.connect_and_listen().await
+    }
+}
+
+impl OrderFillMonitor {
+    async fn connect_and_listen(&mut self) -> TaskResult {
+        info!(ws_url = %self.ws_url, "Reconnecting to DEX WebSocket");
 
         let ws = WsConnect::new(self.ws_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
@@ -158,11 +197,17 @@ mod tests {
         setup_apalis_tables(&pool).await.unwrap();
         let storage: OrderFillJobQueue = SqliteStorage::new(&pool);
 
-        let monitor = OrderFillMonitor {
-            ws_url: Url::parse("ws://localhost:8545").unwrap(),
-            orderbook: Address::ZERO,
-            storage,
+        let dex_streams = DexEventStreams {
+            clear: Box::pin(stream::empty()),
+            take: Box::pin(stream::empty()),
         };
+
+        let monitor = OrderFillMonitor::new(
+            Url::parse("ws://localhost:8545").unwrap(),
+            Address::ZERO,
+            storage,
+            dex_streams,
+        );
 
         (monitor, pool)
     }

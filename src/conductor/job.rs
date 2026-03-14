@@ -5,12 +5,11 @@
 //! `SqliteStorage`; the generic [`handle_job`] handler deserializes
 //! it and calls [`Job::execute`] with the shared context.
 
-use std::fmt;
-use std::sync::Arc;
-
 use apalis::prelude::Data;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fmt;
+use std::sync::Arc;
 use tracing::{debug, error};
 
 /// A persistent, retryable unit of work backed by apalis storage.
