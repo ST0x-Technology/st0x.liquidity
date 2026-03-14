@@ -34,8 +34,8 @@ use crate::bindings::{
     TOFUTokenDecimals,
 };
 use crate::conductor::{
-    OrderFillError, TradeProcessingCqrs, VaultDiscoveryCtx,
-    check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
+    TradeProcessingCqrs, VaultDiscoveryCtx, check_and_execute_accumulated_positions,
+    discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
@@ -49,6 +49,8 @@ use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::alpaca::tests::setup_anvil;
+use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
 
 const TEST_AAPL: &str = "AAPL";
@@ -91,10 +93,10 @@ async fn assert_position(
 }
 
 /// A trade produced by a real OrderBook take-order on Anvil, containing the parsed
-/// `OnchainTrade` and a matching `QueuedEvent` ready for CQRS processing.
+/// `OnchainTrade` and a matching `ChainIncluded` event ready for CQRS processing.
 struct AnvilTrade {
     trade: OnchainTrade,
-    queued_event: QueuedEvent,
+    trade_event: ChainIncluded<RaindexTradeEvent>,
     tx_hash: B256,
     log_index: u64,
     input_vault_id: B256,
@@ -109,16 +111,9 @@ impl AnvilTrade {
     async fn submit(
         &self,
         cqrs: &TradeProcessingCqrs,
-    ) -> Result<Option<OffchainOrderId>, OrderFillError> {
+    ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
         let executor = MockExecutor::default();
-        process_queued_trade(
-            &executor,
-            &self.queued_event,
-            self.trade.clone(),
-            cqrs,
-            true,
-        )
-        .await
+        process_queued_trade(&executor, &self.trade_event, self.trade.clone(), cqrs, true).await
     }
 }
 
@@ -331,7 +326,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let tx_hash = trade.tx_hash;
         let log_index = trade.log_index;
 
-        let queued_event = QueuedEvent {
+        let trade_event = ChainIncluded {
             tx_hash,
             log_index,
             block_number: take_log.block_number.unwrap(),
@@ -341,7 +336,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
 
         AnvilTrade {
             trade,
-            queued_event,
+            trade_event,
             tx_hash,
             log_index,
             input_vault_id,
@@ -1533,7 +1528,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
         order_owner: orderbook.owner,
     };
 
-    discover_vaults_for_trade(&trade1.queued_event, &trade1.trade, &context).await?;
+    discover_vaults_for_trade(&trade1.trade_event, &trade1.trade, &context).await?;
 
     let vault_agg_id = VaultRegistryId {
         orderbook: orderbook.orderbook_addr,

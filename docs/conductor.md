@@ -44,14 +44,14 @@ SupervisorBuilder::default()
 ### OrderFillMonitor
 
 Defined in `src/conductor/order_fill_monitor.rs`. Subscribes to
-ClearV3/TakeOrderV3 WebSocket streams and pushes each event into apalis storage
-as an `OrderFillJob`.
+ClearV3/TakeOrderV3 WebSocket streams and pushes each event into the
+`DexTradeAccountingJobQueue` as an `AccountForDexTrade` job.
 
 ```rust
 struct OrderFillMonitor {
-    ws_url: Url,                  // config -- cloned on restart
-    orderbook: Address,           // config -- cloned on restart
-    storage: OrderFillJobQueue,   // Arc-backed -- survives restarts
+    ws_url: Url,
+    orderbook: Address,
+    job_queue: DexTradeAccountingJobQueue,
 }
 ```
 
@@ -92,31 +92,31 @@ where
 
     fn label(&self) -> Label;
 
-    async fn execute(&self, ctx: &Ctx) -> Result<(), Self::Error>;
+    async fn perform(&self, ctx: &Ctx) -> Result<(), Self::Error>;
 }
 ```
 
 The `Ctx` type parameter bundles all runtime dependencies into one struct,
 injected via apalis `Data<Arc<Ctx>>`. This keeps job structs serializable (data
 only) while the context provides access to executor, CQRS frameworks, config,
-etc. `label()` returns a human-readable `Label` used by `handle_job` for
-structured logging.
+etc. `label()` returns a human-readable `Label` used by `work` for structured
+logging.
 
-### handle_job
+### work
 
 Generic apalis handler that bridges `Job` implementations with apalis's
 function-based worker API:
 
 ```rust
-pub(crate) async fn handle_job<J, Ctx>(job: J, ctx: Data<Arc<Ctx>>)
+pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
 where
-    J: Job<Ctx>,
     Ctx: Send + Sync + 'static,
+    J: Job<Ctx>,
 {
     // Errors are logged but not propagated -- apalis sees Ok(()) and
     // will not retry the job. This is intentional: jobs are responsible
-    // for their own retry/recovery logic inside execute().
-    if let Err(error) = job.execute(&ctx).await {
+    // for their own retry/recovery logic inside perform().
+    if let Err(error) = job.perform(&ctx).await {
         error!(%error, "Job failed");
     }
 }
@@ -126,9 +126,9 @@ where
 
 ```
 WorkerBuilder::new(name)
-    .backend(storage)         // SqliteStorage<MyJob>
+    .backend(job_queue)       // SqliteStorage<MyJob, ...>
     .data(ctx)                // Arc<MyCtx>
-    .build(handle_job::<MyJob, MyCtx>)
+    .build(work::<MyCtx, MyJob>)
 ```
 
 The apalis `Monitor` wraps workers and restarts them on failure:
@@ -140,24 +140,25 @@ Monitor::new()
     .run().await
 ```
 
-### OrderFillJob
+### AccountForDexTrade
 
-Defined in `src/conductor/order_fill_monitor.rs`. Serializable wrapper around
-`QueuedEvent`, pushed into `OrderFillJobQueue` by `OrderFillMonitor`.
+Defined in `src/trading/onchain/trade_accountant.rs`. Serializable wrapper
+around `ChainIncluded<RaindexTradeEvent>`, pushed into
+`DexTradeAccountingJobQueue` by `OrderFillMonitor`.
 
-Implements `Job<OrderFillCtx<P, E>>` in `src/conductor/order_fill_processor.rs`.
-The `execute()` method runs the hedging pipeline:
+Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
+hedging pipeline:
 
-1. `convert_event_to_trade` -- resolve symbol, price, direction
+1. Convert event to trade -- resolve symbol, price, direction
 2. `discover_vaults_for_trade` -- register vaults in VaultRegistry
 3. `process_queued_trade` -- record OnChainTrade, update Position, place
    offsetting broker order
 
-### OrderFillCtx
+### AccountantCtx
 
-Defined in `src/conductor/order_fill_processor.rs`. Bundles all dependencies the
-job needs: config, symbol cache, EVM provider, CQRS frameworks, vault registry,
-executor. Wrapped in `Arc` and injected via apalis `Data`.
+Defined in `src/trading/onchain/trade_accountant.rs`. Bundles all dependencies
+the job needs: config, symbol cache, EVM provider, CQRS frameworks, vault
+registry, executor. Wrapped in `Arc` and injected via apalis `Data`.
 
 ## Conductor assembly
 
@@ -169,8 +170,8 @@ up, returning a `Conductor` with handles to every task.
 
 `Conductor` lifecycle:
 
-- `start()` -- sets up apalis storage, CQRS frameworks, backfill, then delegates
-  to `ConductorBuilder::spawn()`
+- `start()` -- sets up apalis job queue, CQRS frameworks, backfill, then
+  delegates to `ConductorBuilder::spawn()`
 - `wait_for_completion()` -- `tokio::select!` across supervisor, apalis monitor,
   order poller, and position checker; returns when any exits
 - `abort_trading_tasks()` -- shuts down supervisor + monitor + order poller +

@@ -141,24 +141,22 @@ impl OrderFillMonitor {
         event: RaindexTradeEvent,
         log: &alloy::rpc::types::Log,
     ) -> TaskResult {
-        let queued_event = match ChainIncluded::<RaindexTradeEvent>::from_log(event, log) {
-            Ok(queued_event) => queued_event,
+        let trade_event = match ChainIncluded::<RaindexTradeEvent>::from_log(event, log) {
+            Ok(trade_event) => trade_event,
             Err(err) => {
-                error!(%err, "Failed to create queued event from log");
+                error!(%err, "Failed to extract block inclusion metadata from log");
                 return Ok(());
             }
         };
 
         trace!(
-            tx_hash = ?queued_event.tx_hash,
-            log_index = queued_event.log_index,
-            "Pushing order fill job into apalis storage"
+            tx_hash = ?trade_event.tx_hash,
+            log_index = trade_event.log_index,
+            "Enqueuing trade accounting job"
         );
 
         self.job_queue
-            .push(AccountForDexTrade {
-                trade: queued_event,
-            })
+            .push(AccountForDexTrade { trade: trade_event })
             .await?;
 
         Ok(())

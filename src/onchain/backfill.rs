@@ -37,7 +37,7 @@ pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
 }
 
 #[tracing::instrument(
-    skip(provider, evm_ctx, retry_strategy, storage),
+    skip(provider, evm_ctx, retry_strategy, job_queue),
     fields(end_block),
     level = tracing::Level::INFO,
 )]
@@ -76,7 +76,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
                 batch_start,
                 batch_end,
                 retry_strategy.clone(),
-                storage.clone(),
+                job_queue.clone(),
             )
         })
         .collect::<Vec<_>>();
@@ -95,7 +95,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
 }
 
 #[tracing::instrument(
-    skip(provider, evm_ctx, retry_strategy, storage),
+    skip(provider, evm_ctx, retry_strategy, job_queue),
     fields(batch_start, batch_end),
     level = tracing::Level::DEBUG,
 )]
@@ -105,7 +105,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     batch_start: u64,
     batch_end: u64,
     retry_strategy: B,
-    mut storage: OrderFillJobQueue,
+    mut job_queue: DexTradeAccountingJobQueue,
 ) -> Result<usize, OnChainError> {
     let clear_filter = Filter::new()
         .address(evm_ctx.orderbook)
@@ -155,7 +155,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         "Processed a batch of blocks from {batch_start} to {batch_end}",
     );
 
-    let queued_events = clear_logs
+    let trade_events = clear_logs
         .into_iter()
         .chain(take_logs)
         .sorted_by_key(|log| (log.block_number, log.log_index))
@@ -171,9 +171,9 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
             }
         })
         .filter_map(|(event, log)| {
-            QueuedEvent::from_log(event, &log)
+            ChainIncluded::<RaindexTradeEvent>::from_log(event, &log)
                 .inspect_err(
-                    |error| warn!(%error, "Failed to create queued event from log during backfill"),
+                    |error| warn!(%error, "Failed to extract block inclusion metadata during backfill"),
                 )
                 .ok()
         })
@@ -181,11 +181,14 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
 
     let mut enqueued_count = 0;
 
-    for queued_event in queued_events {
-        match storage.push(OrderFillJob { queued_event }).await {
+    for trade_event in trade_events {
+        match job_queue
+            .push(AccountForDexTrade { trade: trade_event })
+            .await
+        {
             Ok(()) => enqueued_count += 1,
             Err(error) => {
-                warn!(%error, "Failed to push backfill job into apalis storage");
+                warn!(%error, "Failed to push backfill job into job queue");
             }
         }
     }
@@ -232,7 +235,7 @@ mod tests {
             .with_max_delay(Duration::from_millis(10))
     }
 
-    async fn setup_storage(pool: &SqlitePool) -> OrderFillJobQueue {
+    async fn setup_job_queue(pool: &SqlitePool) -> DexTradeAccountingJobQueue {
         setup_apalis_tables(pool).await.unwrap();
         SqliteStorage::new(pool)
     }
@@ -247,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_empty_results() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
@@ -260,7 +263,7 @@ mod tests {
             deployment_block: 1,
         };
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -366,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_with_clear_v3_events() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
@@ -412,7 +415,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -422,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_with_take_order_v3_events() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
@@ -470,7 +473,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -480,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_enqueues_all_events() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -559,7 +562,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -569,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_rpc_failure() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -589,7 +592,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result =
-            backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage).await;
+            backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue).await;
 
         assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
     }
@@ -597,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_block_range() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -610,7 +613,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -667,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_preserves_chronological_order() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
@@ -700,7 +703,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -710,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_batch_count_verification() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -729,7 +732,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 2500, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 2500, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -739,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_batch_boundary_verification() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -763,7 +766,7 @@ mod tests {
             &evm_ctx,
             1900,
             get_backfill_retry_strat(),
-            storage,
+            job_queue,
         )
         .await
         .unwrap();
@@ -774,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_batch_with_realistic_data() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
@@ -803,7 +806,7 @@ mod tests {
             100,
             200,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await
         .unwrap();
@@ -815,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_large_block_range_batching() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -836,7 +839,7 @@ mod tests {
             &evm_ctx,
             3000,
             get_backfill_retry_strat(),
-            storage,
+            job_queue,
         )
         .await
         .unwrap();
@@ -847,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_mixed_valid_and_invalid_events() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
@@ -885,7 +888,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -928,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_mixed_clear_and_take_events() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
@@ -955,7 +958,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -965,7 +968,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_batch_retry_mechanism() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -987,7 +990,7 @@ mod tests {
             100,
             200,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await;
 
@@ -998,7 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_batch_exhausted_retries() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1023,7 +1026,7 @@ mod tests {
             100,
             200,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await;
 
@@ -1033,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_partial_batch_failure() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1059,7 +1062,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result =
-            backfill_events(&provider, &evm_ctx, 25000, test_retry_strategy(), storage).await;
+            backfill_events(&provider, &evm_ctx, 25000, test_retry_strategy(), job_queue).await;
 
         assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
     }
@@ -1067,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_corrupted_log_data() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1099,7 +1102,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -1110,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_single_block_range() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1123,7 +1126,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 42, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 42, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -1133,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_database_failure() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1168,7 +1171,7 @@ mod tests {
             100,
             200,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await;
 
@@ -1181,7 +1184,7 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_filter_creation() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1200,7 +1203,7 @@ mod tests {
             100,
             150,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await;
 
@@ -1210,7 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_partial_enqueue_failure() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1255,7 +1258,7 @@ mod tests {
             100,
             200,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await;
 
@@ -1266,7 +1269,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_concurrent_batch_processing() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1300,7 +1303,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 3000, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 3000, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -1310,7 +1313,7 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_retry_exponential_backoff() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1334,7 +1337,7 @@ mod tests {
             100,
             200,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await;
         let elapsed = start_time.elapsed();
@@ -1349,7 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_events_zero_blocks() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1360,7 +1363,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 50, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 50, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 
@@ -1370,7 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_batch_events_mixed_log_types() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1433,7 +1436,7 @@ mod tests {
             100,
             200,
             test_retry_strategy(),
-            storage,
+            job_queue,
         )
         .await;
 
@@ -1445,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_starts_from_deployment_block() {
         let pool = setup_test_db().await;
-        let storage = setup_storage(&pool).await;
+        let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1459,7 +1462,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), storage)
+        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
             .await
             .unwrap();
 

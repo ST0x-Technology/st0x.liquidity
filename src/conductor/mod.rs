@@ -9,11 +9,12 @@ mod builder;
 mod manifest;
 mod order_fill_monitor;
 
-use alloy::primitives::{Address, IntoLogData};
+use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use apalis::prelude::TaskSink;
+use apalis_sqlite::SqliteStorage;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -24,11 +25,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
+use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use st0x_evm::{Evm, Wallet};
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
-use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
+use st0x_execution::{Executor, FractionalShares, Symbol};
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
@@ -40,13 +39,12 @@ use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
+use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
-use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::EquityTransferServices;
@@ -665,7 +663,7 @@ pub(crate) async fn get_cutoff_block<S1, S2, P>(
     clear_stream: &mut S1,
     take_stream: &mut S2,
     provider: &P,
-    storage: &mut DexTradeAccountingJobQueue,
+    job_queue: &mut DexTradeAccountingJobQueue,
 ) -> anyhow::Result<u64>
 where
     S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
@@ -692,7 +690,7 @@ where
 
     buffer_live_events(clear_stream, take_stream, &mut event_buffer, block_number).await;
 
-    enqueue_buffered_events(storage, event_buffer).await;
+    enqueue_buffered_events(job_queue, event_buffer).await;
 
     Ok(block_number)
 }
@@ -707,15 +705,15 @@ async fn enqueue_buffered_events(
         event_buffer.len()
     );
 
-    let queued_events = event_buffer.into_iter().filter_map(|(event, log)| {
-        ChainIncluded::<TradeEvent>::from_log(event, &log)
-            .inspect_err(|error| error!(%error, "Failed to create queued event from log"))
+    let trade_events = event_buffer.into_iter().filter_map(|(event, log)| {
+        ChainIncluded::<RaindexTradeEvent>::from_log(event, &log)
+            .inspect_err(|error| error!(%error, "Failed to extract block inclusion metadata"))
             .ok()
     });
 
-    for queued_event in queued_events {
+    for trade_event in trade_events {
         if let Err(error) = job_queue
-            .push(order_fill_monitor::OrderFillJob { queued_event })
+            .push(AccountForDexTrade { trade: trade_event })
             .await
         {
             error!(%error, "Failed to push buffered event into apalis storage");
@@ -739,15 +737,15 @@ async fn enqueue_buffered_events(
 /// - USDC vault: token == USDC_BASE
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
 pub(crate) async fn discover_vaults_for_trade(
-    queued_event: &QueuedEvent,
+    trade_event: &ChainIncluded<RaindexTradeEvent>,
     trade: &OnchainTrade,
     context: &VaultDiscoveryCtx<'_>,
 ) -> Result<(), TradeAccountingError> {
-    let tx_hash = queued_event.tx_hash;
+    let tx_hash = trade_event.tx_hash;
     let base_symbol = trade.symbol.base();
     let expected_equity_token = trade.equity_token;
 
-    let owned_vaults = match &queued_event.event {
+    let owned_vaults = match &trade_event.event {
         RaindexTradeEvent::ClearV3(clear_event) => extract_vaults_from_clear(clear_event),
         RaindexTradeEvent::TakeOrderV3(take_event) => extract_owned_vaults(
             &take_event.config.order,
@@ -895,7 +893,7 @@ async fn execute_acknowledge_fill(
 
 pub(crate) async fn process_queued_trade<E: Executor>(
     executor: &E,
-    queued_event: &QueuedEvent,
+    trade_event: &ChainIncluded<RaindexTradeEvent>,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
@@ -904,12 +902,12 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     // and rejects duplicates. Only acknowledge the fill on the Position aggregate
     // if this is a genuinely new trade, preventing double-counting.
     let is_new_trade =
-        execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
+        execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
 
     if !is_new_trade {
         info!(
             "Skipping duplicate trade: tx_hash={:?}, log_index={}",
-            queued_event.tx_hash, queued_event.log_index
+            trade_event.tx_hash, trade_event.log_index
         );
         return Ok(None);
     }
@@ -1277,36 +1275,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn clear_event_filtered_when_no_matching_owner() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let queued_event = create_queued_clear_event(alice, bob);
-
-        let cache = SymbolCache::default();
-        let feed_id_cache = FeedIdCache::default();
-
-        let result = convert_event_to_trade(
-            &ctx,
-            &cache,
-            &st0x_evm::ReadOnlyEvm::new(provider),
-            &queued_event,
-            &feed_id_cache,
-            ctx.order_owner(),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            result.is_none(),
-            "Event should be filtered out when neither order belongs to owner"
-        );
-    }
-
     async fn build_test_conductor(pool: &SqlitePool) -> Conductor {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
@@ -1467,7 +1435,7 @@ mod tests {
     async fn test_get_cutoff_block_with_timeout() {
         let pool = setup_test_db().await;
         setup_apalis_tables(&pool).await.unwrap();
-        let mut storage: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+        let mut job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
         let asserter = Asserter::new();
 
         asserter.push_success(&serde_json::Value::from(12345u64));
@@ -1476,10 +1444,14 @@ mod tests {
         let mut clear_stream = futures_util::stream::empty();
         let mut take_stream = futures_util::stream::empty();
 
-        let cutoff_block =
-            get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &mut storage)
-                .await
-                .unwrap();
+        let cutoff_block = get_cutoff_block(
+            &mut clear_stream,
+            &mut take_stream,
+            &provider,
+            &mut job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cutoff_block, 12345);
     }
@@ -1646,7 +1618,7 @@ mod tests {
         }
     }
 
-    fn create_queued_clear_event(alice: OrderV4, bob: OrderV4) -> QueuedEvent {
+    fn included_clear_event(alice: OrderV4, bob: OrderV4) -> ChainIncluded<RaindexTradeEvent> {
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             alice,
@@ -1661,7 +1633,7 @@ mod tests {
             },
         };
 
-        QueuedEvent {
+        ChainIncluded {
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
@@ -1670,7 +1642,7 @@ mod tests {
         }
     }
 
-    fn create_queued_take_event(order: OrderV4) -> QueuedEvent {
+    fn included_take_event(order: OrderV4) -> ChainIncluded<RaindexTradeEvent> {
         let take_event = TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
@@ -1683,7 +1655,7 @@ mod tests {
             output: B256::ZERO,
         };
 
-        QueuedEvent {
+        ChainIncluded {
             tx_hash: TEST_TX_HASH,
             log_index: 0,
             block_number: 12345,
@@ -1733,11 +1705,11 @@ mod tests {
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let queued_event = create_queued_clear_event(alice, bob);
+        let trade_event = included_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
 
@@ -1758,11 +1730,11 @@ mod tests {
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let queued_event = create_queued_clear_event(alice, bob);
+        let trade_event = included_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
 
@@ -1782,11 +1754,11 @@ mod tests {
         let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
 
         let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
-        let queued_event = create_queued_take_event(order);
+        let trade_event = included_take_event(order);
         let trade = create_test_trade("MSFT");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
 
@@ -1813,11 +1785,11 @@ mod tests {
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let queued_event = create_queued_clear_event(alice, bob);
+        let trade_event = included_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed even when no vaults match");
 
@@ -1836,11 +1808,11 @@ mod tests {
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let queued_event = create_queued_clear_event(alice, bob);
+        let trade_event = included_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed");
 
@@ -1871,11 +1843,11 @@ mod tests {
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let queued_event = create_queued_clear_event(alice, bob);
+        let trade_event = included_clear_event(alice, bob);
         let trade = create_test_trade("GOOG");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed");
 
@@ -1977,9 +1949,9 @@ mod tests {
         }
     }
 
-    /// Constructs a `QueuedEvent` with a unique `tx_hash` derived from
+    /// Constructs a `ChainIncluded<RaindexTradeEvent>` with a unique `tx_hash` derived from
     /// the `log_index`.
-    fn make_queued_event(log_index: u64) -> QueuedEvent {
+    fn included_trade_event(log_index: u64) -> ChainIncluded<RaindexTradeEvent> {
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             alice: get_test_order(),
@@ -1997,7 +1969,7 @@ mod tests {
         let mut hash_bytes = [0u8; 32];
         hash_bytes[31] = u8::try_from(log_index).unwrap_or(0);
 
-        QueuedEvent {
+        ChainIncluded {
             tx_hash: B256::from(hash_bytes),
             log_index,
             block_number: 12345,
@@ -2014,11 +1986,11 @@ mod tests {
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
-        let queued_event = make_queued_event(10);
+        let trade_event = included_trade_event(10);
         let trade = test_trade_with_amount(dec!(0.5), 10);
 
         let result =
-            process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true).await;
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
 
         assert_eq!(
             result.unwrap(),
@@ -2052,11 +2024,11 @@ mod tests {
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
-        let queued_event = make_queued_event(20);
+        let trade_event = included_trade_event(20);
         let trade = test_trade_with_amount(dec!(1.5), 20);
 
         let result =
-            process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true).await;
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
 
         let offchain_order_id = result
             .unwrap()
@@ -2096,11 +2068,11 @@ mod tests {
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
-        let queued_event_1 = make_queued_event(30);
+        let trade_event_1 = included_trade_event(30);
         let trade_1 = test_trade_with_amount(dec!(0.5), 30);
 
         let result_1 =
-            process_queued_trade(&MockExecutor::new(), &queued_event_1, trade_1, &cqrs, true).await;
+            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true).await;
 
         assert_eq!(
             result_1.unwrap(),
@@ -2108,11 +2080,11 @@ mod tests {
             "First trade of 0.5 shares should not trigger"
         );
 
-        let queued_event_2 = make_queued_event(31);
+        let trade_event_2 = included_trade_event(31);
         let trade_2 = test_trade_with_amount(dec!(0.7), 31);
 
         let result_2 =
-            process_queued_trade(&MockExecutor::new(), &queued_event_2, trade_2, &cqrs, true).await;
+            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
 
         assert!(
             result_2.unwrap().is_some(),
@@ -2138,20 +2110,20 @@ mod tests {
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
-        let queued_event_1 = make_queued_event(40);
+        let trade_event_1 = included_trade_event(40);
         let trade_1 = test_trade_with_amount(dec!(1.5), 40);
 
         let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &queued_event_1, trade_1, &cqrs, true)
+            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
                 .await
                 .unwrap()
                 .expect("first trade should place an order");
 
-        let queued_event_2 = make_queued_event(41);
+        let trade_event_2 = included_trade_event(41);
         let trade_2 = test_trade_with_amount(dec!(1.5), 41);
 
         let result_2 =
-            process_queued_trade(&MockExecutor::new(), &queued_event_2, trade_2, &cqrs, true).await;
+            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
 
         assert_eq!(
             result_2.unwrap(),
@@ -2187,20 +2159,20 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         // Process first trade -> places order
-        let queued_event_1 = make_queued_event(50);
+        let trade_event_1 = included_trade_event(50);
         let trade_1 = test_trade_with_amount(dec!(1.5), 50);
 
         let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &queued_event_1, trade_1, &cqrs, true)
+            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
                 .await
                 .unwrap()
                 .expect("first trade should place an order");
 
         // Process second trade -> blocked by pending order
-        let queued_event_2 = make_queued_event(51);
+        let trade_event_2 = included_trade_event(51);
         let trade_2 = test_trade_with_amount(dec!(1.5), 51);
 
-        process_queued_trade(&MockExecutor::new(), &queued_event_2, trade_2, &cqrs, true)
+        process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true)
             .await
             .unwrap();
 
@@ -2276,11 +2248,11 @@ mod tests {
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
-        let queued_event = make_queued_event(60);
+        let trade_event = included_trade_event(60);
         let trade = test_trade_with_amount(dec!(2.0), 60);
 
         let result =
-            process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true).await;
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
 
         assert!(
             result.unwrap().is_some(),
@@ -2929,10 +2901,10 @@ mod tests {
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
-        let queued_event = make_queued_event(70);
+        let trade_event = included_trade_event(70);
         let trade = test_trade_with_amount(dec!(1.5), 70);
 
-        process_queued_trade(&MockExecutor::new(), &queued_event, trade, &cqrs, true)
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
             .await
             .unwrap();
 

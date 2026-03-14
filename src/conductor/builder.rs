@@ -211,7 +211,7 @@ where
                     WorkerBuilder::new(format!("order-fill-worker-{index}"))
                         .backend(job_queue.clone())
                         .data(accountant_ctx.clone())
-                        .build(work::<_, AccountantCtx<Prov, Exec>>)
+                        .build(work::<AccountantCtx<Prov, Exec>, _>)
                 });
 
             if let Err(monitor_error) = monitor.run().await {

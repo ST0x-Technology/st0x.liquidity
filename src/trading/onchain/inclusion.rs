@@ -88,4 +88,120 @@ impl fmt::Display for RequiredField {
     }
 }
 
-// TODO: bring over tests
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{Address, LogData, fixed_bytes};
+    use alloy::rpc::types::Log;
+
+    use super::*;
+
+    fn valid_log() -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: LogData::empty(),
+            },
+            block_hash: None,
+            block_number: Some(42),
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(fixed_bytes!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )),
+            transaction_index: None,
+            log_index: Some(7),
+            removed: false,
+        }
+    }
+
+    #[test]
+    fn from_log_extracts_all_fields() {
+        let log = valid_log();
+        let included = ChainIncluded::from_log("test_event", &log).unwrap();
+
+        assert_eq!(included.event, "test_event");
+        assert_eq!(included.tx_hash, log.transaction_hash.unwrap());
+        assert_eq!(included.log_index, 7);
+        assert_eq!(included.block_number, 42);
+        assert!(
+            included.block_timestamp.is_some(),
+            "Should parse valid timestamp"
+        );
+    }
+
+    #[test]
+    fn from_log_handles_missing_timestamp() {
+        let mut log = valid_log();
+        log.block_timestamp = None;
+
+        let included = ChainIncluded::from_log("event", &log).unwrap();
+
+        assert!(
+            included.block_timestamp.is_none(),
+            "Missing timestamp should produce None, not error"
+        );
+    }
+
+    #[test]
+    fn from_log_fails_without_tx_hash() {
+        let mut log = valid_log();
+        log.transaction_hash = None;
+
+        let error = ChainIncluded::from_log("event", &log).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                BlockInclusionError::MissingLogField(RequiredField::TxHash)
+            ),
+            "Expected MissingLogField(TxHash), got: {error}"
+        );
+    }
+
+    #[test]
+    fn from_log_fails_without_log_index() {
+        let mut log = valid_log();
+        log.log_index = None;
+
+        let error = ChainIncluded::from_log("event", &log).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                BlockInclusionError::MissingLogField(RequiredField::LogIndex)
+            ),
+            "Expected MissingLogField(LogIndex), got: {error}"
+        );
+    }
+
+    #[test]
+    fn from_log_fails_without_block_number() {
+        let mut log = valid_log();
+        log.block_number = None;
+
+        let error = ChainIncluded::from_log("event", &log).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                BlockInclusionError::MissingLogField(RequiredField::BlockNumber)
+            ),
+            "Expected MissingLogField(BlockNumber), got: {error}"
+        );
+    }
+
+    #[test]
+    fn timestamp_parsed_as_utc_datetime() {
+        let log = valid_log();
+        let included = ChainIncluded::from_log("event", &log).unwrap();
+
+        let timestamp = included.block_timestamp.unwrap();
+        assert_eq!(timestamp.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn required_field_display() {
+        assert_eq!(RequiredField::TxHash.to_string(), "transaction_hash");
+        assert_eq!(RequiredField::LogIndex.to_string(), "log_index");
+        assert_eq!(RequiredField::BlockNumber.to_string(), "block_number");
+    }
+}
