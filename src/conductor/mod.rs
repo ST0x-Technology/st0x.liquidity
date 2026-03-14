@@ -13,6 +13,7 @@ use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
+use apalis::prelude::TaskSink;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -48,7 +49,7 @@ use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_fro
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::queue::{EventQueueError, QueuedEvent};
+use crate::queue::{self, EventQueueError, QueuedEvent};
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
@@ -74,6 +75,33 @@ pub(crate) async fn setup_apalis_tables(pool: &SqlitePool) -> Result<(), sqlx::E
     let mut migrator = apalis_sqlite::SqliteStorage::migrations();
     migrator.set_ignore_missing(true);
     migrator.run(pool).await?;
+    Ok(())
+}
+
+/// Drains unprocessed events from the legacy `event_queue` table into the
+/// apalis job queue. Backfill and buffered WS events write to `event_queue`,
+/// but the conductor only processes from apalis storage.
+async fn drain_legacy_events_into_job_queue(
+    pool: &SqlitePool,
+    job_queue: &mut order_fill_monitor::OrderFillJobQueue,
+) -> Result<(), anyhow::Error> {
+    let drained = queue::drain_unprocessed_events(pool).await?;
+
+    if drained.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        count = drained.len(),
+        "Draining legacy event_queue into apalis job queue"
+    );
+
+    for queued_event in drained {
+        job_queue
+            .push(order_fill_monitor::OrderFillJob { queued_event })
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -184,8 +212,10 @@ impl Conductor {
             }
 
             setup_apalis_tables(&pool).await?;
-            let job_queue: order_fill_monitor::OrderFillJobQueue =
+            let mut job_queue: order_fill_monitor::OrderFillJobQueue =
                 apalis_sqlite::SqliteStorage::new(&pool);
+
+            drain_legacy_events_into_job_queue(&pool, &mut job_queue).await?;
 
             let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
                 .build(())

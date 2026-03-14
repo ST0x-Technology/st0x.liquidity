@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT\n            id,\n            tx_hash,\n            log_index,\n            block_number,\n            event_data,\n            processed,\n            created_at,\n            processed_at,\n            block_timestamp\n        FROM event_queue\n        WHERE processed = 0\n        ORDER BY block_number ASC, log_index ASC\n        LIMIT 1\n        ",
+  "query": "\n        SELECT\n            id,\n            tx_hash,\n            log_index,\n            block_number,\n            event_data,\n            processed,\n            created_at,\n            processed_at,\n            block_timestamp\n        FROM event_queue\n        WHERE processed = 0\n        ORDER BY block_number ASC, log_index ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -64,5 +64,5 @@
       true
     ]
   },
-  "hash": "0900431855311db452d541e415308e32392c370340e90798831868a521aba626"
+  "hash": "cd27a9a5679994616e61cac90f00607d67f57ff901c19ec9ac08c76e11877441"
 }

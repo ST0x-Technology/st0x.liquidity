@@ -155,6 +155,64 @@ async fn enqueue_event(
     Ok(())
 }
 
+/// Fetches all unprocessed events from `event_queue`, marks them as
+/// processed, and returns them ordered by block number and log index.
+///
+/// Used during startup to drain legacy backfilled/buffered events into
+/// the apalis job queue.
+pub(crate) async fn drain_unprocessed_events(
+    pool: &SqlitePool,
+) -> Result<Vec<QueuedEvent>, EventQueueError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            id,
+            tx_hash,
+            log_index,
+            block_number,
+            event_data,
+            processed,
+            created_at,
+            processed_at,
+            block_timestamp
+        FROM event_queue
+        WHERE processed = 0
+        ORDER BY block_number ASC, log_index ASC
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    sqlx::query!(
+        "UPDATE event_queue SET processed = 1, processed_at = CURRENT_TIMESTAMP WHERE processed = 0"
+    )
+    .execute(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let tx_hash: TxHash = row.tx_hash.parse()?;
+            let event: TradeEvent = serde_json::from_str(&row.event_data)?;
+
+            Ok(QueuedEvent {
+                id: Some(row.id),
+                tx_hash,
+                log_index: row.log_index.try_into()?,
+                block_number: row.block_number.try_into()?,
+                event,
+                processed: true,
+                created_at: Some(row.created_at.and_utc()),
+                processed_at: row.processed_at.map(|dt| dt.and_utc()),
+                block_timestamp: row.block_timestamp.map(|dt| dt.and_utc()),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) async fn get_next_unprocessed_event(
     pool: &SqlitePool,
@@ -637,5 +695,153 @@ mod tests {
 
         let result = get_max_processed_block(&pool).await.unwrap();
         assert_eq!(result, Some(999_999_999));
+    }
+
+    fn test_log(tx_hash: B256, block_number: u64, log_index: u64) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("0x1234567890123456789012345678901234567890"),
+                data: LogData::default(),
+            },
+            block_hash: Some(B256::ZERO),
+            block_number: Some(block_number),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(0),
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    fn test_clear(sender: alloy::primitives::Address) -> TradeEvent {
+        TradeEvent::ClearV3(Box::new(ClearV3 {
+            sender,
+            alice: OrderV4::default(),
+            bob: OrderV4::default(),
+            clearConfig: ClearConfigV2::default(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn drain_unprocessed_returns_empty_when_no_events() {
+        let pool = setup_test_db().await;
+
+        let drained = drain_unprocessed_events(&pool).await.unwrap();
+
+        assert!(drained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_unprocessed_returns_all_unprocessed_events() {
+        let pool = setup_test_db().await;
+        let sender = address!("0x1234567890123456789012345678901234567890");
+
+        let log1 = test_log(
+            b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            100,
+            0,
+        );
+        let log2 = test_log(
+            b256!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            101,
+            1,
+        );
+
+        enqueue_event(&pool, &log1, test_clear(sender))
+            .await
+            .unwrap();
+        enqueue_event(&pool, &log2, test_clear(sender))
+            .await
+            .unwrap();
+
+        let drained = drain_unprocessed_events(&pool).await.unwrap();
+
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].block_number, 100);
+        assert_eq!(drained[1].block_number, 101);
+    }
+
+    #[tokio::test]
+    async fn drain_unprocessed_marks_events_as_processed() {
+        let pool = setup_test_db().await;
+        let sender = address!("0x1234567890123456789012345678901234567890");
+
+        let log = test_log(
+            b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            100,
+            0,
+        );
+        enqueue_event(&pool, &log, test_clear(sender))
+            .await
+            .unwrap();
+
+        assert_eq!(count_unprocessed(&pool).await.unwrap(), 1);
+
+        drain_unprocessed_events(&pool).await.unwrap();
+
+        assert_eq!(count_unprocessed(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_unprocessed_skips_already_processed_events() {
+        let pool = setup_test_db().await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES
+                ('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 0, 100, '{}', 1),
+                ('0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 0, 101, '{}', 0)
+            "#
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let drained = drain_unprocessed_events(&pool).await.unwrap();
+
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].block_number, 101);
+    }
+
+    #[tokio::test]
+    async fn drain_unprocessed_is_idempotent() {
+        let pool = setup_test_db().await;
+        let sender = address!("0x1234567890123456789012345678901234567890");
+
+        let log = test_log(
+            b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            100,
+            0,
+        );
+        enqueue_event(&pool, &log, test_clear(sender))
+            .await
+            .unwrap();
+
+        let first_drain = drain_unprocessed_events(&pool).await.unwrap();
+        assert_eq!(first_drain.len(), 1);
+
+        let second_drain = drain_unprocessed_events(&pool).await.unwrap();
+        assert!(second_drain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_unprocessed_preserves_event_data() {
+        let pool = setup_test_db().await;
+        let sender = address!("0x1234567890123456789012345678901234567890");
+        let tx_hash = b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let log = test_log(tx_hash, 42, 7);
+        enqueue_event(&pool, &log, test_clear(sender))
+            .await
+            .unwrap();
+
+        let drained = drain_unprocessed_events(&pool).await.unwrap();
+
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].tx_hash, tx_hash);
+        assert_eq!(drained[0].block_number, 42);
+        assert_eq!(drained[0].log_index, 7);
+        assert!(matches!(drained[0].event, TradeEvent::ClearV3(_)));
     }
 }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE event_queue SET processed = 1, processed_at = CURRENT_TIMESTAMP WHERE processed = 0",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "08496b098ef4717c44cca5a8ad1ae38cd24be82e454ab8f73f49aa8bffa999f5"
+}
