@@ -1880,6 +1880,18 @@ checking per-symbol equity ratios and global USDC ratio against configured
 thresholds. When deviation exceeds the threshold and minimum amounts are met, it
 emits imbalance detection events.
 
+**Imbalance ratio formula**:
+
+```
+ratio = onchain / (onchain + offchain + inflight_locations)
+```
+
+Where `inflight_locations` is the sum of all in-flight location balances for
+that asset type. In-flight balances dilute the ratio, preventing false triggers
+when capital is in transit between venues. Imbalance detection is still
+suppressed entirely when transfer-inflight operations exist (system-initiated
+transfers in progress).
+
 **Rebalancing Parameters** (configurable per environment):
 
 - **Equity per symbol**:
@@ -1970,6 +1982,35 @@ know about cross-venue inventory.
   from broker
 - `InventorySnapshotEvent::OffchainCash` - Offchain cash balance fetched from
   broker
+- `InventorySnapshotEvent::EthereumCash` - USDC balance at Ethereum wallet
+  (in-flight location)
+- `InventorySnapshotEvent::BaseWalletCash` - USDC balance at Base wallet
+  (in-flight location)
+
+##### In-Flight Location Tracking
+
+Capital can sit at intermediate locations between the two primary venues
+(Raindex onchain, brokerage offchain). These balances are polled by the
+InventoryPollingService and tracked separately from venue balances.
+
+**In-flight cash locations** (USDC between venues):
+
+- Ethereum wallet - USDC on Ethereum mainnet during cross-chain bridging
+- Base wallet - USDC in the wallet on Base (not yet deposited into Raindex
+  vault)
+- Alpaca crypto wallet - USDC in Alpaca's crypto wallet (pending conversion)
+
+**In-flight equity locations** (tokens between venues):
+
+- Base unwrapped - Unwrapped equity tokens on Base (not yet wrapped or
+  deposited)
+- Base wrapped - Wrapped equity tokens on Base (not yet deposited into Raindex)
+
+In-flight location balances are observed reality from polling. They are distinct
+from the existing transfer-inflight bookkeeping (`VenueBalance.inflight`), which
+tracks system-initiated transfers. Both can coexist: transfer-inflight
+suppresses imbalance detection entirely, while location balances affect the
+imbalance ratio denominator.
 
 ##### Separation of concerns
 
@@ -2015,15 +2056,23 @@ Each asset type (equities per symbol, USDC) is tracked via a generic
 distinguishes "not yet polled" from "polled with zero balance" — imbalance
 detection requires both venues to have been initialized by snapshot events.
 
+In addition to venue balances, `InventoryView` tracks balances at in-flight
+locations — intermediate points where assets sit during cross-venue transfers
+(e.g., Ethereum wallet, Base wallet). These are stored separately from venue
+balances and included in the imbalance ratio denominator to prevent false
+triggers when capital is in transit.
+
 `InventoryView` listens to trading events (onchain/offchain fills),
 `TokenizedEquityMintEvent`, `EquityRedemptionEvent`, `UsdcRebalanceEvent`, and
 `InventorySnapshotEvent` to maintain venue balances. Inflight tracking ensures
 assets in transit (minting, redeeming, bridging) are accounted for.
 
 Imbalance detection compares each asset's onchain ratio against a configurable
-`ImbalanceThreshold` (target ratio + deviation). Rebalancing is only triggered
-when no inflight operations exist for the asset. Trigger events are emitted to
-`Rebalancer` for execution.
+`ImbalanceThreshold` (target ratio + deviation). The ratio denominator includes
+in-flight location balances so that capital in transit dilutes the ratio rather
+than being invisible. Rebalancing is only triggered when no transfer-inflight
+operations exist for the asset. Trigger events are emitted to `Rebalancer` for
+execution.
 
 #### Failure Handling and Reconciliation
 
