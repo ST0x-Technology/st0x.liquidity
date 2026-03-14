@@ -1141,6 +1141,27 @@ pub(crate) async fn assert_base_wallet_cash_event_exists(
     Ok(())
 }
 
+/// Asserts that no USDC rebalancing events were emitted.
+pub(crate) async fn assert_no_usdc_rebalancing_events(
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let pool = connect_db(db_path).await?;
+    let events = fetch_events_by_type(&pool, "UsdcRebalance").await?;
+
+    assert!(
+        events.is_empty(),
+        "Expected no UsdcRebalance events, but found {}: {:?}",
+        events.len(),
+        events
+            .iter()
+            .map(|event| &event.event_type)
+            .collect::<Vec<_>>(),
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
 #[bon::builder]
 pub(crate) async fn assert_usdc_rebalancing_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],
