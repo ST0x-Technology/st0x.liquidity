@@ -66,8 +66,9 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use uuid::Uuid;
 
+use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
-use st0x_finance::Usdc;
+use st0x_finance::{Id, Usdc};
 
 use crate::alpaca_wallet::AlpacaTransferId;
 
@@ -476,6 +477,201 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+}
+
+impl UsdcRebalance {
+    pub(crate) fn to_dto(&self, id: &UsdcRebalanceId) -> TransferOperation {
+        let (direction, amount, status, started_at, updated_at) = match self {
+            Self::Converting {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Converting,
+                *initiated_at,
+                *initiated_at,
+            ),
+
+            Self::ConversionComplete {
+                direction,
+                amount,
+                initiated_at,
+                converted_at,
+                ..
+            } => {
+                let status = match direction {
+                    // Pre-withdrawal conversion complete, still has withdrawal/bridging/deposit ahead
+                    RebalanceDirection::AlpacaToBase => UsdcBridgeStatus::Converting,
+                    // Post-deposit conversion complete -> truly done
+                    RebalanceDirection::BaseToAlpaca => UsdcBridgeStatus::Completed {
+                        completed_at: *converted_at,
+                    },
+                };
+
+                (direction, *amount, status, *initiated_at, *converted_at)
+            }
+
+            Self::ConversionFailed {
+                direction,
+                amount,
+                initiated_at,
+                failed_at,
+                ..
+            }
+            | Self::WithdrawalFailed {
+                direction,
+                amount,
+                initiated_at,
+                failed_at,
+                ..
+            }
+            | Self::BridgingFailed {
+                direction,
+                amount,
+                initiated_at,
+                failed_at,
+                ..
+            }
+            | Self::DepositFailed {
+                direction,
+                amount,
+                initiated_at,
+                failed_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Failed {
+                    failed_at: *failed_at,
+                },
+                *initiated_at,
+                *failed_at,
+            ),
+
+            Self::Withdrawing {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Withdrawing,
+                *initiated_at,
+                *initiated_at,
+            ),
+
+            Self::WithdrawalComplete {
+                direction,
+                amount,
+                initiated_at,
+                confirmed_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Withdrawing,
+                *initiated_at,
+                *confirmed_at,
+            ),
+
+            Self::Bridging {
+                direction,
+                amount,
+                initiated_at,
+                burned_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Bridging,
+                *initiated_at,
+                *burned_at,
+            ),
+
+            Self::Attested {
+                direction,
+                amount,
+                initiated_at,
+                attested_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Bridging,
+                *initiated_at,
+                *attested_at,
+            ),
+
+            Self::Bridged {
+                direction,
+                amount,
+                initiated_at,
+                minted_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Bridging,
+                *initiated_at,
+                *minted_at,
+            ),
+
+            Self::DepositInitiated {
+                direction,
+                amount,
+                initiated_at,
+                deposit_initiated_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Depositing,
+                *initiated_at,
+                *deposit_initiated_at,
+            ),
+
+            Self::DepositConfirmed {
+                direction,
+                amount,
+                initiated_at,
+                deposit_confirmed_at,
+                ..
+            } => {
+                let status = match direction {
+                    // Deposit confirmed is terminal for AlpacaToBase
+                    RebalanceDirection::AlpacaToBase => UsdcBridgeStatus::Completed {
+                        completed_at: *deposit_confirmed_at,
+                    },
+                    // BaseToAlpaca still needs post-deposit USDC->USD conversion
+                    RebalanceDirection::BaseToAlpaca => UsdcBridgeStatus::Converting,
+                };
+
+                (
+                    direction,
+                    *amount,
+                    status,
+                    *initiated_at,
+                    *deposit_confirmed_at,
+                )
+            }
+        };
+
+        TransferOperation::UsdcBridge(UsdcBridgeOperation {
+            id: Id::new(id.to_string()),
+            direction: match direction {
+                RebalanceDirection::AlpacaToBase => st0x_dto::UsdcBridgeDirection::AlpacaToBase,
+                RebalanceDirection::BaseToAlpaca => st0x_dto::UsdcBridgeDirection::BaseToAlpaca,
+            },
+            amount,
+            status,
+            started_at,
+            updated_at,
+        })
+    }
 }
 
 #[async_trait]
@@ -3573,5 +3769,203 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
+    }
+
+    #[test]
+    fn to_dto_converting_maps_to_converting_status() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let state = UsdcRebalance::Converting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(dec!(500)),
+            order_id: Uuid::new_v4(),
+            initiated_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert_eq!(bridge.id, Id::new(id.to_string()));
+        assert!(matches!(
+            bridge.direction,
+            st0x_dto::UsdcBridgeDirection::AlpacaToBase
+        ));
+        assert_eq!(bridge.amount, Usdc::new(dec!(500)));
+        assert!(matches!(bridge.status, UsdcBridgeStatus::Converting));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, initiated_at);
+    }
+
+    #[test]
+    fn to_dto_bridging_maps_to_bridging_status() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let burned_at = initiated_at + chrono::Duration::seconds(30);
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let state = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(dec!(2000)),
+            burn_tx_hash: burn_tx,
+            initiated_at,
+            burned_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(
+            bridge.direction,
+            st0x_dto::UsdcBridgeDirection::BaseToAlpaca
+        ));
+        assert_eq!(bridge.amount, Usdc::new(dec!(2000)));
+        assert!(matches!(bridge.status, UsdcBridgeStatus::Bridging));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, burned_at);
+    }
+
+    #[test]
+    fn to_dto_deposit_confirmed_maps_to_completed_status() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let confirmed_at = initiated_at + chrono::Duration::seconds(120);
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000003");
+        let mint_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000004");
+        let state = UsdcRebalance::DepositConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(dec!(1000)),
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: mint_tx,
+            initiated_at,
+            deposit_confirmed_at: confirmed_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(
+            bridge.status,
+            UsdcBridgeStatus::Completed { completed_at } if completed_at == confirmed_at
+        ));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, confirmed_at);
+    }
+
+    #[test]
+    fn to_dto_deposit_confirmed_base_to_alpaca_maps_to_converting() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let confirmed_at = initiated_at + chrono::Duration::seconds(120);
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000003");
+        let mint_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000004");
+        let state = UsdcRebalance::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(dec!(1000)),
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: mint_tx,
+            initiated_at,
+            deposit_confirmed_at: confirmed_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(bridge.status, UsdcBridgeStatus::Converting));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, confirmed_at);
+    }
+
+    #[test]
+    fn to_dto_conversion_complete_alpaca_to_base_maps_to_converting() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let converted_at = initiated_at + chrono::Duration::seconds(30);
+        let state = UsdcRebalance::ConversionComplete {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(dec!(500)),
+            filled_amount: Usdc::new(dec!(499)),
+            initiated_at,
+            converted_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(bridge.status, UsdcBridgeStatus::Converting));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, converted_at);
+    }
+
+    #[test]
+    fn to_dto_conversion_complete_base_to_alpaca_maps_to_completed() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let converted_at = initiated_at + chrono::Duration::seconds(30);
+        let state = UsdcRebalance::ConversionComplete {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(dec!(500)),
+            filled_amount: Usdc::new(dec!(499)),
+            initiated_at,
+            converted_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(
+            bridge.status,
+            UsdcBridgeStatus::Completed { completed_at } if completed_at == converted_at
+        ));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, converted_at);
+    }
+
+    #[test]
+    fn to_dto_deposit_failed_maps_to_failed_status() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let failed_at = initiated_at + chrono::Duration::seconds(60);
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000005");
+        let mint_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000006");
+        let state = UsdcRebalance::DepositFailed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(dec!(750)),
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: mint_tx,
+            deposit_ref: None,
+            reason: "deposit timeout".to_string(),
+            initiated_at,
+            failed_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(
+            bridge.status,
+            UsdcBridgeStatus::Failed { failed_at: fa } if fa == failed_at
+        ));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, failed_at);
     }
 }

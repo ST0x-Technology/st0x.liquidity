@@ -16,17 +16,16 @@
 //! `Wallet::submit` (write transactions), so consumers get
 //! human-readable revert reasons without manual wiring.
 
-use std::sync::Arc;
-
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
+use serde::Deserialize;
+use std::sync::Arc;
 
 pub mod error_decoding;
-
 pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
 use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 
@@ -37,6 +36,97 @@ pub mod turnkey;
 
 #[cfg(feature = "mock")]
 pub mod test_chain;
+
+/// Wallet backend discriminant. Deserialized from a `kind` field in
+/// wallet config sections. Variants are feature-gated so unconfigured
+/// backends fail at parse time with "unknown variant".
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WalletKind {
+    #[cfg(feature = "turnkey")]
+    Turnkey,
+    #[cfg(feature = "local-signer")]
+    PrivateKey,
+}
+
+/// Deserializes `self` into any `DeserializeOwned` target.
+///
+/// Implement this for your config format (e.g. a TOML newtype) so
+/// [`WalletKind::try_into_wallet`] and [`TryIntoWallet::try_into_wallet`]
+/// can parse backend-specific settings and credentials from it.
+pub trait Parser: Send {
+    type Error: Into<EvmError>;
+
+    /// # Errors
+    ///
+    /// Returns `Self::Error` if deserialization fails.
+    fn parse<Target: serde::de::DeserializeOwned>(self) -> Result<Target, Self::Error>;
+}
+
+impl WalletKind {
+    /// Dispatch wallet construction by variant.
+    ///
+    /// Parses the backend's `Settings` and `Credentials` from the
+    /// raw config/secrets via [`Parser::parse`], then delegates to
+    /// [`TryIntoWallet::try_from_ctx`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvmError`] if config/secrets parsing or wallet
+    /// construction fails.
+    ///
+    /// When no wallet backend features are enabled, `WalletKind` is
+    /// uninhabited and this method can never be called.
+    #[cfg_attr(
+        not(any(feature = "turnkey", feature = "local-signer")),
+        allow(clippy::unused_async, clippy::uninhabited_references, unused_variables)
+    )]
+    pub async fn try_into_wallet<Raw, Node>(
+        &self,
+        ctx: WalletCtx<Raw, Raw, Node>,
+    ) -> Result<Arc<dyn Wallet<Provider = Node>>, EvmError>
+    where
+        Raw: Parser,
+        Node: Provider + Clone + Send + Sync + 'static,
+    {
+        match *self {
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey => {
+                let WalletCtx {
+                    settings,
+                    credentials,
+                    provider,
+                    required_confirmations,
+                } = ctx;
+                let wallet = turnkey::TurnkeyWallet::try_from_ctx(WalletCtx {
+                    settings: settings.parse().map_err(Into::into)?,
+                    credentials: credentials.parse().map_err(Into::into)?,
+                    provider,
+                    required_confirmations,
+                })
+                .await?;
+                Ok(Arc::new(wallet))
+            }
+            #[cfg(feature = "local-signer")]
+            Self::PrivateKey => {
+                let WalletCtx {
+                    settings: _,
+                    credentials,
+                    provider,
+                    required_confirmations,
+                } = ctx;
+                let wallet = local::RawPrivateKeyWallet::try_from_ctx(WalletCtx {
+                    settings: (),
+                    credentials: credentials.parse().map_err(Into::into)?,
+                    provider,
+                    required_confirmations,
+                })
+                .await?;
+                Ok(Arc::new(wallet))
+            }
+        }
+    }
+}
 
 /// Errors that can occur during EVM operations.
 #[derive(Debug, thiserror::Error)]
@@ -53,12 +143,20 @@ pub enum EvmError {
     DecodedRevert(#[from] AbiDecodedErrorType),
     #[error("transaction reverted: {tx_hash}")]
     Reverted { tx_hash: alloy::primitives::TxHash },
+    #[error("wallet config parse error: {0}")]
+    WalletConfigParse(Box<dyn std::error::Error + Send + Sync>),
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
     #[cfg(feature = "turnkey")]
     #[error("Turnkey error: {0}")]
     Turnkey(#[from] turnkey::TurnkeyError),
+}
+
+impl From<std::convert::Infallible> for EvmError {
+    fn from(never: std::convert::Infallible) -> Self {
+        match never {}
+    }
 }
 
 #[cfg(feature = "turnkey")]
@@ -112,6 +210,9 @@ pub trait Evm: Send + Sync + 'static {
 /// via Turnkey secure enclaves when the `turnkey` feature is enabled,
 /// while `RawPrivateKeyWallet` signs locally with a raw private key
 /// when the `local-signer` feature is enabled.
+///
+/// Implementations that support construction from config + secrets
+/// should also implement [`TryIntoWallet`].
 #[async_trait]
 pub trait Wallet: Evm {
     /// Returns the address this wallet signs transactions from.
@@ -153,6 +254,65 @@ pub trait Wallet: Evm {
             calldata,
             receipt,
         )
+        .await
+    }
+}
+
+/// Everything needed to construct a wallet: parsed settings,
+/// credentials, an RPC provider, and confirmation depth.
+pub struct WalletCtx<Settings, Credentials, Node> {
+    pub settings: Settings,
+    pub credentials: Credentials,
+    pub provider: Node,
+    pub required_confirmations: u64,
+}
+
+/// Async constructor for wallet implementations.
+///
+/// Each backend defines what it needs as `Settings` (non-secret
+/// config like address, org ID) and `Credentials` (secrets like
+/// private keys). The caller parses raw config into these types
+/// and passes them via [`WalletCtx`].
+#[async_trait]
+pub trait TryIntoWallet: Wallet + Sized {
+    /// Non-secret configuration (address, organization ID, etc.).
+    type Settings: Send;
+
+    /// Secret material (private keys, API keys, etc.).
+    type Credentials: Send;
+
+    /// Construct the wallet from parsed settings and credentials.
+    async fn try_from_ctx(
+        ctx: WalletCtx<Self::Settings, Self::Credentials, Self::Provider>,
+    ) -> Result<Self, EvmError>;
+
+    /// Construct the wallet from raw config/secrets, parsing each
+    /// via [`Parser::parse`] into the backend's `Settings` and
+    /// `Credentials`.
+    async fn try_into_wallet<Raw>(
+        ctx: WalletCtx<Raw, Raw, Self::Provider>,
+    ) -> Result<Self, EvmError>
+    where
+        Raw: Parser,
+        Self::Settings: serde::de::DeserializeOwned,
+        Self::Credentials: serde::de::DeserializeOwned,
+    {
+        let WalletCtx {
+            settings,
+            credentials,
+            provider,
+            required_confirmations,
+        } = ctx;
+
+        let settings: Self::Settings = settings.parse().map_err(Into::into)?;
+        let credentials: Self::Credentials = credentials.parse().map_err(Into::into)?;
+
+        Self::try_from_ctx(WalletCtx {
+            settings,
+            credentials,
+            provider,
+            required_confirmations,
+        })
         .await
     }
 }
@@ -379,5 +539,139 @@ mod tests {
         let block_number = read_only.provider().get_block_number().await.unwrap();
 
         assert_eq!(block_number, 0);
+    }
+
+    /// Parser that succeeds with a JSON value (`Some`) or fails (`None`).
+    struct MaybeParser(Option<serde_json::Value>);
+
+    impl Parser for MaybeParser {
+        type Error = EvmError;
+
+        fn parse<Target: serde::de::DeserializeOwned>(self) -> Result<Target, Self::Error> {
+            let Self(value) = self;
+
+            value.map_or_else(
+                || {
+                    Err(EvmError::WalletConfigParse(
+                        "intentional test parse failure".into(),
+                    ))
+                },
+                |json| {
+                    serde_json::from_value(json)
+                        .map_err(|error| EvmError::WalletConfigParse(Box::new(error)))
+                },
+            )
+        }
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wallet_kind_private_key_dispatch_succeeds() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let private_key = alloy::primitives::B256::random();
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let expected_address = signer.address();
+
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!(null))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "private_key": format!("{private_key}")
+            }))),
+            provider,
+            required_confirmations: 1,
+        };
+
+        let wallet = WalletKind::PrivateKey.try_into_wallet(ctx).await.unwrap();
+
+        assert_eq!(
+            wallet.address(),
+            expected_address,
+            "wallet address should match the private key's address"
+        );
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wallet_kind_private_key_credentials_parse_error() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!(null))),
+            credentials: MaybeParser(None),
+            provider,
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::PrivateKey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected WalletConfigParse error, got Ok");
+        };
+
+        assert!(
+            matches!(error, EvmError::WalletConfigParse(_)),
+            "expected WalletConfigParse error, got: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_settings_parse_error() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let ctx = WalletCtx {
+            settings: MaybeParser(None),
+            credentials: MaybeParser(Some(serde_json::json!({}))),
+            provider,
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected WalletConfigParse error from settings parse, got Ok");
+        };
+
+        assert!(
+            matches!(error, EvmError::WalletConfigParse(_)),
+            "expected WalletConfigParse error from settings parse, got: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_credentials_parse_error() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": "org-test-123"
+            }))),
+            credentials: MaybeParser(None),
+            provider,
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected WalletConfigParse error from credentials parse, got Ok");
+        };
+
+        assert!(
+            matches!(error, EvmError::WalletConfigParse(_)),
+            "expected WalletConfigParse error from credentials parse, got: {error:?}"
+        );
     }
 }

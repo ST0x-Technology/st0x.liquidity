@@ -12,19 +12,15 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
-# Wallet provider — select via `type`:
+# Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
 #   "private-key" — local raw private key signing     (requires --features wallet-private-key)
-#
-# The `type` here must match `[rebalancing.wallet].type` in the secrets file.
-# For "private-key", `address` must match the address derived from the secret key.
 [rebalancing.wallet]
-type = "private-key"
-address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
+kind = "private-key"
 
-# For type = "turnkey", use instead:
+# For kind = "turnkey", use instead:
 # [rebalancing.wallet]
-# type = "turnkey"
+# kind = "turnkey"
 # address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 # organization_id = "org-example-turnkey-org-id"
 

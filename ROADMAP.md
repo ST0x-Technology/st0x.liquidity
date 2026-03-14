@@ -65,6 +65,7 @@ control which wallet backends are compiled into the binary.
 
 Everything below has not been organized into epics yet.
 
+- [ ] [#489 Aggregate evolve transitions silently drop earlier-state context](https://github.com/ST0x-Technology/st0x.liquidity/issues/489)
 - [ ] [#488 Inconsistent rebalancing semantics: whitelist config vs blacklist trigger](https://github.com/ST0x-Technology/st0x.liquidity/issues/488)
 
 ### Fireblocks Contract Calls

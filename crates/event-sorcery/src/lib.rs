@@ -361,3 +361,300 @@ impl<T> DomainError for T where
     T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
 }
+
+/// Load a single entity by replaying events from the store.
+///
+/// Creates a lightweight, temporary event store — no CQRS framework, no
+/// query processors. Suitable for read-only access from contexts that
+/// don't own a [`Store`] (e.g., dashboard transfer loading).
+///
+/// # Errors
+///
+/// Returns `SendError` if event store loading or lifecycle
+/// reconstruction fails.
+pub async fn load_entity<Entity: EventSourced>(
+    pool: &SqlitePool,
+    id: &Entity::Id,
+) -> Result<Option<Entity>, SendError<Entity>> {
+    let repo = SqliteEventRepository::new(pool.clone());
+    let event_store =
+        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_event_store(repo);
+
+    let context = event_store.load_aggregate(&id.to_string()).await?;
+
+    Ok(context.aggregate.into_result()?)
+}
+
+/// Load all aggregate IDs for a given entity type.
+///
+/// Queries the events table for distinct aggregate IDs. Used
+/// by dashboard transfer loading to enumerate all transfer
+/// aggregates without requiring access to a [`Store`].
+///
+/// Returns an error if any stored aggregate ID fails to parse,
+/// since that indicates data corruption or a schema mismatch.
+///
+/// # Errors
+///
+/// Returns `LoadAllIdsError` on database errors or if stored aggregate
+/// IDs fail to parse.
+pub async fn load_all_ids<Entity: EventSourced>(
+    pool: &SqlitePool,
+) -> Result<Vec<Entity::Id>, LoadAllIdsError>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT aggregate_id FROM events \
+         WHERE aggregate_type = ?1 \
+         ORDER BY aggregate_id ASC",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .fetch_all(pool)
+    .await?;
+
+    let (ids, invalid) = rows.into_iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut ids, mut invalid), (id_str,)| {
+            match id_str.parse::<Entity::Id>() {
+                Ok(id) => ids.push(id),
+                Err(parse_error) => {
+                    tracing::warn!(
+                        aggregate_id = id_str,
+                        aggregate_type = Entity::AGGREGATE_TYPE,
+                        ?parse_error,
+                        "Failed to parse aggregate ID"
+                    );
+                    invalid.push(id_str);
+                }
+            }
+            (ids, invalid)
+        },
+    );
+
+    if invalid.is_empty() {
+        Ok(ids)
+    } else {
+        Err(LoadAllIdsError::InvalidIds {
+            aggregate_type: Entity::AGGREGATE_TYPE,
+            ids: invalid,
+        })
+    }
+}
+
+/// Errors that can occur when loading all aggregate IDs.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadAllIdsError {
+    #[error("Database error: {0}")]
+    Sql(#[from] sqlx::Error),
+    #[error(
+        "Found unparseable aggregate IDs for {aggregate_type}: \
+         {ids:?}"
+    )]
+    InvalidIds {
+        aggregate_type: &'static str,
+        ids: Vec<String>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use cqrs_es::DomainEvent;
+    use serde::{Deserialize, Serialize};
+    use sqlx::SqlitePool;
+
+    use super::*;
+
+    /// Numeric-only ID that rejects non-numeric strings.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct NumericId(u64);
+
+    impl Display for NumericId {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.0)
+        }
+    }
+
+    impl FromStr for NumericId {
+        type Err = std::num::ParseIntError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            value.parse::<u64>().map(NumericId)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Widget {
+        name: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum WidgetEvent {
+        Created { name: String },
+    }
+
+    impl DomainEvent for WidgetEvent {
+        fn event_type(&self) -> String {
+            "WidgetEvent::Created".to_string()
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+    #[error("widget error")]
+    struct WidgetError;
+
+    enum WidgetCommand {
+        Create { name: String },
+    }
+
+    #[async_trait]
+    impl EventSourced for Widget {
+        type Id = NumericId;
+        type Event = WidgetEvent;
+        type Command = WidgetCommand;
+        type Error = WidgetError;
+        type Services = ();
+        type Materialized = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "Widget";
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &WidgetEvent) -> Option<Self> {
+            match event {
+                WidgetEvent::Created { name } => Some(Self { name: name.clone() }),
+            }
+        }
+
+        fn evolve(_entity: &Self, _event: &WidgetEvent) -> Result<Option<Self>, WidgetError> {
+            Ok(None)
+        }
+
+        async fn initialize(
+            command: WidgetCommand,
+            _services: &(),
+        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            match command {
+                WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
+            }
+        }
+
+        async fn transition(
+            &self,
+            _command: WidgetCommand,
+            _services: &(),
+        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            Ok(vec![])
+        }
+    }
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_event(pool: &SqlitePool, aggregate_type: &str, aggregate_id: &str) {
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+             event_type, event_version, payload, metadata) \
+             VALUES (?1, ?2, 1, 'WidgetEvent::Created', '1.0', ?3, '{}')",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(r#"{"Created":{"name":"test-widget"}}"#)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_entity_replays_events_into_entity() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<Widget>(pool.clone(), ());
+
+        store
+            .send(
+                &NumericId(42),
+                WidgetCommand::Create {
+                    name: "test-widget".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = load_entity::<Widget>(&pool, &NumericId(42)).await.unwrap();
+
+        let widget = entity.expect("entity should exist after event replay");
+        assert_eq!(widget.name, "test-widget");
+    }
+
+    #[tokio::test]
+    async fn load_entity_returns_none_when_no_events() {
+        let pool = test_pool().await;
+
+        let entity = load_entity::<Widget>(&pool, &NumericId(999)).await.unwrap();
+
+        assert!(entity.is_none(), "expected None for nonexistent aggregate");
+    }
+
+    #[tokio::test]
+    async fn load_all_ids_returns_parsed_ids() {
+        let pool = test_pool().await;
+        insert_event(&pool, "Widget", "10").await;
+        insert_event(&pool, "Widget", "20").await;
+
+        let ids = load_all_ids::<Widget>(&pool).await.unwrap();
+
+        assert_eq!(ids, vec![NumericId(10), NumericId(20)]);
+    }
+
+    #[tokio::test]
+    async fn load_all_ids_returns_empty_when_no_events() {
+        let pool = test_pool().await;
+
+        let ids = load_all_ids::<Widget>(&pool).await.unwrap();
+
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_all_ids_errors_on_unparseable_id() {
+        let pool = test_pool().await;
+        insert_event(&pool, "Widget", "42").await;
+        insert_event(&pool, "Widget", "not-a-number").await;
+
+        let error = load_all_ids::<Widget>(&pool)
+            .await
+            .expect_err("should fail when an ID cannot parse");
+
+        match error {
+            LoadAllIdsError::InvalidIds {
+                aggregate_type,
+                ids,
+            } => {
+                assert_eq!(aggregate_type, "Widget");
+                assert_eq!(ids, vec!["not-a-number"]);
+            }
+            LoadAllIdsError::Sql(sql_error) => {
+                panic!("expected InvalidIds, got Sql: {sql_error}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_all_ids_ignores_other_aggregate_types() {
+        let pool = test_pool().await;
+        insert_event(&pool, "Widget", "1").await;
+        insert_event(&pool, "OtherAggregate", "should-be-excluded").await;
+
+        let ids = load_all_ids::<Widget>(&pool).await.unwrap();
+
+        assert_eq!(ids, vec![NumericId(1)]);
+    }
+}

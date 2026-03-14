@@ -265,15 +265,11 @@ reading `.bacon-locations`. If the file exists and is non-empty, bacon is active
   warnings. Filter out lines containing `lib/` (external submodule warnings we
   don't control). This is faster and always up to date (bacon re-checks on every
   file save). No need to run `cargo check` or `cargo clippy` yourself.
-- **Switch jobs**: Use `bacon --send 'job:clippy'` or
-  `bacon --send 'job:nextest'` to change what bacon is checking.
-- **Wait for completion**: After switching jobs, check if the job is still
-  running with `ps axu | grep <tool>` (e.g., `grep nextest`, `grep cargo`). Only
-  read `.bacon-locations` once the process has exited — reading while the job is
-  still running gives stale results from the previous job.
-- **Escalation chain**: `check-all` -> `nextest` -> `clippy`. Start with
-  `check-all` to catch compilation errors fast, run tests next, then clippy last
-  as a polish step.
+- **Switch jobs**: Use `bacon --send 'job:clippy'` to change what bacon is
+  checking, then read `.bacon-locations` after it updates.
+- **Escalation chain**: `check` -> `nextest` -> `clippy`. Start with `check-all`
+  to catch compilation errors fast, run tests next, then clippy last as a polish
+  step.
 - **Only fall back to manual cargo commands** if `.bacon-locations` doesn't
   exist (bacon not running).
 
@@ -608,20 +604,36 @@ assignments is useless; test actual behavior like
 
 ### Workflow Best Practices
 
-- **Always run verification steps before handing over a piece of work** (skip if
-  only documentation/markdown files were changed). Run them in this order to
-  fail fast:
-  1. `cargo check` - fastest, catches compilation errors first
-  2. `cargo nextest run --workspace` - only run after check passes
-  3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
+- **Incremental verification during development** -- scope checks to the package
+  you're actively working on for fast feedback:
+  1. `cargo check -p <crate>` after every edit -- fast, catches type errors
+  2. `cargo nextest run -p <crate>` after completing a logical unit -- runs that
+     crate's tests only, skips slow e2e and unrelated crates
+  3. `cargo clippy -p <crate>` only after all substantive edits to that crate
+     are done
+  4. Reserve `--workspace` variants for the final verification pass
+- **Final verification before handing over** (skip if only
+  documentation/markdown files were changed). Run full workspace checks in this
+  order to fail fast:
+  1. `cargo check --workspace` - catches compilation errors across all crates
+  2. `cargo nextest run --workspace` - full test suite including e2e
+  3. `cargo clippy --workspace --all-targets --all-features` - full linting
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
+- **CRITICAL: ALL workspace checks must pass before work is considered done.**
+  Do not assume any failure is "pre-existing" -- every warning, error, and test
+  failure must be fixed regardless of origin. CI runs full workspace checks and
+  will block PR merging on any failure.
 - **CRITICAL: Do NOT run clippy until ALL substantive work is done.** Clippy is
   a polish step. Running it while tasks remain open is wasted effort -
   subsequent code changes will introduce new lint issues. Complete every task on
   the list first (`cargo check` + `cargo nextest run` passing), then run clippy
   as a final pass before handing over.
+- **CRITICAL: Do NOT run `cargo nextest run --workspace` repeatedly during
+  development.** The full test suite includes e2e tests that are slow. Use
+  `-p <crate>` for fast feedback during iteration, and only run the full
+  workspace suite as part of the final verification pass.
 
 #### CRITICAL: Quality Control Policy
 
