@@ -4,7 +4,8 @@
 //! domain types that multiple crates need: `Symbol`, `FractionalShares`,
 //! `Usdc`, `Usd`, `Positive`, `HasZero`, and `Id<Tag>`.
 
-use rain_math_float::{Float, FloatError};
+use rain_math_float::Float;
+pub use rain_math_float::error::FloatError;
 use serde::Deserialize;
 use std::fmt::Debug;
 

@@ -66,7 +66,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
     /// Converts USD buying power to USDC in the crypto wallet.
     ///
-    /// Used at the start of AlpacaToBase flow, before withdrawal.
+    /// Used at the start of `AlpacaToBase` flow, before withdrawal.
     /// Places a buy order on USDC/USD and polls until filled.
     ///
     /// Returns the actual filled USDC amount (may differ from requested
@@ -151,7 +151,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
     /// Converts USDC to USD buying power.
     ///
-    /// Used at the end of BaseToAlpaca flow, after deposit is confirmed.
+    /// Used at the end of `BaseToAlpaca` flow, after deposit is confirmed.
     /// Places a sell order on USDC/USD and polls until filled.
     ///
     /// Returns the actual filled USDC amount (the USDC sold, which may
@@ -912,9 +912,9 @@ mod tests {
         Arc::new(test_store(pool, ()))
     }
 
-    /// Advances aggregate through: Initiate -> ConfirmWithdrawal ->
-    /// InitiateBridging -> ReceiveAttestation -> ConfirmBridging ->
-    /// InitiateDeposit -> ConfirmDeposit
+    /// Advances aggregate through: Initiate -> `ConfirmWithdrawal` ->
+    /// `InitiateBridging` -> `ReceiveAttestation` -> `ConfirmBridging` ->
+    /// `InitiateDeposit` -> `ConfirmDeposit`
     async fn advance_to_deposit_confirmed_base_to_alpaca(
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
@@ -1137,7 +1137,7 @@ mod tests {
         })
     }
 
-    /// Creates a mock where filled_qty differs from requested qty to
+    /// Creates a mock where `filled_qty` differs from requested qty to
     /// simulate slippage.
     fn create_get_order_mock_with_slippage<'a>(
         server: &'a MockServer,
@@ -1962,7 +1962,7 @@ mod tests {
         );
     }
 
-    /// AlpacaToBase workflow MUST call USD-to-USDC conversion before
+    /// `AlpacaToBase` workflow MUST call USD-to-USDC conversion before
     /// withdrawal.
     ///
     /// Flow: Convert USD to USDC, then Withdraw, Bridge, Deposit
@@ -2032,7 +2032,7 @@ mod tests {
         );
     }
 
-    /// BaseToAlpaca workflow MUST call USDC-to-USD conversion after
+    /// `BaseToAlpaca` workflow MUST call USDC-to-USD conversion after
     /// deposit is confirmed.
     ///
     /// Flow: Vault Withdraw, CCTP Bridge, Alpaca Deposit, then Convert

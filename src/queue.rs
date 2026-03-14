@@ -5,7 +5,6 @@ use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::num::TryFromIntError;
-use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
@@ -41,6 +40,42 @@ pub(crate) struct QueuedEvent {
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
 }
 
+impl QueuedEvent {
+    /// Constructs a [`QueuedEvent`] from a decoded trade event and its
+    /// log metadata, without writing to the database. Used by the apalis
+    /// event monitor to build job payloads directly.
+    pub(crate) fn from_log(event: TradeEvent, log: &Log) -> Result<Self, EventQueueError> {
+        let tx_hash = log
+            .transaction_hash
+            .ok_or(EventQueueError::MissingLogField("transaction_hash"))?;
+
+        let log_index = log
+            .log_index
+            .ok_or(EventQueueError::MissingLogField("log_index"))?;
+
+        let block_number = log
+            .block_number
+            .ok_or(EventQueueError::MissingLogField("block_number"))?;
+
+        let block_timestamp = log.block_timestamp.and_then(|ts| {
+            let ts_i64 = i64::try_from(ts).ok()?;
+            DateTime::from_timestamp(ts_i64, 0)
+        });
+
+        Ok(Self {
+            id: None,
+            tx_hash,
+            log_index,
+            block_number,
+            event,
+            processed: false,
+            created_at: None,
+            processed_at: None,
+            block_timestamp,
+        })
+    }
+}
+
 /// Event queue persistence and processing errors.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EventQueueError {
@@ -48,8 +83,7 @@ pub(crate) enum EventQueueError {
     Database(#[from] sqlx::Error),
     #[error("Log missing required field: {0}")]
     MissingLogField(&'static str),
-    #[error("Queued event missing ID")]
-    MissingQueuedEventId,
+    #[cfg(test)]
     #[error("Event ID {0} not found in queue")]
     MissingEventId(i64),
     #[error("Integer conversion error: {0}")]
@@ -121,9 +155,7 @@ async fn enqueue_event(
     Ok(())
 }
 
-/// Gets the next unprocessed event from the queue,
-/// ordered by block number then log index.
-#[tracing::instrument(skip(pool), level = tracing::Level::DEBUG)]
+#[cfg(test)]
 pub(crate) async fn get_next_unprocessed_event(
     pool: &SqlitePool,
 ) -> Result<Option<QueuedEvent>, EventQueueError> {
@@ -152,7 +184,7 @@ pub(crate) async fn get_next_unprocessed_event(
         return Ok(None);
     };
 
-    let tx_hash = TxHash::from_str(&row.tx_hash)?;
+    let tx_hash: TxHash = row.tx_hash.parse()?;
 
     let event: TradeEvent = serde_json::from_str(&row.event_data)?;
 
@@ -169,8 +201,7 @@ pub(crate) async fn get_next_unprocessed_event(
     }))
 }
 
-/// Marks an event as processed in the queue
-#[tracing::instrument(skip(pool), fields(event_id), level = tracing::Level::DEBUG)]
+#[cfg(test)]
 pub(crate) async fn mark_event_processed(
     pool: &SqlitePool,
     event_id: i64,
@@ -239,7 +270,7 @@ pub(crate) async fn enqueue_buffer(
         .await;
 }
 
-/// Gets count of unprocessed events in the queue - test utility function
+#[cfg(test)]
 pub(crate) async fn count_unprocessed(pool: &SqlitePool) -> Result<i64, EventQueueError> {
     let row = sqlx::query!("SELECT COUNT(*) as count FROM event_queue WHERE processed = 0")
         .fetch_one(pool)
@@ -508,10 +539,12 @@ mod tests {
         let pool = setup_test_db().await;
 
         sqlx::query(
-            "INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed) \
-            VALUES \
-                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 0), \
-                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 150, '{}', 0)",
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES
+                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 0),
+                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 150, '{}', 0)
+            "
         )
         .execute(&pool)
         .await
@@ -526,11 +559,13 @@ mod tests {
         let pool = setup_test_db().await;
 
         sqlx::query(
-            "INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed) \
-            VALUES \
-                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 1), \
-                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 150, '{}', 1), \
-                ('0x3333333333333333333333333333333333333333333333333333333333333333', 0, 75, '{}', 1)",
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES
+                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 1),
+                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 150, '{}', 1),
+                ('0x3333333333333333333333333333333333333333333333333333333333333333', 0, 75, '{}', 1)
+            "
         )
         .execute(&pool)
         .await
@@ -545,12 +580,14 @@ mod tests {
         let pool = setup_test_db().await;
 
         sqlx::query(
-            "INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed) \
-            VALUES \
-                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 1), \
-                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 150, '{}', 1), \
-                ('0x3333333333333333333333333333333333333333333333333333333333333333', 0, 200, '{}', 0), \
-                ('0x4444444444444444444444444444444444444444444444444444444444444444', 0, 175, '{}', 0)",
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES
+                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 100, '{}', 1),
+                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 150, '{}', 1),
+                ('0x3333333333333333333333333333333333333333333333333333333333333333', 0, 200, '{}', 0),
+                ('0x4444444444444444444444444444444444444444444444444444444444444444', 0, 175, '{}', 0)
+            "
         )
         .execute(&pool)
         .await
@@ -565,10 +602,12 @@ mod tests {
         let pool = setup_test_db().await;
 
         sqlx::query(
-            "INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed) \
-            VALUES \
-                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 0, '{}', 1), \
-                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 50, '{}', 0)",
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES
+                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, 0, '{}', 1),
+                ('0x2222222222222222222222222222222222222222222222222222222222222222', 0, 50, '{}', 0)
+            "
         )
         .execute(&pool)
         .await
@@ -585,9 +624,11 @@ mod tests {
         let large_block: i64 = 999_999_999;
 
         sqlx::query(
-            "INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed) \
-            VALUES \
-                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, ?1, '{}', 1)",
+            r"
+            INSERT INTO event_queue (tx_hash, log_index, block_number, event_data, processed)
+            VALUES
+                ('0x1111111111111111111111111111111111111111111111111111111111111111', 0, ?1, '{}', 1)
+            ",
         )
         .bind(large_block)
         .execute(&pool)

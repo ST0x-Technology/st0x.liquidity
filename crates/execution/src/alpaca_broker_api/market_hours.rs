@@ -7,8 +7,8 @@ use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
 
 /// Response from the calendar endpoint for regular market hours.
-/// We use regular hours (open/close) because Alpaca only allows extended_hours
-/// with limit orders, not market orders.
+/// We use regular hours (`open`/`close`) because Alpaca only allows
+/// `extended_hours` with limit orders, not market orders.
 #[derive(Debug, Clone, Deserialize)]
 struct CalendarDay {
     #[serde(deserialize_with = "deserialize_time")]

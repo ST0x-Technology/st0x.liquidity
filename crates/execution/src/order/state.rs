@@ -61,6 +61,7 @@ impl PartialEq for OrderState {
 impl Eq for OrderState {}
 
 impl OrderState {
+    #[must_use]
     pub const fn status(&self) -> OrderStatus {
         match self {
             Self::Pending => OrderStatus::Pending,
