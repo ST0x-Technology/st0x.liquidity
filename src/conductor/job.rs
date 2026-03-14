@@ -6,11 +6,12 @@
 //! it and calls [`Job::execute`] with the shared context.
 
 use apalis::prelude::Data;
+use backon::{ExponentialBuilder, Retryable};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// A persistent, retryable unit of work backed by apalis storage.
 ///
@@ -51,11 +52,15 @@ where
 
     debug!(%label, "Processing job");
 
-    // Errors are logged but not propagated -- apalis sees Ok(()) and
-    // will not retry the job. Jobs handle their own retry/recovery
-    // logic inside execute().
-    if let Err(error) = job.execute(&ctx).await {
-        error!(%label, %error, "Job failed");
+    let result = (|| job.execute(&ctx))
+        .retry(ExponentialBuilder::default().with_max_times(3))
+        .notify(|error, duration| {
+            warn!(%label, %error, ?duration, "Retrying job after transient failure");
+        })
+        .await;
+
+    if let Err(error) = result {
+        error!(%label, %error, "Job failed after retries");
     }
 }
 
