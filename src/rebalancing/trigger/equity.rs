@@ -96,7 +96,7 @@ impl Drop for InProgressGuard {
 /// or `Redemption` if there's too much onchain equity that needs to be redeemed.
 ///
 /// The onchain (wrapped) amounts are converted to unwrapped-equivalent using
-/// the vault_ratio for accurate imbalance detection.
+/// the `vault_ratio` for accurate imbalance detection.
 pub(super) async fn check_imbalance_and_build_operation(
     symbol: &Symbol,
     threshold: &ImbalanceThreshold,

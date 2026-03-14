@@ -38,10 +38,22 @@ impl SchwabCtx {
         }
     }
 
+    /// Returns the Schwab OAuth authorization URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchwabError`](super::SchwabError) if URL construction
+    /// fails.
     pub fn get_auth_url(&self) -> Result<String, super::SchwabError> {
         self.to_auth_ctx().get_auth_url()
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchwabError`](super::SchwabError) if the token
+    /// exchange request fails.
     pub async fn get_tokens_from_code(
         &self,
         code: &str,
@@ -49,6 +61,12 @@ impl SchwabCtx {
         self.to_auth_ctx().get_tokens_from_code(code).await
     }
 
+    /// Returns a valid access token, refreshing if expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchwabError`](super::SchwabError) if token loading,
+    /// refresh, or storage fails.
     pub async fn get_valid_access_token(&self) -> Result<String, super::SchwabError> {
         SchwabTokens::get_valid_access_token(&self.pool, &self.to_auth_ctx()).await
     }

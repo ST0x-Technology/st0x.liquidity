@@ -33,6 +33,7 @@ use st0x_execution::alpaca_broker_api::{
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
 };
+use st0x_finance::{Positive, Usd};
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
 use st0x_hedge::config::{BrokerCtx, Ctx};
@@ -203,6 +204,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
             vault_id: Some(cash_vault_id),
             rebalancing: cash_rebalancing,
             operational_limit: None,
+            reserved: None,
         }),
     };
 
@@ -229,6 +231,7 @@ pub(crate) fn build_usdc_rebalancing_ctx<BP>(
     equity_tokens: &[(String, Address, Address)],
     usdc_vault_id: B256,
     cctp: CctpOverrides,
+    reserved: Option<Positive<Usd>>,
 ) -> anyhow::Result<Ctx>
 where
     BP: Provider + Clone,
@@ -298,6 +301,7 @@ where
                 vault_id: Some(usdc_vault_id),
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
+                reserved,
             }),
         })
         .inventory_poll_interval(15)

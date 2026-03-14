@@ -126,6 +126,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
                 vault_id: Some(cash_vault_id),
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
+                reserved: None,
             }),
         })
         .inventory_poll_interval(15)

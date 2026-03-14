@@ -58,7 +58,7 @@ pub(crate) struct RebalancerServices<Chain: Wallet> {
 impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// Creates the services needed for rebalancing.
     ///
-    /// RaindexService is passed in rather than created here because it is
+    /// `RaindexService` is passed in rather than created here because it is
     /// needed for CQRS framework initialization in the conductor, which
     /// must happen before this constructor is called.
     pub(crate) async fn new(
