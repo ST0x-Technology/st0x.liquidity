@@ -11,6 +11,26 @@ use super::venue_balance::{InventoryError, VenueBalance};
 use crate::threshold::Usdc;
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
+/// Locations where cash (USDC) can sit between primary venues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum InFlightCashLocation {
+    /// USDC on Ethereum mainnet during cross-chain bridging.
+    Ethereum,
+    /// USDC in the wallet on Base (not yet deposited into Raindex vault).
+    BaseWallet,
+    /// USDC in Alpaca's crypto wallet (pending conversion to USD).
+    AlpacaCryptoWallet,
+}
+
+/// Locations where equity tokens can sit between primary venues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum InFlightEquityLocation {
+    /// Unwrapped equity tokens on Base (not yet wrapped or deposited).
+    BaseUnwrapped,
+    /// Wrapped equity tokens on Base (not yet deposited into Raindex).
+    BaseWrapped,
+}
+
 /// Error type for inventory view operations.
 #[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum InventoryViewError {
@@ -493,6 +513,10 @@ where
 pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
+    #[serde(default)]
+    inflight_cash: HashMap<InFlightCashLocation, Usdc>,
+    #[serde(default)]
+    inflight_equity: HashMap<(Symbol, InFlightEquityLocation), FractionalShares>,
     last_updated: DateTime<Utc>,
 }
 
@@ -541,12 +565,72 @@ impl Default for InventoryView {
         Self {
             usdc: Inventory::default(),
             equities: HashMap::new(),
+            inflight_cash: HashMap::new(),
+            inflight_equity: HashMap::new(),
             last_updated: Utc::now(),
         }
     }
 }
 
 impl InventoryView {
+    /// Updates the balance at an in-flight cash location.
+    pub(crate) fn update_inflight_cash(
+        self,
+        location: InFlightCashLocation,
+        balance: Usdc,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut inflight_cash = self.inflight_cash;
+        inflight_cash.insert(location, balance);
+
+        Self {
+            inflight_cash,
+            last_updated: now,
+            ..self
+        }
+    }
+
+    /// Updates the balance at an in-flight equity location.
+    pub(crate) fn update_inflight_equity(
+        self,
+        symbol: Symbol,
+        location: InFlightEquityLocation,
+        balance: FractionalShares,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut inflight_equity = self.inflight_equity;
+        inflight_equity.insert((symbol, location), balance);
+
+        Self {
+            inflight_equity,
+            last_updated: now,
+            ..self
+        }
+    }
+
+    /// Returns the total in-flight cash across all locations.
+    pub(crate) fn total_inflight_cash(&self) -> Usdc {
+        self.inflight_cash
+            .values()
+            .copied()
+            .fold(Usdc(Decimal::ZERO), |acc, usdc| {
+                // In-flight balances are polled reality — addition cannot
+                // overflow in any realistic scenario.
+                (acc + usdc).unwrap_or(acc)
+            })
+    }
+
+    /// Returns the total in-flight equity for a symbol across all locations.
+    pub(crate) fn total_inflight_equity_for_symbol(&self, symbol: &Symbol) -> FractionalShares {
+        self.inflight_equity
+            .iter()
+            .filter(|((sym, _), _)| sym == symbol)
+            .map(|(_, balance)| *balance)
+            .fold(FractionalShares::ZERO, |acc, shares| {
+                (acc + shares).unwrap_or(acc)
+            })
+    }
+
     /// Registers a symbol with specified available balances (zero inflight).
     #[cfg(test)]
     pub(crate) fn with_equity(
@@ -610,7 +694,7 @@ impl InventoryView {
         Ok(Self {
             equities,
             last_updated: now,
-            usdc: self.usdc,
+            ..self
         })
     }
 
@@ -624,7 +708,7 @@ impl InventoryView {
         Ok(Self {
             usdc: updated,
             last_updated: now,
-            equities: self.equities,
+            ..self
         })
     }
 }
@@ -873,6 +957,8 @@ mod tests {
         InventoryView {
             usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: equities.into_iter().collect(),
+            inflight_cash: HashMap::new(),
+            inflight_equity: HashMap::new(),
             last_updated: Utc::now(),
         }
     }
@@ -891,6 +977,8 @@ mod tests {
                 offchain_inflight,
             ),
             equities: HashMap::new(),
+            inflight_cash: HashMap::new(),
+            inflight_equity: HashMap::new(),
             last_updated: Utc::now(),
         }
     }

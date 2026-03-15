@@ -734,6 +734,75 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// In-flight USDC at the Ethereum wallet should dilute the imbalance ratio,
+/// preventing a false BaseToAlpaca trigger.
+///
+/// Without in-flight tracking: ratio = 800k / (800k + 100k) = 0.889 > 0.6
+/// → triggers BaseToAlpaca. With in-flight tracking: ratio = 800k /
+/// (800k + 100k + 1M) = 0.421, within [0.4, 0.6] → no trigger.
+///
+/// The CctpInfra pre-funds the bot's Ethereum wallet with 1M USDC. The
+/// Raindex vault is pre-funded with 800k USDC. The broker mock starts with
+/// 100k offchain cash. With in-flight tracking correctly diluting the
+/// denominator, the system should NOT trigger USDC rebalancing.
+///
+/// Currently fails because InventoryView ignores EthereumCash events,
+/// computing ratio = 0.889 and triggering BaseToAlpaca.
+#[test_log::test(tokio::test)]
+async fn inflight_usdc_prevents_false_rebalancing_trigger() -> anyhow::Result<()> {
+    let broker_fill_price = dec!(150.00);
+
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let cctp = CctpInfra::start(&infra).await?;
+
+    // 800k onchain USDC: without in-flight tracking, ratio = 800/900 = 0.889
+    // triggers BaseToAlpaca. With 1M Ethereum in-flight, ratio = 800/1900 = 0.421.
+    let usdc_amount: U256 = parse_units("800000", 6)?.into();
+    let usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_usdc_rebalancing_ctx()
+        .base_chain(&infra.base_chain)
+        .ethereum_endpoint(&cctp.ethereum_endpoint)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .usdc_vault_id(usdc_vault_id)
+        .cctp(cctp.cctp_overrides())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    // Wait for at least 2 polling cycles (interval = 15s) to ensure
+    // inventory snapshots are processed. Poll for EthereumCash events
+    // to confirm the Ethereum wallet poller ran.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "InventorySnapshotEvent::EthereumCash",
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Also wait for venue snapshots to ensure the trigger had a chance to fire.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "InventorySnapshotEvent::OnchainCash",
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // With in-flight USDC correctly tracked, the ratio should be within
+    // bounds and no USDC rebalancing should trigger.
+    assert_no_usdc_rebalancing_events(&infra.db_path).await?;
+
+    bot.abort();
+    Ok(())
+}
+
 /// USDC rebalancing from Base (onchain) to Alpaca (offchain).
 ///
 /// SellEquity trades cause the bot to receive USDC onchain (from selling
