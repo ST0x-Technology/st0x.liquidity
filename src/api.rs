@@ -1,14 +1,14 @@
 //! HTTP API endpoints for health checks and broker authentication.
 
+use axum::extract::State;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use rocket::serde::json::Json;
-use rocket::serde::{Deserialize, Serialize};
-use rocket::{Route, State, get, post, routes};
-use sqlx::SqlitePool;
+use serde::{Deserialize, Serialize};
 
 use st0x_execution::extract_code_from_url;
 
-use crate::config::{BrokerCtx, Ctx};
+use crate::config::BrokerCtx;
 
 #[derive(Serialize, Deserialize)]
 struct HealthResponse {
@@ -16,8 +16,7 @@ struct HealthResponse {
     timestamp: DateTime<Utc>,
 }
 
-#[get("/health")]
-fn health() -> Json<HealthResponse> {
+async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "healthy".to_string(),
         timestamp: Utc::now(),
@@ -38,13 +37,11 @@ enum AuthRefreshResponse {
     Error { error: String },
 }
 
-#[post("/auth/refresh", format = "json", data = "<request>")]
 async fn auth_refresh(
-    request: Json<AuthRefreshRequest>,
-    pool: &State<SqlitePool>,
-    ctx: &State<Ctx>,
+    State(state): State<super::AppState>,
+    Json(request): Json<AuthRefreshRequest>,
 ) -> Json<AuthRefreshResponse> {
-    let BrokerCtx::Schwab(schwab_auth) = &ctx.broker else {
+    let BrokerCtx::Schwab(schwab_auth) = &state.ctx.broker else {
         return Json(AuthRefreshResponse::Error {
             error: "Auth refresh is only supported for Schwab broker".to_string(),
         });
@@ -59,7 +56,7 @@ async fn auth_refresh(
         }
     };
 
-    let schwab_ctx = schwab_auth.to_schwab_ctx(pool.inner().clone());
+    let schwab_ctx = schwab_auth.to_schwab_ctx(state.pool.clone());
     let tokens = match schwab_ctx.get_tokens_from_code(&code).await {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -69,10 +66,7 @@ async fn auth_refresh(
         }
     };
 
-    if let Err(error) = tokens
-        .store(pool.inner(), &schwab_auth.encryption_key)
-        .await
-    {
+    if let Err(error) = tokens.store(&state.pool, &schwab_auth.encryption_key).await {
         return Json(AuthRefreshResponse::Error {
             error: format!("Failed to store tokens: {error}"),
         });
@@ -83,22 +77,29 @@ async fn auth_refresh(
     })
 }
 
-pub(crate) fn routes() -> Vec<Route> {
-    routes![health, auth_refresh]
+pub(crate) fn routes() -> Router<super::AppState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/auth/refresh", post(auth_refresh))
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{FixedBytes, address};
+    use axum::body::{self, Body};
+    use axum::http::{Request, StatusCode};
     use httpmock::MockServer;
-    use rocket::http::{ContentType, Status};
-    use rocket::local::asynchronous::Client;
     use serde_json::json;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+    use tower::ServiceExt;
     use url::Url;
 
     use super::*;
     use crate::config::SchwabAuth;
     use crate::config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, TradingMode};
+    use crate::inventory;
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -139,25 +140,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_num_of_routes() {
-        let routes_list = routes();
-        assert_eq!(routes_list.len(), 2);
+    fn create_test_app(pool: SqlitePool, ctx: Ctx) -> Router {
+        let (sender, _) = broadcast::channel(256);
+        let state = super::super::AppState {
+            pool,
+            ctx,
+            event_sender: sender,
+            inventory: Arc::new(inventory::BroadcastingInventory::new(
+                inventory::InventoryView::default(),
+            )),
+        };
+
+        routes().with_state(state)
+    }
+
+    fn json_request(method: &str, uri: &str, body: String) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
     }
 
     #[tokio::test]
     async fn test_health_endpoint() {
-        let rocket = rocket::build().mount("/", routes![health]);
-        let client = Client::tracked(rocket)
+        let pool = setup_test_db().await;
+        let server = MockServer::start();
+        let ctx = create_test_ctx_with_mock_server(&server);
+        let app = create_test_app(pool, ctx);
+
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("valid rocket instance");
-
-        let response = client.get("/health").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+            .unwrap();
         let health_response: HealthResponse =
-            serde_json::from_str(&body).expect("valid JSON response");
+            serde_json::from_slice(&body).expect("valid JSON response");
 
         assert_eq!(health_response.status, "healthy");
         assert!(health_response.timestamp <= chrono::Utc::now());
@@ -181,30 +206,28 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let rocket = rocket::build()
-            .mount("/", routes![auth_refresh])
-            .manage(pool)
-            .manage(ctx);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let app = create_test_app(pool, ctx);
 
         let request_body = json!({
             "redirect_url": "https://127.0.0.1/?code=test_auth_code&state=xyz"
         });
 
-        let response = client
-            .post("/auth/refresh")
-            .header(ContentType::JSON)
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/auth/refresh",
+                request_body.to_string(),
+            ))
+            .await
+            .unwrap();
 
-        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.into_string().await.expect("response body");
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let auth_response: AuthRefreshResponse =
-            serde_json::from_str(&body).expect("valid JSON response");
+            serde_json::from_slice(&body).expect("valid JSON response");
 
         match auth_response {
             AuthRefreshResponse::Success { message } => {
@@ -223,31 +246,28 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
-
-        let rocket = rocket::build()
-            .mount("/", routes![auth_refresh])
-            .manage(pool)
-            .manage(ctx);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let app = create_test_app(pool, ctx);
 
         let request_body = json!({
             "redirect_url": "invalid_url"
         });
 
-        let response = client
-            .post("/auth/refresh")
-            .header(ContentType::JSON)
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/auth/refresh",
+                request_body.to_string(),
+            ))
+            .await
+            .unwrap();
 
-        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.into_string().await.expect("response body");
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let auth_response: AuthRefreshResponse =
-            serde_json::from_str(&body).expect("valid JSON response");
+            serde_json::from_slice(&body).expect("valid JSON response");
 
         match auth_response {
             AuthRefreshResponse::Error { error } => {
@@ -264,31 +284,28 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
-
-        let rocket = rocket::build()
-            .mount("/", routes![auth_refresh])
-            .manage(pool)
-            .manage(ctx);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let app = create_test_app(pool, ctx);
 
         let request_body = json!({
             "redirect_url": "https://127.0.0.1/?state=xyz&other=param"
         });
 
-        let response = client
-            .post("/auth/refresh")
-            .header(ContentType::JSON)
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/auth/refresh",
+                request_body.to_string(),
+            ))
+            .await
+            .unwrap();
 
-        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.into_string().await.expect("response body");
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let auth_response: AuthRefreshResponse =
-            serde_json::from_str(&body).expect("valid JSON response");
+            serde_json::from_slice(&body).expect("valid JSON response");
 
         match auth_response {
             AuthRefreshResponse::Error { error } => {
@@ -314,30 +331,28 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let rocket = rocket::build()
-            .mount("/", routes![auth_refresh])
-            .manage(pool)
-            .manage(ctx);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let app = create_test_app(pool, ctx);
 
         let request_body = json!({
             "redirect_url": "https://127.0.0.1/?code=invalid_code&state=xyz"
         });
 
-        let response = client
-            .post("/auth/refresh")
-            .header(ContentType::JSON)
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/auth/refresh",
+                request_body.to_string(),
+            ))
+            .await
+            .unwrap();
 
-        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.into_string().await.expect("response body");
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let auth_response: AuthRefreshResponse =
-            serde_json::from_str(&body).expect("valid JSON response");
+            serde_json::from_slice(&body).expect("valid JSON response");
 
         match auth_response {
             AuthRefreshResponse::Error { error } => {
@@ -356,24 +371,15 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
+        let app = create_test_app(pool, ctx);
 
-        let rocket = rocket::build()
-            .mount("/", routes![auth_refresh])
-            .manage(pool)
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let response = app
+            .oneshot(json_request("POST", "/auth/refresh", "invalid json".into()))
             .await
-            .expect("valid rocket instance");
+            .unwrap();
 
-        let response = client
-            .post("/auth/refresh")
-            .header(ContentType::JSON)
-            .body("invalid json")
-            .dispatch()
-            .await;
-
-        // Rocket should return 400 for invalid JSON deserialization
-        assert_eq!(response.status(), Status::BadRequest);
+        // Axum returns 400 for invalid JSON syntax
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -381,27 +387,22 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx_with_mock_server(&server);
         let pool = setup_test_db().await;
-
-        let rocket = rocket::build()
-            .mount("/", routes![auth_refresh])
-            .manage(pool)
-            .manage(ctx);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let app = create_test_app(pool, ctx);
 
         let request_body = json!({
             "wrong_field": "https://127.0.0.1/?code=test_code"
         });
 
-        let response = client
-            .post("/auth/refresh")
-            .header(ContentType::JSON)
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/auth/refresh",
+                request_body.to_string(),
+            ))
+            .await
+            .unwrap();
 
-        // Rocket should return 422 for missing required field
-        assert_eq!(response.status(), Status::UnprocessableEntity);
+        // Axum returns 422 for valid JSON that fails deserialization
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

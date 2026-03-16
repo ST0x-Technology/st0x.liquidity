@@ -30,7 +30,7 @@ pub fn init_tracing() {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             "warn,st0x_hedge=trace,st0x_execution=debug,st0x_dto=debug,\
              st0x_event_sorcery=debug,st0x_evm=debug,st0x_finance=debug,\
-             st0x_bridge=debug,e2e=debug,rocket=off,hyper=off,\
+             st0x_bridge=debug,e2e=debug,hyper=off,\
              tungstenite=off,tokio_tungstenite=off,reqwest=off"
                 .into()
         });

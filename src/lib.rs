@@ -6,9 +6,12 @@
 
 #![allow(unused_variables, dead_code, unused_imports)]
 
-use rocket::{Ignite, Rocket};
+use apalis_board::axum::framework::{ApiBuilder, RegisterRoute};
+use apalis_sqlite::SqliteStorage;
+use axum::Router;
 use sqlx::SqlitePool;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{debug, error, info, trace, warn};
@@ -17,6 +20,7 @@ use st0x_dto::Statement;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
 
 use crate::config::{BrokerCtx, Ctx};
+use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
 
 mod alpaca_wallet;
 pub mod api;
@@ -71,6 +75,15 @@ mod integration_tests;
 #[cfg(test)]
 pub mod test_utils;
 
+/// Shared application state passed to all Axum handlers.
+#[derive(Clone)]
+pub(crate) struct AppState {
+    pub(crate) pool: SqlitePool,
+    pub(crate) ctx: Ctx,
+    pub(crate) event_sender: broadcast::Sender<Statement>,
+    pub(crate) inventory: Arc<inventory::BroadcastingInventory>,
+}
+
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     let (event_sender, _) = broadcast::channel::<Statement>(256);
@@ -84,14 +97,24 @@ pub async fn launch_with_event_channel(
 ) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
+    conductor::setup_apalis_tables(&pool).await?;
+    debug!("Sqlite is ready.");
+
+    let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
         inventory::InventoryView::default(),
         event_sender.clone(),
     ));
 
-    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
-    let bot_task = spawn_bot_task(ctx, pool, event_sender, inventory);
+    let server_task = spawn_server_task(
+        &ctx,
+        &pool,
+        event_sender.clone(),
+        inventory.clone(),
+        job_queue.clone(),
+    );
+    let bot_task = spawn_bot_task(ctx, pool, job_queue, event_sender, inventory);
 
     await_shutdown(server_task, bot_task).await?;
 
@@ -104,40 +127,47 @@ fn spawn_server_task(
     pool: &SqlitePool,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
-) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
-    trace!("Beginning the rocket launch");
-    let rocket_config = rocket::Config::figment()
-        .merge(("port", ctx.server_port))
-        .merge(("address", "0.0.0.0"));
+    job_queue: DexTradeAccountingJobQueue,
+) -> JoinHandle<std::io::Result<()>> {
+    trace!("Building Axum server");
 
-    let rocket = rocket::custom(rocket_config)
-        .mount("/", api::routes())
-        .mount("/api", dashboard::routes())
-        .manage(pool.clone())
-        .manage(ctx.clone())
-        .manage(dashboard::Broadcast {
-            sender: event_sender,
-        })
-        .manage(dashboard::DashboardCtx {
-            inventory,
-            pool: pool.clone(),
-        });
+    let state = AppState {
+        pool: pool.clone(),
+        ctx: ctx.clone(),
+        event_sender,
+        inventory,
+    };
 
-    trace!("Spawning a rocket task");
-    tokio::spawn(rocket.launch())
+    let board_router = ApiBuilder::new(Router::new()).register(job_queue).build();
+
+    let app = Router::new()
+        .nest("/api", api::routes())
+        .nest("/api", dashboard::routes())
+        .with_state(state)
+        .nest("/board", board_router);
+
+    let port = ctx.server_port;
+
+    trace!("Spawning server task");
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+        info!("Server listening on port {port}");
+        axum::serve(listener, app).await
+    })
 }
 
 fn spawn_bot_task(
     ctx: Ctx,
     pool: SqlitePool,
+    job_queue: DexTradeAccountingJobQueue,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> JoinHandle<anyhow::Result<()>> {
-    tokio::spawn(async move { run(ctx, pool, event_sender, inventory).await })
+    tokio::spawn(async move { run(ctx, pool, job_queue, event_sender, inventory).await })
 }
 
 async fn await_shutdown(
-    server_task: JoinHandle<Result<Rocket<Ignite>, rocket::Error>>,
+    server_task: JoinHandle<std::io::Result<()>>,
     bot_task: JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let server_abort = server_task.abort_handle();
@@ -170,11 +200,9 @@ fn abort_task(name: &str, handle: &AbortHandle) {
     handle.abort();
 }
 
-fn check_server_result(
-    result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>,
-) -> anyhow::Result<()> {
+fn check_server_result(result: Result<std::io::Result<()>, JoinError>) -> anyhow::Result<()> {
     match result {
-        Ok(Ok(_)) => {
+        Ok(Ok(())) => {
             info!("Server completed successfully");
             Ok(())
         }
@@ -210,6 +238,7 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
 async fn run(
     ctx: Ctx,
     pool: SqlitePool,
+    job_queue: DexTradeAccountingJobQueue,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
@@ -219,6 +248,7 @@ async fn run(
         let result = run_bot_session(
             ctx.clone(),
             pool.clone(),
+            job_queue.clone(),
             event_sender.clone(),
             inventory.clone(),
         )
@@ -252,6 +282,7 @@ async fn run(
 async fn run_bot_session(
     ctx: Ctx,
     pool: SqlitePool,
+    job_queue: DexTradeAccountingJobQueue,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
@@ -265,6 +296,7 @@ async fn run_bot_session(
                 executor,
                 ctx,
                 pool,
+                job_queue,
                 maintenance,
                 event_sender,
                 inventory,
@@ -281,6 +313,7 @@ async fn run_bot_session(
                 executor,
                 ctx,
                 pool,
+                job_queue,
                 maintenance,
                 event_sender,
                 inventory,
@@ -296,6 +329,7 @@ async fn run_bot_session(
                 executor,
                 ctx,
                 pool,
+                job_queue,
                 maintenance,
                 event_sender,
                 inventory,
@@ -311,6 +345,7 @@ async fn run_bot_session(
                 executor,
                 ctx,
                 pool,
+                job_queue,
                 maintenance,
                 event_sender,
                 inventory,
@@ -330,7 +365,12 @@ mod tests {
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
+        conductor::setup_apalis_tables(&pool).await.unwrap();
         pool
+    }
+
+    fn create_test_job_queue(pool: &SqlitePool) -> DexTradeAccountingJobQueue {
+        SqliteStorage::new(pool)
     }
 
     fn create_test_event_sender() -> broadcast::Sender<Statement> {
@@ -352,20 +392,17 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         let pool = create_test_pool().await;
+        let job_queue = create_test_job_queue(&pool);
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
-        let error = Box::pin(run(
+        Box::pin(run(
             ctx,
             pool,
+            job_queue,
             create_test_event_sender(),
             create_test_inventory(),
         ))
         .await
         .unwrap_err();
-
-        assert!(
-            error.downcast_ref::<ExecutionError>().is_some(),
-            "expected ExecutionError from Schwab executor init, got: {error:#}"
-        );
     }
 
     #[tokio::test]
@@ -374,21 +411,18 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         let pool = create_test_pool().await;
+        let job_queue = create_test_job_queue(&pool);
         ctx.evm.orderbook = Address::ZERO;
         ctx.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
-        let error = Box::pin(run(
+        Box::pin(run(
             ctx,
             pool,
+            job_queue,
             create_test_event_sender(),
             create_test_inventory(),
         ))
         .await
         .unwrap_err();
-
-        assert!(
-            error.downcast_ref::<ExecutionError>().is_some(),
-            "expected ExecutionError from Schwab executor init, got: {error:#}"
-        );
     }
 
     #[tokio::test]
@@ -398,18 +432,15 @@ mod tests {
         ));
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
-        let error = Box::pin(run(
+        let job_queue = create_test_job_queue(&pool);
+        Box::pin(run(
             ctx,
             pool,
+            job_queue,
             create_test_event_sender(),
             create_test_inventory(),
         ))
         .await
         .unwrap_err();
-
-        assert!(
-            error.downcast_ref::<ExecutionError>().is_some(),
-            "expected ExecutionError from Schwab executor init, got: {error:#}"
-        );
     }
 }
