@@ -157,7 +157,7 @@ impl TelemetryCtx {
             .with_tracer(tracer)
             .with_level(true);
 
-        let default_filter = format!("st0x_hedge={log_level},st0x_execution={log_level}");
+        let default_filter = get_default_filter(log_level);
 
         let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| default_filter.clone().into());
@@ -224,6 +224,18 @@ impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
     }
 }
 
+pub fn setup_tracing(log_level: &crate::config::LogLevel) {
+    let level: tracing::Level = log_level.into();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| get_default_filter(level).into()),
+        )
+        .compact()
+        .init();
+}
+
 /// Instrumentation library name used to identify the source of traces in the
 /// OpenTelemetry system. This appears in telemetry backends as the library
 /// that generated the spans.
@@ -252,19 +264,10 @@ const CRATES: [&str; 6] = [
     "evm",
 ];
 
-pub fn setup_tracing(log_level: &crate::config::LogLevel) {
-    let level: tracing::Level = log_level.into();
-
-    let fallback_filter = CRATES
+fn get_default_filter(level: tracing::Level) -> String {
+    CRATES
         .iter()
-        .map(|pkg| format!("st0x_{pkg}={level}"))
-        .join(",");
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| fallback_filter.into()),
-        )
-        .compact()
-        .init();
+        .map(|pkg| format!("st0x-{pkg}={level}"))
+        .map(|pkg| pkg.replace('-', "_"))
+        .join(",")
 }
