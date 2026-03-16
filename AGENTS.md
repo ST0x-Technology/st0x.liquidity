@@ -257,28 +257,6 @@ resolution and feature selection.
   linting
 - `cargo fmt` - Format code
 
-### Bacon (Background Checker)
-
-**Before running `cargo check` or `cargo clippy`, check if bacon is running** by
-reading `.bacon-locations`. If the file exists and is non-empty, bacon is active
--- prefer it over manual cargo commands:
-
-- **Read errors/warnings**: Read `.bacon-locations` for current errors and
-  warnings. Filter out lines containing `lib/` (external submodule warnings we
-  don't control). This is faster and always up to date (bacon re-checks on every
-  file save). No need to run `cargo check` or `cargo clippy` yourself.
-- **Switch jobs**: Use `bacon --send 'job:clippy'` to switch bacon's active job,
-  then read `.bacon-locations` after it updates. Only switch to clippy as a
-  final polish step after all substantive work is done.
-- **Escalation chain**: `check` -> `nextest` -> `clippy`. Use `check-all` and
-  `nextest` as iteration defaults during development. Run `clippy` only as the
-  last step before merging -- it's a polish pass, not an iteration tool.
-- **Only fall back to manual cargo commands** if `.bacon-locations` doesn't
-  exist (bacon not running).
-
-Jobs are scoped to workspace crates only (excludes vendored `lib/` submodules).
-Configuration is in `bacon.toml`.
-
 ### Nix Development Environment
 
 - `nix develop` - Enter development shell with all dependencies
@@ -287,28 +265,23 @@ Configuration is in `bacon.toml`.
 
 ### Configuration Files
 
-| File                    | Purpose                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------- |
-| `Cargo.toml`            | Workspace definition, `[workspace.lints.clippy]` lint config, shared dependencies   |
-| `clippy.toml`           | Clippy behavior settings (thresholds, disallowed methods, test permissions)         |
-| `bacon.toml`            | Bacon background checker jobs and lint allow-lists (keep in sync with `Cargo.toml`) |
-| `flake.nix`             | Nix flake: dev shell, NixOS deployment, helper scripts                              |
-| `rust.nix`              | Rust toolchain and cargo/clippy nix config                                          |
-| `os.nix`                | NixOS server configuration for deployment                                           |
-| `services.nix`          | Systemd service definitions for the deployed server                                 |
-| `deploy.nix`            | Deployment targets and settings                                                     |
-| `disko.nix`             | Disk partitioning for server                                                        |
-| `infra/default.nix`     | Infrastructure module aggregator                                                    |
-| `infra/secrets.nix`     | Agenix secret declarations (paths, not values)                                      |
-| `dashboard/default.nix` | Dashboard build derivation                                                          |
-| `dashboard/bun.nix`     | Bun runtime nix packaging for dashboard                                             |
-| `e2e/config.toml`       | End-to-end test configuration                                                       |
-| `.config/nextest.toml`  | Nextest runner configuration                                                        |
-| `crates/*/Cargo.toml`   | Per-crate dependencies and `[lints] workspace = true`                               |
-
-**Sync requirements:** `Cargo.toml` `[workspace.lints.clippy]` and `bacon.toml`
-clippy job `-A` flags must stay in sync. When allowing/denying a lint, update
-both files.
+| File                    | Purpose                                                                           |
+| ----------------------- | --------------------------------------------------------------------------------- |
+| `Cargo.toml`            | Workspace definition, `[workspace.lints.clippy]` lint config, shared dependencies |
+| `clippy.toml`           | Clippy behavior settings (thresholds, disallowed methods, test permissions)       |
+| `flake.nix`             | Nix flake: dev shell, NixOS deployment, helper scripts                            |
+| `rust.nix`              | Rust toolchain and cargo/clippy nix config                                        |
+| `os.nix`                | NixOS server configuration for deployment                                         |
+| `services.nix`          | Systemd service definitions for the deployed server                               |
+| `deploy.nix`            | Deployment targets and settings                                                   |
+| `disko.nix`             | Disk partitioning for server                                                      |
+| `infra/default.nix`     | Infrastructure module aggregator                                                  |
+| `infra/secrets.nix`     | Agenix secret declarations (paths, not values)                                    |
+| `dashboard/default.nix` | Dashboard build derivation                                                        |
+| `dashboard/bun.nix`     | Bun runtime nix packaging for dashboard                                           |
+| `e2e/config.toml`       | End-to-end test configuration                                                     |
+| `.config/nextest.toml`  | Nextest runner configuration                                                      |
+| `crates/*/Cargo.toml`   | Per-crate dependencies and `[lints] workspace = true`                             |
 
 ## Development Workflow Notes
 

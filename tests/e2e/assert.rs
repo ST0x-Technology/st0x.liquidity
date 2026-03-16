@@ -719,17 +719,9 @@ macro_rules! assert_decimal_eq {
             Ok(sub) => sub,
             Err(error) => panic!("Float subtraction failed: {error:?}"),
         };
-        let zero = match rain_math_float::Float::zero() {
-            Ok(z) => z,
-            Err(error) => panic!("Float::zero() failed: {error:?}"),
-        };
-        let abs_diff = if diff.lt(zero).unwrap_or(false) {
-            match (zero - diff) {
-                Ok(neg) => neg,
-                Err(error) => panic!("Float negation failed: {error:?}"),
-            }
-        } else {
-            diff
+        let abs_diff = match diff.abs() {
+            Ok(abs) => abs,
+            Err(error) => panic!("Float abs failed: {error:?}"),
         };
         if abs_diff.gt(eps).unwrap_or(false) {
             panic!(
@@ -745,17 +737,9 @@ macro_rules! assert_decimal_eq {
             Ok(sub) => sub,
             Err(error) => panic!("Float subtraction failed: {error:?}"),
         };
-        let zero = match rain_math_float::Float::zero() {
-            Ok(z) => z,
-            Err(error) => panic!("Float::zero() failed: {error:?}"),
-        };
-        let abs_diff = if diff.lt(zero).unwrap_or(false) {
-            match (zero - diff) {
-                Ok(neg) => neg,
-                Err(error) => panic!("Float negation failed: {error:?}"),
-            }
-        } else {
-            diff
+        let abs_diff = match diff.abs() {
+            Ok(abs) => abs,
+            Err(error) => panic!("Float abs failed: {error:?}"),
         };
         if abs_diff.gt(eps).unwrap_or(false) {
             panic!(

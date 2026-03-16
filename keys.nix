@@ -3,6 +3,9 @@ rec {
     # purpose: dev/ops
     gleb =
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHepyxN9hvXzbCY/z0amzldy7DXjNdyetnVaQexRgDEX";
+    # purpose: dev/ops
+    juan =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHHNeV3nfiJS0QE2JoW3d0dRw1j6OVKl7rXor24XHvsd";
     # purpose: op sec auditing and manual cli while fixing gaps in automation
     alastair =
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJArH3PA+bFIon0JkCVQGs9aWr45lnVjiiTLLO9BPItn";
@@ -32,7 +35,7 @@ rec {
     # this role was meant to be for the ability to ssh into the machine
     # but in the future we should restrict what that exactly means in
     # terms of who should have access to what remote users
-    ssh = [ gleb alastair ci ];
+    ssh = [ juan gleb alastair ci ];
 
     # the host needs to actually decrypt the secrets it receives on
     # deployment. gleb is there cause someone needs to set secrets
