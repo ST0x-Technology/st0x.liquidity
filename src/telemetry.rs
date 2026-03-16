@@ -157,8 +157,16 @@ impl TelemetryCtx {
             .with_tracer(tracer)
             .with_level(true);
 
-        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(mk_env_filter(log_level));
-        let telemetry_layer = telemetry_layer.with_filter(mk_env_filter(log_level));
+        let default_filter = get_default_filter(log_level);
+
+        let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| default_filter.clone().into());
+
+        let telemetry_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| default_filter.into());
+
+        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(fmt_filter);
+        let telemetry_layer = telemetry_layer.with_filter(telemetry_filter);
 
         let subscriber = Registry::default().with(fmt_layer).with(telemetry_layer);
 
@@ -216,6 +224,18 @@ impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
     }
 }
 
+pub fn setup_tracing(log_level: &crate::config::LogLevel) {
+    let level: tracing::Level = log_level.into();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| get_default_filter(level).into()),
+        )
+        .compact()
+        .init();
+}
+
 /// Instrumentation library name used to identify the source of traces in the
 /// OpenTelemetry system. This appears in telemetry backends as the library
 /// that generated the spans.
@@ -234,14 +254,22 @@ impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
 /// maintained for semantic clarity.
 const TRACER_NAME: &str = "st0x-tracer";
 
-pub fn setup_tracing(log_level: &crate::config::LogLevel) {
-    let level: tracing::Level = log_level.into();
-    let env_filter = mk_env_filter(level);
+// TODO: parse from the manifest or something
+const CRATES: [&str; 6] = [
+    "dto",
+    "event-sorcery",
+    "execution",
+    "finance",
+    "bridge",
+    "evm",
+];
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .compact()
-        .init();
+fn get_default_filter(level: tracing::Level) -> String {
+    CRATES
+        .iter()
+        .map(|pkg| format!("st0x-{pkg}={level}"))
+        .map(|pkg| pkg.replace('-', "_"))
+        .join(",")
 }
 
 pub fn mk_env_filter(level: tracing::Level) -> EnvFilter {

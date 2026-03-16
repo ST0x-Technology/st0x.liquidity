@@ -4,14 +4,16 @@
 //! directional exposure by executing offsetting trades on
 //! traditional brokerages.
 
+#![allow(unused_variables, dead_code, unused_imports)]
+
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
-use st0x_dto::ServerMessage;
+use st0x_dto::Statement;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
 
 use crate::config::{BrokerCtx, Ctx};
@@ -71,14 +73,14 @@ pub mod test_utils;
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
-    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+    let (event_sender, _) = broadcast::channel::<Statement>(256);
     launch_with_event_channel(ctx, event_sender).await
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 pub async fn launch_with_event_channel(
     ctx: Ctx,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
 ) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
@@ -100,9 +102,10 @@ pub async fn launch_with_event_channel(
 fn spawn_server_task(
     ctx: &Ctx,
     pool: &SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
+    trace!("Beginning the rocket launch");
     let rocket_config = rocket::Config::figment()
         .merge(("port", ctx.server_port))
         .merge(("address", "0.0.0.0"));
@@ -115,18 +118,19 @@ fn spawn_server_task(
         .manage(dashboard::Broadcast {
             sender: event_sender,
         })
-        .manage(dashboard::DashboardState {
+        .manage(dashboard::DashboardCtx {
             inventory,
             pool: pool.clone(),
         });
 
+    trace!("Spawning a rocket task");
     tokio::spawn(rocket.launch())
 }
 
 fn spawn_bot_task(
     ctx: Ctx,
     pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(async move { Box::pin(run(ctx, pool, event_sender, inventory)).await })
@@ -206,7 +210,7 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
 async fn run(
     ctx: Ctx,
     pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
@@ -248,7 +252,7 @@ async fn run(
 async fn run_bot_session(
     ctx: Ctx,
     pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     match ctx.broker.clone() {
@@ -301,7 +305,7 @@ mod tests {
         pool
     }
 
-    fn create_test_event_sender() -> broadcast::Sender<ServerMessage> {
+    fn create_test_event_sender() -> broadcast::Sender<Statement> {
         let (sender, _) = broadcast::channel(16);
         sender
     }

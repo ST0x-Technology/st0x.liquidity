@@ -15,6 +15,7 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use st0x_dto::{Concern, Reportable, Statement};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{Direction, Symbol};
 
@@ -75,6 +76,15 @@ pub(crate) struct OnChainTrade {
     pub(crate) block_timestamp: DateTime<Utc>,
     pub(crate) filled_at: DateTime<Utc>,
     pub(crate) enrichment: Option<Enrichment>,
+}
+
+impl Reportable for OnChainTradeEvent {
+    fn report(&self, id: &str) -> Statement {
+        Statement {
+            id: id.to_string(),
+            statement: Concern::Trading,
+        }
+    }
 }
 
 #[async_trait]
