@@ -15,7 +15,8 @@ use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, MockOrderSnapshot, MockPositionSnapshot, OrderSide, OrderStatus,
 };
 use st0x_execution::{Direction, SupportedExecutor, Symbol};
-use st0x_hedge::{Dollars, OffchainOrder, Position};
+use st0x_finance::Usd;
+use st0x_hedge::{OffchainOrder, Position};
 
 use crate::assert_decimal_eq;
 use crate::base_chain::TakeDirection;
@@ -561,7 +562,7 @@ async fn assert_offchain_order_views(
             );
             assert_eq!(
                 price,
-                &Dollars(expected_price),
+                &Usd::new(expected_price),
                 "Fill price mismatch for {} offchain order {order_id}",
                 expected_position.symbol
             );

@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use st0x_execution::Positive;
+use st0x_finance::Usdc;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
 use super::serde::{deserialize_decimal_from_string, serialize_decimal_as_string};
-use crate::threshold::Usdc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
@@ -181,7 +181,7 @@ pub(super) async fn initiate_withdrawal(
     address: &Address,
 ) -> Result<Transfer, AlpacaWalletError> {
     let request = WithdrawalRequest {
-        amount: amount.inner().0,
+        amount: amount.inner().inner(),
         asset,
         address,
     };
@@ -251,7 +251,7 @@ mod tests {
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use st0x_execution::{AlpacaAccountId, InvalidSharesError};
+    use st0x_execution::AlpacaAccountId;
     use std::str::FromStr;
     use uuid::uuid;
 
@@ -320,7 +320,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100.5))).unwrap();
+        let amount = Positive::new(Usdc::new(dec!(100.5))).unwrap();
         let asset = TokenSymbol::new("USDC");
 
         let transfer = initiate_withdrawal(&client, amount, &asset, &to_address)
@@ -343,18 +343,14 @@ mod tests {
 
     #[test]
     fn test_initiate_withdrawal_zero_amount() {
-        assert!(matches!(
-            Positive::new(Usdc(Decimal::ZERO)).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == Decimal::ZERO
-        ));
+        let error = Positive::new(Usdc::new(Decimal::ZERO)).unwrap_err();
+        assert_eq!(error.value, Usdc::new(Decimal::ZERO));
     }
 
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
-        assert!(matches!(
-            Positive::new(Usdc(dec!(-100))).unwrap_err(),
-            InvalidSharesError::NonPositive(value) if value == dec!(-100)
-        ));
+        let error = Positive::new(Usdc::new(Decimal::new(-100, 0))).unwrap_err();
+        assert_eq!(error.value, Usdc::new(Decimal::new(-100, 0)));
     }
 
     #[tokio::test]
@@ -377,7 +373,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
         let asset = TokenSymbol::new("INVALID");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -413,7 +409,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
         let asset = TokenSymbol::new("USDC");
         let addr = address!("0x0000000000000000000000000000000000000000");
 
@@ -445,7 +441,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
         let asset = TokenSymbol::new("USDC");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 

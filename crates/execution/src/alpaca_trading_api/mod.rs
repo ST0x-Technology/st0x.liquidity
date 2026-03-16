@@ -30,6 +30,8 @@ pub enum AlpacaTradingApiError {
     EmptySymbol(#[from] crate::EmptySymbolError),
     #[error("Invalid shares: {0}")]
     InvalidShares(#[from] crate::InvalidSharesError),
+    #[error(transparent)]
+    NotPositive(#[from] st0x_finance::NotPositive<st0x_finance::FractionalShares>),
     #[error("Decimal parse error: {0}")]
     DecimalParse(#[from] rust_decimal::Error),
     #[error("Num parse error: {0}")]

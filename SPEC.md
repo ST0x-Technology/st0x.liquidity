@@ -2422,170 +2422,16 @@ All read data flows through a single WebSocket connection:
 
 ##### Message Types
 
-```typescript
-type ServerMessage =
-  | { type: "initial"; data: InitialState }
-  | { type: "event"; data: EventStoreEntry }
-  | { type: "trade:onchain"; data: OnchainTrade }
-  | { type: "trade:offchain"; data: OffchainTrade }
-  | { type: "position:updated"; data: Position }
-  | { type: "inventory:updated"; data: Inventory }
-  | { type: "metrics:updated"; data: PerformanceMetrics }
-  | { type: "spread:updated"; data: SpreadUpdate }
-  | { type: "rebalance:updated"; data: RebalanceOperation }
-  | { type: "circuit_breaker:changed"; data: CircuitBreakerStatus }
-  | { type: "auth:status"; data: AuthStatus };
-
-type InitialState = {
-  recentTrades: Trade[];
-  inventory: Inventory;
-  metrics: PerformanceMetrics;
-  spreads: SpreadSummary[];
-  activeRebalances: RebalanceOperation[];
-  recentRebalances: RebalanceOperation[];
-  authStatus: AuthStatus;
-  circuitBreaker: CircuitBreakerStatus;
-};
-
-type SpreadSummary = {
-  symbol: string;
-  lastBuyPrice: number;
-  lastSellPrice: number;
-  pythPrice: number;
-  spreadBps: number;
-  updatedAt: Date;
-};
-
-type SpreadUpdate = {
-  symbol: string;
-  timestamp: Date;
-  buyPrice?: number;
-  sellPrice?: number;
-  pythPrice: number;
-};
-
-type Timeframe = "1h" | "1d" | "1w" | "1m" | "all";
-
-type PerformanceMetrics = {
-  [K in Timeframe]: {
-    aum: number;
-    pnl: { absolute: number; percent: number };
-    volume: number;
-    tradeCount: number;
-    sharpeRatio: number | null; // null if insufficient data
-    sortinoRatio: number | null;
-    maxDrawdown: number;
-    hedgeLagMs: number | null; // average ms between onchain and offchain execution
-    uptimePercent: number;
-  };
-};
-
-type EventStoreEntry = {
-  aggregate_type: string;
-  aggregate_id: string;
-  sequence: number;
-  event_type: string;
-  timestamp: string;
-  // payload excluded for dashboard display
-};
-
-type Inventory = {
-  perSymbol: SymbolInventory[];
-  usdc: { onchain: number; offchain: number };
-};
-
-type RebalanceOperation =
-  | { type: "mint"; id: string; symbol: string; amount: number }
-    & RebalanceStatus
-  | { type: "redeem"; id: string; symbol: string; amount: number }
-    & RebalanceStatus
-  | {
-    type: "usdc";
-    id: string;
-    direction: "alpaca_to_base" | "base_to_alpaca";
-    amount: number;
-  } & RebalanceStatus;
-
-type RebalanceStatus =
-  | { status: "in_progress"; startedAt: Date }
-  | { status: "completed"; startedAt: Date; completedAt: Date }
-  | { status: "failed"; startedAt: Date; failedAt: Date; reason: string };
-```
+Message types (`ServerMessage`, `InitialState`, etc.) are defined in the
+`st0x-dto` crate (`crates/dto/src/lib.rs`) and auto-generated as TypeScript
+types via `ts-rs`. The DTO crate is the source of truth for all wire formats.
 
 ##### TanStack Query Integration
 
-WebSocket messages populate the TanStack Query cache:
-
-```typescript
-socket.onmessage = (event) => {
-  const msg: ServerMessage = JSON.parse(event.data);
-
-  match(msg, {
-    "initial": ({ data }) => {
-      queryClient.setQueryData(["events"], []); // starts empty, fills with live events
-      queryClient.setQueryData(["trades"], data.recentTrades);
-      queryClient.setQueryData(["inventory"], data.inventory);
-      queryClient.setQueryData(["rebalances", "active"], data.activeRebalances);
-      queryClient.setQueryData(["rebalances", "recent"], data.recentRebalances);
-      queryClient.setQueryData(["auth"], data.authStatus);
-      queryClient.setQueryData(["circuitBreaker"], data.circuitBreaker);
-    },
-    "event": (entry) => {
-      queryClient.setQueryData(
-        ["events"],
-        (old) => [entry, ...old].slice(0, 100),
-      );
-    },
-    "inventory:updated": (inventory) => {
-      queryClient.setQueryData(["inventory"], inventory);
-    },
-    "rebalance:updated": (op) => {
-      // Update active or move to recent based on status
-    },
-    // ... other event handlers
-  });
-};
-```
-
-##### Svelte WebSocket Wrapper
-
-Minimal wrapper using Svelte 5 runes for connection state:
-
-```typescript
-// lib/websocket.svelte.ts
-export const createWebSocket = (url: string, queryClient: QueryClient) => {
-  let status = $state<"connecting" | "connected" | "disconnected">(
-    "connecting",
-  );
-  let socket: WebSocket | null = null;
-
-  const connect = () => {
-    socket = new WebSocket(url);
-    socket.onopen = () => status = "connected";
-    socket.onclose = () => {
-      status = "disconnected";
-      reconnect();
-    };
-    socket.onmessage = (e) => handleMessage(JSON.parse(e.data), queryClient);
-  };
-
-  // Reconnection with exponential backoff...
-
-  return {
-    get status() {
-      return status;
-    },
-    connect,
-    disconnect,
-  };
-};
-```
-
-TanStack Query provides:
-
-- Reactive cache as single source of truth
-- Devtools for inspecting state
-- Automatic component re-renders on cache updates
+WebSocket messages populate the TanStack Query cache. Each `ServerMessage`
+variant maps to one or more query keys (e.g., `["trades"]`, `["inventory"]`,
+`["transfers", "active"]`). The `initial` message seeds all caches on
+connection; subsequent messages update individual caches incrementally.
 
 ### Core Features
 
@@ -2679,41 +2525,21 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
 
 #### Panels
 
-1. **Performance Metrics**: Live-updating key metrics with timeframe selector
-   (1h, 1d, 1w, 1m, all-time):
-   - AUM (assets under management across both venues)
-   - P&L (absolute and percentage return)
-   - Volume (total traded value in USD)
-   - Trade count
-   - Sharpe ratio
-   - Sortino ratio
-   - Max drawdown
-   - Hedge lag (average time between onchain trade and offchain hedge execution)
-   - Uptime (% of market hours the bot was operational)
+1. **Performance Metrics**: Key metrics (AUM, P&L, volume, trade count, Sharpe,
+   Sortino, max drawdown, hedge lag, uptime) with timeframe selector (1h, 1d,
+   1w, 1m, all-time).
 
-2. **Inventory**: Current holdings across both venues (onchain tokens vs
-   offchain shares per symbol, USDC balances). Shows imbalance ratios and
-   proximity to rebalancing thresholds.
+2. **Inventory**: Per-symbol equity holdings and cash balances across venues,
+   with available/inflight breakdowns. Includes an "Inventory Transfers" section
+   showing active and recent transfer operations with status.
 
-3. **Spreads**: Live spread visualization using TradingView Lightweight Charts:
-   - Overview table showing last realized spreads per asset (buy price, sell
-     price, Pyth reference, spread bps)
-   - Asset selector to view detailed chart for a specific symbol
-   - Chart shows buy/sell execution prices vs Pyth oracle price over time
-   - All chart lines (buy/sell/pyth) are toggleable via legend
+3. **Spreads**: Last realized spreads per asset (buy/sell prices, Pyth
+   reference, spread bps) and per-symbol price charts over time.
 
-4. **Trade History**: Live list of trades with toggle switches for
-   onchain/offchain/both (default: both). Shows symbol, direction, amount,
-   price, timestamp, venue.
+4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
 
-5. **Rebalancing** (Alpaca only): Active rebalancing operations with live status
-   updates (CrossVenueEquityTransfer, CrossVenueCashTransfer). Below that,
-   recent completed/failed rebalances.
-
-6. **Live Events**: Real-time stream of domain events as they occur
-   (aggregate_type, aggregate_id, sequence, event_type, timestamp). Payloads
-   excluded to avoid exposing full database records. Starts empty on page load,
-   populates as new events arrive via WebSocket.
+5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
+   event type, timestamp). Starts empty, populates via WebSocket.
 
 ### Architecture
 
