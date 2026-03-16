@@ -32,7 +32,7 @@ use st0x_execution::{Executor, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
-use crate::config::{AssetsConfig, Ctx, CtxError};
+use crate::config::{AssetsConfig, Ctx, CtxError, OperationMode};
 use crate::dashboard::Broadcaster;
 use crate::inventory::{
     BroadcastingInventory, InventoryPollingService, InventorySnapshot, WalletPollingCtx,
@@ -1314,9 +1314,7 @@ mod tests {
     use rain_math_float::Float;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use tokio::sync::broadcast;
 
-    use st0x_dto::ServerMessage;
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{
         Direction, ExecutorOrderId, MarketOrder, MockExecutor, MockExecutorCtx, Positive, Symbol,
@@ -2552,10 +2550,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             imbalanced_inventory(&symbol),
-            event_sender,
         ));
         let (operation_sender, mut operation_receiver) = mpsc::channel(10);
 
@@ -2651,8 +2647,9 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
+            initial_inventory,
+        ));
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -2764,8 +2761,9 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
+            initial_inventory,
+        ));
         let (operation_sender, mut receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -2892,8 +2890,9 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
+            initial_inventory,
+        ));
         let (operation_sender, receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));

@@ -11,7 +11,7 @@ use alloy::providers::RootProvider;
 use futures_util::future::try_join_all;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
