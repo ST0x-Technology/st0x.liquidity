@@ -146,6 +146,19 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     let amount_per_trade = dec!(7.5);
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let wrapped_token = infra.equity_addresses[0].1;
+    let unwrapped_token = infra.equity_addresses[0].2;
+
+    // Keep the owner's direct wrapped and unwrapped balances distinct so the
+    // BaseWalletUnwrappedEquity snapshot assertion proves we polled the
+    // unwrapped token.
+    let balance_skew: U256 = parse_units("1", 18)?.into();
+    crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+        .transfer(infra.base_chain.taker, balance_skew)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
 
     // Set up orders before bot starts (owner nonces, no collision).
     let mut prepared_orders = Vec::new();
@@ -162,6 +175,25 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
                 .await?,
         );
     }
+
+    let owner_unwrapped_balance_before_takes =
+        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_wrapped_balance_before_takes =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_unwrapped_shares_before_takes =
+        st0x_execution::FractionalShares::from_u256_18_decimals(
+            owner_unwrapped_balance_before_takes,
+        )?;
+    let owner_wrapped_shares_before_takes =
+        st0x_execution::FractionalShares::from_u256_18_decimals(
+            owner_wrapped_balance_before_takes,
+        )?;
 
     // Capture block AFTER setup so the bot sees the orders
     let current_block = infra.base_chain.provider.get_block_number().await?;
@@ -182,8 +214,14 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .call()?;
     let mut bot = spawn_bot(ctx);
 
-    // Let bot finish coordination before submitting takes.
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_initial_base_wallet_unwrapped_and_wrapped_equity_snapshot(
+        &mut bot,
+        &infra.db_path,
+        "AAPL",
+        owner_unwrapped_shares_before_takes,
+        owner_wrapped_shares_before_takes,
+    )
+    .await?;
 
     // Take all orders without delay so the inventory poller sees the
     // full imbalance in one pass and triggers a single mint cycle.

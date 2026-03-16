@@ -24,6 +24,7 @@ use std::collections::HashMap;
 pub(crate) use std::str::FromStr;
 use std::sync::Arc;
 pub(crate) use std::time::Duration;
+use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_evm::{Evm, EvmError, Wallet};
@@ -32,7 +33,7 @@ use st0x_execution::alpaca_broker_api::{
     TransferStatus,
 };
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Symbol, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
 };
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
@@ -51,7 +52,7 @@ use crate::assert::{
 pub(crate) use crate::base_chain::TakeDirection;
 use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
-use crate::poll::{connect_db, fetch_events_by_type};
+use crate::poll::{DEFAULT_POLL_TIMEOUT_SECS, connect_db, fetch_events_by_type, sleep_or_crash};
 pub(crate) use crate::poll::{poll_for_events_with_timeout, spawn_bot};
 pub(crate) use crate::test_infra::TestInfra;
 
@@ -740,6 +741,99 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     Ok(())
 }
 
+pub(crate) async fn assert_initial_base_wallet_unwrapped_and_wrapped_equity_snapshot(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    symbol: &str,
+    expected_unwrapped_balance: FractionalShares,
+    expected_wrapped_balance: FractionalShares,
+) -> anyhow::Result<()> {
+    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!(
+        "Base-wallet unwrapped and wrapped equity snapshots for {symbol} matching unwrapped \
+             {expected_unwrapped_balance} and wrapped {expected_wrapped_balance}"
+    );
+
+    let parse_snapshot_balance = |events: &[crate::assert::StoredEvent],
+                                  event_type: &str,
+                                  payload_key: &str|
+     -> anyhow::Result<Option<FractionalShares>> {
+        events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == event_type)
+            .and_then(|event| {
+                event
+                    .payload
+                    .get(payload_key)
+                    .and_then(|value| value.get("balances"))
+                    .and_then(|balances| balances.get(symbol))
+                    .and_then(|value| value.as_str())
+            })
+            .map(|balance_str| {
+                balance_str.parse::<FractionalShares>().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to parse {event_type} balance '{balance_str}' for {symbol}: \
+                         {error}"
+                    )
+                })
+            })
+            .transpose()
+    };
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = connect_db(db_path).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let events = fetch_events_by_type(&pool, "InventorySnapshot").await;
+        pool.close().await;
+
+        let (unwrapped_snapshot_balance, wrapped_snapshot_balance) = match events {
+            Ok(events) => (
+                parse_snapshot_balance(
+                    &events,
+                    "InventorySnapshotEvent::BaseWalletUnwrappedEquity",
+                    "BaseWalletUnwrappedEquity",
+                )?,
+                parse_snapshot_balance(
+                    &events,
+                    "InventorySnapshotEvent::BaseWalletWrappedEquity",
+                    "BaseWalletWrappedEquity",
+                )?,
+            ),
+            Err(error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "Timed out after {timeout:?} waiting for {context} \
+                     (query failed: {error})",
+                );
+                continue;
+            }
+        };
+
+        if unwrapped_snapshot_balance == Some(expected_unwrapped_balance)
+            && wrapped_snapshot_balance == Some(expected_wrapped_balance)
+        {
+            return Ok(());
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context} \
+             (found latest unwrapped snapshot {unwrapped_snapshot_balance:?}, latest wrapped \
+              snapshot {wrapped_snapshot_balance:?})",
+        );
+    }
+}
+
 #[bon::builder]
 pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],
@@ -769,6 +863,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
         EquityRebalanceType::Mint {
             symbol,
             tokenization,
+            ..
         } => {
             assert_equity_mint_rebalancing(
                 &pool,
@@ -786,6 +881,7 @@ pub(crate) async fn assert_equity_rebalancing_flow<P: Provider>(
             tokenization,
             redemption_wallet_balance_before,
             redemption_wallet_balance_after,
+            ..
         } => {
             assert_equity_redeem_rebalancing()
                 .pool(&pool)
