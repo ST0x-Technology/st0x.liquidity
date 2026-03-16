@@ -16,6 +16,7 @@ use alloy::sol_types::SolEvent;
 use bon::bon;
 use chrono::Utc;
 use httpmock::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -36,7 +37,7 @@ pub const TEST_API_KEY: &str = "e2e_test_key";
 pub const TEST_API_SECRET: &str = "e2e_test_secret";
 
 /// Controls how the mock responds to order placement and polling.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum MockMode {
     /// Place succeeds, first poll returns filled.
     HappyPath,
