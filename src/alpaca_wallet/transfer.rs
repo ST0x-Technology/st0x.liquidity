@@ -93,7 +93,11 @@ impl TransferStatus {
 }
 
 /// Transfer response from Alpaca Crypto Wallets API.
+///
+/// Fields match the Alpaca API response schema; some are kept for
+/// deserialization completeness even when not directly accessed.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct Transfer {
     pub(crate) id: AlpacaTransferId,
     #[serde(rename = "tx_hash", default)]

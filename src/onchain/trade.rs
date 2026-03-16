@@ -145,6 +145,7 @@ pub(crate) fn extract_owned_vaults(
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OnchainTrade {
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,

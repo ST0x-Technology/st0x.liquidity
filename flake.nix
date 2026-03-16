@@ -64,7 +64,6 @@
 
           st0xRust = pkgs.callPackage ./rust.nix {
             inherit craneLib;
-            inherit (pkgs) sqlx-cli;
             sol-build-inputs = rainix.sol-build-inputs.${system};
           };
         in rainixPkgs // deployPkgs // {
@@ -224,24 +223,23 @@
           DATABASE_URL = "sqlite:dev.db";
           FOUNDRY_DISABLE_NIGHTLY_WARNING = true;
 
-          buildInputs = with pkgs;
-            [
-              bacon
-              bun
-              sqlx-cli
-              cargo-expand
-              cargo-nextest
-              terraform
-              ragenix.packages.${system}.default
-              packages.ci
-              packages.prepSolArtifacts
-              packages.secret
-              packages.rekey
-              packages.remote
-              packages.deployNixos
-              packages.deployService
-              packages.deployAll
-            ] ++ rainix.devShells.${system}.default.buildInputs;
+          buildInputs = (with pkgs; [
+            bacon
+            bun
+            sqlx-cli
+            cargo-expand
+            cargo-nextest
+            ragenix.packages.${system}.default
+          ]) ++ (with packages; [
+            ci
+            prepSolArtifacts
+            secret
+            rekey
+            remote
+            deployNixos
+            deployService
+            deployAll
+          ]) ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
 

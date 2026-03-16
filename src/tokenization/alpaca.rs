@@ -261,6 +261,7 @@ impl Issuer {
 
 /// A tokenization request returned by the Alpaca API.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct TokenizationRequest {
     #[serde(rename = "tokenization_request_id")]
     pub(crate) id: TokenizationRequestId,
