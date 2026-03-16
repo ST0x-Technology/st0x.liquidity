@@ -28,7 +28,7 @@ static TRACING_INIT: Once = Once::new();
 pub fn init_tracing() {
     TRACING_INIT.call_once(|| {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "warn,st0x_hedge=debug,st0x_execution=debug,st0x_dto=debug,\
+            "warn,st0x_hedge=trace,st0x_execution=debug,st0x_dto=debug,\
              st0x_event_sorcery=debug,st0x_evm=debug,st0x_finance=debug,\
              st0x_bridge=debug,e2e=debug,rocket=off,hyper=off,\
              tungstenite=off,tokio_tungstenite=off,reqwest=off"
@@ -104,6 +104,21 @@ impl TestInfra<()> {
         for (symbol, _price) in &equity_prices {
             let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
             equity_addresses.push(((*symbol).to_owned(), vault_addr, underlying_addr));
+        }
+
+        // Seed Pyth prices for each equity symbol so the bot's
+        // trace-based price extraction finds valid price data.
+        for (symbol, price) in &equity_prices {
+            // Convert Decimal price to Pyth format: price * 10^(-expo).
+            // Use expo=-8 (8 decimal places) which is standard for Pyth.
+            let pyth_price = (*price * Decimal::from(100_000_000i64))
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(0);
+
+            base_chain
+                .set_pyth_price(symbol, pyth_price, 100_000, -8)
+                .await?;
         }
 
         // Fund taker with equity vault shares so it can take BuyEquity

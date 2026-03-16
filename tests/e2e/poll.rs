@@ -10,7 +10,9 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use st0x_dto::ServerMessage;
+use tracing::info;
+
+use st0x_dto::Statement;
 use st0x_hedge::config::Ctx;
 use st0x_hedge::{launch, launch_with_event_channel};
 
@@ -23,7 +25,7 @@ pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
 /// allowing tests to inspect `receiver_count()` for dashboard auto-detect.
 pub fn spawn_bot_with_event_channel(
     ctx: Ctx,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
 ) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(launch_with_event_channel(ctx, event_sender))
 }
@@ -31,10 +33,7 @@ pub fn spawn_bot_with_event_channel(
 /// After assertions complete, keeps the server alive while dashboard
 /// clients are connected. Waits up to `grace` for a client to connect,
 /// then stays alive until all clients disconnect.
-pub async fn await_dashboard_disconnect(
-    sender: &broadcast::Sender<ServerMessage>,
-    grace: Duration,
-) {
+pub async fn await_dashboard_disconnect(sender: &broadcast::Sender<Statement>, grace: Duration) {
     let deadline = tokio::time::Instant::now() + grace;
 
     while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
@@ -42,7 +41,7 @@ pub async fn await_dashboard_disconnect(
     }
 
     if sender.receiver_count() > 0 {
-        eprintln!("Dashboard connected -- keeping server alive until disconnect");
+        info!("Dashboard connected -- keeping server alive until disconnect");
         while sender.receiver_count() > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }

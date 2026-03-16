@@ -5,7 +5,7 @@ use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Interval, interval};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_event_sorcery::{Column, Projection, ProjectionError, SendError, Store};
 use st0x_execution::{
@@ -103,9 +103,9 @@ impl<E: Executor> OrderStatusPoller<E> {
         }
     }
 
-    #[tracing::instrument(skip(self), level = tracing::Level::DEBUG)]
+    #[tracing::instrument(skip(self), level = tracing::Level::TRACE)]
     pub(crate) async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
-        debug!("Starting polling cycle for submitted orders");
+        trace!("Starting polling cycle for submitted orders");
 
         let executor_type = self.executor.to_supported_executor();
         let submitted_executions: Vec<_> = self
@@ -117,11 +117,11 @@ impl<E: Executor> OrderStatusPoller<E> {
             .collect();
 
         if submitted_executions.is_empty() {
-            debug!("No submitted orders to poll");
+            trace!("No submitted orders to poll");
             return Ok(());
         }
 
-        info!("Polling {} submitted orders", submitted_executions.len());
+        debug!("Polling {} submitted orders", submitted_executions.len());
 
         for (offchain_order_id, order) in &submitted_executions {
             if let Err(error) = self.poll_execution_status(*offchain_order_id, order).await {
@@ -131,7 +131,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             self.add_jittered_delay().await;
         }
 
-        debug!("Completed polling cycle");
+        trace!("Completed polling cycle");
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
@@ -35,7 +35,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     }
 
     let Some(position) = position_projection.load(symbol).await? else {
-        debug!(%symbol, "Position aggregate not found, skipping");
+        trace!(%symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };
 
@@ -48,7 +48,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
 
     let Some((direction, shares)) = position.is_ready_for_execution(executor_type, shares_limit)?
     else {
-        debug!(%symbol, net = %position.net, "Position not ready for execution");
+        trace!(%symbol, net = %position.net, "Position not ready for execution");
         return Ok(None);
     };
 
@@ -96,7 +96,7 @@ async fn check_market_open<E: Executor>(
 /// Loads all active positions from the view, then checks each
 /// against its configured threshold. Skips disabled assets.
 /// Returns execution parameters for positions that are ready.
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+#[tracing::instrument(skip_all, level = tracing::Level::TRACE)]
 pub(crate) async fn check_all_positions<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
@@ -110,7 +110,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
 
     for (symbol, position) in &all_positions {
         if !is_trading_enabled(symbol) {
-            debug!(symbol = %symbol, "Asset disabled, skipping periodic check");
+            trace!(symbol = %symbol, "Asset disabled, skipping periodic check");
             continue;
         }
 
@@ -147,7 +147,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
     }
 
     if ready.is_empty() {
-        debug!("No positions ready for execution");
+        trace!("No positions ready for execution");
     } else {
         info!("Found {} positions ready for execution", ready.len());
     }

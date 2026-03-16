@@ -59,6 +59,19 @@ command = [
 need_stdout = true
 analyzer = "nextest"
 
+[jobs.e2e]
+# env.RUST_LOG = "st0x_hedge=trace,st0x_execution=debug,st0x_dto=debug,st0x_event_sorcery=debug,st0x_evm=debug,st0x_finance=debug,st0x_bridge=debug,e2e=trace"
+command = [
+    "cargo", "nextest", "run", "--test", "e2e", "dev_harness", "--run-ignored", "only",
+    "--hide-progress-bar", "--failure-output", "final"
+]
+need_stdout = true
+analyzer = "nextest"
+# allow_warnings = true
+# background = true
+# on_change_strategy = "kill_then_restart"
+
+
 # # Run your long-running application (eg server) and have the result displayed in bacon.
 # # For programs that never stop (eg a server), `background` is set to false
 # # to have the cargo run output immediately displayed instead of waiting for

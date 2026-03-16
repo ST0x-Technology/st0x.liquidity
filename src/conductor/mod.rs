@@ -25,15 +25,15 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_dto::ServerMessage;
+use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use st0x_evm::{Evm, Wallet};
 use st0x_execution::{Executor, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
-use crate::config::{AssetsConfig, Ctx, CtxError, OperationMode};
-use crate::dashboard::EventBroadcaster;
+use crate::config::{AssetsConfig, Ctx, CtxError};
+use crate::dashboard::Broadcaster;
 use crate::inventory::{
     BroadcastingInventory, InventoryPollingService, InventorySnapshot, WalletPollingCtx,
 };
@@ -106,7 +106,7 @@ pub(crate) async fn run_market_hours_loop<E>(
     ctx: Ctx,
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<BroadcastingInventory>,
 ) -> anyhow::Result<()>
 where
@@ -142,7 +142,7 @@ impl Conductor {
         pool: SqlitePool,
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
-        event_sender: broadcast::Sender<ServerMessage>,
+        event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Self>> + Send>>
     where
@@ -369,7 +369,7 @@ struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
 }
@@ -534,7 +534,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(deps.event_sender));
+        let event_broadcaster = Arc::new(Broadcaster::new(deps.event_sender));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let built = manifest
@@ -657,7 +657,7 @@ where
 
         loop {
             interval.tick().await;
-            debug!("Running periodic accumulated position check");
+            trace!("Running periodic accumulated position check");
             if let Err(error) = check_and_execute_accumulated_positions(
                 &executor,
                 &position,
@@ -690,7 +690,7 @@ fn spawn_inventory_poller<Chain: Evm, Exe: Executor + Send + 'static>(
             tokio::select! {
                 _ = interval.tick() => {}
                 () = poll_notify.notified() => {
-                    debug!("Inventory poll triggered by notification");
+                    trace!("Inventory poll triggered by notification");
                 }
             }
 
@@ -1151,7 +1151,7 @@ where
     .await?;
 
     if ready_positions.is_empty() {
-        debug!("No accumulated positions ready for execution");
+        trace!("No accumulated positions ready for execution");
         return Ok(());
     }
 
