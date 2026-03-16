@@ -30,6 +30,7 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
 
+use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
@@ -206,40 +207,56 @@ impl Conductor {
                 Err(error) => return Err(error.into()),
             };
 
-            let (position, position_projection, snapshot, rebalancer, ethereum_wallet, base_wallet) =
-                if let Some(rebalancing_ctx) = rebalancing {
-                    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
-                    let base_wallet = rebalancing_ctx.base_wallet().clone();
-                    let infra = spawn_rebalancing_infrastructure(
-                        rebalancing_ctx,
-                        ethereum_wallet.clone(),
-                        base_wallet.clone(),
-                        RebalancingDeps {
-                            pool: pool.clone(),
-                            ctx: ctx.clone(),
-                            inventory: inventory.clone(),
-                            event_sender,
-                            vault_registry: vault_registry.clone(),
-                            vault_registry_projection: vault_registry_projection.clone(),
-                        },
-                    )
-                    .await?;
+            let (
+                position,
+                position_projection,
+                snapshot,
+                rebalancer,
+                ethereum_wallet,
+                base_wallet,
+                alpaca_wallet,
+            ) = if let Some(rebalancing_ctx) = rebalancing {
+                let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+                let base_wallet = rebalancing_ctx.base_wallet().clone();
+                let infra = spawn_rebalancing_infrastructure(
+                    rebalancing_ctx,
+                    ethereum_wallet.clone(),
+                    base_wallet.clone(),
+                    RebalancingDeps {
+                        pool: pool.clone(),
+                        ctx: ctx.clone(),
+                        inventory: inventory.clone(),
+                        event_sender,
+                        vault_registry: vault_registry.clone(),
+                        vault_registry_projection: vault_registry_projection.clone(),
+                    },
+                )
+                .await?;
 
-                    (
-                        infra.position,
-                        infra.position_projection,
-                        infra.snapshot,
-                        Some(infra.rebalancer),
-                        Some(ethereum_wallet),
-                        Some(base_wallet),
-                    )
-                } else {
-                    let (position, position_projection) = build_position_cqrs(&pool).await?;
-                    let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                        .build(())
-                        .await?;
-                    (position, position_projection, snapshot, None, None, None)
-                };
+                (
+                    infra.position,
+                    infra.position_projection,
+                    infra.snapshot,
+                    Some(infra.rebalancer),
+                    Some(ethereum_wallet),
+                    Some(base_wallet),
+                    Some(infra.alpaca_wallet),
+                )
+            } else {
+                let (position, position_projection) = build_position_cqrs(&pool).await?;
+                let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                    .build(())
+                    .await?;
+                (
+                    position,
+                    position_projection,
+                    snapshot,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
 
             let order_placer: Arc<dyn OrderPlacer> =
                 Arc::new(ExecutorOrderPlacer(executor.clone()));
@@ -290,6 +307,10 @@ impl Conductor {
                     unwrapped_equity_token_addresses,
                     wrapped_equity_token_addresses,
                 );
+            }
+
+            if let Some(wallet) = alpaca_wallet {
+                builder = builder.with_alpaca_wallet(wallet);
             }
 
             Ok(builder.spawn())
@@ -350,6 +371,7 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: JoinHandle<()>,
+    alpaca_wallet: Arc<AlpacaWalletService>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -505,8 +527,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             usdc: built.usdc,
         };
 
+        let alpaca_wallet = Arc::new(AlpacaWalletService::new(
+            rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
+            rebalancing_ctx.alpaca_broker_auth.account_id,
+            rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
+            rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+        ));
+
         let services = RebalancerServices::new(
             rebalancing_ctx.clone(),
+            Arc::clone(&alpaca_wallet),
             deps.ctx.assets.equities.symbols.clone(),
             ethereum_wallet,
             base_wallet,
@@ -535,6 +565,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             rebalancer: handle,
+            alpaca_wallet,
         })
     })
 }

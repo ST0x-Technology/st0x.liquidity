@@ -1,13 +1,8 @@
-//! HTTP client for Alpaca Broker API crypto deposit and withdrawal endpoints.
-//!
-//! Provides [`AlpacaWalletClient`] which can:
-//!
-//! - Fetch whitelisted withdrawal addresses
-//! - Whitelist new withdrawal addresses
-//! - Fetch deposit addresses
+//! Authenticated HTTP transport for Alpaca Broker API wallet modules.
 
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
+use rust_decimal::Decimal;
 use thiserror::Error;
 use tracing::debug;
 
@@ -61,6 +56,8 @@ pub enum AlpacaWalletError {
         previous: TransferStatus,
         next: TransferStatus,
     },
+    #[error("negative USDC balance returned from Alpaca wallet API: {balance}")]
+    NegativeUsdcBalance { balance: Decimal },
 }
 
 pub struct AlpacaWalletClient {
@@ -248,40 +245,6 @@ impl AlpacaWalletClient {
         self.delete(&path).await?;
         Ok(())
     }
-
-    /// Gets or creates a wallet deposit address for a specific asset and network.
-    ///
-    /// Uses GET with account_id in path per Broker API documentation.
-    /// If no wallet exists for the account/asset pair, one will be created.
-    pub(super) async fn get_wallet_address(
-        &self,
-        asset: &TokenSymbol,
-        network: &Network,
-    ) -> Result<Address, AlpacaWalletError> {
-        // Response format from Alpaca API documentation
-        #[derive(serde::Deserialize)]
-        struct Response {
-            #[allow(dead_code)]
-            asset_id: String,
-            address: Address,
-            #[allow(dead_code)]
-            created_at: String,
-        }
-
-        // Broker API endpoint:
-        // GET /v1/accounts/{account_id}/wallets?asset=USDC&network=ethereum
-        let path = format!(
-            "/v1/accounts/{}/wallets?asset={}&network={}",
-            self.account_id,
-            asset.as_ref(),
-            network.as_ref()
-        );
-
-        let response = self.get(&path).await?;
-        let text = response.text().await?;
-
-        Ok(serde_json::from_str::<Response>(&text)?.address)
-    }
 }
 
 #[cfg(test)]
@@ -446,101 +409,5 @@ mod tests {
         ));
 
         error_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_wallet_address_success() {
-        let server = MockServer::start();
-        let expected_address = "0x42a76C83014e886e639768D84EAF3573b1876844";
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets"));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "asset_id": "5d0de74f-827b-41a7-9f74-9c07c08fe55f",
-                    "address": expected_address,
-                    "created_at": "2025-08-07T08:52:40.656166Z"
-                }));
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let result = client
-            .get_wallet_address(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            result.to_string().to_lowercase(),
-            expected_address.to_lowercase()
-        );
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_wallet_address_api_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets"));
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "message": "Invalid asset or network"
-                }));
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        assert!(matches!(
-            client
-                .get_wallet_address(&TokenSymbol::new("INVALID"), &Network::new("ethereum"))
-                .await
-                .unwrap_err(),
-            AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST
-        ));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_wallet_address_empty_response() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets"));
-            then.status(200)
-                .header("content-type", "application/json")
-                .body("");
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        assert!(matches!(
-            client
-                .get_wallet_address(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
-                .await
-                .unwrap_err(),
-            AlpacaWalletError::ParseError(_)
-        ));
-        mock.assert();
     }
 }

@@ -21,6 +21,7 @@ use super::{
     spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
     spawn_queue_processor,
 };
+use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
@@ -144,12 +145,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 event_sender,
                 event_receiver,
                 rebalancer: None,
-                wallet_polling: WalletPollingCtx {
-                    ethereum: None,
-                    base: None,
-                    unwrapped_equity_token_addresses: HashMap::new(),
-                    wrapped_equity_token_addresses: HashMap::new(),
-                },
+                wallet_polling: WalletPollingCtx::default(),
             },
         }
     }
@@ -184,6 +180,11 @@ where
         self.state.wallet_polling.unwrapped_equity_token_addresses =
             unwrapped_equity_token_addresses;
         self.state.wallet_polling.wrapped_equity_token_addresses = wrapped_equity_token_addresses;
+        self
+    }
+
+    pub(crate) fn with_alpaca_wallet(mut self, wallet: Arc<AlpacaWalletService>) -> Self {
+        self.state.wallet_polling.alpaca_wallet = Some(wallet);
         self
     }
 
