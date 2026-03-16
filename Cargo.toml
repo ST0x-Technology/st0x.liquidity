@@ -166,8 +166,6 @@ rain-error-decoding.workspace = true
 rain-math-float.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-rocket.workspace = true
-rocket_ws.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlite-es.workspace = true
@@ -184,6 +182,8 @@ apalis = "1.0.0-rc.4"
 apalis-codec = "0.1.0-rc.4"
 apalis-sqlite = "1.0.0-rc.4"
 task-supervisor = "0.4"
+axum = { version = "0.8.8", features = ["ws", "json"] }
+apalis-board = { version = "1.0.0-rc.4", features = ["axum"] }
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -216,6 +216,7 @@ temp-env.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 tokio-tungstenite.workspace = true
+tower = { version = "0.5.3", features = ["util"] }
 tracing-subscriber.workspace = true
 tracing-test.workspace = true
 url.workspace = true
