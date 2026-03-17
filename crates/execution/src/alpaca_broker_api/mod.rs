@@ -34,9 +34,10 @@ mod market_hours;
 mod mock_api;
 #[cfg(feature = "mock")]
 pub use mock_api::{
-    AlpacaBrokerMock, MockMode, MockOrderSnapshot, MockPosition, MockPositionSnapshot,
-    MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID, TEST_API_KEY,
-    TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus, WhitelistStatus,
+    AlpacaBrokerMock, MockBrokerCommand, MockMode, MockOrderSnapshot, MockPosition,
+    MockPositionSnapshot, MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID,
+    TEST_API_KEY, TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus,
+    WhitelistStatus,
 };
 mod order;
 mod positions;
