@@ -1,0 +1,7 @@
+error: float!(.) failed: Decimal Float error selector: Err(0x34bd2069)
+ --> tests/compile_fail/dot_only.rs:5:13
+  |
+5 |     let _ = float!(.);
+  |             ^^^^^^^^^
+  |
+  = note: this error originates in the macro `float` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,20 @@
+[package]
+name = "st0x-float-macro"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+rain-math-float.workspace = true
+
+[dev-dependencies]
+alloy-primitives.workspace = true
+rain-math-float.workspace = true
+trybuild.workspace = true
+
+[lints]
+workspace = true

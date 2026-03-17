@@ -6,15 +6,14 @@
 
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
+use rain_math_float::Float;
 use st0x_execution::Positive;
 use st0x_finance::Usdc;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
-use super::serde::{deserialize_decimal_from_string, serialize_decimal_as_string};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
@@ -94,16 +93,16 @@ impl TransferStatus {
 }
 
 /// Transfer response from Alpaca Crypto Wallets API.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Transfer {
     pub(crate) id: AlpacaTransferId,
     #[serde(rename = "tx_hash", default)]
     pub(crate) tx: Option<TxHash>,
     pub(crate) direction: TransferDirection,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) amount: Decimal,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) usd_value: Decimal,
+    #[serde(deserialize_with = "deserialize_float_from_string")]
+    pub(crate) amount: Float,
+    #[serde(deserialize_with = "deserialize_float_from_string")]
+    pub(crate) usd_value: Float,
     pub(crate) chain: String,
     pub(crate) asset: TokenSymbol,
     #[serde(rename = "from_address")]
@@ -112,10 +111,10 @@ pub(crate) struct Transfer {
     pub(crate) to: Address,
     pub(crate) status: TransferStatus,
     pub(crate) created_at: DateTime<Utc>,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) network_fee: Decimal,
-    #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(crate) fees: Decimal,
+    #[serde(deserialize_with = "deserialize_float_from_string")]
+    pub(crate) network_fee: Float,
+    #[serde(deserialize_with = "deserialize_float_from_string")]
+    pub(crate) fees: Float,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -155,10 +154,18 @@ impl std::fmt::Display for Network {
     }
 }
 
+fn deserialize_float_from_string<'de, D>(deserializer: D) -> Result<Float, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Float::parse(raw).map_err(serde::de::Error::custom)
+}
+
 #[derive(Serialize)]
 struct WithdrawalRequest<'a> {
-    #[serde(serialize_with = "serialize_decimal_as_string")]
-    amount: Decimal,
+    #[serde(serialize_with = "st0x_float_serde::serialize_float_as_string")]
+    amount: Float,
     asset: &'a TokenSymbol,
     #[serde(serialize_with = "serialize_address_checksummed")]
     address: &'a Address,
@@ -249,13 +256,15 @@ pub(super) async fn find_transfer_by_tx_hash(
 mod tests {
     use alloy::primitives::{address, fixed_bytes};
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
-    use st0x_execution::AlpacaAccountId;
     use std::str::FromStr;
     use uuid::uuid;
 
+    use rain_math_float::Float;
+    use st0x_execution::AlpacaAccountId;
+
     use super::*;
+    use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -266,7 +275,7 @@ mod tests {
         let asset = TokenSymbol::new("USDC");
 
         let request = WithdrawalRequest {
-            amount: dec!(100),
+            amount: float!(100),
             asset: &asset,
             address: &address,
         };
@@ -320,7 +329,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc::new(dec!(100.5))).unwrap();
+        let amount = Positive::new(Usdc::new(float!(100.5))).unwrap();
         let asset = TokenSymbol::new("USDC");
 
         let transfer = initiate_withdrawal(&client, amount, &asset, &to_address)
@@ -332,25 +341,26 @@ mod tests {
 
         assert_eq!(transfer.id, AlpacaTransferId::new(transfer_id));
         assert_eq!(transfer.direction, TransferDirection::Outgoing);
-        assert_eq!(transfer.amount, dec!(100.5));
+        assert!(transfer.amount.eq(float!(100.5)).unwrap());
         assert_eq!(transfer.asset.as_ref(), "USDC");
         assert_eq!(transfer.to, expected_address);
         assert_eq!(transfer.status, TransferStatus::Pending);
-        assert_eq!(transfer.network_fee, dec!(0.5));
+        assert!(transfer.network_fee.eq(float!(0.5)).unwrap());
 
         withdrawal_mock.assert();
     }
 
     #[test]
     fn test_initiate_withdrawal_zero_amount() {
-        let error = Positive::new(Usdc::new(Decimal::ZERO)).unwrap_err();
-        assert_eq!(error.value, Usdc::new(Decimal::ZERO));
+        let zero = Float::zero().unwrap();
+        let error = Positive::new(Usdc::new(zero)).unwrap_err();
+        assert_eq!(error.value, Usdc::new(Float::zero().unwrap()));
     }
 
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
-        let error = Positive::new(Usdc::new(Decimal::new(-100, 0))).unwrap_err();
-        assert_eq!(error.value, Usdc::new(Decimal::new(-100, 0)));
+        let error = Positive::new(Usdc::new(float!(-100))).unwrap_err();
+        assert_eq!(error.value, Usdc::new(float!(-100)));
     }
 
     #[tokio::test]
@@ -373,7 +383,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
         let asset = TokenSymbol::new("INVALID");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -409,7 +419,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
         let asset = TokenSymbol::new("USDC");
         let addr = address!("0x0000000000000000000000000000000000000000");
 
@@ -441,7 +451,7 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
         let asset = TokenSymbol::new("USDC");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -840,9 +850,8 @@ mod tests {
             AlpacaTransferId::from(target_transfer_id),
             "Should return the transfer with matching ID, not the first one in the list"
         );
-        assert_eq!(
-            transfer.amount,
-            dec!(100),
+        assert!(
+            transfer.amount.eq(float!(100)).unwrap(),
             "Should return the 100 USDC withdrawal, not a 0.01 USDC deposit"
         );
         assert_eq!(transfer.direction, TransferDirection::Outgoing);
@@ -1041,5 +1050,29 @@ mod tests {
     fn complete_and_failed_are_not_pending() {
         assert!(!TransferStatus::Complete.is_pending());
         assert!(!TransferStatus::Failed.is_pending());
+    }
+
+    #[test]
+    fn malformed_decimal_string_fails_deserialization() {
+        let malformed = json!({
+            "id": Uuid::new_v4(),
+            "direction": "OUTGOING",
+            "amount": "not_a_number",
+            "usd_value": "100.0",
+            "chain": "BASE",
+            "asset": "USDC",
+            "from_address": Address::ZERO,
+            "to_address": Address::ZERO,
+            "status": "COMPLETE",
+            "created_at": "2025-01-01T00:00:00Z",
+            "network_fee": "0.001",
+            "fees": "0.0"
+        });
+
+        let error = serde_json::from_value::<Transfer>(malformed).unwrap_err();
+        assert!(
+            error.to_string().contains("Float"),
+            "error should indicate Float parse failure: {error}"
+        );
     }
 }

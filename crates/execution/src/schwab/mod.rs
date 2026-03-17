@@ -1,3 +1,4 @@
+use rain_math_float::FloatError;
 use reqwest::header::InvalidHeaderValue;
 use thiserror::Error;
 
@@ -108,6 +109,10 @@ pub enum SchwabError {
     /// Invalid share quantity for Schwab API (requires whole shares).
     #[error("Invalid shares for Schwab API: {0}")]
     InvalidShares(#[from] InvalidSharesError),
+
+    /// Float arithmetic error during price calculation.
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
 }
 
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {

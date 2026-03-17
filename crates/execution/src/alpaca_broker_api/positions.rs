@@ -1,27 +1,38 @@
 //! Position fetching for Alpaca Broker API.
 
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
+use rain_math_float::Float;
 use serde::Deserialize;
+use st0x_float_macro::float;
 use tracing::{debug, error};
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
-use crate::{EquityPosition, FractionalShares, Inventory, Symbol};
+use crate::{
+    EquityPosition, FractionalShares, Inventory, Symbol, deserialize_float_from_number_or_string,
+    deserialize_option_float_from_number_or_string,
+};
 
 /// Position response from Alpaca Broker API.
 #[derive(Debug, Deserialize)]
 struct PositionResponse {
     symbol: String,
-    #[serde(rename = "qty")]
-    quantity: Decimal,
-    market_value: Option<Decimal>,
+    #[serde(
+        rename = "qty",
+        deserialize_with = "deserialize_float_from_number_or_string"
+    )]
+    quantity: Float,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    market_value: Option<Float>,
 }
 
 /// Account details response from Alpaca Broker API.
 #[derive(Debug, Deserialize)]
 struct AccountDetailsResponse {
-    cash: Decimal,
+    #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
+    cash: Float,
 }
 
 pub(super) async fn fetch_inventory(
@@ -41,27 +52,38 @@ pub(super) async fn fetch_inventory(
                 );
             })?;
 
+            let quantity = FractionalShares::new(position.quantity);
+
             Ok(EquityPosition {
                 symbol,
-                quantity: FractionalShares::new(position.quantity),
+                quantity,
                 market_value: position.market_value,
             })
         })
         .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
 
-    let cents_decimal = account
-        .cash
-        .checked_mul(Decimal::from(100))
-        .ok_or(AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
+    let hundred = float!(100);
+    let cents = (account.cash * hundred).map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let frac = cents
+        .frac()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
 
-    if !cents_decimal.fract().is_zero() {
+    if !frac
+        .is_zero()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?
+    {
         return Err(AlpacaBrokerApiError::FractionalCents(account.cash));
     }
 
-    let cash_balance_cents = cents_decimal
-        .trunc()
-        .to_i64()
-        .ok_or(AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
+    let integer_cents = cents
+        .integer()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let formatted = integer_cents
+        .format_with_scientific(false)
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let cash_balance_cents: i64 = formatted
+        .parse()
+        .map_err(|_| AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
 
     Ok(Inventory {
         positions: broker_positions,
@@ -100,7 +122,6 @@ async fn get_account_details(
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
@@ -108,6 +129,19 @@ mod tests {
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
+    use st0x_float_macro::float;
+
+    fn shares(value: &str) -> FractionalShares {
+        FractionalShares::new(float!(value))
+    }
+
+    fn option_float_eq(lhs: Option<Float>, rhs: Option<Float>) -> bool {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) => lhs.eq(rhs).unwrap(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -171,8 +205,11 @@ mod tests {
             .iter()
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
-        assert_eq!(aapl.quantity, FractionalShares::new(dec!(10.5)));
-        assert_eq!(aapl.market_value, Some(dec!(1575.00)));
+        assert_eq!(aapl.quantity, shares("10.5"));
+        assert!(option_float_eq(
+            aapl.market_value,
+            Some(Float::parse("1575.00".to_string()).unwrap())
+        ));
     }
 
     #[tokio::test]
@@ -286,10 +323,12 @@ mod tests {
             .iter()
             .find(|p| p.symbol.to_string() == "AAPL")
             .unwrap();
-        assert_eq!(
-            aapl.market_value,
-            Some(dec!(1575.005)),
-            "Sub-cent market value 1575.005 should be preserved as Decimal"
+        assert!(
+            option_float_eq(
+                aapl.market_value,
+                Some(Float::parse("1575.005".to_string()).unwrap())
+            ),
+            "Sub-cent market value 1575.005 should be preserved as Float"
         );
     }
 
@@ -366,6 +405,52 @@ mod tests {
             .iter()
             .find(|position| position.symbol.to_string() == "RKLB")
             .unwrap();
-        assert_eq!(rklb.market_value, Some(dec!(511.6476)));
+        assert!(option_float_eq(
+            rklb.market_value,
+            Some(Float::parse("511.6476".to_string()).unwrap())
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_accepts_numeric_json_values() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty": 10.5,
+                        "market_value": 1575.00
+                    }
+                ]));
+        });
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({ "cash": "50000.00" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let state = fetch_inventory(&client).await.unwrap();
+
+        positions_mock.assert();
+        account_mock.assert();
+
+        assert_eq!(state.positions.len(), 1);
+
+        let aapl = &state.positions[0];
+        assert_eq!(aapl.quantity, shares("10.5"));
+        assert!(option_float_eq(
+            aapl.market_value,
+            Some(Float::parse("1575".to_string()).unwrap())
+        ));
     }
 }

@@ -333,21 +333,19 @@ impl<E: Executor> OrderStatusPoller<E> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
+    use sqlx::SqlitePool;
 
+    use rain_math_float::Float;
+    use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
-
-    use sqlx::SqlitePool;
-
-    use st0x_event_sorcery::{StoreBuilder, test_store};
 
     use super::*;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+    use st0x_float_macro::float;
 
     async fn create_test_frameworks(
         pool: &SqlitePool,
@@ -372,12 +370,12 @@ mod tests {
         position_store: &Store<Position>,
         symbol: &Symbol,
         tokenized_symbol: &str,
-        amount: Decimal,
+        amount: Float,
     ) {
         let mut onchain_trade = OnchainTradeBuilder::new()
             .with_symbol(tokenized_symbol)
             .with_amount(amount)
-            .with_price(dec!(150.0))
+            .with_price(float!(150.0))
             .build();
         onchain_trade.direction = Direction::Buy;
         onchain_trade.block_timestamp = Some(Utc::now());
@@ -456,9 +454,9 @@ mod tests {
         let ctx = OrderPollerCtx::default();
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(10))).unwrap();
 
-        setup_position_with_onchain_fill(&position_store, &symbol, "wtAAPL", dec!(10)).await;
+        setup_position_with_onchain_fill(&position_store, &symbol, "wtAAPL", float!(10)).await;
 
         let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(
@@ -496,7 +494,7 @@ mod tests {
             .handle_filled_order(
                 offchain_order_id,
                 &order,
-                Usd::new(dec!(150.25)),
+                Usd::new(float!(150.25)),
                 &ExecutorOrderId::new("ORD123"),
                 Utc::now(),
             )
@@ -542,9 +540,9 @@ mod tests {
         let ctx = OrderPollerCtx::default();
 
         let symbol = Symbol::new("TSLA").unwrap();
-        let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(5))).unwrap();
 
-        setup_position_with_onchain_fill(&position_store, &symbol, "wtTSLA", dec!(5)).await;
+        setup_position_with_onchain_fill(&position_store, &symbol, "wtTSLA", float!(5)).await;
 
         let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(

@@ -7,6 +7,8 @@ members = [
   "crates/finance",
   "crates/bridge",
   "crates/evm",
+  "crates/float-macro",
+  "crates/float-serde",
 ]
 resolver = "2"
 
@@ -39,58 +41,87 @@ must_use_candidate = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
+aes-gcm = "0.10.3"
 alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }
+alloy-primitives = "1.4"
+alloy-signer-turnkey = "=1.0.41"
+anyhow = "1.0.102"
+apca = "0.30.0"
+approx = "0.5.1"
 async-trait = "0.1.81"
-cqrs-es = "0.4"
-sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }
-revm = { version = "=25.0.0", default-features = false }
-# Pin wasm-bindgen version for compatibility with rain.wasm transitive dependency
-wasm-bindgen = "0.2.100"
-sqlx = { version = "0.8.6", features = [
-  "sqlite",
-  "chrono",
-  "runtime-tokio-rustls",
-] }
 backon = { version = "1.5.1", features = ["tokio"] }
 base64 = "0.22"
+bon = "3.9.0"
 chrono = { version = "0.4.38", features = ["serde"] }
+chrono-tz = "0.10.4"
 clap = { version = "4.5.40", features = ["derive", "env"] }
+cqrs-es = "0.4"
 flate2 = "1.0"
+futures-util = "0.3.31"
 httpmock = "0.8"
+itertools = "0.14.0"
+lazy_static = "1.5.0"
+num-decimal = { version = "0.2.5", default-features = false, features = [
+  "num-v04",
+] }
+num-traits = "0.2"
+opentelemetry = "0.30.0"
+opentelemetry-otlp = "0.30.0"
+opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
+proptest = "1.7.0"
+rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
 rain-math-float = { path = "lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
+rand = "0.8"
 reqwest = { version = "0.12.4", features = [
   "json",
   "rustls-tls",
   "gzip",
   "blocking",
 ] }
+revm = { version = "=25.0.0", default-features = false }
+rocket = { version = "0.5.1", features = ["json"] }
+rocket_ws = "0.1.1"
+rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.140"
 serial_test = "3.2.0"
+sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }
+sqlx = { version = "0.8.6", features = [
+  "sqlite",
+  "chrono",
+  "runtime-tokio-rustls",
+] }
+st0x-bridge = { path = "crates/bridge" }
+st0x-dto = { path = "crates/dto" }
+st0x-event-sorcery = { path = "crates/event-sorcery" }
+st0x-evm = { path = "crates/evm" }
+st0x-execution = { path = "crates/execution" }
+st0x-finance = { path = "crates/finance" }
+st0x-float-macro = { path = "crates/float-macro" }
+st0x-float-serde = { path = "crates/float-serde" }
+st0x-hedge = { path = "." }
+temp-env = "0.3.6"
+tempfile = "3.24.0"
+test-log = { version = "0.2.19", features = ["trace"] }
 thiserror = "2.0.12"
 tokio = { version = "1.46.0", features = ["full"] }
+tokio-tungstenite = "0.28.0"
+toml = "0.9.11"
 tracing = "0.1.41"
+tracing-opentelemetry = "0.31.0"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-test = "0.2.5"
+trybuild = "1.0.116"
+ts-rs = { version = "11.1.0", features = [
+  "chrono",
+  "chrono-impl",
+  "serde-compat",
+] }
 url = { version = "2.5.4", features = ["serde"] }
 urlencoding = "2.1"
-rand = "0.8"
-rsa = { version = "0.9.10", features = ["pem"] }
 uuid = { version = "1.11", features = ["serde", "v4"] }
-chrono-tz = "0.10.4"
-num-traits = "0.2"
-opentelemetry = "0.30.0"
-opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
-opentelemetry-otlp = "0.30.0"
-tracing-opentelemetry = "0.31.0"
-proptest = "1.7.0"
-rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
-rust_decimal = { version = "1.38.0", features = ["serde"] }
-rust_decimal_macros = "1.40.0"
-alloy-primitives = "1.4"
-st0x-evm = { path = "crates/evm" }
-st0x-finance = { path = "crates/finance" }
-num-decimal = { version = "0.2.5", default-features = false, features = [
-  "num-v04",
-] }
+# Pin wasm-bindgen version for compatibility with rain.wasm transitive dependency
+wasm-bindgen = "0.2.100"
 
 [package]
 name = "st0x-hedge"
@@ -110,85 +141,76 @@ wallet-turnkey = ["st0x-evm/turnkey"]
 wallet-private-key = ["st0x-evm/local-signer"]
 
 [dependencies]
+aes-gcm.workspace = true
 alloy.workspace = true
-anyhow = "1.0.98"
+alloy-primitives.workspace = true
+anyhow.workspace = true
 async-trait.workspace = true
-sqlite-es.workspace = true
-st0x-event-sorcery = { path = "crates/event-sorcery" }
-st0x-dto = { path = "crates/dto" }
-st0x-bridge = { path = "crates/bridge", features = ["cctp"] }
-st0x-execution = { path = "crates/execution" }
 backon.workspace = true
-clap.workspace = true
-futures-util = "0.3.31"
-lazy_static = "1.5.0"
-rain-math-float.workspace = true
-serde_json.workspace = true
-sqlx.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-url.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-chrono.workspace = true
 base64.workspace = true
-uuid.workspace = true
-tracing.workspace = true
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-urlencoding.workspace = true
-flate2.workspace = true
-itertools = "0.14.0"
-rand.workspace = true
-rocket = { version = "0.5.1", features = ["json"] }
+bon.workspace = true
+chrono.workspace = true
 chrono-tz.workspace = true
-aes-gcm = "0.10.3"
-rust_decimal.workspace = true
+clap.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+httpmock = { workspace = true, optional = true }
+itertools.workspace = true
+lazy_static.workspace = true
 num-traits.workspace = true
 opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
-tracing-opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 rain-error-decoding.workspace = true
-ts-rs = { version = "11.1.0", features = [
-  "chrono",
-  "chrono-impl",
-  "serde-compat",
-] }
-rocket_ws = "0.1.1"
-toml = "0.9.11"
-rust_decimal_macros = "1.38.0"
+rain-math-float.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rocket.workspace = true
+rocket_ws.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlite-es.workspace = true
+sqlx.workspace = true
+st0x-bridge = { workspace = true, features = ["cctp"] }
+st0x-dto.workspace = true
+st0x-event-sorcery.workspace = true
 st0x-evm.workspace = true
-bon = "3.9.0"
-httpmock = { workspace = true, optional = true }
-st0x-finance = { workspace = true, features = ["alloy"] }
+st0x-execution.workspace = true
+st0x-finance.workspace = true
+st0x-float-macro.workspace = true
+st0x-float-serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+ts-rs.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+approx.workspace = true
 async-trait.workspace = true
+bon.workspace = true
 httpmock.workspace = true
-serial_test.workspace = true
 proptest.workspace = true
 rain-math-float.workspace = true
-rust_decimal_macros = "1.38.0"
-temp-env = "0.3.6"
-tokio-tungstenite = "0.28.0"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-url.workspace = true
-st0x-bridge = { path = "crates/bridge", features = ["mock"] }
-st0x-event-sorcery = { path = "crates/event-sorcery", features = [
-  "test-support",
-] }
-st0x-evm = { workspace = true, features = ["mock"] }
-st0x-execution = { path = "crates/execution", features = [
-  "mock",
-  "test-support",
-] }
-st0x-hedge = { path = ".", features = ["test-support", "mock"] }
-tempfile = "3.24.0"
-tracing-test = "0.2.5"
-bon = "3.9.0"
-test-log = { version = "0.2.19", features = ["trace"] }
-approx = "0.5.1"
 rsa.workspace = true
+serial_test.workspace = true
+st0x-bridge = { workspace = true, features = ["mock"] }
+st0x-event-sorcery = { workspace = true, features = ["test-support"] }
+st0x-evm = { workspace = true, features = ["mock"] }
+st0x-execution = { workspace = true, features = ["mock", "test-support"] }
+st0x-hedge = { workspace = true, features = ["test-support", "mock"] }
+temp-env.workspace = true
+tempfile.workspace = true
+test-log.workspace = true
+tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true
+tracing-test.workspace = true
+url.workspace = true
 
 [[test]]
 name = "e2e"

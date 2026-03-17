@@ -8,13 +8,12 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use st0x_execution::{
-    ArithmeticError, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
-    Symbol,
+    Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{Usd, Usdc};
 
@@ -23,7 +22,7 @@ use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use crate::offchain_order::OffchainOrderId;
 use crate::threshold::ExecutionThreshold;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: Symbol,
     pub net: FractionalShares,
@@ -31,7 +30,11 @@ pub struct Position {
     pub accumulated_short: FractionalShares,
     pub pending_offchain_order_id: Option<OffchainOrderId>,
     pub threshold: ExecutionThreshold,
-    pub last_price_usdc: Option<Decimal>,
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_option_float",
+        deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
+    )]
+    pub last_price_usdc: Option<Float>,
     pub last_updated: Option<DateTime<Utc>>,
 }
 
@@ -292,19 +295,16 @@ impl Position {
     fn create_trigger_reason(
         &self,
         threshold: &ExecutionThreshold,
-    ) -> Result<Option<TriggerReason>, ArithmeticError<Usdc>> {
+    ) -> Result<Option<TriggerReason>, PositionError> {
         match threshold {
             ExecutionThreshold::Shares(threshold_shares) => {
-                let net_abs = self.net.abs();
+                let net_abs = self.net.abs()?;
                 let threshold_value = threshold_shares.inner().inner();
-                Ok(
-                    (net_abs.inner() >= threshold_value).then_some(
-                        TriggerReason::SharesThreshold {
-                            net_position_shares: net_abs.inner(),
-                            threshold_shares: threshold_value,
-                        },
-                    ),
-                )
+                let meets_threshold = net_abs.inner().gte(threshold_value)?;
+                Ok(meets_threshold.then_some(TriggerReason::SharesThreshold {
+                    net_position_shares: net_abs.inner(),
+                    threshold_shares: threshold_value,
+                }))
             }
             ExecutionThreshold::DollarValue(threshold_dollars) => {
                 let Some(price) = self.last_price_usdc else {
@@ -316,10 +316,10 @@ impl Position {
                     return Ok(None);
                 };
 
-                let net_abs = self.net.abs();
+                let net_abs = self.net.abs()?;
                 let dollar_value = (Usdc::new(price) * net_abs.inner())?;
 
-                if dollar_value.inner() >= threshold_dollars.inner() {
+                if dollar_value.inner().gte(threshold_dollars.inner())? {
                     Ok(Some(TriggerReason::DollarThreshold {
                         net_position_shares: self.net.inner(),
                         dollar_value: dollar_value.inner(),
@@ -376,7 +376,7 @@ impl Position {
 
         match trigger {
             Some(TriggerReason::SharesThreshold { .. } | TriggerReason::DollarThreshold { .. }) => {
-                let raw_shares = self.net.abs();
+                let raw_shares = self.net.abs()?;
 
                 let capped_shares = shares_limit.map_or(raw_shares, |cap| {
                     let cap = cap.inner();
@@ -396,17 +396,17 @@ impl Position {
                 let executable_shares = if executor.supports_fractional_shares() {
                     capped_shares
                 } else {
-                    FractionalShares::new(capped_shares.inner().trunc())
+                    FractionalShares::new(capped_shares.inner().integer()?)
                 };
 
-                if executable_shares.is_zero() {
+                if executable_shares.is_zero()? {
                     return Ok(None);
                 }
 
-                let direction = if self.net.inner() > Decimal::ZERO {
-                    Direction::Sell
-                } else {
+                let direction = if self.net.is_negative()? {
                     Direction::Buy
+                } else {
+                    Direction::Sell
                 };
 
                 Ok(Some((direction, executable_shares)))
@@ -444,10 +444,20 @@ pub enum PositionError {
         expected: OffchainOrderId,
         actual: OffchainOrderId,
     },
-    #[error(transparent)]
-    Arithmetic(#[from] ArithmeticError<FractionalShares>),
-    #[error("Arithmetic error calculating threshold: {0}")]
-    ThresholdCalculation(#[from] ArithmeticError<Usdc>),
+    // Stores the error as String rather than the typed FloatError because
+    // PositionError must implement Serialize/Deserialize (it's a CQRS error
+    // type stored in the event log), and FloatError from rain_float does not
+    // implement those traits. This is a conscious trade-off, not an oversight.
+    #[error("Float arithmetic error: {0}")]
+    Float(String),
+}
+
+// FloatError cannot be stored directly in PositionError (see comment on the
+// Float variant above), so we convert to String here at the boundary.
+impl From<FloatError> for PositionError {
+    fn from(error: FloatError) -> Self {
+        Self::Float(error.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,7 +468,7 @@ pub enum PositionCommand {
         trade_id: TradeId,
         amount: FractionalShares,
         direction: Direction,
-        price_usdc: Decimal,
+        price_usdc: Float,
         block_timestamp: DateTime<Utc>,
     },
     PlaceOffChainOrder {
@@ -485,7 +495,7 @@ pub enum PositionCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PositionEvent {
     Initialized {
         symbol: Symbol,
@@ -496,7 +506,11 @@ pub enum PositionEvent {
         trade_id: TradeId,
         amount: FractionalShares,
         direction: Direction,
-        price_usdc: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
         block_timestamp: DateTime<Utc>,
         seen_at: DateTime<Utc>,
     },
@@ -562,6 +576,114 @@ impl DomainEvent for PositionEvent {
     }
 }
 
+/// Required by `cqrs_es::DomainEvent`.
+impl PartialEq for PositionEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Initialized {
+                    symbol: s1,
+                    threshold: t1,
+                    initialized_at: i1,
+                },
+                Self::Initialized {
+                    symbol: s2,
+                    threshold: t2,
+                    initialized_at: i2,
+                },
+            ) => s1 == s2 && t1 == t2 && i1 == i2,
+            (
+                Self::OnChainOrderFilled {
+                    trade_id: t1,
+                    amount: a1,
+                    direction: d1,
+                    price_usdc: p1,
+                    block_timestamp: bt1,
+                    seen_at: sa1,
+                },
+                Self::OnChainOrderFilled {
+                    trade_id: t2,
+                    amount: a2,
+                    direction: d2,
+                    price_usdc: p2,
+                    block_timestamp: bt2,
+                    seen_at: sa2,
+                },
+            ) => {
+                t1 == t2
+                    && a1 == a2
+                    && d1 == d2
+                    && p1.eq(*p2).unwrap_or(false)
+                    && bt1 == bt2
+                    && sa1 == sa2
+            }
+            (
+                Self::OffChainOrderPlaced {
+                    offchain_order_id: o1,
+                    shares: s1,
+                    direction: d1,
+                    executor: e1,
+                    trigger_reason: tr1,
+                    placed_at: pa1,
+                },
+                Self::OffChainOrderPlaced {
+                    offchain_order_id: o2,
+                    shares: s2,
+                    direction: d2,
+                    executor: e2,
+                    trigger_reason: tr2,
+                    placed_at: pa2,
+                },
+            ) => o1 == o2 && s1 == s2 && d1 == d2 && e1 == e2 && tr1 == tr2 && pa1 == pa2,
+            (
+                Self::OffChainOrderFilled {
+                    offchain_order_id: o1,
+                    shares_filled: sf1,
+                    direction: d1,
+                    executor_order_id: eo1,
+                    price: p1,
+                    broker_timestamp: bt1,
+                },
+                Self::OffChainOrderFilled {
+                    offchain_order_id: o2,
+                    shares_filled: sf2,
+                    direction: d2,
+                    executor_order_id: eo2,
+                    price: p2,
+                    broker_timestamp: bt2,
+                },
+            ) => o1 == o2 && sf1 == sf2 && d1 == d2 && eo1 == eo2 && p1 == p2 && bt1 == bt2,
+            (
+                Self::OffChainOrderFailed {
+                    offchain_order_id: o1,
+                    error: e1,
+                    failed_at: f1,
+                },
+                Self::OffChainOrderFailed {
+                    offchain_order_id: o2,
+                    error: e2,
+                    failed_at: f2,
+                },
+            ) => o1 == o2 && e1 == e2 && f1 == f2,
+            (
+                Self::ThresholdUpdated {
+                    old_threshold: ot1,
+                    new_threshold: nt1,
+                    updated_at: u1,
+                },
+                Self::ThresholdUpdated {
+                    old_threshold: ot2,
+                    new_threshold: nt2,
+                    updated_at: u2,
+                },
+            ) => ot1 == ot2 && nt1 == nt2 && u1 == u2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PositionEvent {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TradeId {
     pub tx_hash: TxHash,
@@ -574,24 +696,86 @@ impl std::fmt::Display for TradeId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TriggerReason {
     SharesThreshold {
-        net_position_shares: Decimal,
-        threshold_shares: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        net_position_shares: Float,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        threshold_shares: Float,
     },
     DollarThreshold {
-        net_position_shares: Decimal,
-        dollar_value: Decimal,
-        price_usdc: Decimal,
-        threshold_dollars: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        net_position_shares: Float,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        dollar_value: Float,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        threshold_dollars: Float,
     },
 }
 
+/// Required by `cqrs_es::DomainEvent` (via `PositionEvent`).
+impl PartialEq for TriggerReason {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::SharesThreshold {
+                    net_position_shares: n1,
+                    threshold_shares: t1,
+                },
+                Self::SharesThreshold {
+                    net_position_shares: n2,
+                    threshold_shares: t2,
+                },
+            ) => n1.eq(*n2).unwrap_or(false) && t1.eq(*t2).unwrap_or(false),
+            (
+                Self::DollarThreshold {
+                    net_position_shares: n1,
+                    dollar_value: d1,
+                    price_usdc: p1,
+                    threshold_dollars: t1,
+                },
+                Self::DollarThreshold {
+                    net_position_shares: n2,
+                    dollar_value: d2,
+                    price_usdc: p2,
+                    threshold_dollars: t2,
+                },
+            ) => {
+                n1.eq(*n2).unwrap_or(false)
+                    && d1.eq(*d2).unwrap_or(false)
+                    && p1.eq(*p2).unwrap_or(false)
+                    && t1.eq(*t2).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TriggerReason {}
+
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use st0x_execution::Positive;
 
     use st0x_event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
@@ -599,9 +783,10 @@ mod tests {
     use st0x_finance::Usdc;
 
     use super::*;
+    use st0x_float_macro::float;
 
     fn one_share_threshold() -> ExecutionThreshold {
-        ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+        ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1))).unwrap())
     }
 
     #[tokio::test]
@@ -615,9 +800,9 @@ mod tests {
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
-                amount: FractionalShares::new(dec!(0.5)),
+                amount: FractionalShares::new(float!(0.5)),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150),
                 block_timestamp: Utc::now(),
             })
             .await
@@ -643,9 +828,9 @@ mod tests {
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
-                amount: FractionalShares::new(dec!(0.5)),
+                amount: FractionalShares::new(float!(0.5)),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150),
                 block_timestamp: Utc::now(),
             })
             .await
@@ -670,9 +855,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(0.6)),
+                    amount: FractionalShares::new(float!(0.6)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150),
                     block_timestamp: Utc::now(),
                     seen_at: Utc::now(),
                 },
@@ -681,16 +866,16 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },
-                    amount: FractionalShares::new(dec!(0.5)),
+                    amount: FractionalShares::new(float!(0.5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(151.0),
+                    price_usdc: float!(151),
                     block_timestamp: Utc::now(),
                     seen_at: Utc::now(),
                 },
             ])
             .when(PositionCommand::PlaceOffChainOrder {
                 offchain_order_id: OffchainOrderId::new(),
-                shares: Positive::new(FractionalShares::ONE).unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
                 threshold,
@@ -717,16 +902,16 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(0.5)),
+                    amount: FractionalShares::new(float!(0.5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150),
                     block_timestamp: Utc::now(),
                     seen_at: Utc::now(),
                 },
             ])
             .when(PositionCommand::PlaceOffChainOrder {
                 offchain_order_id: OffchainOrderId::new(),
-                shares: Positive::new(FractionalShares::ONE).unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
                 threshold,
@@ -757,27 +942,27 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(1.5)),
+                    amount: FractionalShares::new(float!(1.5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150),
                     block_timestamp: Utc::now(),
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
                     offchain_order_id,
-                    shares: Positive::new(FractionalShares::ONE).unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     direction: Direction::Sell,
                     executor: SupportedExecutor::Schwab,
                     trigger_reason: TriggerReason::SharesThreshold {
-                        net_position_shares: dec!(1.5),
-                        threshold_shares: dec!(1.0),
+                        net_position_shares: float!(1.5),
+                        threshold_shares: float!(1),
                     },
                     placed_at: Utc::now(),
                 },
             ])
             .when(PositionCommand::PlaceOffChainOrder {
                 offchain_order_id: OffchainOrderId::new(),
-                shares: Positive::new(FractionalShares::new(dec!(0.5))).unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
                 threshold,
@@ -808,30 +993,30 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(1.5)),
+                    amount: FractionalShares::new(float!(1.5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150),
                     block_timestamp: Utc::now(),
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
                     offchain_order_id,
-                    shares: Positive::new(FractionalShares::ONE).unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     direction: Direction::Sell,
                     executor: SupportedExecutor::Schwab,
                     trigger_reason: TriggerReason::SharesThreshold {
-                        net_position_shares: dec!(1.5),
-                        threshold_shares: dec!(1.0),
+                        net_position_shares: float!(1.5),
+                        threshold_shares: float!(1),
                     },
                     placed_at: Utc::now(),
                 },
             ])
             .when(PositionCommand::CompleteOffChainOrder {
                 offchain_order_id,
-                shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
+                shares_filled: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
                 executor_order_id: ExecutorOrderId::new("ORDER123"),
-                price: Usd::new(dec!(150.50)),
+                price: Usd::new(float!(150.50)),
                 broker_timestamp: Utc::now(),
             })
             .await
@@ -857,20 +1042,20 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(1.5)),
+                    amount: FractionalShares::new(float!(1.5)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150),
                     block_timestamp: Utc::now(),
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
                     offchain_order_id,
-                    shares: Positive::new(FractionalShares::ONE).unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     direction: Direction::Sell,
                     executor: SupportedExecutor::Schwab,
                     trigger_reason: TriggerReason::SharesThreshold {
-                        net_position_shares: dec!(1.5),
-                        threshold_shares: dec!(1.0),
+                        net_position_shares: float!(1.5),
+                        threshold_shares: float!(1),
                     },
                     placed_at: Utc::now(),
                 },
@@ -895,7 +1080,7 @@ mod tests {
             }])
             .when(PositionCommand::UpdateThreshold {
                 threshold: ExecutionThreshold::shares(
-                    Positive::new(FractionalShares::new(dec!(5.0))).unwrap(),
+                    Positive::new(FractionalShares::new(float!(5))).unwrap(),
                 ),
             })
             .await
@@ -919,36 +1104,36 @@ mod tests {
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
-                amount: FractionalShares::new(dec!(2.0)),
+                amount: FractionalShares::new(float!(2)),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150),
                 block_timestamp: Utc::now(),
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
                 offchain_order_id,
-                shares: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
                 trigger_reason: TriggerReason::SharesThreshold {
-                    net_position_shares: dec!(2.0),
-                    threshold_shares: dec!(1.0),
+                    net_position_shares: float!(2),
+                    threshold_shares: float!(1),
                 },
                 placed_at: Utc::now(),
             },
             PositionEvent::OffChainOrderFilled {
                 offchain_order_id,
-                shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+                shares_filled: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
                 direction: Direction::Sell,
                 executor_order_id: ExecutorOrderId::new("ORDER123"),
-                price: Usd::new(dec!(150.50)),
+                price: Usd::new(float!(150.50)),
                 broker_timestamp: Utc::now(),
             },
         ])
         .unwrap()
         .unwrap();
 
-        assert_eq!(position.net, FractionalShares::new(dec!(0.5)));
+        assert_eq!(position.net, FractionalShares::new(float!(0.5)));
         assert!(
             position.pending_offchain_order_id.is_none(),
             "pending_offchain_order_id should be cleared \
@@ -971,36 +1156,36 @@ mod tests {
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
-                amount: FractionalShares::new(dec!(2.0)),
+                amount: FractionalShares::new(float!(2)),
                 direction: Direction::Sell,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150),
                 block_timestamp: Utc::now(),
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
                 offchain_order_id,
-                shares: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
                 direction: Direction::Buy,
                 executor: SupportedExecutor::Schwab,
                 trigger_reason: TriggerReason::SharesThreshold {
-                    net_position_shares: dec!(2.0),
-                    threshold_shares: dec!(1.0),
+                    net_position_shares: float!(2),
+                    threshold_shares: float!(1),
                 },
                 placed_at: Utc::now(),
             },
             PositionEvent::OffChainOrderFilled {
                 offchain_order_id,
-                shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+                shares_filled: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
                 direction: Direction::Buy,
                 executor_order_id: ExecutorOrderId::new("ORDER456"),
-                price: Usd::new(dec!(150.50)),
+                price: Usd::new(float!(150.50)),
                 broker_timestamp: Utc::now(),
             },
         ])
         .unwrap()
         .unwrap();
 
-        assert_eq!(position.net, FractionalShares::new(dec!(-0.5)));
+        assert_eq!(position.net, FractionalShares::new(float!(-0.5)));
         assert!(
             position.pending_offchain_order_id.is_none(),
             "pending_offchain_order_id should be cleared \
@@ -1023,20 +1208,20 @@ mod tests {
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
-                amount: FractionalShares::new(dec!(1.5)),
+                amount: FractionalShares::new(float!(1.5)),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150),
                 block_timestamp: Utc::now(),
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
                 offchain_order_id,
-                shares: Positive::new(FractionalShares::ONE).unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
                 trigger_reason: TriggerReason::SharesThreshold {
-                    net_position_shares: dec!(1.5),
-                    threshold_shares: dec!(1.0),
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
                 },
                 placed_at: Utc::now(),
             },
@@ -1049,7 +1234,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(position.net, FractionalShares::new(dec!(1.5)));
+        assert_eq!(position.net, FractionalShares::new(float!(1.5)));
         assert!(
             position.pending_offchain_order_id.is_none(),
             "pending_offchain_order_id should be cleared \
@@ -1059,7 +1244,7 @@ mod tests {
 
     #[test]
     fn threshold_updated_changes_threshold() {
-        let new_threshold = ExecutionThreshold::dollar_value(Usdc::new(dec!(10000))).unwrap();
+        let new_threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(10000))).unwrap();
 
         let position = replay::<Position>(vec![
             PositionEvent::Initialized {
@@ -1087,8 +1272,8 @@ mod tests {
                 log_index: 0,
             },
             direction: Direction::Buy,
-            amount: FractionalShares::new(dec!(10)),
-            price_usdc: dec!(150.00),
+            amount: FractionalShares::new(float!(10)),
+            price_usdc: float!(150),
             block_timestamp: Utc::now(),
             seen_at: Utc::now(),
         }])
@@ -1118,9 +1303,9 @@ mod tests {
                 tx_hash: TxHash::random(),
                 log_index: 0,
             },
-            amount: FractionalShares::ONE,
+            amount: FractionalShares::new(float!(1)),
             direction: Direction::Buy,
-            price_usdc: dec!(150.0),
+            price_usdc: float!(150),
             block_timestamp,
             seen_at,
         };
@@ -1133,12 +1318,12 @@ mod tests {
         let timestamp = Utc::now();
         let event = PositionEvent::OffChainOrderPlaced {
             offchain_order_id: OffchainOrderId::new(),
-            shares: Positive::new(FractionalShares::ONE).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             trigger_reason: TriggerReason::SharesThreshold {
-                net_position_shares: dec!(1.0),
-                threshold_shares: dec!(1.0),
+                net_position_shares: float!(1),
+                threshold_shares: float!(1),
             },
             placed_at: timestamp,
         };
@@ -1151,10 +1336,10 @@ mod tests {
         let timestamp = Utc::now();
         let event = PositionEvent::OffChainOrderFilled {
             offchain_order_id: OffchainOrderId::new(),
-            shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
+            shares_filled: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Sell,
             executor_order_id: ExecutorOrderId::new("ORD123"),
-            price: Usd::new(dec!(150.00)),
+            price: Usd::new(float!(150.00)),
             broker_timestamp: timestamp,
         };
 
@@ -1179,7 +1364,7 @@ mod tests {
         let event = PositionEvent::ThresholdUpdated {
             old_threshold: ExecutionThreshold::whole_share(),
             new_threshold: ExecutionThreshold::shares(
-                Positive::new(FractionalShares::new(dec!(5.0))).unwrap(),
+                Positive::new(FractionalShares::new(float!(5))).unwrap(),
             ),
             updated_at: timestamp,
         };
@@ -1191,12 +1376,12 @@ mod tests {
     fn is_ready_for_execution_floors_shares_for_non_fractional_executor() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(1.212)),
-            accumulated_long: FractionalShares::new(dec!(1.212)),
+            net: FractionalShares::new(float!(1.212)),
+            accumulated_long: FractionalShares::new(float!(1.212)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150.0)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
@@ -1207,11 +1392,10 @@ mod tests {
 
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
-            shares.inner(),
-            dec!(1),
+            shares,
+            FractionalShares::new(float!(1)),
             "Schwab executor should floor to whole \
-             shares: expected 1, got {}",
-            shares.inner()
+             shares: expected 1, got {shares}",
         );
     }
 
@@ -1219,12 +1403,12 @@ mod tests {
     fn is_ready_for_execution_floors_shares_for_negative_position_with_non_fractional_executor() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(-2.567)),
+            net: FractionalShares::new(float!(-2.567)),
             accumulated_long: FractionalShares::ZERO,
-            accumulated_short: FractionalShares::new(dec!(2.567)),
+            accumulated_short: FractionalShares::new(float!(2.567)),
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150.0)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
@@ -1235,11 +1419,10 @@ mod tests {
 
         assert_eq!(direction, Direction::Buy);
         assert_eq!(
-            shares.inner(),
-            dec!(2),
+            shares,
+            FractionalShares::new(float!(2)),
             "Schwab executor should floor to whole \
-             shares: expected 2, got {}",
-            shares.inner()
+             shares: expected 2, got {shares}",
         );
     }
 
@@ -1247,12 +1430,12 @@ mod tests {
     fn is_ready_for_execution_returns_fractional_shares_for_fractional_executor() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(1.212)),
-            accumulated_long: FractionalShares::new(dec!(1.212)),
+            net: FractionalShares::new(float!(1.212)),
+            accumulated_long: FractionalShares::new(float!(1.212)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc::new(dec!(1))).unwrap(),
-            last_price_usdc: Some(dec!(150.0)),
+            threshold: ExecutionThreshold::dollar_value(Usdc::new(float!(1))).unwrap(),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
@@ -1263,11 +1446,10 @@ mod tests {
 
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
-            shares.inner(),
-            dec!(1.212),
+            shares,
+            FractionalShares::new(float!(1.212)),
             "Alpaca executor should return full \
-             fractional shares: expected 1.212, got {}",
-            shares.inner()
+             fractional shares: expected 1.212, got {shares}",
         );
     }
 
@@ -1275,12 +1457,12 @@ mod tests {
     fn is_ready_for_execution_returns_fractional_for_negative_position_with_fractional_executor() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(-2.567)),
+            net: FractionalShares::new(float!(-2.567)),
             accumulated_long: FractionalShares::ZERO,
-            accumulated_short: FractionalShares::new(dec!(2.567)),
+            accumulated_short: FractionalShares::new(float!(2.567)),
             pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc::new(dec!(1))).unwrap(),
-            last_price_usdc: Some(dec!(150.0)),
+            threshold: ExecutionThreshold::dollar_value(Usdc::new(float!(1))).unwrap(),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
@@ -1291,11 +1473,10 @@ mod tests {
 
         assert_eq!(direction, Direction::Buy);
         assert_eq!(
-            shares.inner(),
-            dec!(2.567),
+            shares,
+            FractionalShares::new(float!(2.567)),
             "Alpaca executor should return full \
-             fractional shares: expected 2.567, got {}",
-            shares.inner()
+             fractional shares: expected 2.567, got {shares}",
         );
     }
 
@@ -1303,16 +1484,16 @@ mod tests {
     fn operational_limits_cap_shares() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(100)),
-            accumulated_long: FractionalShares::new(dec!(100)),
+            net: FractionalShares::new(float!(100)),
+            accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150.0)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
@@ -1321,11 +1502,10 @@ mod tests {
 
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
-            shares.inner(),
-            dec!(50),
+            shares,
+            FractionalShares::new(float!(50)),
             "Shares should be capped by operational \
-             limit: expected 50, got {}",
-            shares.inner()
+             limit: expected 50, got {shares}",
         );
     }
 
@@ -1333,16 +1513,16 @@ mod tests {
     fn operational_limits_do_not_cap_below_limit() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(30)),
-            accumulated_long: FractionalShares::new(dec!(30)),
+            net: FractionalShares::new(float!(30)),
+            accumulated_long: FractionalShares::new(float!(30)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150.0)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
@@ -1351,11 +1531,10 @@ mod tests {
 
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
-            shares.inner(),
-            dec!(30),
+            shares,
+            FractionalShares::new(float!(30)),
             "Shares should not be capped when below \
-             limit: expected 30, got {}",
-            shares.inner()
+             limit: expected 30, got {shares}",
         );
     }
 
@@ -1363,16 +1542,16 @@ mod tests {
     fn operational_limits_cap_floors_for_non_fractional_executor() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(100)),
-            accumulated_long: FractionalShares::new(dec!(100)),
+            net: FractionalShares::new(float!(100)),
+            accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150.0)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50.7))).unwrap();
+        let shares_limit = Positive::new(FractionalShares::new(float!(50.7))).unwrap();
 
         let (_, shares) = position
             .is_ready_for_execution(SupportedExecutor::Schwab, Some(shares_limit))
@@ -1380,11 +1559,10 @@ mod tests {
             .expect("should be ready for execution");
 
         assert_eq!(
-            shares.inner(),
-            dec!(50),
+            shares,
+            FractionalShares::new(float!(50)),
             "Non-fractional executor should floor capped shares: \
-             cap is 50.7, floored to 50, got {}",
-            shares.inner()
+             cap is 50.7, floored to 50, got {shares}",
         );
     }
 
@@ -1393,16 +1571,16 @@ mod tests {
         // Fractional shares cap of 7.5 should constrain a 10-share position
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(10)),
-            accumulated_long: FractionalShares::new(dec!(10)),
+            net: FractionalShares::new(float!(10)),
+            accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(7.5))).unwrap();
+        let shares_limit = Positive::new(FractionalShares::new(float!(7.5))).unwrap();
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
@@ -1411,10 +1589,9 @@ mod tests {
 
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
-            shares.inner(),
-            dec!(7.5),
-            "Fractional shares cap should limit to 7.5 shares, got {}",
-            shares.inner()
+            shares,
+            FractionalShares::new(float!(7.5)),
+            "Fractional shares cap should limit to 7.5 shares, got {shares}",
         );
     }
 
@@ -1423,16 +1600,16 @@ mod tests {
         // Fractional executor with shares cap (5) tighter than position (10)
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(10)),
-            accumulated_long: FractionalShares::new(dec!(10)),
+            net: FractionalShares::new(float!(10)),
+            accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(5))).unwrap();
+        let shares_limit = Positive::new(FractionalShares::new(float!(5))).unwrap();
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
@@ -1441,10 +1618,9 @@ mod tests {
 
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
-            shares.inner(),
-            dec!(5),
-            "Shares cap should limit to 5 shares, got {}",
-            shares.inner()
+            shares,
+            FractionalShares::new(float!(5)),
+            "Shares cap should limit to 5 shares, got {shares}",
         );
     }
 
@@ -1453,8 +1629,8 @@ mod tests {
         // Shares cap works regardless of whether last_price_usdc is available
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(100)),
-            accumulated_long: FractionalShares::new(dec!(100)),
+            net: FractionalShares::new(float!(100)),
+            accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
@@ -1462,7 +1638,7 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
 
         let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
@@ -1471,10 +1647,9 @@ mod tests {
 
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
-            shares.inner(),
-            dec!(50),
-            "Without price, only shares cap applies: expected 50, got {}",
-            shares.inner()
+            shares,
+            FractionalShares::new(float!(50)),
+            "Without price, only shares cap applies: expected 50, got {shares}",
         );
     }
 
@@ -1511,9 +1686,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
-                    amount: FractionalShares::new(dec!(1)),
+                    amount: FractionalShares::new(float!(1)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150),
+                    price_usdc: float!(150),
                     block_timestamp: Utc::now(),
                 },
             )
@@ -1524,21 +1699,21 @@ mod tests {
 
         let position = result.expect("Should return Some for live lifecycle");
         assert_eq!(position.symbol, symbol);
-        assert_eq!(position.net.inner(), dec!(1));
+        assert_eq!(position.net, FractionalShares::new(float!(1)));
     }
 
     #[test]
     fn capped_execution_leaves_remaining_exposure_triggerable() {
-        let shares_limit = Positive::new(FractionalShares::new(dec!(50))).unwrap();
+        let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
 
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(dec!(120)),
-            accumulated_long: FractionalShares::new(dec!(120)),
+            net: FractionalShares::new(float!(120)),
+            accumulated_long: FractionalShares::new(float!(120)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(dec!(150.0)),
+            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
@@ -1547,15 +1722,15 @@ mod tests {
             .unwrap()
             .expect("first check should trigger");
         assert_eq!(
-            first_shares.inner(),
-            dec!(50),
+            first_shares,
+            FractionalShares::new(float!(50)),
             "First execution capped to 50"
         );
 
         // Simulate executing 50 shares: net goes from 120 to 70
         let after_first = Position {
-            net: FractionalShares::new(dec!(70)),
-            accumulated_long: FractionalShares::new(dec!(70)),
+            net: FractionalShares::new(float!(70)),
+            accumulated_long: FractionalShares::new(float!(70)),
             ..position.clone()
         };
 
@@ -1564,15 +1739,15 @@ mod tests {
             .unwrap()
             .expect("remaining 70 shares still exceeds threshold");
         assert_eq!(
-            second_shares.inner(),
-            dec!(50),
+            second_shares,
+            FractionalShares::new(float!(50)),
             "Second execution capped to 50"
         );
 
         // Simulate executing another 50: net goes from 70 to 20
         let after_second = Position {
-            net: FractionalShares::new(dec!(20)),
-            accumulated_long: FractionalShares::new(dec!(20)),
+            net: FractionalShares::new(float!(20)),
+            accumulated_long: FractionalShares::new(float!(20)),
             ..position
         };
 
@@ -1581,8 +1756,8 @@ mod tests {
             .unwrap()
             .expect("remaining 20 shares still exceeds threshold");
         assert_eq!(
-            third_shares.inner(),
-            dec!(20),
+            third_shares,
+            FractionalShares::new(float!(20)),
             "Third execution returns remaining 20 (below cap)"
         );
     }

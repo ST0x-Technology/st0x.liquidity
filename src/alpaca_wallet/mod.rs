@@ -23,12 +23,12 @@
 
 mod asset;
 mod client;
-mod serde;
 mod status;
 mod transfer;
 mod whitelist;
 
 use alloy::primitives::{Address, TxHash};
+use rain_math_float::Float;
 use std::sync::Arc;
 
 use st0x_execution::{AlpacaAccountId, Positive};
@@ -155,7 +155,7 @@ impl AlpacaWalletService {
             return Ok(Usdc::ZERO);
         };
 
-        if balance.is_sign_negative() {
+        if balance.lt(Float::zero()?)? {
             return Err(AlpacaWalletError::NegativeUsdcBalance { balance });
         }
 
@@ -224,13 +224,14 @@ impl AlpacaWalletService {
 mod tests {
     use alloy::primitives::address;
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
-    use st0x_execution::AlpacaAccountId;
     use std::time::Duration;
     use uuid::uuid;
 
+    use st0x_execution::AlpacaAccountId;
+
     use super::*;
+    use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -261,7 +262,7 @@ mod tests {
 
         let asset = TokenSymbol::new("USDC");
         let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
 
         assert!(matches!(
             service
@@ -296,7 +297,7 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
 
         assert!(matches!(
             service
@@ -353,7 +354,7 @@ mod tests {
         });
 
         let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc::new(dec!(100))).unwrap();
+        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
 
         let result = service
             .initiate_withdrawal(amount, &asset, &to_address)
@@ -437,7 +438,7 @@ mod tests {
 
         let balance = service.get_usdc_balance().await.unwrap();
 
-        assert_eq!(balance, Usdc::new(dec!(1250.75)));
+        assert!(balance.inner().eq(float!(1250.75)).unwrap());
         wallets_mock.assert();
     }
 
@@ -485,7 +486,7 @@ mod tests {
 
         assert!(matches!(
             service.get_usdc_balance().await.unwrap_err(),
-            AlpacaWalletError::NegativeUsdcBalance { balance } if balance == dec!(-10)
+            AlpacaWalletError::NegativeUsdcBalance { balance } if balance.eq(float!(-10)).unwrap_or(false)
         ));
         wallets_mock.assert();
     }

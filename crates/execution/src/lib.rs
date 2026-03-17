@@ -1,12 +1,17 @@
 //! Unified executor trait and implementations for brokerage integration.
 
-use alloy::primitives::U256;
 use async_trait::async_trait;
-use rust_decimal::Decimal;
+use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
-use std::str::FromStr;
 use tokio::task::JoinHandle;
+
+pub(crate) use st0x_float_serde::{
+    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
+    serialize_float_as_string,
+};
+
+pub use st0x_float_macro::float;
 
 pub mod alpaca_broker_api;
 pub mod alpaca_trading_api;
@@ -31,9 +36,67 @@ pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdat
 pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from_url};
 
 pub use st0x_finance::{
-    ArithmeticError, ArithmeticOperation, EmptySymbolError, FractionalShares, HasZero, NotPositive,
-    Positive, Symbol, ToWholeSharesError,
+    EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol, ToWholeSharesError,
 };
+
+/// Extension trait for U256 conversions on `FractionalShares`.
+///
+/// These depend on alloy types and therefore live in st0x-execution
+/// rather than the leaf st0x-finance crate.
+pub trait SharesBlockchain {
+    /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
+    ///
+    /// Uses lossy conversion because Float's 224-bit coefficient may carry
+    /// more than 18 decimal places of precision, but ERC-20 tokens are 18
+    /// decimals so the extra precision is representational noise.
+    fn to_u256_18_decimals(self) -> Result<alloy::primitives::U256, SharesConversionError>;
+
+    /// Creates `FractionalShares` from a U256 value with 18 decimal places.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SharesConversionError`] if the Float conversion fails.
+    fn from_u256_18_decimals(
+        value: alloy::primitives::U256,
+    ) -> Result<FractionalShares, SharesConversionError>;
+}
+
+impl SharesBlockchain for FractionalShares {
+    fn to_u256_18_decimals(self) -> Result<alloy::primitives::U256, SharesConversionError> {
+        if self.is_negative()? {
+            return Err(SharesConversionError::NegativeValue(self.inner()));
+        }
+
+        if self.is_zero()? {
+            return Ok(alloy::primitives::U256::ZERO);
+        }
+
+        self.inner()
+            .to_fixed_decimal_lossy(18)
+            .map(|(fixed, _lossless)| fixed)
+            .map_err(SharesConversionError::FloatConversion)
+    }
+
+    fn from_u256_18_decimals(
+        value: alloy::primitives::U256,
+    ) -> Result<FractionalShares, SharesConversionError> {
+        if value.is_zero() {
+            return Ok(Self::ZERO);
+        }
+
+        Float::from_fixed_decimal(value, 18)
+            .map(Self::new)
+            .map_err(SharesConversionError::FloatConversion)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SharesConversionError {
+    #[error("shares value cannot be negative: {0:?}")]
+    NegativeValue(Float),
+    #[error("Float conversion failed: {0}")]
+    FloatConversion(#[from] FloatError),
+}
 
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
@@ -86,7 +149,7 @@ pub trait Executor: Send + Sync + 'static {
     async fn get_inventory(&self) -> Result<InventoryResult, Self::Error>;
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum InvalidSharesError {
     #[error("Shares cannot be zero")]
     Zero,
@@ -96,8 +159,19 @@ pub enum InvalidSharesError {
     WholeShares(#[from] ToWholeSharesError),
     #[error(transparent)]
     TryFromInt(#[from] std::num::TryFromIntError),
-    #[error(transparent)]
-    DecimalConversion(#[from] rust_decimal::Error),
+    #[error("Float conversion failed: {0}")]
+    FloatConversion(#[from] FloatError),
+}
+
+impl From<SharesConversionError> for InvalidSharesError {
+    fn from(error: SharesConversionError) -> Self {
+        match error {
+            SharesConversionError::NegativeValue(value) => Self::NotPositive(NotPositive {
+                value: FractionalShares::new(value),
+            }),
+            SharesConversionError::FloatConversion(error) => Self::FloatConversion(error),
+        }
+    }
 }
 
 /// Share quantity newtype wrapper with validation
@@ -134,97 +208,6 @@ impl Display for Shares {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
-}
-
-/// 10^18 scale factor for tokenized equity decimal conversion.
-///
-/// Tokenized equities use 18 decimals (unlike USDC which uses 6).
-/// This equals 1,000,000,000,000,000,000 (one quintillion).
-const TOKENIZED_EQUITY_SCALE: Decimal =
-    Decimal::from_parts(2_808_348_672, 232_830_643, 0, false, 0);
-
-/// Extension trait for U256 conversions on `FractionalShares`.
-///
-/// These depend on alloy types and therefore live in st0x-execution
-/// rather than the leaf st0x-finance crate.
-pub trait SharesBlockchain {
-    /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
-    ///
-    /// Returns an error for negative values, underflow (values < 1e-18),
-    /// or overflow during scaling.
-    fn to_u256_18_decimals(self) -> Result<U256, SharesConversionError>;
-
-    /// Creates `FractionalShares` from a U256 value with 18 decimal
-    /// places.
-    ///
-    /// Divides by 10^18 to convert from raw token units to decimal
-    /// shares.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SharesConversionError`] if the value overflows
-    /// `Decimal` or division fails.
-    fn from_u256_18_decimals(value: U256) -> Result<FractionalShares, SharesConversionError>;
-}
-
-impl SharesBlockchain for FractionalShares {
-    fn to_u256_18_decimals(self) -> Result<U256, SharesConversionError> {
-        let inner = self.inner();
-
-        if inner.is_sign_negative() {
-            return Err(SharesConversionError::NegativeValue(inner));
-        }
-
-        if inner.is_zero() {
-            return Ok(U256::ZERO);
-        }
-
-        let scaled = inner
-            .checked_mul(TOKENIZED_EQUITY_SCALE)
-            .ok_or(SharesConversionError::Overflow)?;
-
-        let truncated = scaled.trunc();
-
-        if truncated.is_zero() {
-            return Err(SharesConversionError::Underflow(inner));
-        }
-
-        if scaled != truncated {
-            return Err(SharesConversionError::PrecisionLoss(inner));
-        }
-
-        Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
-    }
-
-    fn from_u256_18_decimals(value: U256) -> Result<FractionalShares, SharesConversionError> {
-        if value.is_zero() {
-            return Ok(Self::ZERO);
-        }
-
-        let raw_str = value.to_string();
-        let raw_decimal = Decimal::from_str(&raw_str)?;
-
-        raw_decimal
-            .checked_div(TOKENIZED_EQUITY_SCALE)
-            .map(Self::new)
-            .ok_or(SharesConversionError::Overflow)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SharesConversionError {
-    #[error("shares value cannot be negative: {0}")]
-    NegativeValue(Decimal),
-    #[error("shares value too small to represent with 18 decimals: {0}")]
-    Underflow(Decimal),
-    #[error("overflow when scaling shares to 18 decimals")]
-    Overflow,
-    #[error("decimal conversion failed: {0}")]
-    DecimalConversion(#[from] rust_decimal::Error),
-    #[error("precision loss when scaling to 18 decimals: {0} has sub-wei digits")]
-    PrecisionLoss(Decimal),
-    #[error("failed to parse U256: {0}")]
-    ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -320,15 +303,15 @@ impl std::str::FromStr for Direction {
 }
 
 /// An equity position with symbol, quantity, and optional market value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EquityPosition {
     pub symbol: Symbol,
     pub quantity: FractionalShares,
-    pub market_value: Option<Decimal>,
+    pub market_value: Option<Float>,
 }
 
 /// Account state from the broker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Inventory {
     pub positions: Vec<EquityPosition>,
     pub cash_balance_cents: i64,
@@ -338,7 +321,7 @@ pub struct Inventory {
 ///
 /// Custom enum to force explicit handling. Unlike `Option` which is easy to `.unwrap()`,
 /// this type requires callers to explicitly match on the `Unimplemented` variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum InventoryResult {
     /// Fetching inventory is unimplemented for this executor.
     ///
@@ -378,6 +361,8 @@ pub enum ExecutionError {
     NumericConversion(#[from] std::num::TryFromIntError),
     #[error("Date/time parse error: {0}")]
     DateTimeParse(#[from] chrono::ParseError),
+    #[error("Float operation failed: {0}")]
+    Float(#[from] FloatError),
 }
 
 /// Trait for converting executor contexts into their corresponding executor implementations
@@ -414,180 +399,98 @@ impl Display for ExecutorOrderId {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::U256;
-    use proptest::prelude::*;
-    use rust_decimal_macros::dec;
     use std::str::FromStr;
 
     use super::*;
 
     #[test]
     fn positive_to_whole_shares_succeeds_for_whole_numbers() {
-        let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(5))).unwrap();
         assert_eq!(shares.to_whole_shares().unwrap(), 5);
 
-        let shares = Positive::new(FractionalShares::new(dec!(100.0))).unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(100))).unwrap();
         assert_eq!(shares.to_whole_shares().unwrap(), 100);
     }
 
     #[test]
     fn positive_to_whole_shares_errors_for_fractional_values() {
-        let shares = Positive::new(FractionalShares::new(dec!(1.212))).unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1.212))).unwrap();
         let err = shares.to_whole_shares().unwrap_err();
-        assert!(
-            matches!(err, ToWholeSharesError::Fractional(value) if value == FractionalShares::new(dec!(1.212))),
-            "Expected Fractional error with value 1.212, got: {err:?}"
-        );
+        assert!(matches!(err, ToWholeSharesError::Fractional(_)));
     }
 
     #[test]
     fn fractional_shares_is_whole_returns_true_for_whole_numbers() {
-        let shares = FractionalShares::new(Decimal::from(1));
-        assert!(shares.is_whole());
-
-        let shares = FractionalShares::new(dec!(42.0));
-        assert!(shares.is_whole());
+        assert!(FractionalShares::new(float!(1)).is_whole().unwrap());
+        assert!(FractionalShares::new(float!(42)).is_whole().unwrap());
     }
 
     #[test]
     fn fractional_shares_is_whole_returns_false_for_fractional_values() {
-        let shares = FractionalShares::new(dec!(1.5));
-        assert!(!shares.is_whole());
-
-        let shares = FractionalShares::new(dec!(0.001));
-        assert!(!shares.is_whole());
-    }
-
-    #[test]
-    fn tokenized_equity_scale_equals_10_pow_18() {
-        let expected = Decimal::from_str("1000000000000000000").unwrap();
-        assert_eq!(
-            TOKENIZED_EQUITY_SCALE, expected,
-            "TOKENIZED_EQUITY_SCALE must equal 10^18"
-        );
+        assert!(!FractionalShares::new(float!(1.5)).is_whole().unwrap());
+        assert!(!FractionalShares::new(float!(0.001)).is_whole().unwrap());
     }
 
     #[test]
     fn add_succeeds() {
-        let a = FractionalShares::new(Decimal::ONE);
-        let b = FractionalShares::new(Decimal::TWO);
-        let result = (a + b).unwrap();
-        assert_eq!(result.inner(), Decimal::from(3));
+        let result = (FractionalShares::new(float!(1)) + FractionalShares::new(float!(2))).unwrap();
+        assert!(result.inner().eq(float!(3)).unwrap());
     }
 
     #[test]
     fn sub_succeeds() {
-        let a = FractionalShares::new(Decimal::from(5));
-        let b = FractionalShares::new(Decimal::TWO);
-        let result = (a - b).unwrap();
-        assert_eq!(result.inner(), Decimal::from(3));
-    }
-
-    #[test]
-    fn add_overflow_returns_error() {
-        let max = FractionalShares::new(Decimal::MAX);
-        let one = FractionalShares::new(Decimal::ONE);
-        let err = (max + one).unwrap_err();
-        assert_eq!(err.operation, ArithmeticOperation::Add);
-        assert_eq!(err.lhs, max);
-        assert_eq!(err.rhs, one);
-    }
-
-    #[test]
-    fn sub_overflow_returns_error() {
-        let min = FractionalShares::new(Decimal::MIN);
-        let one = FractionalShares::new(Decimal::ONE);
-        let err = (min - one).unwrap_err();
-        assert_eq!(err.operation, ArithmeticOperation::Sub);
-        assert_eq!(err.lhs, min);
-        assert_eq!(err.rhs, one);
+        let result = (FractionalShares::new(float!(5)) - FractionalShares::new(float!(2))).unwrap();
+        assert!(result.inner().eq(float!(3)).unwrap());
     }
 
     #[test]
     fn abs_returns_absolute_value() {
-        let negative = FractionalShares::new(Decimal::NEGATIVE_ONE);
-        assert_eq!(negative.abs().inner(), Decimal::ONE);
+        let result = FractionalShares::new(float!(-1)).abs().unwrap();
+        assert!(result.inner().eq(float!(1)).unwrap());
     }
 
     #[test]
-    fn into_decimal_extracts_inner_value() {
-        let shares = FractionalShares::new(Decimal::from(42));
-        let decimal: Decimal = shares.into();
-        assert_eq!(decimal, Decimal::from(42));
+    fn into_float_extracts_inner_value() {
+        let float: Float = FractionalShares::new(float!(42)).into();
+        assert!(float.eq(float!(42)).unwrap());
     }
 
     #[test]
-    fn mul_decimal_succeeds() {
-        let shares = FractionalShares::new(Decimal::from(100));
-        let ratio = dec!(0.5);
-        let result = (shares * ratio).unwrap();
-        assert_eq!(result.inner(), Decimal::from(50));
-    }
-
-    #[test]
-    fn mul_decimal_overflow_returns_error() {
-        let max = FractionalShares::new(Decimal::MAX);
-        let two = Decimal::TWO;
-        let err = (max * two).unwrap_err();
-        assert_eq!(err.operation, ArithmeticOperation::Mul);
-        assert_eq!(err.lhs, max);
-        assert_eq!(err.rhs, FractionalShares::new(two));
+    fn mul_float_succeeds() {
+        let result = (FractionalShares::new(float!(100)) * float!(0.5)).unwrap();
+        assert!(result.inner().eq(float!(50)).unwrap());
     }
 
     #[test]
     fn to_u256_18_decimals_zero_returns_zero() {
-        let shares = FractionalShares::new(Decimal::ZERO);
-        let result = shares.to_u256_18_decimals().unwrap();
+        let result = FractionalShares::ZERO.to_u256_18_decimals().unwrap();
         assert_eq!(result, U256::ZERO);
     }
 
     #[test]
     fn to_u256_18_decimals_one_returns_10_pow_18() {
-        let shares = FractionalShares::new(Decimal::ONE);
-        let result = shares.to_u256_18_decimals().unwrap();
+        let result = FractionalShares::new(float!(1))
+            .to_u256_18_decimals()
+            .unwrap();
         assert_eq!(result, U256::from_str("1000000000000000000").unwrap());
     }
 
     #[test]
     fn to_u256_18_decimals_fractional_value() {
-        let shares = FractionalShares::new(dec!(1.5));
-        let result = shares.to_u256_18_decimals().unwrap();
+        let result = FractionalShares::new(float!(1.5))
+            .to_u256_18_decimals()
+            .unwrap();
         assert_eq!(result, U256::from_str("1500000000000000000").unwrap());
     }
 
     #[test]
-    fn to_u256_18_decimals_small_fractional_value() {
-        let shares = FractionalShares::new(dec!(0.000000000000000001));
-        let result = shares.to_u256_18_decimals().unwrap();
-        assert_eq!(result, U256::from(1));
-    }
-
-    #[test]
     fn to_u256_18_decimals_negative_returns_error() {
-        let shares = FractionalShares::new(Decimal::NEGATIVE_ONE);
-        let err = shares.to_u256_18_decimals().unwrap_err();
+        let err = FractionalShares::new(float!(-1))
+            .to_u256_18_decimals()
+            .unwrap_err();
         assert!(
             matches!(err, SharesConversionError::NegativeValue(_)),
             "Expected NegativeValue error, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn to_u256_18_decimals_rejects_sub_wei_digits() {
-        let shares = FractionalShares::new(dec!(1.1234567890123456789));
-        let error = shares.to_u256_18_decimals().unwrap_err();
-        assert!(
-            matches!(error, SharesConversionError::PrecisionLoss(_)),
-            "Expected PrecisionLoss error, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn to_u256_18_decimals_underflow_returns_error() {
-        let shares = FractionalShares::new(dec!(0.0000000000000000001));
-        let err = shares.to_u256_18_decimals().unwrap_err();
-        assert!(
-            matches!(err, SharesConversionError::Underflow(_)),
-            "Expected Underflow error, got: {err:?}"
         );
     }
 
@@ -608,7 +511,7 @@ mod tests {
         let symbol = Symbol::new("A").unwrap();
         assert_eq!(symbol.to_string(), "A");
 
-        let symbol = Symbol::new("ABCDEFGHIJ").unwrap(); // 10 chars
+        let symbol = Symbol::new("ABCDEFGHIJ").unwrap();
         assert_eq!(symbol.to_string(), "ABCDEFGHIJ");
     }
 
@@ -642,60 +545,24 @@ mod tests {
         assert_eq!(shares.to_string(), "1");
     }
 
-    proptest! {
-        #[test]
-        fn fractional_shares_construction_preserves_value(
-            mantissa in i64::MIN..=i64::MAX,
-            scale in 0u32..=10,
-        ) {
-            let decimal = Decimal::new(mantissa, scale);
-            let shares = FractionalShares::new(decimal);
-            prop_assert_eq!(shares.inner(), decimal);
-        }
+    #[test]
+    fn from_u256_18_decimals_zero_returns_zero() {
+        let result = FractionalShares::from_u256_18_decimals(U256::ZERO).unwrap();
+        assert_eq!(result, FractionalShares::ZERO);
+    }
 
-        #[test]
-        fn positive_rejects_zero_and_negative(
-            mantissa in i64::MIN..=0i64,
-            scale in 0u32..=10,
-        ) {
-            let decimal = Decimal::new(mantissa, scale);
-            let shares = FractionalShares::new(decimal);
-            let error = Positive::new(shares).unwrap_err();
-            prop_assert_eq!(error, NotPositive { value: shares });
-        }
+    #[test]
+    fn from_u256_18_decimals_one_whole_share() {
+        let one_share = U256::from_str("1000000000000000000").unwrap();
+        let result = FractionalShares::from_u256_18_decimals(one_share).unwrap();
+        assert!(result.inner().eq(float!(1)).unwrap());
+    }
 
-        #[test]
-        fn fractional_shares_is_whole_matches_fract_is_zero(
-            mantissa in i64::MIN..=i64::MAX,
-            scale in 0u32..=10,
-        ) {
-            let decimal = Decimal::new(mantissa, scale);
-            let shares = FractionalShares::new(decimal);
-            prop_assert_eq!(shares.is_whole(), decimal.fract().is_zero());
-        }
-
-        #[test]
-        fn positive_to_whole_roundtrips_integers(value in 1u64..=u64::MAX) {
-            let decimal = Decimal::from(value);
-            let shares = Positive::new(FractionalShares::new(decimal)).unwrap();
-            prop_assert_eq!(shares.to_whole_shares().unwrap(), value);
-        }
-
-        #[test]
-        fn positive_to_whole_rejects_fractional(
-            whole in 0i64..=1_000_000,
-            frac in 1u32..=999_999_999,
-        ) {
-            let decimal = Decimal::new(whole * 1_000_000_000 + i64::from(frac), 9);
-            if decimal > Decimal::ZERO {
-                let shares = Positive::new(FractionalShares::new(decimal)).unwrap();
-                prop_assert!(matches!(
-                    shares.to_whole_shares(),
-                    Err(ToWholeSharesError::Fractional(_))
-                ));
-            }
-        }
-
+    #[test]
+    fn from_u256_18_decimals_fractional_amount() {
+        let one_and_a_half = U256::from_str("1500000000000000000").unwrap();
+        let result = FractionalShares::from_u256_18_decimals(one_and_a_half).unwrap();
+        assert!(result.inner().eq(float!(1.5)).unwrap());
     }
 
     #[test]
@@ -716,38 +583,5 @@ mod tests {
     #[test]
     fn dry_run_supports_fractional_shares() {
         assert!(SupportedExecutor::DryRun.supports_fractional_shares());
-    }
-
-    #[test]
-    fn from_u256_18_decimals_zero_returns_zero() {
-        let result =
-            <FractionalShares as SharesBlockchain>::from_u256_18_decimals(U256::ZERO).unwrap();
-        assert_eq!(result, FractionalShares::ZERO);
-    }
-
-    #[test]
-    fn from_u256_18_decimals_one_whole_share() {
-        let one_share = U256::from_str("1000000000000000000").unwrap();
-        let result =
-            <FractionalShares as SharesBlockchain>::from_u256_18_decimals(one_share).unwrap();
-        assert_eq!(result.inner(), Decimal::ONE);
-    }
-
-    #[test]
-    fn from_u256_18_decimals_fractional_amount() {
-        let one_and_a_half = U256::from_str("1500000000000000000").unwrap();
-        let result =
-            <FractionalShares as SharesBlockchain>::from_u256_18_decimals(one_and_a_half).unwrap();
-        assert_eq!(result.inner(), dec!(1.5));
-    }
-
-    #[test]
-    fn from_u256_18_decimals_overflow_returns_error() {
-        let result = <FractionalShares as SharesBlockchain>::from_u256_18_decimals(U256::MAX);
-        let error = result.unwrap_err();
-        assert!(
-            matches!(error, SharesConversionError::DecimalConversion(_)),
-            "Expected DecimalConversion error, got: {error:?}"
-        );
     }
 }

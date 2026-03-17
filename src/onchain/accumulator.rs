@@ -162,22 +162,21 @@ pub(crate) async fn check_all_positions<E: Executor>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, TxHash};
-    use rust_decimal_macros::dec;
+    use sqlx::SqlitePool;
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
-
-    use sqlx::SqlitePool;
-
     use st0x_event_sorcery::{Projection, Store, StoreBuilder};
-    use st0x_execution::MockExecutor;
+    use st0x_execution::{
+        Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
+    };
 
     use super::*;
     use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
+    use st0x_float_macro::float;
 
     async fn create_test_position_infra(
         pool: &SqlitePool,
@@ -206,7 +205,7 @@ mod tests {
                     },
                     amount,
                     direction,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -247,7 +246,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(0.5)),
+            FractionalShares::new(float!(0.5)),
             Direction::Buy,
         )
         .await;
@@ -279,7 +278,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(1.5)),
+            FractionalShares::new(float!(1.5)),
             Direction::Buy,
         )
         .await;
@@ -302,7 +301,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+            Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
             "DryRun supports fractional shares"
         );
         assert_eq!(
@@ -325,7 +324,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &aapl,
-            FractionalShares::new(dec!(0.3)),
+            FractionalShares::new(float!(0.3)),
             Direction::Buy,
         )
         .await;
@@ -334,7 +333,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &msft,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(float!(2.0)),
             Direction::Sell,
         )
         .await;
@@ -356,7 +355,7 @@ mod tests {
         assert_eq!(ready[0].symbol, msft);
         assert_eq!(
             ready[0].shares,
-            Positive::new(FractionalShares::new(dec!(2))).unwrap()
+            Positive::new(FractionalShares::new(float!(2))).unwrap()
         );
         assert_eq!(
             ready[0].direction,
@@ -375,7 +374,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(float!(2.0)),
             Direction::Buy,
         )
         .await;
@@ -412,7 +411,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(float!(2.0)),
             Direction::Buy,
         )
         .await;
@@ -437,7 +436,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(2))).unwrap()
+            Positive::new(FractionalShares::new(float!(2))).unwrap()
         );
     }
 
@@ -454,7 +453,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(0.5)),
+            FractionalShares::new(float!(0.5)),
             Direction::Buy,
         )
         .await;
@@ -485,9 +484,9 @@ mod tests {
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },
-                    amount: FractionalShares::new(dec!(1.0)),
+                    amount: FractionalShares::new(float!(1.0)),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
+                    price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -533,7 +532,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
+            Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
             "Should execute full accumulated amount"
         );
     }
@@ -548,7 +547,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(10.0)),
+            FractionalShares::new(float!(10.0)),
             Direction::Buy,
         )
         .await;
@@ -565,7 +564,7 @@ mod tests {
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
                         operational_limit: Some(
-                            Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
+                            Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
                         ),
                     },
                 )]),
@@ -588,7 +587,7 @@ mod tests {
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
-            Positive::new(FractionalShares::new(dec!(3.0))).unwrap(),
+            Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
             "Shares should be capped by operational limit"
         );
     }
@@ -603,7 +602,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &symbol,
-            FractionalShares::new(dec!(5.0)),
+            FractionalShares::new(float!(5.0)),
             Direction::Buy,
         )
         .await;
@@ -641,7 +640,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &aapl,
-            FractionalShares::new(dec!(2.0)),
+            FractionalShares::new(float!(2.0)),
             Direction::Buy,
         )
         .await;
@@ -649,7 +648,7 @@ mod tests {
         initialize_position_with_fill(
             &store,
             &msft,
-            FractionalShares::new(dec!(3.0)),
+            FractionalShares::new(float!(3.0)),
             Direction::Buy,
         )
         .await;

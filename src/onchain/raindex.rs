@@ -14,7 +14,6 @@
 use alloy::primitives::{Address, B256, TxHash, U256, address};
 use async_trait::async_trait;
 use rain_math_float::Float;
-use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -41,8 +40,6 @@ pub(crate) enum RaindexError {
     Contract(#[from] alloy::contract::Error),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
-    #[error("Decimal parse error: {0}")]
-    DecimalParse(#[from] rust_decimal::Error),
     #[error("Amount cannot be zero")]
     ZeroAmount,
     #[error("Vault registry not found for aggregate {0}")]
@@ -251,10 +248,10 @@ impl<E: Evm> RaindexService<E> {
         token: Address,
         vault_id: RaindexVaultId,
     ) -> Result<FractionalShares, RaindexError> {
-        let decimal = self
+        let exact = self
             .get_vault_balance::<Registry>(owner, token, vault_id)
             .await?;
-        Ok(FractionalShares::new(decimal))
+        Ok(FractionalShares::new(exact))
     }
 
     /// Gets the USDC balance of a vault on Base.
@@ -263,10 +260,10 @@ impl<E: Evm> RaindexService<E> {
         owner: Address,
         vault_id: RaindexVaultId,
     ) -> Result<Usdc, RaindexError> {
-        let decimal = self
+        let exact = self
             .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id)
             .await?;
-        Ok(Usdc::new(decimal))
+        Ok(Usdc::new(exact))
     }
 
     async fn get_vault_balance<Registry: IntoErrorRegistry>(
@@ -274,7 +271,7 @@ impl<E: Evm> RaindexService<E> {
         owner: Address,
         token: Address,
         vault_id: RaindexVaultId,
-    ) -> Result<Decimal, RaindexError> {
+    ) -> Result<Float, RaindexError> {
         let balance_float = self
             .evm
             .call::<Registry, _>(
@@ -287,18 +284,8 @@ impl<E: Evm> RaindexService<E> {
             )
             .await?;
 
-        float_to_decimal(balance_float)
+        Ok(Float::from_raw(balance_float))
     }
-}
-
-/// Converts a Float (bytes32) amount to Decimal.
-///
-/// Uses format_with_scientific(false) to avoid scientific notation
-/// (e.g. "1e20") that Decimal::from_str cannot parse.
-fn float_to_decimal(float: B256) -> Result<Decimal, RaindexError> {
-    let float = Float::from_raw(float);
-    let formatted = float.format_with_scientific(false)?;
-    Ok(formatted.parse::<Decimal>()?)
 }
 
 /// Abstraction for Raindex (Rain OrderBook) operations.
@@ -837,7 +824,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = FractionalShares::new(Decimal::from(1000));
+        let expected = FractionalShares::new(Float::parse("1000".to_string()).unwrap());
         assert_eq!(
             balance, expected,
             "Expected 1000 shares but got {balance:?}"
@@ -891,25 +878,29 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = FractionalShares::new(Decimal::from(700));
+        let expected = FractionalShares::new(Float::parse("700".to_string()).unwrap());
         assert_eq!(balance, expected, "Expected 700 shares but got {balance:?}");
     }
 
     /// Values with large exponents produce scientific notation from
     /// Float::format(), which Decimal::from_str cannot parse.
-    /// format_with_scientific(false) prevents this.
+    /// Float::from_raw handles this correctly.
     #[test]
-    fn large_exponent_does_not_produce_scientific_notation() {
+    fn large_exponent_produces_correct_value() {
         let float = Float::parse("100000000000000000000".to_string())
             .expect("valid Float from decimal string");
 
-        let decimal = float_to_decimal(float.get_inner()).unwrap();
-        assert_eq!(decimal, Decimal::from(100_000_000_000_000_000_000_u128));
+        let exact = Float::from_raw(float.get_inner());
+        assert!(
+            exact
+                .eq(Float::parse("100000000000000000000".to_string()).unwrap())
+                .unwrap()
+        );
     }
 
     proptest! {
-        /// Roundtrip: decimal string -> Float::parse -> float_to_decimal ->
-        /// Decimal matches the original string.
+        /// Roundtrip: decimal string -> Float::parse -> Float::from_raw ->
+        /// Float matches the original string.
         #[test]
         fn roundtrip_from_decimal_string(
             integer in 0u64..1_000_000_000,
@@ -920,19 +911,18 @@ mod tests {
                 TestCaseError::Reject(format!("Float::parse rejected {input}: {err}").into())
             })?;
 
-            let decimal = float_to_decimal(float.get_inner()).map_err(|err| {
-                TestCaseError::fail(format!(
-                    "float_to_decimal failed for {input}: {err}"
-                ))
-            })?;
+            let exact = Float::from_raw(float.get_inner());
 
-            // Re-parse original to compare as Decimal (avoids string format differences)
-            let expected: Decimal = input.parse().unwrap();
-            prop_assert_eq!(decimal, expected);
+            // Re-parse original to compare as Float
+            let expected = Float::parse(input.clone()).map_err(|err| {
+                TestCaseError::fail(format!("Float::parse failed for {input}: {err}"))
+            })?;
+            let eq_result = exact.eq(expected).map_err(|float_err| TestCaseError::fail(format!("Float::eq failed: {float_err}")))?;
+            prop_assert!(eq_result);
         }
 
-        /// Roundtrip: random bytes -> float_to_decimal -> Float::parse ->
-        /// get_inner produces equivalent Float value.
+        /// Roundtrip: random bytes -> Float::from_raw -> format ->
+        /// Float::parse -> get_inner produces equivalent Float value.
         #[test]
         fn roundtrip_from_raw_bytes(raw in any::<[u8; 32]>()) {
             let bytes = B256::from(raw);
@@ -943,13 +933,15 @@ mod tests {
                 return Ok(());
             }
 
-            let Ok(decimal) = float_to_decimal(bytes) else {
+            let exact = Float::from_raw(bytes);
+
+            let Ok(formatted) = exact.format_with_scientific(false) else {
                 return Ok(());
             };
 
-            let roundtripped = Float::parse(decimal.to_string()).map_err(|err| {
+            let roundtripped = Float::parse(formatted.clone()).map_err(|err| {
                 TestCaseError::fail(format!(
-                    "Float::parse failed on float_to_decimal output '{decimal}': {err}"
+                    "Float::parse failed on Float output '{formatted}': {err}"
                 ))
             })?;
 

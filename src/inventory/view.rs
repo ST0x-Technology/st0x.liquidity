@@ -1,19 +1,26 @@
 //! Inventory view for tracking cross-venue asset positions.
 
-use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
+use std::sync::LazyLock;
 
-use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
+use chrono::{DateTime, Utc};
+use rain_math_float::{Float, FloatError};
+use serde::{Deserialize, Serialize};
+use tracing::debug;
+
+use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
+use st0x_float_macro::float;
+
 use st0x_finance::Usdc;
 
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
+static EXACT_ONE: LazyLock<Float> = LazyLock::new(|| float!(1));
+
 /// Error type for inventory view operations.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum InventoryViewError {
     #[error(transparent)]
     Equity(#[from] InventoryError<FractionalShares>),
@@ -28,14 +35,14 @@ pub(crate) enum InventoryViewError {
 pub(crate) enum EquityImbalanceError {
     #[error("symbol {0} not tracked in inventory")]
     SymbolNotTracked(Symbol),
-    #[error(transparent)]
-    Arithmetic(#[from] ArithmeticError<FractionalShares>),
+    #[error("arithmetic error: {0}")]
+    Float(#[from] FloatError),
     #[error(transparent)]
     Ratio(#[from] RatioError),
 }
 
 /// Imbalance requiring rebalancing action.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Imbalance<T> {
     /// Too much onchain - triggers movement to offchain.
     TooMuchOnchain { excess: T },
@@ -48,26 +55,34 @@ pub(crate) enum Imbalance<T> {
 /// Invariants enforced by [`ImbalanceThreshold::new`]:
 /// - `target` must be in `[0.0, 1.0]`
 /// - `deviation` must be `>= 0`
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(try_from = "RawImbalanceThreshold", deny_unknown_fields)]
 pub struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
-    pub(crate) target: Decimal,
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub(crate) target: Float,
     /// Deviation from target that triggers rebalancing.
-    pub(crate) deviation: Decimal,
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub(crate) deviation: Float,
 }
 
 /// Error returned when [`ImbalanceThreshold`] is constructed with
 /// out-of-range values.
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum InvalidImbalanceThreshold {
     #[error(
         "target must be between 0.0 and 1.0 inclusive, \
-         got {target}"
+         got {target:?}"
     )]
-    TargetOutOfRange { target: Decimal },
-    #[error("deviation must be >= 0, got {deviation}")]
-    NegativeDeviation { deviation: Decimal },
+    TargetOutOfRange { target: Float },
+    #[error("deviation must be >= 0, got {deviation:?}")]
+    NegativeDeviation { deviation: Float },
 }
 
 impl ImbalanceThreshold {
@@ -77,12 +92,24 @@ impl ImbalanceThreshold {
     ///
     /// Returns [`InvalidImbalanceThreshold`] if `target` is not in
     /// `[0.0, 1.0]` or `deviation` is negative.
-    pub fn new(target: Decimal, deviation: Decimal) -> Result<Self, InvalidImbalanceThreshold> {
-        if target < Decimal::ZERO || target > Decimal::ONE {
+    pub fn new(target: Float, deviation: Float) -> Result<Self, InvalidImbalanceThreshold> {
+        let zero =
+            Float::zero().map_err(|_| InvalidImbalanceThreshold::TargetOutOfRange { target })?;
+
+        if target
+            .lt(zero)
+            .map_err(|_| InvalidImbalanceThreshold::TargetOutOfRange { target })?
+            || target
+                .gt(*EXACT_ONE)
+                .map_err(|_| InvalidImbalanceThreshold::TargetOutOfRange { target })?
+        {
             return Err(InvalidImbalanceThreshold::TargetOutOfRange { target });
         }
 
-        if deviation < Decimal::ZERO {
+        if deviation
+            .lt(zero)
+            .map_err(|_| InvalidImbalanceThreshold::NegativeDeviation { deviation })?
+        {
             return Err(InvalidImbalanceThreshold::NegativeDeviation { deviation });
         }
 
@@ -94,8 +121,10 @@ impl ImbalanceThreshold {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawImbalanceThreshold {
-    target: Decimal,
-    deviation: Decimal,
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
+    target: Float,
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
+    deviation: Float,
 }
 
 impl TryFrom<RawImbalanceThreshold> for ImbalanceThreshold {
@@ -182,15 +211,28 @@ pub(crate) struct Inventory<T> {
 /// Impl block with minimal bounds for `has_inflight` - shared by all other impl blocks.
 impl<T> Inventory<T>
 where
-    T: Add<Output = Result<T, ArithmeticError<T>>>
-        + Sub<Output = Result<T, ArithmeticError<T>>>
+    T: Add<Output = Result<T, FloatError>>
+        + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
         + std::fmt::Debug,
 {
-    fn has_inflight(&self) -> bool {
-        self.onchain.as_ref().is_some_and(|v| v.has_inflight())
-            || self.offchain.as_ref().is_some_and(|v| v.has_inflight())
+    fn has_inflight(&self) -> Result<bool, FloatError> {
+        let onchain_inflight = self
+            .onchain
+            .as_ref()
+            .map(|v| v.has_inflight())
+            .transpose()?
+            .unwrap_or(false);
+
+        let offchain_inflight = self
+            .offchain
+            .as_ref()
+            .map(|v| v.has_inflight())
+            .transpose()?
+            .unwrap_or(false);
+
+        Ok(onchain_inflight || offchain_inflight)
     }
 
     fn get_venue(&self, venue: Venue) -> Option<VenueBalance<T>> {
@@ -216,63 +258,80 @@ where
 
 impl<T> Inventory<T>
 where
-    T: Add<Output = Result<T, ArithmeticError<T>>>
-        + Sub<Output = Result<T, ArithmeticError<T>>>
-        + std::ops::Mul<Decimal, Output = Result<T, ArithmeticError<T>>>
+    T: Add<Output = Result<T, FloatError>>
+        + Sub<Output = Result<T, FloatError>>
+        + std::ops::Mul<Float, Output = Result<T, FloatError>>
         + Copy
         + HasZero
-        + Into<Decimal>
+        + Into<Float>
         + std::fmt::Debug,
 {
     /// Returns the ratio of onchain to total inventory.
-    /// Returns `None` if either venue is uninitialized or total is zero.
-    fn ratio(&self) -> Option<Decimal> {
-        let onchain: Decimal = self.onchain.as_ref()?.total().ok()?.into();
-        let offchain: Decimal = self.offchain.as_ref()?.total().ok()?.into();
-        let total = onchain + offchain;
+    /// Returns `Ok(None)` if either venue is uninitialized or total is zero.
+    fn ratio(&self) -> Result<Option<Float>, FloatError> {
+        let Some(onchain_ref) = self.onchain.as_ref() else {
+            return Ok(None);
+        };
+        let Some(offchain_ref) = self.offchain.as_ref() else {
+            return Ok(None);
+        };
 
-        if total.is_zero() {
-            return None;
+        let onchain: Float = onchain_ref.total()?.into();
+        let offchain: Float = offchain_ref.total()?.into();
+        let total = (onchain + offchain)?;
+
+        if total.is_zero()? {
+            return Ok(None);
         }
 
-        Some(onchain / total)
+        Ok(Some((onchain / total)?))
     }
 
     /// Detects imbalance based on threshold configuration.
-    /// Returns `None` if either venue is uninitialized, balanced, has inflight operations,
-    /// or total is zero.
-    fn detect_imbalance(&self, threshold: &ImbalanceThreshold) -> Option<Imbalance<T>> {
+    /// Returns `Ok(None)` if either venue is uninitialized, balanced, has inflight
+    /// operations, or total is zero.
+    fn detect_imbalance(
+        &self,
+        threshold: &ImbalanceThreshold,
+    ) -> Result<Option<Imbalance<T>>, FloatError> {
         // Require both venues to be initialized before detecting imbalance.
         // This prevents triggering rebalancing when only one venue has been polled.
-        let onchain_venue = self.onchain.as_ref()?;
-        let offchain_venue = self.offchain.as_ref()?;
+        let Some(onchain_venue) = self.onchain.as_ref() else {
+            return Ok(None);
+        };
+        let Some(offchain_venue) = self.offchain.as_ref() else {
+            return Ok(None);
+        };
 
-        if onchain_venue.has_inflight() || offchain_venue.has_inflight() {
-            return None;
+        if onchain_venue.has_inflight()? || offchain_venue.has_inflight()? {
+            return Ok(None);
         }
 
-        let ratio = self.ratio()?;
-        let lower = threshold.target - threshold.deviation;
-        let upper = threshold.target + threshold.deviation;
+        let Some(ratio) = self.ratio()? else {
+            return Ok(None);
+        };
 
-        if ratio < lower {
-            let onchain = onchain_venue.total().ok()?;
-            let offchain = offchain_venue.total().ok()?;
-            let total = (onchain + offchain).ok()?;
-            let target_onchain = (total * threshold.target).ok()?;
-            let excess = (target_onchain - onchain).ok()?;
+        let lower = (threshold.target - threshold.deviation)?;
+        let upper = (threshold.target + threshold.deviation)?;
 
-            Some(Imbalance::TooMuchOffchain { excess })
-        } else if ratio > upper {
-            let onchain = onchain_venue.total().ok()?;
-            let offchain = offchain_venue.total().ok()?;
-            let total = (onchain + offchain).ok()?;
-            let target_onchain = (total * threshold.target).ok()?;
-            let excess = (onchain - target_onchain).ok()?;
+        if ratio.lt(lower)? {
+            let onchain = onchain_venue.total()?;
+            let offchain = offchain_venue.total()?;
+            let total = (onchain + offchain)?;
+            let target_onchain = (total * threshold.target)?;
+            let excess = (target_onchain - onchain)?;
 
-            Some(Imbalance::TooMuchOnchain { excess })
+            Ok(Some(Imbalance::TooMuchOffchain { excess }))
+        } else if ratio.gt(upper)? {
+            let onchain = onchain_venue.total()?;
+            let offchain = offchain_venue.total()?;
+            let total = (onchain + offchain)?;
+            let target_onchain = (total * threshold.target)?;
+            let excess = (onchain - target_onchain)?;
+
+            Ok(Some(Imbalance::TooMuchOnchain { excess }))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -291,8 +350,8 @@ where
         &self,
         threshold: &ImbalanceThreshold,
         normalized_onchain: T,
-    ) -> Result<Option<Imbalance<T>>, ArithmeticError<T>> {
-        if self.has_inflight() {
+    ) -> Result<Option<Imbalance<T>>, FloatError> {
+        if self.has_inflight()? {
             return Ok(None);
         }
 
@@ -300,26 +359,26 @@ where
             return Ok(None);
         };
 
-        let onchain_decimal: Decimal = normalized_onchain.into();
-        let offchain: Decimal = offchain_venue.total()?.into();
-        let total = onchain_decimal + offchain;
+        let onchain_decimal: Float = normalized_onchain.into();
+        let offchain: Float = offchain_venue.total()?.into();
+        let total = (onchain_decimal + offchain)?;
 
-        if total.is_zero() {
+        if total.is_zero()? {
             return Ok(None);
         }
 
-        let ratio = onchain_decimal / total;
-        let lower = threshold.target - threshold.deviation;
-        let upper = threshold.target + threshold.deviation;
+        let ratio = (onchain_decimal / total)?;
+        let lower = (threshold.target - threshold.deviation)?;
+        let upper = (threshold.target + threshold.deviation)?;
 
-        if ratio < lower {
+        if ratio.lt(lower)? {
             let offchain_val = offchain_venue.total()?;
             let total_val = (normalized_onchain + offchain_val)?;
             let target = (total_val * threshold.target)?;
             let excess = (target - normalized_onchain)?;
 
             Ok(Some(Imbalance::TooMuchOffchain { excess }))
-        } else if ratio > upper {
+        } else if ratio.gt(upper)? {
             let offchain_val = offchain_venue.total()?;
             let total_val = (normalized_onchain + offchain_val)?;
             let target = (total_val * threshold.target)?;
@@ -351,11 +410,10 @@ impl<T> Default for Inventory<T> {
 /// to [`InventoryView::update_equity`] or [`InventoryView::update_usdc`].
 impl<T> Inventory<T>
 where
-    T: Add<Output = Result<T, ArithmeticError<T>>>
-        + Sub<Output = Result<T, ArithmeticError<T>>>
+    T: Add<Output = Result<T, FloatError>>
+        + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
-        + PartialOrd
         + std::fmt::Debug
         + Send
         + 'static,
@@ -446,19 +504,35 @@ where
     /// Skips if ANY venue has inflight operations, because we cannot
     /// distinguish "transfer completed but not confirmed" from
     /// "unrelated inventory change".
+    ///
+    /// Also skips if the snapshot predates the last rebalancing operation,
+    /// because a stale snapshot could overwrite post-rebalancing inventory
+    /// and trigger duplicate operations.
     pub(crate) fn on_snapshot(
         venue: Venue,
         snapshot_balance: T,
+        fetched_at: DateTime<Utc>,
     ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
         Box::new(move |inventory| {
-            if inventory.has_inflight() {
+            if inventory.has_inflight()? {
+                return Ok(inventory);
+            }
+
+            if let Some(last_rebalancing) = inventory.last_rebalancing
+                && fetched_at < last_rebalancing
+            {
+                debug!(
+                    ?fetched_at,
+                    ?last_rebalancing,
+                    "Rejecting stale snapshot that predates last rebalancing"
+                );
                 return Ok(inventory);
             }
 
             let balance = inventory
                 .get_venue(venue)
                 .unwrap_or_default()
-                .apply_snapshot(snapshot_balance);
+                .apply_snapshot(snapshot_balance)?;
 
             Ok(inventory.set_venue(venue, Some(balance)))
         })
@@ -532,7 +606,7 @@ impl InventoryView {
     pub(crate) fn check_usdc_imbalance(
         &self,
         threshold: &ImbalanceThreshold,
-    ) -> Option<Imbalance<Usdc>> {
+    ) -> Result<Option<Imbalance<Usdc>>, FloatError> {
         self.usdc.detect_imbalance(threshold)
     }
 }
@@ -584,14 +658,8 @@ impl InventoryView {
     pub(crate) fn with_usdc(self, onchain_available: Usdc, offchain_available: Usdc) -> Self {
         Self {
             usdc: Inventory {
-                onchain: Some(VenueBalance::new(
-                    onchain_available,
-                    Usdc::new(Decimal::ZERO),
-                )),
-                offchain: Some(VenueBalance::new(
-                    offchain_available,
-                    Usdc::new(Decimal::ZERO),
-                )),
+                onchain: Some(VenueBalance::new(onchain_available, Usdc::ZERO)),
+                offchain: Some(VenueBalance::new(offchain_available, Usdc::ZERO)),
                 last_rebalancing: None,
             },
             ..self
@@ -639,18 +707,18 @@ impl InventoryView {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::U256;
-    use chrono::Utc;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
+    use chrono::{Duration, Utc};
+    use rain_math_float::Float;
     use std::collections::HashMap;
 
     use st0x_finance::Usdc;
 
     use super::*;
     use crate::wrapper::RATIO_ONE;
+    use st0x_float_macro::float;
 
     fn shares(amount: i64) -> FractionalShares {
-        FractionalShares::new(Decimal::from(amount))
+        FractionalShares::new(float!(&amount.to_string()))
     }
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
@@ -676,39 +744,46 @@ mod tests {
 
     fn threshold(target: &str, deviation: &str) -> ImbalanceThreshold {
         ImbalanceThreshold {
-            target: target.parse().unwrap(),
-            deviation: deviation.parse().unwrap(),
+            target: Float::parse(target.to_string()).unwrap(),
+            deviation: Float::parse(deviation.to_string()).unwrap(),
         }
     }
 
     #[test]
     fn ratio_returns_none_when_total_is_zero() {
         let inventory = make_inventory(0, 0, 0, 0);
-        assert!(inventory.ratio().is_none());
+        assert!(inventory.ratio().unwrap().is_none());
     }
 
     #[test]
     fn ratio_returns_half_for_equal_split() {
         let inventory = make_inventory(50, 0, 50, 0);
-        assert_eq!(inventory.ratio().unwrap(), dec!(0.5));
+        assert!(inventory.ratio().unwrap().unwrap().eq(float!(0.5)).unwrap());
     }
 
     #[test]
     fn ratio_returns_one_when_all_onchain() {
         let inventory = make_inventory(100, 0, 0, 0);
-        assert_eq!(inventory.ratio().unwrap(), Decimal::ONE);
+        assert!(inventory.ratio().unwrap().unwrap().eq(float!(1)).unwrap());
     }
 
     #[test]
     fn ratio_returns_zero_when_all_offchain() {
         let inventory = make_inventory(0, 0, 100, 0);
-        assert_eq!(inventory.ratio().unwrap(), Decimal::ZERO);
+        assert!(
+            inventory
+                .ratio()
+                .unwrap()
+                .unwrap()
+                .eq(Float::zero().unwrap())
+                .unwrap()
+        );
     }
 
     #[test]
     fn ratio_includes_inflight_in_total() {
         let inventory = make_inventory(25, 25, 25, 25);
-        assert_eq!(inventory.ratio().unwrap(), dec!(0.5));
+        assert!(inventory.ratio().unwrap().unwrap().eq(float!(0.5)).unwrap());
     }
 
     #[test]
@@ -718,7 +793,7 @@ mod tests {
             offchain: Some(venue(100, 0)),
             last_rebalancing: None,
         };
-        assert!(inventory.ratio().is_none());
+        assert!(inventory.ratio().unwrap().is_none());
     }
 
     #[test]
@@ -728,31 +803,31 @@ mod tests {
             offchain: None,
             last_rebalancing: None,
         };
-        assert!(inventory.ratio().is_none());
+        assert!(inventory.ratio().unwrap().is_none());
     }
 
     #[test]
     fn has_inflight_false_when_no_inflight() {
         let inventory = make_inventory(50, 0, 50, 0);
-        assert!(!inventory.has_inflight());
+        assert!(!inventory.has_inflight().unwrap());
     }
 
     #[test]
     fn has_inflight_true_when_onchain_inflight() {
         let inventory = make_inventory(50, 10, 50, 0);
-        assert!(inventory.has_inflight());
+        assert!(inventory.has_inflight().unwrap());
     }
 
     #[test]
     fn has_inflight_true_when_offchain_inflight() {
         let inventory = make_inventory(50, 0, 50, 10);
-        assert!(inventory.has_inflight());
+        assert!(inventory.has_inflight().unwrap());
     }
 
     #[test]
     fn has_inflight_true_when_both_inflight() {
         let inventory = make_inventory(50, 10, 50, 10);
-        assert!(inventory.has_inflight());
+        assert!(inventory.has_inflight().unwrap());
     }
 
     #[test]
@@ -760,7 +835,7 @@ mod tests {
         let inventory = make_inventory(50, 0, 50, 0);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     #[test]
@@ -768,7 +843,7 @@ mod tests {
         let inventory = make_inventory(80, 10, 20, 0);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     #[test]
@@ -776,7 +851,7 @@ mod tests {
         let inventory = make_inventory(0, 0, 0, 0);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     #[test]
@@ -785,7 +860,7 @@ mod tests {
         let inventory = make_inventory(80, 0, 20, 0);
         let thresh = threshold("0.5", "0.2");
 
-        let imbalance = inventory.detect_imbalance(&thresh).unwrap();
+        let imbalance = inventory.detect_imbalance(&thresh).unwrap().unwrap();
 
         // Target is 50 onchain, current is 80, excess = 30
         assert_eq!(imbalance, Imbalance::TooMuchOnchain { excess: shares(30) });
@@ -797,7 +872,7 @@ mod tests {
         let inventory = make_inventory(20, 0, 80, 0);
         let thresh = threshold("0.5", "0.2");
 
-        let imbalance = inventory.detect_imbalance(&thresh).unwrap();
+        let imbalance = inventory.detect_imbalance(&thresh).unwrap().unwrap();
 
         // Target is 50 onchain, current is 20, excess = 30
         assert_eq!(imbalance, Imbalance::TooMuchOffchain { excess: shares(30) });
@@ -809,7 +884,7 @@ mod tests {
         let inventory = make_inventory(70, 0, 30, 0);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     #[test]
@@ -818,7 +893,7 @@ mod tests {
         let inventory = make_inventory(30, 0, 70, 0);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     #[test]
@@ -830,7 +905,7 @@ mod tests {
         };
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     #[test]
@@ -842,7 +917,7 @@ mod tests {
         };
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     #[test]
@@ -854,13 +929,13 @@ mod tests {
         };
         let thresh = threshold("0.5", "0.2");
 
-        assert!(inventory.detect_imbalance(&thresh).is_none());
+        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     fn usdc_venue(available: i64, inflight: i64) -> VenueBalance<Usdc> {
         VenueBalance::new(
-            Usdc::new(Decimal::from(available)),
-            Usdc::new(Decimal::from(inflight)),
+            Usdc::new(float!(&available.to_string())),
+            Usdc::new(float!(&inflight.to_string())),
         )
     }
 
@@ -907,10 +982,13 @@ mod tests {
     fn usdc_inflight_blocks_imbalance_detection() {
         let inventory = usdc_make_inventory(800, 0, 200, 0);
         let thresh = threshold("0.5", "0.2");
-        assert!(inventory.detect_imbalance(&thresh).is_some());
+        assert!(inventory.detect_imbalance(&thresh).unwrap().is_some());
 
         let inventory_with_inflight = usdc_make_inventory(700, 100, 200, 0);
-        assert!(inventory_with_inflight.detect_imbalance(&thresh).is_none());
+        assert_eq!(
+            inventory_with_inflight.detect_imbalance(&thresh).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1100,9 +1178,9 @@ mod tests {
     fn check_usdc_imbalance_returns_none_when_balanced() {
         let view = make_usdc_view(500, 0, 500, 0);
 
-        assert!(
-            view.check_usdc_imbalance(&threshold("0.5", "0.3"))
-                .is_none()
+        assert_eq!(
+            view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap(),
+            None
         );
     }
 
@@ -1110,7 +1188,10 @@ mod tests {
     fn check_usdc_imbalance_returns_too_much_onchain() {
         let view = make_usdc_view(900, 0, 100, 0);
 
-        let imbalance = view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap();
+        let imbalance = view
+            .check_usdc_imbalance(&threshold("0.5", "0.3"))
+            .unwrap()
+            .unwrap();
 
         assert!(matches!(imbalance, Imbalance::TooMuchOnchain { .. }));
     }
@@ -1119,7 +1200,10 @@ mod tests {
     fn check_usdc_imbalance_returns_too_much_offchain() {
         let view = make_usdc_view(100, 0, 900, 0);
 
-        let imbalance = view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap();
+        let imbalance = view
+            .check_usdc_imbalance(&threshold("0.5", "0.3"))
+            .unwrap()
+            .unwrap();
 
         assert!(matches!(imbalance, Imbalance::TooMuchOffchain { .. }));
     }
@@ -1128,9 +1212,80 @@ mod tests {
     fn check_usdc_imbalance_returns_none_when_inflight() {
         let view = make_usdc_view(700, 200, 100, 0);
 
-        assert!(
-            view.check_usdc_imbalance(&threshold("0.5", "0.3"))
-                .is_none()
+        assert_eq!(
+            view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap(),
+            None
         );
+    }
+
+    #[test]
+    fn on_snapshot_rejects_stale_snapshot_predating_last_rebalancing() {
+        let last_rebalancing = Utc::now();
+        let stale_fetched_at = last_rebalancing - Duration::seconds(10);
+
+        let inventory = Inventory {
+            onchain: Some(venue(50, 0)),
+            offchain: Some(venue(50, 0)),
+            last_rebalancing: Some(last_rebalancing),
+        };
+
+        // Stale snapshot should be rejected — inventory unchanged
+        let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), stale_fetched_at);
+        let result = update_fn(inventory.clone()).unwrap();
+        assert_eq!(result, inventory);
+    }
+
+    #[test]
+    fn on_snapshot_applies_when_fetched_at_equals_last_rebalancing() {
+        let last_rebalancing = Utc::now();
+
+        let inventory = Inventory {
+            onchain: Some(venue(50, 0)),
+            offchain: Some(venue(50, 0)),
+            last_rebalancing: Some(last_rebalancing),
+        };
+
+        // fetched_at == last_rebalancing should apply
+        let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), last_rebalancing);
+        let result = update_fn(inventory.clone()).unwrap();
+        assert_ne!(result, inventory);
+
+        let onchain = result.onchain.unwrap();
+        assert_eq!(onchain.total().unwrap(), shares(999));
+    }
+
+    #[test]
+    fn on_snapshot_applies_when_fetched_at_after_last_rebalancing() {
+        let last_rebalancing = Utc::now();
+        let fresh_fetched_at = last_rebalancing + Duration::seconds(10);
+
+        let inventory = Inventory {
+            onchain: Some(venue(50, 0)),
+            offchain: Some(venue(50, 0)),
+            last_rebalancing: Some(last_rebalancing),
+        };
+
+        let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), fresh_fetched_at);
+        let result = update_fn(inventory.clone()).unwrap();
+        assert_ne!(result, inventory);
+
+        let onchain = result.onchain.unwrap();
+        assert_eq!(onchain.total().unwrap(), shares(999));
+    }
+
+    #[test]
+    fn on_snapshot_applies_when_no_last_rebalancing() {
+        let inventory = Inventory {
+            onchain: Some(venue(50, 0)),
+            offchain: Some(venue(50, 0)),
+            last_rebalancing: None,
+        };
+
+        let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), Utc::now());
+        let result = update_fn(inventory.clone()).unwrap();
+        assert_ne!(result, inventory);
+
+        let onchain = result.onchain.unwrap();
+        assert_eq!(onchain.total().unwrap(), shares(999));
     }
 }

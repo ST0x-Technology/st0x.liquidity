@@ -11,7 +11,7 @@ use alloy::hex::FromHexError;
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -19,6 +19,7 @@ use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{Direction, Symbol};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+
 pub(crate) struct OnChainTradeId {
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
@@ -58,12 +59,20 @@ impl FromStr for OnChainTradeId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OnChainTrade {
     pub(crate) symbol: Symbol,
-    pub(crate) amount: Decimal,
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub(crate) amount: Float,
     pub(crate) direction: Direction,
-    pub(crate) price_usdc: Decimal,
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub(crate) price_usdc: Float,
     pub(crate) block_number: Option<u64>,
     pub(crate) block_timestamp: DateTime<Utc>,
     pub(crate) filled_at: DateTime<Utc>,
@@ -205,9 +214,17 @@ pub(crate) enum OnChainTradeError {
 pub(crate) enum OnChainTradeCommand {
     Witness {
         symbol: Symbol,
-        amount: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        amount: Float,
         direction: Direction,
-        price_usdc: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
         block_number: u64,
         block_timestamp: DateTime<Utc>,
     },
@@ -217,13 +234,21 @@ pub(crate) enum OnChainTradeCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OnChainTradeEvent {
     Filled {
         symbol: Symbol,
-        amount: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        amount: Float,
         direction: Direction,
-        price_usdc: Decimal,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
         block_number: u64,
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
@@ -234,6 +259,57 @@ pub(crate) enum OnChainTradeEvent {
         enriched_at: DateTime<Utc>,
     },
 }
+
+/// Required by `cqrs_es::DomainEvent`.
+impl PartialEq for OnChainTradeEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Filled {
+                    symbol: sym_a,
+                    amount: amt_a,
+                    direction: dir_a,
+                    price_usdc: price_a,
+                    block_number: block_num_a,
+                    block_timestamp: block_ts_a,
+                    filled_at: fill_a,
+                },
+                Self::Filled {
+                    symbol: sym_b,
+                    amount: amt_b,
+                    direction: dir_b,
+                    price_usdc: price_b,
+                    block_number: block_num_b,
+                    block_timestamp: block_ts_b,
+                    filled_at: fill_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && amt_a.eq(*amt_b).unwrap_or(false)
+                    && dir_a == dir_b
+                    && price_a.eq(*price_b).unwrap_or(false)
+                    && block_num_a == block_num_b
+                    && block_ts_a == block_ts_b
+                    && fill_a == fill_b
+            }
+            (
+                Self::Enriched {
+                    gas_used: g1,
+                    pyth_price: pp1,
+                    enriched_at: e1,
+                },
+                Self::Enriched {
+                    gas_used: g2,
+                    pyth_price: pp2,
+                    enriched_at: e2,
+                },
+            ) => g1 == g2 && pp1 == pp2 && e1 == e2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for OnChainTradeEvent {}
 
 impl DomainEvent for OnChainTradeEvent {
     fn event_type(&self) -> String {
@@ -265,11 +341,10 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use st0x_event_sorcery::{LifecycleError, TestHarness, replay};
 
     use super::*;
+    use st0x_float_macro::float;
 
     #[tokio::test]
     async fn witness_command_creates_filled_event() {
@@ -280,9 +355,9 @@ mod tests {
             .given_no_previous_events()
             .when(OnChainTradeCommand::Witness {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: float!(10.5),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: float!(150.25),
                 block_number: 12345,
                 block_timestamp: now,
             })
@@ -308,9 +383,9 @@ mod tests {
         let events = TestHarness::<OnChainTrade>::with(())
             .given(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: float!(10.5),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: float!(150.25),
                 block_number: 12345,
                 block_timestamp: now,
                 filled_at: now,
@@ -342,9 +417,9 @@ mod tests {
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol: symbol.clone(),
-                    amount: dec!(10.5),
+                    amount: float!(10.5),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.25),
+                    price_usdc: float!(150.25),
                     block_number: 12345,
                     block_timestamp: now,
                     filled_at: now,
@@ -402,18 +477,18 @@ mod tests {
         let error = TestHarness::<OnChainTrade>::with(())
             .given(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: float!(10.5),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: float!(150.25),
                 block_number: 12345,
                 block_timestamp: now,
                 filled_at: now,
             }])
             .when(OnChainTradeCommand::Witness {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: float!(10.5),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: float!(150.25),
                 block_number: 12345,
                 block_timestamp: now,
             })
@@ -442,9 +517,9 @@ mod tests {
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol: symbol.clone(),
-                    amount: dec!(10.5),
+                    amount: float!(10.5),
                     direction: Direction::Buy,
-                    price_usdc: dec!(150.25),
+                    price_usdc: float!(150.25),
                     block_number: 12345,
                     block_timestamp: now,
                     filled_at: now,
@@ -457,9 +532,9 @@ mod tests {
             ])
             .when(OnChainTradeCommand::Witness {
                 symbol: symbol.clone(),
-                amount: dec!(10.5),
+                amount: float!(10.5),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: float!(150.25),
                 block_number: 12345,
                 block_timestamp: now,
             })
@@ -479,9 +554,9 @@ mod tests {
 
         let trade = replay::<OnChainTrade>(vec![OnChainTradeEvent::Filled {
             symbol,
-            amount: dec!(10.5),
+            amount: float!(10.5),
             direction: Direction::Buy,
-            price_usdc: dec!(150.25),
+            price_usdc: float!(150.25),
             block_number: 12345,
             block_timestamp: now,
             filled_at: now,
@@ -490,7 +565,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(trade.amount, dec!(10.5));
+        assert!(trade.amount.eq(float!(10.5)).unwrap());
         assert_eq!(trade.direction, Direction::Buy);
         assert!(!trade.is_enriched());
     }
@@ -509,9 +584,9 @@ mod tests {
         let trade = replay::<OnChainTrade>(vec![
             OnChainTradeEvent::Filled {
                 symbol: Symbol::new("AAPL").unwrap(),
-                amount: dec!(10.5),
+                amount: float!(10.5),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.25),
+                price_usdc: float!(150.25),
                 block_number: 12345,
                 block_timestamp: now,
                 filled_at: now,

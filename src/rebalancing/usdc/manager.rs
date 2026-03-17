@@ -6,11 +6,11 @@
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
-use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
+use rain_math_float::Float;
 use st0x_bridge::cctp::{AttestationResponse, CctpBridge};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
 use st0x_event_sorcery::Store;
@@ -90,7 +90,6 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<Usdc, UsdcTransferError> {
-        let decimal_amount = amount.inner();
         let correlation_id = Uuid::new_v4();
 
         info!(?amount, %correlation_id, "Starting USD to USDC conversion");
@@ -107,9 +106,11 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             )
             .await?;
 
+        let alpaca_amount = amount.inner();
+
         let order = match self
             .alpaca_broker
-            .convert_usdc_usd(decimal_amount, ConversionDirection::UsdToUsdc)
+            .convert_usdc_usd(alpaca_amount, ConversionDirection::UsdToUsdc)
             .await
         {
             Ok(order) => order,
@@ -141,8 +142,8 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         info!(
             order_id = %order.id,
-            requested = %amount.inner(),
-            filled = %filled_qty,
+            requested = ?amount,
+            filled = ?filled_qty,
             "USD to USDC conversion completed"
         );
         Ok(filled_amount)
@@ -174,7 +175,6 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<Usdc, UsdcTransferError> {
-        let decimal_amount = amount.inner();
         let correlation_id = Uuid::new_v4();
 
         info!(?amount, %correlation_id, "Starting USDC to USD conversion");
@@ -190,9 +190,11 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             )
             .await?;
 
+        let alpaca_amount = amount.inner();
+
         let order = match self
             .alpaca_broker
-            .convert_usdc_usd(decimal_amount, ConversionDirection::UsdcToUsd)
+            .convert_usdc_usd(alpaca_amount, ConversionDirection::UsdcToUsd)
             .await
         {
             Ok(order) => order,
@@ -226,8 +228,8 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         info!(
             order_id = %order.id,
-            requested = %amount.inner(),
-            filled = %filled_amount,
+            requested = ?amount,
+            filled = ?filled_amount,
             "USDC to USD conversion completed"
         );
         Ok(filled_usdc)
@@ -262,7 +264,21 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         self.poll_and_confirm_withdrawal(id, &transfer.id).await?;
 
-        let burn_amount = usdc_to_u256(usdc_amount)?;
+        let burn_amount = match usdc_to_u256(usdc_amount) {
+            Ok(amount) => amount,
+            Err(error) => {
+                warn!(%error, "USDC to U256 conversion failed after withdrawal");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("USDC conversion failed: {error}"),
+                        },
+                    )
+                    .await?;
+                return Err(error);
+            }
+        };
         let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
 
         let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
@@ -807,32 +823,14 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
 /// Converts a USDC decimal amount to U256 with 6 decimals.
 ///
-/// # Errors
-///
-/// Returns an error if the decimal cannot be represented as U256
-/// (e.g., negative values or values exceeding U256::MAX).
+/// Delegates to [`Usdc::to_u256_6_decimals`].
 fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
-    let decimal = usdc.inner();
-
-    if decimal.is_sign_negative() {
-        return Err(UsdcTransferError::NegativeAmount { amount: usdc });
-    }
-
-    // USDC has 6 decimals
-    let scaled = decimal
-        .checked_mul(Decimal::from(1_000_000u64))
-        .ok_or_else(|| UsdcTransferError::ArithmeticOverflow { amount: usdc })?;
-
-    let integer = scaled.trunc().to_string();
-
-    Ok(U256::from_str_radix(&integer, 10)?)
+    Ok(usdc.to_u256_6_decimals()?)
 }
 
 /// Converts a U256 amount (with 6 decimals) to USDC decimal.
 pub(crate) fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
-    let amount_u128: u128 = amount.try_into()?;
-    let decimal = Decimal::from(amount_u128) / Decimal::from(1_000_000u64);
-    Ok(Usdc::new(decimal))
+    Ok(Usdc::new(Float::from_fixed_decimal(amount, 6)?))
 }
 
 /// Alpaca -> Base (hedging -> market-making): convert USD to USDC,
@@ -872,9 +870,9 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use httpmock::prelude::*;
     use reqwest::StatusCode;
-    use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlx::SqlitePool;
+    use std::str::FromStr;
     use std::sync::Arc;
     use uuid::{Uuid, uuid};
 
@@ -895,6 +893,11 @@ mod tests {
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
     use crate::vault_registry::VaultRegistry;
+    use st0x_finance::UsdcConversionError;
+
+    fn usdc(value: &str) -> Usdc {
+        Usdc::from_str(value).unwrap()
+    }
 
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
@@ -955,8 +958,8 @@ mod tests {
             id,
             UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
-                amount_received: Usdc::new(dec!(99.99)),
-                fee_collected: Usdc::new(dec!(0.01)),
+                amount_received: usdc("99.99"),
+                fee_collected: usdc("0.01"),
             },
         )
         .await
@@ -1170,12 +1173,9 @@ mod tests {
     async fn mock_alpaca_to_base_increments_count() {
         let mock = Arc::new(MockUsdcRebalance::new());
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &*mock,
-            Usdc::new(dec!(1000)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&*mock, usdc("1000"))
+            .await
+            .unwrap();
 
         assert_eq!(mock.alpaca_to_base_calls(), 1);
         assert_eq!(mock.base_to_alpaca_calls(), 0);
@@ -1185,12 +1185,9 @@ mod tests {
     async fn mock_base_to_alpaca_increments_count() {
         let mock = Arc::new(MockUsdcRebalance::new());
 
-        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &*mock,
-            Usdc::new(dec!(2000)),
-        )
-        .await
-        .unwrap();
+        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&*mock, usdc("2000"))
+            .await
+            .unwrap();
 
         assert_eq!(mock.alpaca_to_base_calls(), 0);
         assert_eq!(mock.base_to_alpaca_calls(), 1);
@@ -1199,7 +1196,7 @@ mod tests {
     #[tokio::test]
     async fn mock_captures_last_alpaca_to_base_call() {
         let mock = Arc::new(MockUsdcRebalance::new());
-        let amount = Usdc::new(dec!(5000.50));
+        let amount = usdc("5000.50");
 
         CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&*mock, amount)
             .await
@@ -1212,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn mock_captures_last_base_to_alpaca_call() {
         let mock = Arc::new(MockUsdcRebalance::new());
-        let amount = Usdc::new(dec!(7500.25));
+        let amount = usdc("7500.25");
 
         CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&*mock, amount)
             .await
@@ -1226,11 +1223,9 @@ mod tests {
     async fn failing_mock_returns_error_for_alpaca_to_base() {
         let mock = Arc::new(MockUsdcRebalance::failing_alpaca_to_base());
 
-        let result = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &*mock,
-            Usdc::new(dec!(100)),
-        )
-        .await;
+        let result =
+            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&*mock, usdc("100"))
+                .await;
 
         assert!(matches!(
             result,
@@ -1242,11 +1237,9 @@ mod tests {
     async fn failing_mock_returns_error_for_base_to_alpaca() {
         let mock = Arc::new(MockUsdcRebalance::failing_base_to_alpaca());
 
-        let result = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &*mock,
-            Usdc::new(dec!(100)),
-        )
-        .await;
+        let result =
+            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&*mock, usdc("100"))
+                .await;
 
         assert!(matches!(
             result,
@@ -1278,43 +1271,51 @@ mod tests {
 
     #[test]
     fn test_usdc_to_u256_positive_amount() {
-        let amount = Usdc::new(dec!(1000.50));
+        let amount = usdc("1000.50");
         assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1_000_500_000u64));
     }
 
     #[test]
     fn test_usdc_to_u256_negative_amount() {
-        let amount = Usdc::new(dec!(-100));
+        let amount = usdc("-100");
         let error = usdc_to_u256(amount).unwrap_err();
         assert!(
-            matches!(error, UsdcTransferError::NegativeAmount { amount } if amount == Usdc::new(dec!(-100))),
-            "Expected NegativeAmount error, got: {error:?}"
+            matches!(
+                error,
+                UsdcTransferError::UsdcConversion(UsdcConversionError::NegativeValue(_))
+            ),
+            "Expected UsdcConversion(NegativeValue) error, got: {error:?}"
         );
     }
 
     #[test]
     fn test_usdc_to_u256_zero_amount() {
-        let amount = Usdc::new(dec!(0));
+        let amount = usdc("0");
         assert_eq!(usdc_to_u256(amount).unwrap(), U256::ZERO);
     }
 
     #[test]
-    fn test_usdc_to_u256_fractional_truncation() {
-        let amount = Usdc::new(dec!(100.1234567));
-        assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(100_123_456u64));
+    fn test_usdc_to_u256_rejects_excess_precision() {
+        // 7 decimal places exceeds USDC's 6 decimal precision
+        let amount = usdc("100.1234567");
+        let error = usdc_to_u256(amount).unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::UsdcConversion(_)),
+            "Expected UsdcConversion error for lossy conversion, got: {error:?}"
+        );
     }
 
     #[test]
     fn test_usdc_to_u256_fractional_precision() {
         // Test with precise fractional amounts (6 decimals for USDC)
-        let amount = Usdc::new(dec!(1000.123456));
+        let amount = usdc("1000.123456");
         assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1_000_123_456u64));
     }
 
     #[test]
     fn test_usdc_to_u256_minimum_amount() {
         // Test near-minimum amounts (smallest USDC unit is 0.000001)
-        let amount = Usdc::new(dec!(0.000001));
+        let amount = usdc("0.000001");
         assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1u64));
     }
 
@@ -1322,7 +1323,7 @@ mod tests {
     fn test_usdc_to_u256_large_amount_no_overflow() {
         // Test large amounts that should work without overflow
         // $1 trillion in USDC
-        let amount = Usdc::new(dec!(1_000_000_000_000));
+        let amount = usdc("1000000000000");
         assert_eq!(
             usdc_to_u256(amount).unwrap(),
             U256::from(1_000_000_000_000_000_000u64)
@@ -1330,12 +1331,14 @@ mod tests {
     }
 
     #[test]
-    fn test_usdc_to_u256_truncates_beyond_6_decimals() {
-        // USDC has 6 decimals, anything beyond should be truncated
-        let amount = Usdc::new(dec!(100.1234567890));
-        let result = usdc_to_u256(amount).unwrap();
-        // Should truncate to 100.123456 (6 decimals)
-        assert_eq!(result, U256::from(100_123_456u64));
+    fn test_usdc_to_u256_rejects_beyond_6_decimals() {
+        // USDC has 6 decimals, anything beyond should be rejected as lossy
+        let amount = usdc("100.1234567890");
+        let error = usdc_to_u256(amount).unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::UsdcConversion(_)),
+            "Expected UsdcConversion error for lossy conversion, got: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1379,7 +1382,7 @@ mod tests {
         });
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         assert!(
             matches!(
@@ -1441,7 +1444,7 @@ mod tests {
         });
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(500));
+        let amount = usdc("500");
 
         assert!(
             matches!(
@@ -1494,7 +1497,7 @@ mod tests {
         });
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(100));
+        let amount = usdc("100");
 
         assert!(
             matches!(
@@ -1535,15 +1538,18 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(-500));
+        let amount = usdc("-500");
 
         let error = manager
             .execute_base_to_alpaca(&id, amount)
             .await
             .unwrap_err();
         assert!(
-            matches!(error, UsdcTransferError::NegativeAmount { amount } if amount == Usdc::new(dec!(-500))),
-            "Expected NegativeAmount error, got: {error:?}"
+            matches!(
+                error,
+                UsdcTransferError::UsdcConversion(UsdcConversionError::NegativeValue(_))
+            ),
+            "Expected UsdcConversion(NegativeValue) error, got: {error:?}"
         );
     }
 
@@ -1571,16 +1577,16 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
+
+        let error = manager
+            .execute_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
 
         assert!(
-            matches!(
-                manager.execute_base_to_alpaca(&id, amount).await,
-                Err(UsdcTransferError::Aggregate(AggregateError::UserError(
-                    LifecycleError::Apply(UsdcRebalanceError::BridgingNotInitiated)
-                )))
-            ),
-            "Expected Aggregate(UserError(BridgingNotInitiated)) error"
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Expected Cctp error when CCTP burn contract call fails, got: {error:?}"
         );
     }
 
@@ -1619,7 +1625,7 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         manager
             .execute_usd_to_usdc_conversion(&id, amount)
@@ -1663,16 +1669,20 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(500));
+        let amount = usdc("500");
 
         // execute_usdc_to_usd_conversion requires aggregate to be in DepositConfirmed state
         // (after a BaseToAlpaca deposit completes). With a fresh aggregate, it should fail.
         assert!(
             matches!(
                 manager.execute_usdc_to_usd_conversion(&id, amount).await,
-                Err(UsdcTransferError::Aggregate(AggregateError::UserError(
-                    LifecycleError::Apply(UsdcRebalanceError::DepositNotConfirmed)
-                )))
+                Err(UsdcTransferError::Aggregate(error))
+                    if matches!(
+                        error.as_ref(),
+                        AggregateError::UserError(
+                            LifecycleError::Apply(UsdcRebalanceError::DepositNotConfirmed)
+                        )
+                    )
             ),
             "Expected DepositNotConfirmed error when aggregate not in correct state"
         );
@@ -1714,7 +1724,7 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         manager
             .execute_usd_to_usdc_conversion(&id, amount)
@@ -1758,7 +1768,7 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         assert!(
             matches!(
@@ -1789,7 +1799,7 @@ mod tests {
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         // Set up aggregate in DepositConfirmed state (required for execute_usdc_to_usd_conversion)
         let burn_tx =
@@ -1830,8 +1840,8 @@ mod tests {
             &id,
             UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
-                amount_received: Usdc::new(dec!(99.99)),
-                fee_collected: Usdc::new(dec!(0.01)),
+                amount_received: usdc("99.99"),
+                fee_collected: usdc("0.01"),
             },
         )
         .await
@@ -1916,7 +1926,7 @@ mod tests {
         });
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         manager
             .execute_usd_to_usdc_conversion(&id, amount)
@@ -2003,7 +2013,7 @@ mod tests {
         });
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         manager
             .execute_alpaca_to_base(&id, amount)
@@ -2072,7 +2082,7 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, amount).await;
 
@@ -2132,7 +2142,7 @@ mod tests {
         });
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         assert!(
             matches!(
@@ -2162,7 +2172,7 @@ mod tests {
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         // Pre-initialize aggregate to make InitiateConversion fail
         cqrs.send(
@@ -2205,9 +2215,13 @@ mod tests {
         assert!(
             matches!(
                 manager.execute_usd_to_usdc_conversion(&id, amount).await,
-                Err(UsdcTransferError::Aggregate(AggregateError::UserError(
-                    LifecycleError::Apply(UsdcRebalanceError::AlreadyInitiated)
-                )))
+                Err(UsdcTransferError::Aggregate(error))
+                    if matches!(
+                        error.as_ref(),
+                        AggregateError::UserError(
+                            LifecycleError::Apply(UsdcRebalanceError::AlreadyInitiated)
+                        )
+                    )
             ),
             "Expected AlreadyInitiated error"
         );
@@ -2234,7 +2248,7 @@ mod tests {
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
@@ -2297,7 +2311,7 @@ mod tests {
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = Usdc::new(dec!(1000));
+        let amount = usdc("1000");
 
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
@@ -2376,7 +2390,7 @@ mod tests {
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let requested_amount = Usdc::new(dec!(1000));
+        let requested_amount = usdc("1000");
 
         let filled_amount = manager
             .execute_usd_to_usdc_conversion(&id, requested_amount)
@@ -2386,7 +2400,7 @@ mod tests {
         // Should return the actual filled amount, not the requested amount
         assert_eq!(
             filled_amount,
-            Usdc::new(dec!(999.5)),
+            usdc("999.5"),
             "Should return actual filled amount, not requested amount"
         );
     }

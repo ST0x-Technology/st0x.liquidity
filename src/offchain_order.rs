@@ -246,7 +246,7 @@ impl EventSourced for OffchainOrder {
                     shares: *shares,
                     direction: *direction,
                     executor: *executor,
-                    error: error.to_string(),
+                    error: error.clone(),
                     placed_at: *placed_at,
                     failed_at: *failed_at,
                 }),
@@ -575,11 +575,10 @@ pub enum OffchainOrderError {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
-
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestStore, replay};
 
     use super::*;
+    use st0x_float_macro::float;
 
     fn failing_order_placer() -> Arc<dyn OrderPlacer> {
         struct Failing;
@@ -600,7 +599,7 @@ mod tests {
     fn place_command() -> OffchainOrderCommand {
         OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
         }
@@ -655,7 +654,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Usd::new(dec!(150.00)),
+                    price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -701,8 +700,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price: Usd::new(dec!(150.00)),
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -722,8 +721,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price: Usd::new(dec!(150.00)),
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -732,8 +731,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(75)),
-                    avg_price: Usd::new(dec!(150.50)),
+                    shares_filled: FractionalShares::new(float!(75)),
+                    avg_price: Usd::new(float!(150.50)),
                 },
             )
             .await
@@ -744,7 +743,7 @@ mod tests {
         else {
             panic!("Expected PartiallyFilled state");
         };
-        assert_eq!(shares_filled, FractionalShares::new(dec!(75)));
+        assert_eq!(shares_filled, FractionalShares::new(float!(75)));
     }
 
     #[tokio::test]
@@ -757,7 +756,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Usd::new(dec!(150.00)),
+                    price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -777,8 +776,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(75)),
-                    avg_price: Usd::new(dec!(150.00)),
+                    shares_filled: FractionalShares::new(float!(75)),
+                    avg_price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -787,7 +786,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Usd::new(dec!(150.25)),
+                    price: Usd::new(float!(150.25)),
                 },
             )
             .await
@@ -806,7 +805,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Usd::new(dec!(150.00)),
+                    price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -827,7 +826,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Usd::new(dec!(150.00)),
+                    price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -837,7 +836,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Usd::new(dec!(150.00)),
+                    price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -878,8 +877,8 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled: FractionalShares::new(dec!(50)),
-                    avg_price: Usd::new(dec!(150.00)),
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -908,7 +907,7 @@ mod tests {
             .send(
                 &id,
                 OffchainOrderCommand::CompleteFill {
-                    price: Usd::new(dec!(150.00)),
+                    price: Usd::new(float!(150.00)),
                 },
             )
             .await
@@ -961,5 +960,32 @@ mod tests {
             .expect("projection should return Some for live order");
 
         assert!(matches!(order, OffchainOrder::Submitted { .. }));
+    }
+
+    #[test]
+    fn usd_serializes_as_decimal_string() {
+        let usd = Usd::new(float!(150.25));
+        let json = serde_json::to_value(usd).unwrap();
+        assert_eq!(json, serde_json::json!("150.25"));
+    }
+
+    #[test]
+    fn usd_deserializes_from_string() {
+        let usd: Usd = serde_json::from_value(serde_json::json!("150.25")).unwrap();
+        assert_eq!(usd, Usd::new(float!(150.25)));
+    }
+
+    #[test]
+    fn usd_deserializes_from_number() {
+        let usd: Usd = serde_json::from_value(serde_json::json!(150.25)).unwrap();
+        assert_eq!(usd, Usd::new(float!(150.25)));
+    }
+
+    #[test]
+    fn usd_round_trips_through_json() {
+        let original = Usd::new(float!(99.99));
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: Usd = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
     }
 }

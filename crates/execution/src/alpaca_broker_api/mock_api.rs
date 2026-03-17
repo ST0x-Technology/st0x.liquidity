@@ -6,7 +6,6 @@
 //! state via the builder - no per-request mock setup needed.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -17,12 +16,15 @@ use alloy::sol_types::SolEvent;
 use bon::bon;
 use chrono::Utc;
 use httpmock::prelude::*;
-use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use rain_math_float::Float;
+use st0x_float_serde::format_float_with_fallback;
+
 use crate::Symbol;
+use st0x_float_macro::float;
 
 sol! {
     #[sol(all_derives = true)]
@@ -49,13 +51,13 @@ pub enum MockMode {
 
 pub struct MockPosition {
     pub symbol: Symbol,
-    pub quantity: Decimal,
-    pub market_value: Decimal,
+    pub quantity: Float,
+    pub market_value: Float,
 }
 
 struct MockAccount {
-    cash: Decimal,
-    buying_power: Decimal,
+    cash: Float,
+    buying_power: Float,
     positions: HashMap<Symbol, MockPosition>,
 }
 
@@ -95,11 +97,11 @@ impl std::fmt::Display for OrderStatus {
 
 struct MockOrder {
     symbol: Symbol,
-    quantity: Decimal,
+    quantity: Float,
     side: OrderSide,
     status: OrderStatus,
     poll_count: usize,
-    filled_price: Option<Decimal>,
+    filled_price: Option<Float>,
 }
 
 /// A single calendar entry controlling market open/close times.
@@ -113,7 +115,7 @@ struct CalendarEntry {
 struct MockWalletTransfer {
     transfer_id: String,
     direction: TransferDirection,
-    amount: Decimal,
+    amount: Float,
     asset: String,
     from_address: Address,
     to_address: Address,
@@ -127,7 +129,7 @@ struct MockWalletTransfer {
 struct MockState {
     account: MockAccount,
     orders: HashMap<String, MockOrder>,
-    symbol_fill_prices: HashMap<Symbol, Decimal>,
+    symbol_fill_prices: HashMap<Symbol, Float>,
     mode: MockMode,
     /// Per-symbol fill delays: number of polls before filling.
     /// Symbols without an entry fill immediately in `HappyPath` mode.
@@ -139,7 +141,7 @@ struct MockState {
     /// Alpaca deposit wallet address for incoming USDC.
     alpaca_deposit_address: String,
     /// Wallet balances by asset symbol (e.g. USDC in the crypto wallet).
-    wallet_balances: HashMap<String, Decimal>,
+    wallet_balances: HashMap<String, Float>,
     /// Whitelisted withdrawal addresses.
     whitelisted_addresses: Vec<WhitelistEntry>,
 }
@@ -173,18 +175,18 @@ struct WhitelistEntry {
 pub struct MockOrderSnapshot {
     pub order_id: String,
     pub symbol: String,
-    pub quantity: Decimal,
+    pub quantity: Float,
     pub side: OrderSide,
     pub status: OrderStatus,
     pub poll_count: usize,
-    pub filled_price: Option<Decimal>,
+    pub filled_price: Option<Float>,
 }
 
 /// Snapshot of a position, returned by [`AlpacaBrokerMock::positions`].
 pub struct MockPositionSnapshot {
     pub symbol: String,
-    pub quantity: Decimal,
-    pub market_value: Decimal,
+    pub quantity: Float,
+    pub market_value: Float,
 }
 
 /// Direction of a wallet transfer.
@@ -226,7 +228,7 @@ impl std::fmt::Display for TransferStatus {
 pub struct MockWalletTransferSnapshot {
     pub transfer_id: String,
     pub direction: TransferDirection,
-    pub amount: Decimal,
+    pub amount: Float,
     pub asset: String,
     pub status: TransferStatus,
 }
@@ -244,7 +246,7 @@ impl AlpacaBrokerMock {
     /// registered. Optionally configure per-symbol fill prices.
     #[builder]
     pub async fn start(
-        symbol_fill_prices: Vec<(Symbol, Decimal)>,
+        symbol_fill_prices: Vec<(Symbol, Float)>,
         symbol_positions: Vec<MockPosition>,
     ) -> Self {
         let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -263,8 +265,8 @@ impl AlpacaBrokerMock {
 
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
-                cash: Decimal::from(100_000),
-                buying_power: Decimal::from(100_000),
+                cash: float!(100000),
+                buying_power: float!(100000),
                 positions,
             },
             orders: HashMap::new(),
@@ -300,7 +302,7 @@ impl AlpacaBrokerMock {
     }
 
     /// Sets a fill price for a specific symbol.
-    pub fn set_symbol_fill_price(&self, symbol: Symbol, price: Decimal) {
+    pub fn set_symbol_fill_price(&self, symbol: Symbol, price: Float) {
         lock(&self.state).symbol_fill_prices.insert(symbol, price);
     }
 
@@ -340,7 +342,7 @@ impl AlpacaBrokerMock {
     }
 
     /// Sets the USDC balance reported by the Alpaca crypto wallet endpoints.
-    pub fn set_wallet_usdc_balance(&self, balance: Decimal) {
+    pub fn set_wallet_usdc_balance(&self, balance: Float) {
         lock(&self.state)
             .wallet_balances
             .insert("USDC".to_string(), balance);
@@ -520,7 +522,7 @@ async fn scan_block_for_deposits<P: Provider>(
 
             let amount_usdc = format_u256_as_usdc(event.value);
 
-            let Ok(amount) = Decimal::from_str(&amount_usdc) else {
+            let Ok(amount) = Float::parse(amount_usdc) else {
                 continue;
             };
 
@@ -586,13 +588,16 @@ fn register_account_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>)
             .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/account"));
         then.respond_with(move |_request: &HttpMockRequest| {
             let state = lock(&state);
+            let cash = format_float_with_fallback(&state.account.cash);
+            let buying_power = format_float_with_fallback(&state.account.buying_power);
+            drop(state);
             json_response(
                 200,
                 &json!({
                     "id": TEST_ACCOUNT_ID,
                     "status": "ACTIVE",
-                    "cash": state.account.cash.to_string(),
-                    "buying_power": state.account.buying_power.to_string(),
+                    "cash": cash,
+                    "buying_power": buying_power,
                 }),
             )
         });
@@ -626,29 +631,36 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
         when.method(GET)
             .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/positions"));
         then.respond_with(move |_request: &HttpMockRequest| {
-            let positions: Vec<Value> = {
+            let result: Result<Vec<Value>, rain_math_float::FloatError> = {
                 let state = lock(&state);
                 state
                     .account
                     .positions
                     .values()
                     .map(|pos| {
-                        let side = if pos.quantity.is_sign_negative() {
-                            "short"
-                        } else {
-                            "long"
-                        };
-                        json!({
+                        let is_neg = pos
+                            .quantity
+                            .lt(Float::from_raw(alloy::primitives::B256::ZERO))?;
+                        let side = if is_neg { "short" } else { "long" };
+                        let abs_qty = pos.quantity.abs()?;
+                        Ok(json!({
                             "symbol": pos.symbol,
-                            "qty": pos.quantity.abs().to_string(),
-                            "market_value": pos.market_value.to_string(),
+                            "qty": format_float_with_fallback(&abs_qty),
+                            "market_value": format_float_with_fallback(&pos.market_value),
                             "side": side,
                             "avg_entry_price": "0",
-                        })
+                        }))
                     })
                     .collect()
             };
-            json_response(200, &Value::Array(positions))
+
+            match result {
+                Ok(positions) => json_response(200, &Value::Array(positions)),
+                Err(error) => json_response(
+                    500,
+                    &json!({"message": format!("Mock /positions FloatError: {error}")}),
+                ),
+            }
         });
     });
 }
@@ -707,7 +719,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
             let Ok(symbol) = Symbol::new(symbol) else {
                 return json_response(400, &json!({"message": "symbol cannot be empty"}));
             };
-            let Ok(quantity) = Decimal::from_str(qty) else {
+            let Ok(quantity) = Float::parse(qty.to_string()) else {
                 return json_response(400, &json!({"message": format!("invalid qty: {qty}")}));
             };
             let side = match side {
@@ -744,13 +756,12 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 },
             );
             drop(state);
-
             json_response(
                 200,
                 &json!({
                     "id": order_id,
                     "symbol": symbol,
-                    "qty": quantity.to_string(),
+                    "qty": format_float_with_fallback(&quantity),
                     "side": side.to_string(),
                     "status": "new",
                     "filled_avg_price": null,
@@ -765,21 +776,41 @@ fn handle_crypto_order(
     state: &mut MockState,
     order_id: &str,
     symbol: &Symbol,
-    quantity: Decimal,
+    quantity: Float,
     side: OrderSide,
 ) -> HttpMockResponse {
-    // Real Alpaca cash balances are denominated in USD cents, so applying a
-    // sub-cent USDC quantity directly would create fractional cents and break
-    // subsequent inventory polls. Round to 2 decimal places (cents precision)
-    // to mirror the real API's behaviour.
-    let cash_delta = quantity.round_dp(2);
+    // Cash ledger is USD-denominated and modeled at cent precision in inventory.
+    // Match equity fill handling by quantizing crypto conversion cash deltas to 2dp.
+    let cash_delta = match quantity
+        .to_fixed_decimal_lossy(2)
+        .and_then(|(fixed, _lossless)| Float::from_fixed_decimal(fixed, 2))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                500,
+                &json!({"message": format!("cash delta conversion error: {error}")}),
+            );
+        }
+    };
 
-    match side {
-        OrderSide::Buy => state.account.cash -= cash_delta,
-        OrderSide::Sell => state.account.cash += cash_delta,
+    let updated_cash = match side {
+        OrderSide::Buy => state.account.cash - cash_delta,
+        OrderSide::Sell => state.account.cash + cash_delta,
+    };
+    match updated_cash {
+        Ok(cash) => state.account.cash = cash,
+        Err(error) => {
+            return json_response(
+                500,
+                &json!({"message": format!("cash arithmetic error: {error}")}),
+            );
+        }
     }
 
-    let fill_price = Decimal::ONE;
+    let fill_price = float!(1);
+    let quantity_formatted = format_float_with_fallback(&quantity);
+    let fill_price_formatted = format_float_with_fallback(&fill_price);
 
     state.orders.insert(
         order_id.to_string(),
@@ -793,19 +824,18 @@ fn handle_crypto_order(
         },
     );
 
-    json_response(
-        200,
-        &json!({
+    json_response(200, &{
+        json!({
             "id": order_id,
             "symbol": symbol,
-            "qty": quantity.to_string(),
+            "qty": quantity_formatted.as_str(),
             "side": side.to_string(),
             "status": "filled",
-            "filled_avg_price": fill_price.to_string(),
-            "filled_qty": quantity.to_string(),
+            "filled_avg_price": fill_price_formatted.as_str(),
+            "filled_qty": quantity_formatted.as_str(),
             "created_at": "2025-01-06T12:00:00Z"
-        }),
-    )
+        })
+    })
 }
 
 fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -853,7 +883,14 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                                 );
                             };
 
-                            apply_happy_path_fill(&mut state, &order_id, fill_price);
+                            if let Err(error) =
+                                apply_happy_path_fill(&mut state, &order_id, fill_price)
+                            {
+                                return json_response(
+                                    500,
+                                    &json!({"message": format!("fill arithmetic error: {error}")}),
+                                );
+                            }
                         }
                     }
                     MockMode::OrderRejected => {
@@ -878,7 +915,14 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                                 );
                             };
 
-                            apply_happy_path_fill(&mut state, &order_id, fill_price);
+                            if let Err(error) =
+                                apply_happy_path_fill(&mut state, &order_id, fill_price)
+                            {
+                                return json_response(
+                                    500,
+                                    &json!({"message": format!("fill arithmetic error: {error}")}),
+                                );
+                            }
                         }
                     }
                     MockMode::PlacementFails => {
@@ -889,16 +933,17 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
 
                 let order = &state.orders[&order_id];
                 let filled_quantity = if order.status == OrderStatus::Filled {
-                    Some(order.quantity.to_string())
+                    Some(format_float_with_fallback(&order.quantity))
                 } else {
                     None
                 };
                 let filled_price: Option<String> =
-                    order.filled_price.map(|price| price.to_string());
+                    order.filled_price.as_ref().map(format_float_with_fallback);
+                let quantity = format_float_with_fallback(&order.quantity);
                 let body = json!({
                     "id": order_id,
                     "symbol": order.symbol,
-                    "qty": order.quantity.to_string(),
+                    "qty": quantity,
                     "side": order.side.to_string(),
                     "status": order.status.to_string(),
                     "filled_avg_price": filled_price,
@@ -915,42 +960,63 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
 }
 
 /// Transitions a "new" order to "filled" and updates account balances.
-fn apply_happy_path_fill(state: &mut MockState, order_id: &str, fill_price: Decimal) {
+fn apply_happy_path_fill(
+    state: &mut MockState,
+    order_id: &str,
+    fill_price: Float,
+) -> Result<(), rain_math_float::FloatError> {
     let should_fill = state
         .orders
         .get(order_id)
         .is_some_and(|order| order.status == OrderStatus::New);
     if !should_fill {
-        return;
+        return Ok(());
     }
 
     let symbol_key = state.orders[order_id].symbol.clone();
-    let quantity = state.orders[order_id].quantity;
+    let qty = state.orders[order_id].quantity;
     let side = state.orders[order_id].side;
+    let raw_cost = (qty * fill_price)?;
+    let (cost_fixed, _) = raw_cost.to_fixed_decimal_lossy(2)?;
+    let cost = Float::from_fixed_decimal(cost_fixed, 2)?;
 
     if let Some(order) = state.orders.get_mut(order_id) {
         order.status = OrderStatus::Filled;
         order.filled_price = Some(fill_price);
     }
 
-    let trade_value = quantity * fill_price;
-    let (cash_delta, quantity_delta, mv_delta) = match side {
-        OrderSide::Buy => (-trade_value, quantity, trade_value),
-        OrderSide::Sell => (trade_value, -quantity, -trade_value),
-    };
+    match side {
+        OrderSide::Buy => {
+            state.account.cash = (state.account.cash - cost)?;
+            let position = state
+                .account
+                .positions
+                .entry(symbol_key.clone())
+                .or_insert_with(|| MockPosition {
+                    symbol: symbol_key,
+                    quantity: Float::from_raw(alloy::primitives::B256::ZERO),
+                    market_value: Float::from_raw(alloy::primitives::B256::ZERO),
+                });
+            position.quantity = (position.quantity + qty)?;
+            position.market_value = (position.market_value + cost)?;
+        }
+        OrderSide::Sell => {
+            state.account.cash = (state.account.cash + cost)?;
+            let position = state
+                .account
+                .positions
+                .entry(symbol_key.clone())
+                .or_insert_with(|| MockPosition {
+                    symbol: symbol_key,
+                    quantity: Float::from_raw(alloy::primitives::B256::ZERO),
+                    market_value: Float::from_raw(alloy::primitives::B256::ZERO),
+                });
+            position.quantity = (position.quantity - qty)?;
+            position.market_value = (position.market_value - cost)?;
+        }
+    }
 
-    state.account.cash += cash_delta;
-    let position = state
-        .account
-        .positions
-        .entry(symbol_key.clone())
-        .or_insert_with(|| MockPosition {
-            symbol: symbol_key,
-            quantity: Decimal::ZERO,
-            market_value: Decimal::ZERO,
-        });
-    position.quantity += quantity_delta;
-    position.market_value += mv_delta;
+    Ok(())
 }
 
 fn register_whitelist_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -1086,7 +1152,7 @@ fn register_wallet_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState
                             .wallet_balances
                             .get(asset)
                             .copied()
-                            .unwrap_or(Decimal::ZERO),
+                            .unwrap_or_else(|| float!(0)),
                     )
                 };
 
@@ -1096,7 +1162,7 @@ fn register_wallet_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState
                         "asset_id": "00000000-0000-0000-0000-000000000000",
                         "asset": asset,
                         "address": deposit_addr,
-                        "balance": balance.to_string(),
+                        "balance": format_float_with_fallback(&balance),
                         "created_at": "2025-01-01T00:00:00Z"
                     }),
                 );
@@ -1110,7 +1176,7 @@ fn register_wallet_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState
                     .map(|(asset, balance)| {
                         json!({
                             "asset": asset,
-                            "balance": balance.to_string()
+                            "balance": format_float_with_fallback(balance)
                         })
                     })
                     .collect()
@@ -1156,7 +1222,7 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
                     &json!({"message": "missing or non-string field: address"}),
                 );
             };
-            let Ok(amount) = Decimal::from_str(amount_str) else {
+            let Ok(amount) = Float::parse(amount_str.to_string()) else {
                 return json_response(
                     400,
                     &json!({"message": format!("invalid amount: {amount_str}")}),
@@ -1170,6 +1236,7 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
             };
             let asset = asset.to_string();
             let transfer_id = Uuid::new_v4().to_string();
+            let amount_formatted = format_float_with_fallback(&amount);
 
             let from_address = {
                 let mut state = lock(&state);
@@ -1201,13 +1268,13 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
                 from_address
             };
 
-            json_response(
-                200,
-                &json!({
+            json_response(200, &{
+                let amount = amount_formatted.as_str();
+                json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
-                    "amount": amount.to_string(),
-                    "usd_value": amount.to_string(),
+                    "amount": amount,
+                    "usd_value": amount,
                     "asset": asset,
                     "chain": "ETH",
                     "from_address": from_address,
@@ -1217,8 +1284,8 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
                     "created_at": Utc::now().to_rfc3339(),
                     "network_fee": "0",
                     "fees": "0"
-                }),
-            )
+                })
+            })
         });
     });
 }
@@ -1261,12 +1328,13 @@ fn register_wallet_transfers_get_endpoint(server: &MockServer, state: &Arc<Mutex
                         } else {
                             Value::String(transfer.tx_hash.clone())
                         };
+                        let amount = format_float_with_fallback(&transfer.amount);
 
                         json!({
                             "id": transfer.transfer_id,
                             "direction": transfer.direction.to_string(),
-                            "amount": transfer.amount.to_string(),
-                            "usd_value": transfer.amount.to_string(),
+                            "amount": amount.as_str(),
+                            "usd_value": amount.as_str(),
                             "asset": transfer.asset,
                             "chain": "ETH",
                             "from_address": transfer.from_address,
@@ -1329,9 +1397,15 @@ fn json_response(status: u16, body: &Value) -> HttpMockResponse {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::U256;
+    use std::collections::HashMap;
 
-    use super::format_u256_as_usdc;
+    use alloy::primitives::{Address, U256};
+
+    use super::{
+        MockAccount, MockMode, MockState, OrderSide, format_u256_as_usdc, handle_crypto_order,
+    };
+    use crate::Symbol;
+    use st0x_float_macro::float;
 
     #[test]
     fn format_u256_as_usdc_cases() {
@@ -1349,5 +1423,45 @@ mod tests {
         // Beyond u64::MAX - the bug the refactor fixed
         let beyond_u64 = U256::from(u64::MAX) + U256::from(1);
         assert_eq!(format_u256_as_usdc(beyond_u64), "18446744073709.551616");
+    }
+
+    #[test]
+    fn crypto_cash_delta_is_quantized_to_cents() {
+        let mut state = MockState {
+            account: MockAccount {
+                cash: float!(100),
+                buying_power: float!(100),
+                positions: HashMap::new(),
+            },
+            orders: HashMap::new(),
+            symbol_fill_prices: HashMap::new(),
+            mode: MockMode::HappyPath,
+            symbol_fill_delays: HashMap::new(),
+            calendar_entries: vec![],
+            wallet_transfers: vec![],
+            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
+            wallet_balances: HashMap::new(),
+            whitelisted_addresses: vec![],
+        };
+
+        let response = handle_crypto_order(
+            &mut state,
+            "order-1",
+            &Symbol::new("USDCUSD").unwrap(),
+            float!(12.345678),
+            OrderSide::Buy,
+        );
+
+        assert_eq!(response.status, Some(200));
+
+        let expected_cash = float!(87.66);
+        assert!(
+            state.account.cash.eq(expected_cash).unwrap(),
+            "cash should be 100 - 12.34 after cent quantization, got: {:?}",
+            state.account.cash
+        );
+
+        let order = state.orders.get("order-1").unwrap();
+        assert!(order.quantity.eq(float!(12.345678)).unwrap());
     }
 }

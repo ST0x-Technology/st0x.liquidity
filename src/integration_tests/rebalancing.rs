@@ -12,14 +12,13 @@ use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
 use httpmock::Mock;
 use httpmock::prelude::*;
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
+use rain_math_float::Float;
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
@@ -53,6 +52,7 @@ use crate::tokenization::alpaca::tests::{
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::mock::MockWrapper;
+use st0x_float_macro::float;
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
@@ -109,12 +109,12 @@ async fn discover_deterministic_tx_hash(
 fn test_trigger_config() -> RebalancingTriggerConfig {
     RebalancingTriggerConfig {
         equity: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: float!(0.5),
+            deviation: float!(0.2),
         },
         usdc: Some(ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         assets: AssetsConfig {
             equities: EquitiesConfig {
@@ -180,7 +180,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc::new(dec!(1000000)), Usdc::new(dec!(1000000))),
+            .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000))),
     ));
     let (sender, receiver) = mpsc::channel(10);
 
@@ -291,8 +291,8 @@ enum Imbalance<'a> {
     Equity {
         position_cqrs: &'a Store<Position>,
         symbol: &'a Symbol,
-        onchain: Decimal,
-        offchain: Decimal,
+        onchain: Float,
+        offchain: Float,
     },
     Usdc {
         inventory: &'a Arc<RwLock<InventoryView>>,
@@ -321,7 +321,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                         },
                         amount: FractionalShares::new(onchain),
                         direction: Direction::Buy,
-                        price_usdc: dec!(150.0),
+                        price_usdc: float!(150.0),
                         block_timestamp: Utc::now(),
                     },
                 )
@@ -352,7 +352,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                         shares_filled: Positive::new(FractionalShares::new(offchain)).unwrap(),
                         direction: Direction::Buy,
                         executor_order_id: ExecutorOrderId::new("ORD1"),
-                        price: Usd::new(dec!(150)),
+                        price: Usd::new(float!(150)),
                         broker_timestamp: Utc::now(),
                     },
                 )
@@ -426,8 +426,8 @@ async fn equity_offchain_imbalance_triggers_mint() {
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
         symbol: &symbol,
-        onchain: dec!(20),
-        offchain: dec!(80),
+        onchain: float!(20),
+        offchain: float!(80),
     })
     .await;
 
@@ -491,7 +491,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             .json_body_includes(
                 json!({
                     "underlying_symbol": "AAPL",
-                    "qty": "30.500000000",
+                    "qty": "30.5",
                     "wallet_address": wallet_hex,
                 })
                 .to_string(),
@@ -534,9 +534,9 @@ async fn equity_offchain_imbalance_triggers_mint() {
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
-                amount: FractionalShares::new(dec!(1)),
+                amount: FractionalShares::new(float!(1)),
                 direction: Direction::Sell,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150.0),
                 block_timestamp: Utc::now(),
             },
         )
@@ -704,8 +704,8 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
         symbol: &symbol,
-        onchain: dec!(79),
-        offchain: dec!(20),
+        onchain: float!(79),
+        offchain: float!(20),
     })
     .await;
     seed_vault_registry(&pool, &symbol, token_address).await;
@@ -730,9 +730,9 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
-                amount: FractionalShares::new(dec!(1)),
+                amount: FractionalShares::new(float!(1)),
                 direction: Direction::Buy,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150.0),
                 block_timestamp: Utc::now(),
             },
         )
@@ -875,8 +875,8 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,
-        onchain: Usdc::new(dec!(100)),
-        offchain: Usdc::new(dec!(900)),
+        onchain: Usdc::new(float!(100)),
+        offchain: Usdc::new(float!(900)),
     })
     .await;
 
@@ -924,7 +924,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         .expect("Expected a captured call");
     assert_eq!(
         call.amount,
-        Usdc::new(dec!(400)),
+        Usdc::new(float!(400)),
         "Expected excess of $400 (target $500 - actual $100)"
     );
 
@@ -948,8 +948,8 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,
-        onchain: Usdc::new(dec!(900)),
-        offchain: Usdc::new(dec!(100)),
+        onchain: Usdc::new(float!(900)),
+        offchain: Usdc::new(float!(100)),
     })
     .await;
 
@@ -996,7 +996,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         .expect("Expected a captured call");
     assert_eq!(
         call.amount,
-        Usdc::new(dec!(400)),
+        Usdc::new(float!(400)),
         "Expected excess of $400 (actual $900 - target $500)"
     );
 
@@ -1018,8 +1018,8 @@ async fn usdc_none_disables_usdc_rebalancing() {
 
     build_imbalanced_inventory(Imbalance::Usdc {
         inventory: &inventory,
-        onchain: Usdc::new(dec!(100)),
-        offchain: Usdc::new(dec!(900)),
+        onchain: Usdc::new(float!(100)),
+        offchain: Usdc::new(float!(900)),
     })
     .await;
 
@@ -1070,8 +1070,8 @@ async fn mint_api_failure_produces_rejected_event() {
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
         symbol: &symbol,
-        onchain: dec!(20),
-        offchain: dec!(80),
+        onchain: float!(20),
+        offchain: float!(80),
     })
     .await;
 
@@ -1119,9 +1119,9 @@ async fn mint_api_failure_produces_rejected_event() {
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
-                amount: FractionalShares::new(dec!(1)),
+                amount: FractionalShares::new(float!(1)),
                 direction: Direction::Sell,
-                price_usdc: dec!(150.0),
+                price_usdc: float!(150.0),
                 block_timestamp: Utc::now(),
             },
         )
@@ -1198,7 +1198,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     // 50 onchain, 950 offchain = 5% ratio -> TooMuchOffchain
     // Excess to reach 50% target = 500 - 50 = 450 USDC
     let inventory = Arc::new(RwLock::new(
-        InventoryView::default().with_usdc(Usdc::new(dec!(50)), Usdc::new(dec!(950))),
+        InventoryView::default().with_usdc(Usdc::new(float!(50)), Usdc::new(float!(950))),
     ));
 
     let assets = AssetsConfig {
@@ -1206,18 +1206,18 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         cash: Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
-            operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+            operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
         }),
     };
 
     let config = RebalancingTriggerConfig {
         equity: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: float!(0.5),
+            deviation: float!(0.2),
         },
         usdc: Some(ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         assets,
         disabled_assets: HashSet::new(),
@@ -1244,7 +1244,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
             assert_eq!(
                 amount,
-                Usdc::new(dec!(100)),
+                Usdc::new(float!(100)),
                 "First transfer capped to $100"
             );
         }
@@ -1257,7 +1257,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc::new(dec!(150)), Usdc::new(dec!(850)));
+        *guard = taken.with_usdc(Usdc::new(float!(150)), Usdc::new(float!(850)));
     }
 
     // Cycle 2: excess = 350, capped to 100
@@ -1267,7 +1267,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
             assert_eq!(
                 amount,
-                Usdc::new(dec!(100)),
+                Usdc::new(float!(100)),
                 "Second transfer capped to $100"
             );
         }
@@ -1280,7 +1280,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc::new(dec!(250)), Usdc::new(dec!(750)));
+        *guard = taken.with_usdc(Usdc::new(float!(250)), Usdc::new(float!(750)));
     }
 
     // Cycle 3: excess = 250, capped to 100
@@ -1290,7 +1290,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
             assert_eq!(
                 amount,
-                Usdc::new(dec!(100)),
+                Usdc::new(float!(100)),
                 "Third transfer capped to $100"
             );
         }
@@ -1303,7 +1303,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc::new(dec!(350)), Usdc::new(dec!(650)));
+        *guard = taken.with_usdc(Usdc::new(float!(350)), Usdc::new(float!(650)));
     }
 
     trigger.check_and_trigger_usdc().await;
@@ -1326,7 +1326,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
 
     // Large imbalance: 100 onchain, 900 offchain
     let inventory = Arc::new(RwLock::new(
-        InventoryView::default().with_usdc(Usdc::new(dec!(100)), Usdc::new(dec!(900))),
+        InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(900))),
     ));
 
     let assets = AssetsConfig {
@@ -1334,17 +1334,17 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         cash: Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
-            operational_limit: Some(Positive::new(Usdc::new(dec!(100))).unwrap()),
+            operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
         }),
     };
     let config = RebalancingTriggerConfig {
         equity: ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: float!(0.5),
+            deviation: float!(0.2),
         },
         usdc: Some(ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         assets,
         disabled_assets: HashSet::new(),
@@ -1373,7 +1373,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
             assert_eq!(
                 amount,
-                Usdc::new(dec!(100)),
+                Usdc::new(float!(100)),
                 "First transfer capped to $100"
             );
         }
@@ -1402,7 +1402,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         TriggeredOperation::UsdcAlpacaToBase { amount } => {
             assert_eq!(
                 amount,
-                Usdc::new(dec!(100)),
+                Usdc::new(float!(100)),
                 "Retry transfer also capped to $100"
             );
         }
@@ -1428,20 +1428,20 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
         build_imbalanced_inventory(Imbalance::Usdc {
             inventory: &inventory,
-            onchain: Usdc::new(dec!(350)),
-            offchain: Usdc::new(dec!(650)),
+            onchain: Usdc::new(float!(350)),
+            offchain: Usdc::new(float!(650)),
         })
         .await;
 
         let (sender, mut receiver) = mpsc::channel(10);
         let wide_config = RebalancingTriggerConfig {
             equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.4),
+                target: float!(0.5),
+                deviation: float!(0.4),
             },
             usdc: Some(ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.4),
+                target: float!(0.5),
+                deviation: float!(0.4),
             }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -1483,20 +1483,20 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
         build_imbalanced_inventory(Imbalance::Usdc {
             inventory: &inventory,
-            onchain: Usdc::new(dec!(350)),
-            offchain: Usdc::new(dec!(650)),
+            onchain: Usdc::new(float!(350)),
+            offchain: Usdc::new(float!(650)),
         })
         .await;
 
         let (sender, mut receiver) = mpsc::channel(10);
         let tight_config = RebalancingTriggerConfig {
             equity: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.1),
+                target: float!(0.5),
+                deviation: float!(0.1),
             },
             usdc: Some(ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.1),
+                target: float!(0.5),
+                deviation: float!(0.1),
             }),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -1532,7 +1532,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TriggeredOperation::UsdcAlpacaToBase { amount } => {
                 assert_eq!(
                     amount,
-                    Usdc::new(dec!(150)),
+                    Usdc::new(float!(150)),
                     "Excess should be $150 (target $500 - actual $350)"
                 );
             }

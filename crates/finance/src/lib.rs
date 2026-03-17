@@ -2,7 +2,11 @@
 //!
 //! This is a leaf crate with zero workspace dependencies, providing
 //! domain types that multiple crates need: `Symbol`, `FractionalShares`,
-//! `Usdc`, `Usd`, `Positive`, `HasZero`, `ArithmeticError`, and `Id<Tag>`.
+//! `Usdc`, `Usd`, `Positive`, `HasZero`, and `Id<Tag>`.
+
+use rain_math_float::{Float, FloatError};
+use serde::Deserialize;
+use std::fmt::Debug;
 
 mod id;
 mod shares;
@@ -14,55 +18,17 @@ pub use id::{BlankIdError, Id};
 pub use shares::FractionalShares;
 pub use symbol::{EmptySymbolError, Symbol};
 pub use usd::Usd;
-pub use usdc::Usdc;
-#[cfg(feature = "alloy")]
-pub use usdc::UsdcConversionError;
-
-use num_traits::ToPrimitive;
-use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+pub use usdc::{Usdc, UsdcConversionError};
 
 /// Trait for types that have a zero value and can be compared to it.
-pub trait HasZero: PartialOrd + Sized {
+///
+/// Comparisons are fallible because the underlying Float EVM-based
+/// operations can technically fail on malformed data.
+pub trait HasZero: Sized + Copy {
     const ZERO: Self;
 
-    fn is_zero(&self) -> bool
-    where
-        Self: PartialEq,
-    {
-        self == &Self::ZERO
-    }
-
-    fn is_negative(&self) -> bool {
-        self < &Self::ZERO
-    }
-}
-
-/// Which arithmetic operation overflowed.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ArithmeticOperation {
-    Add,
-    Sub,
-    Mul,
-}
-
-impl std::fmt::Display for ArithmeticOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Add => write!(f, "+"),
-            Self::Sub => write!(f, "-"),
-            Self::Mul => write!(f, "*"),
-        }
-    }
-}
-
-/// Checked arithmetic overflow error preserving both operands.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
-pub struct ArithmeticError<T> {
-    pub operation: ArithmeticOperation,
-    pub lhs: T,
-    pub rhs: T,
+    fn is_zero(&self) -> Result<bool, FloatError>;
+    fn is_negative(&self) -> Result<bool, FloatError>;
 }
 
 /// Value must be positive (greater than zero).
@@ -75,19 +41,22 @@ pub struct NotPositive<T> {
 /// Wrapper that guarantees the inner value is positive (greater than zero).
 ///
 /// Use this when an API requires strictly positive values, such as order quantities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct Positive<T>(T);
 
 impl<T> Positive<T>
 where
-    T: PartialOrd + HasZero + Copy + Debug,
+    T: HasZero + Into<Float>,
 {
     /// # Errors
     ///
     /// Returns [`NotPositive`] if `value` is zero or negative.
     pub fn new(value: T) -> Result<Self, NotPositive<T>> {
-        if value <= T::ZERO {
+        let zero = value.is_zero().unwrap_or(false);
+        let negative = value.is_negative().unwrap_or(false);
+
+        if zero || negative {
             return Err(NotPositive { value });
         }
         Ok(Self(value))
@@ -100,7 +69,7 @@ where
 
 impl<'de, T> Deserialize<'de> for Positive<T>
 where
-    T: Deserialize<'de> + PartialOrd + HasZero + Copy + Debug,
+    T: Deserialize<'de> + HasZero + Into<Float> + Debug,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -118,8 +87,6 @@ impl<T: std::fmt::Display> std::fmt::Display for Positive<T> {
 }
 
 impl Positive<FractionalShares> {
-    pub const ONE: Self = Self(FractionalShares::ONE);
-
     /// Converts to whole shares count, returning error if value has a
     /// fractional part or exceeds u64 range. Use this when the target
     /// API does not support fractional shares.
@@ -131,29 +98,38 @@ impl Positive<FractionalShares> {
     /// exceeds `u64` range.
     pub fn to_whole_shares(self) -> Result<u64, ToWholeSharesError> {
         let inner = self.inner();
-        if !inner.is_whole() {
+        if !inner.is_whole()? {
             return Err(ToWholeSharesError::Fractional(inner));
         }
 
-        inner
-            .inner()
-            .to_u64()
-            .ok_or(ToWholeSharesError::Overflow(inner))
+        let formatted = inner.inner().format().map_err(ToWholeSharesError::Float)?;
+
+        let integer_str = formatted.split('.').next().unwrap_or(&formatted);
+        integer_str
+            .parse::<u64>()
+            .map_err(|_| ToWholeSharesError::Overflow(inner))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ToWholeSharesError {
     #[error("Cannot convert fractional shares {0} to whole shares")]
     Fractional(FractionalShares),
     #[error("Shares value {0} exceeds u64 range")]
     Overflow(FractionalShares),
+    #[error("Float operation failed: {0}")]
+    Float(FloatError),
+}
+
+impl From<FloatError> for ToWholeSharesError {
+    fn from(error: FloatError) -> Self {
+        Self::Float(error)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
+    use st0x_float_macro::float;
 
     use super::*;
 
@@ -165,21 +141,21 @@ mod tests {
 
     #[test]
     fn positive_rejects_negative() {
-        let negative = FractionalShares::new(Decimal::NEGATIVE_ONE);
+        let negative = FractionalShares::new(float!(-1));
         let error = Positive::new(negative).unwrap_err();
         assert_eq!(error.value, negative);
     }
 
     #[test]
     fn positive_accepts_positive_value() {
-        let value = FractionalShares::new(Decimal::ONE);
+        let value = FractionalShares::new(float!(1));
         let positive = Positive::new(value).unwrap();
         assert_eq!(positive.inner(), value);
     }
 
     #[test]
     fn positive_deserialize_rejects_zero() {
-        let result: Result<Positive<FractionalShares>, _> = serde_json::from_str("0");
+        let result: Result<Positive<FractionalShares>, _> = serde_json::from_str("\"0\"");
         let error = result.unwrap_err();
         assert!(
             error.to_string().to_lowercase().contains("positive"),
@@ -189,7 +165,7 @@ mod tests {
 
     #[test]
     fn positive_deserialize_rejects_negative() {
-        let result: Result<Positive<FractionalShares>, _> = serde_json::from_str("-1");
+        let result: Result<Positive<FractionalShares>, _> = serde_json::from_str("\"-1\"");
         let error = result.unwrap_err();
         assert!(
             error.to_string().to_lowercase().contains("positive"),
@@ -199,28 +175,48 @@ mod tests {
 
     #[test]
     fn positive_deserialize_accepts_positive() {
-        let positive: Positive<FractionalShares> = serde_json::from_str("5.5").unwrap();
-        assert_eq!(positive.inner(), FractionalShares::new(dec!(5.5)));
+        let positive: Positive<FractionalShares> = serde_json::from_str("\"5.5\"").unwrap();
+        assert!(positive.inner().inner().eq(float!(5.5)).unwrap());
     }
 
     #[test]
     fn to_whole_shares_succeeds_for_whole_number() {
-        let positive = Positive::new(FractionalShares::new(dec!(42))).unwrap();
+        let positive = Positive::new(FractionalShares::new(float!(42))).unwrap();
         assert_eq!(positive.to_whole_shares().unwrap(), 42);
     }
 
     #[test]
     fn to_whole_shares_rejects_fractional() {
-        let positive = Positive::new(FractionalShares::new(dec!(1.5))).unwrap();
+        let positive = Positive::new(FractionalShares::new(float!(1.5))).unwrap();
         let error = positive.to_whole_shares().unwrap_err();
         assert!(matches!(error, ToWholeSharesError::Fractional(_)));
     }
 
     #[test]
-    fn to_whole_shares_rejects_overflow() {
-        let huge = FractionalShares::new(Decimal::MAX);
-        let positive = Positive::new(huge).unwrap();
-        let error = positive.to_whole_shares().unwrap_err();
-        assert!(matches!(error, ToWholeSharesError::Overflow(_)));
+    fn float_from_raw_all_bytes_are_valid() {
+        use alloy_primitives::B256;
+
+        // Float is a dense encoding: 224-bit signed coefficient (high bytes)
+        // + 32-bit signed exponent (low bytes). Every possible B256 value
+        // maps to a valid float — there are no invalid bit patterns.
+        // This means from_raw can never produce a value that fails basic
+        // operations like formatting or comparison.
+        let patterns: Vec<B256> = vec![
+            B256::from([0xff; 32]),
+            B256::from([0x00; 32]),
+            B256::from([0x80; 32]),
+            B256::from([0xde; 32]),
+        ];
+
+        for bytes in patterns {
+            let raw = Float::from_raw(bytes);
+            assert_eq!(raw.get_inner(), bytes);
+
+            // All basic operations succeed on any raw bytes.
+            raw.format().unwrap();
+            raw.is_zero().unwrap();
+            raw.abs().unwrap();
+            (raw + float!(0)).unwrap();
+        }
     }
 }

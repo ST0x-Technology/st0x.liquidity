@@ -4,7 +4,7 @@ use alloy::primitives::TxHash;
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
+use st0x_float_serde::format_float_with_fallback;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
 /// constructed from config. Handles Schwab auth, symbol mapping, etc.
@@ -89,7 +90,11 @@ pub(super) async fn order_status_command<W: Write>(
             writeln!(stdout, "✅ Order Status: FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
             writeln!(stdout, "   Executed At: {executed_at}")?;
-            writeln!(stdout, "   Fill Price: ${price}")?;
+            writeln!(
+                stdout,
+                "   Fill Price: ${}",
+                format_float_with_fallback(&price)
+            )?;
         }
         OrderState::Failed {
             failed_at,
@@ -145,7 +150,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: Positive::new(FractionalShares::new(Decimal::from(quantity)))?,
+        shares: Positive::new(FractionalShares::new(Float::parse(quantity.to_string())?))?,
         direction,
     };
 
@@ -430,7 +435,7 @@ async fn update_position_aggregate(
 
 fn extract_fill_params(
     onchain_trade: &OnchainTrade,
-) -> Option<(FractionalShares, Decimal, DateTime<Utc>)> {
+) -> Option<(FractionalShares, Float, DateTime<Utc>)> {
     let Some(block_timestamp) = onchain_trade.block_timestamp else {
         error!(
             tx_hash = %onchain_trade.tx_hash,
@@ -502,8 +507,8 @@ fn display_trade_details<W: Write>(
     writeln!(stdout, "   Quantity: {}", onchain_trade.amount)?;
     writeln!(
         stdout,
-        "   Price per Share: ${:.2}",
-        onchain_trade.price.value()
+        "   Price per Share: ${}",
+        format_float_with_fallback(&onchain_trade.price.value())
     )?;
     Ok(())
 }

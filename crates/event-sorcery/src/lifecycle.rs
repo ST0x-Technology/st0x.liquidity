@@ -103,7 +103,7 @@ pub enum LifecycleError<Entity: EventSourced> {
     },
     #[error("event '{event:?}' applied to already-failed lifecycle")]
     AlreadyFailed {
-        failure: Box<LifecycleError<Entity>>,
+        failure: Box<Self>,
         event: Entity::Event,
     },
     #[error(transparent)]
@@ -135,7 +135,7 @@ pub enum Never {}
 impl<Entity> Aggregate for Lifecycle<Entity>
 where
     Entity: EventSourced,
-    Entity::Event: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + PartialEq,
+    Entity::Event: Clone + Debug + Serialize + DeserializeOwned + Send + Sync,
 {
     type Command = Entity::Command;
     type Event = Entity::Event;
