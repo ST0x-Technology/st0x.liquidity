@@ -35,7 +35,7 @@ pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
 #[cfg(feature = "mock")]
-pub mod mock_orchestration;
+mod mock_orchestration;
 mod offchain;
 mod offchain_order;
 mod onchain;
