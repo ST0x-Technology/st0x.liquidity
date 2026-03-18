@@ -9,9 +9,10 @@
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
 use futures_util::future::try_join_all;
+use rain_math_float::FloatError;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
@@ -27,7 +28,14 @@ use crate::inventory::snapshot::{
 use crate::onchain::raindex::{RaindexError, RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
+use crate::tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
+
+/// Pending mints and redemptions aggregated by symbol.
+struct PendingRequests {
+    mints: BTreeMap<Symbol, FractionalShares>,
+    redemptions: BTreeMap<Symbol, FractionalShares>,
+}
 
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +54,10 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     UsdcConversion(#[from] UsdcTransferError),
     #[error(transparent)]
     AlpacaWallet(#[from] AlpacaWalletError),
+    #[error(transparent)]
+    Tokenizer(#[from] TokenizerError),
+    #[error(transparent)]
+    Float(#[from] FloatError),
     #[error("vault balance mismatch: expected {expected:?}, got {actual:?}")]
     VaultBalanceMismatch {
         expected: Vec<Address>,
@@ -76,13 +88,16 @@ where
     order_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: WalletPollingCtx,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
 }
 
+#[bon::bon]
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
 where
     Chain: Evm,
     Exe: Executor,
 {
+    #[builder]
     pub(crate) fn new(
         raindex_service: Arc<RaindexService<Chain>>,
         executor: Exe,
@@ -91,6 +106,7 @@ where
         order_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
         wallet_polling: WalletPollingCtx,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Self {
         Self {
             raindex_service,
@@ -100,6 +116,7 @@ where
             order_owner,
             snapshot,
             wallet_polling,
+            tokenizer,
         }
     }
 
@@ -116,6 +133,12 @@ where
             owner: self.order_owner,
         };
 
+        // Inflight must be polled first. Balance snapshots trigger
+        // check_and_trigger_equity, which skips when has_inflight() is true.
+        // On startup the first poll tick runs immediately -- if balance
+        // snapshots land before inflight, the system can trigger a duplicate
+        // operation for a request Alpaca already has pending.
+        self.poll_inflight_equity(&snapshot_id).await?;
         self.poll_onchain(&snapshot_id).await?;
         self.poll_ethereum_cash(&snapshot_id).await?;
         self.poll_base_wallet_cash(&snapshot_id).await?;
@@ -450,6 +473,98 @@ where
 
         Ok(())
     }
+
+    /// Aggregate pending tokenization requests into mint and redemption maps.
+    fn aggregate_pending_requests(
+        requests: impl Iterator<Item = crate::tokenization::TokenizationRequest>,
+    ) -> Result<PendingRequests, FloatError> {
+        let mut mints: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
+        let mut redemptions: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
+
+        for request in requests {
+            let target = match request.r#type {
+                Some(TokenizationRequestType::Mint) => &mut mints,
+                Some(TokenizationRequestType::Redeem) => &mut redemptions,
+                None => {
+                    warn!(
+                        request_id = %request.id.0,
+                        symbol = %request.underlying_symbol,
+                        "Pending tokenization request has no type, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let entry = target
+                .entry(request.underlying_symbol.clone())
+                .or_insert(FractionalShares::ZERO);
+
+            *entry = (*entry + request.quantity)?;
+        }
+
+        Ok(PendingRequests { mints, redemptions })
+    }
+
+    /// Whether a pending request belongs to this conductor's wallet.
+    /// Returns `false` for requests from other wallets (should be filtered
+    /// out). Returns `true` for matching wallets or when `wallet` is `None`
+    /// (older requests may lack the field).
+    // TODO: wallet=None claims the request for every conductor sharing the
+    // tokenizer account, which overstates inflight in multi-conductor setups.
+    // Consider warning+skipping None wallets once the provider reliably
+    // populates the field.
+    fn is_own_request(&self, request: &crate::tokenization::TokenizationRequest) -> bool {
+        match request.wallet {
+            Some(wallet) if wallet != self.order_owner => {
+                warn!(
+                    request_id = %request.id.0,
+                    ?wallet,
+                    expected = ?self.order_owner,
+                    "Skipping pending request from different wallet"
+                );
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Poll the tokenization provider for pending requests and emit an
+    /// inflight equity snapshot.
+    ///
+    /// Pending mint requests represent shares leaving the offchain broker
+    /// (hedging venue inflight). Pending redemption requests represent
+    /// tokens leaving onchain (market-making venue inflight).
+    async fn poll_inflight_equity(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let Some(tokenizer) = &self.tokenizer else {
+            debug!("No tokenizer configured, skipping inflight equity polling");
+            return Ok(());
+        };
+
+        let pending = tokenizer.list_pending_requests().await?;
+        let PendingRequests { mints, redemptions } = Self::aggregate_pending_requests(
+            pending
+                .into_iter()
+                .filter(|request| self.is_own_request(request)),
+        )?;
+
+        debug!(
+            mint_symbols = mints.len(),
+            redemption_symbols = redemptions.len(),
+            "Polled inflight equity from tokenization provider"
+        );
+
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::InflightEquity { mints, redemptions },
+            )
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -635,15 +750,15 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory.clone());
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -682,15 +797,15 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -725,15 +840,15 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -759,15 +874,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         // Should succeed without error
         service.poll_and_record().await.unwrap();
@@ -815,15 +930,15 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -863,15 +978,15 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -905,15 +1020,15 @@ mod tests {
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -998,15 +1113,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1047,15 +1162,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1097,15 +1212,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1146,15 +1261,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
 
@@ -1178,15 +1293,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
 
@@ -1251,18 +1366,18 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 ethereum: Some(ethereum_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1294,18 +1409,18 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1345,18 +1460,18 @@ mod tests {
                 ]));
         });
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(MockExecutor::new())
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 alpaca_wallet: Some(alpaca_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1383,15 +1498,15 @@ mod tests {
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
         let (orderbook, order_owner) = test_addresses();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(MockExecutor::new())
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1426,18 +1541,18 @@ mod tests {
             }));
         });
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(MockExecutor::new())
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 alpaca_wallet: Some(alpaca_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
         assert!(matches!(
@@ -1469,18 +1584,18 @@ mod tests {
                 ]));
         });
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(MockExecutor::new())
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 alpaca_wallet: Some(alpaca_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
         service.poll_and_record().await.unwrap();
@@ -1508,15 +1623,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1545,15 +1660,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1585,18 +1700,18 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 ethereum: Some(ethereum_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
         assert!(matches!(error, InventoryPollingError::Evm(_)));
@@ -1615,21 +1730,381 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
         assert!(matches!(error, InventoryPollingError::Evm(_)));
+    }
+
+    fn mock_pending_request(
+        request_type: crate::tokenization::TokenizationRequestType,
+        symbol: &str,
+        quantity: i64,
+    ) -> crate::tokenization::TokenizationRequest {
+        mock_pending_request_with_wallet(request_type, symbol, quantity, None)
+    }
+
+    fn mock_pending_request_no_type(
+        symbol: &str,
+        quantity: i64,
+    ) -> crate::tokenization::TokenizationRequest {
+        crate::tokenization::TokenizationRequest {
+            id: crate::tokenized_equity_mint::TokenizationRequestId(format!(
+                "REQ_{symbol}_{quantity}_notype"
+            )),
+            r#type: None,
+            status: crate::tokenization::TokenizationRequestStatus::Pending,
+            underlying_symbol: test_symbol(symbol),
+            quantity: test_shares(quantity),
+            wallet: None,
+            issuer_request_id: None,
+            tx_hash: None,
+            token_symbol: None,
+            fees: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn mock_pending_request_with_wallet(
+        request_type: crate::tokenization::TokenizationRequestType,
+        symbol: &str,
+        quantity: i64,
+        wallet: Option<Address>,
+    ) -> crate::tokenization::TokenizationRequest {
+        crate::tokenization::TokenizationRequest {
+            id: crate::tokenized_equity_mint::TokenizationRequestId(format!(
+                "REQ_{symbol}_{quantity}"
+            )),
+            r#type: Some(request_type),
+            status: crate::tokenization::TokenizationRequestStatus::Pending,
+            underlying_symbol: test_symbol(symbol),
+            quantity: test_shares(quantity),
+            wallet,
+            issuer_request_id: None,
+            tx_hash: None,
+            token_symbol: None,
+            fees: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_emits_mints_and_redemptions() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let tokenizer = Arc::new(
+            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "AAPL",
+                    10,
+                ),
+                mock_pending_request(
+                    crate::tokenization::TokenizationRequestType::Redeem,
+                    "MSFT",
+                    5,
+                ),
+            ]),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .tokenizer(tokenizer)
+            .build();
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("Expected InflightEquity event");
+
+        let InventorySnapshotEvent::InflightEquity {
+            mints, redemptions, ..
+        } = inflight_event
+        else {
+            panic!("Expected InflightEquity event");
+        };
+
+        assert_eq!(mints.len(), 1);
+        assert_eq!(mints.get(&test_symbol("AAPL")), Some(&test_shares(10)));
+        assert_eq!(redemptions.len(), 1);
+        assert_eq!(redemptions.get(&test_symbol("MSFT")), Some(&test_shares(5)));
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_aggregates_same_symbol() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let tokenizer = Arc::new(
+            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "AAPL",
+                    10,
+                ),
+                mock_pending_request(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "AAPL",
+                    25,
+                ),
+            ]),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .tokenizer(tokenizer)
+            .build();
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("Expected InflightEquity event");
+
+        let InventorySnapshotEvent::InflightEquity { mints, .. } = inflight_event else {
+            panic!("Expected InflightEquity event");
+        };
+
+        // Two pending mints for AAPL should be summed: 10 + 25 = 35
+        assert_eq!(mints.len(), 1);
+        assert_eq!(mints.get(&test_symbol("AAPL")), Some(&test_shares(35)));
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_skipped_without_tokenizer() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }));
+
+        assert!(
+            inflight_event.is_none(),
+            "No InflightEquity event expected without tokenizer"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_emits_empty_snapshot_when_no_requests_pending() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let executor = MockExecutor::new();
+
+        let tokenizer =
+            Arc::new(crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![]));
+
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .tokenizer(tokenizer)
+            .build();
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("Expected InflightEquity event even with empty pending requests");
+
+        let InventorySnapshotEvent::InflightEquity {
+            mints, redemptions, ..
+        } = inflight_event
+        else {
+            panic!("Expected InflightEquity event");
+        };
+
+        assert!(mints.is_empty(), "No pending mints expected");
+        assert!(redemptions.is_empty(), "No pending redemptions expected");
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_filters_by_wallet() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+        let other_wallet = address!("0x9999999999999999999999999999999999999999");
+
+        let tokenizer = Arc::new(
+            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                // Matching wallet
+                mock_pending_request_with_wallet(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "AAPL",
+                    10,
+                    Some(order_owner),
+                ),
+                // Non-matching wallet -- should be filtered out
+                mock_pending_request_with_wallet(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "MSFT",
+                    20,
+                    Some(other_wallet),
+                ),
+                // No wallet -- should be included
+                mock_pending_request_with_wallet(
+                    crate::tokenization::TokenizationRequestType::Redeem,
+                    "TSLA",
+                    5,
+                    None,
+                ),
+            ]),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .tokenizer(tokenizer)
+            .build();
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("Expected InflightEquity event");
+
+        let InventorySnapshotEvent::InflightEquity {
+            mints, redemptions, ..
+        } = inflight_event
+        else {
+            panic!("Expected InflightEquity event");
+        };
+
+        // Only matching wallet (AAPL) should be in mints
+        assert_eq!(mints.len(), 1, "Only matching wallet should be included");
+        assert_eq!(mints.get(&test_symbol("AAPL")), Some(&test_shares(10)));
+
+        // No-wallet request (TSLA) should be included in redemptions
+        assert_eq!(
+            redemptions.len(),
+            1,
+            "No-wallet requests should be included"
+        );
+        assert_eq!(redemptions.get(&test_symbol("TSLA")), Some(&test_shares(5)));
+    }
+
+    #[test]
+    fn aggregate_pending_requests_skips_none_type_but_keeps_valid_rows() {
+        // A request with r#type: None should be skipped (with a warning),
+        // but valid mint/redemption rows in the same batch must still
+        // aggregate correctly.
+        let requests = vec![
+            mock_pending_request_no_type("AAPL", 5),
+            mock_pending_request(
+                crate::tokenization::TokenizationRequestType::Mint,
+                "AAPL",
+                10,
+            ),
+            mock_pending_request(
+                crate::tokenization::TokenizationRequestType::Redeem,
+                "TSLA",
+                20,
+            ),
+            mock_pending_request(
+                crate::tokenization::TokenizationRequestType::Mint,
+                "AAPL",
+                3,
+            ),
+        ];
+
+        let PendingRequests { mints, redemptions } = InventoryPollingService::<
+            ReadOnlyEvm<RootProvider>,
+            MockExecutor,
+        >::aggregate_pending_requests(
+            requests.into_iter()
+        )
+        .unwrap();
+
+        // AAPL mints: 10 + 3 = 13 (the None-type row was skipped)
+        assert_eq!(
+            mints.get(&test_symbol("AAPL")),
+            Some(&test_shares(13)),
+            "Valid mint rows should aggregate despite a None-type row"
+        );
+
+        // TSLA redemptions: 20
+        assert_eq!(
+            redemptions.get(&test_symbol("TSLA")),
+            Some(&test_shares(20)),
+            "Redemption row should be unaffected by the None-type row"
+        );
+
+        // No other symbols
+        assert_eq!(mints.len(), 1);
+        assert_eq!(redemptions.len(), 1);
     }
 
     #[tokio::test]
@@ -1653,19 +2128,19 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1702,15 +2177,15 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx::default(),
-        );
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx::default())
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1747,18 +2222,18 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1800,19 +2275,19 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
         assert!(
@@ -1843,19 +2318,19 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 unwrapped_equity_token_addresses: equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
         assert!(
@@ -1888,19 +2363,19 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -1955,19 +2430,19 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -2007,18 +2482,18 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -2055,18 +2530,18 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
 
@@ -2108,19 +2583,19 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         let error = service.poll_and_record().await.unwrap_err();
         assert!(
@@ -2154,19 +2629,19 @@ mod tests {
 
         let executor = MockExecutor::new();
 
-        let service = InventoryPollingService::new(
-            raindex_service,
-            executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            WalletPollingCtx {
+        let service = InventoryPollingService::builder()
+            .raindex_service(raindex_service)
+            .executor(executor)
+            .vault_registry(Arc::new(test_store::<VaultRegistry>(pool.clone(), ())))
+            .orderbook(orderbook)
+            .order_owner(order_owner)
+            .snapshot(Arc::new(test_store(pool.clone(), ())))
+            .wallet_polling(WalletPollingCtx {
                 base: Some(base_wallet),
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
                 ..WalletPollingCtx::default()
-            },
-        );
+            })
+            .build();
 
         service.poll_and_record().await.unwrap();
         service.poll_and_record().await.unwrap();

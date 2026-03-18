@@ -77,6 +77,8 @@ pub(crate) struct MockTokenizer {
     verification_outcome: MockVerificationOutcome,
     should_fail_send: bool,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
+    pending_requests: Vec<TokenizationRequest>,
+    /// Override the token_symbol in completed mint responses.
     token_symbol_behavior: MockTokenSymbolBehavior,
     /// Override fees in completed mint responses.
     fees_override: Option<Float>,
@@ -96,6 +98,7 @@ impl MockTokenizer {
             last_issuer_request_id: Mutex::new(None),
             token_symbol_behavior: MockTokenSymbolBehavior::Default,
             fees_override: None,
+            pending_requests: Vec::new(),
         }
     }
 
@@ -126,6 +129,11 @@ impl MockTokenizer {
 
     pub(crate) fn with_send_failure(mut self) -> Self {
         self.should_fail_send = true;
+        self
+    }
+
+    pub(crate) fn with_pending_requests(mut self, requests: Vec<TokenizationRequest>) -> Self {
+        self.pending_requests = requests;
         self
     }
 
@@ -301,5 +309,14 @@ impl Tokenizer for MockTokenizer {
                 })
             }
         }
+    }
+
+    async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError> {
+        Ok(self
+            .pending_requests
+            .iter()
+            .filter(|request| request.status == TokenizationRequestStatus::Pending)
+            .cloned()
+            .collect())
     }
 }

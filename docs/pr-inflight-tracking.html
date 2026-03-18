@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PR: In-Flight Tracking</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --purple: #bc8cff;
+    --pink: #f778ba;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; padding: 2rem; line-height: 1.6; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; color: var(--accent); margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.1rem; color: var(--purple); margin: 1.5rem 0 0.75rem; }
+  .subtitle { color: var(--muted); font-size: 1rem; margin-bottom: 2rem; }
+  .container { max-width: 1200px; margin: 0 auto; }
+
+  /* Stats bar */
+  .stats { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; flex: 1; min-width: 140px; }
+  .stat-value { font-size: 1.8rem; font-weight: bold; }
+  .stat-label { color: var(--muted); font-size: 0.85rem; }
+  .stat-green .stat-value { color: var(--green); }
+  .stat-red .stat-value { color: var(--red); }
+  .stat-orange .stat-value { color: var(--orange); }
+  .stat-blue .stat-value { color: var(--accent); }
+
+  /* Diagram containers */
+  .diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 2rem; margin-bottom: 2rem; overflow-x: auto; }
+  .diagram-title { font-size: 1rem; color: var(--muted); margin-bottom: 1.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* SVG styles */
+  svg text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+
+  /* File changes chart */
+  .file-bar { display: flex; align-items: center; margin: 0.3rem 0; font-size: 0.85rem; }
+  .file-name { width: 280px; text-align: right; padding-right: 1rem; color: var(--muted); font-family: monospace; font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-changes { display: flex; height: 12px; border-radius: 2px; overflow: hidden; }
+  .file-add { background: var(--green); }
+  .file-del { background: var(--red); }
+  .file-count { margin-left: 0.5rem; color: var(--muted); font-size: 0.75rem; min-width: 80px; }
+
+  /* Legend */
+  .legend { display: flex; gap: 1.5rem; margin-top: 1rem; font-size: 0.85rem; color: var(--muted); }
+  .legend-item { display: flex; align-items: center; gap: 0.4rem; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+
+  /* Flow nodes */
+  .flow-container { position: relative; }
+  .note { background: #1c2128; border: 1px dashed var(--border); border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0; font-size: 0.9rem; color: var(--muted); }
+  .note strong { color: var(--orange); }
+
+  /* Key concepts */
+  .concept-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .concept { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; }
+  .concept-header { font-weight: 600; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+  .concept p { color: var(--muted); font-size: 0.9rem; }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+  .badge-new { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+  .badge-changed { background: rgba(210, 153, 34, 0.15); color: var(--orange); }
+  .badge-critical { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+
+  @media (max-width: 800px) {
+    .concept-grid { grid-template-columns: 1fr; }
+    .stats { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>In-Flight Tracking</h1>
+<p class="subtitle">Branch: <code>03-12-in-flight_tracking</code> &mdash; 3 commits, 32 files changed</p>
+
+<div class="stats">
+  <div class="stat stat-green"><div class="stat-value">+6,098</div><div class="stat-label">Lines Added</div></div>
+  <div class="stat stat-red"><div class="stat-value">-1,381</div><div class="stat-label">Lines Removed</div></div>
+  <div class="stat stat-orange"><div class="stat-value">32</div><div class="stat-label">Files Changed</div></div>
+  <div class="stat stat-blue"><div class="stat-value">3</div><div class="stat-label">Commits</div></div>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. The Problem This Solves</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Before: Blind Spots in Inventory Tracking</div>
+<svg width="900" height="320" viewBox="0 0 900 320">
+  <!-- Alpaca box -->
+  <rect x="30" y="40" width="200" height="80" rx="8" fill="#1c2128" stroke="#30363d" stroke-width="1.5"/>
+  <text x="130" y="72" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="600">Alpaca (Offchain)</text>
+  <text x="130" y="95" text-anchor="middle" fill="#8b949e" font-size="12">100 AAPL shares</text>
+
+  <!-- Arrow: Alpaca -> ??? -->
+  <line x1="230" y1="80" x2="350" y2="80" stroke="#f85149" stroke-width="2" stroke-dasharray="6,4"/>
+  <polygon points="350,75 360,80 350,85" fill="#f85149"/>
+  <text x="295" y="68" text-anchor="middle" fill="#f85149" font-size="11" font-weight="600">MINT REQUEST</text>
+
+  <!-- ??? box -->
+  <rect x="360" y="40" width="180" height="80" rx="8" fill="#2d1b1b" stroke="#f85149" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="450" y="72" text-anchor="middle" fill="#f85149" font-size="16" font-weight="700">??? IN FLIGHT ???</text>
+  <text x="450" y="95" text-anchor="middle" fill="#f85149" font-size="11">Not tracked anywhere!</text>
+
+  <!-- Arrow: ??? -> Raindex -->
+  <line x1="540" y1="80" x2="650" y2="80" stroke="#f85149" stroke-width="2" stroke-dasharray="6,4"/>
+  <polygon points="650,75 660,80 650,85" fill="#f85149"/>
+
+  <!-- Raindex box -->
+  <rect x="660" y="40" width="200" height="80" rx="8" fill="#1c2128" stroke="#30363d" stroke-width="1.5"/>
+  <text x="760" y="72" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="600">Raindex (Onchain)</text>
+  <text x="760" y="95" text-anchor="middle" fill="#8b949e" font-size="12">50 tAAPL tokens</text>
+
+  <!-- Problem description -->
+  <rect x="30" y="160" width="830" height="140" rx="8" fill="#2d1b1b" stroke="#f85149" stroke-width="1"/>
+  <text x="50" y="188" fill="#f85149" font-size="13" font-weight="700">PROBLEM: Double-triggering rebalancing</text>
+  <text x="50" y="215" fill="#e6edf3" font-size="12">1. System sees 100 AAPL at Alpaca, 50 tAAPL at Raindex &rarr; imbalanced!</text>
+  <text x="50" y="238" fill="#e6edf3" font-size="12">2. Triggers rebalancing: mint 25 AAPL &rarr; tAAPL to fix the imbalance</text>
+  <text x="50" y="261" fill="#f85149" font-size="12" font-weight="600">3. But 25 shares are ALREADY in-flight from a previous mint! Now we have a DUPLICATE request.</text>
+  <text x="50" y="284" fill="#8b949e" font-size="12">The system couldn't see the pending request because in-flight balances weren't tracked.</text>
+</svg>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">After: Full In-Flight Visibility</div>
+<svg width="900" height="280" viewBox="0 0 900 280">
+  <!-- Alpaca box -->
+  <rect x="30" y="40" width="200" height="100" rx="8" fill="#1c2128" stroke="#30363d" stroke-width="1.5"/>
+  <text x="130" y="68" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="600">Alpaca (Hedging)</text>
+  <text x="130" y="90" text-anchor="middle" fill="#3fb950" font-size="12">Available: 75 AAPL</text>
+  <text x="130" y="110" text-anchor="middle" fill="#d29922" font-size="12">Inflight: 25 AAPL (mint)</text>
+
+  <!-- Arrow: Alpaca -> Inflight -->
+  <line x1="230" y1="80" x2="350" y2="80" stroke="#3fb950" stroke-width="2"/>
+  <polygon points="350,75 360,80 350,85" fill="#3fb950"/>
+  <text x="295" y="68" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="600">TRACKED</text>
+
+  <!-- In-Flight box -->
+  <rect x="360" y="40" width="180" height="100" rx="8" fill="#1b2d1b" stroke="#3fb950" stroke-width="2"/>
+  <text x="450" y="68" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">In-Flight</text>
+  <text x="450" y="90" text-anchor="middle" fill="#e6edf3" font-size="12">25 AAPL minting</text>
+  <text x="450" y="110" text-anchor="middle" fill="#8b949e" font-size="11">Polled from Alpaca API</text>
+
+  <!-- Arrow: Inflight -> Raindex -->
+  <line x1="540" y1="80" x2="650" y2="80" stroke="#3fb950" stroke-width="2"/>
+  <polygon points="650,75 660,80 650,85" fill="#3fb950"/>
+
+  <!-- Raindex box -->
+  <rect x="660" y="40" width="200" height="100" rx="8" fill="#1c2128" stroke="#30363d" stroke-width="1.5"/>
+  <text x="760" y="68" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="600">Raindex (Mkt Making)</text>
+  <text x="760" y="90" text-anchor="middle" fill="#3fb950" font-size="12">Available: 50 tAAPL</text>
+  <text x="760" y="110" text-anchor="middle" fill="#8b949e" font-size="12">Inflight: 0</text>
+
+  <!-- Result description -->
+  <rect x="30" y="180" width="830" height="80" rx="8" fill="#1b2d1b" stroke="#3fb950" stroke-width="1"/>
+  <text x="50" y="208" fill="#3fb950" font-size="13" font-weight="700">RESULT: Rebalancing sees the full picture</text>
+  <text x="50" y="232" fill="#e6edf3" font-size="12">System sees 75 available + 25 inflight at Alpaca, 50 at Raindex &rarr; balanced! No duplicate mint triggered.</text>
+  <text x="50" y="248" fill="#8b949e" font-size="12">has_inflight() returns true &rarr; rebalancing skips until in-flight resolves.</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Architecture: How In-Flight Tracking Works</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Data Flow: Polling &rarr; CQRS &rarr; Inventory View &rarr; Rebalancing Decision</div>
+<svg width="900" height="460" viewBox="0 0 900 460">
+  <!-- Step 1: Alpaca API -->
+  <rect x="20" y="20" width="180" height="70" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+  <text x="110" y="48" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="700">Alpaca API</text>
+  <text x="110" y="68" text-anchor="middle" fill="#8b949e" font-size="11">list_pending_requests()</text>
+
+  <!-- Arrow -->
+  <line x1="200" y1="55" x2="260" y2="55" stroke="#58a6ff" stroke-width="1.5"/>
+  <polygon points="260,50 270,55 260,60" fill="#58a6ff"/>
+  <text x="235" y="45" text-anchor="middle" fill="#8b949e" font-size="9">HTTP</text>
+
+  <!-- Step 2: Tokenizer -->
+  <rect x="270" y="20" width="180" height="70" rx="8" fill="#1c2128" stroke="#bc8cff" stroke-width="2"/>
+  <text x="360" y="45" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="700">Tokenizer Trait</text>
+  <text x="360" y="65" text-anchor="middle" fill="#8b949e" font-size="11">list_pending_requests()</text>
+
+  <!-- Arrow -->
+  <line x1="450" y1="55" x2="510" y2="55" stroke="#bc8cff" stroke-width="1.5"/>
+  <polygon points="510,50 520,55 510,60" fill="#bc8cff"/>
+
+  <!-- Step 3: Polling Service -->
+  <rect x="520" y="20" width="180" height="70" rx="8" fill="#1c2128" stroke="#d29922" stroke-width="2"/>
+  <text x="610" y="45" text-anchor="middle" fill="#d29922" font-size="13" font-weight="700">InventoryPolling</text>
+  <text x="610" y="65" text-anchor="middle" fill="#8b949e" font-size="11">poll_inflight_equity()</text>
+
+  <!-- Arrow down -->
+  <line x1="610" y1="90" x2="610" y2="130" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="605,130 610,140 615,130" fill="#d29922"/>
+  <text x="640" y="115" fill="#8b949e" font-size="9">CQRS cmd</text>
+
+  <!-- Step 4: Snapshot Aggregate -->
+  <rect x="520" y="140" width="180" height="70" rx="8" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+  <text x="610" y="165" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">InventorySnapshot</text>
+  <text x="610" y="185" text-anchor="middle" fill="#8b949e" font-size="11">InflightEquity event</text>
+
+  <!-- Arrow down -->
+  <line x1="610" y1="210" x2="610" y2="250" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="605,250 610,260 615,250" fill="#3fb950"/>
+  <text x="640" y="235" fill="#8b949e" font-size="9">event</text>
+
+  <!-- Step 5: RebalancingTrigger -->
+  <rect x="520" y="260" width="180" height="70" rx="8" fill="#1c2128" stroke="#f778ba" stroke-width="2"/>
+  <text x="610" y="285" text-anchor="middle" fill="#f778ba" font-size="13" font-weight="700">RebalancingTrigger</text>
+  <text x="610" y="305" text-anchor="middle" fill="#8b949e" font-size="11">apply_inflight_snapshot()</text>
+
+  <!-- Arrow down -->
+  <line x1="610" y1="330" x2="610" y2="370" stroke="#f778ba" stroke-width="1.5"/>
+  <polygon points="605,370 610,380 615,370" fill="#f778ba"/>
+
+  <!-- Step 6: InventoryView -->
+  <rect x="520" y="380" width="180" height="70" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+  <text x="610" y="405" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="700">InventoryView</text>
+  <text x="610" y="425" text-anchor="middle" fill="#8b949e" font-size="11">set_inflight() per venue</text>
+
+  <!-- Side: filtering logic -->
+  <rect x="20" y="130" width="460" height="180" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="40" y="158" fill="#d29922" font-size="12" font-weight="700">Filtering Pipeline (inside poll_inflight_equity)</text>
+
+  <text x="40" y="185" fill="#e6edf3" font-size="12">1. Fetch all pending requests from Alpaca</text>
+  <text x="40" y="208" fill="#e6edf3" font-size="12">2. Filter: is_own_request() &mdash; only our wallet's requests</text>
+  <text x="40" y="231" fill="#e6edf3" font-size="12">3. Aggregate: group by symbol, sum quantities</text>
+  <text x="40" y="254" fill="#e6edf3" font-size="12">4. Split into mints map and redemptions map</text>
+  <text x="40" y="277" fill="#e6edf3" font-size="12">5. Emit InflightEquity CQRS command &rarr; event</text>
+  <text x="40" y="300" fill="#8b949e" font-size="11">Dedup: skips event emission if maps unchanged from last poll</text>
+
+  <!-- Side: venue mapping -->
+  <rect x="20" y="330" width="460" height="120" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="40" y="358" fill="#f778ba" font-size="12" font-weight="700">Venue Mapping (inside apply_inflight_snapshot)</text>
+
+  <text x="40" y="385" fill="#d29922" font-size="12">Mints &rarr; inflight at Venue::Hedging</text>
+  <text x="55" y="405" fill="#8b949e" font-size="11">Shares leaving Alpaca (offchain) toward Raindex (onchain)</text>
+
+  <text x="40" y="430" fill="#bc8cff" font-size="12">Redemptions &rarr; inflight at Venue::MarketMaking</text>
+  <text x="55" y="448" fill="#8b949e" font-size="11">Tokens leaving Raindex (onchain) toward Alpaca (offchain)</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Staleness Guard: Preventing Race Conditions</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Timeline: Why Stale Polls Must Be Rejected</div>
+<svg width="900" height="340" viewBox="0 0 900 340">
+  <!-- Time axis -->
+  <line x1="50" y1="60" x2="850" y2="60" stroke="#30363d" stroke-width="1.5"/>
+  <text x="450" y="30" text-anchor="middle" fill="#8b949e" font-size="12">Time &rarr;</text>
+
+  <!-- T0 -->
+  <line x1="120" y1="50" x2="120" y2="70" stroke="#8b949e" stroke-width="1.5"/>
+  <text x="120" y="90" text-anchor="middle" fill="#8b949e" font-size="10">T0</text>
+
+  <!-- T1: Poll fires -->
+  <line x1="250" y1="50" x2="250" y2="70" stroke="#d29922" stroke-width="2"/>
+  <text x="250" y="90" text-anchor="middle" fill="#d29922" font-size="10" font-weight="600">T1: Poll fires</text>
+  <text x="250" y="105" text-anchor="middle" fill="#8b949e" font-size="9">sees 25 AAPL inflight</text>
+  <rect x="210" y="115" width="80" height="25" rx="4" fill="#2d2a1b" stroke="#d29922" stroke-width="1"/>
+  <text x="250" y="132" text-anchor="middle" fill="#d29922" font-size="10">fetched_at</text>
+
+  <!-- T2: Mint completes -->
+  <line x1="450" y1="50" x2="450" y2="70" stroke="#3fb950" stroke-width="2"/>
+  <text x="450" y="90" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="600">T2: Mint completes</text>
+  <text x="450" y="105" text-anchor="middle" fill="#8b949e" font-size="9">CQRS clears inflight</text>
+  <rect x="400" y="115" width="100" height="25" rx="4" fill="#1b2d1b" stroke="#3fb950" stroke-width="1"/>
+  <text x="450" y="132" text-anchor="middle" fill="#3fb950" font-size="10">last_rebalancing</text>
+
+  <!-- T3: Stale poll arrives -->
+  <line x1="650" y1="50" x2="650" y2="70" stroke="#f85149" stroke-width="2"/>
+  <text x="650" y="90" text-anchor="middle" fill="#f85149" font-size="10" font-weight="600">T3: Stale poll arrives</text>
+  <text x="650" y="105" text-anchor="middle" fill="#8b949e" font-size="9">from T1, still says 25 inflight</text>
+
+  <!-- Guard check -->
+  <rect x="50" y="160" width="800" height="160" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Without guard -->
+  <text x="70" y="188" fill="#f85149" font-size="12" font-weight="700">Without staleness guard:</text>
+  <text x="70" y="210" fill="#e6edf3" font-size="12">T3 applies the stale poll &rarr; inflight goes back to 25 AAPL</text>
+  <text x="70" y="230" fill="#f85149" font-size="12">System thinks there's still a pending mint &rarr; blocks rebalancing incorrectly</text>
+
+  <!-- With guard -->
+  <text x="70" y="265" fill="#3fb950" font-size="12" font-weight="700">With staleness guard (this PR):</text>
+  <text x="70" y="287" fill="#e6edf3" font-size="12">T3 checks: fetched_at (T1) &lt; last_rebalancing (T2) &rarr; STALE, skip!</text>
+  <text x="70" y="307" fill="#3fb950" font-size="12">Inflight stays at 0. System correctly sees no pending operations.</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. CQRS Event Flow</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">New InventorySnapshot Event: InflightEquity</div>
+<svg width="900" height="350" viewBox="0 0 900 350">
+  <!-- Command -->
+  <rect x="30" y="20" width="250" height="90" rx="8" fill="#1c2128" stroke="#d29922" stroke-width="2"/>
+  <text x="155" y="45" text-anchor="middle" fill="#d29922" font-size="13" font-weight="700">InflightEquity Command</text>
+  <text x="155" y="68" text-anchor="middle" fill="#8b949e" font-size="11">mints: BTreeMap&lt;Symbol, Shares&gt;</text>
+  <text x="155" y="85" text-anchor="middle" fill="#8b949e" font-size="11">redemptions: BTreeMap&lt;Symbol, Shares&gt;</text>
+
+  <!-- Arrow -->
+  <line x1="280" y1="65" x2="340" y2="65" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="340,60 350,65 340,70" fill="#d29922"/>
+  <text x="310" y="55" text-anchor="middle" fill="#8b949e" font-size="9">handle()</text>
+
+  <!-- Dedup check -->
+  <rect x="350" y="20" width="200" height="90" rx="8" fill="#1c2128" stroke="#bc8cff" stroke-width="2"/>
+  <text x="450" y="45" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="600">Dedup Check</text>
+  <text x="450" y="68" text-anchor="middle" fill="#8b949e" font-size="11">if mints == self.mints</text>
+  <text x="450" y="85" text-anchor="middle" fill="#8b949e" font-size="11">&amp;&amp; redeem == self.redeem</text>
+
+  <!-- Arrow: changed -->
+  <line x1="550" y1="45" x2="620" y2="45" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="620,40 630,45 620,50" fill="#3fb950"/>
+  <text x="585" y="38" text-anchor="middle" fill="#3fb950" font-size="9">changed</text>
+
+  <!-- Arrow: unchanged -->
+  <line x1="450" y1="110" x2="450" y2="145" stroke="#f85149" stroke-width="1.5"/>
+  <polygon points="445,145 450,155 455,145" fill="#f85149"/>
+  <text x="475" y="135" fill="#f85149" font-size="9">unchanged</text>
+
+  <!-- No-op -->
+  <rect x="400" y="155" width="100" height="35" rx="6" fill="#2d1b1b" stroke="#f85149" stroke-width="1"/>
+  <text x="450" y="177" text-anchor="middle" fill="#f85149" font-size="11">No event</text>
+
+  <!-- Event -->
+  <rect x="630" y="20" width="240" height="90" rx="8" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+  <text x="750" y="45" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">InflightEquity Event</text>
+  <text x="750" y="68" text-anchor="middle" fill="#8b949e" font-size="11">mints + redemptions + fetched_at</text>
+  <text x="750" y="85" text-anchor="middle" fill="#8b949e" font-size="11">Persisted to events table</text>
+
+  <!-- Arrow down to consumers -->
+  <line x1="750" y1="110" x2="750" y2="145" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="745,145 750,155 755,145" fill="#3fb950"/>
+
+  <!-- Consumer: RebalancingTrigger -->
+  <rect x="560" y="155" width="180" height="50" rx="8" fill="#1c2128" stroke="#f778ba" stroke-width="1.5"/>
+  <text x="650" y="177" text-anchor="middle" fill="#f778ba" font-size="12" font-weight="600">RebalancingTrigger</text>
+  <text x="650" y="195" text-anchor="middle" fill="#8b949e" font-size="10">apply_inflight_snapshot()</text>
+
+  <!-- Consumer: Snapshot aggregate -->
+  <rect x="770" y="155" width="100" height="50" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="820" y="177" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="600">Snapshot</text>
+  <text x="820" y="195" text-anchor="middle" fill="#8b949e" font-size="10">apply()</text>
+
+  <!-- Ordering note -->
+  <rect x="30" y="230" width="840" height="100" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+  <text x="50" y="258" fill="#d29922" font-size="12" font-weight="700">Critical: Polling Order</text>
+  <text x="50" y="283" fill="#e6edf3" font-size="12">1. poll_inflight_equity() &mdash; FIRST (sets inflight before balance snapshots land)</text>
+  <text x="50" y="303" fill="#e6edf3" font-size="12">2. poll_onchain() + poll_offchain() &mdash; AFTER (these trigger check_and_trigger_equity)</text>
+  <text x="50" y="323" fill="#8b949e" font-size="11">If balance snapshots land first, has_inflight()=false could trigger a duplicate rebalancing operation.</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Event-to-Inventory Mapping Changes</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Mint &amp; Redemption Lifecycle: Events &rarr; Inventory Effects</div>
+<svg width="900" height="560" viewBox="0 0 900 560">
+  <!-- MINTS SECTION -->
+  <text x="30" y="30" fill="#d29922" font-size="14" font-weight="700">MINTS (shares Alpaca &rarr; Raindex)</text>
+
+  <!-- Events -->
+  <rect x="30" y="45" width="260" height="30" rx="4" fill="#1c2128" stroke="#3fb950" stroke-width="1"/>
+  <text x="160" y="65" text-anchor="middle" fill="#3fb950" font-size="11">SharesTransferred &rarr; Start inflight @ Hedging</text>
+
+  <rect x="30" y="85" width="260" height="30" rx="4" fill="#1c2128" stroke="#3fb950" stroke-width="1"/>
+  <text x="160" y="105" text-anchor="middle" fill="#3fb950" font-size="11">TokensReceived &rarr; Complete + last_rebal</text>
+
+  <rect x="30" y="125" width="260" height="30" rx="4" fill="#1c2128" stroke="#d29922" stroke-width="1.5"/>
+  <text x="160" y="145" text-anchor="middle" fill="#d29922" font-size="11">MintAcceptanceFailed &rarr; Cancel + last_rebal</text>
+  <text x="310" y="145" fill="#d29922" font-size="10" font-weight="600">CHANGED</text>
+
+  <rect x="30" y="165" width="260" height="30" rx="4" fill="#1c2128" stroke="#8b949e" stroke-width="1"/>
+  <text x="160" y="185" text-anchor="middle" fill="#8b949e" font-size="11">MintRejected &rarr; No balance change</text>
+  <text x="310" y="185" fill="#d29922" font-size="10" font-weight="600">CHANGED (was: cancel inflight)</text>
+
+  <!-- Explanation -->
+  <rect x="430" y="45" width="440" height="160" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="450" y="72" fill="#d29922" font-size="12" font-weight="600">Why MintRejected changed:</text>
+  <text x="450" y="95" fill="#e6edf3" font-size="11">Before: MintRejected cancelled inflight back to Alpaca available.</text>
+  <text x="450" y="115" fill="#e6edf3" font-size="11">Problem: Rejection happens before shares leave Alpaca, so</text>
+  <text x="450" y="135" fill="#e6edf3" font-size="11">inflight was never started. Cancelling would underflow.</text>
+  <text x="450" y="160" fill="#3fb950" font-size="11">After: No balance change. Shares never left Alpaca, so the</text>
+  <text x="450" y="180" fill="#3fb950" font-size="11">available-balance snapshot already reflects reality.</text>
+
+  <!-- DIVIDER -->
+  <line x1="30" y1="230" x2="870" y2="230" stroke="#30363d" stroke-width="1" stroke-dasharray="4,4"/>
+
+  <!-- REDEMPTIONS SECTION -->
+  <text x="30" y="260" fill="#bc8cff" font-size="14" font-weight="700">REDEMPTIONS (tokens Raindex &rarr; Alpaca)</text>
+
+  <rect x="30" y="275" width="280" height="30" rx="4" fill="#1c2128" stroke="#3fb950" stroke-width="1"/>
+  <text x="170" y="295" text-anchor="middle" fill="#3fb950" font-size="11">WithdrawnFromRaindex &rarr; Start inflight @ MktMaking</text>
+
+  <rect x="30" y="315" width="280" height="30" rx="4" fill="#1c2128" stroke="#3fb950" stroke-width="1"/>
+  <text x="170" y="335" text-anchor="middle" fill="#3fb950" font-size="11">Completed &rarr; Complete inflight @ MktMaking</text>
+
+  <rect x="30" y="355" width="280" height="30" rx="4" fill="#1c2128" stroke="#d29922" stroke-width="1.5"/>
+  <text x="170" y="375" text-anchor="middle" fill="#d29922" font-size="11">TransferFailed &rarr; Cancel + last_rebal</text>
+  <text x="330" y="375" fill="#d29922" font-size="10" font-weight="600">NEW</text>
+
+  <rect x="30" y="395" width="280" height="30" rx="4" fill="#1c2128" stroke="#d29922" stroke-width="1.5"/>
+  <text x="170" y="415" text-anchor="middle" fill="#d29922" font-size="11">RedemptionRejected &rarr; Keep inflight (uncertain)</text>
+  <text x="330" y="415" fill="#d29922" font-size="10" font-weight="600">CHANGED</text>
+
+  <!-- Explanation -->
+  <rect x="430" y="275" width="440" height="170" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="450" y="302" fill="#bc8cff" font-size="12" font-weight="600">Key changes in redemption handling:</text>
+
+  <text x="450" y="328" fill="#d29922" font-size="11" font-weight="600">TransferFailed (new):</text>
+  <text x="450" y="348" fill="#e6edf3" font-size="11">Tokens failed to reach Alpaca's wallet &mdash; still in ours.</text>
+  <text x="450" y="368" fill="#e6edf3" font-size="11">Cancel inflight + set last_rebalancing (staleness guard).</text>
+
+  <text x="450" y="398" fill="#d29922" font-size="11" font-weight="600">RedemptionRejected (changed):</text>
+  <text x="450" y="418" fill="#e6edf3" font-size="11">Before: Cancelled inflight back to Raindex available.</text>
+  <text x="450" y="438" fill="#e6edf3" font-size="11">After: Keep inflight &mdash; token location uncertain after</text>
+  <text x="450" y="455" fill="#e6edf3" font-size="11">rejection. Wait for operator + next snapshot to correct.</text>
+
+  <!-- STUCK REDEMPTIONS -->
+  <line x1="30" y1="480" x2="870" y2="480" stroke="#30363d" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="30" y="510" fill="#f85149" font-size="14" font-weight="700">NEW: Stuck Redemption Recovery</text>
+  <rect x="30" y="520" width="840" height="30" rx="4" fill="#2d1b1b" stroke="#f85149" stroke-width="1"/>
+  <text x="450" y="540" text-anchor="middle" fill="#e6edf3" font-size="11">symbols_with_stuck_redemptions() queries DB for DetectionFailed/RedemptionRejected aggregates &rarr; adds to inflight so system won't re-trigger</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. File Changes Impact</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Lines Changed by File (src/ only, top 15)</div>
+<div>
+  <div class="file-bar"><div class="file-name">inventory/polling.rs</div><div class="file-changes"><div class="file-add" style="width:220px"></div><div class="file-del" style="width:60px"></div></div><div class="file-count">+779 / -326</div></div>
+  <div class="file-bar"><div class="file-name">rebalancing/trigger/mod.rs</div><div class="file-changes"><div class="file-add" style="width:180px"></div><div class="file-del" style="width:10px"></div></div><div class="file-count">+888 / -47 (mostly tests)</div></div>
+  <div class="file-bar"><div class="file-name">integration_tests/rebalancing.rs</div><div class="file-changes"><div class="file-add" style="width:120px"></div><div class="file-del" style="width:5px"></div></div><div class="file-count">+528 / -12</div></div>
+  <div class="file-bar"><div class="file-name">inventory/view.rs</div><div class="file-changes"><div class="file-add" style="width:80px"></div><div class="file-del" style="width:5px"></div></div><div class="file-count">+358 / -7</div></div>
+  <div class="file-bar"><div class="file-name">equity_redemption.rs</div><div class="file-changes"><div class="file-add" style="width:70px"></div><div class="file-del" style="width:5px"></div></div><div class="file-count">+364 / -5</div></div>
+  <div class="file-bar"><div class="file-name">inventory/snapshot.rs</div><div class="file-changes"><div class="file-add" style="width:60px"></div><div class="file-del" style="width:3px"></div></div><div class="file-count">+282 / -6</div></div>
+  <div class="file-bar"><div class="file-name">conductor/mod.rs</div><div class="file-changes"><div class="file-add" style="width:40px"></div><div class="file-del" style="width:5px"></div></div><div class="file-count">+195 / -15</div></div>
+  <div class="file-bar"><div class="file-name">tokenized_equity_mint.rs</div><div class="file-changes"><div class="file-add" style="width:35px"></div><div class="file-del" style="width:5px"></div></div><div class="file-count">+189 / -10</div></div>
+  <div class="file-bar"><div class="file-name">tokenization/alpaca.rs</div><div class="file-changes"><div class="file-add" style="width:30px"></div><div class="file-del" style="width:10px"></div></div><div class="file-count">+143 / -55</div></div>
+  <div class="file-bar"><div class="file-name">onchain/pyth/mod.rs</div><div class="file-changes"><div class="file-add" style="width:20px"></div><div class="file-del" style="width:18px"></div></div><div class="file-count">+96 / -49 (refactor)</div></div>
+  <div class="file-bar"><div class="file-name">tokenization/mock_api.rs</div><div class="file-changes"><div class="file-add" style="width:20px"></div><div class="file-del" style="width:3px"></div></div><div class="file-count">+122 / -6</div></div>
+  <div class="file-bar"><div class="file-name">tokenization/mock.rs</div><div class="file-changes"><div class="file-add" style="width:12px"></div><div class="file-del" style="width:3px"></div></div><div class="file-count">+63 / -8</div></div>
+  <div class="file-bar"><div class="file-name">inventory/venue_balance.rs</div><div class="file-changes"><div class="file-add" style="width:10px"></div><div class="file-del" style="width:0px"></div></div><div class="file-count">+53 / -0</div></div>
+  <div class="file-bar"><div class="file-name">onchain/io.rs</div><div class="file-changes"><div class="file-add" style="width:10px"></div><div class="file-del" style="width:5px"></div></div><div class="file-count">+56 / -16</div></div>
+  <div class="file-bar"><div class="file-name">onchain_trade.rs</div><div class="file-changes"><div class="file-add" style="width:8px"></div><div class="file-del" style="width:2px"></div></div><div class="file-count">+68 / -5</div></div>
+</div>
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>Additions</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div>Deletions</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Key Concepts at a Glance</h2>
+<!-- ============================================================ -->
+
+<div class="concept-grid">
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-new">NEW</span> InflightEquity Event</div>
+    <p>New CQRS event type on InventorySnapshot. Stores per-symbol inflight quantities for both mints and redemptions. Deduped: no event if maps unchanged.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-new">NEW</span> set_inflight()</div>
+    <p>Directly replaces inflight balance at a venue without touching available. Used by snapshot polling (vs transfer() which moves between available/inflight).</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-new">NEW</span> Staleness Guard</div>
+    <p>is_stale_for_symbol() rejects poll data where fetched_at &lt; last_rebalancing. Prevents stale async polls from overwriting cleared inflight after a transfer completes.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-new">NEW</span> Stuck Redemptions Query</div>
+    <p>symbols_with_stuck_redemptions() scans DB for DetectionFailed/RedemptionRejected aggregates. Adds their quantities to inflight so the system doesn't re-trigger.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-changed">CHANGED</span> MintRejected</div>
+    <p>Now: no balance change (shares never left Alpaca). Before: cancelled inflight back to available, which was incorrect since inflight was never started.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-changed">CHANGED</span> RedemptionRejected</div>
+    <p>Now: keeps inflight (uncertain token location). Before: cancelled back to Raindex available. Operator must resolve manually; next snapshot corrects.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-new">NEW</span> TransferFailed handling</div>
+    <p>Tokens never reached Alpaca's wallet. Cancels inflight + sets last_rebalancing timestamp so staleness guard protects the restored balance.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-critical">CRITICAL</span> Poll Ordering</div>
+    <p>Inflight polled FIRST, before balance snapshots. Balance snapshots trigger rebalancing checks &mdash; if they land before inflight is set, has_inflight()=false could trigger duplicates.</p>
+  </div>
+</div>
+
+<h2>8. Tokenizer Trait Extension</h2>
+
+<div class="diagram">
+<div class="diagram-title">New Method on Tokenizer Trait + Implementation</div>
+<svg width="900" height="200" viewBox="0 0 900 200">
+  <!-- Trait -->
+  <rect x="30" y="30" width="280" height="80" rx="8" fill="#1c2128" stroke="#bc8cff" stroke-width="2"/>
+  <text x="170" y="55" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="700">trait Tokenizer</text>
+  <text x="170" y="78" text-anchor="middle" fill="#8b949e" font-size="11">+ list_pending_requests()</text>
+  <text x="170" y="98" text-anchor="middle" fill="#8b949e" font-size="10">&rarr; Vec&lt;TokenizationRequest&gt;</text>
+
+  <!-- Arrow -->
+  <line x1="310" y1="70" x2="380" y2="50" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="380,45 390,50 380,55" fill="#3fb950"/>
+  <line x1="310" y1="70" x2="380" y2="90" stroke="#58a6ff" stroke-width="1.5"/>
+  <polygon points="380,85 390,90 380,95" fill="#58a6ff"/>
+  <line x1="310" y1="70" x2="380" y2="130" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="380,125 390,130 380,135" fill="#d29922"/>
+
+  <!-- Impl: Alpaca -->
+  <rect x="390" y="20" width="240" height="50" rx="6" fill="#1c2128" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="510" y="42" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">AlpacaTokenizationService</text>
+  <text x="510" y="58" text-anchor="middle" fill="#8b949e" font-size="10">HTTP: GET /tokenization?status=pending</text>
+
+  <!-- Impl: Mock -->
+  <rect x="390" y="80" width="240" height="50" rx="6" fill="#1c2128" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="510" y="102" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="600">MockTokenizer</text>
+  <text x="510" y="118" text-anchor="middle" fill="#8b949e" font-size="10">Returns configurable test data</text>
+
+  <!-- Impl: MockApi -->
+  <rect x="390" y="140" width="240" height="50" rx="6" fill="#1c2128" stroke="#d29922" stroke-width="1.5"/>
+  <text x="510" y="162" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">MockTokenizerApi</text>
+  <text x="510" y="178" text-anchor="middle" fill="#8b949e" font-size="10">httpmock-based integration testing</text>
+
+  <!-- Field cleanup note -->
+  <rect x="660" y="30" width="210" height="100" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="680" y="55" fill="#8b949e" font-size="11" font-weight="600">TokenizationRequest cleanup:</text>
+  <text x="680" y="78" fill="#f85149" font-size="11">- issuer (removed)</text>
+  <text x="680" y="95" fill="#f85149" font-size="11">- network (removed)</text>
+  <text x="680" y="112" fill="#f85149" font-size="11">- updated_at (removed)</text>
+  <text x="680" y="128" fill="#d29922" font-size="11">~ token_symbol simplified</text>
+</svg>
+</div>
+
+</div><!-- container -->
+</body>
+</html>

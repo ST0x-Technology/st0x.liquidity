@@ -139,6 +139,7 @@ impl TestInfra<()> {
             .start_redemption_watcher(
                 base_chain.provider.clone(),
                 REDEMPTION_WALLET,
+                base_chain.owner,
                 token_symbols,
             )
             .await?;

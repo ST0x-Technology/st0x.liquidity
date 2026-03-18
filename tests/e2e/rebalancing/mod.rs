@@ -955,3 +955,558 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
     bot.abort();
     Ok(())
 }
+
+/// Redemption rejected by Alpaca preserves inflight via sticky marker.
+///
+/// When a redemption request is rejected by Alpaca, the bot marks the
+/// `(symbol, MarketMaking)` pair as sticky inflight. Subsequent
+/// `InflightEquity` polls that find no pending requests for that symbol
+/// must NOT zero the inflight -- the tokens are physically in Alpaca's
+/// redemption wallet with no snapshot source tracking them.
+///
+/// Without sticky inflight, the system would lose track of those assets
+/// entirely and make incorrect rebalancing decisions.
+#[test_log::test(tokio::test)]
+async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<()> {
+    let onchain_price = float!("112.50");
+    let broker_fill_price = float!("113.60");
+    let trade_amount = float!("12.5");
+
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!("20"))],
+    )
+    .await?;
+
+    // Configure the mock to reject redemption requests instead of completing.
+    infra
+        .tokenization_service
+        .set_redemption_outcome(RedemptionOutcome::Reject);
+
+    // Set up a BuyEquity order that will create TooMuchOnchain imbalance.
+    let prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::BuyEquity)
+        .call()
+        .await?;
+
+    // Deposit extra equity to keep the ratio balanced before the take.
+    // After BuyEquity fill adds 12.5 onchain and hedge sell removes 12.5
+    // offchain, the ratio exceeds threshold -> triggers redemption.
+    let vault_addr = infra.equity_addresses[0].1;
+    let equity_vault_id = prepared.input_vault_id;
+    let extra_equity: U256 = parse_units("20", 18)?.into();
+    infra
+        .base_chain
+        .deposit_into_raindex_vault(vault_addr, equity_vault_id, extra_equity, 18)
+        .await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared.output_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.input_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Take from taker account to create the imbalance.
+    let _take_result = infra.base_chain.take_prepared_order(&prepared).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Wait for the redemption to reach RedemptionRejected terminal state.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "EquityRedemptionEvent::RedemptionRejected",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    // Wait for additional poll cycles after rejection to verify no second
+    // redemption is triggered. The bot polls inventory every ~15s; two
+    // full cycles ensures the InflightEquity snapshot has run post-rejection
+    // and the sticky mechanism has been exercised.
+    tokio::time::sleep(Duration::from_secs(35)).await;
+
+    let pool = connect_db(&infra.db_path).await?;
+
+    // Verify the redemption event sequence includes RedemptionRejected.
+    let redeem_events = fetch_events_by_type(&pool, "EquityRedemption").await?;
+    assert_event_subsequence(
+        &redeem_events,
+        &[
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            "EquityRedemptionEvent::TokensUnwrapped",
+            "EquityRedemptionEvent::TokensSent",
+            "EquityRedemptionEvent::Detected",
+            "EquityRedemptionEvent::RedemptionRejected",
+        ],
+    );
+
+    // Verify that InflightEquity snapshot events were emitted, proving the
+    // poll cycle ran and the bot processed the pending redemption request.
+    // After rejection, the request disappears from pending -- the sticky
+    // marker must prevent the InflightEquity snapshot from zeroing inflight.
+    let snapshot_events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    let inflight_poll_count = snapshot_events
+        .iter()
+        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
+        .count();
+    assert!(
+        inflight_poll_count >= 1,
+        "Expected at least 1 InflightEquity snapshot event (proving the poll ran and \
+         the sticky mechanism was exercised), got {inflight_poll_count}",
+    );
+
+    // The critical assertion: no second WithdrawnFromRaindex event should
+    // exist. After RedemptionRejected, the sticky marker prevents
+    // InflightEquity polls from zeroing inflight for the symbol. Without
+    // sticky, the poll would zero inflight, the system would see a new
+    // imbalance, and trigger another (incorrect) redemption.
+    let withdrawn_count = redeem_events
+        .iter()
+        .filter(|event| event.event_type == "EquityRedemptionEvent::WithdrawnFromRaindex")
+        .count();
+    assert_eq!(
+        withdrawn_count, 1,
+        "Expected exactly 1 WithdrawnFromRaindex event (sticky inflight should prevent \
+         the system from seeing a new imbalance and triggering another redemption), \
+         got {withdrawn_count}",
+    );
+
+    // Verify the mock shows the rejected redemption request.
+    let redeem_requests: Vec<_> = infra
+        .tokenization_service
+        .tokenization_requests()
+        .into_iter()
+        .filter(|req| req.request_type == TokenizationRequestType::Redeem && req.symbol == "AAPL")
+        .collect();
+    assert_eq!(
+        redeem_requests.len(),
+        1,
+        "Expected exactly 1 redeem request for AAPL"
+    );
+    assert_eq!(
+        redeem_requests[0].status,
+        st0x_hedge::mock_api::TokenizationStatus::Rejected,
+        "Redeem request should have Rejected status"
+    );
+
+    pool.close().await;
+    bot.abort();
+    Ok(())
+}
+
+/// Pending tokenization requests from foreign wallets are filtered out.
+///
+/// When multiple conductors share an Alpaca account, each conductor's
+/// `poll_inflight_equity` should only count pending requests matching its
+/// own wallet address. A foreign request (different wallet) must not
+/// inflate the inflight state.
+#[test_log::test(tokio::test)]
+async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
+    let onchain_price = float!("150.00");
+    let broker_fill_price = float!("148.00");
+    let amount_per_trade = float!("7.5");
+
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+
+    // Set up SellEquity orders to create TooMuchOffchain imbalance -> mint.
+    let mut prepared_orders = Vec::new();
+    for _ in 0..3 {
+        prepared_orders.push(
+            infra
+                .base_chain
+                .setup_order()
+                .symbol("AAPL")
+                .amount(amount_per_trade)
+                .price(onchain_price)
+                .direction(TakeDirection::SellEquity)
+                .call()
+                .await?,
+        );
+    }
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared_orders[0].input_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared_orders[0].output_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Take all orders to create the imbalance.
+    for prepared in &prepared_orders {
+        infra.base_chain.take_prepared_order(prepared).await?;
+    }
+
+    // Inject a foreign pending mint request from a different wallet.
+    // This simulates another conductor sharing the same Alpaca account.
+    // If the bot doesn't filter by wallet, it would see 1000 extra shares
+    // of inflight and make incorrect rebalancing decisions.
+    let foreign_wallet = alloy::primitives::Address::random();
+    infra.tokenization_service.inject_pending_request(
+        "AAPL",
+        float!("1000"),
+        foreign_wallet,
+        TokenizationRequestType::Mint,
+    );
+
+    // Wait for the mint to complete successfully.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+
+    // Verify exactly one mint aggregate completed (the foreign request
+    // didn't cause additional mint operations).
+    let mint_events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
+    assert_event_subsequence(
+        &mint_events,
+        &[
+            "TokenizedEquityMintEvent::MintRequested",
+            "TokenizedEquityMintEvent::MintAccepted",
+            "TokenizedEquityMintEvent::TokensReceived",
+            "TokenizedEquityMintEvent::TokensWrapped",
+            "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        ],
+    );
+
+    // Verify only one mint aggregate exists (no spurious second mint
+    // triggered by inflated inflight from the foreign request).
+    let mint_aggregate_ids: std::collections::HashSet<&str> = mint_events
+        .iter()
+        .map(|event| event.aggregate_id.as_str())
+        .collect();
+    assert_eq!(
+        mint_aggregate_ids.len(),
+        1,
+        "Expected exactly 1 mint aggregate (foreign wallet request should be filtered), \
+         got {}: {mint_aggregate_ids:?}",
+        mint_aggregate_ids.len(),
+    );
+
+    // Verify the foreign request still exists in the mock but was not
+    // consumed by the bot.
+    let all_requests = infra.tokenization_service.tokenization_requests();
+    let foreign_requests: Vec<_> = all_requests
+        .iter()
+        .filter(|req| req.request_type == TokenizationRequestType::Mint && req.symbol == "AAPL")
+        .collect();
+    assert!(
+        foreign_requests.len() >= 2,
+        "Expected at least 2 mint requests for AAPL (1 from bot + 1 foreign), \
+         got {}",
+        foreign_requests.len(),
+    );
+
+    pool.close().await;
+    bot.abort();
+    Ok(())
+}
+
+/// Inflight polling picks up pending tokenization requests end-to-end.
+///
+/// The conductor's inventory poller calls `list_pending_requests()` on
+/// every poll cycle. When pending requests exist (matching the conductor's
+/// wallet), the poller aggregates them into an `InflightEquity` snapshot
+/// command, which the CQRS aggregate turns into an `InflightEquity` event.
+///
+/// This test injects a pending mint request into the tokenization mock,
+/// starts the bot, and verifies that `InflightEquity` events are emitted
+/// with non-empty mint data -- proving the full pipeline from HTTP poll
+/// through CQRS event emission works end-to-end.
+#[test_log::test(tokio::test)]
+async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<()> {
+    let broker_fill_price = float!("150.00");
+    let onchain_price = float!("150.00");
+
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        // No offchain positions — avoids rebalancing triggering a real
+        // mint that could satisfy the assertion instead of the injected
+        // pending request.
+        vec![],
+    )
+    .await?;
+
+    // We need at least one order set up so the vault registry gets seeded
+    // and the inventory poller has valid vault IDs to query.
+    let prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(float!("5"))
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    // Inject a pending mint request with the bot's wallet address BEFORE
+    // starting the bot. The first inventory poll should pick this up.
+    infra.tokenization_service.inject_pending_request(
+        "AAPL",
+        float!("25"),
+        infra.base_chain.owner,
+        TokenizationRequestType::Mint,
+    );
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared.input_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.output_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
+    let mut bot = spawn_bot(ctx);
+
+    // Wait for at least one InflightEquity event to be emitted.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "InventorySnapshotEvent::InflightEquity",
+        1,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+
+    // Verify InflightEquity events were emitted.
+    let snapshot_events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    let inflight_events: Vec<_> = snapshot_events
+        .iter()
+        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
+        .collect();
+    assert!(
+        !inflight_events.is_empty(),
+        "Expected at least 1 InflightEquity event from polling"
+    );
+
+    // Verify the first InflightEquity event payload contains the injected
+    // pending mint for AAPL with the exact quantity we injected (25 shares).
+    let payload = &inflight_events[0].payload;
+    let inner = payload
+        .get("InflightEquity")
+        .expect("Event payload should be wrapped in InflightEquity variant");
+    let mints = inner
+        .get("mints")
+        .expect("InflightEquity should contain mints field");
+    let aapl_quantity = mints
+        .get("AAPL")
+        .expect("InflightEquity mints should contain AAPL from the injected pending request");
+    assert_eq!(
+        aapl_quantity.as_str().unwrap(),
+        "25",
+        "InflightEquity mint quantity for AAPL should match the injected \
+         pending request (25 shares), got: {aapl_quantity}"
+    );
+
+    pool.close().await;
+    bot.abort();
+    Ok(())
+}
+
+/// Inflight state survives bot restart via CQRS event replay.
+///
+/// When the bot restarts against the same database, the CQRS aggregate
+/// replays all previous events including `InflightEquity`. The trigger's
+/// `on_snapshot` handler processes the replayed events and restores the
+/// inflight state in the `InventoryView`.
+///
+/// This test:
+/// 1. Starts a bot, lets it poll and emit `InflightEquity` with a pending
+///    mint
+/// 2. Stops the bot
+/// 3. Starts a new bot on the same database
+/// 4. Verifies the second bot starts successfully (CQRS replay doesn't
+///    crash) and continues emitting snapshot events (is functional)
+/// 5. Verifies dedup: the aggregate suppresses duplicate InflightEquity
+///    events when the pending request state hasn't changed
+#[test_log::test(tokio::test)]
+async fn inflight_state_survives_restart() -> anyhow::Result<()> {
+    let broker_fill_price = float!("150.00");
+    let onchain_price = float!("150.00");
+
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        // No offchain positions: the test focuses on inflight polling
+        // and restart behavior, not rebalancing decisions.
+        vec![],
+    )
+    .await?;
+
+    let prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(float!("5"))
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    // Inject a pending mint request that will persist across restarts
+    // (the mock server stays alive).
+    infra.tokenization_service.inject_pending_request(
+        "AAPL",
+        float!("25"),
+        infra.base_chain.owner,
+        TokenizationRequestType::Mint,
+    );
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared.input_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.output_vault_id)]);
+
+    // --- First bot: let it poll and emit InflightEquity events ---
+    let ctx1 = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
+    let mut bot1 = spawn_bot(ctx1);
+
+    // Wait for at least one InflightEquity event from the first bot.
+    poll_for_events_with_timeout(
+        &mut bot1,
+        &infra.db_path,
+        "InventorySnapshotEvent::InflightEquity",
+        1,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Record the total event count before stopping the first bot.
+    let pool = connect_db(&infra.db_path).await?;
+    let events_before_restart = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    let total_count_before = events_before_restart.len();
+    let inflight_count_before = events_before_restart
+        .iter()
+        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
+        .count();
+    pool.close().await;
+
+    assert!(
+        inflight_count_before >= 1,
+        "First bot should have emitted at least 1 InflightEquity event"
+    );
+
+    // Stop the first bot.
+    bot1.abort();
+    // Allow the abort to propagate and release the database.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // --- Second bot: restart on the same database ---
+    let ctx2 = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
+    let bot2 = spawn_bot(ctx2);
+
+    // Wait for the second bot to start polling and emit new snapshot
+    // events. This proves the CQRS replay succeeded and the bot is
+    // functional after restart.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    // Verify the second bot is still alive (didn't crash on replay).
+    assert!(
+        !bot2.is_finished(),
+        "Second bot should still be running after replaying events"
+    );
+
+    let pool = connect_db(&infra.db_path).await?;
+
+    // The second bot should have emitted new snapshot events after
+    // replaying the first bot's events, proving it's functional.
+    let events_after_restart = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    let total_count_after = events_after_restart.len();
+    assert!(
+        total_count_after > total_count_before,
+        "Second bot should emit new snapshot events after restart \
+         (before: {total_count_before}, after: {total_count_after})"
+    );
+
+    // Verify aggregate dedup: the InflightEquity event count should not
+    // explode after restart. The aggregate replays previous events and
+    // sets its state. When the poller emits the same inflight data, the
+    // aggregate's `handle` method suppresses the duplicate. We allow a
+    // modest increase for natural state transitions (e.g., the pending
+    // request completing after polls_until_complete).
+    let inflight_count_after = events_after_restart
+        .iter()
+        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
+        .count();
+    let new_inflight_events = inflight_count_after - inflight_count_before;
+    assert!(
+        new_inflight_events <= 3,
+        "Expected at most 3 new InflightEquity events after restart \
+         (dedup should suppress duplicates), got {new_inflight_events} \
+         (before: {inflight_count_before}, after: {inflight_count_after})"
+    );
+
+    pool.close().await;
+    bot2.abort();
+    Ok(())
+}
