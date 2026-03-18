@@ -8,8 +8,11 @@ use alloy::rpc::types::trace::geth::{
     CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, GethTrace,
 };
 use alloy::sol_types::{SolCall, SolType};
-use chrono::{DateTime, Utc};
-use rain_math_float::{Float, FloatError};
+use chrono::DateTime;
+#[cfg(test)]
+use rain_math_float::Float;
+use rain_math_float::FloatError;
+#[cfg(test)]
 use st0x_float_macro::float;
 use tracing::{debug, error, info, warn};
 
@@ -34,8 +37,6 @@ pub enum PythError {
     AbiDecode(#[from] alloy::sol_types::Error),
     #[error("Trace is not CallTracer variant")]
     InvalidTraceVariant,
-    #[error("Arithmetic overflow in price conversion")]
-    ArithmeticOverflow,
     #[error("RPC error while fetching trace: {0}")]
     Rpc(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Invalid timestamp value: {0}")]
@@ -53,59 +54,44 @@ pub struct PythCall {
     pub depth: u32,
 }
 
-pub(super) struct PythPricing {
-    pub price: Float,
-    pub confidence: Float,
-    pub exponent: i32,
-    pub publish_time: DateTime<Utc>,
+/// Converts a raw Pyth SDK `Price` into the CQRS `PythPrice` struct,
+/// preserving raw string values for lossless event storage.
+pub(crate) fn raw_price_to_pyth_price(
+    price: &Price,
+) -> Result<crate::onchain_trade::PythPrice, PythError> {
+    let publish_time_i64 = i64::try_from(price.publishTime)
+        .map_err(|_| PythError::InvalidTimestamp(price.publishTime))?;
+
+    let publish_time = DateTime::from_timestamp(publish_time_i64, 0)
+        .ok_or(PythError::InvalidTimestamp(price.publishTime))?;
+
+    Ok(crate::onchain_trade::PythPrice {
+        value: price.price.to_string(),
+        expo: price.expo,
+        conf: price.conf.to_string(),
+        publish_time,
+    })
 }
 
-impl PythPricing {
-    pub(super) async fn try_from_tx_hash<P: Provider>(
-        tx_hash: TxHash,
-        provider: P,
-        symbol: &str,
-        feed_id_cache: &FeedIdCache,
-    ) -> Result<Self, PythError> {
-        let pyth_price = extract_pyth_price(tx_hash, &provider, symbol, feed_id_cache).await?;
-
-        let price = pyth_price.to_float()?;
-        let confidence = scale_with_exponent(&pyth_price.conf, pyth_price.expo)?;
-
-        let publish_time_i64 = i64::try_from(pyth_price.publishTime)
-            .map_err(|_| PythError::InvalidTimestamp(pyth_price.publishTime))?;
-
-        let publish_time = DateTime::from_timestamp(publish_time_i64, 0)
-            .ok_or(PythError::InvalidTimestamp(pyth_price.publishTime))?;
-
-        Ok(Self {
-            price,
-            confidence,
-            exponent: pyth_price.expo,
-            publish_time,
-        })
-    }
-}
-
-fn scale_with_exponent(value: &impl ToString, exponent: i32) -> Result<Float, PythError> {
+/// Scales a raw integer value by 10^exponent to produce a
+/// human-readable Float. Only used in tests for verifying Pyth
+/// price conversions.
+#[cfg(test)]
+fn scale_with_exponent(value: &impl ToString, exponent: i32) -> Result<Float, FloatError> {
     let decimal_value = Float::parse(value.to_string())?;
 
     if exponent >= 0 {
         let ten = float!(10);
-        let multiplier =
-            (0..exponent).try_fold(float!(1), |acc, _| (acc * ten).map_err(PythError::Float))?;
+        let multiplier = (0..exponent).try_fold(float!(1), |acc, _| acc * ten)?;
 
-        (decimal_value * multiplier).map_err(PythError::Float)
+        decimal_value * multiplier
     } else {
-        let abs_exponent = exponent
-            .checked_abs()
-            .ok_or(PythError::ArithmeticOverflow)?;
+        let abs_exponent = exponent.checked_abs().expect("exponent overflow");
 
         let ten = float!(10);
-        let divisor = (0..abs_exponent)
-            .try_fold(float!(1), |acc, _| (acc * ten).map_err(PythError::Float))?;
+        let divisor = (0..abs_exponent).try_fold(float!(1), |acc, _| acc * ten)?;
 
-        (decimal_value / divisor).map_err(PythError::Float)
+        decimal_value / divisor
     }
 }
 
@@ -166,8 +152,9 @@ pub fn decode_pyth_price(output: &Bytes) -> Result<Price, PythError> {
     Ok(price)
 }
 
+#[cfg(test)]
 impl Price {
-    pub(crate) fn to_float(&self) -> Result<Float, PythError> {
+    fn to_float(&self) -> Result<Float, FloatError> {
         scale_with_exponent(&self.price, self.expo)
     }
 }
@@ -760,8 +747,8 @@ mod tests {
         assert!(matches!(result, Err(PythError::InvalidTraceVariant)));
     }
 
-    #[tokio::test]
-    async fn test_pyth_pricing_conversion() {
+    #[test]
+    fn test_raw_price_to_pyth_price() {
         let price = Price {
             price: 18_250_000_000,
             conf: 10_000_000,
@@ -769,18 +756,15 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let pricing = PythPricing {
-            price: float!(182.50),
-            confidence: float!(0.10),
-            exponent: -8,
-            publish_time: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-        };
+        let pyth_price = raw_price_to_pyth_price(&price).unwrap();
 
-        let price_exact = price.to_float().unwrap();
-        assert!(price_exact.eq(pricing.price).unwrap());
-
-        let confidence_exact = scale_with_exponent(&price.conf, price.expo).unwrap();
-        assert!(confidence_exact.eq(pricing.confidence).unwrap());
+        assert_eq!(pyth_price.value, "18250000000");
+        assert_eq!(pyth_price.conf, "10000000");
+        assert_eq!(pyth_price.expo, -8);
+        assert_eq!(
+            pyth_price.publish_time,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -806,13 +790,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_pyth_pricing_try_from_tx_hash_timestamp_overflow() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
-        let mut input = pyth_selector.to_vec();
-        let feed_id = B256::repeat_byte(0xaa);
-        input.extend_from_slice(feed_id.as_slice());
-
+    #[test]
+    fn test_raw_price_to_pyth_price_timestamp_overflow() {
         let price = Price {
             price: 100_000,
             conf: 500,
@@ -820,26 +799,24 @@ mod tests {
             publishTime: U256::MAX,
         };
 
-        let encoded = Price::abi_encode(&price);
-        let output = Bytes::from(encoded);
+        assert!(matches!(
+            raw_price_to_pyth_price(&price),
+            Err(PythError::InvalidTimestamp(_))
+        ));
+    }
 
-        let call_frame = create_test_call_frame(
-            BASE_PYTH_CONTRACT_ADDRESS,
-            input,
-            Some(output.to_vec()),
-            vec![],
-        );
-        let trace = GethTrace::CallTracer(call_frame);
-
-        let asserter = Asserter::new();
-        asserter.push_success(&serde_json::to_value(&trace).unwrap());
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let tx_hash = B256::repeat_byte(0xff);
-        let cache = FeedIdCache::new();
+    #[test]
+    fn test_raw_price_to_pyth_price_timestamp_out_of_chrono_range() {
+        // i64::MAX passes i64::try_from but DateTime::from_timestamp rejects it
+        let price = Price {
+            price: 100_000,
+            conf: 500,
+            expo: -5,
+            publishTime: U256::from(i64::MAX as u64),
+        };
 
         assert!(matches!(
-            PythPricing::try_from_tx_hash(tx_hash, provider, "TEST", &cache).await,
+            raw_price_to_pyth_price(&price),
             Err(PythError::InvalidTimestamp(_))
         ));
     }

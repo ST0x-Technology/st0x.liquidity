@@ -6,6 +6,12 @@ max-threads = 8
 fail-fast = true
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+# trybuild compile-fail tests invoke rustc and may need to compile the full
+# dependency tree on CI, which can exceed the default timeout
+[[profile.default.overrides]]
+filter = "test(compile_fail_tests)"
+slow-timeout = { period = "120s", terminate-after = 3 }
+
 # E2e tests are slow and prone to hangs — limit threads and allow more time
 [[profile.default.overrides]]
 filter = "binary(=e2e)"

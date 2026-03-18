@@ -12,6 +12,8 @@ members = [
 ]
 resolver = "2"
 
+exclude = ["lib"]
+
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
@@ -121,12 +123,13 @@ url = { version = "2.5.4", features = ["serde"] }
 urlencoding = "2.1"
 uuid = { version = "1.11", features = ["serde", "v4"] }
 # Pin wasm-bindgen version for compatibility with rain.wasm transitive dependency
-wasm-bindgen = "0.2.100"
+wasm-bindgen = "=0.2.100"
 
 [package]
 name = "st0x-hedge"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 
 [features]
 default = []
@@ -189,6 +192,8 @@ ts-rs.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 uuid.workspace = true
+# Force transitive wasm-bindgen to match rain.wasm's expected version
+wasm-bindgen.workspace = true
 
 [dev-dependencies]
 approx.workspace = true

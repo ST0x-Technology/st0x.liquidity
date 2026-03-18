@@ -87,16 +87,6 @@ pub(crate) trait TokenizationForm: fmt::Debug + Clone + PartialEq + Eq {
     fn prefix() -> &'static str;
 }
 
-/// 1:1 minted tokenized shares (tTICKER, e.g. tAAPL, tSPYM).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OneToOneTokenizedShares;
-
-impl TokenizationForm for OneToOneTokenizedShares {
-    fn prefix() -> &'static str {
-        "t"
-    }
-}
-
 /// ERC-4626 vault shares wrapping tokenized equity
 /// (wtTICKER, e.g. wtCOIN, wtAAPL).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,11 +281,11 @@ mod tests {
 
     #[test]
     fn test_tokenized_equity_symbol_parse() {
-        TokenizedSymbol::<OneToOneTokenizedShares>::parse("tGME").unwrap();
-        TokenizedSymbol::<OneToOneTokenizedShares>::parse("tAAPL").unwrap();
-        TokenizedSymbol::<OneToOneTokenizedShares>::parse("tSPYM").unwrap();
+        TokenizedSymbol::<WrappedTokenizedShares>::parse("wtGME").unwrap();
+        TokenizedSymbol::<WrappedTokenizedShares>::parse("wtAAPL").unwrap();
+        TokenizedSymbol::<WrappedTokenizedShares>::parse("wtSPYM").unwrap();
 
-        let err = TokenizedSymbol::<OneToOneTokenizedShares>::parse("USDC").unwrap_err();
+        let err = TokenizedSymbol::<WrappedTokenizedShares>::parse("USDC").unwrap_err();
         assert!(
             matches!(
                 err,
@@ -306,7 +296,7 @@ mod tests {
             "Expected NotTokenizedEquity for USDC, got: {err:?}"
         );
 
-        let err = TokenizedSymbol::<OneToOneTokenizedShares>::parse("AAPL").unwrap_err();
+        let err = TokenizedSymbol::<WrappedTokenizedShares>::parse("AAPL").unwrap_err();
         assert!(
             matches!(
                 err,
@@ -317,7 +307,7 @@ mod tests {
             "Expected NotTokenizedEquity for AAPL, got: {err:?}"
         );
 
-        let err = TokenizedSymbol::<OneToOneTokenizedShares>::parse("").unwrap_err();
+        let err = TokenizedSymbol::<WrappedTokenizedShares>::parse("").unwrap_err();
         assert!(
             matches!(
                 err,
@@ -331,41 +321,41 @@ mod tests {
 
     #[test]
     fn test_tokenized_equity_symbol_extract_base() {
-        let symbol = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tGME").unwrap();
+        let symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse("wtGME").unwrap();
         assert_eq!(symbol.base().to_string(), "GME");
 
-        let symbol = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tAAPL").unwrap();
+        let symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse("wtAAPL").unwrap();
         assert_eq!(symbol.base().to_string(), "AAPL");
 
-        let symbol = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tNVDA").unwrap();
+        let symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse("wtNVDA").unwrap();
         assert_eq!(symbol.base().to_string(), "NVDA");
 
-        let symbol = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tSPYM").unwrap();
+        let symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse("wtSPYM").unwrap();
         assert_eq!(symbol.base().to_string(), "SPYM");
 
-        // Prefix-only "t" -> empty base -> Symbol validation fails
-        let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("t").unwrap_err();
+        // Prefix-only "wt" -> empty base -> Symbol validation fails
+        let error = TokenizedSymbol::<WrappedTokenizedShares>::parse("wt").unwrap_err();
         assert!(matches!(error, OnChainError::EmptySymbol(_)));
     }
 
     #[test]
     fn test_tokenized_equity_symbol_valid() {
-        let symbol = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tGME").unwrap();
-        assert_eq!(symbol.to_string(), "tGME");
+        let symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse("wtGME").unwrap();
+        assert_eq!(symbol.to_string(), "wtGME");
         assert_eq!(symbol.base().to_string(), "GME");
 
-        let symbol = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tAAPL").unwrap();
-        assert_eq!(symbol.to_string(), "tAAPL");
+        let symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse("wtAAPL").unwrap();
+        assert_eq!(symbol.to_string(), "wtAAPL");
         assert_eq!(symbol.base().to_string(), "AAPL");
 
-        let symbol = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tSPYM").unwrap();
-        assert_eq!(symbol.to_string(), "tSPYM");
+        let symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse("wtSPYM").unwrap();
+        assert_eq!(symbol.to_string(), "wtSPYM");
         assert_eq!(symbol.base().to_string(), "SPYM");
     }
 
     #[test]
     fn test_tokenized_equity_symbol_invalid() {
-        let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("").unwrap_err();
+        let error = TokenizedSymbol::<WrappedTokenizedShares>::parse("").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
@@ -373,7 +363,7 @@ mod tests {
             ) if symbol_provided.is_empty()
         ));
 
-        let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("USDC").unwrap_err();
+        let error = TokenizedSymbol::<WrappedTokenizedShares>::parse("USDC").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
@@ -381,7 +371,7 @@ mod tests {
             ) if symbol_provided == "USDC"
         ));
 
-        let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("AAPL").unwrap_err();
+        let error = TokenizedSymbol::<WrappedTokenizedShares>::parse("AAPL").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
@@ -390,7 +380,7 @@ mod tests {
         ));
 
         // Legacy formats are no longer accepted
-        let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("AAPL0x").unwrap_err();
+        let error = TokenizedSymbol::<WrappedTokenizedShares>::parse("AAPL0x").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
@@ -398,7 +388,7 @@ mod tests {
             ) if symbol_provided == "AAPL0x"
         ));
 
-        let error = TokenizedSymbol::<OneToOneTokenizedShares>::parse("NVDAs1").unwrap_err();
+        let error = TokenizedSymbol::<WrappedTokenizedShares>::parse("NVDAs1").unwrap_err();
         assert!(matches!(
             error,
             OnChainError::Validation(
