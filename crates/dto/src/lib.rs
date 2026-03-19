@@ -20,58 +20,29 @@ fn zero_float() -> Float {
     float!(0)
 }
 
+pub trait Reportable {
+    // TODO: change to a typed id type
+    fn report(&self, id: &str) -> Statement;
+}
+
+/// Messages sent from the server to WebSocket clients.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct Statement {
+    pub id: String,
+    pub statement: Concern,
+}
+
 /// Messages sent from the server to WebSocket clients.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum ServerMessage {
-    Initial(Box<InitialState>),
-    Event(EventStoreEntry),
-    Snapshot(Box<InventorySnapshot>),
-    Transfer(TransferOperation),
+pub enum Concern {
+    Inventory,
+    Transfer,
+    Trading,
 }
 
 /// Full dashboard snapshot sent to the frontend on connection.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct InitialState {
-    pub recent_trades: Vec<Trade>,
-    pub inventory: Inventory,
-    pub metrics: PerformanceMetrics,
-    pub spreads: Vec<SpreadSummary>,
-    pub active_transfers: Vec<TransferOperation>,
-    pub recent_transfers: Vec<TransferOperation>,
-    pub auth_status: AuthStatus,
-    pub circuit_breaker: CircuitBreakerStatus,
-    /// Warnings about partial data (e.g. failed to load some transfers).
-    pub warnings: Vec<Warning>,
-}
-
-impl Default for InitialState {
-    fn default() -> Self {
-        Self {
-            recent_trades: Vec::new(),
-            inventory: Inventory::empty(),
-            metrics: PerformanceMetrics::zero(),
-            spreads: Vec::new(),
-            active_transfers: Vec::new(),
-            recent_transfers: Vec::new(),
-            auth_status: AuthStatus::NotConfigured,
-            circuit_breaker: CircuitBreakerStatus::Active,
-            warnings: Vec::new(),
-        }
-    }
-}
-
-/// Single event from the event store for live updates.
-#[derive(Debug, Clone, Serialize, TS)]
-pub struct EventStoreEntry {
-    pub aggregate_type: String,
-    pub aggregate_id: String,
-    #[ts(type = "number")]
-    pub sequence: u64,
-    pub event_type: String,
-    pub timestamp: DateTime<Utc>,
-}
 
 /// Completed trade record.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -496,9 +467,7 @@ pub enum AuthStatus {
 /// Returns [`ts_rs::ExportError`] if any type's binding file fails to
 /// write (e.g., `out_dir` does not exist or is not writable).
 pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
-    ServerMessage::export_all_to(out_dir)?;
-    InitialState::export_all_to(out_dir)?;
-    EventStoreEntry::export_all_to(out_dir)?;
+    Statement::export_all_to(out_dir)?;
     Trade::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;
     SymbolInventory::export_all_to(out_dir)?;
@@ -518,10 +487,6 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     PerformanceMetrics::export_all_to(out_dir)?;
     SpreadSummary::export_all_to(out_dir)?;
     SpreadUpdate::export_all_to(out_dir)?;
-    CircuitBreakerStatus::export_all_to(out_dir)?;
-    AuthStatus::export_all_to(out_dir)?;
-    Warning::export_all_to(out_dir)?;
-    TransferCategory::export_all_to(out_dir)?;
 
     Ok(())
 }
@@ -644,15 +609,15 @@ mod tests {
         export_bindings(&out_dir).unwrap();
 
         assert!(
-            out_dir.join("ServerMessage.ts").exists(),
-            "ServerMessage.ts should exist in {}/",
+            out_dir.join("Statement.ts").exists(),
+            "Statement.ts should exist in {}/",
             out_dir.display()
         );
-        assert!(
-            out_dir.join("InitialState.ts").exists(),
-            "InitialState.ts should exist in {}/",
-            out_dir.display()
-        );
+        // assert!(
+        //     out_dir.join("InitialState.ts").exists(),
+        //     "InitialState.ts should exist in {}/",
+        //     out_dir.display()
+        // );
 
         TestOnlyBinding::export_all_to(&out_dir).unwrap();
         let test_file = out_dir.join("TestOnlyBinding.ts");
@@ -673,13 +638,13 @@ mod tests {
         std::fs::remove_file(&test_file).unwrap();
     }
 
-    #[test]
-    fn server_message_initial_serializes_with_type_tag() {
-        let msg = ServerMessage::Initial(Box::default());
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(json.contains(r#""type":"initial""#));
-        assert!(json.contains(r#""data":"#));
-    }
+    // #[test]
+    // fn server_message_initial_serializes_with_type_tag() {
+    //     let msg = Statement::Initial(Box::new(InitialState::stub()));
+    //     let json = serde_json::to_string(&msg).expect("serialization should succeed");
+    //     assert!(json.contains(r#""type":"initial""#));
+    //     assert!(json.contains(r#""data":"#));
+    // }
 
     #[test]
     fn server_message_snapshot_serializes_with_type_tag() {

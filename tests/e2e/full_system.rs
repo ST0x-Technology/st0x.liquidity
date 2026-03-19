@@ -18,7 +18,7 @@ use alloy::providers::{Provider, RootProvider};
 use st0x_float_macro::float;
 use tokio::sync::broadcast;
 
-use st0x_dto::ServerMessage;
+use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
 use st0x_evm::Wallet;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
@@ -218,7 +218,7 @@ async fn full_system() -> anyhow::Result<()> {
     // Capture block after all setup
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
-    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+    let (event_sender, _) = broadcast::channel::<Statement>(256);
     let dashboard_sender = event_sender.clone();
 
     let ctx = build_full_system_ctx()
