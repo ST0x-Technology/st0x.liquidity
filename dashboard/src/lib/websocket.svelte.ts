@@ -38,14 +38,15 @@ const isInitialState = (value: unknown): boolean => {
     Array.isArray(value['activeTransfers']) &&
     Array.isArray(value['recentTransfers']) &&
     isObject(value['authStatus']) &&
-    isObject(value['circuitBreaker'])
+    isObject(value['circuitBreaker']) &&
+    Array.isArray(value['warnings'])
   )
 }
 
 const isInventory = (value: unknown): boolean => {
   if (!isObject(value)) return false
   if (!Array.isArray(value['perSymbol']) || !isObject(value['usdc'])) return false
-  const usdc = value['usdc'] as Record<string, unknown>
+  const usdc = value['usdc']
   return (
     typeof usdc['onchainAvailable'] === 'string' &&
     typeof usdc['onchainInflight'] === 'string' &&
@@ -63,7 +64,7 @@ const isTransferOperation = (value: unknown): boolean => {
   if (!isObject(value)) return false
   if (typeof value['kind'] !== 'string' || typeof value['id'] !== 'string') return false
   if (!isObject(value['status'])) return false
-  const status = value['status'] as Record<string, unknown>
+  const status = value['status']
   return typeof status['status'] === 'string'
 }
 
@@ -75,8 +76,8 @@ const isServerMessage = (value: unknown): value is ServerMessage => {
 
   if (type === 'initial') return isInitialState(data)
   if (type === 'event') return isEventStoreEntry(data)
-  if (type === 'inventory_update') return isInventorySnapshot(data)
-  if (type === 'transfer_update') return isTransferOperation(data)
+  if (type === 'snapshot') return isInventorySnapshot(data)
+  if (type === 'transfer') return isTransferOperation(data)
 
   return false
 }
@@ -109,6 +110,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         queryClient.setQueryData(['transfers', 'recent'], data.recentTransfers)
         queryClient.setQueryData(['auth'], data.authStatus)
         queryClient.setQueryData(['circuitBreaker'], data.circuitBreaker)
+        queryClient.setQueryData(['warnings'], data.warnings)
       },
 
       event: ({ data }) => {
@@ -117,11 +119,11 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         )
       },
 
-      inventory_update: ({ data }) => {
+      snapshot: ({ data }) => {
         queryClient.setQueryData<Inventory>(['inventory'], data.inventory)
       },
 
-      transfer_update: ({ data }) => {
+      transfer: ({ data }) => {
         queryClient.setQueryData<TransferOperation[]>(['transfers', 'active'], (old) => {
           const existing = old ?? []
           const index = existing.findIndex((transfer) => transfer.id === data.id)

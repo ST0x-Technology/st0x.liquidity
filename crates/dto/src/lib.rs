@@ -26,6 +26,8 @@ fn zero_float() -> Float {
 pub enum ServerMessage {
     Initial(Box<InitialState>),
     Event(EventStoreEntry),
+    Snapshot(Box<InventorySnapshot>),
+    Transfer(TransferOperation),
 }
 
 /// Full dashboard snapshot sent to the frontend on connection.
@@ -40,10 +42,12 @@ pub struct InitialState {
     pub recent_transfers: Vec<TransferOperation>,
     pub auth_status: AuthStatus,
     pub circuit_breaker: CircuitBreakerStatus,
+    /// Warnings about partial data (e.g. failed to load some transfers).
+    pub warnings: Vec<Warning>,
 }
 
-impl InitialState {
-    pub fn stub() -> Self {
+impl Default for InitialState {
+    fn default() -> Self {
         Self {
             recent_trades: Vec::new(),
             inventory: Inventory::empty(),
@@ -53,6 +57,7 @@ impl InitialState {
             recent_transfers: Vec::new(),
             auth_status: AuthStatus::NotConfigured,
             circuit_breaker: CircuitBreakerStatus::Active,
+            warnings: Vec::new(),
         }
     }
 }
@@ -153,6 +158,28 @@ pub enum EquityRedemptionTag {}
 
 /// Tag type for USDC bridge operation IDs.
 pub enum UsdcBridgeTag {}
+
+/// Category of transfer aggregate that failed to load.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferCategory {
+    EquityMint,
+    EquityRedemption,
+    UsdcBridge,
+}
+
+/// Warning emitted when transfer data is partially loaded.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Warning {
+    /// Failed to query aggregate IDs for an entire category.
+    CategoryUnavailable { category: TransferCategory },
+    /// An individual aggregate's events failed to replay.
+    AggregateReplayFailed {
+        category: TransferCategory,
+        aggregate_id: String,
+    },
+}
 
 /// Transfer operation: a tagged union per operation type.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -260,6 +287,47 @@ pub enum UsdcBridgeStatus {
     Depositing,
     Completed { completed_at: DateTime<Utc> },
     Failed { failed_at: DateTime<Utc> },
+}
+
+impl TransferOperation {
+    /// Whether this transfer is in a terminal state (completed or failed).
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::EquityMint(op) => {
+                use EquityMintStatus::*;
+
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Minting | Wrapping | Depositing => false,
+                }
+            }
+            Self::EquityRedemption(op) => {
+                use EquityRedemptionStatus::*;
+
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Withdrawing | Unwrapping | Sending | PendingConfirmation => false,
+                }
+            }
+            Self::UsdcBridge(op) => {
+                use UsdcBridgeStatus::*;
+
+                match &op.status {
+                    Completed { .. } | Failed { .. } => true,
+                    Converting | Withdrawing | Bridging | Depositing => false,
+                }
+            }
+        }
+    }
+
+    /// The last time this transfer was updated.
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::EquityMint(op) => op.updated_at,
+            Self::EquityRedemption(op) => op.updated_at,
+            Self::UsdcBridge(op) => op.updated_at,
+        }
+    }
 }
 
 /// Absolute and percentage profit/loss.
@@ -447,6 +515,8 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     SpreadUpdate::export_all_to(out_dir)?;
     CircuitBreakerStatus::export_all_to(out_dir)?;
     AuthStatus::export_all_to(out_dir)?;
+    Warning::export_all_to(out_dir)?;
+    TransferCategory::export_all_to(out_dir)?;
 
     Ok(())
 }
@@ -468,8 +538,8 @@ mod tests {
     }
 
     #[test]
-    fn initial_state_stub_serializes_correctly() {
-        let initial = InitialState::stub();
+    fn initial_state_default_serializes_correctly() {
+        let initial = InitialState::default();
         let json = serde_json::to_string(&initial).expect("serialization should succeed");
         assert!(json.contains("recentTrades"));
         assert!(json.contains("inventory"));
@@ -478,6 +548,7 @@ mod tests {
         assert!(json.contains("circuitBreaker"));
         assert!(json.contains("activeTransfers"));
         assert!(json.contains("recentTransfers"));
+        assert!(json.contains("warnings"));
         assert!(
             !json.contains("\"0x"),
             "dashboard DTOs should serialize decimal strings, got: {json}"
@@ -599,10 +670,43 @@ mod tests {
 
     #[test]
     fn server_message_initial_serializes_with_type_tag() {
-        let msg = ServerMessage::Initial(Box::new(InitialState::stub()));
+        let msg = ServerMessage::Initial(Box::default());
         let json = serde_json::to_string(&msg).expect("serialization should succeed");
         assert!(json.contains(r#""type":"initial""#));
         assert!(json.contains(r#""data":"#));
+    }
+
+    #[test]
+    fn server_message_snapshot_serializes_with_type_tag() {
+        let msg = ServerMessage::Snapshot(Box::new(InventorySnapshot {
+            inventory: Inventory::empty(),
+            fetched_at: Utc::now(),
+        }));
+        let json = serde_json::to_string(&msg).expect("serialization should succeed");
+        assert!(
+            json.contains(r#""type":"snapshot""#),
+            "expected snapshot tag, got: {json}"
+        );
+        assert!(json.contains(r#""data":"#));
+    }
+
+    #[test]
+    fn server_message_transfer_serializes_with_type_tag() {
+        let msg = ServerMessage::Transfer(TransferOperation::EquityMint(EquityMintOperation {
+            id: Id::new("mint-001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            status: EquityMintStatus::Minting,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        }));
+        let json = serde_json::to_string(&msg).expect("serialization should succeed");
+        assert!(
+            json.contains(r#""type":"transfer""#),
+            "expected transfer tag, got: {json}"
+        );
+        assert!(json.contains(r#""data":"#));
+        assert!(json.contains(r#""kind":"equity_mint""#));
     }
 
     #[test]
@@ -639,6 +743,110 @@ mod tests {
         assert!(json.contains(r#""kind":"usdc_bridge""#));
         assert!(json.contains(r#""status":"completed""#));
         assert!(json.contains(r#""direction":"alpaca_to_base""#));
+    }
+
+    fn mint_operation(status: EquityMintStatus, updated_at: DateTime<Utc>) -> TransferOperation {
+        TransferOperation::EquityMint(EquityMintOperation {
+            id: Id::new("mint-001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            status,
+            started_at: Utc::now(),
+            updated_at,
+        })
+    }
+
+    fn redemption_operation(
+        status: EquityRedemptionStatus,
+        updated_at: DateTime<Utc>,
+    ) -> TransferOperation {
+        TransferOperation::EquityRedemption(EquityRedemptionOperation {
+            id: Id::new("redeem-001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            status,
+            started_at: Utc::now(),
+            updated_at,
+        })
+    }
+
+    fn bridge_operation(status: UsdcBridgeStatus, updated_at: DateTime<Utc>) -> TransferOperation {
+        TransferOperation::UsdcBridge(UsdcBridgeOperation {
+            id: Id::new("bridge-001"),
+            direction: UsdcBridgeDirection::AlpacaToBase,
+            amount: Usdc::new(float!(1000)),
+            status,
+            started_at: Utc::now(),
+            updated_at,
+        })
+    }
+
+    #[test]
+    fn is_terminal_equity_mint() {
+        let now = Utc::now();
+
+        assert!(
+            mint_operation(EquityMintStatus::Completed { completed_at: now }, now).is_terminal()
+        );
+        assert!(mint_operation(EquityMintStatus::Failed { failed_at: now }, now).is_terminal());
+
+        assert!(!mint_operation(EquityMintStatus::Minting, now).is_terminal());
+        assert!(!mint_operation(EquityMintStatus::Wrapping, now).is_terminal());
+        assert!(!mint_operation(EquityMintStatus::Depositing, now).is_terminal());
+    }
+
+    #[test]
+    fn is_terminal_equity_redemption() {
+        let now = Utc::now();
+
+        assert!(
+            redemption_operation(EquityRedemptionStatus::Completed { completed_at: now }, now)
+                .is_terminal()
+        );
+        assert!(
+            redemption_operation(EquityRedemptionStatus::Failed { failed_at: now }, now)
+                .is_terminal()
+        );
+
+        assert!(!redemption_operation(EquityRedemptionStatus::Withdrawing, now).is_terminal());
+        assert!(!redemption_operation(EquityRedemptionStatus::Unwrapping, now).is_terminal());
+        assert!(!redemption_operation(EquityRedemptionStatus::Sending, now).is_terminal());
+        assert!(
+            !redemption_operation(EquityRedemptionStatus::PendingConfirmation, now).is_terminal()
+        );
+    }
+
+    #[test]
+    fn is_terminal_usdc_bridge() {
+        let now = Utc::now();
+
+        assert!(
+            bridge_operation(UsdcBridgeStatus::Completed { completed_at: now }, now).is_terminal()
+        );
+        assert!(bridge_operation(UsdcBridgeStatus::Failed { failed_at: now }, now).is_terminal());
+
+        assert!(!bridge_operation(UsdcBridgeStatus::Converting, now).is_terminal());
+        assert!(!bridge_operation(UsdcBridgeStatus::Withdrawing, now).is_terminal());
+        assert!(!bridge_operation(UsdcBridgeStatus::Bridging, now).is_terminal());
+        assert!(!bridge_operation(UsdcBridgeStatus::Depositing, now).is_terminal());
+    }
+
+    #[test]
+    fn updated_at_returns_inner_value() {
+        let timestamp = Utc::now();
+
+        assert_eq!(
+            mint_operation(EquityMintStatus::Minting, timestamp).updated_at(),
+            timestamp
+        );
+        assert_eq!(
+            redemption_operation(EquityRedemptionStatus::Withdrawing, timestamp).updated_at(),
+            timestamp
+        );
+        assert_eq!(
+            bridge_operation(UsdcBridgeStatus::Converting, timestamp).updated_at(),
+            timestamp
+        );
     }
 
     #[test]

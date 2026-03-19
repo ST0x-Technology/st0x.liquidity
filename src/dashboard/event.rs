@@ -133,7 +133,7 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "mint-123");
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
@@ -165,7 +165,7 @@ mod tests {
             ServerMessage::Event(entry) => {
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
@@ -189,7 +189,7 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "redemption-123");
                 assert_eq!(entry.event_type, "EquityRedemptionEvent::Completed");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
@@ -213,7 +213,7 @@ mod tests {
                 assert_eq!(entry.aggregate_id, id.to_string());
                 assert_eq!(entry.event_type, "UsdcRebalanceEvent::WithdrawalConfirmed");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
@@ -251,8 +251,8 @@ mod tests {
                         i + 1
                     );
                 }
-                ServerMessage::Initial(_) => {
-                    panic!("receiver {} expected Event message", i + 1)
+                other => {
+                    panic!("receiver {} expected Event message, got {other:?}", i + 1)
                 }
             }
         }
@@ -315,7 +315,7 @@ mod tests {
             ServerMessage::Event(entry) => {
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 }
