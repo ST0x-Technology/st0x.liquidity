@@ -2,7 +2,7 @@
 //! materialized views.
 //!
 //! Generic over the view repository implementation, allowing any
-//! backend (SQLite, Postgres, in-memory) that implements
+//! backend (`SQLite`, Postgres, in-memory) that implements
 //! `ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>`.
 
 use async_trait::async_trait;
@@ -85,7 +85,7 @@ impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Enti
     }
 }
 
-/// SQLite view repository that hides [`Lifecycle`] from
+/// `SQLite` view repository that hides [`Lifecycle`] from
 /// Projection's public type signature.
 ///
 /// Without this newtype, the default `Repo` parameter would be
@@ -131,7 +131,7 @@ impl<Entity: EventSourced> ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>
 /// Provides [`load`](Self::load) to retrieve a single entity by
 /// ID, [`load_all`](Self::load_all) to retrieve all live
 /// entities, and [`filter`](Self::filter) for typed
-/// column-filtered queries. Backed by SQLite in production; the
+/// column-filtered queries. Backed by `SQLite` in production; the
 /// `Repo` parameter defaults to [`SqliteProjectionRepo`] so
 /// consumers write `Projection<Position>`.
 ///
@@ -151,6 +151,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     /// Uses `Entity::PROJECTION` directly to determine the view
     /// table name. Only callable on entities with a materialized
     /// view.
+    #[must_use]
     pub fn sqlite(pool: SqlitePool) -> Self {
         let Table(table) = Entity::PROJECTION;
         let repo = Arc::new(SqliteProjectionRepo {
@@ -172,6 +173,11 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     ///
     /// Returns every entity in `Live` state, skipping
     /// non-live aggregates with a warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProjectionError` if the projection is not
+    /// `SQLite`-backed or the database query fails.
     pub async fn load_all(&self) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError<Entity>>
     where
         <Entity::Id as FromStr>::Err: Debug,
@@ -200,6 +206,12 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     /// and has at least one non-NULL value (catches stale
     /// generated columns whose JSON paths drifted from the
     /// actual serialization format).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProjectionError` if the projection is not
+    /// `SQLite`-backed, the column doesn't exist, the column
+    /// is stale (all NULLs), or the database query fails.
     pub async fn filter<V>(
         &self,
         column: Column,
@@ -298,6 +310,11 @@ where
     /// Delegates to the underlying view repository, then unwraps
     /// the internal `Lifecycle` wrapper. Returns `None` if the
     /// entity doesn't exist or hasn't been initialized yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProjectionError` if the view repository load
+    /// fails or the entity is in a failed lifecycle state.
     pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, ProjectionError<Entity>> {
         let view_id = id.to_string();
 
@@ -475,7 +492,7 @@ mod tests {
         }
     }
 
-    /// In-memory view repository for testing Projection::load.
+    /// In-memory view repository for testing `Projection::load`.
     struct InMemoryRepo {
         views: RwLock<HashMap<String, Lifecycle<TestEntity>>>,
     }

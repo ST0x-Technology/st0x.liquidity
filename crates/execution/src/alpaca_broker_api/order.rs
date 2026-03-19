@@ -159,6 +159,7 @@ pub struct CryptoOrderResponse {
 
 impl CryptoOrderResponse {
     /// Returns the status as a display-friendly string.
+    #[must_use]
     pub fn status_display(&self) -> &'static str {
         match self.status {
             BrokerOrderStatus::Filled => "filled",

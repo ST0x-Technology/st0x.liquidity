@@ -10,6 +10,7 @@ use super::TimeInForce;
 pub struct AlpacaAccountId(Uuid);
 
 impl AlpacaAccountId {
+    #[must_use]
     pub const fn new(uuid: Uuid) -> Self {
         Self(uuid)
     }
@@ -82,10 +83,12 @@ where
 }
 
 impl AlpacaBrokerApiCtx {
+    #[must_use]
     pub fn mode(&self) -> AlpacaBrokerApiMode {
         self.mode.clone().unwrap_or(AlpacaBrokerApiMode::Sandbox)
     }
 
+    #[must_use]
     pub fn base_url(&self) -> &str {
         self.mode.as_ref().map_or_else(
             || AlpacaBrokerApiMode::Sandbox.base_url(),
@@ -93,6 +96,7 @@ impl AlpacaBrokerApiCtx {
         )
     }
 
+    #[must_use]
     pub fn is_sandbox(&self) -> bool {
         self.mode
             .as_ref()

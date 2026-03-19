@@ -7,7 +7,7 @@ use tracing::error;
 use super::{SchwabAuthCtx, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
 
 /// Response from Schwab order placement API.
-/// According to Schwab OpenAPI spec, successful order placement (201) returns
+/// According to Schwab `OpenAPI` spec, successful order placement (201) returns
 /// empty body with order ID in the Location header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrderPlacementResponse {
@@ -181,7 +181,7 @@ impl Order {
 
 /// Extracts order ID from the Location header in Schwab order placement response.
 ///
-/// According to Schwab OpenAPI spec, successful order placement returns Location header
+/// According to Schwab `OpenAPI` spec, successful order placement returns Location header
 /// containing link to the newly created order. The order ID is extracted from this URL.
 /// Expected format: "/trader/v1/accounts/{accountHash}/orders/{orderId}"
 fn extract_order_id_from_location_header(

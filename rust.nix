@@ -114,6 +114,15 @@ in {
     };
   });
 
+  # Verify .sqlx/ cache is fresh (reuses cached deps)
+  sqlxCheck = craneLib.mkCargoDerivation (commonArgs // {
+    inherit cargoArtifacts;
+    preBuild = sqlxSetup;
+    pname = "st0x-sqlx-check";
+    buildPhaseCargoCommand = "cargo sqlx prepare --check --workspace";
+    installPhase = "touch $out";
+  });
+
   # Clippy check (reuses cached deps)
   clippy = craneLib.cargoClippy (commonArgs // {
     inherit cargoArtifacts;

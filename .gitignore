@@ -13,6 +13,7 @@ tarpaulin-report.html
 !.claude/skills
 .idea/
 .worktrees/
+.local/
 out/
 cache/
 .tmp/

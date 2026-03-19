@@ -43,7 +43,7 @@ pub(crate) struct Equity {
     pub(crate) quantity: FractionalShares,
 }
 
-/// Data extracted from the TokensReceived aggregate state for
+/// Data extracted from the `TokensReceived` aggregate state for
 /// onchain verification and subsequent wrapping.
 struct TokensReceivedData {
     shares_minted: U256,
@@ -157,7 +157,7 @@ impl CrossVenueEquityTransfer {
     }
 
     /// Loads the aggregate after Poll and extracts fields from the
-    /// TokensReceived state needed for verification and wrapping.
+    /// `TokensReceived` state needed for verification and wrapping.
     async fn load_tokens_received(
         &self,
         issuer_request_id: &IssuerRequestId,

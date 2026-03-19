@@ -1449,6 +1449,7 @@ mod tests {
     async fn test_backfill_starts_from_deployment_block() {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
+
         let evm_ctx = EvmCtx {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),

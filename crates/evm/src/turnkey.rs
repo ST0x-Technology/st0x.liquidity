@@ -28,8 +28,8 @@ use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 pub struct TurnkeyOrganizationId(String);
 
 impl TurnkeyOrganizationId {
-    pub fn new(value: String) -> Self {
-        Self(value)
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
@@ -40,8 +40,8 @@ impl TurnkeyOrganizationId {
 pub struct TurnkeyApiPrivateKey(String);
 
 impl TurnkeyApiPrivateKey {
-    pub fn new(value: String) -> Self {
-        Self(value)
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
@@ -130,6 +130,11 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
     /// wraps it in an `EthereumWallet`, and builds the signing
     /// provider with standard fillers. The base provider is cloned
     /// and stored separately for read-only access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvmError`] if the chain ID lookup or signer
+    /// construction fails.
     pub async fn new(
         ctx: WalletCtx<TurnkeySettings, TurnkeyCredentials, P>,
     ) -> Result<Self, EvmError> {

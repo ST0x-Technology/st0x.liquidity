@@ -502,11 +502,11 @@ mod tests {
             .unwrap();
 
         let aggregate_id = offchain_order_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
+        let offchain_order_events: Vec<String> = sqlx::query_scalar(
             "SELECT event_type FROM events \
             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
-            aggregate_id
         )
+        .bind(&aggregate_id)
         .fetch_all(&pool)
         .await
         .unwrap();
@@ -516,9 +516,9 @@ mod tests {
         assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
         assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Filled");
 
-        let position_events: Vec<String> = sqlx::query_scalar!(
+        let position_events: Vec<String> = sqlx::query_scalar(
             "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence"
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence",
         )
         .fetch_all(&pool)
         .await
@@ -582,11 +582,11 @@ mod tests {
             .unwrap();
 
         let aggregate_id = offchain_order_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
+        let offchain_order_events: Vec<String> = sqlx::query_scalar(
             "SELECT event_type FROM events \
             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
-            aggregate_id
         )
+        .bind(&aggregate_id)
         .fetch_all(&pool)
         .await
         .unwrap();
@@ -596,9 +596,9 @@ mod tests {
         assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
         assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Failed");
 
-        let position_events: Vec<String> = sqlx::query_scalar!(
+        let position_events: Vec<String> = sqlx::query_scalar(
             "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'TSLA' ORDER BY sequence"
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'TSLA' ORDER BY sequence",
         )
         .fetch_all(&pool)
         .await
