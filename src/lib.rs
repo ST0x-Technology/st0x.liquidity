@@ -339,10 +339,8 @@ mod tests {
     }
 
     fn create_test_inventory() -> Arc<inventory::BroadcastingInventory> {
-        let sender = create_test_event_sender();
-        Arc::new(inventory::BroadcastingInventory::new(
+        Arc::new(inventory::BroadcastingInventory::new_without_broadcast(
             inventory::InventoryView::default(),
-            sender,
         ))
     }
 

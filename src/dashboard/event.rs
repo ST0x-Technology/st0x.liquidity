@@ -1,12 +1,16 @@
-//! Reactor that broadcasts aggregate events to WebSocket dashboard clients.
+//! Reactor that broadcasts aggregate events to WebSocket dashboard
+//! clients as [`Statement`] notifications.
+//!
+//! Each domain event produces a [`Statement`] with the appropriate
+//! [`Concern`] variant, notifying connected clients that something
+//! changed. Clients use the concern type to know what to
+//! refetch/invalidate.
 
 use async_trait::async_trait;
-use chrono::Utc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use st0x_dto::{EventStoreEntry, ServerMessage};
+use st0x_dto::{Concern, Statement};
 use st0x_event_sorcery::{DomainEvent, EntityList, EventSourced, Never, Reactor, deps};
 
 use crate::equity_redemption::EquityRedemption;
@@ -14,46 +18,38 @@ use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
 deps!(
-    EventBroadcaster,
+    Broadcaster,
     [TokenizedEquityMint, EquityRedemption, UsdcRebalance,]
 );
 
-/// Reactor that broadcasts events to connected WebSocket clients.
+/// Reactor that broadcasts [`Statement`] notifications to connected
+/// WebSocket clients when domain events occur.
 ///
 /// Implements [`Reactor`] with exhaustive handling for all
 /// broadcast-eligible aggregate types.
-pub(crate) struct EventBroadcaster {
-    sender: broadcast::Sender<ServerMessage>,
-    sequence: AtomicU64,
+pub(crate) struct Broadcaster {
+    sender: broadcast::Sender<Statement>,
 }
 
-impl EventBroadcaster {
-    pub(crate) fn new(sender: broadcast::Sender<ServerMessage>) -> Self {
-        Self {
-            sender,
-            sequence: AtomicU64::new(0),
-        }
+impl Broadcaster {
+    pub(crate) fn new(sender: broadcast::Sender<Statement>) -> Self {
+        Self { sender }
     }
 
-    fn broadcast_event<Entity: EventSourced>(&self, id: &Entity::Id, event: &Entity::Event) {
-        let entry = EventStoreEntry {
-            aggregate_type: Entity::AGGREGATE_TYPE.to_string(),
-            aggregate_id: id.to_string(),
-            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
-            event_type: event.event_type(),
-            timestamp: Utc::now(),
+    fn notify<Entity: EventSourced>(&self, id: &Entity::Id) {
+        let statement = Statement {
+            id: id.to_string(),
+            statement: Concern::Transfer,
         };
 
-        let msg = ServerMessage::Event(entry);
-
-        if let Err(error) = self.sender.send(msg) {
-            warn!("Failed to broadcast event (no receivers): {error}");
+        if let Err(error) = self.sender.send(statement) {
+            warn!("Failed to broadcast statement (no receivers): {error}");
         }
     }
 }
 
 #[async_trait]
-impl Reactor for EventBroadcaster {
+impl Reactor for Broadcaster {
     type Error = Never;
 
     async fn react(
@@ -61,14 +57,14 @@ impl Reactor for EventBroadcaster {
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
         event
-            .on(|id, event| async move {
-                self.broadcast_event::<TokenizedEquityMint>(&id, &event);
+            .on(|id, _event| async move {
+                self.notify::<TokenizedEquityMint>(&id);
             })
-            .on(|id, event| async move {
-                self.broadcast_event::<EquityRedemption>(&id, &event);
+            .on(|id, _event| async move {
+                self.notify::<EquityRedemption>(&id);
             })
-            .on(|id, event| async move {
-                self.broadcast_event::<UsdcRebalance>(&id, &event);
+            .on(|id, _event| async move {
+                self.notify::<UsdcRebalance>(&id);
             })
             .exhaustive()
             .await;
@@ -79,8 +75,6 @@ impl Reactor for EventBroadcaster {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
-    use rain_math_float::Float;
     use uuid::Uuid;
 
     use st0x_event_sorcery::ReactorHarness;
@@ -91,17 +85,22 @@ mod tests {
     use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
     use crate::usdc_rebalance::{UsdcRebalanceEvent, UsdcRebalanceId};
 
-    fn make_mint_requested_float(symbol: &str, quantity: Float) -> TokenizedEquityMintEvent {
+    fn test_broadcaster() -> (Broadcaster, broadcast::Receiver<Statement>) {
+        let (sender, receiver) = broadcast::channel(16);
+        let broadcaster = Broadcaster::new(sender);
+        (broadcaster, receiver)
+    }
+
+    fn make_mint_requested(symbol: &str) -> TokenizedEquityMintEvent {
+        use alloy::primitives::Address;
+        use rain_math_float::Float;
+
         TokenizedEquityMintEvent::MintRequested {
             symbol: Symbol::new(symbol).unwrap(),
-            quantity,
+            quantity: Float::parse("100".to_string()).unwrap(),
             wallet: Address::ZERO,
             requested_at: chrono::Utc::now(),
         }
-    }
-
-    fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
-        make_mint_requested_float(symbol, Float::parse(quantity.to_string()).unwrap())
     }
 
     fn make_redemption_completed() -> EquityRedemptionEvent {
@@ -117,62 +116,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_broadcaster_sends_to_channel() {
-        let (sender, mut receiver) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+    async fn broadcaster_sends_transfer_statement() {
+        let (broadcaster, mut receiver) = test_broadcaster();
 
         let id = IssuerRequestId::new("mint-123".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("TSLA", 50));
+        broadcaster.notify::<TokenizedEquityMint>(&id);
 
         let msg = receiver.recv().await.expect("should receive message");
 
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.aggregate_type, "TokenizedEquityMint");
-                assert_eq!(entry.aggregate_id, "mint-123");
-                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
+        assert_eq!(msg.id, "mint-123");
+        assert!(
+            matches!(msg.statement, Concern::Transfer),
+            "expected Transfer concern, got {:?}",
+            msg.statement
+        );
     }
 
     #[tokio::test]
-    async fn event_broadcaster_handles_no_receivers() {
-        let (sender, _) = broadcast::channel::<ServerMessage>(16);
-        let broadcaster = EventBroadcaster::new(sender);
+    async fn broadcaster_handles_no_receivers() {
+        let (sender, _) = broadcast::channel::<Statement>(16);
+        let broadcaster = Broadcaster::new(sender);
 
         let id = IssuerRequestId::new("mint-456".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("GOOG", 10));
+        broadcaster.notify::<TokenizedEquityMint>(&id);
     }
 
     #[tokio::test]
-    async fn reactor_receive_broadcasts_mint_event() {
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+    async fn reactor_broadcasts_mint_event() {
+        let (broadcaster, mut receiver) = test_broadcaster();
+        let harness = ReactorHarness::new(broadcaster);
 
         let id = IssuerRequestId::new("mint-multi".to_string());
 
         harness
-            .receive::<TokenizedEquityMint>(id, make_mint_requested("NVDA", 25))
+            .receive::<TokenizedEquityMint>(id, make_mint_requested("NVDA"))
             .await
             .unwrap();
 
         let msg = receiver.recv().await.expect("should receive message");
 
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
+        assert_eq!(msg.id, "mint-multi");
+        assert!(matches!(msg.statement, Concern::Transfer));
     }
 
     #[tokio::test]
-    async fn reactor_receive_works_for_equity_redemption() {
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+    async fn reactor_broadcasts_equity_redemption() {
+        let (broadcaster, mut receiver) = test_broadcaster();
+        let harness = ReactorHarness::new(broadcaster);
 
         let id = RedemptionAggregateId::new("redemption-123".to_string());
 
@@ -183,50 +173,37 @@ mod tests {
 
         let msg = receiver.recv().await.expect("should receive message");
 
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.aggregate_type, "EquityRedemption");
-                assert_eq!(entry.aggregate_id, "redemption-123");
-                assert_eq!(entry.event_type, "EquityRedemptionEvent::Completed");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
+        assert_eq!(msg.id, "redemption-123");
+        assert!(matches!(msg.statement, Concern::Transfer));
     }
 
     #[tokio::test]
-    async fn reactor_receive_works_for_usdc_rebalance() {
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+    async fn reactor_broadcasts_usdc_rebalance() {
+        let (broadcaster, mut receiver) = test_broadcaster();
+        let harness = ReactorHarness::new(broadcaster);
 
         let id = UsdcRebalanceId(Uuid::new_v4());
+        let expected_id = id.to_string();
 
         harness
-            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .receive::<UsdcRebalance>(id, make_usdc_withdrawal_confirmed())
             .await
             .unwrap();
 
         let msg = receiver.recv().await.expect("should receive message");
 
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.aggregate_type, "UsdcRebalance");
-                assert_eq!(entry.aggregate_id, id.to_string());
-                assert_eq!(entry.event_type, "UsdcRebalanceEvent::WithdrawalConfirmed");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
+        assert_eq!(msg.id, expected_id);
+        assert!(matches!(msg.statement, Concern::Transfer));
     }
 
     #[tokio::test]
-    async fn multiple_subscribers_receive_same_event() {
+    async fn multiple_subscribers_receive_same_statement() {
         let (sender, mut receiver1) = broadcast::channel(16);
         let mut receiver2 = sender.subscribe();
-        let mut receiver3 = sender.subscribe();
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = Broadcaster::new(sender);
 
         let id = IssuerRequestId::new("multi-sub".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("MSFT", 100));
+        broadcaster.notify::<TokenizedEquityMint>(&id);
 
         let msg1 = receiver1
             .recv()
@@ -236,86 +213,20 @@ mod tests {
             .recv()
             .await
             .expect("receiver2 should get message");
-        let msg3 = receiver3
-            .recv()
-            .await
-            .expect("receiver3 should get message");
 
-        for (i, msg) in [msg1, msg2, msg3].into_iter().enumerate() {
-            match msg {
-                ServerMessage::Event(entry) => {
-                    assert_eq!(
-                        entry.aggregate_id,
-                        "multi-sub",
-                        "receiver {} got wrong aggregate_id",
-                        i + 1
-                    );
-                }
-                other => {
-                    panic!("receiver {} expected Event message, got {other:?}", i + 1)
-                }
-            }
+        for (idx, msg) in [msg1, msg2].into_iter().enumerate() {
+            assert_eq!(msg.id, "multi-sub", "receiver {} got wrong id", idx + 1);
         }
     }
 
     #[tokio::test]
-    async fn broadcast_empty_does_nothing() {
+    async fn no_broadcast_without_events() {
         let (sender, mut receiver) = broadcast::channel(16);
-        let _broadcaster = EventBroadcaster::new(sender);
+        let _broadcaster = Broadcaster::new(sender);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await;
 
         assert!(result.is_err(), "should timeout with no messages");
-    }
-
-    #[test]
-    fn event_store_entry_serializes_correctly() {
-        let (sender, _) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
-
-        let id = IssuerRequestId::new("serialize-test".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("GOOG", 10));
-
-        // Verify the entry via JSON (can't get the msg since receiver was dropped,
-        // but we can test the entry construction directly)
-        let entry = EventStoreEntry {
-            aggregate_type: "TokenizedEquityMint".to_string(),
-            aggregate_id: "serialize-test".to_string(),
-            sequence: 42,
-            event_type: "TokenizedEquityMintEvent::MintRequested".to_string(),
-            timestamp: Utc::now(),
-        };
-        let json = serde_json::to_string(&entry).expect("serialization should succeed");
-
-        assert!(json.contains("\"aggregate_type\":\"TokenizedEquityMint\""));
-        assert!(json.contains("\"aggregate_id\":\"serialize-test\""));
-        assert!(json.contains("\"sequence\":42"));
-        assert!(json.contains("\"event_type\":\"TokenizedEquityMintEvent::MintRequested\""));
-        assert!(json.contains("\"timestamp\""));
-    }
-
-    #[tokio::test]
-    async fn reactor_broadcasts_mint_event_with_fractional_quantity() {
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
-
-        let id = IssuerRequestId::new("mint-frac".to_string());
-        let fractional_qty = Float::parse("25.5".to_string()).unwrap();
-
-        harness
-            .receive::<TokenizedEquityMint>(id, make_mint_requested_float("TSLA", fractional_qty))
-            .await
-            .unwrap();
-
-        let msg = receiver.recv().await.expect("should receive message");
-
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
     }
 }

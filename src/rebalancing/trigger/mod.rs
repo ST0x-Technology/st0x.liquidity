@@ -1185,12 +1185,9 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use tokio::sync::broadcast;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
-
-    use st0x_dto::ServerMessage;
 
     use super::*;
 
@@ -1234,10 +1231,8 @@ mod tests {
 
     async fn make_trigger() -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
         let pool = crate::test_utils::setup_test_db().await;
         let wrapper = Arc::new(MockWrapper::new());
@@ -1295,10 +1290,8 @@ mod tests {
     #[tokio::test]
     async fn test_usdc_disabled_via_cash_config_does_not_send() {
         let (sender, mut receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
         let pool = crate::test_utils::setup_test_db().await;
         let wrapper = Arc::new(MockWrapper::new());
@@ -1336,10 +1329,8 @@ mod tests {
     async fn disabled_asset_skips_equity_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
         let pool = crate::test_utils::setup_test_db().await;
         let wrapper = Arc::new(MockWrapper::new());
@@ -1481,8 +1472,7 @@ mod tests {
         inventory: InventoryView,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(inventory));
         let pool = crate::test_utils::setup_test_db().await;
 
         (
@@ -1517,8 +1507,7 @@ mod tests {
         wrapper: Arc<MockWrapper>,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(inventory));
         let pool = crate::test_utils::setup_test_db().await;
 
         seed_vault_registry(&pool, symbol).await;
@@ -1588,10 +1577,8 @@ mod tests {
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
-            event_sender,
         ));
         let pool = crate::test_utils::setup_test_db().await;
 
@@ -3356,7 +3343,7 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
 
             [wallet]
-            kind = "private-key"
+            type = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [equity]
@@ -3378,6 +3365,7 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
 
             [wallet]
+            type = "private-key"
             private_key = "{key}"
         "#
         )
@@ -3523,13 +3511,9 @@ mod tests {
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
-            {
-                let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-                Arc::new(BroadcastingInventory::new(
-                    InventoryView::default(),
-                    event_sender,
-                ))
-            },
+            Arc::new(BroadcastingInventory::new_without_broadcast(
+                InventoryView::default(),
+            )),
             sender,
             wrapper,
         );
@@ -3911,10 +3895,8 @@ mod tests {
     async fn trigger_clears_in_progress_flag_when_terminal_event_received() {
         let (sender, _receiver) = mpsc::channel(10);
         let pool = crate::test_utils::setup_test_db().await;
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default().with_usdc(usdc(5000), usdc(5000)),
-            event_sender,
         ));
 
         let trigger = Arc::new(RebalancingTrigger::new(
@@ -4042,15 +4024,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Now start post-deposit conversion (USDC to USD).
-        // Amount must match amount_received from bridging (99.99), not the
-        // originally requested amount (500), since that's what was deposited.
+        // Now start post-deposit conversion (USDC to USD)
         store
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: uuid::Uuid::new_v4(),
-                    amount: Usdc::new(float!(99.99)),
+                    amount: Usdc::new(float!(500)),
                 },
             )
             .await
@@ -4109,10 +4089,8 @@ mod tests {
         let symbol = Symbol::new("RKLB").unwrap();
 
         // Empty inventory - simulates startup state before polling completes
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
 
         let (sender, mut receiver) = mpsc::channel(10);
@@ -4177,10 +4155,8 @@ mod tests {
     async fn trigger_fires_when_both_venues_have_data() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
         let (sender, mut receiver) = mpsc::channel(10);
 
@@ -4258,10 +4234,8 @@ mod tests {
     async fn logs_show_partial_data_skips_imbalance_check() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
         let (sender, _receiver) = mpsc::channel(10);
 
@@ -4320,10 +4294,8 @@ mod tests {
     async fn logs_show_trigger_fires_with_complete_data() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
         let (sender, _receiver) = mpsc::channel(10);
 

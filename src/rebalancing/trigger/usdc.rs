@@ -138,13 +138,9 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::broadcast;
-
-    use st0x_dto::ServerMessage;
-    use st0x_float_macro::float;
-
     use super::*;
     use crate::inventory::InventoryView;
+    use st0x_float_macro::float;
 
     #[test]
     fn test_guard_releases_on_drop() {
@@ -185,10 +181,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_balanced_inventory_returns_no_imbalance() {
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default(),
-            event_sender,
         ));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
@@ -216,8 +210,7 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(float!(10)), Usdc::new(float!(90)));
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(inventory));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -238,8 +231,7 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)));
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(inventory));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -261,8 +253,7 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(float!(0)), Usdc::new(float!(102)));
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(inventory));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -285,8 +276,7 @@ mod tests {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(float!(90)), Usdc::new(float!(10)));
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(inventory));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -304,8 +294,7 @@ mod tests {
     async fn operational_limits_cap_usdc_amount() {
         let inventory =
             InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)));
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(inventory));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -329,10 +318,8 @@ mod tests {
         let usdc_limit = Some(Usdc::new(float!(100)));
 
         // 100 onchain / 500 offchain -> 83% offchain, excess = 200
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500))),
-            event_sender,
         ));
 
         let first = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
@@ -343,10 +330,8 @@ mod tests {
 
         // After transferring 100: 200 onchain / 400 offchain -> 67% offchain
         // Still above 70% threshold? No - 400/600 = 66.7%, within 30%-70%. No trigger.
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let after_first = Arc::new(BroadcastingInventory::new(
+        let after_first = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default().with_usdc(Usdc::new(float!(200)), Usdc::new(float!(400))),
-            event_sender,
         ));
 
         let second =
@@ -359,10 +344,8 @@ mod tests {
 
         // But if only 50 was transferred: 150 onchain / 450 offchain -> 75% offchain
         // Still above 70%, so triggers again
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let partially_resolved = Arc::new(BroadcastingInventory::new(
+        let partially_resolved = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default().with_usdc(Usdc::new(float!(150)), Usdc::new(float!(450))),
-            event_sender,
         ));
 
         let third =
@@ -376,10 +359,8 @@ mod tests {
     #[tokio::test]
     async fn capped_amount_below_minimum_skips_withdrawal() {
         // excess = $200 (above $51 minimum), but limit = $30 caps it below minimum
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500))),
-            event_sender,
         ));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),

@@ -192,9 +192,7 @@ mod tests {
     use alloy::primitives::{U256, address};
     use chrono::Utc;
     use rain_math_float::Float;
-    use tokio::sync::broadcast;
 
-    use st0x_dto::ServerMessage;
     use st0x_execution::FractionalShares;
 
     use super::*;
@@ -231,8 +229,7 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        Arc::new(BroadcastingInventory::new(view, event_sender))
+        Arc::new(BroadcastingInventory::new_without_broadcast(view))
     }
 
     #[test]
@@ -281,8 +278,7 @@ mod tests {
     async fn test_balanced_inventory_returns_no_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(view, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(view));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -434,8 +430,7 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        Arc::new(BroadcastingInventory::new(view, event_sender))
+        Arc::new(BroadcastingInventory::new_without_broadcast(view))
     }
 
     /// Verifies that quantity truncation doesn't lose the truncated portion from inventory.

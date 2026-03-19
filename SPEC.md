@@ -2404,34 +2404,56 @@ No external dependencies - keeps bundle small and avoids library lock-in.
 - **Server state**: TanStack Query v6 as reactive cache, populated via WebSocket
 - **Local UI state**: Svelte 5 `$state` and `$derived` runes
 
-#### WebSocket-First Data Flow
+#### WebSocket Protocol
 
-All read data flows through a single WebSocket connection:
+Bidirectional WebSocket connection at `WS /api/ws`. The server pushes entity
+updates as they happen; in the future, clients can request specific data
+(reconnect reconciliation, pagination).
 
-1. Client connects to `WS /api/ws`
-2. Server sends full initial state as first message (positions, trades, P&L,
-   auth status, circuit breaker state)
-3. Server streams incremental updates as events occur
+Two core concerns drive the dashboard:
 
-##### Benefits
+1. **Inventory** -- balances across trading venues and cross-venue transfer
+   operations (minting, redemption, USDC bridging) at every stage.
+2. **Trading activity** -- onchain trades as detected, net position per asset,
+   offchain hedge orders and their fills.
 
-- Single connection to manage
-- No race condition between HTTP fetch and WebSocket updates
-- Server controls exactly what state the client starts with
-- HTTP endpoints only needed for mutations (circuit breaker, auth)
+These map to two dashboard panels. Both are fed by the same unified message
+format.
 
-##### Message Types
+##### Server-side broadcast loop
 
-Message types (`ServerMessage`, `InitialState`, etc.) are defined in the
-`st0x-dto` crate (`crates/dto/src/lib.rs`) and auto-generated as TypeScript
-types via `ts-rs`. The DTO crate is the source of truth for all wire formats.
+A single dashboard reactor subscribes to all tracked aggregates. On every domain
+event:
 
-##### TanStack Query Integration
+1. Reactor receives the event for entity X
+2. Rebuilds entity state (standard event sourcing)
+3. Converts to DTO (each tracked aggregate implements a DTO conversion trait)
+4. Compares to the last-broadcast DTO for that entity
+5. If different: broadcasts `{ entity_type, entity_id, sequence, trigger, dto }`
 
-WebSocket messages populate the TanStack Query cache. Each `ServerMessage`
-variant maps to one or more query keys (e.g., `["trades"]`, `["inventory"]`,
-`["transfers", "active"]`). The `initial` message seeds all caches on
-connection; subsequent messages update individual caches incrementally.
+One message shape for everything -- a mint progressing, a trade detected, a
+position updating, inventory changing. The client receives what changed and what
+the current value is.
+
+Wire types are defined in `st0x-dto` and auto-generated as TypeScript types via
+`ts-rs`.
+
+##### Future: client-to-server messages
+
+Not yet implemented. Planned capabilities:
+
+- **Reconnect reconciliation**: client sends its known sequences per entity,
+  server sends only what changed since. Enables browser-local caching and
+  resilient reconnection without full state dumps.
+- **Pagination**: client requests historical data beyond the live window (e.g.,
+  trades before a given sequence).
+- **Actions**: circuit breaker, spread adjustment, reduce-only mode.
+
+##### Debug mode
+
+WebSocket message logging is controlled by a `localStorage` key (`ws-debug`).
+Enabled by default in development (`import.meta.env.DEV`), disabled in
+production. Toggle via browser devtools.
 
 ### Core Features
 
@@ -2525,21 +2547,22 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
 
 #### Panels
 
-1. **Performance Metrics**: Key metrics (AUM, P&L, volume, trade count, Sharpe,
-   Sortino, max drawdown, hedge lag, uptime) with timeframe selector (1h, 1d,
-   1w, 1m, all-time).
+Two panels, one per core concern. Both update live via WebSocket snapshots.
 
-2. **Inventory**: Per-symbol equity holdings and cash balances across venues,
-   with available/inflight breakdowns. Includes an "Inventory Transfers" section
-   showing active and recent transfer operations with status.
+1. **Inventory**: Per-symbol equity holdings and cash balances across onchain
+   vaults and the offchain broker, with available/inflight breakdowns. Below the
+   balances, an "Inventory Transfers" section shows active and recent transfer
+   operations (minting, redemption, USDC bridging) with status.
 
-3. **Spreads**: Last realized spreads per asset (buy/sell prices, Pyth
-   reference, spread bps) and per-symbol price charts over time.
+2. **Trading Activity**: The core operational view. Shows onchain trades as they
+   are detected, the current net position per asset, pending offchain hedge
+   orders, and their fills. This is the panel that makes live testing viable --
+   if the bot detects a trade and places a hedge, the operator sees it
+   immediately.
 
-4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
-
-5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
-   event type, timestamp). Starts empty, populates via WebSocket.
+Future panels (performance metrics, spreads, circuit breaker) extend the
+protocol with additional `ServerMessage` variants when the backend data sources
+exist.
 
 ### Architecture
 
@@ -2578,8 +2601,8 @@ Extend existing Rocket server (`src/api.rs`):
 WS /api/ws
 ```
 
-Sends initial state on connect, then streams updates. See WebSocket-First Data
-Flow section above.
+Pushes snapshots on connect and as state changes. See WebSocket Protocol section
+above.
 
 ##### Mutations (HTTP, require auth)
 

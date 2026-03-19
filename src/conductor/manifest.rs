@@ -163,9 +163,8 @@ mod tests {
             vault_registry,
             Address::ZERO,
             Address::ZERO,
-            Arc::new(BroadcastingInventory::new(
+            Arc::new(BroadcastingInventory::new_without_broadcast(
                 InventoryView::default(),
-                event_sender.clone(),
             )),
             operation_sender,
             Arc::new(MockWrapper::new()),

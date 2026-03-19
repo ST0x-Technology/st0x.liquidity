@@ -176,7 +176,7 @@ pub fn test_store<Entity: EventSourced>(
 ///
 /// ```ignore
 /// let (sender, mut receiver) = broadcast::channel(16);
-/// let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+/// let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
 ///
 /// // No manual OneOf nesting -- depth inferred from types
 /// harness.receive(mint_id, mint_event).await.unwrap();

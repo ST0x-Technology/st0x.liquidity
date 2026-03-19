@@ -42,8 +42,6 @@ pub enum Concern {
     Trading,
 }
 
-/// Full dashboard snapshot sent to the frontend on connection.
-
 /// Completed trade record.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -129,28 +127,6 @@ pub enum EquityRedemptionTag {}
 
 /// Tag type for USDC bridge operation IDs.
 pub enum UsdcBridgeTag {}
-
-/// Category of transfer aggregate that failed to load.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum TransferCategory {
-    EquityMint,
-    EquityRedemption,
-    UsdcBridge,
-}
-
-/// Warning emitted when transfer data is partially loaded.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Warning {
-    /// Failed to query aggregate IDs for an entire category.
-    CategoryUnavailable { category: TransferCategory },
-    /// An individual aggregate's events failed to replay.
-    AggregateReplayFailed {
-        category: TransferCategory,
-        aggregate_id: String,
-    },
-}
 
 /// Transfer operation: a tagged union per operation type.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -508,21 +484,14 @@ mod tests {
     }
 
     #[test]
-    fn initial_state_default_serializes_correctly() {
-        let initial = InitialState::default();
-        let json = serde_json::to_string(&initial).expect("serialization should succeed");
-        assert!(json.contains("recentTrades"));
-        assert!(json.contains("inventory"));
-        assert!(json.contains("metrics"));
-        assert!(json.contains("authStatus"));
-        assert!(json.contains("circuitBreaker"));
-        assert!(json.contains("activeTransfers"));
-        assert!(json.contains("recentTransfers"));
-        assert!(json.contains("warnings"));
-        assert!(
-            !json.contains("\"0x"),
-            "dashboard DTOs should serialize decimal strings, got: {json}"
-        );
+    fn statement_serializes_correctly() {
+        let statement = Statement {
+            id: "test-123".to_string(),
+            statement: Concern::Transfer,
+        };
+        let json = serde_json::to_string(&statement).expect("serialization should succeed");
+        assert!(json.contains(r#""id":"test-123""#));
+        assert!(json.contains(r#""statement""#));
     }
 
     #[test]
