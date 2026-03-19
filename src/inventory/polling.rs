@@ -6,16 +6,15 @@
 //! the fetched values. The `InventoryView` reacts to these events to reconcile
 //! tracked inventory.
 
-use alloy::primitives::Address;
-use alloy::providers::RootProvider;
+use alloy::primitives::{Address, RootProvider};
 use futures_util::future::try_join_all;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
-use st0x_execution::{Executor, InventoryResult, SharesBlockchain, SharesConversionError};
+use st0x_execution::{Executor, InventoryResult};
 use st0x_finance::{FloatError, FractionalShares, HasZero, Symbol, Usd};
 
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};

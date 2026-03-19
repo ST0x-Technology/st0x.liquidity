@@ -5,10 +5,6 @@
 //! (happy path, rejected, placement fails) and optionally set initial account
 //! state via the builder - no per-request mock setup needed.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
-
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::sol;
@@ -16,11 +12,17 @@ use alloy::sol_types::SolEvent;
 use bon::bon;
 use chrono::Utc;
 use httpmock::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use rain_math_float::Float;
+use st0x_finance::{Usd, Usdc};
 use st0x_float_serde::format_float_with_fallback;
 
 use crate::Symbol;
@@ -31,206 +33,54 @@ sol! {
     event Transfer(address indexed from, address indexed to, uint256 value);
 }
 
-pub const TEST_ACCOUNT_ID: &str = "904837e3-3b76-47ec-b432-046db621571b";
-pub const TEST_API_KEY: &str = "e2e_test_key";
-pub const TEST_API_SECRET: &str = "e2e_test_secret";
-
-/// Controls how the mock responds to order placement and polling.
-#[derive(Debug, Clone, Copy)]
-pub enum MockMode {
-    /// Place succeeds, first poll returns filled.
-    HappyPath,
-    /// Place succeeds, poll returns rejected.
-    OrderRejected,
-    /// Place returns HTTP 422.
-    PlacementFails,
-    /// Place succeeds, order stays "new" for N polls before filling.
-    /// Simulates real broker latency where fills aren't instant.
-    DelayedFill { polls_before_fill: usize },
+/// A command that controls mock broker behavior at runtime.
+///
+/// Submitted to the Apalis job queue by e2e tests and processed by a
+/// worker running alongside the production workers. Each variant maps
+/// to a method on [`AlpacaBrokerMock`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum MockBrokerCommand {
+    /// Switch the broker mock's response mode.
+    SetMode(MockMode),
+    /// Open the simulated market.
+    OpenMarket,
+    /// Close the simulated market.
+    CloseMarket,
+    /// Set the fill price for a specific symbol.
+    SetFillPrice { symbol: Symbol, price: Usd },
+    /// Set how many polls before a symbol's order fills.
+    SetFillDelay {
+        symbol: Symbol,
+        polls_before_fill: usize,
+    },
+    /// Set the mock wallet's USDC balance.
+    SetWalletBalance { balance: Usdc },
 }
 
-pub struct MockPosition {
-    pub symbol: Symbol,
-    pub quantity: Float,
-    pub market_value: Float,
-}
-
-struct MockAccount {
-    cash: Float,
-    buying_power: Float,
-    positions: HashMap<Symbol, MockPosition>,
-}
-
-/// Side of a broker order (buy or sell).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderSide {
-    Buy,
-    Sell,
-}
-
-impl std::fmt::Display for OrderSide {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl MockBrokerCommand {
+    /// Applies this command to the given broker mock.
+    pub fn apply(self, broker: &AlpacaBrokerMock) {
         match self {
-            Self::Buy => write!(formatter, "buy"),
-            Self::Sell => write!(formatter, "sell"),
+            Self::SetMode(mode) => broker.set_mode(mode),
+            Self::OpenMarket => broker.set_market_open(),
+            Self::CloseMarket => broker.set_market_closed(),
+
+            Self::SetFillPrice { symbol, price } => {
+                broker.set_symbol_fill_price(symbol, price.inner());
+            }
+
+            Self::SetFillDelay {
+                symbol,
+                polls_before_fill,
+            } => {
+                broker.set_symbol_fill_delay(symbol, polls_before_fill);
+            }
+
+            Self::SetWalletBalance { balance } => {
+                broker.set_wallet_usdc_balance(balance.inner());
+            }
         }
     }
-}
-
-/// Status of a broker order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderStatus {
-    New,
-    Filled,
-    Rejected,
-}
-
-impl std::fmt::Display for OrderStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::New => write!(formatter, "new"),
-            Self::Filled => write!(formatter, "filled"),
-            Self::Rejected => write!(formatter, "rejected"),
-        }
-    }
-}
-
-struct MockOrder {
-    symbol: Symbol,
-    quantity: Float,
-    side: OrderSide,
-    status: OrderStatus,
-    poll_count: usize,
-    filled_price: Option<Float>,
-}
-
-/// A single calendar entry controlling market open/close times.
-struct CalendarEntry {
-    pub date: String,
-    pub open: String,
-    pub close: String,
-}
-
-/// A mock wallet transfer tracked in shared state.
-struct MockWalletTransfer {
-    transfer_id: String,
-    direction: TransferDirection,
-    amount: Float,
-    asset: String,
-    from_address: Address,
-    to_address: Address,
-    status: TransferStatus,
-    tx_hash: String,
-    poll_count: usize,
-    /// Number of polls before transitioning from "pending" to "complete".
-    polls_until_complete: usize,
-}
-
-struct MockState {
-    account: MockAccount,
-    orders: HashMap<String, MockOrder>,
-    symbol_fill_prices: HashMap<Symbol, Float>,
-    mode: MockMode,
-    /// Per-symbol fill delays: number of polls before filling.
-    /// Symbols without an entry fill immediately in `HappyPath` mode.
-    symbol_fill_delays: HashMap<Symbol, usize>,
-    /// Dynamic calendar entries. The endpoint reads from this on each request.
-    calendar_entries: Vec<CalendarEntry>,
-    /// Wallet transfers (withdrawals and deposits).
-    wallet_transfers: Vec<MockWalletTransfer>,
-    /// Alpaca deposit wallet address for incoming USDC.
-    alpaca_deposit_address: String,
-    /// Wallet balances by asset symbol (e.g. USDC in the crypto wallet).
-    wallet_balances: HashMap<String, Float>,
-    /// Whitelisted withdrawal addresses.
-    whitelisted_addresses: Vec<WhitelistEntry>,
-}
-
-/// Status of a whitelisted address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WhitelistStatus {
-    Approved,
-    Pending,
-}
-
-impl std::fmt::Display for WhitelistStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Approved => write!(formatter, "APPROVED"),
-            Self::Pending => write!(formatter, "PENDING"),
-        }
-    }
-}
-
-/// A whitelisted address entry in the mock state.
-struct WhitelistEntry {
-    id: String,
-    address: Address,
-    asset: String,
-    chain: String,
-    status: WhitelistStatus,
-}
-
-/// Snapshot of a placed order, returned by [`AlpacaBrokerMock::orders`].
-pub struct MockOrderSnapshot {
-    pub order_id: String,
-    pub symbol: String,
-    pub quantity: Float,
-    pub side: OrderSide,
-    pub status: OrderStatus,
-    pub poll_count: usize,
-    pub filled_price: Option<Float>,
-}
-
-/// Snapshot of a position, returned by [`AlpacaBrokerMock::positions`].
-pub struct MockPositionSnapshot {
-    pub symbol: String,
-    pub quantity: Float,
-    pub market_value: Float,
-}
-
-/// Direction of a wallet transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferDirection {
-    Incoming,
-    Outgoing,
-}
-
-impl std::fmt::Display for TransferDirection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Incoming => write!(formatter, "INCOMING"),
-            Self::Outgoing => write!(formatter, "OUTGOING"),
-        }
-    }
-}
-
-/// Status of a wallet transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferStatus {
-    Pending,
-    Processing,
-    Complete,
-}
-
-impl std::fmt::Display for TransferStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pending => write!(formatter, "PENDING"),
-            Self::Processing => write!(formatter, "PROCESSING"),
-            Self::Complete => write!(formatter, "COMPLETE"),
-        }
-    }
-}
-
-/// Snapshot of a wallet transfer, returned by
-/// [`AlpacaBrokerMock::wallet_transfers`].
-pub struct MockWalletTransferSnapshot {
-    pub transfer_id: String,
-    pub direction: TransferDirection,
-    pub amount: Float,
-    pub asset: String,
-    pub status: TransferStatus,
 }
 
 /// Owns the `MockServer` and shared state. All endpoints respond dynamically
@@ -485,6 +335,208 @@ impl AlpacaBrokerMock {
             }
         }))
     }
+}
+
+pub const TEST_ACCOUNT_ID: &str = "904837e3-3b76-47ec-b432-046db621571b";
+pub const TEST_API_KEY: &str = "e2e_test_key";
+pub const TEST_API_SECRET: &str = "e2e_test_secret";
+
+/// Controls how the mock responds to order placement and polling.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum MockMode {
+    /// Place succeeds, first poll returns filled.
+    HappyPath,
+    /// Place succeeds, poll returns rejected.
+    OrderRejected,
+    /// Place returns HTTP 422.
+    PlacementFails,
+    /// Place succeeds, order stays "new" for N polls before filling.
+    /// Simulates real broker latency where fills aren't instant.
+    DelayedFill { polls_before_fill: usize },
+}
+
+pub struct MockPosition {
+    pub symbol: Symbol,
+    pub quantity: Float,
+    pub market_value: Float,
+}
+
+struct MockAccount {
+    cash: Float,
+    buying_power: Float,
+    positions: HashMap<Symbol, MockPosition>,
+}
+
+/// Side of a broker order (buy or sell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+impl std::fmt::Display for OrderSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Buy => write!(formatter, "buy"),
+            Self::Sell => write!(formatter, "sell"),
+        }
+    }
+}
+
+/// Status of a broker order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStatus {
+    New,
+    Filled,
+    Rejected,
+}
+
+impl std::fmt::Display for OrderStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::New => write!(formatter, "new"),
+            Self::Filled => write!(formatter, "filled"),
+            Self::Rejected => write!(formatter, "rejected"),
+        }
+    }
+}
+
+struct MockOrder {
+    symbol: Symbol,
+    quantity: Float,
+    side: OrderSide,
+    status: OrderStatus,
+    poll_count: usize,
+    filled_price: Option<Float>,
+}
+
+/// A single calendar entry controlling market open/close times.
+struct CalendarEntry {
+    pub date: String,
+    pub open: String,
+    pub close: String,
+}
+
+/// A mock wallet transfer tracked in shared state.
+struct MockWalletTransfer {
+    transfer_id: String,
+    direction: TransferDirection,
+    amount: Float,
+    asset: String,
+    from_address: Address,
+    to_address: Address,
+    status: TransferStatus,
+    tx_hash: String,
+    poll_count: usize,
+    /// Number of polls before transitioning from "pending" to "complete".
+    polls_until_complete: usize,
+}
+
+struct MockState {
+    account: MockAccount,
+    orders: HashMap<String, MockOrder>,
+    symbol_fill_prices: HashMap<Symbol, Float>,
+    mode: MockMode,
+    /// Per-symbol fill delays: number of polls before filling.
+    /// Symbols without an entry fill immediately in `HappyPath` mode.
+    symbol_fill_delays: HashMap<Symbol, usize>,
+    /// Dynamic calendar entries. The endpoint reads from this on each request.
+    calendar_entries: Vec<CalendarEntry>,
+    /// Wallet transfers (withdrawals and deposits).
+    wallet_transfers: Vec<MockWalletTransfer>,
+    /// Alpaca deposit wallet address for incoming USDC.
+    alpaca_deposit_address: String,
+    /// Wallet balances by asset symbol (e.g. USDC in the crypto wallet).
+    wallet_balances: HashMap<String, Float>,
+    /// Whitelisted withdrawal addresses.
+    whitelisted_addresses: Vec<WhitelistEntry>,
+}
+
+/// Status of a whitelisted address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhitelistStatus {
+    Approved,
+    Pending,
+}
+
+impl std::fmt::Display for WhitelistStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Approved => write!(formatter, "APPROVED"),
+            Self::Pending => write!(formatter, "PENDING"),
+        }
+    }
+}
+
+/// A whitelisted address entry in the mock state.
+struct WhitelistEntry {
+    id: String,
+    address: Address,
+    asset: String,
+    chain: String,
+    status: WhitelistStatus,
+}
+
+/// Snapshot of a placed order, returned by [`AlpacaBrokerMock::orders`].
+pub struct MockOrderSnapshot {
+    pub order_id: String,
+    pub symbol: String,
+    pub quantity: Float,
+    pub side: OrderSide,
+    pub status: OrderStatus,
+    pub poll_count: usize,
+    pub filled_price: Option<Float>,
+}
+
+/// Snapshot of a position, returned by [`AlpacaBrokerMock::positions`].
+pub struct MockPositionSnapshot {
+    pub symbol: String,
+    pub quantity: Float,
+    pub market_value: Float,
+}
+
+/// Direction of a wallet transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Incoming,
+    Outgoing,
+}
+
+impl std::fmt::Display for TransferDirection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Incoming => write!(formatter, "INCOMING"),
+            Self::Outgoing => write!(formatter, "OUTGOING"),
+        }
+    }
+}
+
+/// Status of a wallet transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferStatus {
+    Pending,
+    Processing,
+    Complete,
+}
+
+impl std::fmt::Display for TransferStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(formatter, "PENDING"),
+            Self::Processing => write!(formatter, "PROCESSING"),
+            Self::Complete => write!(formatter, "COMPLETE"),
+        }
+    }
+}
+
+/// Snapshot of a wallet transfer, returned by
+/// [`AlpacaBrokerMock::wallet_transfers`].
+pub struct MockWalletTransferSnapshot {
+    pub transfer_id: String,
+    pub direction: TransferDirection,
+    pub amount: Float,
+    pub asset: String,
+    pub status: TransferStatus,
 }
 
 /// Scans a single block for USDC Transfer events to `mint_recipient`
