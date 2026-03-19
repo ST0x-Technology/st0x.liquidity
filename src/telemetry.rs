@@ -56,7 +56,7 @@
 //! - Console layer: Respects `RUST_LOG` environment variable, defaults to bot crates only
 //! - Telemetry layer: Independent filter, defaults to bot crates only
 //!
-//! This prevents external crate spam (e.g., from `alloy`, `rocket`) from cluttering
+//! This prevents external crate spam (e.g., from `alloy`, `hyper`) from cluttering
 //! traces while still allowing those logs in console if needed.
 
 use itertools::Itertools;

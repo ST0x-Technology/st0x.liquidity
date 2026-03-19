@@ -1,140 +1,129 @@
 //! WebSocket-based dashboard for real-time server state streaming.
 
-use futures_util::SinkExt;
-use rocket::{Route, State, get, routes};
-use rocket_ws::{Channel, Message, WebSocket};
-use sqlx::SqlitePool;
-use std::sync::Arc;
+use axum::Router;
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
+use axum::routing::get;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use st0x_dto::Statement;
 
-use crate::inventory::BroadcastingInventory;
-
 mod event;
 mod transfer_loader;
 pub(crate) use event::Broadcaster;
 
-pub(crate) struct Broadcast {
-    pub(crate) sender: broadcast::Sender<Statement>,
+async fn ws_endpoint(
+    ws: WebSocketUpgrade,
+    State(state): State<super::AppState>,
+) -> impl IntoResponse {
+    let receiver = state.event_sender.subscribe();
+
+    ws.on_upgrade(move |socket| handle_ws(socket, receiver))
 }
 
-pub(crate) struct DashboardCtx {
-    pub(crate) inventory: Arc<BroadcastingInventory>,
-    pub(crate) pool: SqlitePool,
-}
-
-#[get("/ws")]
-fn ws_endpoint<'r>(
-    ws: WebSocket,
-    broadcast: &'r State<Broadcast>,
-    dashboard: &'r State<DashboardCtx>,
-) -> Channel<'r> {
-    let mut receiver = broadcast.sender.subscribe();
-    let inventory = Arc::clone(&dashboard.inventory);
-
-    ws.channel(move |mut stream| {
-        Box::pin(async move {
-            stream
-                .send(Message::Ping((&("pinging".as_bytes())).to_vec()))
-                .await?;
-
-            loop {
-                match receiver.recv().await {
-                    Ok(msg) => {
-                        info!(?msg, "Broadcasting to dashboard client");
-                        let json = match serde_json::to_string(&msg) {
-                            Ok(serialized) => serialized,
-                            Err(error) => {
-                                warn!("Failed to serialize message: {error}");
-                                continue;
-                            }
-                        };
-
-                        if let Err(error) = stream.send(Message::Text(json)).await {
-                            warn!("Failed to send message to client: {error}");
-                            break;
-                        }
+async fn handle_ws(mut socket: WebSocket, mut receiver: broadcast::Receiver<Statement>) {
+    loop {
+        match receiver.recv().await {
+            Ok(msg) => {
+                info!(?msg, "Broadcasting to dashboard client");
+                let json = match serde_json::to_string(&msg) {
+                    Ok(serialized) => serialized,
+                    Err(error) => {
+                        warn!("Failed to serialize message: {error}");
+                        continue;
                     }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("Client lagged, skipped {skipped} messages");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                };
+
+                if let Err(error) = socket.send(Message::Text(json.into())).await {
+                    warn!("Failed to send message to client: {error}");
+                    break;
                 }
             }
-
-            Ok(())
-        })
-    })
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!("Client lagged, skipped {skipped} messages");
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
+    }
 }
 
-pub(crate) fn routes() -> Vec<Route> {
-    routes![ws_endpoint]
+pub(crate) fn routes() -> Router<super::AppState> {
+    Router::new().route("/ws", get(ws_endpoint))
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
     use futures_util::StreamExt;
     use futures_util::future::join_all;
-    use rocket::config::Config;
-    use rocket::fairing::AdHoc;
-    use st0x_dto::EventStoreEntry;
-    use std::sync::Mutex;
-    use tokio::sync::oneshot;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
     use tokio_tungstenite::connect_async;
 
+    use st0x_dto::Concern;
+
     use super::*;
+    use crate::config::tests::create_test_ctx_with_order_owner;
+    use crate::inventory::{self, BroadcastingInventory};
 
-    fn create_test_broadcast() -> Broadcast {
-        let (sender, _) = broadcast::channel(256);
-        Broadcast { sender }
-    }
-
-    async fn create_test_dashboard_state() -> DashboardCtx {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        DashboardCtx {
-            inventory: Arc::new(BroadcastingInventory::new(
-                crate::inventory::InventoryView::default(),
-            )),
-            pool,
+    fn test_statement(id: &str) -> Statement {
+        Statement {
+            id: id.to_string(),
+            statement: Concern::Inventory,
         }
     }
 
-    #[tokio::test]
-    async fn initial_state_stub_serializes_correctly() {
-        let initial = InitialState::default();
-        let json = serde_json::to_string(&initial).expect("serialization should succeed");
-        assert!(json.contains("recentTrades"));
-        assert!(json.contains("inventory"));
-        assert!(json.contains("metrics"));
-        assert!(json.contains("authStatus"));
-        assert!(json.contains("circuitBreaker"));
+    async fn create_test_state() -> (super::super::AppState, broadcast::Sender<Statement>) {
+        let (sender, _) = broadcast::channel(256);
+        let sender_clone = sender.clone();
+
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let state = super::super::AppState {
+            pool,
+            ctx: create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )),
+            event_sender: sender,
+            inventory: Arc::new(BroadcastingInventory::new(
+                inventory::InventoryView::default(),
+            )),
+        };
+
+        (state, sender_clone)
     }
 
-    #[tokio::test]
-    async fn server_message_initial_serializes_with_type_tag() {
-        let msg = Statement::Initial(Box::new(InitialState::stub()));
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(json.contains(r#""type":"initial""#));
-        assert!(json.contains(r#""data":"#));
+    async fn start_test_server() -> (u16, tokio::task::AbortHandle, broadcast::Sender<Statement>) {
+        let (state, sender) = create_test_state().await;
+
+        let app = Router::new().nest("/api", routes()).with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (port, handle.abort_handle(), sender)
     }
 
     #[tokio::test]
     async fn broadcast_channel_delivers_messages_to_subscribers() {
-        let broadcast = create_test_broadcast();
-        let mut rx = broadcast.sender.subscribe();
+        let (sender, _) = broadcast::channel(256);
+        let mut receiver = sender.subscribe();
 
-        let sent_msg = Statement::Initial(Box::new(InitialState::stub()));
-        broadcast
-            .sender
-            .send(sent_msg.clone())
-            .expect("send should succeed");
+        let sent_msg = test_statement("test-1");
 
-        let recv_msg = rx.recv().await.expect("receive should succeed");
+        sender.send(sent_msg.clone()).expect("send should succeed");
+
+        let recv_msg = receiver.recv().await.expect("receive should succeed");
         let original_json = serde_json::to_string(&sent_msg).expect("serialization should succeed");
         let received_json = serde_json::to_string(&recv_msg).expect("serialization should succeed");
         assert_eq!(original_json, received_json);
@@ -142,12 +131,13 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_supports_multiple_subscribers() {
-        let broadcast = create_test_broadcast();
-        let mut receiver1 = broadcast.sender.subscribe();
-        let mut receiver2 = broadcast.sender.subscribe();
+        let (sender, _) = broadcast::channel::<Statement>(256);
+        let mut receiver1 = sender.subscribe();
+        let mut receiver2 = sender.subscribe();
 
-        let msg = Statement::Initial(Box::new(InitialState::stub()));
-        broadcast.sender.send(msg).expect("send should succeed");
+        sender
+            .send(test_statement("test-1"))
+            .expect("send should succeed");
 
         receiver1
             .recv()
@@ -160,153 +150,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_routes_returns_one_route() {
-        let route_list = routes();
-        assert_eq!(route_list.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn websocket_endpoint_sends_initial_message() {
-        let broadcast = create_test_broadcast();
-        let dashboard_state = create_test_dashboard_state().await;
-
-        let config = Config {
-            port: 0, // Let OS assign a random available port
-            log_level: rocket::config::LogLevel::Off,
-            ..Config::debug_default()
-        };
-
-        let (port_tx, port_rx) = oneshot::channel::<u16>();
-        let port_tx = Mutex::new(Some(port_tx));
-
-        let rocket = rocket::build()
-            .configure(config)
-            .mount("/api", routes())
-            .manage(broadcast)
-            .manage(dashboard_state)
-            .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
-                Box::pin(async move {
-                    let maybe_tx = port_tx.lock().unwrap().take();
-                    if let Some(tx) = maybe_tx {
-                        let _ = tx.send(rocket.config().port);
-                    }
-                })
-            }));
-
-        let rocket = rocket.ignite().await.expect("ignite failed");
-        let shutdown_handle = rocket.shutdown();
-
-        tokio::spawn(async move {
-            let _ = rocket.launch().await;
-        });
-
-        let port = port_rx.await.expect("failed to receive port");
-
-        let url = format!("ws://127.0.0.1:{port}/api/ws");
-        let (mut ws_stream, _response) = connect_async(&url)
-            .await
-            .expect("WebSocket connection failed");
-
-        let msg = ws_stream
-            .next()
-            .await
-            .expect("stream closed")
-            .expect("message error");
-
-        let text = msg.into_text().expect("expected text message");
-        let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
-
-        assert_eq!(parsed["type"], "initial");
-        assert!(parsed["data"]["recentTrades"].is_array());
-        assert!(parsed["data"]["inventory"].is_object());
-
-        shutdown_handle.notify();
-    }
-
-    async fn start_test_server() -> (u16, rocket::Shutdown, Broadcast) {
-        let broadcast = create_test_broadcast();
-        let broadcast_clone = Broadcast {
-            sender: broadcast.sender.clone(),
-        };
-        let dashboard_state = create_test_dashboard_state().await;
-
-        let config = Config {
-            port: 0,
-            log_level: rocket::config::LogLevel::Off,
-            ..Config::debug_default()
-        };
-
-        let (port_tx, port_rx) = oneshot::channel::<u16>();
-        let port_tx = Mutex::new(Some(port_tx));
-
-        let rocket = rocket::build()
-            .configure(config)
-            .mount("/api", routes())
-            .manage(broadcast_clone)
-            .manage(dashboard_state)
-            .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
-                Box::pin(async move {
-                    let maybe_tx = port_tx.lock().unwrap().take();
-                    if let Some(tx) = maybe_tx {
-                        let _ = tx.send(rocket.config().port);
-                    }
-                })
-            }));
-
-        let rocket = rocket.ignite().await.expect("ignite failed");
-        let shutdown_handle = rocket.shutdown();
-
-        tokio::spawn(async move {
-            let _ = rocket.launch().await;
-        });
-
-        let port = port_rx.await.expect("failed to receive port");
-
-        (port, shutdown_handle, broadcast)
-    }
-
-    #[tokio::test]
-    async fn multiple_concurrent_clients_receive_initial_message() {
-        let (port, shutdown_handle, _broadcast) = start_test_server().await;
-        let url = format!("ws://127.0.0.1:{port}/api/ws");
-
-        let (mut client1, _) = connect_async(&url)
-            .await
-            .expect("client1 connection failed");
-        let (mut client2, _) = connect_async(&url)
-            .await
-            .expect("client2 connection failed");
-        let (mut client3, _) = connect_async(&url)
-            .await
-            .expect("client3 connection failed");
-
-        for (i, client) in [&mut client1, &mut client2, &mut client3]
-            .iter_mut()
-            .enumerate()
-        {
-            let msg = client
-                .next()
-                .await
-                .unwrap_or_else(|| panic!("client{} stream closed", i + 1))
-                .unwrap_or_else(|error| panic!("client{} message error: {}", i + 1, error));
-
-            let text = msg.into_text().expect("expected text message");
-            let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
-
-            assert_eq!(
-                parsed["type"],
-                "initial",
-                "client{} should receive initial message",
-                i + 1
-            );
-        }
-
-        shutdown_handle.notify();
-    }
-
-    #[tokio::test]
     async fn broadcast_message_reaches_connected_clients() {
-        let (port, shutdown_handle, broadcast) = start_test_server().await;
+        let (port, abort_handle, sender) = start_test_server().await;
         let url = format!("ws://127.0.0.1:{port}/api/ws");
 
         let (mut client1, _) = connect_async(&url)
@@ -316,51 +161,35 @@ mod tests {
             .await
             .expect("client2 connection failed");
 
-        // Consume initial messages
-        client1.next().await.expect("client1 initial").unwrap();
-        client2.next().await.expect("client2 initial").unwrap();
-
-        // Broadcast an event message
-        let event = EventStoreEntry {
-            aggregate_type: "TestAggregate".to_string(),
-            aggregate_id: "test-123".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
-        let broadcast_msg = Statement::Event(event);
-        broadcast
-            .sender
-            .send(broadcast_msg)
+        sender
+            .send(test_statement("test-123"))
             .expect("broadcast send");
 
-        // Both clients should receive the broadcast
         let results = join_all([client1.next(), client2.next()]).await;
 
-        for (i, result) in results.into_iter().enumerate() {
+        for (idx, result) in results.into_iter().enumerate() {
             let msg = result
-                .unwrap_or_else(|| panic!("client{} stream closed", i + 1))
-                .unwrap_or_else(|error| panic!("client{} error: {}", i + 1, error));
+                .unwrap_or_else(|| panic!("client{} stream closed", idx + 1))
+                .unwrap_or_else(|error| panic!("client{} error: {}", idx + 1, error));
 
             let text = msg.into_text().expect("expected text");
             let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
             assert_eq!(
-                parsed["type"],
-                "event",
-                "client{} should receive event message",
-                i + 1
+                parsed["id"],
+                "test-123",
+                "client{} should receive the broadcast message",
+                idx + 1
             );
-            assert_eq!(parsed["data"]["aggregate_type"], "TestAggregate");
-            assert_eq!(parsed["data"]["aggregate_id"], "test-123");
+            assert_eq!(parsed["statement"]["type"], "inventory");
         }
 
-        shutdown_handle.notify();
+        abort_handle.abort();
     }
 
     #[tokio::test]
     async fn client_disconnect_does_not_affect_other_clients() {
-        let (port, shutdown_handle, broadcast) = start_test_server().await;
+        let (port, abort_handle, sender) = start_test_server().await;
         let url = format!("ws://127.0.0.1:{port}/api/ws");
 
         let (mut client1, _) = connect_async(&url)
@@ -370,9 +199,6 @@ mod tests {
             .await
             .expect("client2 connection failed");
 
-        // Consume initial messages
-        client1.next().await.expect("client1 initial").unwrap();
-
         // Drop client2 to simulate disconnect
         drop(client2);
 
@@ -380,19 +206,10 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Broadcast a message - should still reach client1
-        let event = EventStoreEntry {
-            aggregate_type: "StillWorking".to_string(),
-            aggregate_id: "after-disconnect".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
-        broadcast
-            .sender
-            .send(Statement::Event(event))
+        sender
+            .send(test_statement("still-working"))
             .expect("broadcast send");
 
-        // client1 should still receive messages
         let msg = client1
             .next()
             .await
@@ -402,45 +219,38 @@ mod tests {
         let text = msg.into_text().expect("expected text");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
-        assert_eq!(parsed["type"], "event");
-        assert_eq!(parsed["data"]["aggregate_type"], "StillWorking");
+        assert_eq!(parsed["id"], "still-working");
 
-        shutdown_handle.notify();
+        abort_handle.abort();
     }
 
     #[tokio::test]
-    async fn new_client_receives_initial_not_previous_broadcasts() {
-        let (port, shutdown_handle, broadcast) = start_test_server().await;
+    async fn new_client_does_not_receive_previous_broadcasts() {
+        let (port, abort_handle, sender) = start_test_server().await;
         let url = format!("ws://127.0.0.1:{port}/api/ws");
 
-        // Connect first client to have a receiver
+        // Connect first client
         let (mut client1, _) = connect_async(&url)
             .await
             .expect("client1 connection failed");
 
-        // Consume initial message for client1
-        client1.next().await.expect("client1 initial").unwrap();
-
         // Broadcast a message (client1 will receive it)
-        let event = EventStoreEntry {
-            aggregate_type: "OldEvent".to_string(),
-            aggregate_id: "before-client2".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
-        broadcast
-            .sender
-            .send(Statement::Event(event))
+        sender
+            .send(test_statement("old-event"))
             .expect("broadcast send");
 
         // Consume the broadcast on client1
         client1.next().await.expect("client1 broadcast").unwrap();
 
-        // Now connect a second client - should get initial, not the old broadcast
+        // Connect a second client - should NOT receive the old broadcast
         let (mut client2, _) = connect_async(&url)
             .await
             .expect("client2 connection failed");
+
+        // Send a new event so client2 has something to receive
+        sender
+            .send(test_statement("new-event"))
+            .expect("broadcast send");
 
         let msg = client2
             .next()
@@ -452,10 +262,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
         assert_eq!(
-            parsed["type"], "initial",
-            "new client should receive initial, not previous broadcast"
+            parsed["id"], "new-event",
+            "new client should receive new event, not previous broadcast"
         );
 
-        shutdown_handle.notify();
+        abort_handle.abort();
     }
 }

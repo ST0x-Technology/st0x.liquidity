@@ -105,6 +105,7 @@ pub(crate) async fn run_market_hours_loop<E>(
     executor: E,
     ctx: Ctx,
     pool: SqlitePool,
+    job_queue: DexTradeAccountingJobQueue,
     executor_maintenance: Option<JoinHandle<()>>,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<BroadcastingInventory>,
@@ -116,6 +117,7 @@ where
     let mut conductor = Conductor::start(
         ctx,
         pool,
+        job_queue,
         executor,
         executor_maintenance,
         event_sender,
@@ -140,6 +142,7 @@ impl Conductor {
     pub(crate) fn start<E>(
         ctx: Ctx,
         pool: SqlitePool,
+        mut job_queue: DexTradeAccountingJobQueue,
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<Statement>,
@@ -154,9 +157,6 @@ impl Conductor {
             let provider = ProviderBuilder::new().connect_ws(ws).await?;
             let cache = SymbolCache::default();
             let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
-
-            setup_apalis_tables(&pool).await?;
-            let mut job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
 
             let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
             let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
