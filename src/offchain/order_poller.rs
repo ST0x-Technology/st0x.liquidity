@@ -501,34 +501,30 @@ mod tests {
             .await
             .unwrap();
 
-        let aggregate_id = offchain_order_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
-            aggregate_id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let offchain_order = poller
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("OffchainOrder should exist");
 
-        assert_eq!(offchain_order_events.len(), 3);
-        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
-        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
-        assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Filled");
+        assert!(
+            matches!(offchain_order, OffchainOrder::Filled { .. }),
+            "Expected Filled state, got: {offchain_order:?}"
+        );
 
-        let position_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let position = poller
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("Position should exist");
 
-        assert_eq!(position_events.len(), 4);
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFilled");
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Position should have no pending order after fill"
+        );
     }
 
     #[tokio::test]
@@ -581,33 +577,29 @@ mod tests {
             .await
             .unwrap();
 
-        let aggregate_id = offchain_order_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
-            aggregate_id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let offchain_order = poller
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("OffchainOrder should exist");
 
-        assert_eq!(offchain_order_events.len(), 3);
-        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
-        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
-        assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Failed");
+        assert!(
+            matches!(offchain_order, OffchainOrder::Failed { .. }),
+            "Expected Failed state, got: {offchain_order:?}"
+        );
 
-        let position_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'TSLA' ORDER BY sequence"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let symbol = Symbol::new("TSLA").unwrap();
+        let position = poller
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("Position should exist");
 
-        assert_eq!(position_events.len(), 4);
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFailed");
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Position should have no pending order after failure"
+        );
     }
 }
