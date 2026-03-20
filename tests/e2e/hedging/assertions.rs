@@ -20,8 +20,9 @@ use crate::assert::{assert_broker_state, assert_cqrs_state};
 pub(crate) use crate::base_chain::TakeDirection;
 use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::poll::{
-    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_events, poll_for_aggregate_events_containing,
-    poll_for_events, sleep_or_crash, spawn_bot, wait_for_processing,
+    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_done_jobs, count_events, count_jobs,
+    poll_for_aggregate_events_containing, poll_for_events, sleep_or_crash, spawn_bot,
+    wait_for_processing,
 };
 pub(crate) use crate::test_infra::TestInfra;
 
@@ -104,24 +105,6 @@ pub(crate) async fn poll_for_hedged_position(
             "Timed out after {timeout:?} waiting for {context}",
         );
     }
-}
-
-/// Counts rows in the `event_queue` table.
-pub(crate) async fn count_queued_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_queue")
-        .fetch_one(pool)
-        .await?;
-
-    Ok(row.0)
-}
-
-/// Counts processed rows in the `event_queue` table.
-pub(crate) async fn count_processed_queue_events(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_queue WHERE processed = 1")
-        .fetch_one(pool)
-        .await?;
-
-    Ok(row.0)
 }
 
 /// Comprehensive end-to-end assertions covering broker state, onchain

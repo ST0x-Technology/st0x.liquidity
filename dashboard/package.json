@@ -15,7 +15,8 @@
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "e2e": "bun run dev & DEV_PID=$!; sleep 2; open http://localhost:5173; cargo nextest run --test e2e full_system --nocapture; kill $DEV_PID 2>/dev/null"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

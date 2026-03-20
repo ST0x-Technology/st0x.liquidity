@@ -49,6 +49,11 @@ impl<'de> Deserialize<'de> for SchwabTokens {
 }
 
 impl SchwabTokens {
+    /// Encrypts and persists tokens to the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchwabError`] if encryption or database write fails.
     pub async fn store(
         &self,
         pool: &SqlitePool,
@@ -90,6 +95,12 @@ impl SchwabTokens {
         Ok(())
     }
 
+    /// Loads and decrypts tokens from the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchwabError`] if no tokens exist, decryption fails,
+    /// or the database read fails.
     pub async fn load(
         pool: &SqlitePool,
         encryption_key: &FixedBytes<32>,
@@ -134,6 +145,7 @@ impl SchwabTokens {
         })
     }
 
+    #[must_use]
     pub fn is_access_token_expired(&self) -> bool {
         let now = Utc::now();
         let expires_at =
@@ -141,6 +153,7 @@ impl SchwabTokens {
         now >= expires_at
     }
 
+    #[must_use]
     pub fn is_refresh_token_expired(&self) -> bool {
         let now = Utc::now();
         let expires_at =
@@ -148,6 +161,7 @@ impl SchwabTokens {
         now >= expires_at
     }
 
+    #[must_use]
     pub fn access_token_expires_in(&self) -> Duration {
         let now = Utc::now();
         let expires_at =
@@ -155,6 +169,12 @@ impl SchwabTokens {
         expires_at - now
     }
 
+    /// Returns a valid access token, refreshing via the API if expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchwabError`] if the refresh token is expired,
+    /// the refresh request fails, or token storage fails.
     pub async fn get_valid_access_token(
         pool: &SqlitePool,
         ctx: &SchwabAuthCtx,
@@ -176,12 +196,18 @@ impl SchwabTokens {
 
     #[cfg(test)]
     pub(crate) async fn db_count(pool: &SqlitePool) -> Result<i64, SchwabError> {
-        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM schwab_auth")
+        let (count,) = sqlx::query_as("SELECT COUNT(*) FROM schwab_auth")
             .fetch_one(pool)
             .await?;
         Ok(count)
     }
 
+    /// Refreshes the access token if expired or about to expire.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchwabError`] if the refresh token is expired,
+    /// the refresh request fails, or token storage fails.
     pub async fn refresh_if_needed(
         pool: &SqlitePool,
         ctx: &SchwabAuthCtx,
