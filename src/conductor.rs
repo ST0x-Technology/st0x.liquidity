@@ -35,7 +35,7 @@ use crate::offchain_order::{
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
-use crate::onchain::backfill::backfill_events;
+use crate::onchain::backfill::{backfill_events, get_backfill_retry_strat};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
@@ -149,7 +149,7 @@ impl Conductor {
                 &provider,
                 &ctx.evm,
                 end_block,
-                backon::ExponentialBuilder::default(),
+                get_backfill_retry_strat(),
                 job_queue.clone(),
             )
             .await?;
@@ -776,11 +776,13 @@ pub(crate) async fn discover_vaults_for_trade(
     Ok(())
 }
 
+/// Returns `true` if the witness was accepted, `false` if rejected
+/// (e.g. duplicate trade already witnessed).
 async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
-) {
+) -> bool {
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
@@ -794,7 +796,7 @@ async fn execute_witness_trade(
             "Missing block_timestamp for OnChainTrade::Witness: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
         );
-        return;
+        return false;
     };
 
     let command = OnChainTradeCommand::Witness {
@@ -807,14 +809,20 @@ async fn execute_witness_trade(
     };
 
     match onchain_trade.send(&trade_id, command).await {
-        Ok(()) => info!(
-            "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
-        ),
-        Err(error) => error!(
-            "Failed to execute OnChainTrade::Witness command: {error}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        ),
+        Ok(()) => {
+            info!(
+                "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
+                trade.tx_hash, trade.log_index
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                "OnChainTrade::Witness rejected: {error}, tx_hash={:?}, log_index={}, symbol={}",
+                trade.tx_hash, trade.log_index, trade.symbol
+            );
+            false
+        }
     }
 }
 
@@ -908,11 +916,16 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
-    // Update Position aggregate FIRST so threshold check sees current state
-    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
+    let witnessed =
+        execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
 
-    execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
+    if !witnessed {
+        return Ok(None);
+    }
+
     execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
+
+    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
     let base_symbol = trade.symbol.base();
 
