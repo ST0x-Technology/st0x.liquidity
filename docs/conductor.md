@@ -2,13 +2,17 @@
 
 The conductor module (`src/conductor/`) owns the bot's runtime lifecycle. It
 composes two categories of work -- **long-running supervised tasks** and
-**one-shot persistent jobs** -- into a unified orchestration layer.
+**one-shot persistent jobs** -- into a unified orchestration layer built on
+apalis (job queues) and task-supervisor (streaming services).
+
+See SPEC.md "Orchestration" section for the full architecture vision including
+the Baton/Conductor split and future lifecycle workflows.
 
 ## Long-running tasks (task-supervisor)
 
 Continuous async tasks that run indefinitely and restart automatically on
-failure with exponential backoff. Use these for streaming connections, polling
-loops, and anything that should "always be running."
+failure with exponential backoff. Use these for streaming connections and
+anything that must maintain a persistent connection.
 
 ### SupervisedTask trait
 
@@ -59,19 +63,6 @@ The WebSocket connection is created inside `run()`. On disconnect or error,
 `run()` returns `Err(...)`, the supervisor restarts the task, and a fresh
 connection is established.
 
-### Candidates for migration
-
-These tasks currently use `tokio::spawn` with no restart logic and are
-candidates for supervisor migration (#421-#424):
-
-| Task                 | Description                                  |
-| -------------------- | -------------------------------------------- |
-| Order poller         | Polls broker for offchain order status       |
-| Position checker     | Periodic accumulated position reconciliation |
-| Inventory poller     | Polls Raindex vault balances                 |
-| Executor maintenance | Broker-specific maintenance (token refresh)  |
-| Rebalancer           | USDC rebalancing between onchain/offchain    |
-
 ## One-shot jobs (apalis + Job trait)
 
 Discrete units of work that are serialized to SQLite before processing and have
@@ -113,12 +104,7 @@ where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx>,
 {
-    // Errors are logged but not propagated -- apalis sees Ok(()) and
-    // will not retry the job. This is intentional: jobs are responsible
-    // for their own retry/recovery logic inside perform().
-    if let Err(error) = job.perform(&ctx).await {
-        error!(%error, "Job failed");
-    }
+    // Retries with exponential backoff, then logs on final failure.
 }
 ```
 
@@ -143,7 +129,7 @@ Monitor::new()
 ### AccountForDexTrade
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Serializable wrapper
-around `ChainIncluded<RaindexTradeEvent>`, pushed into
+around `EmittedOnChain<RaindexTradeEvent>`, pushed into
 `DexTradeAccountingJobQueue` by `OrderFillMonitor`.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
@@ -162,21 +148,35 @@ registry, executor. Wrapped in `Arc` and injected via apalis `Data`.
 
 ## Conductor assembly
 
-`ConductorBuilder` (`src/conductor/builder.rs`) uses a typestate pattern to
-enforce assembly order: `Initial` -> `WithExecutorMaintenance` -> `spawn()`.
+`builder::spawn()` (`src/conductor/builder.rs`) uses `#[bon::builder]` to
+construct a running `Conductor`. Required parameters: `ConductorCtx` (shared
+dependencies), `DexTradeAccountingJobQueue`, `DexEventStreams`. Optional:
+`executor_maintenance`, `rebalancer`.
+
 `ConductorCtx` bundles the shared dependencies (config, symbol cache, provider,
-executor, CQRS frameworks, execution threshold) and `spawn()` wires everything
-up, returning a `Conductor` with handles to every task.
+executor, CQRS frameworks, execution threshold, wallet polling config).
 
 `Conductor` lifecycle:
 
-- `start()` -- sets up apalis job queue, CQRS frameworks, backfill, then
-  delegates to `ConductorBuilder::spawn()`
+- `run()` -- the single entry point. Sets up apalis tables, CQRS frameworks,
+  determines cutoff block, backfills historical events, then calls
+  `builder::spawn()` to start the runtime
 - `wait_for_completion()` -- `tokio::select!` across supervisor, apalis monitor,
   order poller, and position checker; returns when any exits
-- `abort_trading_tasks()` -- shuts down supervisor + monitor + order poller +
-  position checker; keeps rebalancer, inventory poller, and executor maintenance
-- `abort_all()` -- aborts everything
+- `abort_all()` -- shuts down supervisor, aborts all task handles
+
+## Startup sequencing
+
+```
+Phase 1 (parallel):  connect_ws | setup_cqrs | setup_apalis_tables
+Phase 2 (parallel):  get_cutoff_block | seed_vaults | setup_rebalancing
+Phase 3 (sequential): backfill historical events to job queue
+Phase 4:              builder::spawn() starts the runtime
+```
+
+The trade accounting worker starts only after backfill completes. The WS
+subscription is established in phase 1, so no events are missed -- they buffer
+until the monitor starts.
 
 ## SQLite migration coexistence
 

@@ -28,7 +28,7 @@ the limit:
 - [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
   `::random()`, mocks, encoding, compile-time macros
 - [docs/conductor.md](docs/conductor.md) - Conductor orchestration layer:
-  task-supervisor, apalis workers, DexEventMonitor, ConductorBuilder, lifecycle
+  task-supervisor, apalis workers, OrderFillMonitor, bon builder, lifecycle
 - [docs/cqrs.md](docs/cqrs.md) - Event sourcing with st0x-event-sorcery
 - [docs/float.md](docs/float.md) - Float type, precision-safe financial
   arithmetic
